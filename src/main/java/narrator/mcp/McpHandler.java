@@ -77,7 +77,8 @@ public class McpHandler {
                 "Prepares the narrative for a commit or pull request and returns an overview of the narrative, including the total number of chapters for each grain level. It also generates a set of HTML pages demonstrating the narrative and returns the path to their entry page.\n\nUser Flow: Report the entry page path and the chapter counts for each GrainLevel, then ask the user to choose a GrainLevel to start the narration.",
                 "url"));
         tools.add(createToolDefinition("get_next_chapter",
-                "Retrieves the next chapter in the narrative for the specified grain level (use a GrainLevel returned by init_narrative).\n\nUser Flow: Analyze and explain the content of the current chapter, then ask the user if they would like to proceed to the next chapter. If the tool indicates the narrative has ended, provide a comprehensive final synthesis and explanation of the commit based on all chapters read."));
+                "Retrieves the next chapter in the narrative for the specified grain level (use a GrainLevel returned by init_narrative).\n\nUser Flow: Analyze and explain the content of the current chapter, then ask the user if they would like to proceed to the next chapter. If the tool indicates the narrative has ended, provide a comprehensive final synthesis and explanation of the commit based on all chapters read.",
+                "url", "grainLevel"));
         result.add("tools", tools);
         response.add("result", result);
     }
