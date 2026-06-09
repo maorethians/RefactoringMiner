@@ -30,7 +30,7 @@ public class NarrativeHtmlGenerator {
             if (chapters == null) continue;
 
             for (int i = 0; i < chapters.size(); i++) {
-                generateChapterPage(level, i, chapters.get(i));
+                generateChapterPage(level, i, chapters.size(), chapters.get(i));
             }
         }
 
@@ -46,85 +46,143 @@ public class NarrativeHtmlGenerator {
 
     private void generateOverviewPage() throws IOException {
         StringBuilder html = new StringBuilder();
-        html.append("<html><head><title>Narrative Overview</title>");
-        html.append("<style>body { font-family: sans-serif; margin: 40px; line-height: 1.6; }");
-        html.append("h1 { color: #333; } .grain-item { margin-bottom: 10px; } a { color: #0066cc; text-decoration: none; }");
-        html.append("a:hover { text-decoration: underline; }</style></head><body>");
-        html.append("<h1>Narrative Overview</h1>");
-        html.append("<p>Select a grain level to explore the changes:</p>");
+        html.append(getHtmlHeader("Narrative Overview"));
+        html.append("<div class='max-w-5xl mx-auto px-4 py-12'>");
+        html.append("<header class='text-center mb-12'>");
+        html.append("<h1 class='text-4xl font-extrabold text-slate-900 mb-4'>Narrative Overview</h1>");
+        html.append("<p class='text-lg text-slate-600'>Select a grain level to explore the architectural changes in detail.</p>");
+        html.append("</header>");
 
+        html.append("<div class='grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6'>");
         for (GrainLevel level : GrainLevel.values()) {
             int count = narrator.getNarrative(level).size();
             String filename = "grain_" + level.name().toLowerCase() + ".html";
-            html.append("<div class='grain-item'>");
-            html.append("<a href='").append(filename).append("'><strong>").append(level).append("</strong></a>");
-            html.append(" - ").append(level.getDescription()).append(" (").append(count).append(" chapters)</div>");
+            html.append("<a href='").append(filename).append("' class='group p-6 bg-white rounded-xl shadow-sm border border-slate-200 hover:border-indigo-500 hover:shadow-md transition-all duration-200'>");
+            html.append("<div class='flex items-center justify-between mb-4'>");
+            html.append("<h3 class='text-xl font-bold text-indigo-600 group-hover:text-indigo-700'>" + level + "</h3>");
+            html.append("<span class='px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800'>" + count + " chapters</span>");
+            html.append("</div>");
+            html.append("<p class='text-slate-600 text-sm leading-relaxed'>" + level.getDescription() + "</p>");
+            html.append("</a>");
         }
-
-        html.append("</body></html>");
+        html.append("</div>");
+        html.append("</div>");
+        html.append(getHtmlFooter());
         writeFile("index.html", html.toString());
     }
 
     private void generateGrainLevelPage(GrainLevel level) throws IOException {
         List<TraversalPattern> chapters = narrator.getNarrative(level);
         StringBuilder html = new StringBuilder();
-        html.append("<html><head><title>").append(level).append(" Overview</title>");
-        html.append("<style>body { font-family: sans-serif; margin: 40px; line-height: 1.6; }");
-        html.append("h1 { color: #333; } .chapter-item { margin-bottom: 10px; } a { color: #0066cc; text-decoration: none; }");
-        html.append("a:hover { text-decoration: underline; }</style></head><body>");
-        html.append("<a href='index.html'>&larr; Back to Overview</a>");
-        html.append("<h1>Grain Level: ").append(level).append("</h1>");
-        html.append("<p>Chapters in this level:</p>");
+        html.append(getHtmlHeader(level + " Overview"));
+        html.append("<div class='max-w-4xl mx-auto px-4 py-12'>");
+        html.append(getBreadcrumbs(level, null));
+        html.append("<header class='mb-8'>");
+        html.append("<h1 class='text-3xl font-bold text-slate-900 mb-2'>Grain Level: ").append(level).append("</h1>");
+        html.append("<p class='text-slate-600'>Explore the detailed chapters for this level of granularity.</p>");
+        html.append("</header>");
 
+        html.append("<div class='bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden'>");
+        html.append("<ul class='divide-y divide-slate-200'>");
         for (int i = 0; i < chapters.size(); i++) {
             String filename = "chapter_" + level.name().toLowerCase() + "_" + (i + 1) + ".html";
-            html.append("<div class='chapter-item'>");
-            html.append("<a href='").append(filename).append("'>Chapter ").append(i + 1).append("</a></div>");
+            html.append("<li class='hover:bg-slate-50 transition-colors'>");
+            html.append("<a href='").append(filename).append("' class='flex items-center justify-between p-4 text-slate-700 hover:text-indigo-600'>");
+            html.append("<span class='font-medium'>Chapter ").append(i + 1).append("</span>");
+            html.append("<span class='text-slate-400'>&rarr;</span>");
+            html.append("</a>");
+            html.append("</li>");
         }
-
-        html.append("</body></html>");
+        html.append("</ul>");
+        html.append("</div>");
+        html.append("</div>");
+        html.append(getHtmlFooter());
         writeFile("grain_" + level.name().toLowerCase() + ".html", html.toString());
     }
 
-    private void generateChapterPage(GrainLevel level, int index, TraversalPattern pattern) throws IOException {
-        // Note: In a real scenario, we would need the Cluster here to call pattern.extended(cluster, level)
-        // Since the generator doesn't have all clusters, we might need to pass them or handle it differently.
-        // For now, we will generate a placeholder or assume the content is already processed.
-        // ACTUALLY: The user wants the path returned to "see the changes in a professional diff page".
-        // If the HTML is the diff page, we need the content.
-
-        // Let's assume the content is generated on the fly or passed in.
-        // Since the generator is called during init, we don't have the cluster yet.
-        // WAIT: The user said "the path to its corresponding page must be returned".
-        // This means get_next_chapter should return the path.
-
-        // If we generate all pages at init, we need the cluster content for EVERY chapter.
-        // This might be expensive.
-
-        // Let's reconsider: maybe generate the structure at init, and the content at get_next_chapter?
-        // No, the user said "a procedure which generates a set of clean professional HTMLs" on initialization.
-
-        // To do this at init, we need to compute the clusters.
-        // I'll modify the constructor to take clusters or a way to get them.
-
-        // For now, let's implement the a basic structure. I will update this after seeing how to integrate it.
+    private void generateChapterPage(GrainLevel level, int index, int totalChapters, TraversalPattern pattern) throws IOException {
         StringBuilder html = new StringBuilder();
-        html.append("<html><head><title>Chapter ").append(index + 1).append("</title>");
-        html.append("<style>body { font-family: sans-serif; margin: 40px; line-height: 1.6; }");
-        html.append(".diff-container { background: #f6f8fa; border: 1px solid #ddd; padding: 15px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; }");
-        html.append("h1 { color: #333; }</style></head><body>");
-        html.append("<a href='grain_" + level.name().toLowerCase() + ".html'>&larr; Back to Grain Level Overview</a>");
-        html.append("<h1>Chapter ").append(index + 1).append(" (").append(level).append(")</h1>");
-        html.append("<div class='diff-container'>");
+        html.append(getHtmlHeader("Chapter " + (index + 1)));
+        html.append("<div class='max-w-5xl mx-auto px-4 py-12'>");
+        html.append(getBreadcrumbs(level, index));
+
+        html.append("<header class='flex items-center justify-between mb-8'>");
+        html.append("<div>");
+        html.append("<h1 class='text-3xl font-bold text-slate-900'>Chapter ").append(index + 1).append("</h1>");
+        html.append("<p class='text-slate-600'>Level: ").append(level).append("</p>");
+        html.append("</div>");
+
+        html.append("<div class='flex items-center space-x-4'>");
+        if (index > 0) {
+            String prevFile = "chapter_" + level.name().toLowerCase() + "_" + index + ".html";
+            html.append("<a href='").append(prevFile).append("' class='px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors'>&larr; Previous</a>");
+        } else {
+            html.append("<span class='px-4 py-2 bg-slate-100 border border-slate-200 rounded-lg text-sm font-medium text-slate-400 cursor-not-allowed'>&larr; Previous</span>");
+        }
+
+        if (index < totalChapters - 1) {
+            String nextFile = "chapter_" + level.name().toLowerCase() + "_" + (index + 2) + ".html";
+            html.append("<a href='").append(nextFile).append("' class='px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors'>Next &rarr;</a>");
+        } else {
+            html.append("<span class='px-4 py-2 bg-slate-100 border border-slate-200 rounded-lg text-sm font-medium text-slate-400 cursor-not-allowed'>Next &rarr;</span>");
+        }
+        html.append("</div>");
+        html.append("</header>");
+
+        html.append("<div class='bg-slate-900 rounded-xl shadow-2xl overflow-hidden border border-slate-800'>");
+        html.append("<div class='bg-slate-800 px-4 py-2 border-b border-slate-700 flex items-center justify-between'>");
+        html.append("<span class='text-xs font-mono text-slate-400'>Diff Content</span>");
+        html.append("<div class='flex space-x-1.5'>");
+        html.append("<div class='w-3 h-3 rounded-full bg-red-500/50'></div>");
+        html.append("<div class='w-3 h-3 rounded-full bg-yellow-500/50'></div>");
+        html.append("<div class='w-3 h-3 rounded-full bg-green-500/50'></div>");
+        html.append("</div>");
+        html.append("</div>");
+        html.append("<div class='p-6 font-mono text-sm text-slate-300 leading-relaxed overflow-x-auto whitespace-pre-wrap'>");
         html.append("[Diff content will be injected here]");
         html.append("</div>");
-        html.append("</body></html>");
+        html.append("</div>");
 
+        html.append("</div>");
+        html.append(getHtmlFooter());
         writeFile("chapter_" + level.name().toLowerCase() + "_" + (index + 1) + ".html", html.toString());
     }
 
     private void writeFile(String filename, String content) throws IOException {
         Files.write(baseDir.resolve(filename), content.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String getHtmlHeader(String title) {
+        StringBuilder html = new StringBuilder();
+        html.append("<!DOCTYPE html><html lang='en'><head>");
+        html.append("<meta charset='UTF-8'>");
+        html.append("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+        html.append("<title>").append(title).append("</title>");
+        html.append("<script src='https://cdn.tailwindcss.com'></script>");
+        html.append("<style>body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }</style>");
+        html.append("</head><body class='bg-slate-50 text-slate-900'>");
+        return html.toString();
+    }
+
+    private String getHtmlFooter() {
+        return "</body></html>";
+    }
+
+    private String getBreadcrumbs(GrainLevel level, Integer index) {
+        StringBuilder html = new StringBuilder();
+        html.append("<nav class='flex text-sm text-slate-500 mb-6' aria-label='Breadcrumb'>");
+        html.append("<ol class='flex items-center space-x-2'>");
+        html.append("<li><a href='index.html' class='text-indigo-600 hover:text-indigo-800 font-medium'>Overview</a></li>");
+        html.append("<li class='flex items-center space-x-2'>");
+        html.append("<span class='text-slate-400'>&rsaquo;</span>");
+        html.append("<a href='grain_" + level.name().toLowerCase() + ".html' class='text-indigo-600 hover:text-indigo-800 font-medium'>" + level + "</a></li>");
+        if (index != null) {
+            html.append("<li class='flex items-center space-x-2'>");
+            html.append("<span class='text-slate-400'>&rsaquo;</span>");
+            html.append("<span class='text-slate-700 font-semibold'>Chapter ").append(index + 1).append("</span></li>");
+        }
+        html.append("</ol></nav>");
+        return html.toString();
     }
 
     public String getOverviewPath() {
@@ -138,19 +196,54 @@ public class NarrativeHtmlGenerator {
     // We need a way to update the content of a chapter page when the actual diff is ready
     public void updateChapterContent(GrainLevel level, int index, String content) throws IOException {
         String filename = "chapter_" + level.name().toLowerCase() + "_" + (index + 1) + ".html";
-        Path path = baseDir.resolve(filename);
+
+        // We need the total number of chapters to correctly render the Next button
+        int totalChapters = narrator.getNarrative(level).size();
 
         StringBuilder html = new StringBuilder();
-        html.append("<html><head><title>Chapter ").append(index + 1).append("</title>");
-        html.append("<style>body { font-family: sans-serif; margin: 40px; line-height: 1.6; }");
-        html.append(".diff-container { background: #f6f8fa; border: 1px solid #ddd; padding: 15px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; }");
-        html.append("h1 { color: #333; }</style></head><body>");
-        html.append("<a href='grain_" + level.name().toLowerCase() + ".html'>&larr; Back to Grain Level Overview</a>");
-        html.append("<h1>Chapter ").append(index + 1).append(" (").append(level).append(")</h1>");
-        html.append("<div class='diff-container'>");
+        html.append(getHtmlHeader("Chapter " + (index + 1)));
+        html.append("<div class='max-w-5xl mx-auto px-4 py-12'>");
+        html.append(getBreadcrumbs(level, index));
+
+        html.append("<header class='flex items-center justify-between mb-8'>");
+        html.append("<div>");
+        html.append("<h1 class='text-3xl font-bold text-slate-900'>Chapter ").append(index + 1).append("</h1>");
+        html.append("<p class='text-slate-600'>Level: ").append(level).append("</p>");
+        html.append("</div>");
+
+        html.append("<div class='flex items-center space-x-4'>");
+        if (index > 0) {
+            String prevFile = "chapter_" + level.name().toLowerCase() + "_" + index + ".html";
+            html.append("<a href='").append(prevFile).append("' class='px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors'>&larr; Previous</a>");
+        } else {
+            html.append("<span class='px-4 py-2 bg-slate-100 border border-slate-200 rounded-lg text-sm font-medium text-slate-400 cursor-not-allowed'>&larr; Previous</span>");
+        }
+
+        if (index < totalChapters - 1) {
+            String nextFile = "chapter_" + level.name().toLowerCase() + "_" + (index + 2) + ".html";
+            html.append("<a href='").append(nextFile).append("' class='px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors'>Next &rarr;</a>");
+        } else {
+            html.append("<span class='px-4 py-2 bg-slate-100 border border-slate-200 rounded-lg text-sm font-medium text-slate-400 cursor-not-allowed'>Next &rarr;</span>");
+        }
+        html.append("</div>");
+        html.append("</header>");
+
+        html.append("<div class='bg-slate-900 rounded-xl shadow-2xl overflow-hidden border border-slate-800'>");
+        html.append("<div class='bg-slate-800 px-4 py-2 border-b border-slate-700 flex items-center justify-between'>");
+        html.append("<span class='text-xs font-mono text-slate-400'>Diff Content</span>");
+        html.append("<div class='flex space-x-1.5'>");
+        html.append("<div class='w-3 h-3 rounded-full bg-red-500/50'></div>");
+        html.append("<div class='w-3 h-3 rounded-full bg-yellow-500/50'></div>");
+        html.append("<div class='w-3 h-3 rounded-full bg-green-500/50'></div>");
+        html.append("</div>");
+        html.append("</div>");
+        html.append("<div class='p-6 font-mono text-sm text-slate-300 leading-relaxed overflow-x-auto whitespace-pre-wrap'>");
         html.append(content);
         html.append("</div>");
-        html.append("</body></html>");
+        html.append("</div>");
+
+        html.append("</div>");
+        html.append(getHtmlFooter());
 
         writeFile(filename, html.toString());
     }
