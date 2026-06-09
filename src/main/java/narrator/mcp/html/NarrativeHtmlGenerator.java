@@ -1,5 +1,6 @@
 package narrator.mcp.html;
 
+import narrator.graph.Node;
 import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.traverse.GrainLevel;
 import narrator.graph.cluster.traverse.Narrator;
@@ -23,14 +24,17 @@ public class NarrativeHtmlGenerator {
         Files.createDirectories(baseDir);
     }
 
-    public String generateAll() throws IOException {
+    public String generateAll(List<Cluster> clusters) throws IOException {
         // 1. Generate Chapter pages
         for (GrainLevel level : GrainLevel.values()) {
             List<TraversalPattern> chapters = narrator.getNarrative(level);
             if (chapters == null) continue;
 
             for (int i = 0; i < chapters.size(); i++) {
-                generateChapterPage(level, i, chapters.size(), chapters.get(i));
+                TraversalPattern pattern = chapters.get(i);
+                Cluster cluster = findClusterForNode(pattern.getLead(), clusters);
+                String content = (cluster != null) ? pattern.extended(cluster, level) : "[Content unavailable]";
+                generateChapterPage(level, i, chapters.size(), pattern, content);
             }
         }
 
@@ -100,7 +104,7 @@ public class NarrativeHtmlGenerator {
         writeFile("grain_" + level.name().toLowerCase() + ".html", html.toString());
     }
 
-    private void generateChapterPage(GrainLevel level, int index, int totalChapters, TraversalPattern pattern) throws IOException {
+    private void generateChapterPage(GrainLevel level, int index, int totalChapters, TraversalPattern pattern, String content) throws IOException {
         StringBuilder html = new StringBuilder();
         html.append(getHtmlHeader("Chapter " + (index + 1)));
         html.append("<div class='max-w-5xl mx-auto px-4 py-12'>");
@@ -139,7 +143,7 @@ public class NarrativeHtmlGenerator {
         html.append("</div>");
         html.append("</div>");
         html.append("<div class='p-6 font-mono text-sm text-slate-300 leading-relaxed overflow-x-auto whitespace-pre-wrap'>");
-        html.append("[Diff content will be injected here]");
+        html.append(content);
         html.append("</div>");
         html.append("</div>");
 
@@ -191,6 +195,20 @@ public class NarrativeHtmlGenerator {
 
     public String getChapterPath(GrainLevel level, int index) {
         return baseDir.resolve("chapter_" + level.name().toLowerCase() + "_" + (index + 1) + ".html").toAbsolutePath().toString();
+    }
+
+    private Cluster findClusterForNode(Node node, List<Cluster> clusters) {
+        if (clusters == null || clusters.isEmpty()) {
+            return null;
+        }
+
+        for (Cluster cluster : clusters) {
+            if (cluster.getGraph().vertexSet().contains(node)) {
+                return cluster;
+            }
+        }
+
+        return null;
     }
 
     // We need a way to update the content of a chapter page when the actual diff is ready

@@ -270,8 +270,9 @@ public class McpHandler {
         Narrator narrator = new Narrator(root);
         cacheManager.putNarrative(url + ":root", narrator);
 
+        List<Cluster> clusters = getOrComputeClusters(url);
         NarrativeHtmlGenerator generator = new NarrativeHtmlGenerator(url, narrator);
-        generator.generateAll();
+        generator.generateAll(clusters);
         cacheManager.putHtmlGenerator(url, generator);
 
         StringBuilder summary = new StringBuilder();
