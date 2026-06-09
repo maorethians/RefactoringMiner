@@ -18,12 +18,26 @@ public class AggregatorPattern extends TraversalPattern {
 
     @Override
     public String extended(Cluster cluster, GrainLevel level) {
-        List<Node> mains = getMains(cluster, level);
-        List<Node> sides = getSides(cluster, level);
+        List<Node> allMains = getMains(cluster, level);
+        List<Node> allSides = getSides(cluster, level);
+
+        Set<Node> nodesToFilter = new HashSet<>();
+        for (TraversalPattern sub : subs) {
+            Narrator subNarrator = new Narrator(sub);
+            List<TraversalPattern> subNarrative = subNarrator.getNarrative(level);
+            for (TraversalPattern p : subNarrative) {
+                if (Narrator.isChapter(p, level)) {
+                    nodesToFilter.addAll(p.getMains(cluster));
+                    nodesToFilter.addAll(p.getSides(cluster));
+                }
+            }
+        }
+
+        List<Node> mains = allMains.stream().filter(n -> !nodesToFilter.contains(n)).toList();
+        List<Node> sides = allSides.stream().filter(n -> !nodesToFilter.contains(n)).toList();
 
         StringBuilder prompt = new StringBuilder();
         prompt.append("# Subject:\n```\n");
-
 
         List<List<Node>> mainGroups = new ArrayList<>();
         Map<Set<Node>, List<Node>> mainPartnerMap = new HashMap<>();
