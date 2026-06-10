@@ -18,8 +18,8 @@ public class AggregatorPattern extends TraversalPattern {
 
     @Override
     public String extended(Cluster cluster, GrainLevel level) {
-        List<Node> allMains = getMains(cluster, level);
-        List<Node> allSides = getSides(cluster, level);
+        List<Node> allMains = getMains(cluster);
+        List<Node> allSides = getSides(cluster);
 
         Set<Node> nodesToFilter = new HashSet<>();
         for (TraversalPattern sub : subs) {
@@ -124,31 +124,33 @@ public class AggregatorPattern extends TraversalPattern {
         return hunk.toString();
     }
 
-    public List<Node> getMains(Cluster cluster, GrainLevel level) {
+    @Override
+    public List<Node> getMains(Cluster cluster) {
         Narrator narrator = new Narrator(this);
         List<TraversalPattern> leaves = narrator.getNarrative(GrainLevel.LEAF);
         if (leaves.isEmpty()) {
             return List.of();
         }
-        
+
         Set<Node> mainsOrdered = new LinkedHashSet<>();
         for (TraversalPattern leaf : leaves) {
             for (Node main : leaf.getMains(cluster)) {
                 mainsOrdered.add(main);
             }
         }
-        
+
         return new ArrayList<>(mainsOrdered);
     }
 
-    public List<Node> getSides(Cluster cluster, GrainLevel level) {
-        Set<Node> mainsSet = new HashSet<>(getMains(cluster, level));
+    @Override
+    public List<Node> getSides(Cluster cluster) {
+        Set<Node> mainsSet = new HashSet<>(getMains(cluster));
         Narrator narrator = new Narrator(this);
         List<TraversalPattern> leaves = narrator.getNarrative(GrainLevel.LEAF);
         if (leaves.isEmpty()) {
             return List.of();
         }
-        
+
         Set<Node> sidesOrdered = new LinkedHashSet<>();
         for (TraversalPattern leaf : leaves) {
             for (Node side : leaf.getSides(cluster)) {
@@ -157,7 +159,7 @@ public class AggregatorPattern extends TraversalPattern {
                 }
             }
         }
-        
+
         return new ArrayList<>(sidesOrdered);
     }
 
