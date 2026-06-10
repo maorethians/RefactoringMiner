@@ -1,5 +1,6 @@
 package gr.uom.java.xmi.diff;
 
+import gr.uom.java.xmi.AnnotationProvider;
 import gr.uom.java.xmi.UMLClass;
 
 import java.util.ArrayList;
@@ -8,26 +9,26 @@ import java.util.List;
 import java.util.Set;
 
 import org.apache.commons.lang3.tuple.ImmutablePair;
-import org.refactoringminer.api.Refactoring;
 import org.refactoringminer.api.RefactoringType;
 
-public class RenameClassRefactoring implements Refactoring {
+public class RenameClassRefactoring extends ChangeTypeRefactoring {
 
-	private UMLClass originalClass;
-	private UMLClass renamedClass;
+	protected UMLClass originalClass;
+	protected UMLClass renamedClass;
 	
 	public RenameClassRefactoring(UMLClass originalClass,  UMLClass renamedClass) {
 		this.originalClass = originalClass;
 		this.renamedClass = renamedClass;
 	}
 
-	public String toString() {
-		StringBuilder sb = new StringBuilder();
-		sb.append(getName()).append("\t");
-		sb.append(originalClass.getName());
-		sb.append(" renamed to ");
-		sb.append(renamedClass.getName());
-		return sb.toString();
+	@Override
+	public AnnotationProvider getProviderBefore() {
+		return originalClass;
+	}
+
+	@Override
+	public AnnotationProvider getProviderAfter() {
+		return renamedClass;
 	}
 
 	public String getName() {

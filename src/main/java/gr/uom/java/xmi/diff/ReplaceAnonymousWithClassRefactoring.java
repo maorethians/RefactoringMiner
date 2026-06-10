@@ -3,16 +3,17 @@ package gr.uom.java.xmi.diff;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import org.apache.commons.lang3.tuple.ImmutablePair;
-import org.refactoringminer.api.Refactoring;
 import org.refactoringminer.api.RefactoringType;
 
+import gr.uom.java.xmi.AnnotationProvider;
 import gr.uom.java.xmi.UMLAnonymousClass;
 import gr.uom.java.xmi.UMLClass;
 
-public class ReplaceAnonymousWithClassRefactoring implements Refactoring {
+public class ReplaceAnonymousWithClassRefactoring extends ChangeTypeRefactoring {
 	private UMLAnonymousClass anonymousClass;
 	private UMLClass addedClass;
 	private UMLAnonymousToClassDiff diff;
@@ -21,6 +22,24 @@ public class ReplaceAnonymousWithClassRefactoring implements Refactoring {
 		this.anonymousClass = anonymousClass;
 		this.addedClass = addedClass;
 		this.diff = diff;
+	}
+
+	@Override
+	public AnnotationProvider getProviderBefore() {
+		return anonymousClass;
+	}
+
+	@Override
+	public AnnotationProvider getProviderAfter() {
+		return addedClass;
+	}
+
+	public Optional<String> getTemplateParameterBefore() {
+		return Optional.of(anonymousClass.getCodePath());
+	}
+
+	public String getTemplateParameterAfter() {
+		return addedClass.toString();
 	}
 
 	public UMLAnonymousClass getAnonymousClass() {
@@ -33,15 +52,6 @@ public class ReplaceAnonymousWithClassRefactoring implements Refactoring {
 
 	public UMLAnonymousToClassDiff getDiff() {
 		return diff;
-	}
-
-	public String toString() {
-		StringBuilder sb = new StringBuilder();
-		sb.append(getName()).append("\t");
-		sb.append(anonymousClass.getCodePath());
-		sb.append(" with ");
-		sb.append(addedClass);
-		return sb.toString();
 	}
 
 	public String getName() {
@@ -80,5 +90,36 @@ public class ReplaceAnonymousWithClassRefactoring implements Refactoring {
 				.setDescription("added type declaration")
 				.setCodeElement(addedClass.getName()));
 		return ranges;
+	}
+
+	@Override
+	public int hashCode() {
+		final int prime = 31;
+		int result = 1;
+		result = prime * result + ((anonymousClass == null) ? 0 : anonymousClass.getLocationInfo().hashCode());
+		result = prime * result + ((addedClass == null) ? 0 : addedClass.getLocationInfo().hashCode());
+		return result;
+	}
+
+	@Override
+	public boolean equals(Object obj) {
+		if (this == obj)
+			return true;
+		if (obj == null)
+			return false;
+		if (getClass() != obj.getClass())
+			return false;
+		ReplaceAnonymousWithClassRefactoring other = (ReplaceAnonymousWithClassRefactoring) obj;
+		if (anonymousClass == null) {
+			if (other.anonymousClass != null)
+				return false;
+		} else if (!anonymousClass.getLocationInfo().equals(other.anonymousClass.getLocationInfo()))
+			return false;
+		if (addedClass == null) {
+			if (other.addedClass != null)
+				return false;
+		} else if (!addedClass.getLocationInfo().equals(other.addedClass.getLocationInfo()))
+			return false;
+		return true;
 	}
 }
