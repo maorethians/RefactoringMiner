@@ -240,6 +240,16 @@ public class McpHandler {
         int currentChapter = progress + 1;
         int totalChapters = chapters.size();
 
+        // Update HTML page to expand only the current chapter
+        NarrativeHtmlGenerator generator = cacheManager.getHtmlGenerator(url);
+        if (generator != null) {
+            try {
+                generator.generateGrainLevelPage(level, clusters, progress);
+            } catch (Exception e) {
+                logger.error("Failed to update narrative HTML page", e);
+            }
+        }
+
         StringBuilder output = new StringBuilder();
         output.append("[Chapter ").append(currentChapter).append(" of ").append(totalChapters).append(" - GrainLevel: ").append(level).append("]\n\n");
         output.append(content);

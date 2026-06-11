@@ -27,7 +27,7 @@ public class NarrativeHtmlGenerator {
     public String generateAll(List<Cluster> clusters) throws IOException {
         // 1. Generate Grain Level pages
         for (GrainLevel level : GrainLevel.values()) {
-            generateGrainLevelPage(level, clusters);
+            generateGrainLevelPage(level, clusters, -1);
         }
 
         // 2. Generate Overview page
@@ -62,7 +62,7 @@ public class NarrativeHtmlGenerator {
         writeFile("index.html", html.toString());
     }
 
-    private void generateGrainLevelPage(GrainLevel level, List<Cluster> clusters) throws IOException {
+    public void generateGrainLevelPage(GrainLevel level, List<Cluster> clusters, int expandedChapterIndex) throws IOException {
         List<TraversalPattern> chapters = narrator.getNarrative(level);
         StringBuilder html = new StringBuilder();
         html.append(getHtmlHeader(level + " Overview"));
@@ -79,7 +79,8 @@ public class NarrativeHtmlGenerator {
             Cluster cluster = findClusterForNode(pattern.getLead(), clusters);
             String content = (cluster != null) ? pattern.extended(cluster, level) : "[Content unavailable]";
 
-            html.append("<details class='group bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all duration-200'>");
+            String openAttr = (i == expandedChapterIndex) ? " open" : "";
+            html.append("<details").append(openAttr).append(" class='group bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all duration-200'>");
             html.append("<summary class='flex items-center justify-between p-4 cursor-pointer hover:bg-slate-50 transition-colors list-none'>");
             html.append("<span class='font-medium text-slate-700 group-open:text-indigo-600'>Chapter ").append(i + 1).append("</span>");
             html.append("<span class='text-slate-400 group-open:rotate-180 transition-transform duration-200'>&darr;</span>");
