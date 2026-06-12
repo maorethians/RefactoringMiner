@@ -280,8 +280,8 @@ public class McpHandler {
         cacheManager.putHtmlGenerator(url, generator);
 
         StringBuilder summary = new StringBuilder();
-        summary.append("Narrative initialized. A set of HTML pages has been generated for the narrative. \n\n");
-        summary.append("Entry page: ").append(generator.getOverviewPath()).append("\n\n");
+        summary.append("Narrative initialized.\n\n");
+        summary.append("A set of HTML pages have been generated for the narrative. Entry page: ").append(generator.getOverviewPath()).append("\n\n");
         summary.append("Available GrainLevels and their chapter counts:\n");
 
         for (GrainLevel level : GrainLevel.values()) {
