@@ -207,10 +207,11 @@ public class McpHandler {
             throw new IllegalArgumentException("Invalid grainLevel: " + grainLevelStr + ". Valid values are: " + java.util.Arrays.toString(GrainLevel.values()));
         }
 
-        Narrator narrator = cacheManager.getNarrative(url + ":root");
-        if (narrator == null) {
+        TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
+        if (root == null) {
             return "No narrative initialized for this URL. Please call init_narrative first.";
         }
+        Narrator narrator = root.getNarrator();
 
         int progress = narrator.getProgress(level);
         List<TraversalPattern> chapters = narrator.getNarrative(level);
@@ -271,8 +272,7 @@ public class McpHandler {
             return "No changes found to narrate.";
         }
 
-        Narrator narrator = new Narrator(root);
-        cacheManager.putNarrative(url + ":root", narrator);
+        Narrator narrator = root.getNarrator();
 
         List<Cluster> clusters = getOrComputeClusters(url);
         NarrativeHtmlGenerator generator = new NarrativeHtmlGenerator(url, narrator);

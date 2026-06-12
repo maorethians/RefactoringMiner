@@ -14,6 +14,11 @@ import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.GraphWrapper;
 
 public class TraversalPattern extends GraphWrapper {
+    private final Narrator narrator = new Narrator(this);
+
+    public Narrator getNarrator() {
+        return narrator;
+    }
 
     public String extended(Cluster cluster, GrainLevel level) {
         return "";

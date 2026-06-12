@@ -13,7 +13,6 @@ public class CacheManager {
     private final Map<String, List<Cluster>> clustersCache = new ConcurrentHashMap<>();
     private final Map<String, TraversalPattern> hierarchyCache = new ConcurrentHashMap<>();
 
-    private final Map<String, Narrator> narrativesCache = new ConcurrentHashMap<>();
     private final Map<String, NarrativeHtmlGenerator> htmlGeneratorsCache = new ConcurrentHashMap<>();
 
     public List<Cluster> getClusters(String url) {
@@ -33,13 +32,7 @@ public class CacheManager {
         hierarchyCache.put(url, hierarchy);
     }
 
-    public Narrator getNarrative(String key) {
-        return narrativesCache.get(key);
-    }
 
-    public void putNarrative(String key, Narrator narrative) {
-        narrativesCache.put(key, narrative);
-    }
 
     public NarrativeHtmlGenerator getHtmlGenerator(String url) {
         return htmlGeneratorsCache.get(url);
@@ -52,6 +45,5 @@ public class CacheManager {
     public void clear() {
         clustersCache.clear();
         hierarchyCache.clear();
-        narrativesCache.clear();
     }
 }

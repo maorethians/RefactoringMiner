@@ -23,8 +23,7 @@ public class AggregatorPattern extends TraversalPattern {
 
         Set<Node> nodesToFilter = new HashSet<>();
         for (TraversalPattern sub : subs) {
-            Narrator subNarrator = new Narrator(sub);
-            List<TraversalPattern> subNarrative = subNarrator.getNarrative(level);
+            List<TraversalPattern> subNarrative = sub.getNarrator().getNarrative(level);
             for (TraversalPattern p : subNarrative) {
                 if (Narrator.isChapter(p, level)) {
                     nodesToFilter.addAll(p.getMains(cluster));
@@ -126,8 +125,7 @@ public class AggregatorPattern extends TraversalPattern {
 
     @Override
     public List<Node> getMains(Cluster cluster) {
-        Narrator narrator = new Narrator(this);
-        List<TraversalPattern> leaves = narrator.getNarrative(GrainLevel.LEAF);
+        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         if (leaves.isEmpty()) {
             return List.of();
         }
@@ -145,8 +143,7 @@ public class AggregatorPattern extends TraversalPattern {
     @Override
     public List<Node> getSides(Cluster cluster) {
         Set<Node> mainsSet = new HashSet<>(getMains(cluster));
-        Narrator narrator = new Narrator(this);
-        List<TraversalPattern> leaves = narrator.getNarrative(GrainLevel.LEAF);
+        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         if (leaves.isEmpty()) {
             return List.of();
         }
