@@ -74,10 +74,10 @@ public class McpHandler {
         JsonArray tools = new JsonArray();
 
         tools.add(createToolDefinition("init_narrative",
-                "Prepares the narrative for a commit or pull request and returns an overview of the narrative, including the total number of chapters for each grain level. It also generates a set of HTML pages demonstrating the narrative and returns the path to their entry page.\n\nUser Flow: Report the entry page path and the chapter counts for each GrainLevel, then ask the user to choose a GrainLevel to start the narration.",
+                "Prepares the narrative for a commit or pull request and returns its overview, including the total number of chapters for each grain level. It also generates an HTML page demonstrating the narrative and returns its path.\n\nYou must report the path of the HTML page and the chapter counts for each GrainLevel to the user. Then ask the user to choose a GrainLevel to start the narration.",
                 "url"));
         tools.add(createToolDefinition("get_next_chapter",
-                "Retrieves the next chapter in the narrative for the specified grain level (use a GrainLevel returned by init_narrative).\n\nUser Flow: Analyze and explain the content of the current chapter, then ask the user if they would like to proceed to the next chapter. If the tool indicates the narrative has ended, provide a comprehensive final synthesis and explanation of the commit based on all chapters read.",
+                "Retrieves the next chapter in the narrative for the specified grain level (use a GrainLevel returned by init_narrative).\n\nYou must analyze and explain the content of the current chapter, then ask the user if they would like to proceed to the next chapter. If the tool indicates the narrative has ended, provide a comprehensive final synthesis and explanation of the commit based on all chapters read.",
                 "url", "grainLevel"));
         result.add("tools", tools);
         response.add("result", result);
@@ -281,7 +281,7 @@ public class McpHandler {
 
         StringBuilder summary = new StringBuilder();
         summary.append("Narrative initialized.\n\n");
-        summary.append("A set of HTML pages have been generated for the narrative. Entry page: ").append(generator.getOverviewPath()).append("\n\n");
+        summary.append("The path of the HTML page demonstrating the narrative: ").append(generator.getOverviewPath()).append("\n\n");
         summary.append("Available GrainLevels and their chapter counts:\n");
 
         for (GrainLevel level : GrainLevel.values()) {
