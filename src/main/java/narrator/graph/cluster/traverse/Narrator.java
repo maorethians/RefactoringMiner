@@ -52,12 +52,9 @@ public class Narrator {
             case LEAF -> traverse(rootPattern, visited, result, pp -> false, pp -> pp instanceof Leaf);
             case USAGE_CHAIN_ROOT -> {
                 Set<UsagePattern> roots = findUsageRoots(rootPattern);
-                traverse(rootPattern, visited, result, pp -> false, pp -> {
-                    if (pp instanceof UsagePattern usage) {
-                        return roots.contains(usage);
-                    }
-                    return pp instanceof Leaf;
-                });
+                traverse(rootPattern, visited, result,
+                    pp -> pp instanceof UsagePattern u && roots.contains(u),
+                    pp -> pp instanceof Leaf && (!(pp instanceof UsagePattern) || roots.contains((UsagePattern) pp)));
             }
             case SEMANTIC_LEAF -> traverse(rootPattern, visited, result,
                 pp -> pp instanceof TraversalComponent tc && isSemanticLeaf(tc),
