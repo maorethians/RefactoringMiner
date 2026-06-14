@@ -28,6 +28,7 @@ public class TraversalPattern extends GraphWrapper {
     protected final Set<String> identifiers = new HashSet<>();
     protected Node cachedLead = null;
     protected NodeType nodeType;
+    private List<TraversalPattern> cachedFlatten = null;
 
     public Node getLead() {
         if (cachedLead == null) {
@@ -88,10 +89,7 @@ public class TraversalPattern extends GraphWrapper {
     }
 
     public boolean dependsOn(TraversalPattern p) {
-        List<TraversalPattern> pNarrative = new ArrayList<>();
-        Set<TraversalPattern> visited = new HashSet<>();
-        Narrator.traverse(p, visited, pNarrative, pp -> false, pp -> true);
-        return checkDependsOn(pNarrative);
+        return checkDependsOn(p.flatten());
     }
 
     private boolean checkDependsOn(List<TraversalPattern> pNarrative) {
@@ -106,5 +104,28 @@ public class TraversalPattern extends GraphWrapper {
             }
         }
         return false;
+    }
+
+    private List<TraversalPattern> flatten() {
+        if (cachedFlatten == null) {
+            List<TraversalPattern> result = new ArrayList<>();
+            Set<TraversalPattern> visited = new HashSet<>();
+            flattenRecursive(this, visited, result);
+            cachedFlatten = List.copyOf(result);
+        }
+        return cachedFlatten;
+    }
+
+    private void flattenRecursive(TraversalPattern p, Set<TraversalPattern> visited, List<TraversalPattern> result) {
+        if (visited.contains(p)) return;
+        visited.add(p);
+
+        if (p instanceof AggregatorPattern agg) {
+            for (TraversalPattern sub : agg.subs) {
+                flattenRecursive(sub, visited, result);
+            }
+        }
+
+        result.add(p);
     }
 }
