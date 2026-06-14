@@ -10,7 +10,7 @@ import java.util.Set;
 import java.util.function.Function;
 
 public class GraphWrapper {
-    private Graph<Node, Edge> graph = GraphTypeBuilder
+    protected Graph<Node, Edge> graph = GraphTypeBuilder
             .<Node, Edge>directed()
             .allowingMultipleEdges(true)
             .allowingSelfLoops(true)

@@ -3,6 +3,7 @@ package narrator.restapi;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.util.List;
+import java.util.Objects;
 import narrator.Driver;
 import narrator.graph.Edge;
 import narrator.graph.Node;
@@ -115,9 +116,9 @@ public class Service {
     private String respondHierarchy(Graph<Node, Edge> graph) {
         Clusterer clusterer = new Clusterer(graph);
         List<Cluster> clusters = clusterer.getClusters();
-        List<List<TraversalPattern>> clustersComponents =
-                clusters.stream().map(TraversalEngine::new).map(TraversalEngine::getComponents)
-                        .filter(components -> !components.isEmpty()).toList();
+        List<TraversalPattern> clustersComponents =
+                clusters.stream().map(TraversalEngine::new).map(TraversalEngine::get)
+                        .filter(Objects::nonNull).toList();
 
         JsonObject stringifiedCommit = Stringifier.hierarchy(clustersComponents);
         return stringifiedCommit.toString();

@@ -32,8 +32,8 @@ public class TraversalEngine {
         process();
     }
 
-    public List<TraversalPattern> getComponents() {
-        return components;
+    public TraversalPattern get() {
+        return components.get(0);
     }
 
     private void process() {
@@ -48,6 +48,13 @@ public class TraversalEngine {
 
         // up until this point, they are merged per file.
         mergeByUsageChain();
+
+        if (components.size() > 1) {
+            TraversalComponent finalComponent = new TraversalComponent(new ArrayList<>(components),
+                ReasonType.CONTEXT);
+            components.clear();
+            components.add(finalComponent);
+        }
     }
 
     private void addUsageComponents() {

@@ -104,23 +104,6 @@ public class Stringifier {
         }
     }
 
-    private static JsonObject stringifyTraversalComponents(
-            List<TraversalPattern> traversalComponents,
-            String aggregatorId) {
-        Map<String, PreprocessedNode> preprocessedNodes = new HashMap<>();
-        JsonArray edges = new JsonArray();
-
-        for (TraversalPattern traversalComponent : traversalComponents) {
-            stringifyTraversalComponent(traversalComponent, aggregatorId, preprocessedNodes, edges);
-        }
-
-        JsonObject graphObj = new JsonObject();
-        graphObj.add("nodes", processNodes(preprocessedNodes));
-        graphObj.add("edges", edges);
-
-        return graphObj;
-    }
-
     private static void stringifyTraversalComponent(TraversalPattern traversalComponent,
             String aggregatorId,
             Map<String, PreprocessedNode> preprocessedNodes, JsonArray edges) {
@@ -172,20 +155,20 @@ public class Stringifier {
         return nodes;
     }
 
-    public static JsonObject hierarchy(List<List<TraversalPattern>> clustersComponents) {
+    public static JsonObject hierarchy(List<TraversalPattern> clustersComponent) {
         String rootId = "root";
 
         JsonArray nodesArray = new JsonArray();
         JsonArray edgesArray = new JsonArray();
 
-        for (int i = 1; i < clustersComponents.size() + 1; i++) {
+        for (int i = 1; i < clustersComponent.size() + 1; i++) {
             String clusterId = String.format("cluster-%d", i);
 
-            List<TraversalPattern> clusterComponents = clustersComponents.get(i - 1);
-            JsonObject stringifiedCluster = stringifyTraversalComponents(clusterComponents,
-                    clusterId);
-            nodesArray.addAll(stringifiedCluster.getAsJsonArray("nodes"));
-            edgesArray.addAll(stringifiedCluster.getAsJsonArray("edges"));
+            Map<String, PreprocessedNode> preprocessedNodes = new HashMap<>();
+            JsonArray edges = new JsonArray();
+            stringifyTraversalComponent(clustersComponent.get(i - 1), clusterId, preprocessedNodes, edges);
+            nodesArray.addAll(processNodes(preprocessedNodes));
+            edgesArray.addAll(edges);
 
             JsonObject clusterNode = new JsonObject();
             clusterNode.addProperty("id", clusterId);

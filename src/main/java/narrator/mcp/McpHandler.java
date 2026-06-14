@@ -318,12 +318,7 @@ public class McpHandler {
         List<TraversalPattern> finalHierarchy = new java.util.ArrayList<>();
 
         for (Cluster cluster : clusters) {
-            List<TraversalPattern> patterns = new TraversalEngine(cluster).getComponents();
-            if (patterns.size() > 1) {
-                finalHierarchy.add(new TraversalComponent(patterns, ReasonType.CONTEXT));
-            } else if (patterns.size() == 1) {
-                finalHierarchy.add(patterns.get(0));
-            }
+            finalHierarchy.add(new TraversalEngine(cluster).get());
         }
 
         TraversalPattern root;
