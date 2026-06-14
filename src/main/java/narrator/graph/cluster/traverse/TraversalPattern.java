@@ -10,10 +10,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
 import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.GraphWrapper;
+import org.jgrapht.Graph;
 
 public class TraversalPattern extends GraphWrapper {
     private final Narrator narrator = new Narrator(this);
@@ -22,7 +24,7 @@ public class TraversalPattern extends GraphWrapper {
         return narrator;
     }
 
-    public String extended(Cluster cluster, GrainLevel level) {
+    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
         return "";
     }
 
@@ -83,11 +85,11 @@ public class TraversalPattern extends GraphWrapper {
         this.identifiers.add(identifier);
     }
 
-    public List<Node> getMains(Cluster cluster) {
+    public List<Node> getMains(Graph<Node, Edge> graph) {
         return List.of(getLead());
     }
 
-    public List<Node> getSides(Cluster cluster) {
+    public List<Node> getSides(Graph<Node, Edge> graph) {
         return List.of();
     }
 

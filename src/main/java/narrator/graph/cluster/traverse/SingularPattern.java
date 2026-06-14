@@ -1,12 +1,11 @@
 package narrator.graph.cluster.traverse;
 
 import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
-import narrator.graph.Context;
+import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
 import narrator.graph.cluster.Cluster;
+import org.jgrapht.Graph;
 
 public class SingularPattern extends TraversalPattern implements Leaf {
 
@@ -28,21 +27,22 @@ public class SingularPattern extends TraversalPattern implements Leaf {
     }
 
     @Override
-    public String base(Cluster cluster) {
+    public String base() {
         StringBuilder prompt = new StringBuilder();
-        prompt.append("# Subject:\n```\n").append(node.mapping(cluster)).append("\n```\n");
+        prompt.append("# Subject:\n```\n").append(node.mapping(this.getGraph())).append("\n```\n");
         
         // Add immediate semantic context (surrounding code)
-        List<Node> semanticContexts = node.getSemanticContexts(cluster);
+        List<Node> semanticContexts = node.getSemanticContexts(this.getGraph());
         if (!semanticContexts.isEmpty()) {
-            prompt.append("\n# Surrounding:\n```\n").append(semanticContexts.get(0).mapping(cluster)).append("\n```\n");
+            prompt.append("\n# Surrounding:\n```\n").append(semanticContexts.get(0)
+                .mapping(this.getGraph())).append("\n```\n");
         }
         
         return prompt.toString();
     }
 
     @Override
-    public String extended(Cluster cluster, GrainLevel level) {
-        return base(cluster);
+    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
+        return base();
     }
 }

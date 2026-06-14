@@ -14,8 +14,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import javax.annotation.Nullable;
-import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.traverse.Util;
+import org.jgrapht.Graph;
 import org.refactoringminer.astDiff.models.ASTDiff;
 import org.refactoringminer.astDiff.utils.Constants;
 import org.refactoringminer.astDiff.utils.TreeUtilFunctions;
@@ -305,9 +305,9 @@ public class Node {
     return nodeObj;
   }
 
-  public String base(Cluster cluster) {
-    String basePrompt = "{ id: " + this.getPromptId() + ", type: " + getPromptType(cluster);
-    String contextString = getContextString(cluster);
+  public String base(Graph<Node, Edge> graph) {
+    String basePrompt = "{ id: " + this.getPromptId() + ", type: " + getPromptType(graph);
+    String contextString = getContextString(graph);
     if (!contextString.isEmpty()) {
       basePrompt += ", location: " + contextString;
     }
@@ -316,20 +316,20 @@ public class Node {
     return basePrompt;
   }
 
-  public List<String> getOperations(Cluster cluster) {
+  public List<String> getOperations(Graph<Node, Edge> graph) {
     List<String> operations = new ArrayList<>();
 
     List<Node> alts = new ArrayList<>();
-    alts.addAll(this.getMappingSources(cluster));
-    alts.addAll(this.getMappingTargets(cluster));
+    alts.addAll(this.getMappingSources(graph));
+    alts.addAll(this.getMappingTargets(graph));
     Node alt = alts.isEmpty() ? null : alts.get(0);
 
     if (alt == null) {
       return operations;
     }
 
-    String thisContextString = this.getContextString(cluster);
-    String altContextString = alt.getContextString(cluster);
+    String thisContextString = this.getContextString(graph);
+    String altContextString = alt.getContextString(graph);
     if (!thisContextString.equals(altContextString)) {
       if (!(thisContextString.endsWith(this.getContent()) && altContextString.endsWith(
           alt.getContent()))) {
@@ -347,7 +347,7 @@ public class Node {
     return operations;
   }
 
-  private String getPromptType(Cluster cluster) {
+  private String getPromptType(Graph<Node, Edge> graph) {
     String type = switch (this.getNodeType()) {
       case EXTENSION -> "UNCHANGED";
       case DELETION -> "DELETED";
@@ -355,27 +355,27 @@ public class Node {
       default -> this.getNodeType().name();
     };
 
-    if (!cluster.getGraph().vertexSet().contains(this)) {
+    if (!graph.vertexSet().contains(this)) {
       return type;
     }
 
-    List<String> operations = getOperations(cluster);
+    List<String> operations = getOperations(graph);
     if (operations.isEmpty()) {
       return type;
     }
 
     List<String> upperCaseOperations = operations.stream().map(String::toUpperCase).toList();
-    if (!this.getMappingSources(cluster).isEmpty()) {
+    if (!this.getMappingSources(graph).isEmpty()) {
       return "AFTER_" + String.join("_AND_", upperCaseOperations);
     }
-    if (!this.getMappingTargets(cluster).isEmpty()) {
+    if (!this.getMappingTargets(graph).isEmpty()) {
       return "BEFORE_" + String.join("_AND_", upperCaseOperations);
     }
     return type;
   }
 
-  public List<Node> getSemanticContexts(Cluster cluster) {
-    List<Node> contexts = Context.get(cluster.getGraph(), this);
+  public List<Node> getSemanticContexts(Graph<Node, Edge> graph) {
+    List<Node> contexts = Context.get(graph, this);
     List<Node> semanticContexts = new ArrayList<>();
     for (Node contextNode : contexts) {
       if (contextNode.getNodeType().equals(NodeType.SEMANTIC_CONTEXT)) {
@@ -385,8 +385,8 @@ public class Node {
     return semanticContexts;
   }
 
-  private String getContextString(Cluster cluster) {
-    List<Node> contexts = Context.get(cluster.getGraph(), this);
+  private String getContextString(Graph<Node, Edge> graph) {
+    List<Node> contexts = Context.get(graph, this);
     List<Node> locationContexts = new ArrayList<>();
     for (Node contextNode : contexts) {
       if (contextNode.getNodeType().equals(NodeType.LOCATION_CONTEXT)) {
@@ -411,22 +411,22 @@ public class Node {
     return sb.toString();
   }
 
-  public String mapping(Cluster cluster) {
-    String basePrompt = base(cluster);
+  public String mapping(Graph<Node, Edge> graph) {
+    String basePrompt = base(graph);
 
-    List<Node> sources = getMappingSources(cluster);
-    List<Node> targets = getMappingTargets(cluster);
+    List<Node> sources = getMappingSources(graph);
+    List<Node> targets = getMappingTargets(graph);
 
     if (sources.isEmpty() && targets.isEmpty()) {
       return basePrompt;
     }
 
-    List<String> operations = getOperations(cluster);
+    List<String> operations = getOperations(graph);
 
     if (!sources.isEmpty()) {
       List<String> sourcePrompts = new ArrayList<>();
       for (Node source : sources) {
-        sourcePrompts.add(source.base(cluster));
+        sourcePrompts.add(source.base(graph));
       }
       String sourcePrompt = String.join("\n", sourcePrompts);
       return sourcePrompt
@@ -440,7 +440,7 @@ public class Node {
     // targets.length > 0
     List<String> targetPrompts = new ArrayList<>();
     for (Node target : targets) {
-      targetPrompts.add(target.base(cluster));
+      targetPrompts.add(target.base(graph));
     }
     String targetPrompt = String.join("\n", targetPrompts);
     return basePrompt
@@ -451,12 +451,12 @@ public class Node {
         + targetPrompt;
   }
 
-  public List<Node> getMappingSources(Cluster cluster) {
-    return new Util(cluster.getGraph()).getMappingSources(this);
+  public List<Node> getMappingSources(Graph<Node, Edge> graph) {
+    return new Util(graph).getMappingSources(this);
   }
 
-  public List<Node> getMappingTargets(Cluster cluster) {
-    return new Util(cluster.getGraph()).getMappingTargets(this);
+  public List<Node> getMappingTargets(Graph<Node, Edge> graph) {
+    return new Util(graph).getMappingTargets(this);
   }
 
   public List<String> getDescendantSimpleNames() {

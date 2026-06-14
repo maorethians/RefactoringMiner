@@ -11,24 +11,26 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.stream.Collectors;
+import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.SrcDst;
 import narrator.graph.cluster.Cluster;
+import org.jgrapht.Graph;
 
 public class AggregatorPattern extends TraversalPattern {
 
     @Override
-    public String extended(Cluster cluster, GrainLevel level) {
-        List<Node> allMains = getMains(cluster);
-        List<Node> allSides = getSides(cluster);
+    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
+        List<Node> allMains = getMains(graph);
+        List<Node> allSides = getSides(graph);
 
         Set<Node> nodesToFilter = new HashSet<>();
         for (TraversalPattern sub : subs) {
             List<TraversalPattern> subNarrative = sub.getNarrator().getNarrative(level);
             for (TraversalPattern p : subNarrative) {
                 if (Narrator.isChapter(p, level)) {
-                    nodesToFilter.addAll(p.getMains(cluster));
-                    nodesToFilter.addAll(p.getSides(cluster));
+                    nodesToFilter.addAll(p.getMains(graph));
+                    nodesToFilter.addAll(p.getSides(graph));
                 }
             }
         }
@@ -42,7 +44,7 @@ public class AggregatorPattern extends TraversalPattern {
         List<List<Node>> mainGroups = new ArrayList<>();
         Map<Set<Node>, List<Node>> mainPartnerMap = new HashMap<>();
         for (Node n : mains) {
-            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(cluster) : n.getMappingSources(cluster);
+            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
             if (partners.isEmpty()) {
                 mainGroups.add(new ArrayList<>(List.of(n)));
             } else {
@@ -59,11 +61,11 @@ public class AggregatorPattern extends TraversalPattern {
         List<String> subjectHunks = new ArrayList<>();
         for (List<Node> group : mainGroups) {
             Node rep = group.get(0);
-            List<Node> partners = (rep.getSrcDst() == SrcDst.SRC) ? rep.getMappingTargets(cluster) : rep.getMappingSources(cluster);
+            List<Node> partners = (rep.getSrcDst() == SrcDst.SRC) ? rep.getMappingTargets(graph) : rep.getMappingSources(graph);
             if (partners.isEmpty()) {
-                subjectHunks.add(String.join("\n", group.stream().map(n -> n.base(cluster)).toList()));
+                subjectHunks.add(String.join("\n", group.stream().map(n -> n.base(graph)).toList()));
             } else {
-                subjectHunks.add(buildMappingHunk(group, partners, cluster));
+                subjectHunks.add(buildMappingHunk(group, partners, graph));
             }
         }
         prompt.append(String.join("\n---\n", subjectHunks));
@@ -73,13 +75,13 @@ public class AggregatorPattern extends TraversalPattern {
         if (this instanceof TraversalComponent tc && tc.getMergeContexts() != null && !tc.getMergeContexts().isEmpty()) {
             Set<Node> mergeContexts = tc.getMergeContexts();
             Node firstMergeContext = mergeContexts.iterator().next();
-            prompt.append("\n# Surrounding:\n```\n").append(firstMergeContext.mapping(cluster)).append("\n```\n");
+            prompt.append("\n# Surrounding:\n```\n").append(firstMergeContext.mapping(graph)).append("\n```\n");
         }
 
         List<List<Node>> sideGroups = new ArrayList<>();
         Map<Set<Node>, List<Node>> sidePartnerMap = new HashMap<>();
         for (Node n : sides) {
-            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(cluster) : n.getMappingSources(cluster);
+            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
             if (!partners.isEmpty()) {
                 Set<Node> set = new HashSet<>(partners);
                 List<Node> group = sidePartnerMap.computeIfAbsent(set, k -> {
@@ -96,8 +98,8 @@ public class AggregatorPattern extends TraversalPattern {
             List<String> contextHunks = new ArrayList<>();
             for (List<Node> group : sideGroups) {
                 Node rep = group.get(0);
-                List<Node> partners = (rep.getSrcDst() == SrcDst.SRC) ? rep.getMappingTargets(cluster) : rep.getMappingSources(cluster);
-                contextHunks.add(buildMappingHunk(group, partners, cluster));
+                List<Node> partners = (rep.getSrcDst() == SrcDst.SRC) ? rep.getMappingTargets(graph) : rep.getMappingSources(graph);
+                contextHunks.add(buildMappingHunk(group, partners, graph));
             }
             prompt.append(String.join("\n---\n", contextHunks));
             prompt.append("\n```");
@@ -106,10 +108,10 @@ public class AggregatorPattern extends TraversalPattern {
         return prompt.toString();
     }
 
-    private String buildMappingHunk(List<Node> group, List<Node> partners, Cluster cluster) {
+    private String buildMappingHunk(List<Node> group, List<Node> partners, Graph<Node, Edge> graph) {
         Set<String> allOps = new HashSet<>();
         for (Node n : group) {
-            allOps.addAll(n.getOperations(cluster));
+            allOps.addAll(n.getOperations(graph));
         }
         String ops = String.join(" and ", allOps.stream().map(op -> op + "d").toList());
 
@@ -118,14 +120,14 @@ public class AggregatorPattern extends TraversalPattern {
         Collection<Node> to = (rep.getSrcDst() == SrcDst.SRC) ? partners : group;
 
         StringBuilder hunk = new StringBuilder();
-        hunk.append(String.join("\n", from.stream().map(n -> n.base(cluster)).toList()))
+        hunk.append(String.join("\n", from.stream().map(n -> n.base(graph)).toList()))
             .append("\n\n").append(ops).append(" to:\n\n")
-            .append(String.join("\n", to.stream().map(n -> n.base(cluster)).toList()));
+            .append(String.join("\n", to.stream().map(n -> n.base(graph)).toList()));
         return hunk.toString();
     }
 
     @Override
-    public List<Node> getMains(Cluster cluster) {
+    public List<Node> getMains(Graph<Node, Edge> graph) {
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         if (leaves.isEmpty()) {
             return List.of();
@@ -133,7 +135,7 @@ public class AggregatorPattern extends TraversalPattern {
 
         Set<Node> mainsOrdered = new LinkedHashSet<>();
         for (TraversalPattern leaf : leaves) {
-            for (Node main : leaf.getMains(cluster)) {
+            for (Node main : leaf.getMains(graph)) {
                 mainsOrdered.add(main);
             }
         }
@@ -142,8 +144,8 @@ public class AggregatorPattern extends TraversalPattern {
     }
 
     @Override
-    public List<Node> getSides(Cluster cluster) {
-        Set<Node> mainsSet = new HashSet<>(getMains(cluster));
+    public List<Node> getSides(Graph<Node, Edge> graph) {
+        Set<Node> mainsSet = new HashSet<>(getMains(graph));
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         if (leaves.isEmpty()) {
             return List.of();
@@ -151,7 +153,7 @@ public class AggregatorPattern extends TraversalPattern {
 
         Set<Node> sidesOrdered = new LinkedHashSet<>();
         for (TraversalPattern leaf : leaves) {
-            for (Node side : leaf.getSides(cluster)) {
+            for (Node side : leaf.getSides(graph)) {
                 if (!mainsSet.contains(side)) {
                     sidesOrdered.add(side);
                 }

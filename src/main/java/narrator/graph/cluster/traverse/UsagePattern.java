@@ -84,34 +84,34 @@ public class UsagePattern extends AggregatorPattern implements Leaf {
     }
 
     @Override
-    public List<Node> getMains(Cluster cluster) {
+    public List<Node> getMains(Graph<Node, Edge> graph) {
         return List.of(useNode);
     }
 
     @Override
-    public List<Node> getSides(Cluster cluster) {
+    public List<Node> getSides(Graph<Node, Edge> graph) {
         return new ArrayList<>(getUsedNodes());
     }
 
     @Override
-    public String base(Cluster cluster) {
-        String subject = useNode.mapping(cluster);
+    public String base() {
+        String subject = useNode.mapping(this.getGraph());
         Set<Node> usedNodes = getUsedNodes();
 
         StringBuilder prompt = new StringBuilder();
         prompt.append("# Subject:\n```\n").append(subject).append("\n```\n");
 
         // Add immediate semantic context (surrounding code)
-        List<Node> semanticContexts = useNode.getSemanticContexts(cluster);
+        List<Node> semanticContexts = useNode.getSemanticContexts(this.getGraph());
         if (!semanticContexts.isEmpty()) {
             prompt.append("\n# Surrounding:\n```\n")
-                    .append(semanticContexts.get(0).mapping(cluster)).append("\n```\n");
+                    .append(semanticContexts.get(0).mapping(this.getGraph())).append("\n```\n");
         }
 
         if (!usedNodes.isEmpty()) {
             prompt.append("\n# Context:\n```\n");
             List<String> mappings = usedNodes.stream()
-                    .map(n -> n.mapping(cluster))
+                    .map(n -> n.mapping(this.getGraph()))
                     .toList();
             prompt.append(String.join("\n", mappings));
             prompt.append("\n```\n");
@@ -121,10 +121,10 @@ public class UsagePattern extends AggregatorPattern implements Leaf {
     }
 
     @Override
-    public String extended(Cluster cluster, GrainLevel level) {
+    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
         if (level.equals(GrainLevel.LEAF)) {
-            return this.base(cluster);
+            return this.base();
         }
-        return super.extended(cluster, level);
+        return super.extended(graph, level);
     }
 }

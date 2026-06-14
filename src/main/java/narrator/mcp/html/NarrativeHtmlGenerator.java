@@ -77,7 +77,7 @@ public class NarrativeHtmlGenerator {
         for (int i = 0; i < chapters.size(); i++) {
             TraversalPattern pattern = chapters.get(i);
             Cluster cluster = findClusterForNode(pattern.getLead(), clusters);
-            String content = (cluster != null) ? pattern.extended(cluster, level) : "[Content unavailable]";
+            String content = (cluster != null) ? pattern.extended(cluster.getGraph(), level) : "[Content unavailable]";
 
             String openAttr = (i == expandedChapterIndex) ? " open" : "";
             html.append("<details").append(openAttr).append(" class='group bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all duration-200'>");

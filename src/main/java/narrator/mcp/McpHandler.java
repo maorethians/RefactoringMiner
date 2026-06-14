@@ -237,7 +237,7 @@ public class McpHandler {
             return "Error: Could not find associated cluster for the current chapter.";
         }
 
-        String content = chapterPattern.extended(cluster, level);
+        String content = chapterPattern.extended(cluster.getGraph(), level);
         int currentChapter = progress + 1;
         int totalChapters = chapters.size();
 

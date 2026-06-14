@@ -49,20 +49,19 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
         return getHead();
     }
 
-    public List<Node> getSequence(Cluster cluster) {
+    public List<Node> getSequence() {
         List<Node> sequence = new ArrayList<>();
         Node current = getHead();
         if (current == null) {
             return sequence;
         }
 
-        Graph<Node, Edge> graph = cluster.getGraph();
         while (current != null) {
             sequence.add(current);
             Node next = null;
-            for (Edge edge : graph.outgoingEdgesOf(current)) {
+            for (Edge edge : this.getGraph().outgoingEdgesOf(current)) {
                 if (edge.getType().equals(EdgeType.SUCCESSION)) {
-                    next = graph.getEdgeTarget(edge);
+                    next = this.getGraph().getEdgeTarget(edge);
                     break;
                 }
             }
@@ -72,21 +71,20 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
     }
 
     @Override
-    public String base(Cluster cluster) {
+    public String base() {
         StringBuilder prompt = new StringBuilder();
 
         prompt.append("# Subject:\n```\n");
-        List<Node> sequence = getSequence(cluster);
-        List<String> basePrompts = sequence.stream()
-                .map(node -> node.base(cluster))
+        List<Node> sequence = getSequence();
+        List<String> basePrompts = sequence.stream().map(node -> node.base(this.getGraph()))
                 .toList();
         prompt.append(String.join("\n---\n", basePrompts));
         prompt.append("\n```");
 
-        Node semanticContext = sequence.get(0).getSemanticContexts(cluster).get(0);
-        if (semanticContext != null) {
+        List<Node> semanticContexts = sequence.get(0).getSemanticContexts(this.getGraph());
+        if (!semanticContexts.isEmpty()) {
             prompt.append("\n# Surrounding:\n```\n");
-            prompt.append(semanticContext.mapping(cluster));
+            prompt.append(semanticContexts.get(0).mapping(this.getGraph()));
             prompt.append("\n```\n");
         }
 
@@ -94,7 +92,8 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
         Map<Set<Node>, List<Node>> aggregated = new LinkedHashMap<>();
     
         for (Node node : sequence) {
-            List<Node> partners = node.getSrcDst() == SrcDst.SRC ? node.getMappingTargets(cluster) : node.getMappingSources(cluster);
+            List<Node> partners = node.getSrcDst() == SrcDst.SRC ?
+                node.getMappingTargets(this.getGraph()) : node.getMappingSources(this.getGraph());
             if (partners.isEmpty()) continue;
         
             Set<Node> partnerSet = new HashSet<>(partners);
@@ -107,7 +106,7 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
             
             Set<String> allOps = new HashSet<>();
             for (Node n : group) {
-                allOps.addAll(n.getOperations(cluster));
+                allOps.addAll(n.getOperations(this.getGraph()));
             }
             String ops = String.join(" and ", allOps.stream().map(op -> op + "d").toList());
             
@@ -117,9 +116,9 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
             Collection<Node> from = (rep.getSrcDst() == SrcDst.SRC) ? group : partners;
             Collection<Node> to = (rep.getSrcDst() == SrcDst.SRC) ? partners : group;
 
-            hunk.append(String.join("\n", from.stream().map(n -> n.base(cluster)).toList()))
+            hunk.append(String.join("\n", from.stream().map(n -> n.base(this.getGraph())).toList()))
                 .append("\n\n").append(ops).append(" to:\n\n")
-                .append(String.join("\n", to.stream().map(n -> n.base(cluster)).toList()));
+                .append(String.join("\n", to.stream().map(n -> n.base(this.getGraph())).toList()));
             mappingHunks.add(hunk.toString());
         }
 
@@ -133,13 +132,13 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
     }
 
     @Override
-    public String extended(Cluster cluster, GrainLevel level) {
-        return base(cluster);
+    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
+        return base();
     }
 
     @Override
-    public List<Node> getMains(Cluster cluster) {
-        return getSequence(cluster);
+    public List<Node> getMains(Graph<Node, Edge> graph) {
+        return getSequence();
     }
 
     @Override
