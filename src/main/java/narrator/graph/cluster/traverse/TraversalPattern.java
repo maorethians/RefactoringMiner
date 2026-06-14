@@ -5,8 +5,10 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
@@ -29,6 +31,7 @@ public class TraversalPattern extends GraphWrapper {
     protected Node cachedLead = null;
     protected NodeType nodeType;
     private List<TraversalPattern> cachedFlatten = null;
+    private Map<TraversalPattern, Boolean> dependsOnCache = new HashMap<>();
 
     public Node getLead() {
         if (cachedLead == null) {
@@ -89,22 +92,27 @@ public class TraversalPattern extends GraphWrapper {
     }
 
     public boolean dependsOn(TraversalPattern p) {
-        return checkDependsOn(p.flatten());
+        if (dependsOnCache.containsKey(p)) {
+            return dependsOnCache.get(p);
+        }
+
+        List<TraversalPattern> pNarrative = p.flatten();
+        boolean result = false;
+        for (TraversalPattern thisP : this.flatten()) {
+            if (thisP instanceof UsagePattern usage) {
+                for (TraversalPattern sub : usage.subs) {
+                    if (pNarrative.contains(sub)) {
+                        result = true;
+                        break;
+                    }
+                }
+            }
+            if (result) break;
+        }
+        dependsOnCache.put(p, result);
+        return result;
     }
 
-    private boolean checkDependsOn(List<TraversalPattern> pNarrative) {
-        if (this instanceof UsagePattern usage) {
-            for (TraversalPattern sub : usage.subs) {
-                if (pNarrative.contains(sub)) return true;
-            }
-        }
-        if (this instanceof AggregatorPattern agg) {
-            for (TraversalPattern sub : agg.subs) {
-                if (sub.checkDependsOn(pNarrative)) return true;
-            }
-        }
-        return false;
-    }
 
     private List<TraversalPattern> flatten() {
         if (cachedFlatten == null) {
