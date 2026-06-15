@@ -218,14 +218,6 @@ public class AggregatorPattern extends TraversalPattern {
 
         List<TraversalPattern> subList = new ArrayList<>(this.subs);
         int n = subList.size();
-        boolean[][] dependsOnMatrix = new boolean[n][n];
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                if (i != j) {
-                    dependsOnMatrix[i][j] = subList.get(i).dependsOn(subList.get(j));
-                }
-            }
-        }
 
         List<Set<Integer>> groups = new ArrayList<>();
         for (int i = 0; i < n; i++) {
@@ -242,7 +234,7 @@ public class AggregatorPattern extends TraversalPattern {
                     boolean related = false;
                     for (int idx1 : g1) {
                         for (int idx2 : g2) {
-                            if (dependsOnMatrix[idx1][idx2] || dependsOnMatrix[idx2][idx1]) {
+                            if (subList.get(idx1).dependsOn(subList.get(idx2)) || subList.get(idx2).dependsOn(subList.get(idx1))) {
                                related = true;
                                 break;
                             }
