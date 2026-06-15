@@ -1299,6 +1299,22 @@ public abstract class AbstractCall extends LeafExpression {
 				}
 			}
 		}
+		if(call.arguments().size() < this.arguments().size()) {
+			for(String s2 : call.arguments()) {
+				if(s2.startsWith("\"") && s2.endsWith("\"") && s2.length() > 2) {
+					String value2 = s2.substring(1, s2.length()-1);
+					for(String s1 : arguments()) {
+						if(s1.startsWith("\"") && s1.endsWith("\"") && s1.length() > 2) {
+							String value1 = s1.substring(1, s1.length()-1);
+							if(value2.contains(value1)) {
+								argumentIntersectionSize++;
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
 		return argumentIntersectionSize;
 	}
 
@@ -1534,7 +1550,7 @@ public abstract class AbstractCall extends LeafExpression {
 		if(statement.contains(LANG.ASSIGNMENT) && statement.endsWith(LANG.STATEMENT_TERMINATION)) {
 			int index = 0;
 			for(String argument : arguments()) {
-				if(equalsIgnoringExtraParenthesis(argument, statement.substring(statement.indexOf(LANG.ASSIGNMENT)+1, statement.length()-LANG.STATEMENT_TERMINATION.length()))) {
+				if(equalsIgnoringExtraParenthesis(argument, statement.substring(statement.indexOf(LANG.ASSIGNMENT) + LANG.ASSIGNMENT.length(), statement.length()-LANG.STATEMENT_TERMINATION.length()))) {
 					return index;
 				}
 				index++;
@@ -1545,7 +1561,7 @@ public abstract class AbstractCall extends LeafExpression {
 
 	private boolean expressionIsAssigned(String statement) {
 		if(statement.contains(LANG.ASSIGNMENT) && statement.endsWith(LANG.STATEMENT_TERMINATION) && expression != null) {
-			if(equalsIgnoringExtraParenthesis(expression, statement.substring(statement.indexOf(LANG.ASSIGNMENT)+1, statement.length()-LANG.STATEMENT_TERMINATION.length()))) {
+			if(equalsIgnoringExtraParenthesis(expression, statement.substring(statement.indexOf(LANG.ASSIGNMENT) + LANG.ASSIGNMENT.length(), statement.length()-LANG.STATEMENT_TERMINATION.length()))) {
 				return true;
 			}
 		}
@@ -1555,7 +1571,7 @@ public abstract class AbstractCall extends LeafExpression {
 	public Replacement makeReplacementForAssignedArgument(String statement) {
 		int index = argumentIsAssigned(statement);
 		if(index >= 0 && (arguments().size() == 1 || (statement.contains(LANG.TERNARY_CONDITION) && statement.contains(LANG.TERNARY_ELSE)))) {
-			return new Replacement(statement.substring(statement.indexOf(LANG.ASSIGNMENT)+1, statement.length()-LANG.STATEMENT_TERMINATION.length()),
+			return new Replacement(statement.substring(statement.indexOf(LANG.ASSIGNMENT) + LANG.ASSIGNMENT.length(), statement.length()-LANG.STATEMENT_TERMINATION.length()),
 					arguments().get(index), ReplacementType.ARGUMENT_REPLACED_WITH_RIGHT_HAND_SIDE_OF_ASSIGNMENT_EXPRESSION);
 		}
 		return null;
@@ -1563,7 +1579,7 @@ public abstract class AbstractCall extends LeafExpression {
 
 	public Replacement makeReplacementForAssignedExpression(String statement) {
 		if(expressionIsAssigned(statement)) {
-			return new Replacement(statement.substring(statement.indexOf(LANG.ASSIGNMENT)+1, statement.length()-LANG.STATEMENT_TERMINATION.length()),
+			return new Replacement(statement.substring(statement.indexOf(LANG.ASSIGNMENT) + LANG.ASSIGNMENT.length(), statement.length()-LANG.STATEMENT_TERMINATION.length()),
 					expression, ReplacementType.EXPRESSION_REPLACED_WITH_RIGHT_HAND_SIDE_OF_ASSIGNMENT_EXPRESSION);
 		}
 		return null;

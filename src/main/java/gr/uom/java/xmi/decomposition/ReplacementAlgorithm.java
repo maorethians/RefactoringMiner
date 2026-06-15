@@ -1834,7 +1834,8 @@ public class ReplacementAlgorithm {
 				equalAfterNewArgumentAdditions(s1, s2, replacementInfo, operationBodyMapper) ||
 				(validStatementForConcatComparison(statement1, statement2) && commonConcat(s1, s2, parameterToArgumentMap, replacementInfo, statement1, statement2, operationBodyMapper)) ||
 				partiallyUndoParameterToArgumentMap(s1, s2, parameterToArgumentMap) ||
-				javaToKotlin(s1, s2, statement1, statement2, replacementInfo, LANG1, LANG2);
+				javaToKotlin(s1, s2, statement1, statement2, replacementInfo, LANG1, LANG2) ||
+				multipleVariableDeclarationMatch(variableDeclarations1, variableDeclarations2);
 		int refactoringsAfter = operationBodyMapper.getRefactoringsAfterPostProcessing().size();
 		List<Refactoring> orderedRefactorings = new ArrayList<>(operationBodyMapper.getRefactoringsAfterPostProcessing());
 		Set<Refactoring> newRefactorings = new LinkedHashSet<>();
@@ -4919,6 +4920,34 @@ public class ReplacementAlgorithm {
 		return null;
 	}
 
+	private static boolean multipleVariableDeclarationMatch(List<VariableDeclaration> variableDeclarations1, List<VariableDeclaration> variableDeclarations2) {
+		if(variableDeclarations1.size() > 1 && variableDeclarations2.size() > 1) {
+			if(variableDeclarations1.toString().equals(variableDeclarations2.toString()))
+				return true;
+			if(variableDeclarations1.size() == variableDeclarations2.size()) {
+				int matches = 0;
+				for(int i=0; i<variableDeclarations1.size(); i++) {
+					VariableDeclaration v1 = variableDeclarations1.get(i);
+					VariableDeclaration v2 = variableDeclarations2.get(i);
+					if(v1.getInitializer() != null && v2.getInitializer() != null &&
+							v1.getInitializer().getString().equals(v2.getInitializer().getString())) {
+						matches++;
+					}
+					else if(v1.getInitializer() == null && v2.getInitializer() == null && v1.getVariableName().equals(v2.getVariableName())) {
+						matches++;
+					}
+					else if(v1.getVariableName().equals(v2.getVariableName())) {
+						matches++;
+					}
+				}
+				if(matches >= variableDeclarations1.size()-1) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	private static boolean sameTypeChangeInUnmatchedStatements(ObjectCreation creationCoveringTheEntireStatement1, ObjectCreation creationCoveringTheEntireStatement2, ReplacementInfo info) {
 		if(creationCoveringTheEntireStatement1.isArray() && creationCoveringTheEntireStatement1.getAnonymousClassDeclaration() != null) {
 			return false;
@@ -5854,8 +5883,8 @@ public class ReplacementAlgorithm {
 		if(statement1.getString().startsWith(candidateReplacement.getBefore() + LANG1.ASSIGNMENT) &&
 				statement2.getString().startsWith(candidateReplacement.getAfter() + LANG2.ASSIGNMENT) &&
 				statement1.getString().endsWith(LANG1.STATEMENT_TERMINATION) && statement2.getString().endsWith(LANG2.STATEMENT_TERMINATION)) {
-			String suffix1 = statement1.getString().substring(statement1.getString().indexOf(LANG1.ASSIGNMENT) + 1, statement1.getString().lastIndexOf(LANG1.STATEMENT_TERMINATION));
-			String suffix2 = statement2.getString().substring(statement2.getString().indexOf(LANG2.ASSIGNMENT) + 1, statement2.getString().lastIndexOf(LANG2.STATEMENT_TERMINATION));
+			String suffix1 = statement1.getString().substring(statement1.getString().indexOf(LANG1.ASSIGNMENT) + LANG1.ASSIGNMENT.length(), statement1.getString().lastIndexOf(LANG1.STATEMENT_TERMINATION));
+			String suffix2 = statement2.getString().substring(statement2.getString().indexOf(LANG2.ASSIGNMENT) + LANG2.ASSIGNMENT.length(), statement2.getString().lastIndexOf(LANG2.STATEMENT_TERMINATION));
 			if(suffix1.startsWith(suffix2) || suffix2.startsWith(suffix1)) {
 				return true;
 			}

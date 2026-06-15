@@ -568,6 +568,21 @@ public class TypeScriptOperationBody extends OperationBody {
 						}
 						return;
 					}
+					else if(declarator.getInit().get() instanceof Swc4jAstAssignExpr assignExpr && assignExpr.getRight() instanceof Swc4jAstObjectLit objectLiteral && objectLiteral.getProps().size() > 0) {
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+						List<UMLImport> imports = new ArrayList<>();
+						String codePath = getAnonymousCodePath(objectLiteral, fileContent);
+						UMLClass umlClass = new UMLClass(container.getClassName(), codePath, location, true, imports);
+						umlClass.setObject(true);
+						umlClass.setVisibility(Visibility.PUBLIC);
+						processObjectLiteral(sourceFolder, filePath, container, activeVariableDeclarations, fileContent, typeDeclarations, comments, objectLiteral, umlClass);
+						addToContainer(container, umlClass);
+						StatementObject child = new StatementObject(sourceFolder, filePath, variableDecl, parent.getDepth()+1, CodeElementType.VARIABLE_DECLARATION_STATEMENT, container, activeVariableDeclarations, fileContent);
+						parent.addStatement(child);
+						addStatementInVariableScopes(child);
+						addAllInActiveVariableDeclarations(child.getVariableDeclarations());
+						return;
+					}
 					else if(declarator.getInit().get() instanceof Swc4jAstCallExpr callExpr && callExpr.getCallee() instanceof Swc4jAstMemberExpr memberExpr &&
 							memberExpr.getProp() instanceof Swc4jAstIdentName ident && jsExtension.contains(ident.getSym()) && objectLiteralArgument(callExpr)) {
 						//jQuery: $.extend(target, object); merges object into target.
@@ -1402,6 +1417,19 @@ public class TypeScriptOperationBody extends OperationBody {
 			}
 			else if(member instanceof Swc4jAstConstructor constructor) {
 				UMLOperation nested = TypeScriptFileProcessor.processConstructor(sourceFolder, filePath, constructor, activeVariableDeclarations, fileContent, umlClass.getName(), comments);
+				//JavaScript is a dynamically typed language, assigning a value to a property using this.propertyName inside the constructor automatically creates and initializes that property on the object instance.
+				if(nested.getBody() != null) {
+					for(VariableDeclaration vd : nested.getBody().getAllVariableDeclarations()) {
+						if(vd.isAttribute()) {
+							UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), vd.getLocationInfo(), umlClass.getName());
+							attribute.setVariableDeclaration(vd);
+							attribute.setVisibility(Visibility.PUBLIC);
+							if(!umlClass.containsAttributeWithTheSameName(attribute)) {
+								umlClass.addAttribute(attribute);
+							}
+						}
+					}
+				}
 				umlClass.addOperation(nested);
 			}
 			else if(member instanceof Swc4jAstClassProp classProperty) {

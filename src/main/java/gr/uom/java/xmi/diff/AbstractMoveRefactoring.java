@@ -36,13 +36,21 @@ public abstract class AbstractMoveRefactoring implements Refactoring {
 		return toString(Refactoring.Decorator.HTML);
 	}
 
+	public String toMarkupString() {
+		return toString(Refactoring.Decorator.MARKUP);
+	}
+
 	private String toString(Refactoring.Decorator decorator) {
 		StringBuilder sb = new StringBuilder();
 		sb.append(decorator.BOLD_OPEN).append(getName()).append(decorator.BOLD_CLOSE).append("\t");
 		if(getRefactoringType().equals(RefactoringType.MOVE_CODE)) {
 			sb.append("from ");
 		}
-		sb.append(decorator.CODE_OPEN).append(codeElementDescription(getRefactoringType().equals(RefactoringType.EXTRACT_FIXTURE) ? getProviderAfter() : getProviderBefore())).append(decorator.CODE_CLOSE);
+		String codeElementDescription1 = codeElementDescription(getRefactoringType().equals(RefactoringType.EXTRACT_FIXTURE) ? getProviderAfter() : getProviderBefore());
+		if(decorator.equals(Decorator.HTML)) {
+			codeElementDescription1 = escapeHTML(codeElementDescription1);
+		}
+		sb.append(decorator.CODE_OPEN).append(codeElementDescription1).append(decorator.CODE_CLOSE);
 		if(addClassName(getProviderBefore(), getRefactoringType())) {
 			sb.append(" from class ");
 			sb.append(decorator.LINK_OPEN).append(getProviderBefore().getClassName()).append(decorator.LINK_CLOSE);
@@ -52,7 +60,11 @@ public abstract class AbstractMoveRefactoring implements Refactoring {
 			sb.append(decorator.LINK_OPEN).append(getProviderBefore().getClassName()).append(decorator.LINK_CLOSE);
 		}
 		appendTextBetweenMovedElements(sb);
-		sb.append(decorator.CODE_OPEN).append(codeElementDescription(getRefactoringType().equals(RefactoringType.EXTRACT_FIXTURE) ? getProviderBefore() : getProviderAfter())).append(decorator.CODE_CLOSE);
+		String codeElementDescription2 = codeElementDescription(getRefactoringType().equals(RefactoringType.EXTRACT_FIXTURE) ? getProviderBefore() : getProviderAfter());
+		if(decorator.equals(Decorator.HTML)) {
+			codeElementDescription2 = escapeHTML(codeElementDescription2);
+		}
+		sb.append(decorator.CODE_OPEN).append(codeElementDescription2).append(decorator.CODE_CLOSE);
 		if(addClassName(getProviderAfter(), getRefactoringType())) {
 			sb.append(" from class ");
 			sb.append(decorator.LINK_OPEN).append(getProviderAfter().getClassName()).append(decorator.LINK_CLOSE);
@@ -68,6 +80,10 @@ public abstract class AbstractMoveRefactoring implements Refactoring {
 			sb.append(decorator.LINK_OPEN).append(getProviderAfter().getClassName()).append(decorator.LINK_CLOSE);
 		}
 		return sb.toString();
+	}
+
+	private static String escapeHTML(String codeElement) {
+		return codeElement.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;");
 	}
 
 	private void appendTextBetweenMovedElements(StringBuilder sb) {
