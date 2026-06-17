@@ -24,7 +24,7 @@ public class TraversalPattern extends GraphWrapper {
         return narrator;
     }
 
-    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
+    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
         return "";
     }
 

@@ -20,18 +20,15 @@ import org.jgrapht.Graph;
 public class AggregatorPattern extends TraversalPattern {
 
     @Override
-    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
+    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
         List<Node> allMains = getMains(graph);
         List<Node> allSides = getSides(graph);
 
         Set<Node> nodesToFilter = new HashSet<>();
-        for (TraversalPattern sub : subs) {
-            List<TraversalPattern> subNarrative = sub.getNarrator().getNarrative(level);
-            for (TraversalPattern p : subNarrative) {
-                if (Narrator.isChapter(p, level)) {
-                    nodesToFilter.addAll(p.getMains(graph));
-                    nodesToFilter.addAll(p.getSides(graph));
-                }
+        if (filterPatterns != null) {
+            for (TraversalPattern p : filterPatterns) {
+                nodesToFilter.addAll(p.getMains(graph));
+                nodesToFilter.addAll(p.getSides(graph));
             }
         }
 

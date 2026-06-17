@@ -132,7 +132,7 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
     }
 
     @Override
-    public String extended(Graph<Node, Edge> graph, GrainLevel level) {
+    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
         return base();
     }
 
