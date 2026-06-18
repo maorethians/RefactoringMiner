@@ -210,26 +210,6 @@ public class AggregatorPattern extends TraversalPattern {
         return result;
     }
 
-    public List<TraversalPattern> sortSubs() {
-        List<TraversalPattern> result = new ArrayList<>();
-        Set<TraversalPattern> visited = new HashSet<>();
-        for (TraversalPattern sub : subs) {
-            visit(sub, visited, result);
-        }
-        return result;
-    }
-
-    private void visit(TraversalPattern pattern, Set<TraversalPattern> visited, List<TraversalPattern> result) {
-        if (!visited.add(pattern)) {
-            return;
-        }
-        for (TraversalPattern other : subs) {
-            if (pattern.dependsOn(other)) {
-                visit(other, visited, result);
-            }
-        }
-        result.add(pattern);
-    }
     // TODO: test and validate
     protected void breakCircularDependencies(List<AggregatorPattern> path) {
         List<AggregatorPattern> acceptableSubs = subs.stream()

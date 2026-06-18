@@ -3,6 +3,7 @@ package narrator.graph.cluster.traverse;
 import java.util.*;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.Comparator;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
 import narrator.graph.Edge;
@@ -67,7 +68,7 @@ public class Narrator {
                 pp -> pp instanceof Leaf);
         }
 
-        return result;
+        return sortPatterns(result);
     }
 
     private Set<UsagePattern> findUsageRoots(TraversalPattern root) {
@@ -160,6 +161,25 @@ public class Narrator {
         };
     }
 
+    public List<TraversalPattern> sortPatterns(List<TraversalPattern> patterns) {
+        List<TraversalPattern> result = new ArrayList<>();
+        Set<TraversalPattern> visited = new HashSet<>();
+        for (TraversalPattern pattern : patterns) {
+            visit(pattern, visited, result, patterns);
+        }
+        return result;
+    }
+
+    private void visit(TraversalPattern pattern, Set<TraversalPattern> visited, List<TraversalPattern> result, Collection<TraversalPattern> candidates) {
+        if (!visited.add(pattern)) return;
+        for (TraversalPattern other : candidates) {
+            if (pattern.dependsOn(other)) {
+                visit(other, visited, result, candidates);
+            }
+        }
+        result.add(pattern);
+    }
+
     public static void traverse(TraversalPattern p, Set<TraversalPattern> visited, List<TraversalPattern> result, Predicate<TraversalPattern> stopPredicate, Predicate<TraversalPattern> leafPredicate) {
         if (visited.contains(p)) return;
         visited.add(p);
@@ -170,7 +190,9 @@ public class Narrator {
         }
 
         if (p instanceof AggregatorPattern agg) {
-            for (TraversalPattern sub : agg.sortSubs()) {
+            List<TraversalPattern> sortedSubs = new ArrayList<>(agg.subs);
+            sortedSubs.sort(Comparator.comparingInt(TraversalPattern::getDepth).reversed());
+            for (TraversalPattern sub : sortedSubs) {
                 traverse(sub, visited, result, stopPredicate, leafPredicate);
             }
         }
