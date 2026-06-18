@@ -211,41 +211,25 @@ public class AggregatorPattern extends TraversalPattern {
     }
 
     public List<TraversalPattern> sortSubs() {
-        if (this.subs == null || this.subs.isEmpty()) return Collections.emptyList();
-
-        List<TraversalPattern> subList = new ArrayList<>(this.subs);
-        subList.sort((s1, s2) -> Integer.compare(s2.getDepth(), s1.getDepth()));
-
         List<TraversalPattern> result = new ArrayList<>();
         Set<TraversalPattern> visited = new HashSet<>();
-
-        for (TraversalPattern sub : subList) {
-            if (!visited.contains(sub)) {
-                dfs(sub, visited, result);
-            }
+        for (TraversalPattern sub : subs) {
+            visit(sub, visited, result);
         }
         return result;
     }
 
-    private void dfs(TraversalPattern u, Set<TraversalPattern> visited, List<TraversalPattern> result) {
-        visited.add(u);
-
-        List<TraversalPattern> neighbors = new ArrayList<>();
-        for (TraversalPattern v : subs) {
-            if (u.dependsOn(v)) {
-                neighbors.add(v);
+    private void visit(TraversalPattern pattern, Set<TraversalPattern> visited, List<TraversalPattern> result) {
+        if (!visited.add(pattern)) {
+            return;
+        }
+        for (TraversalPattern other : subs) {
+            if (pattern.dependsOn(other)) {
+                visit(other, visited, result);
             }
         }
-        neighbors.sort((s1, s2) -> Integer.compare(s2.getDepth(), s1.getDepth()));
-
-        for (TraversalPattern v : neighbors) {
-            if (!visited.contains(v)) {
-                dfs(v, visited, result);
-            }
-        }
-        result.add(u);
+        result.add(pattern);
     }
-
     // TODO: test and validate
     protected void breakCircularDependencies(List<AggregatorPattern> path) {
         List<AggregatorPattern> acceptableSubs = subs.stream()
