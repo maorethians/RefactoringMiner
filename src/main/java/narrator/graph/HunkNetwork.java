@@ -9,8 +9,10 @@ import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.UMLAnonymousClass;
 import gr.uom.java.xmi.UMLAttribute;
 import gr.uom.java.xmi.UMLClass;
+import gr.uom.java.xmi.UMLGeneralization;
 import gr.uom.java.xmi.UMLModel;
 import gr.uom.java.xmi.UMLOperation;
+import gr.uom.java.xmi.UMLRealization;
 import gr.uom.java.xmi.decomposition.AbstractCall;
 import gr.uom.java.xmi.decomposition.AbstractCodeFragment;
 import gr.uom.java.xmi.decomposition.LeafExpression;
@@ -29,6 +31,7 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import org.jgrapht.Graph;
 import org.jgrapht.graph.builder.GraphTypeBuilder;
 import org.refactoringminer.astDiff.models.ASTDiff;
@@ -286,7 +289,7 @@ public class HunkNetwork {
 
   public void process() {
     processDefUse();
-    processClassInstanceCreations();
+    processClassLevelRelations();
     processExtensions(SrcDst.SRC);
     processExtensions(SrcDst.DST);
     processMapping();
@@ -296,7 +299,8 @@ public class HunkNetwork {
   }
 
   private void processMapping() {
-    List<Node> nodes = graph.vertexSet().stream().toList().stream().filter(node -> !node.isExtension()).toList();
+    List<Node> nodes = graph.vertexSet().stream().toList().stream()
+        .filter(node -> !node.isExtension()).toList();
     List<Node> srcNodes = nodes.stream().filter(Node::isSrc).toList();
     List<Node> dstNodes = nodes.stream().filter(Node::isDst).toList();
 
@@ -571,7 +575,8 @@ public class HunkNetwork {
     }
   }
 
-  private void processClassInstanceCreations() {
+  private void processClassLevelRelations() {
+    // Class Instance Creation
     List<Node> nodes = graph.vertexSet().stream()
         .filter(node -> !node.isContext() && !node.isExtension()).toList();
     for (Node node : nodes) {
@@ -585,45 +590,123 @@ public class HunkNetwork {
           subTrees.stream().filter(subTree -> subTree.getType().name.equals(
               constants.CLASS_INSTANCE_CREATION)).toList();
       for (Tree classInstanceCreation : classInstanceCreations) {
-        Tree classType = TreeUtilFunctions.findChildByType(classInstanceCreation,
+        Tree instantiatedClassTypeTree = TreeUtilFunctions.findChildByType(classInstanceCreation,
             constants.SIMPLE_TYPE);
-        if (classType == null) {
+        if (instantiatedClassTypeTree == null) {
           continue;
         }
-        Tree className = TreeUtilFunctions.findChildByType(classType,
+        Tree instantiatedClassNameTree = TreeUtilFunctions.findChildByType(
+            instantiatedClassTypeTree,
             constants.SIMPLE_NAME);
-        if (className == null) {
+        if (instantiatedClassNameTree == null) {
           continue;
         }
 
-        Optional<UMLClass> instantiatedClass = (node.isSrc() ? modelDiff.getParentModel()
-            : modelDiff.getChildModel()).getClassList()
-            .stream()
-            .filter(c -> c.getName().endsWith(className.getLabel()))
-            .findFirst();
-        if (instantiatedClass.isEmpty()) {
+        UMLClass instantiatedClass = getUMLClass(instantiatedClassNameTree.getLabel(),
+            node.isSrc() ? modelDiff.getParentModel() : modelDiff.getChildModel());
+        if (instantiatedClass == null) {
           continue;
         }
 
-        LocationInfo classDeclarationLocation = instantiatedClass.get().getLocationInfo();
-        List<Node> classDeclarationNodes = findOverlappingNodes(
-            classDeclarationLocation.getFilePath(), node.getSrcDst(),
-            classDeclarationLocation.getStartOffset(),
-            classDeclarationLocation.getEndOffset(),
-            (n) -> !n.isExtension()
-                && n.getTree().getPos() == classDeclarationLocation.getStartOffset()
-                && n.getTree().getEndPos()
-                == classDeclarationLocation.getEndOffset());
-        for (Node classNode : classDeclarationNodes) {
-          if (classNode.equals(node)) {
-            continue;
-          }
-
-          addEdge(classNode, node, EdgeType.DEF_USE);
-          classNode.addIdentifier(instantiatedClass.get().getNonQualifiedName());
+        Node classNode = getClassNode(instantiatedClass, node.getSrcDst());
+        if (classNode == null || classNode.equals(node)) {
+          continue;
         }
+
+        addEdge(classNode, node, EdgeType.DEF_USE);
       }
     }
+
+    // extends and implements
+    processGeneralizations(SrcDst.SRC);
+    processRealizations(SrcDst.SRC);
+    processGeneralizations(SrcDst.DST);
+    processRealizations(SrcDst.DST);
+  }
+
+  private void processGeneralizations(SrcDst srcDst) {
+    UMLModel umlModel =
+        srcDst.equals(SrcDst.SRC) ? modelDiff.getParentModel() : modelDiff.getChildModel();
+
+    for (UMLGeneralization generalization : umlModel.getGeneralizationList()) {
+      UMLClass child = generalization.getChild();
+
+      Node childClassNode = getClassNode(child, srcDst);
+      if (childClassNode == null) {
+        continue;
+      }
+
+      UMLClass parentClass = getUMLClass(generalization.getParent(), umlModel);
+      if (parentClass == null) {
+        continue;
+      }
+
+      Node parentClassNode = getClassNode(parentClass, srcDst);
+      if (parentClassNode == null) {
+        continue;
+      }
+
+      addEdge(parentClassNode, childClassNode, EdgeType.DEF_USE);
+    }
+  }
+
+  private void processRealizations(SrcDst srcDst) {
+    UMLModel umlModel =
+        srcDst.equals(SrcDst.SRC) ? modelDiff.getParentModel() : modelDiff.getChildModel();
+
+    for (UMLRealization realization : umlModel.getRealizationList()) {
+      UMLClass child = realization.getClient();
+
+      Node childClassNode = getClassNode(child, srcDst);
+      if (childClassNode == null) {
+        continue;
+      }
+
+      UMLClass parentClass = getUMLClass(realization.getSupplier(), umlModel);
+      if (parentClass == null) {
+        continue;
+      }
+
+      Node parentClassNode = getClassNode(parentClass, srcDst);
+      if (parentClassNode == null) {
+        continue;
+      }
+
+      addEdge(parentClassNode, childClassNode, EdgeType.DEF_USE);
+    }
+  }
+
+  @Nullable
+  private UMLClass getUMLClass(String className, UMLModel model) {
+//    List<UMLImport> contextImportedTypes = contextClass.getImportedTypes().stream()
+//        .filter(importedType -> importedType.getName().endsWith(targetClassName))
+//        .toList();
+//    String targetQualifiedName = contextImportedTypes.isEmpty() ?
+//        contextClass.getPackageName() + "." + targetClassName : contextImportedTypes.get(0).getName();
+//    Optional<UMLClass> targetWithQualifiedName = model.getClassList().stream()
+//        .filter(c -> c.getName().equals(targetQualifiedName)).findFirst();
+//    if (targetWithQualifiedName.isPresent()) {
+//      return targetWithQualifiedName.get();
+//    }
+    return model.getClassList().stream().filter(c -> c.getName().endsWith(className)).findFirst()
+        .orElse(null);
+  }
+
+  @Nullable
+  private Node getClassNode(UMLClass umlClass, SrcDst srcDst) {
+    LocationInfo classLocation = umlClass.getLocationInfo();
+    List<Node> classNodes = findOverlappingNodes(classLocation.getFilePath(), srcDst,
+        classLocation.getStartOffset(), classLocation.getEndOffset(),
+        (n) -> !n.isExtension() && n.getTree().getPos() == classLocation.getStartOffset()
+            && n.getTree().getEndPos() == classLocation.getEndOffset());
+    if (classNodes.isEmpty()) {
+      return null;
+    }
+
+    Node classNode = classNodes.get(0);
+    classNode.addIdentifier(umlClass.getNonQualifiedName());
+
+    return classNode;
   }
 
   private UMLClass getUMLClass(String path, Tree tree, SrcDst srcDst) {
@@ -650,14 +733,14 @@ public class HunkNetwork {
         srcDst.equals(SrcDst.SRC) ? modelDiff.getParentModel() : modelDiff.getChildModel());
   }
 
-  private UMLClass getUMLClass(String path, String typeName, UMLModel umlModel) {
+  private UMLClass getUMLClass(String path, String className, UMLModel umlModel) {
     if (path == null) {
       return null;
     }
 
     UMLClass UmlClass = null;
     for (UMLClass uc : umlModel.getClassList()) {
-      if (uc.getSourceFile().equals(path) && uc.getNonQualifiedName().equals(typeName)) {
+      if (uc.getSourceFile().equals(path) && uc.getNonQualifiedName().equals(className)) {
         UmlClass = uc;
         break;
       }
