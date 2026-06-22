@@ -77,8 +77,11 @@ public class McpHandler {
                 "Prepares the narrative for a commit or pull request and returns its overview, including the total number of chapters for each grain level. It also generates an HTML page demonstrating the narrative and returns its path.\n\nParameters:\n- url: The commit or PR URL\n- mode: 'manual' (default) - asks the user to choose a GrainLevel; 'automatic' - provides metadata for the agent to decide the GrainLevel automatically.",
                 "url", "mode"));
         tools.add(createToolDefinition("get_next_chapter",
-                "Retrieves the next chapter in the narrative for the specified grain level (use a GrainLevel returned by init_narrative).\n\nYou must analyze and explain the content of the current chapter, then ask the user if they would like to proceed to the next chapter. If the tool indicates the narrative has ended, provide a comprehensive final synthesis and explanation of the commit based on all chapters read.",
+                "Retrieves the next single chapter in the narrative for the specified grain level. This tool is designed for MANUAL mode. For each chapter retrieved, perform the requested task (e.g., review, search, analysis) for that specific content, then ask the user if they would like to proceed to the next chapter. When the end of the narrative is reached, provide a final comprehensive wrap-up of the task.",
                 "url", "grainLevel"));
+        tools.add(createToolDefinition("get_next_chapters",
+                "Retrieves the next N chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
+                "url", "grainLevel", "count"));
         result.add("tools", tools);
         response.add("result", result);
     }
@@ -177,6 +180,11 @@ public class McpHandler {
                 throw new IllegalArgumentException("Missing required argument: grainLevel");
             }
             return getNextChapter(url, arguments.get("grainLevel").getAsString());
+        } else if ("get_next_chapters".equals(toolName)) {
+            if (!arguments.has("grainLevel") || !arguments.has("count")) {
+                throw new IllegalArgumentException("Missing required arguments: grainLevel and count");
+            }
+            return getNextChapters(url, arguments.get("grainLevel").getAsString(), arguments.get("count").getAsInt());
         } else {
             throw new UnsupportedOperationException("Unknown tool: " + toolName);
         }
@@ -198,6 +206,62 @@ public class McpHandler {
 
     private String getHierarchyCacheKey(String url) {
         return "hierarchy:" + url;
+    }
+
+    private String getNextChapters(String url, String grainLevelStr, int count) throws Exception {
+        GrainLevel level;
+        try {
+            level = GrainLevel.valueOf(grainLevelStr.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid grainLevel: " + grainLevelStr + ". Valid values are: " + java.util.Arrays.toString(GrainLevel.values()));
+        }
+
+        TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
+        if (root == null) {
+            return "No narrative initialized for this URL. Please call init_narrative first.";
+        }
+        Narrator narrator = root.getNarrator();
+        List<TraversalPattern> chapters = narrator.getNarrative(level);
+        if (chapters == null) {
+            return "Narrative state lost. Please call init_narrative again.";
+        }
+
+        int startProgress = narrator.getProgress(level);
+        if (startProgress >= chapters.size()) {
+            return "[End of Narrative] All chapters for grain level " + level + " have been read.";
+        }
+
+        int endProgress = Math.min(startProgress + count, chapters.size());
+        List<Cluster> clusters = getOrComputeClusters(url);
+        StringBuilder output = new StringBuilder();
+        output.append(String.format("Retrieving next %d chapters (Chapters %d to %d) for GrainLevel: %s\n\n",
+            endProgress - startProgress, startProgress + 1, endProgress, level));
+
+        for (int i = startProgress; i < endProgress; i++) {
+            TraversalPattern chapterPattern = chapters.get(i);
+            Cluster cluster = findClusterForNode(chapterPattern.getLead(), clusters);
+            if (cluster == null) {
+                output.append(String.format("[Chapter %d]: Error: Could not find associated cluster.\n\n", i + 1));
+                continue;
+            }
+
+            String content = chapterPattern.extended(cluster.getGraph(), level, null);
+            output.append(String.format("[Chapter %d of %d]\n", i + 1, chapters.size()));
+            output.append(content).append("\n\n");
+        }
+
+        int chaptersRead = endProgress - startProgress;
+        for (int i = 0; i < chaptersRead; i++) {
+            narrator.incrementProgress(level);
+        }
+
+        if (endProgress < chapters.size()) {
+            output.append("\nReminder: Process these chapters toward the requested task and then call get_next_chapters again to continue. DO NOT stop until you reach the end of the narrative.");
+        } else {
+            output.append("\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
+        }
+
+        return output.toString();
     }
 
     private String getNextChapter(String url, String grainLevelStr) throws Exception {
@@ -258,10 +322,10 @@ public class McpHandler {
         output.append("\n\n");
 
         if (currentChapter < totalChapters) {
-            output.append("Reminder: Explain the changes, and ask to proceed.");
+            output.append("Reminder: Perform the requested task for this chapter and ask the user if they would like to proceed to the next chapter.");
         } else {
-            output.append("Reminder: Explain the changes.");
-            output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide your final synthesis and explanation of the commit.");
+            output.append("Reminder: Perform the requested task for this final chapter.");
+            output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
         }
 
         return output.toString();
