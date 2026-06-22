@@ -74,8 +74,8 @@ public class McpHandler {
         JsonArray tools = new JsonArray();
 
         tools.add(createToolDefinition("init_narrative",
-                "Prepares the narrative for a commit or pull request and returns its overview, including the total number of chapters for each grain level. It also generates an HTML page demonstrating the narrative and returns its path.\n\nYou must report the path of the HTML page and the chapter counts for each GrainLevel to the user. Then ask the user to choose a GrainLevel to start the narration.",
-                "url"));
+                "Prepares the narrative for a commit or pull request and returns its overview, including the total number of chapters for each grain level. It also generates an HTML page demonstrating the narrative and returns its path.\n\nParameters:\n- url: The commit or PR URL\n- mode: 'manual' (default) - asks the user to choose a GrainLevel; 'automatic' - provides metadata for the agent to decide the GrainLevel automatically.",
+                "url", "mode"));
         tools.add(createToolDefinition("get_next_chapter",
                 "Retrieves the next chapter in the narrative for the specified grain level (use a GrainLevel returned by init_narrative).\n\nYou must analyze and explain the content of the current chapter, then ask the user if they would like to proceed to the next chapter. If the tool indicates the narrative has ended, provide a comprehensive final synthesis and explanation of the commit based on all chapters read.",
                 "url", "grainLevel"));
@@ -170,7 +170,8 @@ public class McpHandler {
         String url = arguments.get("url").getAsString();
 
         if ("init_narrative".equals(toolName)) {
-            return initNarrative(url);
+            String mode = arguments.has("mode") ? arguments.get("mode").getAsString() : "manual";
+            return initNarrative(url, mode);
         } else if ("get_next_chapter".equals(toolName)) {
             if (!arguments.has("grainLevel")) {
                 throw new IllegalArgumentException("Missing required argument: grainLevel");
@@ -266,7 +267,7 @@ public class McpHandler {
         return output.toString();
     }
 
-    private String initNarrative(String url) throws Exception {
+    private String initNarrative(String url, String mode) throws Exception {
         TraversalPattern root = getOrComputeHierarchy(url);
         if (root == null) {
             return "No changes found to narrate.";
@@ -281,15 +282,49 @@ public class McpHandler {
 
         StringBuilder summary = new StringBuilder();
         summary.append("Narrative initialized.\n\n");
-        summary.append("The path of the HTML page demonstrating the narrative: ").append(generator.getOverviewPath()).append("\n\n");
-        summary.append("Available GrainLevels and their chapter counts:\n");
 
-        for (GrainLevel level : GrainLevel.values()) {
-            int count = narrator.getNarrative(level).size();
-            summary.append("- ").append(level).append(" (").append(level.getDescription()).append("): ").append(count).append(" chapters\n");
+        if ("automatic".equalsIgnoreCase(mode)) {
+            summary.append("Mode: Automatic. Use the following metadata to choose the most appropriate GrainLevel:\n\n");
+            summary.append(String.format("%-20s | %-10s | %-18s | %-18s\n", "GrainLevel", "Chapters", "Avg Chapter Lines", "Max Chapter Lines"));
+            summary.append("-------------------------------------------------------------------------------------------------\n");
+
+            for (GrainLevel level : GrainLevel.values()) {
+                List<TraversalPattern> chapters = narrator.getNarrative(level);
+                int count = chapters.size();
+
+                double totalLines = 0;
+                double maxLines = 0;
+
+                for (TraversalPattern chapter : chapters) {
+                    Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
+                    if (cluster != null) {
+                        String content = chapter.extended(cluster.getGraph(), level, null);
+                        int lines = content.split("\n").length;
+
+                        totalLines += lines;
+                        if (lines > maxLines) maxLines = lines;
+                    }
+                }
+
+                double avgLines = count > 0 ? totalLines / count : 0;
+
+                summary.append(String.format("%-20s | %-10d | %-10.1f | %-10.1f\n",
+                    level, count, avgLines, maxLines));
+            }
+            summary.append("\n\nPlease analyze the metadata and decide which GrainLevel to use for the review.");
+        } else {
+            summary.append("You must now guide the user to start the narration. Please follow these steps:\n");
+            summary.append("1. Provide the user with the path to the narrative overview HTML page for a high-level overview: ").append(generator.getOverviewPath()).append("\n");
+            summary.append("2. List the available GrainLevels and their respective chapter counts from the list below, explaining that they should choose one to start the detailed narration.\n\n");
+            summary.append("Available GrainLevels and their chapter counts:\n");
+
+            for (GrainLevel level : GrainLevel.values()) {
+                int count = narrator.getNarrative(level).size();
+                summary.append("- ").append(level).append(" (").append(level.getDescription()).append("): ").append(count).append(" chapters\n");
+            }
+
+            summary.append("\n3. Ask the user which GrainLevel they would like to use to proceed.");
         }
-
-        summary.append("\nPlease choose a GrainLevel to start the narration.");
 
         return summary.toString();
     }
