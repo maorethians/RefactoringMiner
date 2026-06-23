@@ -80,7 +80,7 @@ public class McpHandler {
                 "Retrieves the next single chapter in the narrative for the specified grain level. This tool is designed for MANUAL mode. For each chapter retrieved, perform the requested task (e.g., review, search, analysis) for that specific content, then ask the user if they would like to proceed to the next chapter. When the end of the narrative is reached, provide a final comprehensive wrap-up of the task.",
                 "url", "grainLevel"));
         tools.add(createToolDefinition("get_next_chapters",
-                "Retrieves the next N chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
+                "Retrieves the next N chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. The tool provides metadata about upcoming chapters (lines of the next chapter, lines of the next batch, and total remaining lines) to help you adjust the 'count' parameter for your next request. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
                 "url", "grainLevel", "count"));
         result.add("tools", tools);
         response.add("result", result);
@@ -190,6 +190,13 @@ public class McpHandler {
         }
     }
 
+    private int getChapterLines(TraversalPattern chapter, List<Cluster> clusters, GrainLevel level) {
+        Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
+        if (cluster == null) return 0;
+        String content = chapter.extended(cluster.getGraph(), level, null);
+        return content.split("\n").length;
+    }
+
     private Cluster findClusterForNode(Node node, List<Cluster> clusters) {
         if (clusters.isEmpty()) {
             return null;
@@ -256,7 +263,26 @@ public class McpHandler {
         }
 
         if (endProgress < chapters.size()) {
-            output.append("\nReminder: Process these chapters toward the requested task and then call get_next_chapters again to continue. DO NOT stop until you reach the end of the narrative.");
+            int nextChapterLines = getChapterLines(chapters.get(endProgress), clusters, level);
+
+            int nextBatchEnd = Math.min(endProgress + count, chapters.size());
+            int nextBatchLines = 0;
+            for (int i = endProgress; i < nextBatchEnd; i++) {
+                nextBatchLines += getChapterLines(chapters.get(i), clusters, level);
+            }
+
+            int remainingLines = 0;
+            for (int i = endProgress; i < chapters.size(); i++) {
+                remainingLines += getChapterLines(chapters.get(i), clusters, level);
+            }
+
+            output.append("\n--- Upcoming Narrative Metadata ---\n");
+            output.append(String.format("Lines in next chapter: %d\n", nextChapterLines));
+            output.append(String.format("Lines in next batch (up to %d chapters): %d\n", nextBatchEnd - endProgress, nextBatchLines));
+            output.append(String.format("Total lines remaining in narrative: %d\n", remainingLines));
+            output.append("\nGuidance: Use this metadata to adjust the 'count' for your next call. Increase 'count' if the next batch is small, or decrease it if you expect too many lines.");
+
+            output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_chapters again to continue. DO NOT stop until you reach the end of the narrative.");
         } else {
             output.append("\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
         }
