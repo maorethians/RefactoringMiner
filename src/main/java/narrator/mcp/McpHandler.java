@@ -263,25 +263,31 @@ public class McpHandler {
         }
 
         if (endProgress < chapters.size()) {
-            int nextChapterLines = getChapterLines(chapters.get(endProgress), clusters, level);
-
-            int nextBatchEnd = Math.min(endProgress + count, chapters.size());
-            int nextBatchLines = 0;
-            for (int i = endProgress; i < nextBatchEnd; i++) {
-                nextBatchLines += getChapterLines(chapters.get(i), clusters, level);
-            }
-
-            int remainingLines = 0;
-            for (int i = endProgress; i < chapters.size(); i++) {
-                remainingLines += getChapterLines(chapters.get(i), clusters, level);
-            }
-
             output.append("\n--- Upcoming Narrative Metadata ---\n");
-            output.append(String.format("Lines in next chapter: %d\n", nextChapterLines));
-            output.append(String.format("Lines in next batch (up to %d chapters): %d\n", nextBatchEnd - endProgress, nextBatchLines));
-            output.append(String.format("Total lines remaining in narrative: %d\n", remainingLines));
-            output.append("\nGuidance: Use this metadata to adjust the 'count' for your next call. Increase 'count' if the next batch is small, or decrease it if you expect too many lines.");
 
+            int[] countOptions = {1, count / 2, count, count * 2};
+            java.util.Set<Integer> uniqueOptions = new java.util.TreeSet<>();
+            for (int opt : countOptions) {
+                if (opt > 0) uniqueOptions.add(opt);
+            }
+
+            int lastLines = -1;
+            for (int optCount : uniqueOptions) {
+                int batchEnd = Math.min(endProgress + optCount, chapters.size());
+                int batchLines = 0;
+                for (int i = endProgress; i < batchEnd; i++) {
+                    batchLines += getChapterLines(chapters.get(i), clusters, level);
+                }
+
+                if (batchLines == lastLines) {
+                    break;
+                }
+
+                output.append(String.format("Lines in next %d chapter(s): %d\n", optCount, batchLines));
+                lastLines = batchLines;
+            }
+
+            output.append("\nGuidance: Use this metadata to adjust the 'count' for your next call. Increase 'count' if the next batch is small, or decrease it if you expect too many lines.");
             output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_chapters again to continue. DO NOT stop until you reach the end of the narrative.");
         } else {
             output.append("\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
