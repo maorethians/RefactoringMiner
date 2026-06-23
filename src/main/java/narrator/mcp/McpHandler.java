@@ -80,7 +80,7 @@ public class McpHandler {
                 "Retrieves the next single chapter in the narrative for the specified grain level. This tool is designed for MANUAL mode. For each chapter retrieved, perform the requested task (e.g., review, search, analysis) for that specific content, then ask the user if they would like to proceed to the next chapter. When the end of the narrative is reached, provide a final comprehensive wrap-up of the task.",
                 "url", "grainLevel"));
         tools.add(createToolDefinition("get_next_chapters",
-                "Retrieves the next N chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. The tool provides metadata about upcoming chapters (lines of the next chapter, lines of the next batch, and total remaining lines) to help you adjust the 'count' parameter for your next request. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
+                "Retrieves the next N chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. The tool provides metadata about the estimated line counts for various upcoming ranges to help you adjust the 'count' parameter for your next request. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
                 "url", "grainLevel", "count"));
         result.add("tools", tools);
         response.add("result", result);
@@ -287,7 +287,7 @@ public class McpHandler {
                 lastLines = batchLines;
             }
 
-            output.append("\nGuidance: Use this metadata to adjust the 'count' for your next call. Increase 'count' if the next batch is small, or decrease it if you expect too many lines.");
+            output.append("\nGuidance: Use the estimates above to select the 'count' for your next call. Aim for a balance: increase 'count' to progress faster if projected line counts are low, or decrease it to avoid overwhelming your context window if they are high.");
             output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_chapters again to continue. DO NOT stop until you reach the end of the narrative.");
         } else {
             output.append("\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
