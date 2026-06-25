@@ -38,7 +38,6 @@ async def proxy_request(request: Request, path: str):
         req_text = json.dumps(req_json, indent=2)
     except:
         req_text = body.decode("utf-8", errors="replace") if body else "Empty Body"
-    logger.info(f"--> REQUEST {request.method} {path}\n{req_text}")
 
     client = request.app.state.client
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
@@ -58,7 +57,9 @@ async def proxy_request(request: Request, path: str):
                 async with client.stream(method=request.method, url=path, content=body, headers=headers) as resp:
                     async for chunk in resp.aiter_bytes():
                         if chunk:
-                            logger.info(f"<-- RESPONSE CHUNK: {chunk.decode('utf-8', errors='replace')}")
+                            chunk_text = chunk.decode('utf-8', errors='replace')
+                            if '"type":"message_delta"' in chunk_text:
+                                logger.info(f"<-- RESPONSE CHUNK: {chunk_text}")
                             yield chunk
             except Exception as e:
                 logger.exception(f"Error during streaming to {path}: {e}")
