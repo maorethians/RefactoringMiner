@@ -4,6 +4,7 @@ import com.github.gumtreediff.tree.Tree;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -13,11 +14,43 @@ import java.util.Set;
 import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
+import narrator.graph.SrcDst;
 import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.GraphWrapper;
 import org.jgrapht.Graph;
 
 public class TraversalPattern extends GraphWrapper {
+    public static class MappingGroup {
+        public final List<Node> group;
+        public final List<Node> partners;
+
+        public MappingGroup(List<Node> group, List<Node> partners) {
+            this.group = group;
+            this.partners = partners;
+        }
+    }
+
+    public static List<MappingGroup> aggregateByMapping(Graph<Node, Edge> graph, Collection<Node> nodes) {
+        List<MappingGroup> result = new ArrayList<>();
+        Map<Set<Node>, MappingGroup> partnerMap = new HashMap<>();
+
+        for (Node n : nodes) {
+            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
+            if (partners.isEmpty()) {
+                result.add(new MappingGroup(new ArrayList<>(List.of(n)), List.of()));
+            } else {
+                Set<Node> partnerSet = new HashSet<>(partners);
+                MappingGroup group = partnerMap.computeIfAbsent(partnerSet, k -> {
+                    MappingGroup mg = new MappingGroup(new ArrayList<>(), partners);
+                    result.add(mg);
+                    return mg;
+                });
+                group.group.add(n);
+            }
+        }
+        return result;
+    }
+
     private final Narrator narrator = new Narrator(this);
 
     public Narrator getNarrator() {

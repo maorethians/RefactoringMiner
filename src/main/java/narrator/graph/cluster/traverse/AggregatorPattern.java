@@ -38,31 +38,14 @@ public class AggregatorPattern extends TraversalPattern {
         StringBuilder prompt = new StringBuilder();
         prompt.append("# Subject:\n```\n");
 
-        List<List<Node>> mainGroups = new ArrayList<>();
-        Map<Set<Node>, List<Node>> mainPartnerMap = new HashMap<>();
-        for (Node n : mains) {
-            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
-            if (partners.isEmpty()) {
-                mainGroups.add(new ArrayList<>(List.of(n)));
-            } else {
-                Set<Node> set = new HashSet<>(partners);
-                List<Node> group = mainPartnerMap.computeIfAbsent(set, k -> {
-                    List<Node> g = new ArrayList<>();
-                    mainGroups.add(g);
-                    return g;
-                });
-                group.add(n);
-            }
-        }
+        List<TraversalPattern.MappingGroup> mainGroups = TraversalPattern.aggregateByMapping(graph, mains);
 
         List<String> subjectHunks = new ArrayList<>();
-        for (List<Node> group : mainGroups) {
-            Node rep = group.get(0);
-            List<Node> partners = (rep.getSrcDst() == SrcDst.SRC) ? rep.getMappingTargets(graph) : rep.getMappingSources(graph);
-            if (partners.isEmpty()) {
-                subjectHunks.add(String.join("\n", group.stream().map(n -> n.base(graph)).toList()));
+        for (TraversalPattern.MappingGroup mg : mainGroups) {
+            if (mg.partners.isEmpty()) {
+                subjectHunks.add(String.join("\n", mg.group.stream().map(n -> n.base(graph)).toList()));
             } else {
-                subjectHunks.add(buildMappingHunk(group, partners, graph));
+                subjectHunks.add(buildMappingHunk(mg.group, mg.partners, graph));
             }
         }
         prompt.append(String.join("\n---\n", subjectHunks));
@@ -75,28 +58,15 @@ public class AggregatorPattern extends TraversalPattern {
             prompt.append("\n# Surrounding:\n```\n").append(firstMergeContext.mapping(graph)).append("\n```\n");
         }
 
-        List<List<Node>> sideGroups = new ArrayList<>();
-        Map<Set<Node>, List<Node>> sidePartnerMap = new HashMap<>();
-        for (Node n : sides) {
-            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
-            if (!partners.isEmpty()) {
-                Set<Node> set = new HashSet<>(partners);
-                List<Node> group = sidePartnerMap.computeIfAbsent(set, k -> {
-                    List<Node> g = new ArrayList<>();
-                    sideGroups.add(g);
-                    return g;
-                });
-                group.add(n);
-            }
-        }
+        List<TraversalPattern.MappingGroup> sideGroups = TraversalPattern.aggregateByMapping(graph, sides).stream()
+                .filter(mg -> !mg.partners.isEmpty())
+                .toList();
 
         if (!sideGroups.isEmpty()) {
             prompt.append("\n# Context:\n```\n");
             List<String> contextHunks = new ArrayList<>();
-            for (List<Node> group : sideGroups) {
-                Node rep = group.get(0);
-                List<Node> partners = (rep.getSrcDst() == SrcDst.SRC) ? rep.getMappingTargets(graph) : rep.getMappingSources(graph);
-                contextHunks.add(buildMappingHunk(group, partners, graph));
+            for (TraversalPattern.MappingGroup mg : sideGroups) {
+                contextHunks.add(buildMappingHunk(mg.group, mg.partners, graph));
             }
             prompt.append(String.join("\n---\n", contextHunks));
             prompt.append("\n```");

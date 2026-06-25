@@ -89,20 +89,13 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
         }
 
         List<String> mappingHunks = new ArrayList<>();
-        Map<Set<Node>, List<Node>> aggregated = new LinkedHashMap<>();
-    
-        for (Node node : sequence) {
-            List<Node> partners = node.getSrcDst() == SrcDst.SRC ?
-                node.getMappingTargets(this.getGraph()) : node.getMappingSources(this.getGraph());
-            if (partners.isEmpty()) continue;
-        
-            Set<Node> partnerSet = new HashSet<>(partners);
-            aggregated.computeIfAbsent(partnerSet, k -> new ArrayList<>()).add(node);
-        }
+        List<TraversalPattern.MappingGroup> aggregated = TraversalPattern.aggregateByMapping(this.getGraph(), sequence).stream()
+                .filter(mg -> !mg.partners.isEmpty())
+                .toList();
 
-        for (Map.Entry<Set<Node>, List<Node>> entry : aggregated.entrySet()) {
-            List<Node> group = entry.getValue();
-            Set<Node> partners = entry.getKey();
+        for (TraversalPattern.MappingGroup mg : aggregated) {
+            List<Node> group = mg.group;
+            List<Node> partners = mg.partners;
             
             Set<String> allOps = new HashSet<>();
             for (Node n : group) {
