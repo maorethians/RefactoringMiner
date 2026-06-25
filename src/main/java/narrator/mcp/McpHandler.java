@@ -79,9 +79,9 @@ public class McpHandler {
         tools.add(createToolDefinition("get_next_chapter",
                 "Retrieves the next single chapter in the narrative for the specified grain level. This tool is designed for MANUAL mode. For each chapter retrieved, perform the requested task (e.g., review, search, analysis) for that specific content, then ask the user if they would like to proceed to the next chapter. When the end of the narrative is reached, provide a final comprehensive wrap-up of the task.",
                 "url", "grainLevel"));
-        tools.add(createToolDefinition("get_next_chapters",
-                "Retrieves the next N chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. The tool provides metadata about the estimated line counts for various upcoming ranges to help you adjust the 'count' parameter for your next request. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
-                "url", "grainLevel", "count"));
+        tools.add(createToolDefinition("get_next_batch",
+                "Retrieves a batch of chapters in the narrative for the specified grain level. This tool is designed for AUTOMATIC mode. Process each batch of chapters toward the requested task. IMPORTANT: You must continue calling this tool sequentially until the end of the narrative is reached; do not stop or synthesize a final result until the tool explicitly indicates that no more chapters remain.",
+                "url", "grainLevel"));
         result.add("tools", tools);
         response.add("result", result);
     }
@@ -180,11 +180,11 @@ public class McpHandler {
                 throw new IllegalArgumentException("Missing required argument: grainLevel");
             }
             return getNextChapter(url, arguments.get("grainLevel").getAsString());
-        } else if ("get_next_chapters".equals(toolName)) {
-            if (!arguments.has("grainLevel") || !arguments.has("count")) {
-                throw new IllegalArgumentException("Missing required arguments: grainLevel and count");
+        } else if ("get_next_batch".equals(toolName)) {
+            if (!arguments.has("grainLevel")) {
+                throw new IllegalArgumentException("Missing required argument: grainLevel");
             }
-            return getNextChapters(url, arguments.get("grainLevel").getAsString(), arguments.get("count").getAsInt());
+            return getNextBatch(url, arguments.get("grainLevel").getAsString());
         } else {
             throw new UnsupportedOperationException("Unknown tool: " + toolName);
         }
@@ -215,7 +215,7 @@ public class McpHandler {
         return "hierarchy:" + url;
     }
 
-    private String getNextChapters(String url, String grainLevelStr, int count) throws Exception {
+    private String getNextBatch(String url, String grainLevelStr) throws Exception {
         GrainLevel level;
         try {
             level = GrainLevel.valueOf(grainLevelStr.toUpperCase());
@@ -238,8 +238,21 @@ public class McpHandler {
             return "[End of Narrative] All chapters for grain level " + level + " have been read.";
         }
 
-        int endProgress = Math.min(startProgress + count, chapters.size());
         List<Cluster> clusters = getOrComputeClusters(url);
+
+        int endProgress = startProgress + 1;
+        int totalLinesInBatch = 0;
+        totalLinesInBatch += getChapterLines(chapters.get(startProgress), clusters, level);
+
+        while (endProgress < chapters.size()) {
+            int nextChapterLines = getChapterLines(chapters.get(endProgress), clusters, level);
+            if (totalLinesInBatch + nextChapterLines > 1000) {
+                break;
+            }
+            totalLinesInBatch += nextChapterLines;
+            endProgress++;
+        }
+
         StringBuilder output = new StringBuilder();
         output.append(String.format("Retrieving next %d chapters (Chapters %d to %d) for GrainLevel: %s\n\n",
             endProgress - startProgress, startProgress + 1, endProgress, level));
@@ -263,32 +276,7 @@ public class McpHandler {
         }
 
         if (endProgress < chapters.size()) {
-            output.append("\n--- Upcoming Narrative Metadata ---\n");
-
-            int[] countOptions = {1, count / 2, count, count * 2};
-            java.util.Set<Integer> uniqueOptions = new java.util.TreeSet<>();
-            for (int opt : countOptions) {
-                if (opt > 0) uniqueOptions.add(opt);
-            }
-
-            int lastLines = -1;
-            for (int optCount : uniqueOptions) {
-                int batchEnd = Math.min(endProgress + optCount, chapters.size());
-                int batchLines = 0;
-                for (int i = endProgress; i < batchEnd; i++) {
-                    batchLines += getChapterLines(chapters.get(i), clusters, level);
-                }
-
-                if (batchLines == lastLines) {
-                    break;
-                }
-
-                output.append(String.format("Lines in next %d chapter(s): %d\n", optCount, batchLines));
-                lastLines = batchLines;
-            }
-
-            output.append("\nGuidance: Use the estimates above to select the 'count' for your next call. Aim for a balance: increase 'count' to progress faster if projected line counts are low, or decrease it to avoid overwhelming your context window if they are high.");
-            output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_chapters again to continue. DO NOT stop until you reach the end of the narrative.");
+            output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
         } else {
             output.append("\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
         }
