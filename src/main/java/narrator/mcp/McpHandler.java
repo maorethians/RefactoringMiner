@@ -372,8 +372,8 @@ public class McpHandler {
             summary.append(String.format("%-20s | %-10s | %-18s | %-18s\n", "GrainLevel", "Chapters", "Avg Chapter Lines", "Max Chapter Lines"));
             summary.append("-------------------------------------------------------------------------------------------------\n");
 
-            // for (GrainLevel level : GrainLevel.values()) {
-                List<TraversalPattern> chapters = narrator.getNarrative(GrainLevel.LEAF);
+            for (GrainLevel level : GrainLevel.values()) {
+                List<TraversalPattern> chapters = narrator.getNarrative(level);
                 int count = chapters.size();
 
                 double totalLines = 0;
@@ -382,7 +382,7 @@ public class McpHandler {
                 for (TraversalPattern chapter : chapters) {
                     Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
                     if (cluster != null) {
-                        String content = chapter.extended(cluster.getGraph(), GrainLevel.LEAF, null);
+                        String content = chapter.extended(cluster.getGraph(), level, null);
                         int lines = content.split("\n").length;
 
                         totalLines += lines;
@@ -393,8 +393,8 @@ public class McpHandler {
                 double avgLines = count > 0 ? totalLines / count : 0;
 
                 summary.append(String.format("%-20s | %-10d | %-10.1f | %-10.1f\n",
-                    GrainLevel.LEAF, count, avgLines, maxLines));
-            // }
+                    level, count, avgLines, maxLines));
+            }
             summary.append("\n\nPlease analyze the metadata and decide which GrainLevel to use for the review.");
         } else {
             summary.append("You must now guide the user to start the narration. Please follow these steps:\n");
