@@ -1,59 +1,79 @@
 package narrator.graph.cluster.traverse;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Set;
-import java.util.stream.Collectors;
 import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.SrcDst;
-import narrator.graph.cluster.Cluster;
 import org.jgrapht.Graph;
+
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.stream.Collectors;
 
 public class AggregatorPattern extends TraversalPattern {
 
+    Set<TraversalPattern> subs = new HashSet<>();
+
     @Override
     public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
-        List<Node> allMains = getMains(graph);
-        List<Node> allSides = getSides(graph);
+        Set<Node> nodesTracker = new HashSet<>();
+        nodesTracker.addAll(getMains(graph));
+        nodesTracker.addAll(getSides(graph));
 
-        Set<Node> nodesToFilter = new HashSet<>();
-        if (filterPatterns != null) {
-            for (TraversalPattern p : filterPatterns) {
-                nodesToFilter.addAll(p.getMains(graph));
-                nodesToFilter.addAll(p.getSides(graph));
+//        Set<Node> nodesToFilter = new HashSet<>();
+//        if (filterPatterns != null) {
+//            for (TraversalPattern p : filterPatterns) {
+//                nodesToFilter.addAll(p.getMains(graph));
+//                nodesToFilter.addAll(p.getSides(graph));
+//            }
+//        }
+//        nodesTracker = nodesTracker.stream().filter(node -> !nodesToFilter.contains(node)).collect(Collectors.toSet());
+
+        Set<String> promptSections = new HashSet<>();
+
+        List<TraversalComponent> semanticLeaves = this.getNarrator().getNarrative(GrainLevel.SEMANTIC_LEAF).stream()
+                .filter(chapter -> chapter instanceof TraversalComponent
+                        && Narrator.isSemanticLeaf((TraversalComponent) chapter))
+                .map(chapter -> (TraversalComponent) chapter).toList();
+        if (!semanticLeaves.isEmpty()) {
+            for (TraversalComponent semanticLeaf : semanticLeaves) {
+                List<Node> allLeafNodes = new ArrayList<>();
+                allLeafNodes.addAll(semanticLeaf.getMains(graph));
+                allLeafNodes.addAll(semanticLeaf.getSides(graph));
+
+                StringBuilder leafPrompt = new StringBuilder();
+
+                List<String> leafPromptSections = new ArrayList<>();
+                for (MappingGroup leafMappingGroup : TraversalPattern.aggregateByMapping(graph, allLeafNodes)) {
+                    if (leafMappingGroup.partners.isEmpty()) {
+                        leafPromptSections.add(String.join("\n", leafMappingGroup.group.stream().map(n -> n.base(graph)).toList()));
+                    } else {
+                        leafPromptSections.add(buildMappingHunk(leafMappingGroup.group, leafMappingGroup.partners, graph));
+                    }
+                }
+                leafPrompt.append(String.join("\n---\n", leafPromptSections));
+
+                Set<Node> mergeContexts = semanticLeaf.getMergeContexts();
+                Node firstMergeContext = mergeContexts.iterator().next();
+                leafPrompt.append("\n\nwithin:\n\n").append(firstMergeContext.mapping(graph));
+
+                promptSections.add(leafPrompt.toString());
+                nodesTracker = nodesTracker.stream().filter(n -> !allLeafNodes.contains(n)).collect(Collectors.toSet());
             }
         }
 
-        List<Node> allNodes = new ArrayList<>();
-        allNodes.addAll(allMains);
-        allNodes.addAll(allSides);
-
-        List<Node> filteredNodes = allNodes.stream()
-                .filter(n -> !nodesToFilter.contains(n))
-                .filter(n -> {
-                    List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
-                    return !partners.isEmpty();
-                })
-                .toList();
-
-        List<TraversalPattern.MappingGroup> groups = TraversalPattern.aggregateByMapping(graph, filteredNodes);
-        List<String> hunks = new ArrayList<>();
-        for (TraversalPattern.MappingGroup mg : groups) {
-            hunks.add(buildMappingHunk(mg.group, mg.partners, graph));
+        if (nodesTracker.isEmpty()) {
+            // TODO: sort
+            return String.join("\n```\n", promptSections);
         }
 
-        StringBuilder prompt = new StringBuilder();
-        prompt.append(String.join("\n---\n", hunks));
+        List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, nodesTracker);
+        List<MappingGroup> groupsWithMapping = mappingGroups.stream().filter(g -> !g.partners.isEmpty()).toList();
+        for (MappingGroup mg : groupsWithMapping) {
+            promptSections.add(buildMappingHunk(mg.group, mg.partners, graph));
+        }
 
-        return prompt.toString();
+        // TODO: sort
+        return String.join("\n```\n", promptSections);
     }
 
     private String buildMappingHunk(List<Node> group, List<Node> partners, Graph<Node, Edge> graph) {
@@ -67,11 +87,10 @@ public class AggregatorPattern extends TraversalPattern {
         Collection<Node> from = (rep.getSrcDst() == SrcDst.SRC) ? group : partners;
         Collection<Node> to = (rep.getSrcDst() == SrcDst.SRC) ? partners : group;
 
-        StringBuilder hunk = new StringBuilder();
-        hunk.append(String.join("\n", from.stream().map(n -> n.base(graph)).toList()))
-            .append("\n\n").append(ops).append(" to:\n\n")
-            .append(String.join("\n", to.stream().map(n -> n.base(graph)).toList()));
-        return hunk.toString();
+        String hunk = String.join("\n", from.stream().map(n -> n.base(graph)).toList()) +
+                "\n\n" + ops + " to:\n\n" +
+                String.join("\n", to.stream().map(n -> n.base(graph)).toList());
+        return hunk;
     }
 
     @Override
@@ -110,8 +129,6 @@ public class AggregatorPattern extends TraversalPattern {
 
         return new ArrayList<>(sidesOrdered);
     }
-
-    Set<TraversalPattern> subs = new HashSet<>();
 
     protected boolean containsNode(Node node, Set<TraversalPattern> visited) {
         if (!visited.add(this)) {
