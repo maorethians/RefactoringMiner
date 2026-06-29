@@ -1,22 +1,10 @@
 package narrator.graph.cluster.traverse;
 
 import com.google.gson.JsonObject;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
-import narrator.graph.Context;
-import narrator.graph.Edge;
-import narrator.graph.EdgeType;
-import narrator.graph.Node;
-import narrator.graph.NodeType;
-import narrator.graph.SrcDst;
-import narrator.graph.cluster.Cluster;
+import narrator.graph.*;
 import org.jgrapht.Graph;
+
+import java.util.*;
 
 public class SuccessivePattern extends TraversalPattern implements Leaf {
 
@@ -90,28 +78,28 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
 
         List<String> mappingHunks = new ArrayList<>();
         List<TraversalPattern.MappingGroup> aggregated = TraversalPattern.aggregateByMapping(this.getGraph(), sequence).stream()
-                .filter(mg -> !mg.partners.isEmpty())
+                .filter(mg -> !mg.partners().isEmpty())
                 .toList();
 
         for (TraversalPattern.MappingGroup mg : aggregated) {
-            List<Node> group = mg.group;
-            List<Node> partners = mg.partners;
-            
+            List<Node> group = mg.group();
+            List<Node> partners = mg.partners();
+
             Set<String> allOps = new HashSet<>();
             for (Node n : group) {
                 allOps.addAll(n.getOperations(this.getGraph()));
             }
             String ops = String.join(" and ", allOps.stream().map(op -> op + "d").toList());
-            
+
             StringBuilder hunk = new StringBuilder();
             Node rep = group.get(0);
-            
+
             Collection<Node> from = (rep.getSrcDst() == SrcDst.SRC) ? group : partners;
             Collection<Node> to = (rep.getSrcDst() == SrcDst.SRC) ? partners : group;
 
             hunk.append(String.join("\n", from.stream().map(n -> n.base(this.getGraph())).toList()))
-                .append("\n\n").append(ops).append(" to:\n\n")
-                .append(String.join("\n", to.stream().map(n -> n.base(this.getGraph())).toList()));
+                    .append("\n\n").append(ops).append(" to:\n\n")
+                    .append(String.join("\n", to.stream().map(n -> n.base(this.getGraph())).toList()));
             mappingHunks.add(hunk.toString());
         }
 

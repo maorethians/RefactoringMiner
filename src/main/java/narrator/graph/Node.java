@@ -316,6 +316,21 @@ public class Node {
     return basePrompt;
   }
 
+  public String baseXml(Graph<Node, Edge> graph) {
+    String xmlPrompt = "<" + this.getPromptType(graph) + " id=\"" + getPromptId() + "\"";
+
+    String contextString = getContextString(graph);
+    if (!contextString.isEmpty()) {
+      xmlPrompt += " location=\"" + contextString + "\"";
+    }
+
+    xmlPrompt += ">\n    ";
+    xmlPrompt += this.normalizeContent().replace("\n", "\n    ");
+    xmlPrompt += "\n</" + this.getPromptType(graph) + ">";
+
+    return xmlPrompt;
+  }
+
   public List<String> getOperations(Graph<Node, Edge> graph) {
     List<String> operations = new ArrayList<>();
 
@@ -449,6 +464,34 @@ public class Node {
         .collect(java.util.stream.Collectors.joining(" and "))
         + " to:\n\n"
         + targetPrompt;
+  }
+
+  public String mappingXml(Graph<Node, Edge> graph) {
+    String basePrompt = baseXml(graph);
+
+    List<Node> sources = getMappingSources(graph);
+    List<Node> targets = getMappingTargets(graph);
+
+    if (sources.isEmpty() && targets.isEmpty()) {
+      return basePrompt;
+    }
+
+    if (!sources.isEmpty()) {
+      List<String> sourcePrompts = new ArrayList<>();
+      for (Node source : sources) {
+        sourcePrompts.add(source.baseXml(graph));
+      }
+      String sourcePrompt = String.join("\n", sourcePrompts);
+      return sourcePrompt + "\n" + basePrompt;
+    }
+
+    // targets.length > 0
+    List<String> targetPrompts = new ArrayList<>();
+    for (Node target : targets) {
+      targetPrompts.add(target.baseXml(graph));
+    }
+    String targetPrompt = String.join("\n", targetPrompts);
+    return basePrompt + "\n" + targetPrompt;
   }
 
   public List<Node> getMappingSources(Graph<Node, Edge> graph) {

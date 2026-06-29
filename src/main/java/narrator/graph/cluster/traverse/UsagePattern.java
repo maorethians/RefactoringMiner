@@ -3,6 +3,7 @@ package narrator.graph.cluster.traverse;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import narrator.graph.Edge;
@@ -90,7 +91,19 @@ public class UsagePattern extends AggregatorPattern implements Leaf {
 
     @Override
     public List<Node> getSides(Graph<Node, Edge> graph) {
-        return new ArrayList<>(getUsedNodes());
+        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
+        Set<Node> superSidesOrdered = new LinkedHashSet<>();
+        for (TraversalPattern leaf : leaves) {
+            if (leaf.equals(this)) {
+                superSidesOrdered.addAll(getUsedNodes());
+            } else {
+                superSidesOrdered.addAll(leaf.getSides(graph));
+                superSidesOrdered.addAll(leaf.getMains(graph));
+            }
+        }
+
+        List<Node> mains = this.getMains(graph);
+        return superSidesOrdered.stream().filter(side -> !mains.contains(side)).toList();
     }
 
     @Override

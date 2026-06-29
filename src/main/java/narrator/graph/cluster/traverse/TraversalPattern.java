@@ -3,55 +3,78 @@ package narrator.graph.cluster.traverse;
 import com.github.gumtreediff.tree.Tree;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
-import narrator.graph.SrcDst;
-import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.GraphWrapper;
 import org.jgrapht.Graph;
 
-public class TraversalPattern extends GraphWrapper {
-    public static class MappingGroup {
-        public final List<Node> group;
-        public final List<Node> partners;
+import java.util.*;
 
-        public MappingGroup(List<Node> group, List<Node> partners) {
-            this.group = group;
-            this.partners = partners;
-        }
-    }
+public class TraversalPattern extends GraphWrapper {
+    protected final Util util = new Util(getGraph());
+    protected final Set<String> identifiers = new HashSet<>();
+    private final Narrator narrator = new Narrator(this);
+    private final Map<TraversalPattern, Boolean> dependsOnCache = new HashMap<>();
+    protected Node cachedLead = null;
+    protected NodeType nodeType;
+    private List<TraversalPattern> cachedFlatten = null;
 
     public static List<MappingGroup> aggregateByMapping(Graph<Node, Edge> graph, Collection<Node> nodes) {
+        Set<Node> visited = new HashSet<>();
         List<MappingGroup> result = new ArrayList<>();
-        Map<Set<Node>, MappingGroup> partnerMap = new HashMap<>();
 
-        for (Node n : nodes) {
-            List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
-            if (partners.isEmpty()) {
-                result.add(new MappingGroup(new ArrayList<>(List.of(n)), List.of()));
-            } else {
-                Set<Node> partnerSet = new HashSet<>(partners);
-                MappingGroup group = partnerMap.computeIfAbsent(partnerSet, k -> {
-                    MappingGroup mg = new MappingGroup(new ArrayList<>(), partners);
-                    result.add(mg);
-                    return mg;
-                });
-                group.group.add(n);
+        for (Node node : nodes) {
+            if (visited.contains(node)) continue;
+
+            Set<Node> component = new HashSet<>();
+            Queue<Node> queue = new LinkedList<>();
+            queue.add(node);
+            visited.add(node);
+
+            while (!queue.isEmpty()) {
+                Node curr = queue.poll();
+                component.add(curr);
+
+                for (Node src : curr.getMappingSources(graph)) {
+                    if (!visited.contains(src)) {
+                        visited.add(src);
+                        queue.add(src);
+                    }
+                }
+                for (Node dst : curr.getMappingTargets(graph)) {
+                    if (!visited.contains(dst)) {
+                        visited.add(dst);
+                        queue.add(dst);
+                    }
+                }
+            }
+
+            List<Node> srcNodes = new ArrayList<>();
+            List<Node> dstNodes = new ArrayList<>();
+            for (Node n : component) {
+                if (n.isSrc()) srcNodes.add(n);
+                else dstNodes.add(n);
+            }
+
+            Comparator<Node> nodeComparator = Comparator.comparing(Node::getPath)
+                    .thenComparingInt(n -> n.getTree().getPos());
+            srcNodes.sort(nodeComparator);
+            dstNodes.sort(nodeComparator);
+
+
+            Set<Node> inputSet = new HashSet<>(nodes);
+            List<Node> srcInInput = srcNodes.stream().filter(inputSet::contains).toList();
+            List<Node> dstInInput = dstNodes.stream().filter(inputSet::contains).toList();
+
+            if (!srcInInput.isEmpty()) {
+                result.add(new MappingGroup(srcNodes, dstNodes));
+            } else if (!dstInInput.isEmpty()) {
+                result.add(new MappingGroup(dstNodes, srcNodes));
             }
         }
         return result;
     }
-
-    private final Narrator narrator = new Narrator(this);
 
     public Narrator getNarrator() {
         return narrator;
@@ -60,13 +83,6 @@ public class TraversalPattern extends GraphWrapper {
     public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
         return "";
     }
-
-    protected final Util util = new Util(getGraph());
-    protected final Set<String> identifiers = new HashSet<>();
-    protected Node cachedLead = null;
-    protected NodeType nodeType;
-    private List<TraversalPattern> cachedFlatten = null;
-    private Map<TraversalPattern, Boolean> dependsOnCache = new HashMap<>();
 
     public Node getLead() {
         if (cachedLead == null) {
@@ -78,8 +94,7 @@ public class TraversalPattern extends GraphWrapper {
 
     public String getId() {
         Tree tree = getLead().getTree();
-        return getClass().getSimpleName() + "-" + tree.getPos() + '-' + tree.getEndPos() + '-'
-                + System.identityHashCode(this);
+        return getClass().getSimpleName() + "-" + tree.getPos() + '-' + tree.getEndPos() + '-' + System.identityHashCode(this);
     }
 
     public JsonObject stringify() {
@@ -106,10 +121,7 @@ public class TraversalPattern extends GraphWrapper {
 
     public int getDepth() {
         if (this instanceof AggregatorPattern aggregator) {
-            return aggregator.subs.stream()
-                    .mapToInt(TraversalPattern::getDepth)
-                    .max()
-                    .orElse(0) + 1;
+            return aggregator.subs.stream().mapToInt(TraversalPattern::getDepth).max().orElse(0) + 1;
         }
         return 0;
     }
@@ -148,7 +160,6 @@ public class TraversalPattern extends GraphWrapper {
         return result;
     }
 
-
     private List<TraversalPattern> flatten() {
         if (cachedFlatten == null) {
             List<TraversalPattern> result = new ArrayList<>();
@@ -170,5 +181,8 @@ public class TraversalPattern extends GraphWrapper {
         }
 
         result.add(p);
+    }
+
+    public record MappingGroup(List<Node> group, List<Node> partners) {
     }
 }
