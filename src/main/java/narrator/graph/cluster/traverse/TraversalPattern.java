@@ -8,8 +8,10 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import narrator.graph.Edge;
 import narrator.graph.Node;
@@ -31,23 +33,33 @@ public class TraversalPattern extends GraphWrapper {
     }
 
     public static List<MappingGroup> aggregateByMapping(Graph<Node, Edge> graph, Collection<Node> nodes) {
-        List<MappingGroup> result = new ArrayList<>();
-        Map<Set<Node>, MappingGroup> partnerMap = new HashMap<>();
+        Map<HashSet<Node>, LinkedHashSet<Node>> partnerMap = new HashMap<>();
 
         for (Node n : nodes) {
             List<Node> partners = (n.getSrcDst() == SrcDst.SRC) ? n.getMappingTargets(graph) : n.getMappingSources(graph);
-            if (partners.isEmpty()) {
-                result.add(new MappingGroup(new ArrayList<>(List.of(n)), List.of()));
-            } else {
-                Set<Node> partnerSet = new HashSet<>(partners);
-                MappingGroup group = partnerMap.computeIfAbsent(partnerSet, k -> {
-                    MappingGroup mg = new MappingGroup(new ArrayList<>(), partners);
-                    result.add(mg);
-                    return mg;
-                });
-                group.group.add(n);
+            HashSet<Node> partnersSet = new HashSet<>(partners);
+            if (!partnerMap.containsKey(partnersSet)) {
+                partnerMap.put(partnersSet, new LinkedHashSet<>());
             }
+            partnerMap.get(partnersSet).add(n);
         }
+
+        List<MappingGroup> result = new ArrayList<>();
+        for (Entry<HashSet<Node>, LinkedHashSet<Node>> partnerGroup : partnerMap.entrySet()) {
+            LinkedHashSet<Node> group = partnerGroup.getValue();
+            HashSet<Node> partners = partnerGroup.getKey();
+            if (partners.isEmpty()) {
+                for (Node node : group) {
+                    ArrayList<Node> singleGroup = new ArrayList<>();
+                    singleGroup.add(node);
+                    result.add(new MappingGroup(singleGroup, new ArrayList<>()));
+                }
+                continue;
+            }
+
+            result.add(new MappingGroup(new ArrayList<>(group), new ArrayList<>(partners)));
+        }
+
         return result;
     }
 
