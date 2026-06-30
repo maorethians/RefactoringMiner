@@ -2,7 +2,6 @@ package narrator.graph.cluster.traverse;
 
 import narrator.graph.Edge;
 import narrator.graph.Node;
-import narrator.graph.SrcDst;
 import org.jgrapht.Graph;
 
 import java.util.*;
@@ -13,8 +12,7 @@ public class AggregatorPattern extends TraversalPattern {
     Set<TraversalPattern> subs = new HashSet<>();
 
     @Override
-    public String extended(Graph<Node, Edge> graph, GrainLevel level,
-                           List<TraversalPattern> filterPatterns) {
+    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
 //        Set<Node> nodesToFilter = new HashSet<>();
 //        if (filterPatterns != null) {
 //            for (TraversalPattern p : filterPatterns) {
@@ -69,11 +67,65 @@ public class AggregatorPattern extends TraversalPattern {
         Set<String> nodesSubChapters = new HashSet<>();
 
         List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, getMains(graph));
+
+        Map<MappingGroup, Set<Node>> mappingGroupContexts = new HashMap<>();
         for (MappingGroup mg : mappingGroups) {
-            String groupXml = "<SUB_CHAPTER>\n    "
-                    + buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    ")
-                    + "\n" + "</SUB_CHAPTER>";
-            nodesSubChapters.add(groupXml);
+            Set<Node> contexts = new HashSet<>();
+
+            for (Node target : mg.targets()) {
+                List<Node> semanticContexts = target.getSemanticContexts(graph);
+                if (semanticContexts.isEmpty()) {
+                    continue;
+                }
+
+                Node semanticContext = semanticContexts.get(0);
+                contexts.add(semanticContext);
+
+                List<Node> contextSources = semanticContext.getMappingSources(graph);
+                contexts.addAll(contextSources);
+            }
+            for (Node source : mg.sources()) {
+                List<Node> semanticContexts = source.getSemanticContexts(graph);
+                if (semanticContexts.isEmpty()) {
+                    continue;
+                }
+
+                Node semanticContext = semanticContexts.get(0);
+                contexts.add(semanticContext);
+
+                List<Node> contextSources = semanticContext.getMappingTargets(graph);
+                contexts.addAll(contextSources);
+            }
+
+            mappingGroupContexts.put(mg, contexts);
+        }
+
+        Map<Set<Node>, List<MappingGroup>> groupsByContext = new HashMap<>();
+        for (Map.Entry<MappingGroup, Set<Node>> entry : mappingGroupContexts.entrySet()) {
+            groupsByContext.computeIfAbsent(entry.getValue(), k -> new ArrayList<>()).add(entry.getKey());
+        }
+
+        for (Entry<Set<Node>, List<MappingGroup>> contextsGroups : groupsByContext.entrySet()) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("<SUB_CHAPTER>");
+
+            Set<String> contextsText = new HashSet<>();
+            for (Node context : contextsGroups.getKey()) {
+                contextsText.add(context.mappingXml(graph));
+            }
+            if (!contextsText.isEmpty()) {
+                sb.append("\n    <CONTEXT>\n        ");
+                sb.append(String.join("\n        ", contextsText.stream().map(contextText -> contextText.replace("\n", "\n        ")).toList()));
+                sb.append("\n    </CONTEXT>");
+            }
+
+            List<MappingGroup> groups = contextsGroups.getValue();
+            for (MappingGroup mg : groups) {
+                sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    ")).append("\n");
+            }
+
+            sb.append("</SUB_CHAPTER>");
+            nodesSubChapters.add(sb.toString());
         }
 
         return String.join("\n", nodesSubChapters);
@@ -87,13 +139,11 @@ public class AggregatorPattern extends TraversalPattern {
         // TODO: ordering before and after in an interleaved manner?
         if (!sources.isEmpty()) {
             xmlOutput.append("\n    ");
-            xmlOutput.append(String.join("\n    ",
-                sources.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
+            xmlOutput.append(String.join("\n    ", sources.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
         }
         if (!targets.isEmpty()) {
             xmlOutput.append("\n    ");
-            xmlOutput.append(String.join("\n    ",
-                targets.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
+            xmlOutput.append(String.join("\n    ", targets.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
         }
 
         xmlOutput.append("\n</CHANGE>");
@@ -134,8 +184,7 @@ public class AggregatorPattern extends TraversalPattern {
             return false;
         }
 
-        boolean isRootNode = getGraph().vertexSet().stream()
-                .anyMatch(coreNode -> coreNode.equals(node));
+        boolean isRootNode = getGraph().vertexSet().stream().anyMatch(coreNode -> coreNode.equals(node));
         if (isRootNode) {
             return true;
         }
@@ -179,9 +228,7 @@ public class AggregatorPattern extends TraversalPattern {
 
     // TODO: test and validate
     protected void breakCircularDependencies(List<AggregatorPattern> path) {
-        List<AggregatorPattern> acceptableSubs = subs.stream()
-                .filter(sub -> sub instanceof AggregatorPattern).map(sub -> (AggregatorPattern) sub)
-                .toList();
+        List<AggregatorPattern> acceptableSubs = subs.stream().filter(sub -> sub instanceof AggregatorPattern).map(sub -> (AggregatorPattern) sub).toList();
         if (acceptableSubs.isEmpty()) {
             return;
         }
@@ -190,13 +237,11 @@ public class AggregatorPattern extends TraversalPattern {
         newPath.add(this);
 
         if (this instanceof UsagePattern thisUsage) {
-            List<AggregatorPattern> circularSubs = acceptableSubs.stream().filter(newPath::contains)
-                    .toList();
+            List<AggregatorPattern> circularSubs = acceptableSubs.stream().filter(newPath::contains).toList();
             for (AggregatorPattern circularSub : circularSubs) {
                 subs.remove(circularSub);
 
-                List<Node> requirementNodes = thisUsage.getRequirements().entrySet().stream()
-                        .filter(entry -> entry.getValue().equals(circularSub)).map(Entry::getKey).toList();
+                List<Node> requirementNodes = thisUsage.getRequirements().entrySet().stream().filter(entry -> entry.getValue().equals(circularSub)).map(Entry::getKey).toList();
                 if (requirementNodes.size() > 1) {
                     System.out.println("Requirement Breaking Failure");
                     continue;
