@@ -21,6 +21,12 @@ public class TraversalPattern extends GraphWrapper {
     private List<TraversalPattern> cachedFlatten = null;
 
     public static List<MappingGroup> aggregateByMapping(Graph<Node, Edge> graph, Collection<Node> nodes) {
+        Set<Node> allowedNodes = new HashSet<>(nodes);
+        for (Node node : nodes) {
+            allowedNodes.addAll(node.getMappingSources(graph));
+            allowedNodes.addAll(node.getMappingTargets(graph));
+        }
+
         Set<Node> visited = new HashSet<>();
         List<MappingGroup> result = new ArrayList<>();
 
@@ -53,6 +59,7 @@ public class TraversalPattern extends GraphWrapper {
             List<Node> srcNodes = new ArrayList<>();
             List<Node> dstNodes = new ArrayList<>();
             for (Node n : component) {
+                if (!allowedNodes.contains(n)) continue;
                 if (n.isSrc()) srcNodes.add(n);
                 else dstNodes.add(n);
             }
