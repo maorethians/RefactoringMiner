@@ -46,25 +46,22 @@ public class AggregatorPattern extends TraversalPattern {
                 contexts.addAll(contextSources);
             }
 
-            Set<Node> filteredContexts = contexts.stream()
-                    .filter(ctx -> ctx.getSemanticContexts(graph).stream()
-                            .noneMatch(sc -> sc != ctx && contexts.contains(sc)))
-                    .collect(java.util.stream.Collectors.toSet());
+            Set<Node> filteredContexts = filterLargest(contexts, graph);
             mappingGroupContexts.put(mg, filteredContexts);
         }
 
-        List<Map.Entry<MappingGroup, Set<Node>>> sortedEntries = new ArrayList<>(mappingGroupContexts.entrySet());
-        sortedEntries.sort((e1, e2) -> Integer.compare(e2.getValue().size(), e1.getValue().size()));
-
         List<MergedGroup> mergedGroups = new ArrayList<>();
-        for (Map.Entry<MappingGroup, Set<Node>> entry : sortedEntries) {
+        for (Map.Entry<MappingGroup, Set<Node>> entry : mappingGroupContexts.entrySet()) {
             MappingGroup mg = entry.getKey();
             Set<Node> context = entry.getValue();
 
             boolean merged = false;
             for (MergedGroup mergedGroup : mergedGroups) {
-                if (mergedGroup.context.containsAll(context)) {
+                if (isCompatible(context, mergedGroup.context, graph)) {
                     mergedGroup.groups.add(mg);
+                    Set<Node> union = new HashSet<>(mergedGroup.context);
+                    union.addAll(context);
+                    mergedGroup.context = filterLargest(union, graph);
                     merged = true;
                     break;
                 }
@@ -219,6 +216,49 @@ public class AggregatorPattern extends TraversalPattern {
         for (AggregatorPattern sub : acceptableSubs) {
             sub.breakCircularDependencies(newPath);
         }
+    }
+
+    private boolean isCompatible(Set<Node> setA, Set<Node> setB, Graph<Node, Edge> graph) {
+        if (setA.isEmpty() || setB.isEmpty()) return false;
+
+        boolean aCoveredByB = true;
+        for (Node a : setA) {
+            boolean matched = false;
+            for (Node b : setB) {
+                if (a.equals(b) || a.getSemanticContexts(graph).contains(b) || b.getSemanticContexts(graph).contains(a)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                aCoveredByB = false;
+                break;
+            }
+        }
+
+        boolean bCoveredByA = true;
+        for (Node b : setB) {
+            boolean matched = false;
+            for (Node a : setA) {
+                if (a.equals(b) || a.getSemanticContexts(graph).contains(b) || b.getSemanticContexts(graph).contains(a)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                bCoveredByA = false;
+                break;
+            }
+        }
+
+        return aCoveredByB || bCoveredByA;
+    }
+
+    private Set<Node> filterLargest(Set<Node> contexts, Graph<Node, Edge> graph) {
+        return contexts.stream()
+                .filter(ctx -> ctx.getSemanticContexts(graph).stream()
+                        .noneMatch(sc -> sc != ctx && contexts.contains(sc)))
+                .collect(java.util.stream.Collectors.toSet());
     }
 
     private static class MergedGroup {
