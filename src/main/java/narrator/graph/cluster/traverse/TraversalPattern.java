@@ -62,16 +62,7 @@ public class TraversalPattern extends GraphWrapper {
             srcNodes.sort(nodeComparator);
             dstNodes.sort(nodeComparator);
 
-
-            Set<Node> inputSet = new HashSet<>(nodes);
-            List<Node> srcInInput = srcNodes.stream().filter(inputSet::contains).toList();
-            List<Node> dstInInput = dstNodes.stream().filter(inputSet::contains).toList();
-
-            if (!srcInInput.isEmpty()) {
-                result.add(new MappingGroup(srcNodes, dstNodes));
-            } else if (!dstInInput.isEmpty()) {
-                result.add(new MappingGroup(dstNodes, srcNodes));
-            }
+            result.add(new MappingGroup(srcNodes, dstNodes));
         }
         return result;
     }
@@ -183,6 +174,6 @@ public class TraversalPattern extends GraphWrapper {
         result.add(p);
     }
 
-    public record MappingGroup(List<Node> group, List<Node> partners) {
+    public record MappingGroup(List<Node> sources, List<Node> targets) {
     }
 }

@@ -66,40 +66,34 @@ public class AggregatorPattern extends TraversalPattern {
 //      return xmlOutput.toString();
 //    }
 
-        Map<Set<Node>, String> nodesSubChapters = new HashMap<>();
+        Set<String> nodesSubChapters = new HashSet<>();
 
         List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, getMains(graph));
         for (MappingGroup mg : mappingGroups) {
             String groupXml = "<SUB_CHAPTER>\n    "
-                    + buildXmlMappingHunk(mg.group(), mg.partners(), graph).replace("\n", "\n    ")
+                    + buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    ")
                     + "\n" + "</SUB_CHAPTER>";
-            nodesSubChapters.put(new HashSet<>(mg.group()), groupXml);
+            nodesSubChapters.add(groupXml);
         }
 
-        return String.join("\n", nodesSubChapters.values());
+        return String.join("\n", nodesSubChapters);
     }
 
-    private String buildXmlMappingHunk(List<Node> group, List<Node> partners,
-                                       Graph<Node, Edge> graph) {
+    private String buildXmlMappingHunk(List<Node> sources, List<Node> targets, Graph<Node, Edge> graph) {
         StringBuilder xmlOutput = new StringBuilder();
 
-        xmlOutput.append("<CHANGE>\n    ");
+        xmlOutput.append("<CHANGE>");
 
-        if (partners.isEmpty()) {
-            xmlOutput.append(String.join("\n",
-                    group.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
-        } else {
-            Node rep = group.get(0);
-            Collection<Node> from = (rep.getSrcDst() == SrcDst.SRC) ? group : partners;
-            Collection<Node> to = (rep.getSrcDst() == SrcDst.SRC) ? partners : group;
-
-            String fromContent = String.join("\n    ",
-                    from.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList());
-            xmlOutput.append(fromContent);
+        // TODO: ordering before and after in an interleaved manner?
+        if (!sources.isEmpty()) {
             xmlOutput.append("\n    ");
-            String toContent = String.join("\n    ",
-                    to.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList());
-            xmlOutput.append(toContent);
+            xmlOutput.append(String.join("\n    ",
+                sources.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
+        }
+        if (!targets.isEmpty()) {
+            xmlOutput.append("\n    ");
+            xmlOutput.append(String.join("\n    ",
+                targets.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
         }
 
         xmlOutput.append("\n</CHANGE>");

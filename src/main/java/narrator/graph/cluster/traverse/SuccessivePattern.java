@@ -78,29 +78,25 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
 
         List<String> mappingHunks = new ArrayList<>();
         List<TraversalPattern.MappingGroup> aggregated = TraversalPattern.aggregateByMapping(this.getGraph(), sequence).stream()
-                .filter(mg -> !mg.partners().isEmpty())
-                .toList();
-
+                .filter(mg -> !mg.sources().isEmpty() && !mg.targets().isEmpty()).toList();
         for (TraversalPattern.MappingGroup mg : aggregated) {
-            List<Node> group = mg.group();
-            List<Node> partners = mg.partners();
+            List<Node> sources = mg.sources();
+            List<Node> targets = mg.targets();
 
             Set<String> allOps = new HashSet<>();
-            for (Node n : group) {
+            for (Node n : sources) {
+                allOps.addAll(n.getOperations(this.getGraph()));
+            }
+            for (Node n : targets) {
                 allOps.addAll(n.getOperations(this.getGraph()));
             }
             String ops = String.join(" and ", allOps.stream().map(op -> op + "d").toList());
 
-            StringBuilder hunk = new StringBuilder();
-            Node rep = group.get(0);
-
-            Collection<Node> from = (rep.getSrcDst() == SrcDst.SRC) ? group : partners;
-            Collection<Node> to = (rep.getSrcDst() == SrcDst.SRC) ? partners : group;
-
-            hunk.append(String.join("\n", from.stream().map(n -> n.base(this.getGraph())).toList()))
-                    .append("\n\n").append(ops).append(" to:\n\n")
-                    .append(String.join("\n", to.stream().map(n -> n.base(this.getGraph())).toList()));
-            mappingHunks.add(hunk.toString());
+            String hunk =
+                String.join("\n", sources.stream().map(n -> n.base(this.getGraph())).toList())
+                    + "\n\n" + ops + " to:\n\n"
+                    + String.join("\n", targets.stream().map(n -> n.base(this.getGraph())).toList());
+            mappingHunks.add(hunk);
         }
 
         if (!mappingHunks.isEmpty()) {
