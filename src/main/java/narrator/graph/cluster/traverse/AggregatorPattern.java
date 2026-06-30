@@ -46,7 +46,11 @@ public class AggregatorPattern extends TraversalPattern {
                 contexts.addAll(contextSources);
             }
 
-            mappingGroupContexts.put(mg, contexts);
+            Set<Node> filteredContexts = contexts.stream()
+                    .filter(ctx -> ctx.getSemanticContexts(graph).stream()
+                            .noneMatch(sc -> sc != ctx && contexts.contains(sc)))
+                    .collect(java.util.stream.Collectors.toSet());
+            mappingGroupContexts.put(mg, filteredContexts);
         }
 
         List<Map.Entry<MappingGroup, Set<Node>>> sortedEntries = new ArrayList<>(mappingGroupContexts.entrySet());
@@ -87,10 +91,10 @@ public class AggregatorPattern extends TraversalPattern {
             }
 
             for (MappingGroup mg : mergedGroup.groups) {
-                sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    ")).append("\n");
+                sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    "));
             }
 
-            sb.append("</SUB_CHAPTER>");
+            sb.append("\n</SUB_CHAPTER>");
             nodesSubChapters.add(sb.toString());
         }
 
