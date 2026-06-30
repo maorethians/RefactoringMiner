@@ -13,57 +13,6 @@ public class AggregatorPattern extends TraversalPattern {
 
     @Override
     public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
-//        Set<Node> nodesToFilter = new HashSet<>();
-//        if (filterPatterns != null) {
-//            for (TraversalPattern p : filterPatterns) {
-//                nodesToFilter.addAll(p.getMains(graph));
-//                nodesToFilter.addAll(p.getSides(graph));
-//            }
-//        }
-//        nodesTracker = nodesTracker.stream().filter(node -> !nodesToFilter.contains(node)).collect(Collectors.toSet());
-
-        // Group by Semantic Mapping
-//    List<TraversalComponent> semanticLeaves = this.getNarrator()
-//        .getNarrative(GrainLevel.SEMANTIC_LEAF).stream().filter(
-//            chapter -> chapter instanceof TraversalComponent && Narrator.isSemanticLeaf(
-//                (TraversalComponent) chapter)).map(chapter -> (TraversalComponent) chapter)
-//        .filter(chapter -> chapter.getMergeContexts().size() > 1).toList();
-//    for (TraversalComponent semanticLeaf : semanticLeaves) {
-//      StringBuilder subChapter = new StringBuilder();
-//
-//      subChapter.append("<SUB_CHAPTER>\n");
-//
-//      subChapter.append("    <CONTEXT>\n        ").append(
-//          semanticLeaf.getMergeContexts().iterator().next().mappingXml(graph)
-//              .replace("\n", "\n        ")).append("\n    </CONTEXT>\n");
-//
-//      List<Node> leafMains = semanticLeaf.getMains(graph);
-//      for (MappingGroup leafMappingGroup : TraversalPattern.aggregateByMapping(graph, leafMains)) {
-//        subChapter.append("    ").append(
-//            buildXmlMappingHunk(leafMappingGroup.group, leafMappingGroup.partners, graph).replace(
-//                "\n", "\n    ")).append("\n");
-//      }
-//
-//      List<Node> leafSides = semanticLeaf.getSides(graph);
-//      Map<Boolean, List<Node>> sidesMainsExtensions = leafSides.stream()
-//          .collect(Collectors.partitioningBy(n -> n.getNodeType().equals(NodeType.EXTENSION)));
-//      // TODO: show their relations
-////        List<Node> leafSidesMains = sidesMainsExtensions.get(false);
-//      List<Node> leafSidesExtensions = sidesMainsExtensions.get(true);
-//      if (!leafSidesExtensions.isEmpty()) {
-//        subChapter.append("    <DEPENDENCIES>\n        ").append(String.join("\n        ",
-//            leafSidesExtensions.stream().map(e -> e.baseXml(graph).replace("\n", "\n        "))
-//                .toList())).append("\n    </DEPENDENCIES>").append("\n");
-//      }
-//      subChapter.append("</SUB_CHAPTER>\n");
-//      allNodes = allNodes.stream().filter(n -> !leafMains.contains(n))
-//          .collect(Collectors.toSet());
-//    }
-//
-//    if (!allNodes.isEmpty()) {
-//      return xmlOutput.toString();
-//    }
-
         Set<String> nodesSubChapters = new HashSet<>();
 
         List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, getMains(graph));
@@ -100,17 +49,35 @@ public class AggregatorPattern extends TraversalPattern {
             mappingGroupContexts.put(mg, contexts);
         }
 
-        Map<Set<Node>, List<MappingGroup>> groupsByContext = new HashMap<>();
-        for (Map.Entry<MappingGroup, Set<Node>> entry : mappingGroupContexts.entrySet()) {
-            groupsByContext.computeIfAbsent(entry.getValue(), k -> new ArrayList<>()).add(entry.getKey());
+        List<Map.Entry<MappingGroup, Set<Node>>> sortedEntries = new ArrayList<>(mappingGroupContexts.entrySet());
+        sortedEntries.sort((e1, e2) -> Integer.compare(e2.getValue().size(), e1.getValue().size()));
+
+        List<MergedGroup> mergedGroups = new ArrayList<>();
+        for (Map.Entry<MappingGroup, Set<Node>> entry : sortedEntries) {
+            MappingGroup mg = entry.getKey();
+            Set<Node> context = entry.getValue();
+
+            boolean merged = false;
+            for (MergedGroup mergedGroup : mergedGroups) {
+                if (mergedGroup.context.containsAll(context)) {
+                    mergedGroup.groups.add(mg);
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                MergedGroup newGroup = new MergedGroup(context);
+                newGroup.groups.add(mg);
+                mergedGroups.add(newGroup);
+            }
         }
 
-        for (Entry<Set<Node>, List<MappingGroup>> contextsGroups : groupsByContext.entrySet()) {
+        for (MergedGroup mergedGroup : mergedGroups) {
             StringBuilder sb = new StringBuilder();
             sb.append("<SUB_CHAPTER>");
 
             Set<String> contextsText = new HashSet<>();
-            for (Node context : contextsGroups.getKey()) {
+            for (Node context : mergedGroup.context) {
                 contextsText.add(context.mappingXml(graph));
             }
             if (!contextsText.isEmpty()) {
@@ -119,8 +86,7 @@ public class AggregatorPattern extends TraversalPattern {
                 sb.append("\n    </CONTEXT>");
             }
 
-            List<MappingGroup> groups = contextsGroups.getValue();
-            for (MappingGroup mg : groups) {
+            for (MappingGroup mg : mergedGroup.groups) {
                 sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    ")).append("\n");
             }
 
@@ -195,9 +161,6 @@ public class AggregatorPattern extends TraversalPattern {
                     return true;
                 }
             } else {
-                if (!visited.add(this)) {
-                    continue;
-                }
                 if (sub.containsNode(node)) {
                     return true;
                 }
@@ -217,9 +180,6 @@ public class AggregatorPattern extends TraversalPattern {
             if (sub instanceof AggregatorPattern) {
                 result.addAll(((AggregatorPattern) sub).vertexSet(visited));
             } else {
-                if (!visited.add(this)) {
-                    continue;
-                }
                 result.addAll(sub.vertexSet());
             }
         }
@@ -257,4 +217,12 @@ public class AggregatorPattern extends TraversalPattern {
         }
     }
 
+    private static class MergedGroup {
+        Set<Node> context;
+        List<MappingGroup> groups = new ArrayList<>();
+
+        MergedGroup(Set<Node> context) {
+            this.context = context;
+        }
+    }
 }
