@@ -13,48 +13,36 @@ public class AggregatorPattern extends TraversalPattern {
 
     @Override
     public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
-        Set<String> nodesSubChapters = new HashSet<>();
+        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
+        List<Node> aggMains = getMains(graph);
 
-        List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, getMains(graph));
-
+        List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, aggMains);
         Map<MappingGroup, Set<Node>> mappingGroupContexts = new HashMap<>();
         for (MappingGroup mg : mappingGroups) {
             Set<Node> contexts = new HashSet<>();
-
             for (Node target : mg.targets()) {
                 List<Node> semanticContexts = target.getSemanticContexts(graph);
-                if (semanticContexts.isEmpty()) {
-                    continue;
+                if (!semanticContexts.isEmpty()) {
+                    Node semanticContext = semanticContexts.get(0);
+                    contexts.add(semanticContext);
+                    contexts.addAll(semanticContext.getMappingSources(graph));
                 }
-
-                Node semanticContext = semanticContexts.get(0);
-                contexts.add(semanticContext);
-
-                List<Node> contextSources = semanticContext.getMappingSources(graph);
-                contexts.addAll(contextSources);
             }
             for (Node source : mg.sources()) {
                 List<Node> semanticContexts = source.getSemanticContexts(graph);
-                if (semanticContexts.isEmpty()) {
-                    continue;
+                if (!semanticContexts.isEmpty()) {
+                    Node semanticContext = semanticContexts.get(0);
+                    contexts.add(semanticContext);
+                    contexts.addAll(semanticContext.getMappingTargets(graph));
                 }
-
-                Node semanticContext = semanticContexts.get(0);
-                contexts.add(semanticContext);
-
-                List<Node> contextSources = semanticContext.getMappingTargets(graph);
-                contexts.addAll(contextSources);
             }
-
-            Set<Node> filteredContexts = filterLargest(contexts, graph);
-            mappingGroupContexts.put(mg, filteredContexts);
+            mappingGroupContexts.put(mg, filterLargest(contexts, graph));
         }
 
         List<MergedGroup> mergedGroups = new ArrayList<>();
         for (Map.Entry<MappingGroup, Set<Node>> entry : mappingGroupContexts.entrySet()) {
             MappingGroup mg = entry.getKey();
             Set<Node> context = entry.getValue();
-
             boolean merged = false;
             for (MergedGroup mergedGroup : mergedGroups) {
                 if (isCompatible(context, mergedGroup.context, graph)) {
@@ -73,48 +61,140 @@ public class AggregatorPattern extends TraversalPattern {
             }
         }
 
-        for (MergedGroup mergedGroup : mergedGroups) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("<SUB_CHAPTER>");
-
-            Set<String> contextsText = new HashSet<>();
-            for (Node context : mergedGroup.context) {
-                contextsText.add(context.mappingXml(graph));
+        Map<Node, Set<Node>> sideToMains = new HashMap<>();
+        for (TraversalPattern leaf : leaves) {
+            List<Node> leafMains = leaf.getMains(graph);
+            List<Node> leafSides = leaf.getSides(graph);
+            for (Node side : leafSides) {
+                if (!aggMains.contains(side)) {
+                    Set<Node> relyingMains = sideToMains.computeIfAbsent(side, k -> new HashSet<>());
+                    for (Node m : leafMains) {
+                        if (aggMains.contains(m)) {
+                            relyingMains.add(m);
+                        }
+                    }
+                }
             }
-            if (!contextsText.isEmpty()) {
-                sb.append("\n    <CONTEXT>\n        ");
-                sb.append(String.join("\n        ", contextsText.stream().map(contextText -> contextText.replace("\n", "\n        ")).toList()));
-                sb.append("\n    </CONTEXT>");
+        }
+
+        Map<Node, MergedGroup> mainToSubChapter = new HashMap<>();
+        for (MergedGroup mg : mergedGroups) {
+            for (MappingGroup group : mg.groups) {
+                for (Node n : group.sources()) mainToSubChapter.put(n, mg);
+                for (Node n : group.targets()) mainToSubChapter.put(n, mg);
+            }
+        }
+
+        Map<MergedGroup, Integer> groupEarliestIndex = new HashMap<>();
+        for (MergedGroup mg : mergedGroups) {
+            int minIdx = Integer.MAX_VALUE;
+            for (MappingGroup group : mg.groups) {
+                for (Node n : group.sources()) {
+                    for (int i = 0; i < leaves.size(); i++) {
+                        if (leaves.get(i).getMains(graph).contains(n)) {
+                            minIdx = Math.min(minIdx, i);
+                            break;
+                        }
+                    }
+                }
+                for (Node n : group.targets()) {
+                    for (int i = 0; i < leaves.size(); i++) {
+                        if (leaves.get(i).getMains(graph).contains(n)) {
+                            minIdx = Math.min(minIdx, i);
+                            break;
+                        }
+                    }
+                }
+            }
+            groupEarliestIndex.put(mg, minIdx);
+        }
+
+        Set<Node> globalSides = new HashSet<>();
+        Map<MergedGroup, List<Node>> localSidesMap = new HashMap<>();
+
+        for (Map.Entry<Node, Set<Node>> entry : sideToMains.entrySet()) {
+            Node side = entry.getKey();
+            Set<Node> mains = entry.getValue();
+            Set<MergedGroup> chapters = new HashSet<>();
+            for (Node m : mains) {
+                MergedGroup mg = mainToSubChapter.get(m);
+                if (mg != null) chapters.add(mg);
             }
 
-            for (MappingGroup mg : mergedGroup.groups) {
-                sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    "));
+            if (chapters.size() > 1) {
+                globalSides.add(side);
+            } else if (chapters.size() == 1) {
+                MergedGroup mg = chapters.iterator().next();
+                localSidesMap.computeIfAbsent(mg, k -> new ArrayList<>()).add(side);
             }
-
-            sb.append("\n</SUB_CHAPTER>");
-            nodesSubChapters.add(sb.toString());
         }
 
         StringBuilder result = new StringBuilder();
-        List<Node> sides = getSides(graph);
-        if (!sides.isEmpty()) {
-            result.append("<DEPENDENCY>");
-            for (Node side : sides) {
-                result.append("\n    ").append(side.baseXml(graph).replace("\n", "\n    "));
+        Set<Node> outputtedSides = new HashSet<>();
+        Set<MergedGroup> outputtedGroups = new HashSet<>();
+
+        for (int i = 0; i < leaves.size(); i++) {
+            TraversalPattern leaf = leaves.get(i);
+            for (Node s : leaf.getSides(graph)) {
+                if (!aggMains.contains(s) && globalSides.contains(s) && !outputtedSides.contains(s)) {
+                    result.append("<DEPENDENCY>");
+                    result.append("\n    ").append(s.baseXml(graph).replace("\n", "\n    "));
+                    result.append("\n</DEPENDENCY>\n");
+                    outputtedSides.add(s);
+                }
             }
-            result.append("\n</DEPENDENCY>\n");
+            for (MergedGroup mg : mergedGroups) {
+                if (!outputtedGroups.contains(mg) && groupEarliestIndex.get(mg) == i) {
+                    result.append("\n").append(buildSubChapterXml(mg, graph, leaves, localSidesMap));
+                    outputtedGroups.add(mg);
+                }
+            }
         }
-        result.append(String.join("\n", nodesSubChapters));
 
         return result.toString();
     }
 
+    private String buildSubChapterXml(MergedGroup mergedGroup, Graph<Node, Edge> graph, List<TraversalPattern> leaves, Map<MergedGroup, List<Node>> localSidesMap) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<SUB_CHAPTER>");
+
+        Set<String> contextsText = new HashSet<>();
+        for (Node context : mergedGroup.context) {
+            contextsText.add(context.mappingXml(graph));
+        }
+        if (!contextsText.isEmpty()) {
+            sb.append("\n    <CONTEXT>\n        ");
+            sb.append(String.join("\n        ", contextsText.stream().map(contextText -> contextText.replace("\n", "\n        ")).toList()));
+            sb.append("\n    </CONTEXT>");
+        }
+
+        List<Node> localSides = localSidesMap.getOrDefault(mergedGroup, List.of());
+        if (!localSides.isEmpty()) {
+            sb.append("\n    <DEPENDENCY>");
+            List<Node> sortedLocalSides = new ArrayList<>(localSides);
+            sortedLocalSides.sort(Comparator.comparingInt(s -> {
+                for (int i = 0; i < leaves.size(); i++) {
+                    if (leaves.get(i).getSides(graph).contains(s)) return i;
+                }
+                return leaves.size();
+            }));
+            for (Node side : sortedLocalSides) {
+                sb.append("\n        ").append(side.baseXml(graph).replace("\n", "\n        "));
+            }
+            sb.append("\n    </DEPENDENCY>");
+        }
+
+        for (MappingGroup mg : mergedGroup.groups) {
+            sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    "));
+        }
+
+        sb.append("\n</SUB_CHAPTER>");
+        return sb.toString();
+    }
+
     private String buildXmlMappingHunk(List<Node> sources, List<Node> targets, Graph<Node, Edge> graph) {
         StringBuilder xmlOutput = new StringBuilder();
-
         xmlOutput.append("<CHANGE>");
-
-        // TODO: ordering before and after in an interleaved manner?
         if (!sources.isEmpty()) {
             xmlOutput.append("\n    ");
             xmlOutput.append(String.join("\n    ", sources.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
@@ -123,9 +203,7 @@ public class AggregatorPattern extends TraversalPattern {
             xmlOutput.append("\n    ");
             xmlOutput.append(String.join("\n    ", targets.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
         }
-
         xmlOutput.append("\n</CHANGE>");
-
         return xmlOutput.toString();
     }
 
@@ -198,7 +276,6 @@ public class AggregatorPattern extends TraversalPattern {
         return result;
     }
 
-    // TODO: test and validate
     protected void breakCircularDependencies(List<AggregatorPattern> path) {
         List<AggregatorPattern> acceptableSubs = subs.stream().filter(sub -> sub instanceof AggregatorPattern).map(sub -> (AggregatorPattern) sub).toList();
         if (acceptableSubs.isEmpty()) {
@@ -266,10 +343,7 @@ public class AggregatorPattern extends TraversalPattern {
     }
 
     private Set<Node> filterLargest(Set<Node> contexts, Graph<Node, Edge> graph) {
-        return contexts.stream()
-                .filter(ctx -> ctx.getSemanticContexts(graph).stream()
-                        .noneMatch(sc -> sc != ctx && contexts.contains(sc)))
-                .collect(java.util.stream.Collectors.toSet());
+        return contexts.stream().filter(ctx -> ctx.getSemanticContexts(graph).stream().noneMatch(sc -> sc != ctx && contexts.contains(sc))).collect(java.util.stream.Collectors.toSet());
     }
 
     private static class MergedGroup {
