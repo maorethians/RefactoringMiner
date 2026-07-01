@@ -95,7 +95,18 @@ public class AggregatorPattern extends TraversalPattern {
             nodesSubChapters.add(sb.toString());
         }
 
-        return String.join("\n", nodesSubChapters);
+        StringBuilder result = new StringBuilder();
+        List<Node> sides = getSides(graph);
+        if (!sides.isEmpty()) {
+            result.append("<DEPENDENCY>");
+            for (Node side : sides) {
+                result.append("\n    ").append(side.baseXml(graph).replace("\n", "\n    "));
+            }
+            result.append("\n</DEPENDENCY>\n");
+        }
+        result.append(String.join("\n", nodesSubChapters));
+
+        return result.toString();
     }
 
     private String buildXmlMappingHunk(List<Node> sources, List<Node> targets, Graph<Node, Edge> graph) {
