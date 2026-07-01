@@ -91,19 +91,7 @@ public class UsagePattern extends AggregatorPattern implements Leaf {
 
     @Override
     public List<Node> getSides(Graph<Node, Edge> graph) {
-        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
-        Set<Node> superSidesOrdered = new LinkedHashSet<>();
-        for (TraversalPattern leaf : leaves) {
-            if (leaf.equals(this)) {
-                superSidesOrdered.addAll(getUsedNodes());
-            } else {
-                superSidesOrdered.addAll(leaf.getSides(graph));
-                superSidesOrdered.addAll(leaf.getMains(graph));
-            }
-        }
-
-        List<Node> mains = this.getMains(graph);
-        return superSidesOrdered.stream().filter(side -> !mains.contains(side)).toList();
+        return getUsedNodes().stream().toList();
     }
 
     @Override
