@@ -62,15 +62,19 @@ public class AggregatorPattern extends TraversalPattern {
 
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
 
+        Set<Node> allMainsSet = new HashSet<>(aggMains);
+        for (TraversalPattern fp : filterPatterns) {
+            allMainsSet.addAll(fp.getMains(graph));
+        }
         Map<Node, Set<Node>> sideToMains = new HashMap<>();
         for (TraversalPattern leaf : leaves) {
             List<Node> leafMains = leaf.getMains(graph);
             List<Node> leafSides = leaf.getSides(graph);
             for (Node side : leafSides) {
-                if (!aggMains.contains(side)) {
+                if (!allMainsSet.contains(side)) {
                     Set<Node> relyingMains = sideToMains.computeIfAbsent(side, k -> new HashSet<>());
                     for (Node m : leafMains) {
-                        if (aggMains.contains(m)) {
+                        if (allMainsSet.contains(m)) {
                             relyingMains.add(m);
                         }
                     }
@@ -108,7 +112,6 @@ public class AggregatorPattern extends TraversalPattern {
             groupLatestIndex.put(mg, maxIdx);
         }
 
-        Set<Node> globalSides = new HashSet<>();
         Map<MergedGroup, List<Node>> localSidesMap = new HashMap<>();
 
         for (Map.Entry<Node, Set<Node>> entry : sideToMains.entrySet()) {
@@ -119,29 +122,15 @@ public class AggregatorPattern extends TraversalPattern {
                 MergedGroup mg = mainToSubChapter.get(m);
                 if (mg != null) chapters.add(mg);
             }
-
-            if (chapters.size() > 1) {
-                globalSides.add(side);
-            } else if (chapters.size() == 1) {
-                MergedGroup mg = chapters.iterator().next();
+            for (MergedGroup mg : chapters) {
                 localSidesMap.computeIfAbsent(mg, k -> new ArrayList<>()).add(side);
             }
         }
 
         StringBuilder result = new StringBuilder();
-        Set<Node> outputtedSides = new HashSet<>();
         Set<MergedGroup> outputtedGroups = new HashSet<>();
 
         for (int i = 0; i < leaves.size(); i++) {
-            TraversalPattern leaf = leaves.get(i);
-            for (Node s : leaf.getSides(graph)) {
-                if (!aggMains.contains(s) && globalSides.contains(s) && !outputtedSides.contains(s)) {
-                    result.append("\n<DEPENDENCY>");
-                    result.append("\n    ").append(s.baseXml(graph).replace("\n", "\n    "));
-                    result.append("\n</DEPENDENCY>");
-                    outputtedSides.add(s);
-                }
-            }
             for (MergedGroup mg : mergedGroups) {
                 if (!outputtedGroups.contains(mg) && groupLatestIndex.get(mg) == i) {
                     result.append("\n").append(buildSubChapterXml(mg, graph, leaves, localSidesMap));
@@ -170,14 +159,7 @@ public class AggregatorPattern extends TraversalPattern {
         List<Node> localSides = localSidesMap.getOrDefault(mergedGroup, List.of());
         if (!localSides.isEmpty()) {
             sb.append("\n    <DEPENDENCY>");
-            List<Node> sortedLocalSides = new ArrayList<>(localSides);
-            sortedLocalSides.sort(Comparator.comparingInt(s -> {
-                for (int i = 0; i < leaves.size(); i++) {
-                    if (leaves.get(i).getSides(graph).contains(s)) return i;
-                }
-                return leaves.size();
-            }));
-            for (Node side : sortedLocalSides) {
+            for (Node side : localSides) {
                 sb.append("\n        ").append(side.baseXml(graph).replace("\n", "\n        "));
             }
             sb.append("\n    </DEPENDENCY>");
