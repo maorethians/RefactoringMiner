@@ -137,9 +137,9 @@ public class AggregatorPattern extends TraversalPattern {
             TraversalPattern leaf = leaves.get(i);
             for (Node s : leaf.getSides(graph)) {
                 if (!aggMains.contains(s) && globalSides.contains(s) && !outputtedSides.contains(s)) {
-                    result.append("<DEPENDENCY>");
+                    result.append("\n<DEPENDENCY>");
                     result.append("\n    ").append(s.baseXml(graph).replace("\n", "\n    "));
-                    result.append("\n</DEPENDENCY>\n");
+                    result.append("\n</DEPENDENCY>");
                     outputtedSides.add(s);
                 }
             }
