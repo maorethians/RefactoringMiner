@@ -148,27 +148,27 @@ public class AggregatorPattern extends TraversalPattern {
         StringBuilder sb = new StringBuilder();
         sb.append("<SUB_CHAPTER>");
 
-        Set<String> contextsText = new HashSet<>();
-        for (Node context : mergedGroup.context) {
-            contextsText.add(context.mappingXml(graph));
+        for (MappingGroup mg : mergedGroup.groups) {
+            sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    "));
         }
-        if (!contextsText.isEmpty()) {
-            sb.append("\n    <CONTEXT>\n        ");
-            sb.append(String.join("\n        ", contextsText.stream().map(contextText -> contextText.replace("\n", "\n        ")).toList()));
+
+        if (!mergedGroup.context.isEmpty()) {
+            sb.append("\n    <CONTEXT>");
+            Set<String> contextsText = new HashSet<>();
+            for (Node context : mergedGroup.context) {
+                contextsText.add(context.mappingXml(graph));
+            }
+            sb.append("\n        ").append(String.join("\n        ", contextsText.stream().map(text -> text.replace("\n", "\n        ")).toList()));
             sb.append("\n    </CONTEXT>");
         }
 
         List<Node> localSides = localSidesMap.getOrDefault(mergedGroup, List.of());
         if (!localSides.isEmpty()) {
-            sb.append("\n    <DEPENDENCY>");
+            sb.append("\n    <DEPENDENCIES>");
             for (Node side : localSides) {
                 sb.append("\n        ").append(side.baseXml(graph).replace("\n", "\n        "));
             }
-            sb.append("\n    </DEPENDENCY>");
-        }
-
-        for (MappingGroup mg : mergedGroup.groups) {
-            sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    "));
+            sb.append("\n    </DEPENDENCIES>");
         }
 
         sb.append("\n</SUB_CHAPTER>");
