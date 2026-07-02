@@ -63,8 +63,10 @@ public class AggregatorPattern extends TraversalPattern {
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
 
         Set<Node> allMainsSet = new HashSet<>(aggMains);
-        for (TraversalPattern fp : filterPatterns) {
-            allMainsSet.addAll(fp.getMains(graph));
+        if (filterPatterns != null) {
+            for (TraversalPattern fp : filterPatterns) {
+                allMainsSet.addAll(fp.getMains(graph));
+            }
         }
         Map<Node, Set<Node>> sideToMains = new HashMap<>();
         for (TraversalPattern leaf : leaves) {

@@ -190,10 +190,12 @@ public class McpHandler {
         }
     }
 
-    private int getChapterLines(TraversalPattern chapter, List<Cluster> clusters, GrainLevel level) {
+    private int getChapterLines(List<TraversalPattern> chapters, int index, List<Cluster> clusters, GrainLevel level) {
+        TraversalPattern chapter = chapters.get(index);
         Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
         if (cluster == null) return 0;
-        String content = chapter.extended(cluster.getGraph(), level, null);
+        List<TraversalPattern> filterPatterns = index > 0 ? chapters.subList(0, index) : java.util.Collections.emptyList();
+        String content = chapter.extended(cluster.getGraph(), level, filterPatterns);
         return content.split("\n").length;
     }
 
@@ -242,10 +244,10 @@ public class McpHandler {
 
         int endProgress = startProgress + 1;
         int totalLinesInBatch = 0;
-        totalLinesInBatch += getChapterLines(chapters.get(startProgress), clusters, level);
+        totalLinesInBatch += getChapterLines(chapters, startProgress, clusters, level);
 
         while (endProgress < chapters.size()) {
-            int nextChapterLines = getChapterLines(chapters.get(endProgress), clusters, level);
+            int nextChapterLines = getChapterLines(chapters, endProgress, clusters, level);
             if (totalLinesInBatch + nextChapterLines > 800) {
                 break;
             }
@@ -265,7 +267,8 @@ public class McpHandler {
                 continue;
             }
 
-            String content = chapterPattern.extended(cluster.getGraph(), level, null);
+            List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : java.util.Collections.emptyList();
+            String content = chapterPattern.extended(cluster.getGraph(), level, filterPatterns);
             output.append(String.format("[Chapter %d of %d]\n", i + 1, chapters.size()));
             output.append(content).append("\n\n");
         }
@@ -322,7 +325,8 @@ public class McpHandler {
             return "Error: Could not find associated cluster for the current chapter.";
         }
 
-        String content = chapterPattern.extended(cluster.getGraph(), level, null);
+        List<TraversalPattern> filterPatterns = progress > 0 ? chapters.subList(0, progress) : java.util.Collections.emptyList();
+        String content = chapterPattern.extended(cluster.getGraph(), level, filterPatterns);
         int currentChapter = progress + 1;
         int totalChapters = chapters.size();
 
@@ -379,10 +383,12 @@ public class McpHandler {
                 double totalLines = 0;
                 double maxLines = 0;
 
-                for (TraversalPattern chapter : chapters) {
+                for (int i = 0; i < chapters.size(); i++) {
+                    TraversalPattern chapter = chapters.get(i);
                     Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
                     if (cluster != null) {
-                        String content = chapter.extended(cluster.getGraph(), level, null);
+                        List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : java.util.Collections.emptyList();
+                        String content = chapter.extended(cluster.getGraph(), level, filterPatterns);
                         int lines = content.split("\n").length;
 
                         totalLines += lines;
