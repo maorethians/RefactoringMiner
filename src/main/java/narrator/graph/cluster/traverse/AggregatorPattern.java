@@ -13,7 +13,6 @@ public class AggregatorPattern extends TraversalPattern {
 
     @Override
     public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
-        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         List<Node> aggMains = getMains(graph);
 
         List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, aggMains);
@@ -61,6 +60,8 @@ public class AggregatorPattern extends TraversalPattern {
             }
         }
 
+        List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
+
         Map<Node, Set<Node>> sideToMains = new HashMap<>();
         for (TraversalPattern leaf : leaves) {
             List<Node> leafMains = leaf.getMains(graph);
@@ -85,28 +86,26 @@ public class AggregatorPattern extends TraversalPattern {
             }
         }
 
-        Map<MergedGroup, Integer> groupEarliestIndex = new HashMap<>();
+        Map<MergedGroup, Integer> groupLatestIndex = new HashMap<>();
         for (MergedGroup mg : mergedGroups) {
-            int minIdx = Integer.MAX_VALUE;
+            int maxIdx = -1;
             for (MappingGroup group : mg.groups) {
                 for (Node n : group.sources()) {
-                    for (int i = 0; i < leaves.size(); i++) {
+                    for (int i = leaves.size() - 1; i >= 0; i--) {
                         if (leaves.get(i).getMains(graph).contains(n)) {
-                            minIdx = Math.min(minIdx, i);
-                            break;
+                            maxIdx = Math.max(maxIdx, i);
                         }
                     }
                 }
                 for (Node n : group.targets()) {
-                    for (int i = 0; i < leaves.size(); i++) {
+                    for (int i = leaves.size() - 1; i >= 0; i--) {
                         if (leaves.get(i).getMains(graph).contains(n)) {
-                            minIdx = Math.min(minIdx, i);
-                            break;
+                            maxIdx = Math.max(maxIdx, i);
                         }
                     }
                 }
             }
-            groupEarliestIndex.put(mg, minIdx);
+            groupLatestIndex.put(mg, maxIdx);
         }
 
         Set<Node> globalSides = new HashSet<>();
@@ -144,7 +143,7 @@ public class AggregatorPattern extends TraversalPattern {
                 }
             }
             for (MergedGroup mg : mergedGroups) {
-                if (!outputtedGroups.contains(mg) && groupEarliestIndex.get(mg) == i) {
+                if (!outputtedGroups.contains(mg) && groupLatestIndex.get(mg) == i) {
                     result.append("\n").append(buildSubChapterXml(mg, graph, leaves, localSidesMap));
                     outputtedGroups.add(mg);
                 }
