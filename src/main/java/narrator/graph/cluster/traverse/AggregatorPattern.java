@@ -2,6 +2,7 @@ package narrator.graph.cluster.traverse;
 
 import narrator.graph.Edge;
 import narrator.graph.Node;
+import narrator.graph.NodeType;
 import org.jgrapht.Graph;
 
 import java.util.*;
@@ -73,7 +74,7 @@ public class AggregatorPattern extends TraversalPattern {
             List<Node> leafMains = leaf.getMains(graph);
             List<Node> leafSides = leaf.getSides(graph);
             for (Node side : leafSides) {
-                if (side.isContext() || allMainsSet.contains(side)) {
+                if ((side.isContext() && !side.getNodeType().equals(NodeType.SEMANTIC_CONTEXT)) || allMainsSet.contains(side)) {
                     continue;
                 }
 
