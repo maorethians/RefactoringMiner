@@ -172,7 +172,8 @@ public class TraversalPattern extends GraphWrapper {
         if (visited.contains(p)) return;
         visited.add(p);
 
-        if (p instanceof AggregatorPattern agg) {
+        // UsagePattern subs lead to cross dependency which contradicts the idea of "dependsOn"
+        if (p instanceof AggregatorPattern agg && !(p instanceof UsagePattern)) {
             for (TraversalPattern sub : agg.subs) {
                 flattenRecursive(sub, visited, result);
             }
