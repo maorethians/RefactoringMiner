@@ -3,29 +3,40 @@ package narrator.mcp;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import narrator.Driver;
 import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.cluster.Cluster;
 import narrator.graph.cluster.Clusterer;
-import narrator.graph.cluster.traverse.Leaf;
-import narrator.graph.cluster.traverse.Narrator;
-import narrator.graph.cluster.traverse.TraversalComponent;
-import narrator.graph.cluster.traverse.TraversalEngine;
-import narrator.graph.cluster.traverse.TraversalPattern;
-import narrator.graph.cluster.traverse.ReasonType;
-import narrator.graph.cluster.traverse.GrainLevel;
+import narrator.graph.cluster.traverse.*;
 import narrator.mcp.html.NarrativeHtmlGenerator;
 import org.jgrapht.Graph;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class McpHandler {
     private static final Logger logger = LoggerFactory.getLogger(McpHandler.class);
     private static final CacheManager cacheManager = new CacheManager();
+    private final int THRESHOLD = 200;
+
+    private static void sendToolError(JsonObject response, int code, String message) {
+        JsonObject error = new JsonObject();
+        error.addProperty("code", code);
+        error.addProperty("message", message);
+        response.add("error", error);
+        response.add("result", JsonNull.INSTANCE);
+    }
+
+    private static void sendMethodNotFound(JsonObject response) {
+        JsonObject error = new JsonObject();
+        error.addProperty("code", -32601);
+        error.addProperty("message", "Method not found");
+        response.add("error", error);
+        response.add("result", JsonNull.INSTANCE);
+    }
 
     public JsonObject handle(JsonObject request) {
         logger.debug("Handling MCP request: {}", request);
@@ -110,22 +121,6 @@ public class McpHandler {
         return tool;
     }
 
-    private static void sendToolError(JsonObject response, int code, String message) {
-        JsonObject error = new JsonObject();
-        error.addProperty("code", code);
-        error.addProperty("message", message);
-        response.add("error", error);
-        response.add("result", JsonNull.INSTANCE);
-    }
-
-    private static void sendMethodNotFound(JsonObject response) {
-        JsonObject error = new JsonObject();
-        error.addProperty("code", -32601);
-        error.addProperty("message", "Method not found");
-        response.add("error", error);
-        response.add("result", JsonNull.INSTANCE);
-    }
-
     private void handleCallTool(JsonObject request, JsonObject response) {
         JsonObject params = request.getAsJsonObject("params");
         if (params == null) {
@@ -190,6 +185,62 @@ public class McpHandler {
         }
     }
 
+    private List<List<NarrativeElement>> createBalancedSplits(List<NarrativeElement> elements) {
+        int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
+        if (totalLines <= THRESHOLD) {
+            return List.of(elements);
+        }
+
+        for (int n = 2; n <= elements.size(); n++) {
+            List<List<NarrativeElement>> splits = splitIntoN(elements, n);
+            boolean anyBelow = splits.stream().anyMatch(s -> s.stream().mapToInt(NarrativeElement::lineCount).sum() <= THRESHOLD);
+            if (anyBelow) {
+                return splits;
+            }
+        }
+        return List.of(elements);
+    }
+
+    private List<List<NarrativeElement>> splitIntoN(List<NarrativeElement> elements, int n) {
+        List<List<NarrativeElement>> splits = new ArrayList<>();
+        int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
+        double target = (double) totalLines / n;
+
+        int currentStart = 0;
+        for (int i = 0; i < n - 1; i++) {
+            int bestEnd = currentStart;
+            double minDiff = Double.MAX_VALUE;
+            double currentSum = 0;
+
+            for (int j = currentStart; j < elements.size(); j++) {
+                currentSum += elements.get(j).lineCount();
+                double diff = Math.abs(currentSum - target);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    bestEnd = j + 1;
+                } else {
+                    break;
+                }
+            }
+            splits.add(new ArrayList<>(elements.subList(currentStart, bestEnd)));
+            currentStart = bestEnd;
+        }
+        splits.add(new ArrayList<>(elements.subList(currentStart, elements.size())));
+        return splits;
+    }
+
+    private String buildSplitContent(List<NarrativeElement> elements, int chapterIdx, int totalChapters, int splitIdx, int totalSplits) {
+        StringBuilder sb = new StringBuilder();
+        if (totalSplits > 1) {
+            sb.append(String.format("[Chapter %d of %d - Split %d of %d]\n\n",
+                    chapterIdx, totalChapters, splitIdx, totalSplits));
+        } else {
+            sb.append(String.format("[Chapter %d of %d]\n", chapterIdx, totalChapters));
+        }
+        sb.append(String.join("\n", elements.stream().map(NarrativeElement::content).toList()));
+        return sb.toString();
+    }
+
     private int getChapterLines(List<TraversalPattern> chapters, int index, List<Cluster> clusters, GrainLevel level) {
         TraversalPattern chapter = chapters.get(index);
         Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
@@ -242,13 +293,84 @@ public class McpHandler {
 
         List<Cluster> clusters = getOrComputeClusters(url);
 
+        // 1. Handle resuming a split chapter
+        if (narrator.getSubChapterProgress(level) > 0) {
+            TraversalPattern currentChapter = chapters.get(startProgress);
+            Cluster cluster = findClusterForNode(currentChapter.getLead(), clusters);
+            if (cluster == null) {
+                narrator.setSubChapterProgress(level, 0);
+                narrator.incrementProgress(level);
+                return getNextBatch(url, grainLevelStr);
+            }
+
+            List<TraversalPattern> filterPatterns = startProgress > 0 ? chapters.subList(0, startProgress) : java.util.Collections.emptyList();
+            List<NarrativeElement> elements = (currentChapter instanceof AggregatorPattern agg)
+                    ? agg.getElements(cluster.getGraph(), filterPatterns)
+                    : java.util.Collections.emptyList();
+
+            List<List<NarrativeElement>> splits = createBalancedSplits(elements);
+            int splitIdx = narrator.getSubChapterProgress(level);
+
+            if (splitIdx > splits.size()) {
+                narrator.setSubChapterProgress(level, 0);
+                narrator.incrementProgress(level);
+                return getNextBatch(url, grainLevelStr);
+            }
+
+            String content = buildSplitContent(splits.get(splitIdx - 1), startProgress + 1, chapters.size(), splitIdx, splits.size());
+            narrator.setSubChapterProgress(level, splitIdx + 1);
+            if (splitIdx >= splits.size()) {
+                narrator.setSubChapterProgress(level, 0);
+                narrator.incrementProgress(level);
+            }
+
+            StringBuilder output = new StringBuilder();
+            output.append(content);
+            if (startProgress + 1 < chapters.size() || narrator.getSubChapterProgress(level) > 0) {
+                output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
+            } else {
+                output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
+            }
+            return output.toString();
+        }
+
+        // 2. Start building a new batch
+        int firstChapterLines = getChapterLines(chapters, startProgress, clusters, level);
+        TraversalPattern firstChapter = chapters.get(startProgress);
+
+        if (firstChapterLines > THRESHOLD && firstChapter instanceof AggregatorPattern) {
+            Cluster cluster = findClusterForNode(firstChapter.getLead(), clusters);
+            List<TraversalPattern> filterPatterns = startProgress > 0 ? chapters.subList(0, startProgress) : java.util.Collections.emptyList();
+            List<NarrativeElement> elements = ((AggregatorPattern) firstChapter).getElements(cluster.getGraph(), filterPatterns);
+            List<List<NarrativeElement>> splits = createBalancedSplits(elements);
+
+            narrator.setSubChapterProgress(level, 1);
+            String content = buildSplitContent(splits.get(0), startProgress + 1, chapters.size(), 1, splits.size());
+
+            if (splits.size() == 1) {
+                narrator.setSubChapterProgress(level, 0);
+                narrator.incrementProgress(level);
+            } else {
+                narrator.setSubChapterProgress(level, 2);
+            }
+
+            StringBuilder output = new StringBuilder();
+            output.append(content);
+            if (startProgress + 1 < chapters.size() || narrator.getSubChapterProgress(level) > 0) {
+                output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
+            } else {
+                output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
+            }
+            return output.toString();
+        }
+
+        // Regular batching for smaller chapters
         int endProgress = startProgress + 1;
-        int totalLinesInBatch = 0;
-        totalLinesInBatch += getChapterLines(chapters, startProgress, clusters, level);
+        int totalLinesInBatch = firstChapterLines;
 
         while (endProgress < chapters.size()) {
             int nextChapterLines = getChapterLines(chapters, endProgress, clusters, level);
-            if (totalLinesInBatch + nextChapterLines > 800) {
+            if (totalLinesInBatch + nextChapterLines > THRESHOLD) {
                 break;
             }
             totalLinesInBatch += nextChapterLines;
@@ -257,21 +379,26 @@ public class McpHandler {
 
         StringBuilder output = new StringBuilder();
         output.append(String.format("Retrieving next %d chapters (Chapters %d to %d) for GrainLevel: %s\n\n",
-            endProgress - startProgress, startProgress + 1, endProgress, level));
+                endProgress - startProgress, startProgress + 1, endProgress, level));
 
+        List<String> chaptersString = new ArrayList<>();
         for (int i = startProgress; i < endProgress; i++) {
             TraversalPattern chapterPattern = chapters.get(i);
             Cluster cluster = findClusterForNode(chapterPattern.getLead(), clusters);
             if (cluster == null) {
-                output.append(String.format("[Chapter %d]: Error: Could not find associated cluster.\n\n", i + 1));
+                chaptersString.add(String.format("[Chapter %d]: Error: Could not find associated cluster.\n\n", i + 1));
                 continue;
             }
 
+            StringBuilder chapterString = new StringBuilder();
             List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : java.util.Collections.emptyList();
             String content = chapterPattern.extended(cluster.getGraph(), level, filterPatterns);
-            output.append(String.format("[Chapter %d of %d]\n", i + 1, chapters.size()));
-            output.append(content).append("\n\n");
+            chapterString.append(String.format("[Chapter %d of %d]\n", i + 1, chapters.size()));
+            chapterString.append(content);
+
+            chaptersString.add(chapterString.toString());
         }
+        output.append(String.join("\n\n", chaptersString));
 
         int chaptersRead = endProgress - startProgress;
         for (int i = 0; i < chaptersRead; i++) {
@@ -281,7 +408,7 @@ public class McpHandler {
         if (endProgress < chapters.size()) {
             output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
         } else {
-            output.append("\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
+            output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
         }
 
         return output.toString();
@@ -398,8 +525,7 @@ public class McpHandler {
 
                 double avgLines = count > 0 ? totalLines / count : 0;
 
-                summary.append(String.format("%-20s | %-10d | %-10.1f | %-10.1f\n",
-                    level, count, avgLines, maxLines));
+                summary.append(String.format("%-20s | %-10d | %-10.1f | %-10.1f\n", level, count, avgLines, maxLines));
             }
             summary.append("\n\nPlease analyze the metadata and decide which GrainLevel to use for the review.");
         } else {

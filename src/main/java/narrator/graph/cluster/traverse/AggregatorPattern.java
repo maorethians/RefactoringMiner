@@ -12,8 +12,7 @@ public class AggregatorPattern extends TraversalPattern {
 
     Set<TraversalPattern> subs = new HashSet<>();
 
-    @Override
-    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
+    public List<NarrativeElement> getElements(Graph<Node, Edge> graph, List<TraversalPattern> filterPatterns) {
         List<Node> aggMains = getMains(graph);
 
         List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, aggMains);
@@ -137,7 +136,7 @@ public class AggregatorPattern extends TraversalPattern {
             }
         }
 
-        StringBuilder result = new StringBuilder();
+        List<NarrativeElement> elements = new ArrayList<>();
         Set<Node> outputtedSides = new HashSet<>();
         Set<MergedGroup> outputtedGroups = new HashSet<>();
 
@@ -145,21 +144,26 @@ public class AggregatorPattern extends TraversalPattern {
             TraversalPattern leaf = leaves.get(i);
             for (Node s : leaf.getSides(graph)) {
                 if (!aggMains.contains(s) && globalSides.contains(s) && !outputtedSides.contains(s)) {
-                    result.append("\n<DEPENDENCY>");
-                    result.append("\n    ").append(s.baseXml(graph).replace("\n", "\n    "));
-                    result.append("\n</DEPENDENCY>");
+                    String content = "<DEPENDENCY>\n    " + s.baseXml(graph).replace("\n", "\n    ") + "\n</DEPENDENCY>";
+                    elements.add(new NarrativeElement(content, content.split("\n").length, NarrativeElement.ElementType.DEPENDENCY));
                     outputtedSides.add(s);
                 }
             }
             for (MergedGroup mg : mergedGroups) {
                 if (!outputtedGroups.contains(mg) && groupLatestIndex.get(mg) == i) {
-                    result.append("\n").append(buildSubChapterXml(mg, graph, leaves, localSidesMap));
+                    String content = buildSubChapterXml(mg, graph, leaves, localSidesMap);
+                    elements.add(new NarrativeElement(content, content.split("\n").length, NarrativeElement.ElementType.SUB_CHAPTER));
                     outputtedGroups.add(mg);
                 }
             }
         }
 
-        return result.toString();
+        return elements;
+    }
+
+    @Override
+    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
+        return String.join("\n", getElements(graph, filterPatterns).stream().map(NarrativeElement::content).toList());
     }
 
     private String buildSubChapterXml(MergedGroup mergedGroup, Graph<Node, Edge> graph, List<TraversalPattern> leaves, Map<MergedGroup, List<Node>> localSidesMap) {
