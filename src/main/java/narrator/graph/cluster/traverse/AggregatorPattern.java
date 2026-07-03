@@ -73,12 +73,14 @@ public class AggregatorPattern extends TraversalPattern {
             List<Node> leafMains = leaf.getMains(graph);
             List<Node> leafSides = leaf.getSides(graph);
             for (Node side : leafSides) {
-                if (!allMainsSet.contains(side)) {
-                    Set<Node> relyingMains = sideToMains.computeIfAbsent(side, k -> new HashSet<>());
-                    for (Node m : leafMains) {
-                        if (allMainsSet.contains(m)) {
-                            relyingMains.add(m);
-                        }
+                if (side.isContext() || allMainsSet.contains(side)) {
+                    continue;
+                }
+
+                Set<Node> relyingMains = sideToMains.computeIfAbsent(side, k -> new HashSet<>());
+                for (Node m : leafMains) {
+                    if (allMainsSet.contains(m)) {
+                        relyingMains.add(m);
                     }
                 }
             }
