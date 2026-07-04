@@ -378,8 +378,6 @@ public class McpHandler {
         }
 
         StringBuilder output = new StringBuilder();
-        output.append(String.format("Retrieving next %d chapters (Chapters %d to %d) for GrainLevel: %s\n\n",
-                endProgress - startProgress, startProgress + 1, endProgress, level));
 
         List<String> chaptersString = new ArrayList<>();
         for (int i = startProgress; i < endProgress; i++) {
