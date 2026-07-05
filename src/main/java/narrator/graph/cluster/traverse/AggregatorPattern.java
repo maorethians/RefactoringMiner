@@ -15,7 +15,10 @@ public class AggregatorPattern extends TraversalPattern {
     public List<NarrativeElement> getElements(Graph<Node, Edge> graph, List<TraversalPattern> filterPatterns) {
         List<Node> aggMains = getMains(graph);
 
+        // Merge Mains by Mapping
         List<MappingGroup> mappingGroups = TraversalPattern.aggregateByMapping(graph, aggMains);
+
+        // Get Group Contexts
         Map<MappingGroup, Set<Node>> mappingGroupContexts = new HashMap<>();
         for (MappingGroup mg : mappingGroups) {
             Set<Node> contexts = new HashSet<>();
@@ -38,6 +41,7 @@ public class AggregatorPattern extends TraversalPattern {
             mappingGroupContexts.put(mg, filterLargest(contexts, graph));
         }
 
+        // Merge Groups by Context
         List<MergedGroup> mergedGroups = new ArrayList<>();
         for (Map.Entry<MappingGroup, Set<Node>> entry : mappingGroupContexts.entrySet()) {
             MappingGroup mg = entry.getKey();
@@ -62,10 +66,11 @@ public class AggregatorPattern extends TraversalPattern {
 
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
 
-        Set<Node> allMainsSet = new HashSet<>(aggMains);
+        // Side to Mains Mappings
+        Set<Node> allMains = new HashSet<>(aggMains);
         if (filterPatterns != null) {
             for (TraversalPattern fp : filterPatterns) {
-                allMainsSet.addAll(fp.getMains(graph));
+                allMains.addAll(fp.getMains(graph));
             }
         }
         Map<Node, Set<Node>> sideToMains = new HashMap<>();
@@ -73,27 +78,29 @@ public class AggregatorPattern extends TraversalPattern {
             List<Node> leafMains = leaf.getMains(graph);
             List<Node> leafSides = leaf.getSides(graph);
             for (Node side : leafSides) {
-                if ((side.isContext() && !side.getNodeType().equals(NodeType.SEMANTIC_CONTEXT)) || allMainsSet.contains(side)) {
+                if ((side.isContext() && !side.getNodeType().equals(NodeType.SEMANTIC_CONTEXT)) || allMains.contains(side)) {
                     continue;
                 }
 
                 Set<Node> relyingMains = sideToMains.computeIfAbsent(side, k -> new HashSet<>());
                 for (Node m : leafMains) {
-                    if (allMainsSet.contains(m)) {
+                    if (allMains.contains(m)) {
                         relyingMains.add(m);
                     }
                 }
             }
         }
 
-        Map<Node, MergedGroup> mainToSubChapter = new HashMap<>();
+        // Main to Group Mappings (Each Main Maps to Only 1 Group)
+        Map<Node, MergedGroup> mainToGroup = new HashMap<>();
         for (MergedGroup mg : mergedGroups) {
             for (MappingGroup group : mg.groups) {
-                for (Node n : group.sources()) mainToSubChapter.put(n, mg);
-                for (Node n : group.targets()) mainToSubChapter.put(n, mg);
+                for (Node n : group.sources()) mainToGroup.put(n, mg);
+                for (Node n : group.targets()) mainToGroup.put(n, mg);
             }
         }
 
+        // TODO: Sort Must be Done By Dependency, Not Latest Index
         Map<MergedGroup, Integer> groupLatestIndex = new HashMap<>();
         for (MergedGroup mg : mergedGroups) {
             int maxIdx = -1;
@@ -116,15 +123,15 @@ public class AggregatorPattern extends TraversalPattern {
             groupLatestIndex.put(mg, maxIdx);
         }
 
+        // Identify Group Dependencies
         Set<Node> globalSides = new HashSet<>();
         Map<MergedGroup, List<Node>> localSidesMap = new HashMap<>();
-
         for (Map.Entry<Node, Set<Node>> entry : sideToMains.entrySet()) {
             Node side = entry.getKey();
             Set<Node> mains = entry.getValue();
             Set<MergedGroup> chapters = new HashSet<>();
             for (Node m : mains) {
-                MergedGroup mg = mainToSubChapter.get(m);
+                MergedGroup mg = mainToGroup.get(m);
                 if (mg != null) chapters.add(mg);
             }
 
@@ -136,21 +143,21 @@ public class AggregatorPattern extends TraversalPattern {
             }
         }
 
+        // Produce Elements
         List<NarrativeElement> elements = new ArrayList<>();
         Set<Node> outputtedSides = new HashSet<>();
         Set<MergedGroup> outputtedGroups = new HashSet<>();
-
         for (int i = 0; i < leaves.size(); i++) {
             TraversalPattern leaf = leaves.get(i);
             for (Node s : leaf.getSides(graph)) {
-                if (!aggMains.contains(s) && globalSides.contains(s) && !outputtedSides.contains(s)) {
+                if (globalSides.contains(s) && !outputtedSides.contains(s)) {
                     String content = "<DEPENDENCY>\n    " + s.baseXml(graph).replace("\n", "\n    ") + "\n</DEPENDENCY>";
                     elements.add(new NarrativeElement(content, content.split("\n").length, NarrativeElement.ElementType.DEPENDENCY));
                     outputtedSides.add(s);
                 }
             }
             for (MergedGroup mg : mergedGroups) {
-                if (!outputtedGroups.contains(mg) && groupLatestIndex.get(mg) == i) {
+                if (groupLatestIndex.get(mg) == i && !outputtedGroups.contains(mg)) {
                     String content = buildSubChapterXml(mg, graph, leaves, localSidesMap);
                     elements.add(new NarrativeElement(content, content.split("\n").length, NarrativeElement.ElementType.SUB_CHAPTER));
                     outputtedGroups.add(mg);

@@ -64,6 +64,7 @@ public class TraversalPattern extends GraphWrapper {
                 else dstNodes.add(n);
             }
 
+            // TODO: Sort by Dependency
             Comparator<Node> nodeComparator = Comparator.comparing(Node::getPath)
                     .thenComparingInt(n -> n.getTree().getPos());
             srcNodes.sort(nodeComparator);
