@@ -120,12 +120,4 @@ public class UsagePattern extends AggregatorPattern implements Leaf {
 
         return prompt.toString();
     }
-
-    @Override
-    public String extended(Graph<Node, Edge> graph, GrainLevel level, List<TraversalPattern> filterPatterns) {
-        if (level.equals(GrainLevel.LEAF)) {
-            return this.base();
-        }
-        return super.extended(graph, level, filterPatterns);
-    }
 }
