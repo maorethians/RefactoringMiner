@@ -19,8 +19,10 @@ public class Narrator {
 
     private final TraversalPattern rootPattern;
     private final Map<GrainLevel, List<TraversalPattern>> cache = new HashMap<>();
+    private final Map<GrainLevel, List<String>> flatCache = new HashMap<>();
     private final Map<GrainLevel, Integer> progressMap = new HashMap<>();
-    private final Map<GrainLevel, Integer> subChapterProgressMap = new HashMap<>();
+    public static final int THRESHOLD = 200;
+
 
     public Narrator(TraversalPattern rootPattern) {
         this.rootPattern = rootPattern;
@@ -108,25 +110,129 @@ public class Narrator {
         return cache.computeIfAbsent(grainLevel, this::narrate);
     }
 
+    public List<String> getFlatChapters(GrainLevel level, List<narrator.graph.cluster.Cluster> clusters) {
+        if (flatCache.containsKey(level)) {
+            return flatCache.get(level);
+        }
+
+        List<TraversalPattern> chapters = getNarrative(level);
+        if (chapters == null) return Collections.emptyList();
+
+        // 1. Expand original chapters into atomic units
+        List<ChapterUnit> units = new ArrayList<>();
+        for (int i = 0; i < chapters.size(); i++) {
+            TraversalPattern chapter = chapters.get(i);
+            narrator.graph.cluster.Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
+            if (cluster == null) {
+                units.add(new ChapterUnit(String.format("[Chapter %d of %d]: Error: Could not find associated cluster.\n\n", i + 1, chapters.size()), 0, i + 1));
+                continue;
+            }
+
+            List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : Collections.emptyList();
+
+            if (chapter instanceof AggregatorPattern agg) {
+                List<NarrativeElement> elements = agg.getElements(cluster.getGraph(), filterPatterns);
+                int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
+
+                if (totalLines > THRESHOLD) {
+                    List<List<NarrativeElement>> splits = createBalancedSplits(elements);
+                    for (int s = 0; s < splits.size(); s++) {
+                        String content = String.join("\n", splits.get(s).stream().map(NarrativeElement::content).toList());
+                        units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
+                    }
+                } else {
+                    String content = agg.extended(cluster.getGraph(), level, filterPatterns);
+                    units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
+                }
+            } else {
+                String content = chapter.extended(cluster.getGraph(), level, filterPatterns);
+                units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
+            }
+        }
+
+        // 2. Merge units into flat chapters
+        List<List<ChapterUnit>> mergedGroups = new ArrayList<>();
+        List<ChapterUnit> currentGroup = new ArrayList<>();
+        int currentSum = 0;
+
+        for (ChapterUnit unit : units) {
+            if (currentGroup.isEmpty() || (currentSum + unit.lines <= THRESHOLD)) {
+                currentGroup.add(unit);
+                currentSum += unit.lines;
+            } else {
+                mergedGroups.add(currentGroup);
+                currentGroup = new ArrayList<>();
+                currentGroup.add(unit);
+                currentSum = unit.lines;
+            }
+        }
+        if (!currentGroup.isEmpty()) {
+            mergedGroups.add(currentGroup);
+        }
+
+        // 3. Final formatting
+        List<String> flatChapters = new ArrayList<>();
+        for (List<ChapterUnit> group : mergedGroups) {
+            flatChapters.add(String.join("\n", group.stream().map(subGroup -> subGroup.content).toList()));
+        }
+
+        flatCache.put(level, flatChapters);
+        return flatChapters;
+    }
+
+    private record ChapterUnit(String content, int lines, int originalIdx) {}
+
+    private narrator.graph.cluster.Cluster findClusterForNode(narrator.graph.Node node, List<narrator.graph.cluster.Cluster> clusters) {
+        if (clusters.isEmpty()) return null;
+        for (narrator.graph.cluster.Cluster cluster : clusters) {
+            if (cluster.getGraph().vertexSet().contains(node)) return cluster;
+        }
+        return null;
+    }
+
+    private List<List<NarrativeElement>> createBalancedSplits(List<NarrativeElement> elements) {
+        int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
+        if (totalLines <= THRESHOLD) return List.of(elements);
+        for (int n = 2; n <= elements.size(); n++) {
+            List<List<NarrativeElement>> splits = splitIntoN(elements, n);
+            boolean anyBelow = splits.stream().anyMatch(s -> s.stream().mapToInt(NarrativeElement::lineCount).sum() <= THRESHOLD);
+            if (anyBelow) return splits;
+        }
+        return List.of(elements);
+    }
+
+    private List<List<NarrativeElement>> splitIntoN(List<NarrativeElement> elements, int n) {
+        List<List<NarrativeElement>> splits = new ArrayList<>();
+        int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
+        double target = (double) totalLines / n;
+        int currentStart = 0;
+        for (int i = 0; i < n - 1; i++) {
+            int bestEnd = currentStart;
+            double minDiff = Double.MAX_VALUE;
+            double currentSum = 0;
+            for (int j = currentStart; j < elements.size(); j++) {
+                currentSum += elements.get(j).lineCount();
+                double diff = Math.abs(currentSum - target);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    bestEnd = j + 1;
+                } else {
+                    break;
+                }
+            }
+            splits.add(new ArrayList<>(elements.subList(currentStart, bestEnd)));
+            currentStart = bestEnd;
+        }
+        splits.add(new ArrayList<>(elements.subList(currentStart, elements.size())));
+        return splits;
+    }
+
     public int getProgress(GrainLevel grainLevel) {
         return progressMap.getOrDefault(grainLevel, 0);
     }
 
-    public int getSubChapterProgress(GrainLevel grainLevel) {
-        return subChapterProgressMap.getOrDefault(grainLevel, 0);
-    }
-
-    public void setSubChapterProgress(GrainLevel grainLevel, int progress) {
-        subChapterProgressMap.put(grainLevel, progress);
-    }
-
-    public void resetSubChapterProgress(GrainLevel grainLevel) {
-        subChapterProgressMap.remove(grainLevel);
-    }
-
     public void incrementProgress(GrainLevel grainLevel) {
         progressMap.put(grainLevel, getProgress(grainLevel) + 1);
-        resetSubChapterProgress(grainLevel);
     }
 
     private List<TraversalPattern> narrate(GrainLevel grainLevel) {

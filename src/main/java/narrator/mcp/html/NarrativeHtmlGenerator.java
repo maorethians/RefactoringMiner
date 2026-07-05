@@ -31,11 +31,11 @@ public class NarrativeHtmlGenerator {
         }
 
         // 2. Generate Overview page
-        generateOverviewPage();
+        generateOverviewPage(clusters);
         return getOverviewPath();
     }
 
-    private void generateOverviewPage() throws IOException {
+    private void generateOverviewPage(List<Cluster> clusters) throws IOException {
         StringBuilder html = new StringBuilder();
         html.append(getHtmlHeader("Narrative Overview"));
         html.append("<div class='max-w-5xl mx-auto px-4 py-12'>");
@@ -46,7 +46,7 @@ public class NarrativeHtmlGenerator {
 
         html.append("<div class='grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6'>");
         for (GrainLevel level : GrainLevel.values()) {
-            int count = narrator.getNarrative(level).size();
+            int count = narrator.getFlatChapters(level, clusters).size();
             String filename = "grain_" + level.name().toLowerCase() + ".html";
             html.append("<a href='").append(filename).append("' class='group p-6 bg-white rounded-xl shadow-sm border border-slate-200 hover:border-indigo-500 hover:shadow-md transition-all duration-200'>");
             html.append("<div class='flex items-center justify-between mb-4'>");
@@ -63,7 +63,7 @@ public class NarrativeHtmlGenerator {
     }
 
     public void generateGrainLevelPage(GrainLevel level, List<Cluster> clusters, int expandedChapterIndex) throws IOException {
-        List<TraversalPattern> chapters = narrator.getNarrative(level);
+        List<String> chapters = narrator.getFlatChapters(level, clusters);
         StringBuilder html = new StringBuilder();
         html.append(getHtmlHeader(level + " Overview"));
         html.append("<div class='max-w-4xl mx-auto px-4 py-12'>");
@@ -75,9 +75,7 @@ public class NarrativeHtmlGenerator {
 
         html.append("<div class='space-y-6'>");
         for (int i = 0; i < chapters.size(); i++) {
-            TraversalPattern pattern = chapters.get(i);
-            Cluster cluster = findClusterForNode(pattern.getLead(), clusters);
-            String content = (cluster != null) ? pattern.extended(cluster.getGraph(), level, null) : "[Content unavailable]";
+            String content = chapters.get(i);
 
             String openAttr = (i == expandedChapterIndex) ? " open" : "";
             html.append("<details").append(openAttr).append(" class='group bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all duration-200'>");

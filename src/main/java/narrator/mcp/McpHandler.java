@@ -20,7 +20,6 @@ import java.util.List;
 public class McpHandler {
     private static final Logger logger = LoggerFactory.getLogger(McpHandler.class);
     private static final CacheManager cacheManager = new CacheManager();
-    private final int THRESHOLD = 200;
 
     private static void sendToolError(JsonObject response, int code, String message) {
         JsonObject error = new JsonObject();
@@ -185,85 +184,6 @@ public class McpHandler {
         }
     }
 
-    private List<List<NarrativeElement>> createBalancedSplits(List<NarrativeElement> elements) {
-        int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
-        if (totalLines <= THRESHOLD) {
-            return List.of(elements);
-        }
-
-        for (int n = 2; n <= elements.size(); n++) {
-            List<List<NarrativeElement>> splits = splitIntoN(elements, n);
-            boolean anyBelow = splits.stream().anyMatch(s -> s.stream().mapToInt(NarrativeElement::lineCount).sum() <= THRESHOLD);
-            if (anyBelow) {
-                return splits;
-            }
-        }
-        return List.of(elements);
-    }
-
-    private List<List<NarrativeElement>> splitIntoN(List<NarrativeElement> elements, int n) {
-        List<List<NarrativeElement>> splits = new ArrayList<>();
-        int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
-        double target = (double) totalLines / n;
-
-        int currentStart = 0;
-        for (int i = 0; i < n - 1; i++) {
-            int bestEnd = currentStart;
-            double minDiff = Double.MAX_VALUE;
-            double currentSum = 0;
-
-            for (int j = currentStart; j < elements.size(); j++) {
-                currentSum += elements.get(j).lineCount();
-                double diff = Math.abs(currentSum - target);
-                if (diff < minDiff) {
-                    minDiff = diff;
-                    bestEnd = j + 1;
-                } else {
-                    break;
-                }
-            }
-            splits.add(new ArrayList<>(elements.subList(currentStart, bestEnd)));
-            currentStart = bestEnd;
-        }
-        splits.add(new ArrayList<>(elements.subList(currentStart, elements.size())));
-        return splits;
-    }
-
-    private String buildSplitContent(List<NarrativeElement> elements, int chapterIdx, int totalChapters, int splitIdx, int totalSplits) {
-        StringBuilder sb = new StringBuilder();
-        if (totalSplits > 1) {
-            sb.append(String.format("[Chapter %d of %d - Split %d of %d]\n\n",
-                    chapterIdx, totalChapters, splitIdx, totalSplits));
-        } else {
-            sb.append(String.format("[Chapter %d of %d]\n", chapterIdx, totalChapters));
-        }
-        sb.append(String.join("\n", elements.stream().map(NarrativeElement::content).toList()));
-        return sb.toString();
-    }
-
-    private int getChapterLines(List<TraversalPattern> chapters, int index, List<Cluster> clusters, GrainLevel level) {
-        TraversalPattern chapter = chapters.get(index);
-        Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
-        if (cluster == null) return 0;
-        List<TraversalPattern> filterPatterns = index > 0 ? chapters.subList(0, index) : java.util.Collections.emptyList();
-        String content = chapter.extended(cluster.getGraph(), level, filterPatterns);
-        return content.split("\n").length;
-    }
-
-    private Cluster findClusterForNode(Node node, List<Cluster> clusters) {
-        if (clusters.isEmpty()) {
-            return null;
-        }
-
-        for (Cluster cluster : clusters) {
-            if (cluster.getGraph().vertexSet().contains(node)) {
-                return cluster;
-            }
-        }
-
-        return null;
-    }
-
     private String getHierarchyCacheKey(String url) {
         return "hierarchy:" + url;
     }
@@ -281,129 +201,24 @@ public class McpHandler {
             return "No narrative initialized for this URL. Please call init_narrative first.";
         }
         Narrator narrator = root.getNarrator();
-        List<TraversalPattern> chapters = narrator.getNarrative(level);
-        if (chapters == null) {
-            return "Narrative state lost. Please call init_narrative again.";
-        }
+        List<Cluster> clusters = getOrComputeClusters(url);
+        List<String> flatChapters = narrator.getFlatChapters(level, clusters);
 
         int startProgress = narrator.getProgress(level);
-        if (startProgress >= chapters.size()) {
+        if (startProgress >= flatChapters.size()) {
             return "[End of Narrative] All chapters for grain level " + level + " have been read.";
         }
 
-        List<Cluster> clusters = getOrComputeClusters(url);
-
-        // 1. Handle resuming a split chapter
-        if (narrator.getSubChapterProgress(level) > 0) {
-            TraversalPattern currentChapter = chapters.get(startProgress);
-            Cluster cluster = findClusterForNode(currentChapter.getLead(), clusters);
-            if (cluster == null) {
-                narrator.setSubChapterProgress(level, 0);
-                narrator.incrementProgress(level);
-                return getNextBatch(url, grainLevelStr);
-            }
-
-            List<TraversalPattern> filterPatterns = startProgress > 0 ? chapters.subList(0, startProgress) : java.util.Collections.emptyList();
-            List<NarrativeElement> elements = (currentChapter instanceof AggregatorPattern agg)
-                    ? agg.getElements(cluster.getGraph(), filterPatterns)
-                    : java.util.Collections.emptyList();
-
-            List<List<NarrativeElement>> splits = createBalancedSplits(elements);
-            int splitIdx = narrator.getSubChapterProgress(level);
-
-            if (splitIdx > splits.size()) {
-                narrator.setSubChapterProgress(level, 0);
-                narrator.incrementProgress(level);
-                return getNextBatch(url, grainLevelStr);
-            }
-
-            String content = buildSplitContent(splits.get(splitIdx - 1), startProgress + 1, chapters.size(), splitIdx, splits.size());
-            narrator.setSubChapterProgress(level, splitIdx + 1);
-            if (splitIdx >= splits.size()) {
-                narrator.setSubChapterProgress(level, 0);
-                narrator.incrementProgress(level);
-            }
-
-            StringBuilder output = new StringBuilder();
-            output.append(content);
-            if (startProgress + 1 < chapters.size() || narrator.getSubChapterProgress(level) > 0) {
-                output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
-            } else {
-                output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
-            }
-            return output.toString();
-        }
-
-        // 2. Start building a new batch
-        int firstChapterLines = getChapterLines(chapters, startProgress, clusters, level);
-        TraversalPattern firstChapter = chapters.get(startProgress);
-
-        if (firstChapterLines > THRESHOLD && firstChapter instanceof AggregatorPattern) {
-            Cluster cluster = findClusterForNode(firstChapter.getLead(), clusters);
-            List<TraversalPattern> filterPatterns = startProgress > 0 ? chapters.subList(0, startProgress) : java.util.Collections.emptyList();
-            List<NarrativeElement> elements = ((AggregatorPattern) firstChapter).getElements(cluster.getGraph(), filterPatterns);
-            List<List<NarrativeElement>> splits = createBalancedSplits(elements);
-
-            narrator.setSubChapterProgress(level, 1);
-            String content = buildSplitContent(splits.get(0), startProgress + 1, chapters.size(), 1, splits.size());
-
-            if (splits.size() == 1) {
-                narrator.setSubChapterProgress(level, 0);
-                narrator.incrementProgress(level);
-            } else {
-                narrator.setSubChapterProgress(level, 2);
-            }
-
-            StringBuilder output = new StringBuilder();
-            output.append(content);
-            if (startProgress + 1 < chapters.size() || narrator.getSubChapterProgress(level) > 0) {
-                output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
-            } else {
-                output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
-            }
-            return output.toString();
-        }
-
-        // Regular batching for smaller chapters
-        int endProgress = startProgress + 1;
-        int totalLinesInBatch = firstChapterLines;
-
-        while (endProgress < chapters.size()) {
-            int nextChapterLines = getChapterLines(chapters, endProgress, clusters, level);
-            if (totalLinesInBatch + nextChapterLines > THRESHOLD) {
-                break;
-            }
-            totalLinesInBatch += nextChapterLines;
-            endProgress++;
-        }
+        // Since Narrator already produces chapters balanced to the threshold,
+        // we just return the next single flat chapter.
+        String content = flatChapters.get(startProgress);
+        String header = String.format("[Chapter %d of %d]\n", startProgress + 1, flatChapters.size());
+        narrator.incrementProgress(level);
 
         StringBuilder output = new StringBuilder();
+        output.append(header).append(content);
 
-        List<String> chaptersString = new ArrayList<>();
-        for (int i = startProgress; i < endProgress; i++) {
-            TraversalPattern chapterPattern = chapters.get(i);
-            Cluster cluster = findClusterForNode(chapterPattern.getLead(), clusters);
-            if (cluster == null) {
-                chaptersString.add(String.format("[Chapter %d]: Error: Could not find associated cluster.\n\n", i + 1));
-                continue;
-            }
-
-            StringBuilder chapterString = new StringBuilder();
-            List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : java.util.Collections.emptyList();
-            String content = chapterPattern.extended(cluster.getGraph(), level, filterPatterns);
-            chapterString.append(String.format("[Chapter %d of %d]\n", i + 1, chapters.size()));
-            chapterString.append(content);
-
-            chaptersString.add(chapterString.toString());
-        }
-        output.append(String.join("\n\n", chaptersString));
-
-        int chaptersRead = endProgress - startProgress;
-        for (int i = 0; i < chaptersRead; i++) {
-            narrator.incrementProgress(level);
-        }
-
-        if (endProgress < chapters.size()) {
+        if (startProgress + 1 < flatChapters.size()) {
             output.append("\n\nReminder: Process these chapters toward the requested task and then call get_next_batch again to continue. DO NOT stop until you reach the end of the narrative.");
         } else {
             output.append("\n\n[End of Narrative] All chapters for grain level " + level + " have been read. You may now provide a final comprehensive wrap-up of the task.");
@@ -425,37 +240,20 @@ public class McpHandler {
             return "No narrative initialized for this URL. Please call init_narrative first.";
         }
         Narrator narrator = root.getNarrator();
+        List<Cluster> clusters = getOrComputeClusters(url);
+        List<String> flatChapters = narrator.getFlatChapters(level, clusters);
 
         int progress = narrator.getProgress(level);
-        List<TraversalPattern> chapters = narrator.getNarrative(level);
-        if (chapters == null) {
-            return "Narrative state lost. Please call init_narrative again.";
-        }
-
-        if (progress >= chapters.size()) {
+        if (progress >= flatChapters.size()) {
             return "[End of Narrative] All chapters for grain level " + level + " have been read.";
         }
 
-        TraversalPattern chapterPattern = chapters.get(progress);
+        String content = flatChapters.get(progress);
+        String header = String.format("[Chapter %d of %d]\n", progress + 1, flatChapters.size());
         narrator.incrementProgress(level);
 
-        List<Cluster> clusters = getOrComputeClusters(url);
-        if (clusters.isEmpty()) {
-            return "Error: No clusters available to provide context for the chapter.";
-        }
-
-        Cluster cluster = findClusterForNode(chapterPattern.getLead(), clusters);
-
-        if (cluster == null) {
-            return "Error: Could not find associated cluster for the current chapter.";
-        }
-
-        List<TraversalPattern> filterPatterns = progress > 0 ? chapters.subList(0, progress) : java.util.Collections.emptyList();
-        String content = chapterPattern.extended(cluster.getGraph(), level, filterPatterns);
-        int currentChapter = progress + 1;
-        int totalChapters = chapters.size();
-
         // Update HTML page to expand only the current chapter
+        // We use the progress in the flat list to sync the HTML page.
         NarrativeHtmlGenerator generator = cacheManager.getHtmlGenerator(url);
         if (generator != null) {
             try {
@@ -466,11 +264,10 @@ public class McpHandler {
         }
 
         StringBuilder output = new StringBuilder();
-        output.append("[Chapter ").append(currentChapter).append(" of ").append(totalChapters).append(" - GrainLevel: ").append(level).append("]\n\n");
-        output.append(content);
+        output.append(header).append(content);
         output.append("\n\n");
 
-        if (currentChapter < totalChapters) {
+        if (progress + 1 < flatChapters.size()) {
             output.append("Reminder: Perform the requested task for this chapter and ask the user if they would like to proceed to the next chapter.");
         } else {
             output.append("Reminder: Perform the requested task for this final chapter.");
@@ -502,23 +299,16 @@ public class McpHandler {
             summary.append("-------------------------------------------------------------------------------------------------\n");
 
             for (GrainLevel level : GrainLevel.values()) {
-                List<TraversalPattern> chapters = narrator.getNarrative(level);
-                int count = chapters.size();
+                List<String> flatChapters = narrator.getFlatChapters(level, clusters);
+                int count = flatChapters.size();
 
                 double totalLines = 0;
                 double maxLines = 0;
 
-                for (int i = 0; i < chapters.size(); i++) {
-                    TraversalPattern chapter = chapters.get(i);
-                    Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
-                    if (cluster != null) {
-                        List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : java.util.Collections.emptyList();
-                        String content = chapter.extended(cluster.getGraph(), level, filterPatterns);
-                        int lines = content.split("\n").length;
-
-                        totalLines += lines;
-                        if (lines > maxLines) maxLines = lines;
-                    }
+                for (String content : flatChapters) {
+                    int lines = content.split("\n").length;
+                    totalLines += lines;
+                    if (lines > maxLines) maxLines = lines;
                 }
 
                 double avgLines = count > 0 ? totalLines / count : 0;
@@ -533,7 +323,7 @@ public class McpHandler {
             summary.append("Available GrainLevels and their chapter counts:\n");
 
             for (GrainLevel level : GrainLevel.values()) {
-                int count = narrator.getNarrative(level).size();
+                int count = narrator.getFlatChapters(level, clusters).size();
                 summary.append("- ").append(level).append(" (").append(level.getDescription()).append("): ").append(count).append(" chapters\n");
             }
 
