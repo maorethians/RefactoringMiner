@@ -145,8 +145,8 @@ public class TraversalPattern extends GraphWrapper {
         List<TraversalPattern> pNarrative = p.flatten();
         boolean result = false;
         for (TraversalPattern thisP : this.flatten()) {
-            if (thisP instanceof UsagePattern usage) {
-                for (TraversalPattern sub : usage.subs) {
+            if (thisP instanceof AggregatorPattern agg) {
+                for (TraversalPattern sub : agg.subs) {
                     if (pNarrative.contains(sub)) {
                         result = true;
                         break;
