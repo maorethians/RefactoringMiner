@@ -21,7 +21,7 @@ public class Narrator {
     private final Map<GrainLevel, List<TraversalPattern>> cache = new HashMap<>();
     private final Map<GrainLevel, List<String>> flatCache = new HashMap<>();
     private final Map<GrainLevel, Integer> progressMap = new HashMap<>();
-    public static final int THRESHOLD = 200;
+    public static final int THRESHOLD = 500;
 
 
     public Narrator(TraversalPattern rootPattern) {
@@ -299,23 +299,59 @@ public class Narrator {
         return false;
     }
 
-    // TODO: This secondary sorting puts seemingly unrelated changes (comments) far away.
     public List<TraversalPattern> sortPatterns(List<TraversalPattern> patterns) {
-        List<TraversalPattern> result = new ArrayList<>();
-        Set<TraversalPattern> visited = new HashSet<>();
-        for (TraversalPattern pattern : patterns) {
-            visit(pattern, visited, result, patterns);
+        int n = patterns.size();
+        if (n == 0) return Collections.emptyList();
+
+        Map<TraversalPattern, Integer> priority = new HashMap<>();
+        Map<TraversalPattern, List<TraversalPattern>> adj = new HashMap<>();
+        Map<TraversalPattern, Integer> inDegree = new HashMap<>();
+
+        for (int i = 0; i < n; i++) {
+            TraversalPattern p = patterns.get(i);
+            priority.put(p, i);
+            adj.put(p, new ArrayList<>());
+            inDegree.put(p, 0);
         }
+
+        for (TraversalPattern p1 : patterns) {
+            for (TraversalPattern p2 : patterns) {
+                if (p1 != p2 && p1.dependsOn(p2)) {
+                    adj.get(p2).add(p1);
+                    inDegree.put(p1, inDegree.get(p1) + 1);
+                }
+            }
+        }
+
+        PriorityQueue<TraversalPattern> pq = new PriorityQueue<>(Comparator.comparingInt(priority::get));
+        for (TraversalPattern p : patterns) {
+            if (inDegree.get(p) == 0) {
+                pq.add(p);
+            }
+        }
+
+        List<TraversalPattern> result = new ArrayList<>();
+        while (!pq.isEmpty()) {
+            TraversalPattern p = pq.poll();
+            result.add(p);
+            for (TraversalPattern neighbor : adj.get(p)) {
+                inDegree.put(neighbor, inDegree.get(neighbor) - 1);
+                if (inDegree.get(neighbor) == 0) {
+                    pq.add(neighbor);
+                }
+            }
+        }
+
+        if (result.size() < n) {
+            Set<TraversalPattern> resultSet = new HashSet<>(result);
+            for (TraversalPattern p : patterns) {
+                if (!resultSet.contains(p)) {
+                    result.add(p);
+                }
+            }
+        }
+
         return result;
     }
 
-    private void visit(TraversalPattern pattern, Set<TraversalPattern> visited, List<TraversalPattern> result, Collection<TraversalPattern> candidates) {
-        if (!visited.add(pattern)) return;
-        for (TraversalPattern other : candidates) {
-            if (pattern.dependsOn(other)) {
-                visit(other, visited, result, candidates);
-            }
-        }
-        result.add(pattern);
-    }
 }
