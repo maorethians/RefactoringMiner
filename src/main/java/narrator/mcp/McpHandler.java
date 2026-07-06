@@ -15,7 +15,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 
 public class McpHandler {
     private static final Logger logger = LoggerFactory.getLogger(McpHandler.class);
@@ -202,7 +207,12 @@ public class McpHandler {
         }
         Narrator narrator = root.getNarrator();
         List<Cluster> clusters = getOrComputeClusters(url);
-        List<String> flatChapters = narrator.getFlatChapters(level, clusters);
+        List<String> flatChapters;
+        if (level == GrainLevel.RAW_DIFF) {
+            flatChapters = getRawDiffChunks(url, narrator, clusters);
+        } else {
+            flatChapters = narrator.getFlatChapters(level, clusters);
+        }
 
         int startProgress = narrator.getProgress(level);
         if (startProgress >= flatChapters.size()) {
@@ -241,7 +251,12 @@ public class McpHandler {
         }
         Narrator narrator = root.getNarrator();
         List<Cluster> clusters = getOrComputeClusters(url);
-        List<String> flatChapters = narrator.getFlatChapters(level, clusters);
+        List<String> flatChapters;
+        if (level == GrainLevel.RAW_DIFF) {
+            flatChapters = getRawDiffChunks(url, narrator, clusters);
+        } else {
+            flatChapters = narrator.getFlatChapters(level, clusters);
+        }
 
         int progress = narrator.getProgress(level);
         if (progress >= flatChapters.size()) {
@@ -299,7 +314,12 @@ public class McpHandler {
             summary.append("-------------------------------------------------------------------------------------------------\n");
 
             for (GrainLevel level : GrainLevel.values()) {
-                List<String> flatChapters = narrator.getFlatChapters(level, clusters);
+                List<String> flatChapters;
+                if (level == GrainLevel.RAW_DIFF) {
+                    flatChapters = getRawDiffChunks(url, narrator, clusters);
+                } else {
+                    flatChapters = narrator.getFlatChapters(level, clusters);
+                }
                 int count = flatChapters.size();
 
                 double totalLines = 0;
@@ -323,7 +343,9 @@ public class McpHandler {
             summary.append("Available GrainLevels and their chapter counts:\n");
 
             for (GrainLevel level : GrainLevel.values()) {
-                int count = narrator.getFlatChapters(level, clusters).size();
+                int count = (level == GrainLevel.RAW_DIFF)
+                        ? getRawDiffChunks(url, narrator, clusters).size()
+                        : narrator.getFlatChapters(level, clusters).size();
                 summary.append("- ").append(level).append(" (").append(level.getDescription()).append("): ").append(count).append(" chapters\n");
             }
 
@@ -333,6 +355,64 @@ public class McpHandler {
         return summary.toString();
     }
 
+
+    private List<String> getRawDiffChunks(String url, Narrator narrator, List<Cluster> clusters) throws Exception {
+        List<String> cached = cacheManager.getRawDiffChunks(url);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 1. Determine number of chunks from FILE level
+        List<String> fileChapters = narrator.getFlatChapters(GrainLevel.FILE, clusters);
+        int numChunks = fileChapters.size();
+        if (numChunks == 0) {
+            return Collections.emptyList();
+        }
+
+        // 2. Fetch raw diff
+        String rawDiffUrl = url;
+        if (url.contains("/pull/") || url.contains("/pr/")) {
+            if (!url.endsWith(".patch")) {
+                rawDiffUrl = url + ".patch";
+            }
+        } else if (url.contains("/commit/")) {
+            if (!url.endsWith(".patch")) {
+                rawDiffUrl = url + ".patch";
+            }
+        }
+
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(rawDiffUrl))
+                .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new Exception("Failed to fetch raw diff from " + rawDiffUrl + ". Status code: " + response.statusCode());
+        }
+        String diffContent = response.body();
+
+        // 3. Split into balanced chunks (by line)
+        String[] lines = diffContent.split("\n");
+        int totalLines = lines.length;
+        List<String> chunks = new ArrayList<>();
+
+        int baseSize = totalLines / numChunks;
+        int remainder = totalLines % numChunks;
+        int currentLine = 0;
+
+        for (int i = 0; i < numChunks; i++) {
+            int chunkSize = baseSize + (i < remainder ? 1 : 0);
+            StringBuilder chunkBuilder = new StringBuilder();
+            for (int j = 0; j < chunkSize && currentLine < totalLines; j++) {
+                chunkBuilder.append(lines[currentLine++]).append("\n");
+            }
+            chunks.add(chunkBuilder.toString());
+        }
+
+        cacheManager.putRawDiffChunks(url, chunks);
+        return chunks;
+    }
 
     private List<Cluster> getOrComputeClusters(String url) throws Exception {
         List<Cluster> cached = cacheManager.getClusters(url);

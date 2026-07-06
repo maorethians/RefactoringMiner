@@ -14,6 +14,7 @@ public class CacheManager {
     private final Map<String, TraversalPattern> hierarchyCache = new ConcurrentHashMap<>();
 
     private final Map<String, NarrativeHtmlGenerator> htmlGeneratorsCache = new ConcurrentHashMap<>();
+    private final Map<String, List<String>> rawDiffsCache = new ConcurrentHashMap<>();
 
     public List<Cluster> getClusters(String url) {
         return clustersCache.get(url);
@@ -40,6 +41,14 @@ public class CacheManager {
 
     public void putHtmlGenerator(String url, NarrativeHtmlGenerator generator) {
         htmlGeneratorsCache.put(url, generator);
+    }
+
+    public List<String> getRawDiffChunks(String url) {
+        return rawDiffsCache.get(url);
+    }
+
+    public void putRawDiffChunks(String url, List<String> chunks) {
+        rawDiffsCache.put(url, chunks);
     }
 
     public void clear() {

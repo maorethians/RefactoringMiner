@@ -7,7 +7,8 @@ public enum GrainLevel {
     CLASS("Changes at the class/type level"),
     FILE("Changes at the file level"),
     SEMANTIC_LEAF("Lowest semantic component changes"),
-    SEMANTIC_ROOT("Highest semantic component changes");
+    SEMANTIC_ROOT("Highest semantic component changes"),
+    RAW_DIFF("Raw diff split into balanced chunks");
 
     private final String description;
 
