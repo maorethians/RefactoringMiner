@@ -21,7 +21,7 @@ public class Narrator {
     private final Map<GrainLevel, List<TraversalPattern>> cache = new HashMap<>();
     private final Map<GrainLevel, List<String>> flatCache = new HashMap<>();
     private final Map<GrainLevel, Integer> progressMap = new HashMap<>();
-    public static final int THRESHOLD = 500;
+    public static final int THRESHOLD = 100;
 
 
     public Narrator(TraversalPattern rootPattern) {
@@ -72,16 +72,6 @@ public class Narrator {
             }
         }
         return false;
-    }
-
-    public static boolean isChapter(TraversalPattern p, GrainLevel level) {
-        return switch (level) {
-            case LEAF -> p instanceof Leaf;
-            case USAGE_CHAIN_ROOT -> p instanceof UsagePattern;
-            case SEMANTIC_LEAF -> p instanceof TraversalComponent tc && isSemanticLeaf(tc);
-            case SEMANTIC_ROOT -> p instanceof TraversalComponent tc && isSemanticRoot(tc);
-            case METHOD, CLASS, FILE -> p instanceof TraversalComponent tc && matchesGrain(tc, level);
-        };
     }
 
     public static void traverse(TraversalPattern p, Set<TraversalPattern> visited, List<TraversalPattern> result, Predicate<TraversalPattern> stopPredicate, Predicate<TraversalPattern> leafPredicate) {
