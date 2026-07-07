@@ -85,12 +85,12 @@ public class UsagePattern extends AggregatorPattern implements Leaf {
     }
 
     @Override
-    public List<Node> getMains(Graph<Node, Edge> graph) {
+    public List<Node> getMains() {
         return List.of(useNode);
     }
 
     @Override
-    public List<Node> getSides(Graph<Node, Edge> graph) {
+    public List<Node> getSides() {
         return getUsedNodes().stream().toList();
     }
 

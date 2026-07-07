@@ -1,9 +1,6 @@
 package narrator.graph.cluster.traverse;
 
-import narrator.graph.Edge;
 import narrator.graph.Node;
-import narrator.graph.NodeType;
-import org.jgrapht.Graph;
 
 import java.util.*;
 import java.util.Map.Entry;
@@ -13,30 +10,30 @@ public class AggregatorPattern extends TraversalPattern {
     Set<TraversalPattern> subs = new HashSet<>();
 
     @Override
-    public List<Node> getMains(Graph<Node, Edge> graph) {
+    public List<Node> getMains() {
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         Set<Node> superMainsOrdered = new LinkedHashSet<>();
         for (TraversalPattern leaf : leaves) {
-            superMainsOrdered.addAll(leaf.getMains(graph));
+            superMainsOrdered.addAll(leaf.getMains());
         }
 
         Set<Node> subsMains = new HashSet<>();
         for (TraversalPattern sub : subs) {
-            subsMains.addAll(sub.getMains(graph));
+            subsMains.addAll(sub.getMains());
         }
 
         return superMainsOrdered.stream().filter(subsMains::contains).toList();
     }
 
     @Override
-    public List<Node> getSides(Graph<Node, Edge> graph) {
+    public List<Node> getSides() {
         List<TraversalPattern> leaves = this.getNarrator().getNarrative(GrainLevel.LEAF);
         Set<Node> superSidesOrdered = new LinkedHashSet<>();
         for (TraversalPattern leaf : leaves) {
-            superSidesOrdered.addAll(leaf.getSides(graph));
+            superSidesOrdered.addAll(leaf.getSides());
         }
 
-        List<Node> mains = this.getMains(graph);
+        List<Node> mains = this.getMains();
         return superSidesOrdered.stream().filter(side -> !mains.contains(side)).toList();
     }
 

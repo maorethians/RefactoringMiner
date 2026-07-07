@@ -85,7 +85,32 @@ public class Narrator {
 
         if (p instanceof AggregatorPattern agg) {
             List<TraversalPattern> sortedSubs = new ArrayList<>(agg.subs);
-            sortedSubs.sort(Comparator.comparingInt(TraversalPattern::getDepth).reversed());
+            sortedSubs.sort((s1, s2) -> {
+                int d1 = s1.getDepth();
+                int d2 = s2.getDepth();
+                if (d1 != d2) {
+                    return Integer.compare(d2, d1);
+                }
+
+                List<Node> mains1 = s1.getMains();
+                List<Node> mains2 = s2.getMains();
+
+                int points1 = 0;
+                int points2 = 0;
+
+                for (Node m1 : mains1) {
+                    for (Node m2 : mains2) {
+                        if (m1.getPath().equals(m2.getPath())) {
+                            if (m1.getTree().getPos() < m2.getTree().getPos()) {
+                                points1++;
+                            } else if (m2.getTree().getPos() < m1.getTree().getPos()) {
+                                points2++;
+                            }
+                        }
+                    }
+                }
+                return Integer.compare(points2, points1);
+            });
             for (TraversalPattern sub : sortedSubs) {
                 traverse(sub, visited, result, stopPredicate, leafPredicate);
             }

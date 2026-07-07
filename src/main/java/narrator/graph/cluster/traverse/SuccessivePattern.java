@@ -114,7 +114,7 @@ public class SuccessivePattern extends TraversalPattern implements Leaf {
     }
 
     @Override
-    public List<Node> getMains(Graph<Node, Edge> graph) {
+    public List<Node> getMains() {
         return getSequence();
     }
 
