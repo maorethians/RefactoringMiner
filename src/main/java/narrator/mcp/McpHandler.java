@@ -371,14 +371,8 @@ public class McpHandler {
 
         // 2. Fetch raw diff
         String rawDiffUrl = url;
-        if (url.contains("/pull/") || url.contains("/pr/")) {
-            if (!url.endsWith(".patch")) {
-                rawDiffUrl = url + ".patch";
-            }
-        } else if (url.contains("/commit/")) {
-            if (!url.endsWith(".patch")) {
-                rawDiffUrl = url + ".patch";
-            }
+        if ((url.contains("/pull/") || url.contains("/pr/") || url.contains("/commit/")) && !url.endsWith(".diff")) {
+            rawDiffUrl = url + ".diff";
         }
 
         HttpClient client = HttpClient.newHttpClient();
