@@ -13,6 +13,25 @@ OLLAMA_URL = "http://localhost:11434"
 PROXY_PORT = int(os.getenv("OLLAMA_PROXY_PORT", 11435))
 LOG_FILE = "/tmp/ollama_proxy.log"
 
+def update_token_log(in_tokens, out_tokens):
+    try:
+        current_in, current_out = 0, 0
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r") as f:
+                lines = f.readlines()
+                if lines:
+                    last_line = lines[-1].strip()
+                    if last_line:
+                        current_in, current_out = map(int, last_line.split())
+    except Exception:
+        current_in, current_out = 0, 0
+
+    new_in = current_in + in_tokens
+    new_out = current_out + out_tokens
+
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{new_in} {new_out}\n")
+
 # Hop-by-hop headers that MUST NOT be forwarded by a proxy
 HOP_BY_HOP = {
     "connection",
@@ -25,12 +44,6 @@ HOP_BY_HOP = {
     "upgrade"
 }
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
-)
-logger = logging.getLogger("ollama_proxy")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -47,13 +60,6 @@ app = FastAPI(lifespan=lifespan)
 
 async def proxy_request(request: Request, path: str):
     body = await request.body()
-
-    # 1. LOG REQUEST (Best effort, non-blocking)
-    try:
-        # We log the raw bytes first to ensure we don't miss anything
-        raw_body = body.decode("utf-8", errors="replace")
-    except Exception as e:
-        logger.warning(f"Could not log request body: {e}")
 
     # 2. CLEAN HEADERS
     # Only forward headers that are NOT hop-by-hop
@@ -73,19 +79,27 @@ async def proxy_request(request: Request, path: str):
     if is_streaming:
         # We use a generator to pipe the stream directly from Ollama to the Client
         async def stream_generator() -> AsyncGenerator[bytes, None]:
+            final_usage = {"input_tokens": 0, "output_tokens": 0}
             try:
                 async with client.stream(method=request.method, url=path, content=body, headers=headers) as resp:
-                    # We MUST forward the response headers in the StreamingResponse wrapper
-                    # but the actual bytes flow through here.
                     async for chunk in resp.aiter_bytes():
                         if chunk:
-                            # Log only the relevant parts of the chunk to avoid flooding logs
                             chunk_text = chunk.decode('utf-8', errors='replace')
                             if '"type":"message_delta"' in chunk_text:
-                                logger.info(f"<-- CHUNK: {chunk_text}")
+                                try:
+                                    # Extract usage from the chunk
+                                    # The chunk is usually: event: message_delta\ndata: {...}
+                                    if 'data: ' in chunk_text:
+                                        data_str = chunk_text.split('data: ', 1)[1]
+                                        data_json = json.loads(data_str)
+                                        if 'usage' in data_json:
+                                            final_usage['input_tokens'] = data_json['usage'].get('input_tokens', 0)
+                                            final_usage['output_tokens'] = data_json['usage'].get('output_tokens', 0)
+                                except Exception:
+                                    pass
                             yield chunk
+                update_token_log(final_usage['input_tokens'], final_usage['output_tokens'])
             except Exception as e:
-                logger.exception(f"Stream Error: {e}")
                 yield json.dumps({"error": str(e)}).encode("utf-8")
 
         # IMPORTANT: We do NOT hardcode media_type.
@@ -100,9 +114,13 @@ async def proxy_request(request: Request, path: str):
         try:
             resp = await client.request(method=request.method, url=path, content=body, headers=headers)
 
-            # LOG RESPONSE
-            res_text = resp.content.decode("utf-8", errors="replace")
-            logger.info(f"<-- RESPONSE {resp.status_code}\n{res_text}")
+            # LOG TOKENS
+            try:
+                res_json = resp.json()
+                usage = res_json.get("usage", {})
+                update_token_log(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+            except Exception:
+                pass
 
             # REPLICATE EVERYTHING: Return the exact content, status, and headers
             return Response(
@@ -111,7 +129,6 @@ async def proxy_request(request: Request, path: str):
                 headers={k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP}
             )
         except Exception as e:
-            logger.exception(f"Request Error: {e}")
             return Response(content=str(e), status_code=500)
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -119,5 +136,4 @@ async def catch_all(request: Request, path: str):
     return await proxy_request(request, f"/{path}")
 
 if __name__ == "__main__":
-    logger.info(f"Transparent Ollama Proxy: {OLLAMA_URL} <-> port {PROXY_PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, proxy_headers=False)
