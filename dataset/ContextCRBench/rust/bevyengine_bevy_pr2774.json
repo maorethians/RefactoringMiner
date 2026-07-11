@@ -1,0 +1,82 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 2774,
+    "lang": "rust",
+    "pr_title": "[Merged by Bors] - Converted exclusive systems to parallel systems wherever possible",
+    "pr_body": "Closes #2767.\r\n\r\nConverted:\r\n- `play_queued_audio_system`\r\n- `change_window`",
+    "pr_comments": [
+        "It is probably introducing ambiguity and some one-frame delays. From what I understand by default all the exclusive systems run at the start of the stage and this change makes it run in between. I would assume the same applies to `gilrs_event_system`.\r\n\r\nI don't know how to make these systems run first without making them exclusive again or putting labels everywhere. Idk if putting labels everywhere is an acceptable solution, I don't think it is very maintainable.\r\n\r\nFor Reference:\r\n- Ambiguity before this change:\r\n  ```\r\n  -- \"bevy_winit::change_window\" and \"bevy_audio::audio_output::play_queued_audio_system<bevy_audio::audio_source::AudioSource>\"\r\n  ```\r\n- Ambiguity after this change:\r\n  ```\r\n  -- \"bevy_render::camera::camera::camera_system<bevy_render::camera::projection::OrthographicProjection>\" and \"bevy_winit::change_window\"\r\n  -- \"bevy_render::camera::camera::camera_system<bevy_render::camera::projection::PerspectiveProjection>\" and \"bevy_winit::change_window\"\r\n  -- \"bevy_ui::widget::text::text_system\" and \"bevy_winit::change_window\"\r\n  -- \"bevy_ui::flex::flex_node_system\" and \"bevy_winit::change_window\"\r\n  -- \"bevy_winit::change_window\" and \"bevy_text::text2d::text2d_system\"\r\n  ```",
+        "> Idk if putting labels everywhere is an acceptable solution, I don't think it is very maintainable.\r\n\r\nYeah; there's a larger conversation ongoing about this: see #2747.\r\n\r\nI suspect that the `change_window` system's ambiguities are going to genuinely cause issues. Can we move this into the stage before?",
+        "> Can we move this into the stage before?\r\n\r\nI think that will exacerbate the issue of one-frame delays because the majority of commands put into the `Window::command_queue` will probably come from `CoreStage::Update`. It might be best to keep it as an exclusive system for now. It is hard to say which is better without more testing.",
+        "@alice-i-cecile I did some testing with timing the duration it takes for changes triggered in `scale_factor_override.rs` example to show up in the `flex_node_system` (the only consumer of `WindowScaleFactorChanged` events).\r\n```\r\npostupdate parallel: 0.549728 ms - 10.027739 ms\r\npostupdate exlcusive: 0.390465 ms - 0.620356 ms\r\nupdate parallel: 0.390914 ms - 7.55568875 ms \r\nupdate exclusive: 7.643498 ms - 11.235118 ms \r\n```\r\nI think the parallel ones change the order they are executed in across executions of the binary. They produce extremely varying results.",
+        "> because the majority of commands put into the Window::command_queue will probably come from CoreStage::Update\r\n\r\nHmm, I agree. We could make another stage :/ I think the best solution here is probably to add a public label to `change_window` and then have all the other conflicting systems run before it.\r\n\r\n> I think the parallel ones change the order they are executed in across executions of the binary. They produce extremely varying results.\r\n\r\nYep, that's standard ambiguous ordering behavior :(",
+        "@alice-i-cecile Added the labels in. Ran a benchmark again and now its around 0.302998 ms - 0.411899 ms pretty reliably. There are no more ambiguities reported related to this pr now.",
+        "@SarthakSingh31 can you rebase this on main? :) I'd like to get this merged but there are now merge conflicts",
+        "@alice-i-cecile rebased. It looks like `gilrs_event_system` was converted in a different pr so removed anything related to it from this pr.",
+        "Thanks! Ping @mockersf; can you merge this in?",
+        "The system `add_clusters` in bevy_pbr is an exclusive system that uses `Res<Windows>` and that would be executed before the `change_window` system after this change. Is that an issue? @superdump ?",
+        "> The system add_clusters in bevy_pbr is an exclusive system that uses Res<Windows> and that would be executed before the change_window system after this change. Is that an issue?\r\n\r\nMy intution is that this should run after, both to preserve existing behavior and for correctness. @SarthakSingh31 can you make that change? We can revert it if our rendering experts tell us otherwise.",
+        "> The system `add_clusters` in bevy_pbr is an exclusive system that uses `Res<Windows>` and that would be executed before the `change_window` system after this change. Is that an issue? @superdump ?\r\n\r\nHmm. I think the current setup has add_clusters being run first as an exclusive system to ensure the presence of Clusters components on appropriate views, and then update_clusters is a normal system that overwrites the cluster configuration based on the window size. I think that suggests it only has to be correct when update_clusters is run. To complicate things further, I know that update_clusters is going to move to being called from assign_lights_to_clusters in an upcoming PR.\r\n\r\nTo be clear, add_clusters needs to be run such that the Clusters components are actually added (ie commands are applied to the world) before any of the subsequent clustered forward rendering PostUpdate systems are run. And I _think_ the window sizes only have to be correct at the point of execution of update_clusters currently but it would have to be tested. If possible just preserve current behaviour.",
+        "If add_clusters required windows to be correct and it is an exclusive system, then it would then require that change_windows is either exclusive and run before it, or it is run in an earlier stage, right?",
+        "> If add_clusters required windows to be correct and it is an exclusive system, then it would then require that change_windows is either exclusive and run before it, or it is run in an earlier stage, right?\r\n\r\nHuh, `change_window` is also an exclusive system. In that case, yes.\r\n\r\nHowever, it looks like `change_window` *also* has no reason to be exclusive: https://github.com/bevyengine/bevy/blob/caf6611c62fddf1477e74a5cbe7c3e757446fbba/crates/bevy_winit/src/lib.rs#L48.",
+        "yup, this pr is changing `change_window` from exclusive to non exclusive\r\n\r\nit seems `add_clusters` is set as exclusive only for ordering purpose though",
+        "> yup, this pr is changing `change_window` from exclusive to non exclusive\r\n> \r\n> it seems `add_clusters` is set as exclusive only for ordering purpose though\r\n\r\nIt isn't only for ordering. It inserts `Clusters` components on views which don't have them. Subsequent systems in PostUpdate expect Clusters to be present. I suppose if you accepted a 1-frame delay in the Clusters component coming into existence then it would be fine.\r\n\r\nThat said, I don't think add_clusters was specified to necessarily run after change_windows among the exclusive PostUpdate systems, so it could have run after. And, also as said, I think as long as update_clusters runs after change_windows, it should be fine, but we need to test it.",
+        "@mockersf fixed the ordering and resolved the new merge conflicts. I feel like `update_clusters` should be reported as ambiguous before this change but it isn't.",
+        "@SarthakSingh31 can you rebase this? I'd like to merge this in.",
+        "bors r+",
+        "I don't know if it's too late now, but it would be nice if this PR used the actual system as a label instead of a new SystemLabel now that we have this feature.\r\n\r\nedit: it's too late now",
+        "Pull request successfully merged into main.\n\nBuild succeeded:\n  * [build-android](https://github.com/bevyengine/bevy/runs/6159475935?check_suite_focus=true)\n  * [build (nightly, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/6159475761?check_suite_focus=true)\n  * [build (stable, macos-latest)](https://github.com/bevyengine/bevy/runs/6159475635?check_suite_focus=true)\n  * [build (stable, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/6159475498?check_suite_focus=true)\n  * [build (stable, windows-latest)](https://github.com/bevyengine/bevy/runs/6159475357?check_suite_focus=true)\n  * [build-wasm (nightly, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/6159476338?check_suite_focus=true)\n  * [build-wasm (stable, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/6159476179?check_suite_focus=true)\n  * [check-benches](https://github.com/bevyengine/bevy/runs/6159581003?check_suite_focus=true)\n  * [check-doc](https://github.com/bevyengine/bevy/runs/6159613279?check_suite_focus=true)\n  * [check-markdown-links](https://github.com/bevyengine/bevy/runs/6159583626?check_suite_focus=true)\n  * [check-missing-examples-in-docs](https://github.com/bevyengine/bevy/runs/6159477131?check_suite_focus=true)\n  * [check-unused-dependencies](https://github.com/bevyengine/bevy/runs/6159476554?check_suite_focus=true)\n  * [ci](https://github.com/bevyengine/bevy/runs/6159476847?check_suite_focus=true)\n  * [markdownlint](https://github.com/bevyengine/bevy/runs/6159518626?check_suite_focus=true)\n  * [miri](https://github.com/bevyengine/bevy/runs/6159477429?check_suite_focus=true)\n  * [run-examples](https://github.com/bevyengine/bevy/runs/6159477635?check_suite_focus=true)"
+    ],
+    "merged": false,
+    "created_at": "2022-03-03T07:39:05Z",
+    "issue_context": {
+        "number": 2767,
+        "title": "Convert exclusive systems in Bevy to ordinary systems wherever possible",
+        "body": "I recently noticed that several exclusive systems in Bevy no longer need to be exclusive systems: `change_window` and `play_queued_audio_system` were the two I initially noticed. These were originally exclusive systems due to an inability to use `NonSend` resources in parallelizable systems: this limitation has since been removed.\r\n\r\nThese and any other similar cases should be converted to ordinary parallel systems (in the same stage) to improve the performance of Bevy's apps by reducing unnecessary blocking, and better communicate intent (we really don't need access to *everything* in the world).\r\n\r\n[bevy_mod_debug_dump](https://lib.rs/crates/bevy_mod_debugdump) may be able to assist you in grabbing a list of all of the systems to inspect. Or just search for uses of `.exclusive_system` in the code base using your IDE of choice.",
+        "comments": [
+            "Good call!",
+            "There are no instances of `.exclusive_system()` anymore since its no longer required, and I couldn't find any systems that accessed `&mut World` or used `at_end`/`at_start` without needing it.\r\nThis can probably be closed :)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1745,
+            "commit_id": "f04d91c9c155a3b9f55140ae3fb9a4f9d1967645",
+            "original_commit_id": "2a5202637f1aef74e1f13a0aa4e0039e666b3ac0",
+            "path": "crates/bevy_window/src/lib.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 79,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Can systems have multiple labels, if not then the approach of tagging a system with things it does doesn\u2019t really hold because a system could modify multiple things as well as the windows.",
+                "Yes, multiple levels are permitted.",
+                "Ok. Then this is not a problem."
+            ]
+        },
+        {
+            "hunk_id": 1744,
+            "commit_id": "f04d91c9c155a3b9f55140ae3fb9a4f9d1967645",
+            "original_commit_id": "2a5202637f1aef74e1f13a0aa4e0039e666b3ac0",
+            "path": "crates/bevy_window/src/lib.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 79,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "The system is called change_window, so maybe call this ChangesWindows",
+                "My intent with that name was that it can be added to any system that modifies the `Windows` resource and not be specific to `change_window`. I didn't want to make it specific to `change_window` because I can't put it inside `bevy_winit`."
+            ]
+        }
+    ]
+}

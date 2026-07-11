@@ -1,0 +1,92 @@
+{
+    "repo": "apache/airflow",
+    "pr_number": 32249,
+    "lang": "python",
+    "pr_title": "Schedulers are issuing abrupt pod deletes when there is a delay in schedulers' heartbeat",
+    "pr_body": "Schedulers are racing for pod adoption and leads abrupt pod deletes when there is delay in schedulers heartbeats. However the schedulers are alive but not dead their heartbeat is delayed due to network timeout or heavy processing and etc.\r\nThis MR will fix the scheduler abrupt deletes in case of delay in scheduler heartbeat.\r\nCloses: https://github.com/apache/airflow/issues/31198",
+    "pr_comments": [
+        "Congratulations on your first Pull Request and welcome to the Apache Airflow community! If you have any issues or are unsure about any anything please check our Contribution Guide (https://github.com/apache/airflow/blob/main/CONTRIBUTING.rst)\nHere are some useful points:\n- Pay attention to the quality of your code (ruff, mypy and type annotations). Our [pre-commits]( https://github.com/apache/airflow/blob/main/STATIC_CODE_CHECKS.rst#prerequisites-for-pre-commit-hooks) will help you with that.\n- In case of a new feature add useful documentation (in docstrings or in `docs/` directory). Adding a new operator? Check this short [guide](https://github.com/apache/airflow/blob/main/docs/apache-airflow/howto/custom-operator.rst) Consider adding an example DAG that shows how users should use it.\n- Consider using [Breeze environment](https://github.com/apache/airflow/blob/main/BREEZE.rst) for testing locally, it's a heavy docker but it ships with a working Airflow and a lot of integrations.\n- Be patient and persistent. It might take some time to get a review or get the final approval from Committers.\n- Please follow [ASF Code of Conduct](https://www.apache.org/foundation/policies/conduct) for all communication including (but not limited to) comments on Pull Requests, Mailing list and Slack.\n- Be sure to read the [Airflow Coding style]( https://github.com/apache/airflow/blob/main/CONTRIBUTING.rst#coding-style-and-best-practices).\nApache Airflow is a community-driven project and together we are making it better \ud83d\ude80.\nIn case of doubts contact the developers at:\nMailing List: dev@airflow.apache.org\nSlack: https://s.apache.org/airflow-slack\n",
+        "hi, welcome @dirrao \r\n\r\nfrom looking at the changed lines alone, it's hard to understand what the effect of the change is and why it has the effect.  it's also important to be sure that it doesn't break anything e.g. how do we know pods will still be deleted in \"legitimate\" circumstances.  can you add some explanation re how your change works?  Additionally I see that no tests are added, though one updated.  It seems likely that we are missing coverage for the scenario that you are trying to address.  Additionally can you make sure that we have coverage for the scenario we wish not to break, i.e. the scenario in which perhaps it was working properly?",
+        "Hi @dstandis / @jedcunningham \r\n\r\nProblem: \r\n\r\nWhen scheduler creates a worker pod for the task, it attaches a label to the pod. This label is airflow-worker=<scheduler_job_id>. This label is a unique identifier that indicates which scheduler is tracking this worker pod.\r\nEach scheduler will keep listening for events for only pods that it started. So for watching the pod events, it uses kubernetes watch api. This watch is done only for the condition: label_selector: airflow-worker=<my_job_id> So because of this each scheduler will listen to their own pod events.\r\n\r\nSo now the following is happening:\r\n\r\n1. Lets say scheduler1 with id 1 started a task in worker pod with label `airflow-worker=1` and its heartbeat got delayed.\r\n2. Now scheduler2 with id 2 thinks that scheduler1 is dead because its heartbeat was not received on time (even though scheduler 1 is alive).\r\n3. So scheduler2 will adopt tasks of scheduler1. This means scheduler2 will update the label for the pod with scheduler2's job id i.e label is now updated from airflow-worker=1 to airflow-worker=2.\r\n4. In the case of label updation, Kubernetes watch API is sending a DELETE event on airflow-worker=1 and ADDED event on airflow-worker=2 . \r\n5. As scheduler1 is still alive, it will keep listening to all events with label airflow-worker=1. It gets the event as DELETED as explained in point 4. So scheduler1 thinks that POD is deleted while it was in running phase and goes ahead and runs the task failure scenario. One of the step in this is to do pod cleanup which is to delete the pod to avoid dangling pods. So it sends a delete request to kubernetes API.\r\n\r\nSolution: Change the airflow Kubernetes watch label selector filter from kwargs = {\"label_selector\": f\"airflow-worker={scheduler_job_id}\"} to  kwargs = {\"label_selector\": \"airflow-worker\"} and then filter the events in scheduler by airflow-worker=<my_job_id>.\r\n\r\nQA: I have updated the test case to ensure the existing functionality. However, I am not sure how to write the test cases in case multi scheduler. Can you share references to it?  \r\n",
+        "Good investigation, I just created a simple pod for testing:\r\n```yaml\r\napiVersion: v1\r\nkind: Pod\r\nmetadata:\r\n  name: test-pod\r\n  labels:\r\n    airflow-worker: scheduler1\r\nspec:\r\n  restartPolicy: Always\r\n  containers:\r\n  - name: base\r\n    image: ubuntu\r\n    command: [\"tail\"]\r\n    args: [\"-f\", \"/dev/null\"]\r\n```\r\nand a watcher:\r\n```python\r\nfrom kubernetes import client, config, watch\r\n\r\nif __name__ == '__main__':\r\n    config.load_kube_config(context=\"<context>\")\r\n    v1 = client.CoreV1Api()\r\n\r\n    kwargs = {\"label_selector\": \"airflow-worker=scheduler1\"}\r\n\r\n    w = watch.Watch()\r\n    for event in w.stream(v1.list_namespaced_pod, \"<namespace>\", **kwargs):\r\n        print(\"Event: %s %s %s\" % (event['type'], event['object'].kind, event['object'].metadata.name))\r\n```\r\nand I got:\r\n```\r\nEvent: DELETED Pod test-pod\r\n```\r\nwhen I patched the label with:\r\n```bash\r\nkubectl --context <my context> --namespace <my namespace> pod/test-pod airflow-worker=scheduler2 --overwrite\r\n```\r\nHowever, I don't think that your change could fix this issue. When we call:\r\n```python\r\nfor event in self._pod_events(kube_client=kube_client, query_kwargs=kwargs)\r\n``` \r\nThe scheduler 1 will fetch only the events for the pods with `airflow-worker=scheduler1` at the moment of the call, so this issue happens after fetching the pod list, in this case, `labels.get(\"airflow-worker\", None) != scheduler_job_id` will be false. Instead, you can add a check in the method `process_status` before adding the pod to the watcher_queue with a failed state, in this case, when we receive a `DELETED` event, we could fetch the last state of the pod (with the new labels), and we compare the `airflow-worker` label with the scheduler id, if it's the same (normal case), we fail the TI, if not (the event was created by an adoption operation), we skip failing the TI. WDYT?\r\n\r\n(You need to merge/rebase master because #30727 has moved these methods to a new module)",
+        "@hussein-awala \r\nThanks for sharing the example. The reason for this issue is schedulers are subscribed to their worker pod events based on the scheduler id label filter i.e. ( kwargs = {\"label_selector\": \"airflow-worker=scheduler1\"}). Whenever there is a change in the label of a worker pod from airflow-worker=scheduler1 to  airflow-worker=scheduler2, this worker pod events goes out of scope for scheduler1. So, that's why we are seeing the DELETE event though the worker pod is still running. I have proposed to subscribe to all the worker pod events i.e. (kwargs = {\"label_selector\": \"airflow-worker\"}). So, each scheduler receives all the worker pod events i.e. both scheduler1 and scheduler2. In this specific issue, now the scheduler1 receives a MODIFIED instead of a DELETE event during the label change. To avoid processing worker pod events of other schedulers, drop the events based on the scheduler id label i.e. (labels.get(\"airflow-worker\", None) != scheduler_job_id). I will rebase my PR and update it soon.\r\n\r\nNote: This issue is happening for worker pods in all phases (PENDING, RUNNING, etc.)\r\n\r\nexisting code\r\n\r\n`    \r\nkwargs = {\"label_selector\": f\"airflow-worker={scheduler_job_id}\"}\r\n`\r\n\r\nproposed code\r\n\r\n```\r\nkwargs = {\"label_selector\": \"airflow-worker\"}\r\n\r\nif labels.get(\"airflow-worker\", None) != scheduler_job_id:\r\n     last_resource_version = task.metadata.resource_version\r\n     continue\r\n\r\n```\r\n\r\nExample\r\n\r\n```\r\nfrom kubernetes import client, config, watch\r\n\r\nif __name__ == '__main__':\r\n    config.load_kube_config(context=\"<context>\")\r\n    v1 = client.CoreV1Api()\r\n\r\n    kwargs = {\"label_selector\": \"airflow-worker\"}\r\n\r\n    w = watch.Watch()\r\n    for event in w.stream(v1.list_namespaced_pod, \"<namespace>\", **kwargs):\r\n        print(\"Event: %s %s %s\" % (event['type'], event['object'].kind, event['object'].metadata.name))\r\n        if labels.get(\"airflow-worker\", None) != \"scheduler1\":\r\n             print(\"Skipping the event of other scheduler i.e scheduler2\")\r\n             continue\r\n        else\r\n             print(\"Processing the event of current scheduler i.e scheduler1\")\r\n\r\n```\r\n\r\nand I got:\r\n\r\n```\r\nEvent: MODIFIED Pod test-pod\r\nSkipping the event of other scheduler i.e scheduler2\r\n```\r\n\r\nwhen I patched the label with:\r\n\r\n`kubectl --context <my context> --namespace <my namespace> pod/test-pod airflow-worker=scheduler2 --overwrite`",
+        "> Whenever there is a change in the label of a worker pod from airflow-worker=scheduler1 to airflow-worker=scheduler2, this worker pod events goes out of scope for scheduler1.\r\n\r\nOk it's more clear now, the produced event tell us that the watcher doesn't find the watched pod anymore using the current selectors.\r\n\r\nI will run more tests to make sure that it doesn't break anything. Could you add a unit test? (don't forget to merge master before)",
+        "@hussein-awala \r\nI have rebased the code with main branch and added unit test cases. Can you  review it?",
+        "@dstandish @jedcunningham could you review this PR before merging it?",
+        "In theory this was fixed in #31274 which was in 2.6.2. Have you reproduced this in main?",
+        "hey @dirrao, thanks for the very helpful explanation and nice fix for this.  i was hoping maybe we could figure out a way to not watch all scheduler's pods... but it seems there may not be a way... is that your assessment as well?\r\n",
+        "Ah yes thanks @jedcunningham \r\n\r\nyeah tried this out locally (manually watching pods and messing with them).  i guess the idea is to use the pod's deletion_timestamp metadata attr to determine whether it was actually deleted.\r\n\r\nseems it should work\r\n\r\n```python\r\nfrom kubernetes import client, config, watch\r\n\r\nif __name__ == '__main__':\r\n    config.load_kube_config()\r\n    v1 = client.CoreV1Api()\r\n\r\n    kwargs = {\"label_selector\": \"airflow-worker=scheduler-1\"}\r\n\r\n    w = watch.Watch()\r\n    for event in w.stream(v1.list_namespaced_pod, \"default\", **kwargs):\r\n        print(\"Event: %s %s %s\" % (event['type'], event['object'].kind, event['object'].metadata.name))\r\n        if event['type'] == \"DELETED\":\r\n            if event['object'].metadata.deletion_timestamp:\r\n                print(\"Pod was deleted\")\r\n            else:\r\n                print(\"Pod was not actually deleted\")\r\n```\r\n",
+        "Hi @dstandish, @jedcunningham, @hussein-awala \r\nGood to know this is already fixed. deletion_timestamp made things much easy. I have verified a few scenarios, the existing fix is working. Thanks every one for helping me. "
+    ],
+    "merged": false,
+    "created_at": "2023-07-20T17:56:03Z",
+    "issue_context": {
+        "number": 31198,
+        "title": "Schedulers are issuing abrupt pod deletes when there is a delay in schedulers' heartbeat",
+        "body": "### Apache Airflow version\n\nOther Airflow 2 version (please specify below)\n\n### What happened\n\nApache Airflow version:\r\n2.3.3\r\n\r\nSchedulers are racing for pod adoption and leads abrupt pod deletes when there is delay in schedulers heartbeats. However  the schedulers are alive but not dead their heartbeat is delayed due to network timeout or heavy processing and etc. \r\n\n\n### What you think should happen instead\n\nIf schedulers heartbeat is delayed for genuine reason, then we shouldn't kill the running worker pods. \n\n### How to reproduce\n\nReduce the scheduler_health_check_threshold=5 and orphaned_tasks_check_interval=10 values in the airflow config file\r\nLaunch the airflow with two schedulers and try to schedule multiple DAGs with backfill for every 1/5 mins.\n\n### Operating System\n\nNAME=\"CentOS Linux\" VERSION=\"7 (Core)\" ID=\"centos\" ID_LIKE=\"rhel fedora\" VERSION_ID=\"7\" PRETTY_NAME=\"CentOS Linux 7 (Core)\" ANSI_COLOR=\"0;31\" CPE_NAME=\"cpe:/o:centos:centos:7\" HOME_URL=\"https://www.centos.org/\" BUG_REPORT_URL=\"https://bugs.centos.org/\"  CENTOS_MANTISBT_PROJECT=\"CentOS-7\" CENTOS_MANTISBT_PROJECT_VERSION=\"7\" REDHAT_SUPPORT_PRODUCT=\"centos\" REDHAT_SUPPORT_PRODUCT_VERSION=\"7\"\n\n### Versions of Apache Airflow Providers\n\n_No response_\n\n### Deployment\n\nOther Docker-based deployment\n\n### Deployment details\n\n_No response_\n\n### Anything else\n\n_No response_\n\n### Are you willing to submit PR?\n\n- [X] Yes I am willing to submit a PR!\n\n### Code of Conduct\n\n- [X] I agree to follow this project's [Code of Conduct](https://github.com/apache/airflow/blob/main/CODE_OF_CONDUCT.md)\n",
+        "comments": [
+            "Thanks for opening your first issue here! Be sure to follow the issue template! If you are willing to raise PR to address this issue please do so, no need to wait for approval.\n",
+            "When the `SchedulerJob` is no longer running, we reset queued and scheduled TI that were enqueued by this `SchedulerJob`, but we don't do that for the running tasks.\r\n\r\nIn your case, the `SchedulerJob` is considered as dead because of missing heartbeat, but it is still alive and it can schedule the job and create the executor to run the task. However, we try to adopt the task (the pod for KubernetesExecutor) before deleting it, and since it is deleted in your case, I think there is an exception raised in the adoption method.\r\n\r\nCan your provide the other schedulers logs if you have multiple schedulers running or the log of the new scheduler if you have a single running scheduler?",
+            "We are running 2 schedulers. We haven't seen any exceptions in schedulers logs. We have verified the Kube api logs,  the pod delete request is from the one of the scheduler. ",
+            "Fixed by #31274. Closing."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 54501,
+            "commit_id": "5c94023b6b18a7dcde08f1d0633d42cd2059cc85",
+            "original_commit_id": "4a44343731144a7a7dc7fff7e3ed01663d4dd2e1",
+            "path": "airflow/executors/kubernetes_executor_utils.py",
+            "start_line": 149,
+            "original_start_line": 149,
+            "start_side": "RIGHT",
+            "line": 151,
+            "original_line": 151,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "I would move these comments (here and on 132) to (1) the commit message and (2) the test.  Don't think they are needed here."
+            ]
+        },
+        {
+            "hunk_id": 54500,
+            "commit_id": "5c94023b6b18a7dcde08f1d0633d42cd2059cc85",
+            "original_commit_id": "4a44343731144a7a7dc7fff7e3ed01663d4dd2e1",
+            "path": "airflow/executors/kubernetes_executor_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 154,
+            "original_line": 148,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do we need to update the `last_resource_version` when the pod is not managed by this executor? To be safe, I think we should directly `continue` when the label is not equals to the current scheduler job id. WDYT?",
+                "The scheduler don't want to receives the same event again and again. To avoid this we have to update the last_resource_version. So, it will get the events from the last_resource_version onwards. "
+            ]
+        },
+        {
+            "hunk_id": 54499,
+            "commit_id": "5c94023b6b18a7dcde08f1d0633d42cd2059cc85",
+            "original_commit_id": "4a44343731144a7a7dc7fff7e3ed01663d4dd2e1",
+            "path": "airflow/executors/kubernetes_executor_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 135,
+            "original_line": 132,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "By modifying the label selector to `airflow-worker`, the executor will watch all pods created by Airflow. This change introduces a slight additional load, but it is essential to address a critical bug in the executor that currently disrupts its high-availability mode. IMO, this adjustment should not pose any issues.\r\n\r\nHowever, it is crucial to include a comment preceding this statement clarifying the reason behind watching all pods. This comment will prevent anyone from reverting the change under the false assumption that it improves performance.",
+                "I have verified this fix. This is not adding any additional bugs. However, there might be slight increase in kube watcher load. I haven't seen any other options to fix this issue. I have updated the comments in the code."
+            ]
+        }
+    ]
+}

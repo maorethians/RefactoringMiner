@@ -1,0 +1,74 @@
+{
+    "repo": "mastodon/mastodon",
+    "pr_number": 30780,
+    "lang": "ruby",
+    "pr_title": "Improve encoding detection for link cards",
+    "pr_body": "Fixes #27230 \r\n\r\nThis was a nasty case, as encoding issues tend to be. Servers may use different vehicles to communicate the encoding of a HTML document. The `Content-Type` header may include an encoding of which the webserver thinks should be correct. Authors of HTML pages may include a `<meta>` tag to communicate what they think their encoding is. Of course, both may contradict each other and both can be totally wrong.\r\n\r\nIn the case of the issue, the HTTP header gives the correct encoding (`iso-8859-1`) while the HTML document itself announces itself incorrectly as `utf-8`.\r\n\r\nWe currently use the `charlock_holmes` gem to try to detect the encoding. It reports a confidence together with the result and we only accept results with a high enough confidence. In this case, `charlock_holmes` _does_ detect the correct encoding, but gives a very low confidence, so we ignore it. (This was to fix another encoding bug and is thus sensible.)\r\n\r\nNext, the HTML gets parsed by `nokogiri`. `nokogiri` tries to get the encoding from meta tags and thus will report a wrong one here, leading to an exception later on.\r\n\r\nIn this PR I propose another, layered strategy:\r\n\r\n1. First, we try the established way, using `charlock_holmes`. If we get a high confidence result, we can happily ignore all other, possibly erroneous, information.\r\n2. Next, we let nokogiri parse the document and test if the encoding it detects is actually valid.\r\n3. Next, we see if we have an encoding from the HTTP header and if yes, try if this is valid for the document we have.\r\n4. If all other three steps fail, we just default to `utf-8`.\r\n\r\nThis fixes the case reported in the issue. It also works for all the existing test cases.\r\n\r\nAdditionally, I made sure that it does not raise any exceptions for ~30k URLs from actual statuses on my server.\r\n\r\nThis might still fail in some very weird cases, but I failed to construct such a case :frowning_face:, so I was not able to figure out how to better handle this.\r\n\r\nIn any case this should improve things imo.\r\n\r\nPlease also note that I restructured the code here a little bit to avoid having to parse the document twice in case that nokogiri sets a working encoding. I suspect that the parsing can be quite expensive.",
+    "pr_comments": [
+        "Going to give this one a test, because this is something that has plagued my Sidekiq dead queue for a long time. ",
+        "```\r\nPG::ProgramLimitExceeded: ERROR: index row size 2896 exceeds btree version 4 maximum 2704 for index \"index_preview_cards_on_url\" DETAIL: Index row references tuple (553997,7) in relation \"preview_cards\". HINT: Values larger than 1/3 of a buffer page cannot be indexed. Consider a function index of an MD5 hash of the value, or use full text indexing.\r\n```\r\n\r\nNot entirely sure if this is related but I don't ever recall seeing this before?",
+        "This is a separate issue caused by URL length, I am not sure if we have a ticket for it (but it blocked some people that upgraded from old pg versions iirc).",
+        "> This is a separate issue caused by URL length, I am not sure if we have a ticket for it (but it blocked some people that upgraded from old pg versions iirc).\r\n\r\n#18965 \r\n\r\n@vmstan I'm pretty sure this is (mostly) related to URLs that include a lot of tracking bullshit at the end... having a full URL with lots of query strings\r\n",
+        "I think ideally we would extract information early and catch exceptions instead of calling `to_s.valid_encoding?` to avoid unnecessary and unrelated work.\r\n\r\nHowever, I acknowledge this is made awkward by the error being a generic `ArgumentError`, and after some benchmarking (CPU time only, I haven't looked at RAM usage), the overhead from `to_s.valid_encoding?` is measurable but limited (around 10% increase in CPU time), in something that is not currently a bottleneck, so this is not a blocker.",
+        "This has made a big improvement in the number of encoding errors I'm seeing in my dead queue. There is one type that existed before, that wasn't the same error message seen in the original problem, I was hoping it would have been covered by this. I'll open another issue for it.",
+        "> This has made a big improvement in the number of encoding errors I'm seeing in my dead queue.\r\n\r\n:tada: \r\n\r\n> I'll open another issue for it.\r\n\r\nPlease do, that would be super helpful!"
+    ],
+    "merged": true,
+    "created_at": "2024-06-21T10:30:35Z",
+    "issue_context": {
+        "number": 27230,
+        "title": "LinkCrawlWorker does not handle non-UTF8 charsets",
+        "body": "### Steps to reproduce the problem\n\n1. Post or receive a status with https://www.worldconcerthall.com/en/schedule/herrmann_korngold_with_lamsma_wagner_and_kodaly_from_rotterdam/77834/ in it\r\n\n\n### Expected behaviour\n\nThe `LinkCrawlWorker` will fetch the URL properly\n\n### Actual behaviour\n\nThe `LinkCrawlWorker` crashes with \"ArgumentError: invalid byte sequence in UTF-8\"\n\n### Detailed description\n\nWhen looking at the above URL, the headers indicate `content-type: text/html; charset=ISO-8859-1`, a non-UTF8 charset.\r\n\r\nWe have around hundreds of these dead workers littering the dead worker queue, and nearly every one of them failed in this similar fashion. I think it's a fixable problem, so i'm reporting it here.\n\n### Mastodon instance\n\ntech.lgbt\n\n### Mastodon version\n\nv4.2.0-rc2+glitch\n\n### Technical details\n\nIf this is happening on your own Mastodon server, please fill out those:\r\n- Ruby version: ruby 3.0.2p107 (2021-07-07 revision 0db68f0233) [x86_64-linux-gnu]\r\n- Node.js version: v18.12.1\r\n",
+        "comments": [
+            "Also happening on my server running 4.2.0 release:\r\n* Ruby version: ruby 3.2.2 (2023-03-30 revision e51014f9c0) [x86_64-linux]\r\n* Node.js version: v20.6.1",
+            "Digging a bit, there does seem to be code that's supposed to detect charset and set up a chunker for that charset, but then i'm confused if it misses that code somewhere along the way.",
+            "Also in 4.3.0-alpha.0 (AKA Main branch):\n\n- Ruby 3.2.2p53 +YJIT\n- PostgreSQL 16.0\n- Redis 7.2.2 (Main, Cache and Sidekiq in separate services and 2 replica each)\n- Tested with Node 20 and 21\n- Elasticsearch 7.17.14\n",
+            "Also see these in my instance.",
+            "I've gotten the following backtrace, performing the worker in the rails console;\r\n\r\n```\r\nlive/vendor/bundle/ruby/3.0.0/gems/htmlentities-4.3.4/lib/htmlentities/decoder.rb:10:in `gsub'\r\nlive/vendor/bundle/ruby/3.0.0/gems/htmlentities-4.3.4/lib/htmlentities/decoder.rb:10:in `decode'\r\nlive/vendor/bundle/ruby/3.0.0/gems/htmlentities-4.3.4/lib/htmlentities.rb:44:in `decode'\r\nlive/app/lib/link_details_extractor.rb:158:in `title'\r\nlive/app/lib/link_details_extractor.rb:114:in `to_preview_card_attributes'\r\nlive/app/services/fetch_link_card_service.rb:152:in `attempt_opengraph'\r\nlive/app/services/fetch_link_card_service.rb:42:in `process_url'\r\nlive/app/services/fetch_link_card_service.rb:28:in `block in call'\r\nlive/app/models/concerns/lockable.rb:12:in `block (2 levels) in with_redis_lock'\r\nlive/vendor/bundle/ruby/3.0.0/gems/mario-redis-lock-1.2.1/lib/redis_lock.rb:44:in `acquire'\r\nlive/app/models/concerns/lockable.rb:10:in `block in with_redis_lock'\r\nlive/vendor/bundle/ruby/3.0.0/gems/connection_pool-2.4.1/lib/connection_pool.rb:110:in `block (2 levels) in with'\r\nlive/vendor/bundle/ruby/3.0.0/gems/connection_pool-2.4.1/lib/connection_pool.rb:109:in `handle_interrupt'\r\nlive/vendor/bundle/ruby/3.0.0/gems/connection_pool-2.4.1/lib/connection_pool.rb:109:in `block in with'\r\nlive/vendor/bundle/ruby/3.0.0/gems/connection_pool-2.4.1/lib/connection_pool.rb:106:in `handle_interrupt'\r\nlive/vendor/bundle/ruby/3.0.0/gems/connection_pool-2.4.1/lib/connection_pool.rb:106:in `with'\r\nlive/app/lib/redis_configuration.rb:10:in `with'\r\nlive/app/models/concerns/redisable.rb:9:in `with_redis'\r\nlive/app/models/concerns/lockable.rb:9:in `with_redis_lock'\r\nlive/app/services/fetch_link_card_service.rb:26:in `call'\r\nlive/app/workers/link_crawl_worker.rb:9:in `perform'\r\n(irb):120:in `<main>'\r\n```\r\n\r\nIt chokes on this;\r\n<img width=\"463\" alt=\"image\" src=\"https://github.com/mastodon/mastodon/assets/22740616/269632b8-0cf0-4344-b403-cac633812582\">\r\n",
+            "I think I have a possible fix that checks the encoding and re-encodes to UTF-8 if it's not. I was able to generate a link preview for that particular link you shared where it doesn't before, and I haven't seen any of the UTF-8 errors for a while. Need to play with it some more though.\r\n\r\n<img width=\"571\" alt=\"image\" src=\"https://github.com/mastodon/mastodon/assets/3002053/ece71962-27ae-4e68-95f9-582ddaaffbfd\">",
+            "Has anyone got any further than this?  I see a good percentage of this error in my dead queue (running v4.2.8)",
+            "@vmstan Any luck with your possible fix? Otherwise I might take a look into this.",
+            "Have at it, I haven't had a chance to dig into it and my fix created more issues than it solved."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50827,
+            "commit_id": "98980878601d2e656c23e41864eb81f36b66eb01",
+            "original_commit_id": "f723370c6982d914695378ef70949b22a8bb235d",
+            "path": "spec/services/fetch_link_card_service_spec.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 156,
+            "original_line": 156,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "I am confused at this assertion, are we not asserting this is decoded correctly?",
+                "Nevermind, github decided to decode it as something else than utf-8, but the file's content is correct utf-8.\r\n![image](https://github.com/mastodon/mastodon/assets/384364/657d6f91-2ec9-48e2-bd98-1627c1ea4180)\r\n"
+            ]
+        },
+        {
+            "hunk_id": 50826,
+            "commit_id": "98980878601d2e656c23e41864eb81f36b66eb01",
+            "original_commit_id": "f723370c6982d914695378ef70949b22a8bb235d",
+            "path": "spec/services/fetch_link_card_service_spec.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 152,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we stub out the charlock response to be confident in it's confidence? If the gem or its underlying libraries changed such that it COULD detect this, the nature of this spec would change (I think?)",
+                "Good question. Note that the test is for `FetchLinkCardService` and mimicks the situation from the issue. I believe that at this point we only care that it works and not _how_ it works.\r\n\r\nThe follow-up question then is of course if we should invest in specs for `LinkDetailsExtractor` that simulate all four possible scenarios."
+            ]
+        }
+    ]
+}

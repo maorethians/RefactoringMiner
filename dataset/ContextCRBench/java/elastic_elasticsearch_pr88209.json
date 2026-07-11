@@ -1,0 +1,144 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 88209,
+    "lang": "java",
+    "pr_title": "Rework shard snapshot workers",
+    "pr_body": "Currently, when starting the shard snapshot tasks, we loop through the\r\nshards to be snapshotted back-to-back. This will calculate whether/which\r\nchanges in the shard there are to be snapshotted, write some metadata,\r\nand ONLY if there are changes and there are files to be uploaded, fork\r\noff the file upload calls. This could be further improved by parallelizing \r\nshard snapshot tasks (currently, only file uploads happen in parallel). \r\n\r\nThis change uses a worker pool and a queue to:\r\n\r\n1. Paralleize (with limited number of workers) shard snapshotting, and \r\n    limit the number of the concurrently running snapshot tasks.\r\n2. Prioritize shard snapshot tasks over file snapshot tasks.\r\n\r\nCloses #83408 ",
+    "pr_comments": [
+        "Hi @pxsalehi, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "I wonder if this approach is necessarily better. IIUC, we currently keep the one thread looping until the end. In the new approach, we risk the first (or an early) shard filling up the snapshot queue before the last tasks are added to the queue. This could mean that shards with no changes being scheduled after large file uploads?",
+        "> This could mean that shards with no changes being scheduled after large file uploads?\r\n\r\nWe figured this was somewhat unlikely (to happen a lot) and outweigh by the fact that we now multi-thread the starting of shard snapshots (which is the main motivation for this change, as we realized that running this single-threaded could take a long time on large data nodes).\r\nBut I guess if we want to be stricter about this, we could implement this differently by putting all the shards to start in a queue and then running threads (one of which would be the original thread that we fork from) that poll from that queue. That way we get even better ordering at the price of a little more code? Think it's worth it?\r\n",
+        "(Apologies for using too many vague/relative terms like many/few/large! But I need to somehow ask my question!)\r\n\r\nFor me one missing piece to evaluate the worst case impact of a file upload on unchanged shard snapshots, is the following: could the size of single files (to be uploaded) be extremely large? What would be a realistic \"average\" case? Or is it hard to tell since it could be wildly different depending on the settings/load? It seemed to me that many not-huge files to uploads is the common case. (Also another assumption from our talk, it seems often what happens during a snapshot is that most shards have no changes, and only few of them need to upload files.)\r\n\r\n",
+        "We generally try to not fill the queue with all tasks, for instance in `BlobStoreRepository.snapshotShard` which only schedules as many threads as there are. I assume to allow other work to interleave?\r\n\r\nIf we do all shards in parallel, we risk getting `#shards * thread_pool_size` into the queue. It seems like the \"throttling\" we do per shard is no longer useful then? This could mean a duration of many minutes if not hours of no response on the `SNAPSHOT` thread pool. I think that could block restores, new followers and single-index snapshots? Am I missing something essential here?\r\n\r\nI think this would be true also if we queue up the shard level execution and only do n jobs in parallel.",
+        "> Am I missing something essential here?\r\n\r\nYou're not directly missing anything actually. But I think there is a tradeoff here. This change makes it so that running a snapshot on a 10k shard warm-node may block the snapshot pool for ~15 min (assuming ~0.5s per shard snapshot and 5 snapshot threads max) vs. taking 75min to run a single snapshot without blocking the pool.\r\nTaking the 15 min over the 75 min and accepting the blocking seems like the right tradeoff to me, especially when it's this easy to implement?\r\nAlso, note that we are doing the delete side where we're not being clever about doing any sort of hand-crafted work stealing queue like we do for file uploads either and no complaints about it have come in ever as far as I'm aware :)\r\n\r\n> I think this would be true also if we queue up the shard level execution and only do n jobs in parallel.\r\n\r\nTrue, the advantage of that approach would be that we'd have a harder guarantee on running the metadata work right before the file uploads (and it's a little faster potentially I guess).",
+        "I'm trying to understand how much of this discussion relates to the original issue (https://github.com/elastic/elasticsearch/issues/83408). \r\n\r\nIf blocking the snapshot threadpool during a snapshot is a concern, then what would be an acceptable approach that addresses the issue and avoids blocking the threadpool? One thread going through the shard snapshot tasks, calculating which snapshots do not upload a file, doing all of those in the same thread, and then again in the same thread going through the shard snapshots that do have a change, and only fork-off the file-uploads? \r\n\r\nBasically, everything else other than file upload should be done on the thread going through the shards, and actually in two passes? No snapshotting of unchanged shards in parallel? Considering having many thousand unchanged shard snapshots and few shards actually uploading files is a normal occurrence, as Armin mentioned, parallelizing snapshotting of unchanged shards seems to reduce snapshot time, which I guess is an improvement.\r\n\r\nMy question is that if we do not want to parallelize shard snapshot tasks, then would the approach I mentioned above have any real improvement for the issue? Currently, all unchanged snapshots happen in the same thread, which doesn't seem that different than the two phase approach! ",
+        "Armin and I had a brief conversation on this and while the existing mechanism for limiting the number of upload threads is somewhat broken, running the outer level tasks in parallel will slightly increase this brokennes. We prefer to instead fix this for good by maintaining enough data structures to just fill the snapshot pool with the right amount of work without exhausting it for potentially hours.\r\n\r\nSomething like 2 queues (the other level work and the actual file upload work) and a counter for how many jobs are active should do. When any job finishes it checks the outer level queue first and once that is depleted it does the actual file upload jobs.\r\n\r\nThis also ensures that all no-change shards are done prior to any file uploads. I think Armin intends to chat sync with you on this.",
+        "@elasticmachine please run elasticsearch-ci/part-1\r\n\r\n(I think, the test failure was unrelated to the PR. I opened: https://github.com/elastic/elasticsearch/issues/88615)",
+        "@elasticmachine please update branch",
+        "@elasticmachine update branch",
+        "I have also undone the changes to `SnapshotShardsService` in favour of https://github.com/elastic/elasticsearch/pull/88707.",
+        "@elasticmachine update branch",
+        "@henningandersen @original-brownbear Thank you for the reviews. Please have another look. I've addressed all comments.\r\n\r\nI haven't added that case in Henning's code sample where we spawn directly if workers are available. IMO, it is an optimization for a very specific corner case which I don't know if we need. Always queueing and polling seems simpler (unless it has some disadvantage I'm not aware of).",
+        "(Test failure doesn't seem to be related to the PR: https://github.com/elastic/elasticsearch/issues/89623)",
+        "@elasticmachine run elasticsearch-ci/part-1",
+        "@elasticmachine update branch\r\n(There is a fix to one of the Snapshot ITs in main that was failing also in this PR)",
+        "I looked into the [previous failures](https://gradle-enterprise.elastic.co/s/lpiy4ql6ecvxc/tests/:server:internalClusterTest/org.elasticsearch.snapshots.CloneSnapshotIT/testRemoveFailedCloneFromCSWithQueuedSnapshotInProgress?top-execution=1), since they were both related to snapshotting. From the previous test failures, it seems `ConcurrentSnapshotsIT.testMasterFailoverOnFinalizationLoop` was failing due to recent changes on main, and is now fixed on main and doesn't fail here anymore. However, `CloneSnapshotIT.testRemoveFailedCloneFromCSWithQueuedSnapshotInProgress` seems to rarely fail on this PR. Not sure why! I can make it time out on a slow system, but can't tell whether the test assumption doesn't match anymore with how we schedule the snapshotting tasks, or there is an issue in the PR. It seems that the snapshot cloning step of the test doesn't return and times out. I'd have to spend some more time on it. \r\n\r\nCC: @original-brownbear maybe we could look into it together.",
+        "@henningandersen Thanks for the detailed feedback. I addressed all your comments. Please have another look. Meanwhile I'll look into that previous CI failure to see if it is related or I was just paranoid!",
+        "> @henningandersen Thanks for the detailed feedback. I addressed all your comments. Please have another look. Meanwhile I'll look into that previous CI failure to see if it is related or I was just paranoid!\r\n\r\nI am not able to reproduce that issue on the branch. For the record, it used to timeout on different asserts in the test, the couple of times that it happened (not just a specific one), and that was on a pretty slow system. I think, it is safe to dismiss that.",
+        "@original-brownbear @henningandersen All done! Please check again.",
+        "Thanks Henning and Armin!"
+    ],
+    "merged": true,
+    "created_at": "2022-08-29T14:54:40Z",
+    "issue_context": {
+        "number": 83408,
+        "title": "Order shards by \"changes\" when snapshoting",
+        "body": "### Description\n\nSnapshotting process when interrupted will return all not copied yet shards as PARTIAL.\r\nIf shards were ordered by what changes they have, the snapshoting process could work with \"unchanged\" shards first and finish them immediately. Then when working on copying a bigger \"changed\" shard, during interruption (node with shard is shut down) only the shards with changes will be marked as PARTIAL. \r\nThis could be an improvement untill https://github.com/elastic/elasticsearch/issues/71333 is implemented. ",
+        "comments": [
+            "Pinging @elastic/es-distributed (Team:Distributed)",
+            "Just adding a few details about this plan:\r\n\r\nWe basically want to add another version of `org.elasticsearch.repositories.Repository#snapshotShard` here that will only take do the snapshot in case it's a noop (does not require uploading any data files).\r\nThis way we can do one fast pass over all shards on a data node to deal with the quick noop shard snapshots that just update metadata. After that pass we check which shards were not noops and upload those in another pass that does the file uploading.\r\n=> way fewer shard failures when snapshotting while there's node restarts or other node changes going on.",
+            "After a very nice and fruitful discussion with @original-brownbear and based on his suggestions, we arrived at the following approach:\r\n\r\nAs of the current `master` (bc9478d3f12a527358ac5a1630b0ebb3ff168ba7), when starting the shard snapshot tasks, we [loop through](https://github.com/elastic/elasticsearch/blob/bc9478d3f12a527358ac5a1630b0ebb3ff168ba7/server/src/main/java/org/elasticsearch/snapshots/SnapshotShardsService.java#L254) the shards to be snapshotted and run the above-mentioned `Repository#snapshotShard`. This will calculate whether/which changes in the shard there are to be snapshotted, write some metadata, and ONLY if there are changes and there are files to be uploaded, [fork off the file upload calls](https://github.com/elastic/elasticsearch/blob/bc9478d3f12a527358ac5a1630b0ebb3ff168ba7/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java#L2888-L2898). This means, the issue as described here does not have such a severe impact (probably the code has been improved/optimized since then).\r\n\r\nHowever, as suggested by Armin, this could even be further improved by starting the shard snapshot tasks in parallel. This would mean that since all of the above tasks are scheduled on the same threadpool, those shard snapshot calls that have no files to upload would just finish in the same thread, and the file upload calls (kind of!) go to the end of the working queue. \r\n\r\nThat being said, since these are not synchronized and some of the file upload tasks could run before all the start shard snapshots have been started, file upload tasks could still keep some of the threads busy and take precedence over unchanged shard snapshots. However, this wouldn't starve other snapshot calls since the [number of parallel file uploads](https://github.com/elastic/elasticsearch/blob/bc9478d3f12a527358ac5a1630b0ebb3ff168ba7/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java#L2893) for the same shard snapshot is throttled. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 36414,
+            "commit_id": "ad896feb178f12551f4885bff8ad412d8000f48e",
+            "original_commit_id": "a6efa722adf28342a9bbc67069c47e9bbd0f8963",
+            "path": "server/src/test/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunnerTests.java",
+            "start_line": 72,
+            "original_start_line": 72,
+            "start_side": "RIGHT",
+            "line": 74,
+            "original_line": 74,
+            "side": "RIGHT",
+            "original_position": 74,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "I think this can be simplified to:\r\n\r\n```suggestion\r\n            if (filesToUpload != 0) {\r\n```",
+                "No, I think it's different. When there is no file to upload, we mark the snapshot as done/finished. The increment at the end of the if/else is for the task, not the snapshot.",
+                "Thanks, I missed that."
+            ]
+        },
+        {
+            "hunk_id": 36416,
+            "commit_id": "ad896feb178f12551f4885bff8ad412d8000f48e",
+            "original_commit_id": "a6efa722adf28342a9bbc67069c47e9bbd0f8963",
+            "path": "server/src/main/java/org/elasticsearch/common/util/concurrent/PrioritizedThrottledTaskRunner.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 54,
+            "original_line": 46,
+            "side": "RIGHT",
+            "original_position": 46,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we add some commentary on how this loop works. In particular, on why we need to peek the queue. This is somewhat hard to follow for me and will be even harder to follow for future readers of this code.",
+                "Good point!"
+            ]
+        },
+        {
+            "hunk_id": 36415,
+            "commit_id": "ad896feb178f12551f4885bff8ad412d8000f48e",
+            "original_commit_id": "a6efa722adf28342a9bbc67069c47e9bbd0f8963",
+            "path": "server/src/test/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunnerTests.java",
+            "start_line": 158,
+            "original_start_line": 158,
+            "start_side": "RIGHT",
+            "line": 160,
+            "original_line": 160,
+            "side": "RIGHT",
+            "original_position": 160,
+            "position": 160,
+            "subject_type": "line",
+            "review_comments": [
+                "I wonder if there is a risk of the `assertBusy` exiting too early, since `runningTasks` could in theory be 0 with many more queued items. Suppose all your runners has just done the decrement and now wants to do the increment. At that time, the `runningTasks()` could be 0?\r\n\r\nYou will likely have to include either the queue size or the file-snapshot task check in the assert busy. If you include queue-size it must be checked before the `runningTasks` check.",
+                "Maybe there is a misunderstanding but `finishedShardSnapshots` means all file/meta tasks are finished, not just the meta work. I think the assertBusy there waits until all tasks (of both type) are finished."
+            ]
+        },
+        {
+            "hunk_id": 36413,
+            "commit_id": "ad896feb178f12551f4885bff8ad412d8000f48e",
+            "original_commit_id": "a6efa722adf28342a9bbc67069c47e9bbd0f8963",
+            "path": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2905,
+            "original_line": 2898,
+            "side": "RIGHT",
+            "original_position": 46,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "Turns out sometimes `indexIncrementalFileCount` can be non-zero, and `filesToSnapshot` still be empty. This was somehow not necessary to check before this change, since it would just lead to some idle workers that would exit immediately. However, with this change, we'd have to wait for actual file uploads to finish, not the file upload workers.",
+                "Makes sense, neat fix saving some redundant tasks :)",
+                "Well, with the current PR this was necessary, as otherwise, we'd be creating a `GroupedActionListener` of size 0."
+            ]
+        },
+        {
+            "hunk_id": 36417,
+            "commit_id": "ad896feb178f12551f4885bff8ad412d8000f48e",
+            "original_commit_id": "a6efa722adf28342a9bbc67069c47e9bbd0f8963",
+            "path": "server/src/test/java/org/elasticsearch/common/util/concurrent/PrioritizedThrottledTaskRunnerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 73,
+            "original_line": 73,
+            "side": "RIGHT",
+            "original_position": 73,
+            "position": 73,
+            "subject_type": "line",
+            "review_comments": [
+                "NIT: could use `CyclicBarrier` here instead which seems to be the correct primitive?",
+                "We could. But since we need only a one-time barrier, the latch is enough I think. I've seen it used like that in several places in the code.",
+                "I'd agree with Armin here, `CyclicBarrier` is good for a rendezvous interaction. And saves a line of code too.\r\n\r\nBut fine to leave as is..."
+            ]
+        }
+    ]
+}

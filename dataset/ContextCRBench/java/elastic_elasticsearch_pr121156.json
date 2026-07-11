@@ -1,0 +1,142 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 121156,
+    "lang": "java",
+    "pr_title": "ES|QL: Remove redundant sorts from execution plan",
+    "pr_body": "Fixes: https://github.com/elastic/elasticsearch/issues/120817\r\nFixes: https://github.com/elastic/elasticsearch/issues/120803\r\n\r\nWhen we have multiple SORT commands in a query, some of them could be redundant.\r\n\r\nEg. \r\n\r\n```\r\nfrom test | sort x | mv_expand x | sort y | limit 1\r\n\r\nfrom test | sort x | lookup join lookup on x | sort y | limit 1\r\n```\r\n\r\nin both cases, the first SORT is practically irrelevant, as the second SORT will reorder the results, and the commands in-between don't rely on the order of results.\r\n\r\nIn addition, since the second SORT \"absorbes\" the LIMIT, the first SORT will remain unbounded, and it is problematic, since ES|QL does not support unbounded sort.\r\n\r\nThis change adds an optimization rule that finds and removes redundant sorts.\r\n\r\nA SORT is redundant if all the following conditions are met:\r\n- it is before another SORT.\r\n- all the commands between the two SORTs do not rely on the order of results.\r\n\r\nEg. in `FROM idx | ... | SORT x | <command1> | ... | <commandN> | SORT y`, `SORT x` can be considered redundant:\r\n- because `SORT y` will reorder the results\r\n- but only if none of `<command1>`, `<commandN>` rely on the order of results\r\n\r\nTypes of commands that could rely on input order are:\r\n- LIMIT: it takes first N results, and if the input is ordered, that order matters\r\n- EVAL with window functions: eg. functions that, for a record, also consider the content of previous/next N records\r\n- STREAMSTATS\r\n- any commands with an inner limit (eg. like MV_EXPAND before [this change](https://github.com/elastic/elasticsearch/pull/120411))\r\n\r\n~~At this stage we don't support window functions and STREAMSTATS, but in future we could, so to avoid regressions we consider EVAL and STATS as relevant for order for now.~~\r\n\r\nToday we don't support window functions and STREAMSTATS, and we already had rules that do the same thing and don't consider these cases (the old `PruneOrderByBeforeStats` rule), so we'll consider EVAL, FILTER and STATS safe for now.\r\n\r\n~~Given this limitation, `AddDefaultTopN` is still in place to make a couple of tests pass, but as reported [here](https://github.com/elastic/elasticsearch/issues/120803), it is most likely incorrect and needs a double-check.~~\r\n\r\nSince in some cases we can still have unbounded sorts (eg. `| sort | mv_expand | where`), we also let OrderBy implement `PostOptimizationVerificationAware` and fail validation in a more graceful way.\r\n\r\n\r\n",
+    "pr_comments": [
+        "Hi @luigidellaquila, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-analytical-engine (Team:Analytics)",
+        "Thanks for the feedback @alex-spies @costin, I added another round of changes that should address your comments",
+        "Thanks @costin \r\n\r\n>Sorting is expensive in a distributed system and commands and users should not depend on it.\r\nAt the moment, only Limit and the upcoming change point depend on it, all the other commands do not - hence my preference to opt in. That is the default is optimized for the majority of use-cases.\r\n\r\nI'd prefer to keep it safe and have the optimization happen only when we know it's safe. ES|QL is evolving fast, and the risk of breaking things is pretty high\r\n\r\n>If it's opt in, the presence of the (marker) interface (SortAware) is enough - no need to implement a method, it's redundant.\r\nIf it's opt out, use the same marker interface but change its name to reflect the intent, e.g. SortIgnorant, SortIgnorant and simply use its presence.\r\n\r\n\ud83d\udc4d I renamed it `SortAgnostic` (it's the best I could think of, naming is hard...) and I removed the method (we don't need it for now, we'll add it in the future if we want more control on single commands)",
+        "> SortAgnostic\r\n\ud83d\udc4d ",
+        "Thanks folks!\r\nMerging",
+        "## \ud83d\udc94 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| \u274c |  8.18  | Commit could not be cherrypicked due to conflicts |\n| \u274c |  8.x  | Commit could not be cherrypicked due to conflicts |\n| \u274c |  9.0  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 121156`",
+        "Manual backport https://github.com/elastic/elasticsearch/pull/122187 https://github.com/elastic/elasticsearch/pull/122231"
+    ],
+    "merged": true,
+    "created_at": "2025-02-07T14:25:30Z",
+    "issue_context": {
+        "number": 120817,
+        "title": "ESQL: LOOKUP JOIN and Sort: wrong optimizations or unplannable with \"unknown physical plan node [OrderExec]",
+        "body": "The same problems from https://github.com/elastic/elasticsearch/issues/120803 also occur with `LOOKUP JOIN`. Although, there may be different solutions because `LOOKUP JOIN` preserves the sort order if there is one.\n\nTo summarize:\nThere are situations where a SORT/OrderBy node cannot be combined with a downstream LIMIT node when there's a `LOOKUP JOIN` in between. When we cannot combine an OrderBy with a Limit, it gets mapped to a OrderExec - a physical plan node that we cannot map to an operator because we don't implement unbounded sorts (sorts without a built-in limit, i.e. TopNs).\n\nIn contrast to `MvExpand`, the optimization rule `AddDefaultTopN` doesn't apply because it only works with unary plans (although its application wouldn't be correct, anyway), so more queries fail (instead of running, but incorrectly) with the cryptic message `unknown physical plan node [OrderExec]`.\n\nSimilarly to `MV_EXPAND`, I think this requires:\n\n- A better error message. In fact, I think we shouldn't ever map to `OrderExec`. We probably should implement `PostOptimizationVerificationAware` on the OrderBy class and have the verification fail if a node is even present after optimization, ideally with a suggestion on what a user can try to do.\n- A new optimization rule that _somehow_ leads to eliminating unbounded sorts, by moving them around, somehow (but correctly) combining them with `Limit`s into `TopN`s, or straight up globally analyzing the plan and checking if the sort can just be removed.\n\nIn the following examples, consider a `test` index with fields `x` and `a`, and a lookup index `lookup` with fields `x` and `y`.\n\n**Example 1**:\n```\nfrom test | sort x | lookup join lookup on x | sort y\n\n{\"error\":{\"root_cause\":[{\"type\":\"esql_illegal_argument_exception\",\"reason\":\"unknown physical plan node [OrderExec]\"}],\"type\":\"esql_illegal_argument_exception\",\"reason\":\"unknown physical plan node [OrderExec]\"},\"status\":500}\n```\nThe `sort y` is not pushable because it requires a field from `lookup`. But the `sort x` could be pulled up, so the two sorts are next to each other and the `sort y` eliminates the `sort x`.\n\nThe combinations `sort some_field | lookup join ...` and `lookup join ... | sort some_field` are always interchangeable as long as `some_field` (or, more generally, all fields that we sort on) exist _before and after_ the `lookup join`. Note that `lookup join` will shadow attributes which are not the join key in case of name conflicts!\n\n**Example 2**:\n```\nfrom test | sort a | lookup join lookup on x | sort x\n\n{\"error\":{\"root_cause\":[{\"type\":\"esql_illegal_argument_exception\",\"reason\":\"unknown physical plan node [OrderExec]\"}],\"type\":\"esql_illegal_argument_exception\",\"reason\":\"unknown physical plan node [OrderExec]\"},\"status\":500}\n```\nHere, both the `sort a` and the `sort x` could be pushed up/down past the `lookup join`, and would in both cases lead to an elimination of the earlier sort. However, in terms of performance it's likely better to have the sort done before the lookup join as long as it's possible to turn that into a `TopN`. Because some times, we can push down a `TopN` to Lucene - and otherwise, performing the `lookup join` on _all documents_ is mighty wasteful.\n\n**Summary**\n- `SORT` should likely be pushed down past `LOOKUP JOINs` whenever possible.\n- When there is a `SORT` before and after `LOOKUP JOIN`, we should try to eliminate the earlier one if that's correct - or at least issue a useful error message so a user can remove that `SORT` manually.",
+        "comments": [
+            "Pinging @elastic/es-analytical-engine (Team:Analytics)",
+            "Another interesting example:\n\nConsider a `test` index with fields `x` and `a`, and a lookup index `lookup` with fields `x` and `y`.\n```\nfrom test | sort x | lookup join lookup on x | where y > 0 | limit 1\n```\nPushing down the `limit` past the `where` is incorrect, whichever number we set. Pushing the `where` past the `lookup join` is impossible because `y` is not present before that. Pulling up the `sort x` is possible, but not something that we'd normally want to do, as lookups are expensive."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 37019,
+            "commit_id": "9083477333bbaf5e200735c7e36c5c180235a1fc",
+            "original_commit_id": "aaa5ce85a931c64f2f3aa4ace5f8508557a904b2",
+            "path": "x-pack/plugin/esql/src/test/java/org/elasticsearch/xpack/esql/optimizer/LogicalPlanOptimizerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7398,
+            "original_line": 7398,
+            "side": "RIGHT",
+            "original_position": 425,
+            "position": 425,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't see a test with SORT + DROP/KEEP/RENAME + SORT. Could we add one if they already exist?",
+                "Adding one.\r\n\r\n> nit: maybe it makes sense to move tests related to the new optimizer rule into a dedicated file.\r\n\r\nLet's do it with a separate PR. LogicalPlanOptimizerTests has quite some initialization logic, it will need some refactoring."
+            ]
+        },
+        {
+            "hunk_id": 37018,
+            "commit_id": "9083477333bbaf5e200735c7e36c5c180235a1fc",
+            "original_commit_id": "aaa5ce85a931c64f2f3aa4ace5f8508557a904b2",
+            "path": "x-pack/plugin/esql/src/test/java/org/elasticsearch/xpack/esql/optimizer/LogicalPlanOptimizerTests.java",
+            "start_line": 7495,
+            "original_start_line": 7459,
+            "start_side": "RIGHT",
+            "line": 7500,
+            "original_line": 7464,
+            "side": "RIGHT",
+            "original_position": 491,
+            "position": 527,
+            "subject_type": "line",
+            "review_comments": [
+                "suggestion: Could we have a simple test like this but for LOOKUP JOIN? This test is a nice minimal example."
+            ]
+        },
+        {
+            "hunk_id": 36731,
+            "commit_id": "9083477333bbaf5e200735c7e36c5c180235a1fc",
+            "original_commit_id": "aaa5ce85a931c64f2f3aa4ace5f8508557a904b2",
+            "path": "x-pack/plugin/esql/src/test/java/org/elasticsearch/xpack/esql/optimizer/LogicalPlanOptimizerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1844,
+            "original_line": 1844,
+            "side": "LEFT",
+            "original_position": 6,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Notice that here you are losing a performance aspect: `mv_expand` is applied on all documents. The idea with a sort (and the **default** pushed down `limit`) in front of `mv_expand` was to have fewer documents to expand from because the expansion is, theoretically, creating even more rows. Before this PR, each node was getting 1000 docs, mv_expanded them and a final sort performed. With this PR, each node is expanding everything, then sorting.",
+                "Yes, but you were also discarding all the employees after the first 1000 (sorted by emp_no), that is not what the query says, so technically you got a faster execution, but a wrong result."
+            ]
+        },
+        {
+            "hunk_id": 36733,
+            "commit_id": "9083477333bbaf5e200735c7e36c5c180235a1fc",
+            "original_commit_id": "aaa5ce85a931c64f2f3aa4ace5f8508557a904b2",
+            "path": "x-pack/plugin/esql/src/test/java/org/elasticsearch/xpack/esql/optimizer/LogicalPlanOptimizerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7398,
+            "original_line": 7398,
+            "side": "RIGHT",
+            "original_position": 425,
+            "position": 425,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't see a test with SORT + DROP/KEEP/RENAME + SORT. Could we add one if they already exist?",
+                "Adding one.\r\n\r\n> nit: maybe it makes sense to move tests related to the new optimizer rule into a dedicated file.\r\n\r\nLet's do it with a separate PR. LogicalPlanOptimizerTests has quite some initialization logic, it will need some refactoring."
+            ]
+        },
+        {
+            "hunk_id": 36732,
+            "commit_id": "9083477333bbaf5e200735c7e36c5c180235a1fc",
+            "original_commit_id": "aaa5ce85a931c64f2f3aa4ace5f8508557a904b2",
+            "path": "x-pack/plugin/esql/src/test/java/org/elasticsearch/xpack/esql/optimizer/LogicalPlanOptimizerTests.java",
+            "start_line": 7495,
+            "original_start_line": 7459,
+            "start_side": "RIGHT",
+            "line": 7500,
+            "original_line": 7464,
+            "side": "RIGHT",
+            "original_position": 491,
+            "position": 527,
+            "subject_type": "line",
+            "review_comments": [
+                "suggestion: Could we have a simple test like this but for LOOKUP JOIN? This test is a nice minimal example."
+            ]
+        },
+        {
+            "hunk_id": 37017,
+            "commit_id": "9083477333bbaf5e200735c7e36c5c180235a1fc",
+            "original_commit_id": "aaa5ce85a931c64f2f3aa4ace5f8508557a904b2",
+            "path": "x-pack/plugin/esql/src/test/java/org/elasticsearch/xpack/esql/optimizer/LogicalPlanOptimizerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1844,
+            "original_line": 1844,
+            "side": "LEFT",
+            "original_position": 6,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Notice that here you are losing a performance aspect: `mv_expand` is applied on all documents. The idea with a sort (and the **default** pushed down `limit`) in front of `mv_expand` was to have fewer documents to expand from because the expansion is, theoretically, creating even more rows. Before this PR, each node was getting 1000 docs, mv_expanded them and a final sort performed. With this PR, each node is expanding everything, then sorting.",
+                "Yes, but you were also discarding all the employees after the first 1000 (sorted by emp_no), that is not what the query says, so technically you got a faster execution, but a wrong result."
+            ]
+        }
+    ]
+}

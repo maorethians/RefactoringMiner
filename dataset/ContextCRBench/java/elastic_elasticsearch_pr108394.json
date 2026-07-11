@@ -1,0 +1,47 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 108394,
+    "lang": "java",
+    "pr_title": "[Transform] Retry Destination IndexNotFoundException",
+    "pr_body": "An Index can be removed from its previous shard in the middle of a Transform run.  Ideally, this happens as part of the Delete API, and the Transform has already been stopped, but in the case that it isn't, we want to retry the checkpoint.\r\n\r\nIf the Transform had been stopped, the retry will move the Indexer into a graceful shutdown.\r\n\r\nIf the Transform had not been stopped, the retry will check if the Index exists or recreate the Index if it does not exist.\r\n\r\nThis is currently how unattended Transforms work, and this change will make it so regular Transforms can also auto-recover from this error.\r\n\r\nFix #107263\r\n\r\n",
+    "pr_comments": [
+        "Hi @prwhelan, I've created a changelog YAML for you.",
+        "Pinging @elastic/ml-core (Team:ML)"
+    ],
+    "merged": true,
+    "created_at": "2024-05-09T11:29:00Z",
+    "issue_context": {
+        "number": 107263,
+        "title": "[Transform] IndexNotFoundException during cluster upgrade",
+        "body": "### Description\n\nFrom: https://github.com/elastic/elasticsearch/issues/107251\r\n\r\nWhile a cluster is upgrading, we see `IndexNotFoundException` for some Transforms.\r\nExample:\r\n```java\r\n[endpoint.metadata_united-default-8.13.0] transform has failed; experienced: [Failed to index documents into destination index due to permanent error: [org.elasticsearch.xpack.transform.transforms.BulkIndexingException: Bulk index experienced [36] failures and at least 1 irrecoverable [org.elasticsearch.index.IndexNotFoundException: no such index [.metrics-endpoint.metadata_united_default]]. Other failures: [RemoteTransportException] message [org.elasticsearch.transport.RemoteTransportException: [<>][<>][indices:data/write/bulk[s]]]; org.elasticsearch.index.IndexNotFoundException: no such index [.metrics-endpoint.metadata_united_default]]].\r\n```\r\n\r\nThis is likely an eventual consistency issue, and the transform needs to give the index time to become consistently reachable",
+        "comments": [
+            "Pinging @elastic/ml-core (Team:ML)",
+            "Similar to https://github.com/elastic/elasticsearch/issues/107266#issuecomment-2070444809\r\n\r\nA stopped transform has a running thread that eventually fails to do whatever it is that it is doing (in this case, save to index)",
+            "I cannot think of a good way to approach this, the current option is to explicitly check for this [here](https://github.com/elastic/elasticsearch/blob/main/x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/ClientTransformIndexer.java#L217):\r\n```java\r\n else if (irrecoverableException instanceof IndexNotFoundException && IndexerState.ABORTING == getState()) {\r\n    logger.debug(\r\n        \"[{}] Bulk index experienced IndexNotFoundException failure while Transform is aborting. This is likely \"\r\n            + \"due to the Transform delete API called with delete_dest_index=true.  Aborting indexer. \",\r\n        getJobId()\r\n    );\r\n    onAbort();\r\n    // do not call listener\r\n}\r\n```\r\n\r\nThis is similar to what happens [before](https://github.com/elastic/elasticsearch/blob/main/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexing/AsyncTwoPhaseIndexer.java#L483) and [after](https://github.com/elastic/elasticsearch/blob/main/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/indexing/AsyncTwoPhaseIndexer.java#L573) this code is invoked, where the Transform exits gracefully if it was moved into the `ABORTING` state (via the `DELETE` API).\r\n\r\nThe alternative is to have [fail](https://github.com/elastic/elasticsearch/blob/main/x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformTask.java#L506) check for the `ABORTING` state and exit gracefully there, but that is a more invasive change with broader impact",
+            "The above isn't quite true, it is correlated but I cannot repro it.\r\n\r\nThis is actually the line that is throwing the exception: https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/action/support/replication/TransportReplicationAction.java#L832\r\n\r\nI haven't fully digested what this code is doing enough to repro it, it feels vaguely like the node running the transform has a earlier cluster state version than the node processing the bulk request, so we fail out instead of retrying?",
+            "This can kinda be consistently reproduced by trying to get the shards to relocate.  When this happens, we want the Transform to retry the checkpoint and check if the Index exists.\r\n\r\nIt might be possible that a Delete API can still trigger this issue, in which case we will want to have the Indexer gracefully shut down.\r\n\r\nIt also might be possible that the user can delete the Index using the Index API without stopping the Transform, in that case the Transform seems to continue running and the Bulk API will recreate the Index as per its spec.  Ideally we'd either stop the Transform or have the Transform create/update the Index as per the Transport API spec, but I don't think that is within the scope of this issue."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 37106,
+            "commit_id": "c8c13c888bb5e3c61cec0599598651a2a5aee4dd",
+            "original_commit_id": "fb84a22a754eca18d23d1375888d1469dfc1d984",
+            "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/utils/ExceptionRootCauseFinder.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 67,
+            "original_line": 67,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "If we no longer consider `IndexNotFoundException` irrecoverable, could we modify the `isExceptionIrrecoverable` method to reflect that instead of adding the `isNotIndexNotFoundException` method?\r\n\r\nOr the distinction is still needed for cases other than bulk responses?",
+                "That is a good question - at least for now I was thinking of just handling it for the destination index? The source index can still fail with IndexNotFoundException (if PIT == null): https://github.com/elastic/elasticsearch/blob/main/x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/ClientTransformIndexer.java#L602\r\n\r\nI haven't seen this same type of intermittent failure scenario though, where the source index gets relocated to a new shard and the request fails on the old shard, so I'm not sure if we just haven't seen it yet or if search behaves differently where the request will automatically reroute.",
+                "> I'm not sure if we just haven't seen it yet or if search behaves differently where the request will automatically reroute.\r\n\r\nI don't know either unfortunately :(\r\nBut since we are going in a direction to make more errors recoverable (and more transforms unattended) it could make sense to make `IndexNotFoundException` recoverable.\r\nBut maybe let's not do it in this PR if you don't feel comfortable.\r\nWe can leave this PR for dealing with destination index only.\r\nPlease make it clear in the PR title/description."
+            ]
+        }
+    ]
+}

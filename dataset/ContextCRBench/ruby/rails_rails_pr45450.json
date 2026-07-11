@@ -1,0 +1,216 @@
+{
+    "repo": "rails/rails",
+    "pr_number": 45450,
+    "lang": "ruby",
+    "pr_title": "Only remove connection for an existing pool if the config is different",
+    "pr_body": "Previously Rails would always remove the connection if it found a\r\nmatching class in the pool manager. Therefore if\r\n`ActiveRecord::Base.establish_connection` was called with the same\r\nconfig, each time it was called it would be clobbered, even though the\r\nconfig hasn't changed and the existing connection is prefectly fine. As\r\nfar as I can tell from conversations and reading the history this\r\nfunctionality was added for ActiveRecord tests to be able to clobber the\r\nconnection and use a new config, then re-establish the old connection.\r\nEssentially outside Rake tasks and AR tests, this functionality doesn't\r\nhave a ton of value.\r\n\r\nOn top of not adding a ton of value, this has resulted in a few bugs. In\r\nRails 6.0 I made it so that if you established a connection on\r\n`ApplicationRecord` Rails would treat that connection the same as\r\n`ActiveRecord::Base.` The reason for this is that the Railtie\r\nestablishes a connection on boot to the first database, but then if\r\nyou're using multiple databases you're calling `connects_to` in your\r\n`ApplicationRecord` or primary abstract class which essentially doubles\r\nyour connections to the same database. To avoid opening 2 connections to\r\nthe same database, Rails treats them the same.\r\n\r\nHowever, because we have this code that removes existing connections,\r\nwhen an application boots, `ApplicationRecord` will clobber the\r\nconnection that the Railtie established even though the connection\r\nconfigs are the same.\r\n\r\nThis removal of the connection caused bugs in migrations that load up a\r\nmodel connected to `ApplicationRecord` (ex `Post.first`) and then calls\r\n`execute(\"SELECT 1\")` (obviously a simplified example). When `execute`\r\nruns the connection is different from the one opened to run the\r\nmigration and essentially it is lost when the `remove_connection` code\r\nis called.\r\n\r\nTo fix this I've updated the code to only remove the connection if the\r\ndatabase config is different. Ultimately I'd like to remove this code\r\naltogether but to do that we first need to stop using\r\n`Base.establish_connection` in the rake tasks and tests. This will fix\r\nthe major bugs until I come up with a solution for the areas that\r\ncurrently need to call `establish_connection` on Base.\r\n\r\nThe added benefit of this change is that if your app is calling\r\n`establish_connection` multiple times with the same config, it is now\r\n3x faster than the previous implementation because we can return the\r\nfound pool instead of setting it up again. To benchmark this I\r\nduplicated the `establish_connection` method to use the new behavior\r\nwith a new name.\r\n\r\nBenchmark script:\r\n\r\n```ruby\r\nrequire \"active_record\"\r\nrequire \"logger\"\r\nrequire \"benchmark/ips\"\r\n\r\nconfig_hash = { \"development\" => { \"primary\" => { \"adapter\" => \"mysql2\", \"username\" => \"rails\", \"database\" => \"activerecord_unittest\"}}}\r\nActiveRecord::Base.configurations = config_hash\r\n\r\ndb_config = ActiveRecord::Base.configurations.configs_for(env_name: \"development\", name: \"primary\")\r\n\r\nActiveRecord::Base.connected_to(role: :writing, prevent_writes: true) do\r\n  Benchmark.ips do |x|\r\n    x.report \"establish_connection with remove\" do\r\n      ActiveRecord::Base.establish_connection(db_config)\r\n    end\r\n\r\n    x.report \"establish_connection without remove\" do\r\n      ActiveRecord::Base.establish_connection_no_remove(db_config)\r\n    end\r\n\r\n    x.compare!\r\n  end\r\nend\r\n```\r\n\r\nBenchmark results:\r\n\r\n    \r\n```\r\nWarming up --------------------------------------\r\nestablish_connection with remove\r\n                            4.677k i/100ms\r\nestablish_connection without remove\r\n                        19.501k i/100ms\r\nCalculating -------------------------------------\r\nestablish_connection with remove\r\n                            41.252k (\u00b111.3%) i/s -    205.788k in   5.075525s\r\nestablish_connection without remove\r\n                        179.205k (\u00b1 6.9%) i/s -    897.046k in   5.029742s\r\n\r\nComparison:\r\nestablish_connection without remove:   179205.1 i/s\r\nestablish_connection with remove:    41252.3 i/s - 4.34x  (\u00b1 0.00) slower\r\n```\r\n\r\nOther changes:\r\n\r\n1) sqlite3 now disconnects and reconnects the connection when `purge` is\r\ncalled. This is necessary now that a new connection isn't created\r\neveryt time `establish_connection` is called. Without this change to\r\npurge the new database is left in an inaccessible state causing a\r\nreadonly error from the sqlite3 client. This wasn't happening in mysql\r\nor postgres because they were already reconnecting the db connection.\r\n2) I added `remove_connection` to tests that use `ApplicationRecord`.\r\nThis is required because `ApplicationRecord` or any class that is a\r\n`primary_abstract_class` will be treated the same as\r\n`ActiveRecord::Base`. This is fine in applications because they are\r\nshared connections, but in the AR test environment, we don't want those\r\nconnnections to stick around (we want AR::Base back).\r\n3) In the async tests I removed 2 calls to `establish_connection`. These\r\nwere causing sqlite3 tests to leak the state of async_executor because\r\nit's stored on the connection. I'm not sure why these were calling\r\n`establish_connection` but it's not necessary and was leaking state when\r\nnow that we are no longer removing the connection.\r\n\r\nFixes: #41855\r\nFixes: #41876\r\nFixes: #42873\r\nFixes: #43004\r\n\r\ncc/ @matthewd as we talked about this today.",
+    "pr_comments": [
+        "This has a change of behavior in that if you used to depend on `establish_connection` to remove an existing connection that's identical to the one you're establishing, it no longer is removed. This would avoid a `database closed` error but I can't imagine why you'd want this functionality. If applications really want to remove connections before establishing, then I think they should do that explicitly. ",
+        "I'm going to merge this mainly because I need to make more changes and don't want to deal with conflicts. If anyone has an objection please let me know and I will revert. \r\n\r\nI won't be backporting this due to the behavior change. Calling a model and then execute is not _that_ common in migrations. There is a valid workaround in that apps can call `ActiveRecord::Base.connection.execute` instead of `execute` directly."
+    ],
+    "merged": true,
+    "created_at": "2022-06-29T14:12:04Z",
+    "issue_context": {
+        "number": 41855,
+        "title": "Connection closed during migrations under certain circumstances",
+        "body": "MVCE: https://github.com/joshleblanc/sharding-migrations-bug\r\n\r\n### Steps to reproduce\r\n\r\nCreate a new rails application\r\n\r\nCreate a sharded database with \r\n\r\n```yml\r\n# database.yml\r\ndevelopment:\r\n  default:\r\n    database: default\r\n  archive:\r\n    database: archive\r\n```\r\n\r\n```ruby\r\n# application_record.rb\r\nclass ApplicationRecord < ActiveRecord::Base\r\n  self.abstract_class = true\r\n\r\n  connects_to shards: {\r\n    default: {writing: :default, reading: :default},\r\n    archive: {writing: :archive, reading: :archive}\r\n  }\r\nend\r\n```\r\n\r\nCreate any model, then add a second migration that queries the database using the model, then runs an `execute` statement.\r\n\r\n```ruby\r\nclass ThisShouldBreak < ActiveRecord::Migration[6.0]\r\n  def up\r\n    Author.count\r\n    execute \"SELECT * from authors\"\r\n  end\r\n\r\n  def down\r\n    # no-op\r\n  end\r\nend\r\n```\r\n\r\n### Expected behavior\r\n\r\nThe migration should run\r\n\r\n### Actual behavior\r\n\r\nThe connection is closed during the migration, triggering a rollback.\r\n\r\n### System configuration\r\n**Rails version**: Rails 6.1.3.1\r\n\r\n**Ruby version**: ruby 2.7.2p137 (2020-10-01 revision 5445e04352) [x64-mingw32]\r\n",
+        "comments": [
+            "Can you see if this is reproducible on master? I am pretty sure I fixed this - but it might not have gotten backported.",
+            "Also, not sure if it's related to the issue you're seeing but if you don't have replicas, you shouldn't create connections for them. You're just doubling the number of open connections to your database without the benefit of using replicas.\r\n\r\n```ruby\r\n# application_record.rb\r\nclass ApplicationRecord < ActiveRecord::Base\r\n  self.abstract_class = true\r\n\r\n  connects_to shards: {\r\n    default: {writing: :default, reading: :default},\r\n    archive: {writing: :archive, reading: :archive}\r\n  }\r\nend\r\n```\r\n\r\nShould be\r\n\r\n```ruby\r\n# application_record.rb\r\nclass ApplicationRecord < ActiveRecord::Base\r\n  self.abstract_class = true\r\n\r\n  connects_to shards: {\r\n    default: {writing: :default},\r\n    archive: {writing: :archive}\r\n  }\r\nend\r\n```",
+            "@eileencodes Thanks for the quick response.\r\n\r\nRunning the MVCE off of master produces the same problem.\r\n\r\nThanks for the tip re: the reading role. Horizontal sharding requires specifying a role when connecting, and the docs didn't really touch on what was required or not, so this is useful to know.",
+            "I have reproduced this and bisected and found that this is caused by https://github.com/rails/rails/pull/39758. Will update again when I have a fix. Not sure how long it will take since this is a little bit of a chicken and egg problem. Just wanted to let you know I haven't forgotten about this.\r\n\r\nIn the mean time you can \"fix\" this by using `ActiveRecord::Base.connection.execute` (or the connection you're executing on like `AnimalsRecord.connection.execute`. This is still a bug that needs to get fixed but this will unblock you until I figure it out."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48550,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/test/cases/primary_class_test.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 113,
+            "original_line": 113,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Rails apps treat `ApplicationRecord` OR the class named `primary_abstract_class` (example below) the same as `ActiveRecord::Base` in order to avoid opening duplicate connections to the same database. In a real app we want these connections to be shared and if `ApplicationRecord.establish_connection` is called it shouldn't replace  or duplicate `ActiveRecord::Base`.\r\n\r\nHowever, in the AR tests we don't actually want `ApplicationRecord` shared with `ActiveRecord::Base` beyond these tests so we need to remove the connection when the test is complete. Previously `establish_connection` was handling this for us, but now we need to do it explicitly. In an app these would actually be shared, but in our tests we don't want to share this global state."
+            ]
+        },
+        {
+            "hunk_id": 48364,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 130,
+            "original_line": 130,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "It's unlikely to matter either way in practice (mostly because the whole point of being okay with changing this is that we don't think real people are doing widespread same-config re-establishment in the first place), but I feel like we should only do this if the call had an effect.",
+                "Yea I was on the fence about this. My first implementation didn't instrument but then I wasn't sure if someone still wanted to know that establish_connection was called. Removing it makes an existing pool 4x faster than the prior behavior. ",
+                "I'm leaving this in place for now. I made a refactor that skipped and included other changes when we have a pool, but that refactor resulted in a mysql2 test run with a bunch of flakes I couldn't reproduce locally. I'm going to do that refactor in a followup PR so I can more easily isolate what's going on there from the other fixes here.",
+                "Our own code inside fixtures consume this instrumentation, but this instrumentation is private (that is why it starts with `!`) so people should not be using.",
+                "Oh good to know, I want to change the keys in a followup PR anyway so I'll hopefully get rid of it then."
+            ]
+        },
+        {
+            "hunk_id": 48549,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/lib/active_record/tasks/sqlite_database_tasks.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 40,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Action Mailbox and other related libraries are relying on loading the schema before test runs via `db:test:prepare` which calls `db:schema:load` which calls `db:purge`. With the changes in connection management we no longer are re-establishing the connection so anything that called purge would fail with a sqlite3 error. I noticed that this behavior was not reproducible in mysql2 and found that the `purge` method there reconnects to the new database. I implemented that same behavior in `purge` here. Previously this was working \"fine\" because we were always removing the connection even if it was the same. Now that we're not removing the connection we want to reset it so we don't have a bad connection."
+            ]
+        },
+        {
+            "hunk_id": 48366,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/test/cases/primary_class_test.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 113,
+            "original_line": 113,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Rails apps treat `ApplicationRecord` OR the class named `primary_abstract_class` (example below) the same as `ActiveRecord::Base` in order to avoid opening duplicate connections to the same database. In a real app we want these connections to be shared and if `ApplicationRecord.establish_connection` is called it shouldn't replace  or duplicate `ActiveRecord::Base`.\r\n\r\nHowever, in the AR tests we don't actually want `ApplicationRecord` shared with `ActiveRecord::Base` beyond these tests so we need to remove the connection when the test is complete. Previously `establish_connection` was handling this for us, but now we need to do it explicitly. In an app these would actually be shared, but in our tests we don't want to share this global state."
+            ]
+        },
+        {
+            "hunk_id": 48367,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/test/cases/relation/load_async_test.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 234,
+            "original_line": 234,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "I removed these because I found that the sqlite3 async tests were failing with some seeds and my changes. After debugging I found that the connection that was opened had `asycn_query_executor` set to `nil` rather than the global executor default. I don't know why these tests were re-establishing a connection, there would be one in the pool to pick up. Removing this fixed the tests that incorrectly had the wrong query executor. I believe this works because it will open a new connection for both tests (there wont be one in the pool). Previously calling `establish_connection` was ensuring there was an existing pool (with async executor set to nil) but we don't want to use that one so it's better not to establish a connection at all."
+            ]
+        },
+        {
+            "hunk_id": 48547,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 115,
+            "original_line": 115,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Does this retain the `ActiveRecord::Base` / `:primary` protection mentioned in the above-removed comment? (Assuming we need to)",
+                "That was for when we were deprecating primary as a name for ActiveRecord::Base and since that's been deprecated and removed I think we no longer need this. I wrote the original comment and went back to the original PR to verify that."
+            ]
+        },
+        {
+            "hunk_id": 48551,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/test/cases/relation/load_async_test.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 234,
+            "original_line": 234,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "I removed these because I found that the sqlite3 async tests were failing with some seeds and my changes. After debugging I found that the connection that was opened had `asycn_query_executor` set to `nil` rather than the global executor default. I don't know why these tests were re-establishing a connection, there would be one in the pool to pick up. Removing this fixed the tests that incorrectly had the wrong query executor. I believe this works because it will open a new connection for both tests (there wont be one in the pool). Previously calling `establish_connection` was ensuring there was an existing pool (with async executor set to nil) but we don't want to use that one so it's better not to establish a connection at all."
+            ]
+        },
+        {
+            "hunk_id": 48363,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 115,
+            "original_line": 115,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Does this retain the `ActiveRecord::Base` / `:primary` protection mentioned in the above-removed comment? (Assuming we need to)",
+                "That was for when we were deprecating primary as a name for ActiveRecord::Base and since that's been deprecated and removed I think we no longer need this. I wrote the original comment and went back to the original PR to verify that."
+            ]
+        },
+        {
+            "hunk_id": 48365,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/lib/active_record/tasks/sqlite_database_tasks.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 40,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Action Mailbox and other related libraries are relying on loading the schema before test runs via `db:test:prepare` which calls `db:schema:load` which calls `db:purge`. With the changes in connection management we no longer are re-establishing the connection so anything that called purge would fail with a sqlite3 error. I noticed that this behavior was not reproducible in mysql2 and found that the `purge` method there reconnects to the new database. I implemented that same behavior in `purge` here. Previously this was working \"fine\" because we were always removing the connection even if it was the same. Now that we're not removing the connection we want to reset it so we don't have a bad connection."
+            ]
+        },
+        {
+            "hunk_id": 48548,
+            "commit_id": "adb64db43dba5cad1007ce57e25df67f8b3e91f8",
+            "original_commit_id": "c3c747547a85937e67bc62cfb9f466948fb631ad",
+            "path": "activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 130,
+            "original_line": 130,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "It's unlikely to matter either way in practice (mostly because the whole point of being okay with changing this is that we don't think real people are doing widespread same-config re-establishment in the first place), but I feel like we should only do this if the call had an effect.",
+                "Yea I was on the fence about this. My first implementation didn't instrument but then I wasn't sure if someone still wanted to know that establish_connection was called. Removing it makes an existing pool 4x faster than the prior behavior. ",
+                "I'm leaving this in place for now. I made a refactor that skipped and included other changes when we have a pool, but that refactor resulted in a mysql2 test run with a bunch of flakes I couldn't reproduce locally. I'm going to do that refactor in a followup PR so I can more easily isolate what's going on there from the other fixes here.",
+                "Our own code inside fixtures consume this instrumentation, but this instrumentation is private (that is why it starts with `!`) so people should not be using.",
+                "Oh good to know, I want to change the keys in a followup PR anyway so I'll hopefully get rid of it then."
+            ]
+        }
+    ]
+}

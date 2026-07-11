@@ -1,0 +1,65 @@
+{
+    "repo": "netty/netty",
+    "pr_number": 14414,
+    "lang": "java",
+    "pr_title": "AdaptiveByteBufAllocator: Make pooling of AdaptiveByteBuf magazine local",
+    "pr_body": "Motivation:\r\n\r\nTo reduce the usage of FastThreadLocal and make the AdaptiveByteBufAllocator also play nice with virtual threads we should just pool the AdapativeByteBuf instances in the Magazines itself.\r\n\r\nModifications:\r\n\r\nRemove usage of Recycler for pooling AdaptiveByteBuf Use a bounded MPMC queue that is stored in the Magazine itself for pooling these instances Result:\r\n\r\nFixes #14279\r\n",
+    "pr_comments": [
+        "@normanmaurer I was investigating why there were test failures on https://github.com/netty/netty/pull/14332 and tried to recreate the PR from first principles. Regardless, I ended up with a very similar but slightly different implementation.",
+        "I'm all in to have this - it trades the virtue of simplicity with some cost in the optimized common path i.e.\r\n- if a thread is an event loop one it has to perform a CAS using the mpsc q to release the buffer wrapper\r\n\r\nAnother option could be to have a Recycler impl which has the same tunable we're used to AND using a pluggable concept of ownership. I'm preparing a small PoC to show what I mean",
+        "@normanmaurer Take a look. The allocate method does the fallback allocation now, instead of communicating potential allocation failure.",
+        "@franz1981 any other comments or can we merge this one ?",
+        "Yep this morning I can share my proposal, yesterday I have been sidetracked the whole day : \ud83d\ude4f",
+        "@franz1981 ok just so I am sure I understood correctly... we should hold back until you shared your proposal, correct ?",
+        "Yess please \ud83e\udd7a",
+        "@normanmaurer @chrisvest it -> https://github.com/franz1981/netty/tree/4.1-mag-local-pool\r\n\r\nI'm not fixing the comment at https://github.com/netty/netty/pull/14414#discussion_r1816359191 or the ones from Norman, but proposing a different fast(er)-path for event loop confined magazines (as usual :P )\r\nI would have preferred to avoid another fasthreadlocal::get TBH, given that we already do it for the event loop-local magazine, but in this way we can reuse the `Recycler` without modifying it.\r\nI believe there is some bench which correctly use fast thread local threads on JMH which can be used to compare against the 2.\r\n\r\nThe branch I've sent got a sole concern, perf wise:\r\n- I made the q-based handle (shared magazines) to be an `EnhancedHandle` child (which impl the recycle methods)\r\n- The `Recycler` already have 2 `EnhancedHandle` i.e NOOP_HANDLE and the default one\r\n- it means that `AdpativeByteBuf::deallocate` can be megamorphic  (having 3 concrete types which can be called there)\r\n\r\nAn \"easy\" solution to this would be to have `AdaptiveByteBuf` to  just use an `Handle` (meaning that the shared magazines won't create a child of `EnhancedHandle` anymore, but just `Handle` - and perform an instance check on the buffer deallocate vs `EnhancedHandle` - this will make possible to have 2 call-sites:\r\n- `Handle::recycle` which will observe a single type  i.e. the one using the queue\r\n- `Handle::unguardedRecycle` which can observe 2 concrete types and get in the fast path of virtual call (making the JIT to emit an bimorphic guard vs the 2 types observed)\r\n\r\nwdyt? I can add an additional commit to fix this",
+        "@franz1981 The two approaches sound equivalent in terms of code style, so we could just let the benchmarks decide. So how about we look at that in a follow-up? I know it can take lot of time to tweak benchmarks back and forth.",
+        "Right now I suggest already to bring the fast thread local solution in too - which uses array deq for the fastest path - which is very difficult to beat, unless there is something very wrong in fast thread local or elsewhere (the handle availability).\nIf you don't feel confident for this I can send a separate PR with the follow up changes ",
+        "@chrisvest I've sent by accident my changes into your branch - now I've forcibly pushed your original commits removing mine :\"( \r\nI'll send a separate draft PR on top of your changes here to help @normanmaurer as well to see what changes I'm proposing "
+    ],
+    "merged": true,
+    "created_at": "2024-10-25T09:35:13Z",
+    "issue_context": {
+        "number": 14279,
+        "title": "Don't use Netty recyclers for the adaptive ByteBuf pool, but leverage magazine-local ones",
+        "body": "Currently the adaptive pool is splitting the allocation by:\r\n- creating/reusing an \"empty\" `AdaptiveByteBuf`, at https://github.com/netty/netty/blob/c0fdb8e9f8f256990e902fcfffbbe10754d0f3dd/buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java#L193\r\n- filling it with some complex logic, at https://github.com/netty/netty/blob/c0fdb8e9f8f256990e902fcfffbbe10754d0f3dd/buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java#L417\r\n\r\nThis is nice, but suboptimal for non `FastThreadLocalThread`s as reported at #14272 (see https://github.com/netty/netty/issues/14272#issuecomment-2326620742).\r\n\r\nInstead, it would be better to have 2 recyclers:\r\n1. attached to non event-loop magazines - It's fine(ish) to reuse the existing `Recycler` too if we don't want to create an extra type\r\n2. attached to the `Magazine` (lazily) - https://github.com/netty/netty/blob/c0fdb8e9f8f256990e902fcfffbbe10754d0f3dd/buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java#L223: which access is already protected by a lock and it allow release to happen from other threads\r\n\r\nFor the former, just reusing the existing logic is fine - while for the latter it is important to find the appropriate quiescient state to release such.\r\nClearly the issue will be that an explosion of magazine (due to lack of CPU resources i.e. when the allocators are from a non Netty event loop and they oversubscribe the system) will likely cause an explosion of magazine-locals recyclers - which means more memory; but the benefits, perf-wise should be obvious.\r\n",
+        "comments": [
+            "@chrisvest @normanmaurer wdyt?",
+            "@franz1981 hmm... I wonder why we not always just use the `Recycler` as we do as of today in `PooledByteBufAllocator` ?",
+            "Also /cc @chrisvest for my question :)",
+            "@normanmaurer this is because of virtual threads: these threads are supposely abundant and created while never been cached - allocating the whole `ThreadLocal` stuff there will kill perf -> see https://github.com/FasterXML/jackson-core/issues/919\r\n\r\nThe thing is that I see no point to pooling per thread, given that until the magazine is avaialble and \"owned\" there is no point to allocating an empty wrapper",
+            "@franz1981 maybe you can do a PR to better show your idea... ",
+            "@franz1981 also we could just use a methodhandle to check if the thread is virtual or not and based on it use the recycler or not via using `Thread.currentThread.isVirtual()`. The method handle will ensure we can still support java8 ",
+            "@normanmaurer fully agree - it was what i do in other libs - but the problem si that recyclers retain lot of garbage and most of the time higher level frameworks/libs have blocking thread pools as well with TONS of half-idle threads, which can get destroyed and recreated while active again...\r\nhaving all of them to retain N direct buffers from being used elsewhere or released, usually cost memory/RSS. \r\nHere we're lucky that is just a wrapper, so maybe we can make an exception...\r\nBut in general, that's why I prefer users to have a conscious choice and extends FastThreadLocalThread: it means they really need that ",
+            "@franz1981 not sure about that... I think both approaches have trade-offs . That said I am looking forward to see a PR with your ideas :) ",
+            "If magazines can directly recycle AdaptiveByteBufs without the traditional Recycler machinery, then we could perhaps also reduce some of the event-loop special-case code in the allocator.\r\n\r\nI don't understand the \"explosion of magazines\" problem that you are anticipating, @franz1981. The ByteBufs being recycled or not should not impact the number of magazines floating around, no?",
+            "Let's say you have a blocking thread pool which grows due to a sudden burst of parallel work, it \"could\" cause magazine expansion due to 3 failures in a row to acquire the stamped lock; if later on these threads die (which is not uncommon for elastic thead pools), given that the buffer wrappers doesn't belong to them, they won't GC'd but will still be bound to the newly allocated magazine.",
+            "@chrisvest if you are fine with this proposal - which I believe you got perfectly despite my poor language to explain it - fell free to send a PR or I will do it in the next week(s)...sadly right now I'm a bit overwhelmed...\r\nThe good thing of this is that recycling can be made fast like this, for ANY thread, including virtual ones, and will compensate with https://github.com/netty/netty/pull/14322 which had a performance impact - atomic ops in the hot path are never free (!)",
+            "I think the \"downside\" of this approach would be:\r\n\r\n- AdapativeByteBuf pooling will be per magazine, which might result into more objects pooled.\r\n- The queue that is used for pooling would need to be MPSC as the offer might happen from any thread (there is no guarantees on which thread might call `release(...)`.  that said we could use some form of `relaxedOffer(...)` I guess \r\n\r\nI am not saying its worse then what we have as of today but something to keep in mind. ",
+            "yeah @normanmaurer fully agree on both points; My suggestion was to let any threads (virtual, event loops, whatever) to have the same mechanism to recycle such `AdapativeByteBuf`.\r\nVirtual threads cannot really use `ThreadLocal`s for pooling if not with big performance problems and not using pooling is equally bad...\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50660,
+            "commit_id": "b2bbd8d026e122c4f9ff8588cd4ba2fd45694a44",
+            "original_commit_id": "8e3a97f37b501a80b07e300e16471e9b16ecaee2",
+            "path": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 216,
+            "original_line": 216,
+            "side": "RIGHT",
+            "original_position": 52,
+            "position": 52,
+            "subject_type": "line",
+            "review_comments": [
+                "if this is happening why holding the lock there's no need the q to be mpmc",
+                "> if this is happening why holding the lock there's no need the q to be mpmc\n\nThis @chrisvest ?",
+                "Perhaps, but I want to have a full CI run backing up any move away from MPMC.",
+                "Here in the thread-local case, we'll go to the `Magazine.EVENT_LOOP_LOCAL_BUFFER_POOL`, which uses MPSC under the hood.\r\n\r\nWhen magazines are sharable, they may be used as fallbacks, which do not involve locking the magazine."
+            ]
+        }
+    ]
+}

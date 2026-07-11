@@ -1,0 +1,64 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 96014,
+    "lang": "go",
+    "pr_title": "multitenant: prevent tenant from overriding next tenant's span config",
+    "pr_body": "Fixes #95882\r\n\r\nWe want to ensure we have a split at the non-inclusive end of the tenant's\r\nkeyspace, which also happens to be the inclusive start of the next\r\ntenant's (with ID=ours+1). If we didn't do anything here, and we were the\r\ntenant with the highest ID thus far, our last range would extend to /Max.\r\nIf a tenant with a higher ID was created, when installing its initial span\r\nconfig record, it would carve itself off (and our last range would only\r\nextend to that next tenant's boundary), but this is a bit awkward for code\r\nthat wants to rely on the invariant that ranges for a tenant only extend\r\nto the tenant's well-defined end key.\r\n\r\nSo how do we ensure this split at this tenant's non-inclusive end key?\r\nHard splits are controlled by the start keys on span config records[^1],\r\nso we'll try insert one accordingly. But we cannot do this blindly. We\r\ncannot assume that tenants are created in ID order, so it's possible that\r\nthe tenant with the next ID is already present + running. If so, it may\r\nalready have span config records that start at the key at which we want\r\nto write a span config record for. Over-writing it blindly would be a\r\nmistake -- there's no telling what config that next tenant has associated\r\nfor that span. So we'll do something simple -- we'll check transactionally\r\nwhether there's anything written already, and if so, do nothing. We\r\nalready have the split we need.\r\n\r\n[^1]: See ComputeSplitKey in spanconfig.StoreReader.\r\n\r\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/96014)\n<!-- Reviewable:end -->\n",
+        "bors r=arulajmani",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=8619737&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2023-01-26T17:56:12Z",
+    "issue_context": {
+        "number": 95882,
+        "title": "multitenant: tenant creation can unintentionally overwrite another tenant's span configs",
+        "body": "**Describe the problem**\r\n\r\n[#95100](https://github.com/cockroachdb/cockroach/pull/95100) introduced a bug in our handling of tenant span configs. It's possible now that the creation of a tenant ends up overwriting another tenant's span config records, and thus affecting zone configs that the original tenant had applied. #95881 is a branch that contains the reproduction through an annotated test case. Specifically:\r\n\r\n```\r\n# Peek near the start of the span_configurations table where tenant=11's records\r\n# are stored. The first one is from the start of its keyspace to start of\r\n# table with ID=4: /Tenant/11{-/Table/4}.\r\nstate offset=56 limit=5\r\n----\r\n...\r\n/Table/5{7-8}                              ttl_seconds=3600 ignore_strict_gc=true num_replicas=5 rangefeed_enabled=true\r\n/Tenant/11{-/Table/4}                      database system (tenant)\r\n/Tenant/11/Table/{4-5}                     database system (tenant)\r\n/Tenant/11/Table/{5-6}                     database system (tenant)\r\n/Tenant/11/Table/{6-7}                     database system (tenant)\r\n...\r\n\r\n# Now for the bug. We'll create tenant=10, but see that it actually ends up\r\n# overwriting span config state for the already-reconciling tenant=11. That\r\n# tenant's reconciler is not expecting this! It operates with the invariant that\r\n# it's the only writer of span configs for its keyspan, which we're simply\r\n# breaking.\r\ninitialize tenant=10\r\n----\r\n\r\n# We re-inserted a record at /Tenant/11{-\\x00}, and split up tenant=11's own\r\n# span config records in the process. Previously tenant=11's first record was\r\n/Tenant/11{-/Table/4}. Now it's /Tenant/11{-\\x00}. If tenant=11 had set some\r\nspan config for that keyspan, tenant=10's creation just nuked it.\r\n----\r\n...\r\n/Tenant/10{-\\x00}                          database system (tenant)\r\n/Tenant/11{-\\x00}                          database system (tenant)\r\n/Tenant/11/Table/{4-5}                     database system (tenant)\r\n/Tenant/11/Table/{5-6}                     database system (tenant)\r\n/Tenant/11/Table/{6-7}                     database system (tenant)\r\n...\r\n```\r\n\r\n**To Reproduce**\r\n\r\nUsing #95881:\r\n```\r\n$ dev test pkg/ccl/spanconfigccl/spanconfigreconcilerccl -f=TestDataDriven/multitenant/bug -v --timeout=10s --rewrite\r\n```\r\n\r\n**Expected behavior**\r\n\r\nTenant creation should not overwrite another tenant's span configs.\r\n\r\nJira issue: CRDB-23792\r\nEpic: [CRDB-23344](https://cockroachlabs.atlassian.net/browse/CRDB-23344)\n\nEpic CRDB-23344",
+        "comments": [
+            "Good catch! @irfansharif and I spoke about this a bit, and I think what we want when creating a tenant is to check if any span configs exist for the next tenant already. We should only create a span config entry at the start of the next tenant's key space if no span config entries exist for it (the patch linked above creates these blindly). This should work, and give us what we want, considering we're using a transactional KVAccessor in the tenant creation path. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15687,
+            "commit_id": "9d4e27ac930f9f3bb6187647bcee58e8ee19a985",
+            "original_commit_id": "cc99062a810b5d9687e0c2b08cf73ce83fcd73cd",
+            "path": "pkg/sql/tenant_creation.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 407,
+            "original_line": 407,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Replace this comment with something better that tries to explain exactly what we're doing, which is something approximately \"ensuring that we have a split at the end of the tenant's keyspace, which we achieve by guaranteeing a split at the start of the next tenant's since splits are done based on start keys\". And then walk through why we're checking for existing records, to not overwrite them. The comments below, to me at least, were bit difficult to parse. Summarizing the exact hazard instead of referring to the soon-to-be-closed issue may be friendlier to future readers.",
+                "Updated the comments in this section.",
+                "> The current tenant's endRecordTarget is the same as the next tenant's startRecordTarget.\r\n\r\nWe're glossing over the fact that once the next tenant starts reconciling, it deletes the \"startRecordTarget\" it finds and replaces it with another. In the test above, this is what we see in the following snippet. I'm taking startRecordTarget to mean one with the single-key span: [tenantPrefix, tenantPrefix.Next()).\r\n\r\n```\r\n # Just another view of what the tenant's reconciler actually did. It got rid of\r\n # the original, single-key /Tenant/11{-\\x00} record, and replaced it with\r\n # /Tenant/11{-/Table/4}, just like the comment above said. The remaining upserts\r\n # are for its SQL state.\r\n mutations tenant=11 limit=2\r\n ----\r\n delete /Tenant/11{-\\x00}\r\n upsert /Tenant/11{-/Table/4}               database system (tenant)\r\n```\r\n\r\nI tried rewriting the comments + invariants in this section, and in writing it, I think I see another bug in this implementation. First, the comment:\r\n\r\n```\r\n// We want to ensure we have a split at the non-inclusive end of the tenant's\r\n// keyspace, which also happens to be the inclusive start of the next tenant's\r\n// (with ID=ours+1). If we didn't do anything here and we were the tenant with the\r\n// highest ID thus far, our last range would extend to /Max. If a tenant with a\r\n// higher ID was created, when installing its initial span config record, it would\r\n// carve itself off (and our last range would only extend to that next tenant's\r\n// boundary), but this is a bit awkward for code that want to rely on the\r\n// invariant that ranges for a tenant only extend to the tenant's well-defined end\r\n// key.\r\n//\r\n// So how do we ensure this split at this tenant's non-inclusive end key? Hard\r\n// splits are controlled by the start keys found span config records[^1], so we'll\r\n// try insert one accordingly. But we cannot do this blindly. We cannot assume\r\n// that tenants are created in ID order, so it's possible that the tenant with the\r\n// next ID is already present + running. If so, it may already have span config\r\n// records that start at the key at which we want to write a span config record\r\n// for. Over-writing it blindly would be a mistake -- there's no telling what\r\n// config that next tenant has associated for that span. So we'll do something\r\n// simple -- we'll check transactionally whether there's anything written already,\r\n// and if so, do nothing. We already have the split we need.\r\n//\r\n// [^1]: See ComputeSplitKey in spanconfig.StoreReader.\r\n```\r\n\r\nNow, the new bug. Consider the following sequence:\r\n- tenant=11 gets deleted, and so doing, gets rid of all its span configs, including the one at its start key. This gets rid of that hard split point. \r\n- If tenant=11 was the tenant with the highest tenant ID, and there was a tenant=10 that was relying on tenant=11's first span config record, now tenant=10's last range could now go back to extending all the way to /Max.\r\n\r\nWe're back to where we were with https://github.com/cockroachdb/cockroach/issues/92072. With any tenant deletions, we might end up creating tenant end ranges that straddle until /Max or the next non-deleted tenant's start key."
+            ]
+        },
+        {
+            "hunk_id": 15688,
+            "commit_id": "9d4e27ac930f9f3bb6187647bcee58e8ee19a985",
+            "original_commit_id": "cc99062a810b5d9687e0c2b08cf73ce83fcd73cd",
+            "path": "pkg/sql/tenant_creation.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 441,
+            "original_line": 441,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "We're making some assumptions here for code that currently meets the assumptions but at a distance. Specifically we're assuming that the SQLTranslator's first emitted record, once spanconfig.Reconciler kicks in, starts at `keys.MakeTenantPrefix(tenantID)`. So it's queryable here. That record must always stay around -- the spanconfig.{Reconciler,Translator} can't get rid of the record with start key == `keys.MakeTenantPrefix(tenantID)`. If it did, then this read txn would not find anything and insert its own. Documenting the specifics will help, and we should, but it's worth adding an assertion in the spanconfig package to make sure we don't regress on this bug accidentally.",
+                "Could you point me to where to add the assertion? I'm not very familiar with this code.",
+                "> Could you point me to where to add the assertion? I'm not very familiar with this code.\r\n\r\n@arulajmani is your resident expert (especially if this assertion is better suited within spanconfig.SQLTranslator), but one place to do it is here: https://github.com/cockroachdb/cockroach/blob/2f811420a1492ca547659003f193233341b7fd87/pkg/spanconfig/spanconfigreconciler/reconciler.go#L301\r\n\r\nIf we're running that code as a tenant, the storeWithLatestSpanConfigs can be queried/iterated over for the first span config, to sanity check that it's the one we expect -- starting at the tenant prefix. (For the system tenant the first span config will be over `/{Min-System/NodeLiveness}`, hence the check that we're not the system tenant)."
+            ]
+        }
+    ]
+}

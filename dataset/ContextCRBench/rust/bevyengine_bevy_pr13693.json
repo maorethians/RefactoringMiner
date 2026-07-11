@@ -1,0 +1,68 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 13693,
+    "lang": "rust",
+    "pr_title": "Poll system information in separate tasks",
+    "pr_body": "# Objective\r\n\r\nReading system information severely slows down the update loop.\r\nFixes #12848.\r\n\r\n## Solution\r\n\r\nRead system info in a separate thread.\r\n\r\n## Testing\r\n\r\n- Open the scene 3d example\r\n-  Add `FrameTimeDiagnosticsPlugin`, `SystemInformationDiagnosticsPlugin` and `LogDiagnosticsPlugin` to the app.\r\n- Add this system to the update schedule to disable Vsync on the main window\r\n```rust\r\nfn change_window_mode(mut windows: Query<&mut Window, Added<Window>>) {\r\n    for mut window in &mut windows {\r\n        window.present_mode = PresentMode::AutoNoVsync;\r\n    }\r\n}\r\n```\r\n- Read the fps values in the console before and after this PR.\r\n\r\nOn my PC I went from around 50 fps to around 1150 fps.\r\n\r\n---\r\n\r\n## Changelog\r\n\r\n### Changed\r\n\r\n- The `SystemInformationDiagnosticsPlugin` now reads system data separate of the update cycle.\r\n\r\n### Added \r\n\r\n-  The `EXPECTED_SYSTEM_INFORMATION_INTERVAL` constant which defines how often we read system diagnostic data.",
+    "pr_comments": [
+        "The sleep also doesn't take into account the time it took to get the info so it will sleep for longer than necessary. Which is another reason why using a thread + sleep isn't great.",
+        "> I don't think this should be implemented with a thread only used for that. I feel like it should use bevy's task system and create a new task based on the polling rate.\r\n\r\nDo we have a equivalent of smol's [`unblock`](https://docs.rs/smol/latest/smol/fn.unblock.html) or tokio's [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)? sysinfo doesn't support async and from my understanding spawning a blocking task could block the whole task pool.\r\n",
+        "Here's more or less what I had in mind. I tested it and it works like I would expect.\r\n\r\n```rust\r\n pub(crate) fn diagnostic_system(\r\n        mut diagnostics: Diagnostics,\r\n        mut sysinfo: Local<Option<Arc<Mutex<System>>>>,\r\n        mut tasks: Local<Vec<Task<SysinfoRefreshData>>>,\r\n        mut last_refresh: Local<Option<Instant>>,\r\n    ) {\r\n        if sysinfo.is_none() {\r\n            *sysinfo = Some(Arc::new(Mutex::new(System::new_with_specifics(\r\n                RefreshKind::new()\r\n                    .with_cpu(CpuRefreshKind::new().with_cpu_usage())\r\n                    .with_memory(MemoryRefreshKind::everything()),\r\n            ))));\r\n        }\r\n        let Some(sys) = sysinfo.as_mut() else {\r\n            error!(\"sysinfo should have been created at this point\");\r\n            return;\r\n        };\r\n        if last_refresh.is_none() {\r\n            *last_refresh = Some(Instant::now());\r\n        }\r\n        let Some(last_refresh) = last_refresh.as_mut() else {\r\n            error!(\"last_refresh should have been created at this point\");\r\n            return;\r\n        };\r\n\r\n        let thread_pool = AsyncComputeTaskPool::get();\r\n\r\n        // Only queue a new system refresh task when necessary\r\n        // Queueing earlier than that will not give new data\r\n        if last_refresh.elapsed() > sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {\r\n            let sys = sys.clone();\r\n            let task = thread_pool.spawn(async move {\r\n                let mut sys = sys.lock().unwrap();\r\n\r\n                sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());\r\n                sys.refresh_memory();\r\n                let current_cpu_usage = sys.global_cpu_info().cpu_usage();\r\n                // `memory()` fns return a value in bytes\r\n                let total_mem = sys.total_memory() as f64 / BYTES_TO_GIB;\r\n                let used_mem = sys.used_memory() as f64 / BYTES_TO_GIB;\r\n                let current_used_mem = used_mem / total_mem * 100.0;\r\n\r\n                SysinfoRefreshData {\r\n                    current_cpu_usage,\r\n                    current_used_mem,\r\n                }\r\n            });\r\n            tasks.push(task);\r\n            *last_refresh = Instant::now();\r\n        }\r\n\r\n        let mut tasks_completed = vec![];\r\n        for (i, mut task) in tasks.iter_mut().enumerate() {\r\n            let Some(refresh_data) = block_on(future::poll_once(&mut task)) else {\r\n                continue;\r\n            };\r\n            tasks_completed.push(i);\r\n\r\n            diagnostics.add_measurement(&SystemInformationDiagnosticsPlugin::CPU_USAGE, || {\r\n                refresh_data.current_cpu_usage as f64\r\n            });\r\n            diagnostics.add_measurement(&SystemInformationDiagnosticsPlugin::MEM_USAGE, || {\r\n                refresh_data.current_used_mem\r\n            });\r\n        }\r\n        for task_completed in tasks_completed {\r\n            drop(tasks.remove(task_completed));\r\n        }\r\n    }\r\n```\r\n\r\nThere might be a better way to do this without `Arc<Mutex<System>>` and all those `Local`, but that's the rough outline of what I meant. \r\n\r\nThe idea is to queue a small task every time you want to refresh the system data. I don't _think_ it will block the main thread using this approach, but I'm not entirely sure. At least it doesn't poll every frame though. It might be better to do the polling and task clean up in a separate system too, not sure.\r\n\r\nThis also takes advantage of the fact that bevy is already running in a loop so no need to have another loop for that.\r\n",
+        "I've tough about it a don't think launching multiple tasks will work. If a task gets stuck reading data for at least the time it takes to generate one + margin (e.g. the system took to long to get the data) we're likely to violate the minimum cpu update interval.\r\n\r\n```\r\n1. Task0 is spawned and takes a while to finish\r\n\r\nTask0 ~~~\r\n\r\n2. Task1 gets spawned but Task0 hasn't finished\r\n\r\nTask0 ~~~ Task1\r\n\r\n3. Task0 finishes a while after Task1 was spawned.\r\n\r\nTask0 ~~~ Task1 ~|\r\n                 ^\r\n Task0 has finished, Task1 has started immediately after\r\n\r\n4. worst case Task1 finishes before another task can spawn\r\n\r\nTask0 ~~~ Task1 ~|~| Task2 \r\n                 ^ |\r\n      Task0 has finished, Task1 has started\r\n                   |\r\n                   ^\r\n           Task1 has finished\r\n                       \r\n5. Task2 gets to start immediately\r\n\r\nTask0 ~~~ Task1 ~|~| Task2 \r\n                 ^ |   |\r\n      Task0 has finished, Task1 has started\r\n                 | |   |\r\n                 | ^   |\r\n             Task1 has finished\r\n                 |     |\r\n                 |     ^\r\n            Task2 has started\r\n                 |     |\r\n                 ^~~~~~^\r\n            The time it took Task2 to start after Task1 started is less than MINIMUM_CPU_UPDATE_INTERVAL.\r\n            It's output will be garbage.\r\n            \r\n```\r\n",
+        "The minimum time interval is 100ms on linux and 200ms on everything else. I doubt it would ever take more than that to get the cpu info, but if we want to protect against it we could add a timestamp to the task and check that it hasn't been longer than the minimum and drop it if it has. We could also just hardcode it to 200ms to stay on the safer side.",
+        "Another solution could be to not spawn any task and just do it at a fixed interval in a regular system. The system will run in parallel so it won't block any work, the only issue is if it takes longer than the duration of a frame to sample the cpu. We could detect that and start logging errors if it happen or maybe even stop sampling the cpu if it does it multiple times",
+        "Okay, nevermind, it takes 5ms on my machine to refresh the cpu data so we probably shouldn't do that in a system. At least it's 5ms that doesn't block anything else in the frame, but that's still really long and could create stutters on games that run fast enough.",
+        "Once CI is green I'll merge this :)"
+    ],
+    "merged": true,
+    "created_at": "2024-06-09T18:02:24Z",
+    "issue_context": {
+        "number": 12848,
+        "title": "SystemInformationDiagnosticsPlugin is slow due to `sysinfo` crate",
+        "body": "## Bevy version\r\n\r\n0.13.1\r\n\r\n## Relevant system information\r\n\r\n- OS: Windows 11\r\n- Processor: AMD Ryzen 9 7950X3D 16-Core Processor\r\n\r\n## What you did\r\n\r\nAdd the `bevy::diagnostic::SystemInformationDiagnosticsPlugin` plugin.\r\n\r\n## What went wrong\r\n\r\nThe `diagnostic_system` of the `SystemInformationDiagnosticsPlugin` takes around 4ms on my system, which makes it unsuitable to use while measuring performance.\r\n\r\n## Additional information\r\n\r\nNoticed this, as I used this with `iyes_perf_ui` and could not get more than 200FPS.\r\n",
+        "comments": [
+            "Any indication if this is an upstream problem, versus something that Bevy is doing wrong? Is this just latency, or is there real work being done?",
+            "For the CPU usage there seems to be a [`MINIMUM_CPU_UPDATE_INTERVAL`](https://docs.rs/sysinfo/latest/sysinfo/constant.MINIMUM_CPU_UPDATE_INTERVAL.html). This is definitively not respected when running at high frame rates.\r\n\r\nOther than that I could not find information on how costly the refresh calls are. It might make sense to do the refreshes/measurements on an AsyncCompute task, so it does not block the frames.",
+            "I ran into this today so here's the tracy graph I was looking at. Enabling the plugin can drop fps to 30 or less, while disabling the plugin lets this particular app run at 200+ fps.\r\n\r\n![image](https://github.com/bevyengine/bevy/assets/551247/f47c0999-3c30-445d-8531-72be76236c72)\r\n\r\n```\r\n2024-05-30T17:46:01.222416Z  INFO bevy_render::renderer: AdapterInfo { name: \"NVIDIA GeForce RTX 2080 Ti\", vendor: 4318, device: 7687, device_type: DiscreteGpu, driver: \"NVIDIA\", driver_info: \"551.23\", backend: Vulkan }\r\n2024-05-30T17:46:01.515482Z  INFO bevy_diagnostic::system_information_diagnostics_plugin::internal: SystemInfo { os: \"Windows 11 Pro\", kernel: \"22631\", cpu: \"AMD Ryzen 9 7950X 16-Core Processor\", core_count: \"16\", memory: \"63.2 GiB\" }\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 345,
+            "commit_id": "873c22221284d45dd14f334a9df348db6ecd3674",
+            "original_commit_id": "49661b99fe2f02e2d66e8af6d3b3584eb5ca7a26",
+            "path": "crates/bevy_diagnostic/src/system_information_diagnostics_plugin.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 128,
+            "original_line": 134,
+            "side": "RIGHT",
+            "original_position": 117,
+            "position": 111,
+            "subject_type": "line",
+            "review_comments": [
+                "I assume this is done to avoid the issue you mentioned, but I'm not sure I understand what it's doing.",
+                "Nevermind, I get it now, it just took a while to process in my head for some reason \ud83d\ude05 "
+            ]
+        },
+        {
+            "hunk_id": 346,
+            "commit_id": "873c22221284d45dd14f334a9df348db6ecd3674",
+            "original_commit_id": "49661b99fe2f02e2d66e8af6d3b3584eb5ca7a26",
+            "path": "crates/bevy_diagnostic/src/system_information_diagnostics_plugin.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 153,
+            "original_line": 159,
+            "side": "RIGHT",
+            "original_position": 142,
+            "position": 136,
+            "subject_type": "line",
+            "review_comments": [
+                "`retain_mut` is way better than the weird thing I did in my snippet \ud83d\ude05I didn't remember what that api was called."
+            ]
+        }
+    ]
+}

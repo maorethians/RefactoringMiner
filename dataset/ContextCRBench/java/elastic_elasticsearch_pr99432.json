@@ -1,0 +1,96 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 99432,
+    "lang": "java",
+    "pr_title": "ESQL: Enable arithmetics for durations and periods",
+    "pr_body": "This partially solves #99293.\r\n\r\n- Enable date math expressions like `(1year + 1month) + now()` and `(1hour + 1second) + now()`, where the durations/periods are added before being added to a datetime. This extends to expressions like `1year + month + now()` (without parentheses).\r\n- To achieve this, enable folding of duration/period literals.\r\n- Provide user-friendly error messages for date time arithmetic overflows, and for illegal expressions like `eval x = 1week + 1month` whose type is not representable.\r\n\r\nWhat's not covered from #99293: Mixed duration/period expressions like `(1year + 1hour) + now()`, resp. `1year + 1hour + now()`.",
+    "pr_comments": [
+        "Hi @alex-spies, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-ql (Team:QL)",
+        "Pinging @elastic/elasticsearch-esql (:Query Languages/ES|QL)",
+        "Alright, this is ready for review now!",
+        "Hi @alex-spies, I've updated the changelog YAML for you."
+    ],
+    "merged": true,
+    "created_at": "2023-09-20T00:34:12Z",
+    "issue_context": {
+        "number": 99293,
+        "title": "ESQL: syntax error on date math if date period variable is at the end of the expression",
+        "body": "### Elasticsearch Version\n\n8.11.0\n\n### Installed Plugins\n\n_No response_\n\n### Java Version\n\n_bundled_\n\n### OS Version\n\nMacOS\n\n### Problem Description\n\nTesting date math in ES|QL in Kibana after #98870 and noticed that the date math feature kicks in only when the date period variable is not at the end of the statement.\n\n### Steps to Reproduce\n\nThis works:\r\n\r\n```\r\nrow n = now() | eval then = n - 1 year + 2 minutes\r\n```\r\n\r\nas in the PR works \u2705 \r\n\r\nbut the same expression with a different order errors out:\r\n\r\n```\r\nrow n = now() | eval then = - 1 year - 2 minutes + n\r\n```\r\n\r\n:x: Errors: `Unexpected error from Elasticsearch: verification_exception - Found 1 problem\r\nline 1:29: [-] has arguments with incompatible types [DATE_PERIOD] and [TIME_DURATION]`\r\n\r\nThis one works instead \u2705 :\r\n```\r\nrow n = now() | eval then = - 1 year + n - 2 minutes\r\n```\n\n### Logs (if relevant)\n\n_No response_",
+        "comments": [
+            "Pinging @elastic/es-ql (Team:QL)",
+            "Pinging @elastic/elasticsearch-esql (:Query Languages/ES|QL)",
+            "I had a super quick look because I was curious.\r\n\r\nThe exception is triggered in `org/elasticsearch/xpack/esql/expression/predicate/operator/arithmetic/DateTimeArithmeticOperation.java`, in `resolveType`. The way date math currently works is, I think, that we can always add a duration to a datetime, but we cannot add two durations. The same holds for subtractions.\r\n\r\nThe following fails for the same reason, and does not contain subtractions/negatives:\r\n```\r\nrow n = now() | eval then = 1 year + 2 minutes + n\r\n```\r\nIt does work just fine, though, if we set parentheses:\r\n```\r\nrow n = now() | eval then = 1 year + (2 minutes + n)\r\n```\r\n\r\nResolving this issue may require us to allow adding/subtracting time periods and only disallowing time periods as the final output of an expression instead.",
+            "I made a bit of progress on this one.\r\n\r\nThe problem already occurs when using exclusively date periods, e.g. years:\r\n```\r\nrow n = now() | eval then = 1 year + 2 year + n\r\n```\r\nThe problem is that this is equivalent to\r\n```\r\nrow n = now() | eval then = (1 year + 2 year) + n\r\n```\r\nand the sum `1year + 2year` should be folded into `3 year` even before execution. However, the folding in `DateTimeArithmeticOperation` is the _default_ folding, which falls back to using `toEvaluator`. `toEvaluator`, however, is only implemented for `datetime +/- time_duration` and `datetime +/- date_period`.\r\n\r\nI think this issue can be solved in two steps:\r\n- Override `fold` to enable adding/subtracting `time_duration` and `date_period` literal expressions.\r\n- Generalize `DateTimeArithmeticOperation` to support adding/subtracting _combinations_ of time durations and date periods to datetimes.",
+            "Created a draft PR that already addresses adding/subtracting years before adding them to a datetime: https://github.com/elastic/elasticsearch/pull/99432\r\n\r\n@bpintea if you think the general direction of this is fine, I think I can take care of this issue.",
+            "@alex-spies an alternative approach might be to canonicalize ADD, having the DATETIME on the left and the temporal amount(s) on the right. This should work with the current folding approach of just chaining evaluators.",
+            "Thanks @bpintea , that's a good point and would work as well.\r\n\r\nOn the other hand, wouldn't we normally want to canonicalize in a way that allows for the most folding possible? Before the evaluator is even triggered, I think our constant folding optimization rule should do as much work as possible, and ideally we should only be left with just one date math ADD or SUB (or two, if we consider both date periods and time durations), right?\r\n\r\nThis requires that we can fold periods/durations in the first place, so I think we'll have to do something about the `fold` method one way or another, no?",
+            "> I think we'll have to do something about the fold method one way or another, no?\r\n\r\nYes, indeed! We can have the [proposed](https://github.com/elastic/elasticsearch/pull/99432) solution as an intermediary one until something [more generic](https://github.com/elastic/elasticsearch/issues/99502) is in place. But was thinking that if it's intermediary, a quicker fix might be to just canonicalize. Not having strong feelings about it, though.",
+            "Alright, PR #99432 enables part of this functionality: expressions like `1week + 1day + now()` as well as `1minute + 1 hour + now()` (also with minus signs wherever) are covered fine.\r\n\r\nWhat's missing after that are mixed expressions, where both periods (days, months etc.) and durations (hours, minutes etc.) occur _and are added to each other before being added to a datetime_. This includes the initial expression that started this issue: `- 1 year - 2 minutes + n` (which is equivalent to `(-1year -2minutes) + n`).\r\n\r\nI'll try to summarize the possible approaches.\r\n\r\n# Approach 1: Add another unrepresentable data type\r\n\r\nWe could declare another data type that is comprised of a period _and_ a duration; `1year + 1hour` would then be a valid value for this data type. By allowing arithmetics with this data type and datetimes, expressions like `(1year + 1hour) + now()` would become valid.\r\n\r\n## Pros\r\n- Probably easy-ish to implement in the current state.\r\n- Maybe we can consolidate both durations and periods into the new data type, simplifying some logic.\r\n\r\n## Cons\r\n- Since this is a new data type, it will probably proliferate into lots of places, and potentially become even somewhat user-facing (at least in error messages).\r\n- Removing the new data type later for whatever reason might be complicated or impossible.\r\n\r\n# Approach 2: Rely on correct parentheses/canonicalization of expressions\r\n\r\n@bpintea suggested that canonicalizing expressions would solve this issue. This relates to issue #99502, which suggests canonicalizing arithmetic expressions (though for other reasons). By exploiting (or imposing) associativity and commutativity of `+`, an expression like `(1year + 1hour) + now()` could be transformed into `(now() + 1year) + 1hour`, so that no sums involving _both_ periods and durations will ever have to be evaluated.\r\n\r\nMore generally, we could canonicalize any date math expression by grouping all period summands and all duration summands, so that e.g.\r\n```\r\n1 year + 1 hour + 1 month + 1 second + now() + 1 millisecond\r\n```\r\nbecomes\r\n```\r\n(now() + (1year + 1month)) + (1hour + 1millisecond)\r\n```\r\n\r\n## Pros\r\n- Also improves performance, as constant folding will turn any date math expression into an operation that involves at most two sums. `(((now() + 1year) + 1month) -2year)-2month` would just become `(now() -1year)-1month`.\r\n- This effectively imposes associativity on date math expressions. Note that\r\n  ```\r\n  (2023-04-30 + (1 month + 2day)) -(1month +2day) == 2023-04-29\r\n  ```\r\n  because of the order of execution. With canonicalization, the expression above will just become `2023-04-30 + (0month + 0day)` instead of creating an unexpected result.\r\n\r\n## Cons\r\n- Relying on canonicalization of an expression to be able to evaluate it, at all, is more complex than just writing another evaluator (or constant folding code).\r\n- Since canonicalization also contributes to performance, this might lead to complex situations and harder to maintain code.",
+            "Since both possible approaches are either impactful or (potentially) complex, I think we need to postpone the full solution to this issue for a bit.",
+            "Pinging @elastic/es-analytics-geo (Team:Analytics)",
+            "Pinging @elastic/es-analytical-engine (Team:Analytics)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 36702,
+            "commit_id": "833047b8d45fb1d20b6a62ce4e4133dce390e632",
+            "original_commit_id": "f3aa254b55747c704d56dc8fb87ba8c31880d9f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/expression/predicate/operator/arithmetic/DateTimeArithmeticOperation.java",
+            "start_line": 36,
+            "original_start_line": 36,
+            "start_side": "RIGHT",
+            "line": 49,
+            "original_line": 49,
+            "side": "RIGHT",
+            "original_position": 42,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "An exception has 'cognitive' value - it should be generic enough that enough places encounter the same condition that an exception makes sense to be created.\r\n\r\nThis is rarely the case (which is why *QL in general has only a couple of exceptions) -  just return an EsqlClientException with the correct message.",
+                "I tried just using EsqlClientException before I arrived at this solution; the problem with `EsqlClientException` is that it is abstract, so I can only create an anonymous class that inherits from it.\r\n\r\nThis works, but the user facing error message that it creates when an overflow is triggered during folding is not so great:\r\n```\r\n{\"type\":\"\",\r\n  \"reason\":\"arithmetic exception in expression [2147483647 day + 1 day]: [integer overflow]\"}\r\n```\r\nNotice the empty type string. Since the point of this exception is providing a nicer user-facing error, I don't think an anonymous class is a good solution.\r\n\r\nWith the current solution, the error message looks like this instead:\r\n```\r\n{\"type\":\"illegal_temporal_value_exception\",\r\n  \"reason\":\"arithmetic exception in expression [9223372036854775807 second + 1000 millisecond]: [long overflow]\"}\r\n```\r\n\r\nI'll add this to the javadoc of the class to make it clear.\r\n\r\n(I also contemplated either adding a more generic named exception, like `FoldingException` or so - but the case that it's used in only 2 places in just 1 class made that feel very awkward. The other option would be to make EsqlClientException just not abstract, but that again seemed like being against EsqlClientException's intended purpose. If you'd like me to go with any of these solutions, instead, just let me know and I'll create a follow-up PR!\r\n\r\nThere's also a solid chance that there may be more situations where a user-caused error will happen during folding time, at which point we can also factor out `IllegalTemporalValueException` into a more generic exception class.)",
+                "As it turns out, I need an exception to communicate arithmetic exceptions when folding `Neg` as well. So, the best is probably to factor this out into a dedicated `DateMathException`.\r\n\r\nI'll make a follow-up PR to handle `Neg` and will do that there."
+            ]
+        },
+        {
+            "hunk_id": 36701,
+            "commit_id": "833047b8d45fb1d20b6a62ce4e4133dce390e632",
+            "original_commit_id": "f3aa254b55747c704d56dc8fb87ba8c31880d9f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/analysis/Verifier.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 247,
+            "original_line": 247,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "Wondering if for numeric types we shouldn't suggest a conversion, \u00e0 la: `cannot use [{}]  of type [{}] in an EVAL assignment. Convert to a wider type`. ",
+                "Hm, this would only apply to some of the [unrepresentable data types](https://github.com/elastic/elasticsearch/blob/c663c831b7e334f980667686d1b0555a605f4bdf/x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/type/EsqlDataTypes.java#L151). Converting to a wider type does not really apply to a date period, for instance, right?\r\n\r\nBut, we could add a couple more type specific error messages, like \"convert to a wider type\" for short, half float etc. and \"can use period/duration only in combination with a datetime\" or so for periods/durations.\r\n\r\nI planned to do another small PR once this is merged to have good error messages for cases when users add durations and periods (which will inevitably happen IMO until we implement mixed durations and periods). I can add type-specific verifier errors for EVAL there :)",
+                "> Hm, this would only apply to some of the [unrepresentable data types](https://github.com/elastic/elasticsearch/blob/c663c831b7e334f980667686d1b0555a605f4bdf/x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/type/EsqlDataTypes.java#L151). Converting to a wider type does not really apply to a date period, for instance, right?\r\n\r\nRight, just for numeric types (`DataType#isNumeric()`).\r\n\r\n> when users add durations and periods\r\n\r\nRight, we can suggest reordering there."
+            ]
+        },
+        {
+            "hunk_id": 36700,
+            "commit_id": "833047b8d45fb1d20b6a62ce4e4133dce390e632",
+            "original_commit_id": "f3aa254b55747c704d56dc8fb87ba8c31880d9f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/expression/predicate/operator/arithmetic/Sub.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 50,
+            "original_line": 47,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "The changed format works because `super.resolveType()` ensures that they the operands are of different type, but the original form makes it more clear about the LHS type requirement.",
+                "Hm, to allow folding of durations/periods with SUB, I need to allow the left hand side to be something different than datetime. In this respect, the two conditions are not equivalent and I need this change to allow e.g. `1week - 1day` while still disallowing `1week - now()`. This is the most concise way I came up with, and it seems logical to me: it says \"you cannot subtract a datetime from something else\".\r\n\r\nI'll add a comment to make sure this is as clear as can be; if there's something else I can do to make things clear, let me know!"
+            ]
+        }
+    ]
+}

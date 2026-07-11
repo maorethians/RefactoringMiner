@@ -1,0 +1,63 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 92693,
+    "lang": "java",
+    "pr_title": "Delay master task failure notifications until commit",
+    "pr_body": "Today when the master service processes a batch of tasks in which some tasks fail and others succeed, the failure notifications occur straight away. However, the tasks may have failed because earlier tasks in the batch succeeded, and the effects of those successful tasks will not be visible to clients straight away. This commit delays all notifications until the publication is complete.\r\n\r\nCloses #92677",
+    "pr_comments": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Hi @DaveCTurner, I've created a changelog YAML for you.",
+        "Hi @DaveCTurner, I've updated the changelog YAML for you."
+    ],
+    "merged": true,
+    "created_at": "2023-01-04T21:53:33Z",
+    "issue_context": {
+        "number": 92677,
+        "title": "Results of update alias actions are not visible immediately after execution",
+        "body": "### Elasticsearch Version\r\n\r\n8.7.0 (snapshot archives/20230103-151926_4d37feea)\r\n\r\n### Installed Plugins\r\n\r\n_No response_\r\n\r\n### Java Version\r\n\r\n_bundled_\r\n\r\n### OS Version\r\n\r\nDarwin 21.6.0 Darwin Kernel Version 21.6.0: Sun Nov  6 23:31:13 PST 2022; root:xnu-8020.240.14~1/RELEASE_ARM64_T6000 arm64\r\n\r\n### Problem Description\r\n\r\nFirst seen since `f332fc2e3625af8e7e4acb03f1aea673cf00e00a`, `c40615c3155a90bd54f68254d183c54df2752367` looks OK.\r\n\r\n---\r\n\r\nIn Kibana we use the `updateAliases` API as an atomic way to:\r\n\r\n1. remove an alias from the old index\r\n2. add aliases to the new index\r\n3. remove a temporary index\r\n\r\nWe're observing tests failing where we run 3 Kibana instances in parallel, processing steps more or less at the same time (a few milliseconds apart).\r\n\r\n### High level flow\r\n\r\n1. We send the following request from each Kibana to update aliases and indices:\r\n\r\n```\r\nPOST /_aliases?timeout=60s\r\n{\r\n  \"actions\": [\r\n    {\r\n      \"remove\": {\r\n        \"index\": \".kibana_7.13.0_001\",\r\n        \"alias\": \".kibana\",\r\n        \"must_exist\": true\r\n      }\r\n    },\r\n    {\r\n      \"add\": {\r\n        \"index\": \".kibana_8.7.0_001\",\r\n        \"alias\": \".kibana\"\r\n      }\r\n    },\r\n    {\r\n      \"add\": {\r\n        \"index\": \".kibana_8.7.0_001\",\r\n        \"alias\": \".kibana_8.7.0\"\r\n      }\r\n    },\r\n    {\r\n      \"remove_index\": {\r\n        \"index\": \".kibana_8.7.0_reindex_temp\"\r\n      }\r\n    }\r\n  ]\r\n}\r\n```\r\n\r\n2. Kibana 1 succeeds, Kibana 2 + 3 error with `[index_not_found_exception]: no such index [.kibana_8.7.0_reindex_temp]`. \r\n\r\n3. In Kibana 2 + 3 we assume that another Kibana has already successfully deleted the temp index. We proceed to `list indices` based on our new aliases (`.kibana`, `.kibana_8.7.0`):\r\n\r\n`GET /.kibana%2C.kibana_8.7.0?ignore_unavailable=true`\r\n\r\nWe then see a response like:\r\n\r\n```json\r\n{\r\n  \".kibana_7.13.0_001\": {\r\n    \"aliases\": { \".kibana\": {}, \".kibana_7.13.0\": {} }\r\n    ...\r\n  }\r\n}\r\n```\r\n\r\nThis is unexpected because we assume the `.kibana` alias should be pointing to our new index `.kibana_8.7.0_001` NOT `.kibana_7.13.0_001`, additionally the alias `.kibana_8.7.0` should be pointing to `.kibana_8.7.0_001` as well.\r\n\r\n4. It looks like there is a small amount of lag, when issuing the same list indices request (`GET /.kibana%2C.kibana_8.7.0?ignore_unavailable=true`) a bit later we see:\r\n\r\n```json\r\n{\r\n  \".kibana_8.7.0_001\": {\r\n    \"aliases\": {\r\n      \".kibana\": {\r\n        \"is_hidden\": true\r\n      },\r\n      \".kibana_8.7.0\": {\r\n        \"is_hidden\": true\r\n      }\r\n    ....\r\n}\r\n```\r\n\r\n---\r\n\r\n#### Description of requests in cURL\r\n\r\nNote: this script does not seem to reproduce the issue, see below.\r\n\r\n```bash\r\n#! /bin/bash\r\n\r\nORIGIN=http://localhost:9200\r\nU=elastic:changeme\r\nSLEEP=0.1\r\n\r\n## Setup of our partially migrated environment ##\r\n# Create kibana0, our \"old\" index\r\ncurl -su$U -XPUT $ORIGIN/kibana0 > /dev/null\r\n# Create temp, our temporary bulk index from our old index\r\ncurl -su$U -XPUT $ORIGIN/temp > /dev/null\r\n# Set write block so we can clone\r\ncurl -su$U -XPUT $ORIGIN/temp/_block/write > /dev/null\r\n# Clone temp to our final index kibana1\r\ncurl -su$U -XPUT $ORIGIN/temp/_clone/kibana1 > /dev/null\r\n# Point our \"current\" alias to old index kibana0\r\ncurl -su$U -XPOST $ORIGIN/_aliases?timeout=60s -H 'content-type: application/json' -d '{\"actions\":[{\"add\":{\"index\":\"kibana0\",\"alias\":\"current\"}},{\"add\":{\"index\":\"kibana0\",\"alias\":\"previous\"}}]}' > /dev/null\r\n\r\nupdate_aliases() {\r\n  echo \"\"\r\n curl -su$U -XPOST $ORIGIN/_aliases?timeout=60s -H 'content-type: application/json' -d '{\"actions\":[{\"remove\":{\"index\":\"kibana0\",\"alias\":\"current\",\"must_exist\":true}},{\"add\":{\"index\":\"kibana1\",\"alias\":\"current\"}},{\"add\":{\"index\":\"kibana1\",\"alias\":\"next\"}},{\"remove_index\":{\"index\":\"temp\"}}]}'\r\n # List current indices, this is where we are seeing unexpected results \ud83d\udc47\ud83c\udffb \r\n curl -su$U $ORIGIN/current,next?ignore_unavailable=true -H 'content-type: application/json'\r\n echo \"\"\r\n}\r\n\r\n# Simulate 3 Kibana's sending update alias and list index requests at \"the same time\"\r\nupdate_aliases &\r\nsleep $SLEEP\r\nupdate_aliases &\r\nsleep $SLEEP\r\nupdate_aliases\r\n```\r\n\r\n### Steps to Reproduce\r\n\r\nRunning a test case from the Kibana repo that starts Elastic and multiple Kibana instances:\r\n\r\nhttps://github.com/elastic/kibana/blob/f2e3c5d480892e87b945f7c189a7abe5830c03fc/src/core/server/integration_tests/saved_objects/migrations/multiple_kibana_nodes.test.ts#L204\r\n\r\n1. Clone the Kibana repo and checkout `f2e3c5d480892e87b945f7c189a7abe5830c03fc`\r\n2. Apply the diff below to unskip the test\r\n3. Run `yarn kbn bootstrap` and `yarn test:jest_integration ./src/core/server/integration_tests/saved_objects/migrations/multiple_kibana_nodes.test.ts`\r\n\r\nYou may need to run the test 1-5 times before you hit a failure.\r\n\r\n\r\n<details>\r\n\r\n<summary>diff</summary>\r\n\r\n```diff\r\ndiff --git i/src/core/server/integration_tests/saved_objects/migrations/multiple_kibana_nodes.test.ts w/src/core/server/integration_tests/saved_objects/migrations/multiple_kibana_nodes.test.ts\r\nindex 34df1d484b9..9985525b725 100644\r\n--- i/src/core/server/integration_tests/saved_objects/migrations/multiple_kibana_nodes.test.ts\r\n+++ w/src/core/server/integration_tests/saved_objects/migrations/multiple_kibana_nodes.test.ts\r\n@@ -107,7 +107,7 @@ async function createRoot({ logFileName }: CreateRootConfig) {\r\n jest.setTimeout(15 * 60 * 1000);\r\n \r\n // FLAKY: https://github.com/elastic/kibana/issues/148263\r\n-describe.skip('migration v2', () => {\r\n+describe('migration v2', () => {\r\n   let esServer: TestElasticsearchUtils;\r\n   let rootA: Root;\r\n   let rootB: Root;\r\n@@ -149,6 +149,7 @@ describe.skip('migration v2', () => {\r\n       settings: {\r\n         es: {\r\n           license: 'basic',\r\n+          esArgs:['logger.org.elasticsearch.discovery=TRACE'],\r\n           // original SOs: 5k of `foo` docs with this structure:\r\n           // [\r\n           //   { id: 'foo:1', type: 'foo', foo: { status: 'unmigrated' }, migrationVersion: { foo: '7.13.0' } },\r\n@@ -201,7 +202,7 @@ describe.skip('migration v2', () => {\r\n     });\r\n   });\r\n \r\n-  it('migrates saved objects normally when multiple Kibana instances are started with a small interval', async () => {\r\n+  it.only('migrates saved objects normally when multiple Kibana instances are started with a small interval', async () => {\r\n     const setupContracts = await Promise.all([rootA.setup(), rootB.setup(), rootC.setup()]);\r\n \r\n     setupContracts.forEach((setup) => setup.savedObjects.registerType(fooType));\r\n```\r\n</details>\r\n\r\n### Logs (if relevant)\r\n\r\n[ES logs at TRACE level](https://github.com/elastic/elasticsearch/files/10343649/temp.log)\r\n\r\ncc @rudolf ",
+        "comments": [
+            "Pinging @elastic/es-data-management (Team:Data Management)",
+            "Related to #90010 "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 37714,
+            "commit_id": "979a2e79b4126d46f1093c5ea8f32d0c94e73d17",
+            "original_commit_id": "722410a5e50e0c30ab49a046895e3131ba2c2c3e",
+            "path": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1009,
+            "original_line": 999,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 93,
+            "subject_type": "line",
+            "review_comments": [
+                "It is not entirely clear to me that this could not be the state returned from the `blockMasterTask`? Perhaps we can pollute the cluster state returned from the real executor with a piece of data to check the presence of?\r\n",
+                "The `blockMasterTask` returns an unchanged state so it isn't published. I added some more machinery to verify this in 34e0605cafed1aea283744f2056e7f1af79c730a."
+            ]
+        },
+        {
+            "hunk_id": 37713,
+            "commit_id": "979a2e79b4126d46f1093c5ea8f32d0c94e73d17",
+            "original_commit_id": "722410a5e50e0c30ab49a046895e3131ba2c2c3e",
+            "path": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1012,
+            "original_line": 1000,
+            "side": "RIGHT",
+            "original_position": 57,
+            "position": 96,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we assert that `publishSuccessCountdown.getCount() > 0`? Also in `onSuccess`.",
+                "I added some checks that tasks are not double-completed in 34e0605cafed1aea283744f2056e7f1af79c730a."
+            ]
+        }
+    ]
+}

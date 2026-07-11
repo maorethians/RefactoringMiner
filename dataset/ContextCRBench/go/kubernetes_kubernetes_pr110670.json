@@ -1,0 +1,321 @@
+{
+    "repo": "kubernetes/kubernetes",
+    "pr_number": 110670,
+    "lang": "go",
+    "pr_title": "Fix pod stuck in termination state when mount fails or gets skipped after kubelet restart",
+    "pr_body": "This PR partially uses changes from - https://github.com/kubernetes/kubernetes/pull/110575 \r\n\r\n\r\nAnd fixes https://github.com/kubernetes/kubernetes/issues/96635 and https://github.com/kubernetes/kubernetes/issues/70044 \r\n\r\nThis PR:\r\n\r\n1. Keeps tracks of volumes which were skipped during reconstruction with the assumption that since they were present in DSOW, they will make it to ASOW. \r\n2. Enhances the check that makes volumes uncertain on unmounted - https://github.com/kubernetes/kubernetes/pull/110670/files#diff-3e8f8a6e5eca57db8e84bcc6c896f0a3b10289fe55d8e999b4bdf1cfdc0de394L785 to ensure that, we are not accidentally marking volumes which were added via reconsturction as unmounted because mount is failing after kubelet restart.\r\n\r\nThere are two important things in this PR:\r\n1. It adds volumes skipped during reconstruction as uncertain in ASOW.\r\n2. But above change alone is not enough to fix the bug (or unmount the volume), because - when kubelet will retry to mount the volume, mount will fail and it will mark the volume we added as uncertain in previous step as \"unmounted\" - https://github.com/kubernetes/kubernetes/blob/master/pkg/volume/util/operationexecutor/operation_generator.go#L788 . So basically if mount operation fails, kubelet will undo our hard work of adding volumes which we added as uncertain in step#1.\r\n\r\nNow it is clear that - we need to add volumes we read from disk as uncertain, so as kubelet can unmount them properly. But there are two ways to fix the second problem (i.e where kubelet is marking mount point as unmounted, if mount fails for a volume which was marked uncertain before).\r\n\r\n1. In this PR - I am keeping track of such reconstructed volumes in ASOW, so as even if mount fails for the volume it *must* not mark the volume was unmounted, if volume was added via reconstruction.\r\n2. There is another easier way - which is to make all volumes uncertain in ASOW if mount fails. That is what - https://github.com/kubernetes/kubernetes/pull/110650 PR does. This code however breaks an existing behaviour where if kubelet starts mounting a volume and may be operation timed-out (marked uncertain) and kubelet retries and mount fails then volume is marked as unmounted and a pod that was using this volume can be deleted without unmounting the volume. If we treat every mount failure as uncertain mount, then volume *must* be unmounted for pod to be deleted.\r\n\r\n```release-note\r\nUnmount volumes correctly for reconstructed volumes even if mount operation fails after kubelet restart\r\n```\r\n",
+    "pr_comments": [
+        "[APPROVALNOTIFIER] This PR is **APPROVED**\n\nThis pull-request has been approved by: *<a href=\"https://github.com/kubernetes/kubernetes/pull/110670#\" title=\"Author self-approved\">gnufied</a>*\n\nThe full list of commands accepted by this bot can be found [here](https://go.k8s.io/bot-commands?repo=kubernetes%2Fkubernetes).\n\nThe pull request process is described [here](https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process)\n\n<details >\nNeeds approval from an approver in each of these files:\n\n- ~~[pkg/kubelet/volumemanager/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/volumemanager/OWNERS)~~ [gnufied]\n- ~~[pkg/volume/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/pkg/volume/OWNERS)~~ [gnufied]\n\nApprovers can indicate their approval by writing `/approve` in a comment\nApprovers can cancel approval by writing `/approve cancel` in a comment\n</details>\n<!-- META={\"approvers\":[]} -->",
+        "/assign @smarterclayton @bobbypage ",
+        "How about during reconstruction, we put all reconstructed volumes into actual state with uncertain mode even if desired state has this information (we might need to sync between desired state and actual state which already there)?",
+        "@jingxu97 we could and that is what https://github.com/kubernetes/kubernetes/pull/108180 PR by @jsafrane  does. But adding *all* volumes to ASW in uncertain state during reconstruction brings new challenges, such as if we add a volume to ASW before it gets added to DSW, then we could accidently unmount the volume. So it has all these additional checks to safeguard against similar failure modes - https://github.com/kubernetes/kubernetes/pull/108180/files#diff-2acbd2d6c088f99f9c7e9042b3449418b4824675d2692350c332d0f276489268R40 ( @jsafrane correct me if I am wrong). \r\n\r\nBut that alone will not fix the issue, because we still need to avoid marking volumes which we added via recontruction to ASW as \"unmounted\" (from previous \"uncertan\" state if mount fails) - https://github.com/kubernetes/kubernetes/pull/110670/commits/f291291be86c1e376624f78601e290acfd3515f5#diff-3e8f8a6e5eca57db8e84bcc6c896f0a3b10289fe55d8e999b4bdf1cfdc0de394R787\r\n\r\nSo we have this middle ground PR of mine, which avoids those problems and still fixes issues we set out to fix. \r\n",
+        "/retest\r\n",
+        "As Hemant pointed out. will need *all* reconstructed volumes in ASW for my SELinux work. But I can have it behind a feature gate + we don't need to worry about backporting it as a bugfix to older releases. (And yes, I need to update it with the latest Hemant's fixes from this PR.) This PR can be somewhere in middle and could be backported to older releases.",
+        "Yeah eventually once jan's PR gets merged and enabled by default - we could delete the separate `processReconstructedVolumes` function and have reconstruction add all volumes. We will still need part#2 of this PR - which tracks reconstructed volumes in ASOW, so as we are not accidently flipping mount state of uncertain volumes which were added to ASOW via reconstruction on mount failures.",
+        "/kind bug\r\n/lgtm\r\n/hold\r\nBut I want @jingxu97's approval / lgtm too.",
+        "I am thinking again the logic of reconstruction. We still allow desired state populated first, and let reconciler execute without delay. During reconstruction, we can CheckandMarkAsUncertain only if no state in ASW. During reconcile, if mount fail, it should not clean up metadata and markasunmounted if it is uncertain or already mounted. (I am checking old PR https://github.com/kubernetes/kubernetes/pull/82492 to understand why we markvolumeasunmounted. See https://github.com/kubernetes/kubernetes/pull/82492#pullrequestreview-327200934, but that is markdeviceasuncertain) So this way we can avoid interference between reconstruction and reconcile.",
+        "> During reconcile, if mount fail, it should not clean up metadata and markasunmounted if it is uncertain or already mounted. (I am checking old PR https://github.com/kubernetes/kubernetes/pull/82492 to understand why we markvolumeasunmounted. See https://github.com/kubernetes/kubernetes/pull/82492#pullrequestreview-327200934, but that is markdeviceasuncertain) So this way we can avoid interference between reconstruction and reconcile.\r\n\r\nBasically the underlying reason for marking volume as unmounted when mount fails is backward compatibility. Before - https://github.com/kubernetes/kubernetes/pull/82492 patch landed, if mount operation fails then pod+volume basically will not even exist in ASOW. After that change - since pod+volume could exist in ASOW even if mount operation timedout, we made a change to mark the volume as *unmounted* if mount operation fails.\r\n\r\nIf we don't do that anymore - we will be making a change that is not entirely backward compatible. Whether this behaviour change breaks anyone or not - is kind of hard to predict. This is similar to code that we are removing which checks if path is a mount point. Generally it is safer to do but we are not sure if it will break anyone. \r\n\r\nI see your point of doing `CheckandMarkAsUncertain` during reconstruction and simplifying the ASOW code by not keeping track of reconstructed volumes separately.  My vote is lets revisit this topic via a change that we don't have to backport. We make it 1.26 or something and let it soak during the release cycle. We could even do a release note and develop CSI sanity tests that verify that `NodeUnpublish` should succeed for volumes which were *never* `NodePublished`. \r\n\r\nThere is one more thing though - calling `CheckandMarkAsUncertain` during recontruction will not be exact equivalent of code  proposed in this PR.  Because there are other minor differences that needs to be sorted out:\r\n\r\nFor example - the code in `processReconstructedVolumes` only handles volumes which were marked as attached. This is generally safer to do because, if we also start doing `CheckandMarkAsUncertain` for every volume not found in ASOW during reconstruction, we could be marking device path as wrong, since presence of api-server is not guaranteed during reconstruction. `processReconstructedVolumes` avoids this problem by not processing volumes which were not already marked as attached.\r\n\r\n\r\n\r\n\r\n\r\n",
+        "> > During reconcile, if mount fail, it should not clean up metadata and markasunmounted if it is uncertain or already mounted. (I am checking old PR #82492 to understand why we markvolumeasunmounted. See [#82492 (review)](https://github.com/kubernetes/kubernetes/pull/82492#pullrequestreview-327200934), but that is markdeviceasuncertain) So this way we can avoid interference between reconstruction and reconcile.\r\n> \r\n> Basically the underlying reason for marking volume as unmounted when mount fails is backward compatibility. Before - #82492 patch landed, if mount operation fails then pod+volume basically will not even exist in ASOW. After that change - since pod+volume could exist in ASOW even if mount operation timedout, we made a change to mark the volume as _unmounted_ if mount operation fails.\r\n> \r\n> If we don't do that anymore - we will be making a change that is not entirely backward compatible. Whether this behaviour change breaks anyone or not - is kind of hard to predict. This is similar to code that we are removing which checks if path is a mount point. Generally it is safer to do but we are not sure if it will break anyone.\r\n> \r\n> I see your point of doing `CheckandMarkAsUncertain` during reconstruction and simplifying the ASOW code by not keeping track of reconstructed volumes separately. My vote is lets revisit this topic via a change that we don't have to backport. We make it 1.26 or something and let it soak during the release cycle. We could even do a release note and develop CSI sanity tests that verify that `NodeUnpublish` should succeed for volumes which were _never_ `NodePublished`.\r\n> \r\n> There is one more thing though - calling `CheckandMarkAsUncertain` during recontruction will not be exact equivalent of code proposed in this PR. Because there are other minor differences that needs to be sorted out:\r\n> \r\n> For example - the code in `processReconstructedVolumes` only handles volumes which were marked as attached. This is generally safer to do because, if we also start doing `CheckandMarkAsUncertain` for every volume not found in ASOW during reconstruction, we could be marking device path as wrong, since presence of api-server is not guaranteed during reconstruction. `processReconstructedVolumes` avoids this problem by not processing volumes which were not already marked as attached.\r\n\r\nI basically agree with you. Just to be honest, I lost track of some code history. Seems to me that before PR #82492, if mount failure does not result in marking volume unmounted, the ASW should still have volume information if it is already there (e.g., remount case). ",
+        "> Seems to me that before PR https://github.com/kubernetes/kubernetes/pull/82492, if mount failure does not result in marking volume unmounted, the ASW should still have volume information if it is already there (e.g., remount case).\r\n\r\nBefore https://github.com/kubernetes/kubernetes/pull/82492 any mount failure used to return the call without touching anything in ASOW. So if mount failed (and volume was never mounted successfully previously) then no information about volume  mount gets recorded in ASOW.\r\n\r\nFor remount case - similarly if mount failed, then since call returns without touching ASOW, it will consider volume as mounted (but we do this today as well, so no change in behaviour).\r\n",
+        "/retest\r\n",
+        "/priority important-soon\r\n/triage accepted\r\n",
+        "/lgtm\r\n\r\nThank you very much for the great effort on fixing it!",
+        "/retest\r\n",
+        "/lgtm",
+        "/hold cancel\r\n",
+        "Created a cherry pick for 1.24 [here](https://github.com/kubernetes/kubernetes/pull/111636)."
+    ],
+    "merged": true,
+    "created_at": "2022-07-06T04:53:33Z",
+    "issue_context": {
+        "number": 96635,
+        "title": "kubelet is not able to delete pod with mounted secret/configmap after restart",
+        "body": "From https://github.com/kubernetes/kubernetes/issues/96038#issuecomment-728928671\r\n\r\n**What happened**:\r\nIn https://prow.k8s.io/view/gcs/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance/1328563866136743936 one of the nodes (gce-scale-cluster-minion-group-bddx) restarted for some reason (some kernel panic).\r\n\r\nThe last kubelet log entry is at 08:13:05.362859 and the first one after restart is 08:15:40.361826.\r\n\r\nIn the meantime (at 08:13:17.496033), one of the pods (small-deployment-167-56c965c4cf-9pw8k) running on that kubelet has been deleted by generic-garbage-collector (i.e. deletionTimestamp has been set).\r\n\r\nKubelet after restart was never able to mark this pod as deleted (i.e. object has been never actually deleted).\r\n\r\n**What you expected to happen**:\r\nAfter kubelet's restart, the pod object will be deleted from etcd.\r\n\r\n**How to reproduce it (as minimally and precisely as possible)**:\r\nBased on our logs, stopping kubelet for a while, deleting pod running on it and restarting kubelet should trigger this issue.\r\n\r\nPotentially, it may be important that the pod was using configmap (that has been already deleted).\r\n**Anything else we need to know?**:\r\n\r\nLink to the test run: https://prow.k8s.io/view/gcs/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance/1328563866136743936\r\nKubelet's logs: http://storage.googleapis.com/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance/1328563866136743936/artifacts/gce-scale-cluster-minion-group-bddx/kubelet.log\r\nPod name: test-sk0eco-5/small-deployment-167-56c965c4cf-9pw8k\r\nMore logs (like all kube-apiserver's logs for that pod can be found here): https://github.com/kubernetes/kubernetes/issues/96038#issuecomment-728939343\r\n\r\n\r\n**Environment**:\r\n- Kubernetes version (use `kubectl version`): v1.20.0-beta.1.663+147a120948482e\r\n- Cloud provider or hardware configuration:\r\n- OS (e.g: `cat /etc/os-release`):\r\n- Kernel (e.g. `uname -a`):\r\n- Install tools:\r\n- Network plugin and version (if this is a network-related bug):\r\n- Others:\r\n\r\n/cc @kubernetes/sig-node-bugs ",
+        "comments": [
+            "It looks like kubelet is continuously trying to mount secret that has been deleted in the meantime:\r\n\r\n```\r\nI1117 08:15:58.345135    2017 reconciler.go:269] operationExecutor.MountVolume started for volume \"secret\" (UniqueName: \"kubernetes.io/secret/7b4d462c-23ad-4a45-9e1e-ee73fee9e1da-secret\") pod \"small-deployment-167-56c965c4cf-9pw8k\" (UID: \"7b4d462c-23ad-4a45-9e1e-ee73fee9e1da\")\r\nE1117 08:15:58.345326    2017 secret.go:195] Couldn't get secret test-sk0eco-5/small-deployment-167: secret \"small-deployment-167\" not found\r\nE1117 08:15:58.345419    2017 nestedpendingoperations.go:301] Operation for \"{volumeName:kubernetes.io/secret/7b4d462c-23ad-4a45-9e1e-ee73fee9e1da-secret podName:7b4d462c-23ad-4a45-9e1e-ee73fee9e1da nodeName:}\" failed. No retries permitted until 2020-11-17 08:16:06.345386223 +0000 UTC m=+26.080620409 (durationBeforeRetry 8s). Error: \"MountVolume.SetUp failed for volume \\\"secret\\\" (UniqueName: \\\"kubernetes.io/secret/7b4d462c-23ad-4a45-9e1e-ee73fee9e1da-secret\\\") pod \\\"small-deployment-167-56c965c4cf-9pw8k\\\" (UID: \\\"7b4d462c-23ad-4a45-9e1e-ee73fee9e1da\\\") : secret \\\"small-deployment-167\\\" not found\"\r\nI1117 08:15:58.445474    2017 reconciler.go:269] operationExecutor.MountVolume started for volume \"configmap\" (UniqueName: \"kubernetes.io/configmap/7b4d462c-23ad-4a45-9e1e-ee73fee9e1da-configmap\") pod \"small-deployment-167-56c965c4cf-9pw8k\" (UID: \"7b4d462c-23ad-4a45-9e1e-ee73fee9e1da\")\r\nE1117 08:15:58.445673    2017 configmap.go:200] Couldn't get configMap test-sk0eco-5/small-deployment-167: configmap \"small-deployment-167\" not found\r\n```\r\n\r\nIs it possible to delete configmap or secret that is still mounted somewhere?",
+            "mark",
+            "The secret and configmap have been deleted at 08:13:17.372114 and 08:13:17.407192:\r\n```\r\nI1117 08:13:17.372114      11 httplog.go:89] \"HTTP\" verb=\"DELETE\" URI=\"/api/v1/namespaces/test-sk0eco-5/secrets/small-deployment-167\" latency=\"4.841432ms\" userAgent=\"clusterloader/v0.0.0 (linux/amd64) kubernetes/$Format\" srcIP=\"34.123.35.171:58728\" resp=200\r\nI1117 08:13:17.407192      11 httplog.go:89] \"HTTP\" verb=\"DELETE\" URI=\"/api/v1/namespaces/test-sk0eco-5/configmaps/small-deployment-167\" latency=\"2.654193ms\" userAgent=\"clusterloader/v0.0.0 (linux/amd64) kubernetes/$Format\" srcIP=\"34.123.35.171:58732\" resp=200\r\n```\r\n\r\nThe pod has been deleted at 08:13:17.496033:\r\n```\r\nI1117 08:13:17.496033      11 httplog.go:89] \"HTTP\" verb=\"DELETE\" URI=\"/api/v1/namespaces/test-sk0eco-5/pods/small-deployment-167-56c965c4cf-9pw8k\" latency=\"7.49838ms\" userAgent=\"kube-controller-manager/v1.20.0 (linux/amd64) kubernetes/147a120/system:serviceaccount:kube-system:generic-garbage-collector\" srcIP=\"[::1]:52478\" resp=200\r\n```\r\n\r\nSo the secret and configmap have been deleted **before** pod. This seems to be incorrect.\r\n\r\nSo most likely the question is: Should we support pod deletion after mounted secret/configmap has been deleted?\r\n\r\nI don't have that much kubelet context, but I think we should (e.g. if some user accidentally removes configmap before pod, then the user should have a way to delete pod without recreating configmap) and this is the bug that it's not always the case.",
+            "> Should we support pod deletion after mounted secret/configmap has been deleted?\r\n\r\nYes, the kubelet should not block cleanup of the pod on unavailability of secret/configmap resources\r\n\r\n/sig storage",
+            "/assign\r\n\r\nI have found the reason, i will fix it.",
+            "Issues go stale after 90d of inactivity.\nMark the issue as fresh with `/remove-lifecycle stale`.\nStale issues rot after an additional 30d of inactivity and eventually close.\n\nIf this issue is safe to close now please do so with `/close`.\n\nSend feedback to sig-contributor-experience at [kubernetes/community](https://github.com/kubernetes/community).\n/lifecycle stale",
+            "Stale issues rot after 30d of inactivity.\nMark the issue as fresh with `/remove-lifecycle rotten`.\nRotten issues close after an additional 30d of inactivity.\n\nIf this issue is safe to close now please do so with `/close`.\n\nSend feedback to sig-contributor-experience at [kubernetes/community](https://github.com/kubernetes/community).\n/lifecycle rotten",
+            "/remove-lifecycle rotten\r\nWe are still observing this flake in our tests, here is recent run in which it occurred: https://prow.k8s.io/view/gs/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance/1377667417462804480\r\n\r\nThis time pod \"test-vil5th-43/small-deployment-227-5cd8b577c9-mfhx5\" was not deleted. \r\nLogs confirming kubelet restart:\r\n```\r\n13:I0401 17:09:11.320405    1908 flags.go:59] FLAG: --add-dir-header=\"false\"\r\n14:I0401 17:09:11.320452    1908 flags.go:59] FLAG: --address=\"0.0.0.0\"\r\n...\r\n2440:I0401 20:23:03.271231  151431 flags.go:59] FLAG: --add-dir-header=\"false\"\r\n2441:I0401 20:23:03.271285  151431 flags.go:59] FLAG: --address=\"0.0.0.0\"\r\n```\r\n\r\nExample kubelet errors while trying to read deleted configmap/secret for this pod:\r\n```\r\n3337:I0401 21:28:24.861587  151431 reconciler.go:269] \"operationExecutor.MountVolume started for volume \\\"configmap\\\" (UniqueName: \\\"kubernetes.io/configmap/8f73aa25-79dd-4222-b5b7-0d29c06f948c-configmap\\\") pod \\\"small-deployment-227-5cd8b577c9-mfhx5\\\" (UID: \\\"8f73aa25-79dd-4222-b5b7-0d29c06f948c\\\") \"\r\n3338:I0401 21:28:24.862309  151431 reconciler.go:269] \"operationExecutor.MountVolume started for volume \\\"secret\\\" (UniqueName: \\\"kubernetes.io/secret/8f73aa25-79dd-4222-b5b7-0d29c06f948c-secret\\\") pod \\\"small-deployment-227-5cd8b577c9-mfhx5\\\" (UID: \\\"8f73aa25-79dd-4222-b5b7-0d29c06f948c\\\") \"\r\n3341:E0401 21:28:24.862654  151431 nestedpendingoperations.go:301] Operation for \"{volumeName:kubernetes.io/secret/8f73aa25-79dd-4222-b5b7-0d29c06f948c-secret podName:8f73aa25-79dd-4222-b5b7-0d29c06f948c nodeName:}\" failed. No retries permitted until 2021-04-01 21:30:26.862598616 +0000 UTC m=+4043.677596199 (durationBeforeRetry 2m2s). Error: \"MountVolume.SetUp failed for volume \\\"secret\\\" (UniqueName: \\\"kubernetes.io/secret/8f73aa25-79dd-4222-b5b7-0d29c06f948c-secret\\\") pod \\\"small-deployment-227-5cd8b577c9-mfhx5\\\" (UID: \\\"8f73aa25-79dd-4222-b5b7-0d29c06f948c\\\") : secret \\\"small-deployment-227\\\" not found\"\r\n3342:E0401 21:28:24.862703  151431 nestedpendingoperations.go:301] Operation for \"{volumeName:kubernetes.io/configmap/8f73aa25-79dd-4222-b5b7-0d29c06f948c-configmap podName:8f73aa25-79dd-4222-b5b7-0d29c06f948c nodeName:}\" failed. No retries permitted until 2021-04-01 21:30:26.862675209 +0000 UTC m=+4043.677672777 (durationBeforeRetry 2m2s). Error: \"MountVolume.SetUp failed for volume \\\"configmap\\\" (UniqueName: \\\"kubernetes.io/configmap/8f73aa25-79dd-4222-b5b7-0d29c06f948c-configmap\\\") pod \\\"small-deployment-227-5cd8b577c9-mfhx5\\\" (UID: \\\"8f73aa25-79dd-4222-b5b7-0d29c06f948c\\\") : configmap \\\"small-deployment-227\\\" not found\"\r\n``` ",
+            "Ping, any updates?",
+            "Friendly ping for the update. We came across this issue one again in a recent scale test job run: https://prow.k8s.io/view/gs/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance/1390713430448541696.",
+            "Also https://prow.k8s.io/view/gs/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance/1401222770964041728 failed due to this",
+            "/triage accepted\r\n/kind flake\r\n\r\nI think this bug was known (we've been tracking similar issues in OpenShift) but no one had seen this issue. Let's get it on our CI board.",
+            "The Kubernetes project currently lacks enough contributors to adequately respond to all issues and PRs.\n\nThis bot triages issues and PRs according to the following rules:\n- After 90d of inactivity, `lifecycle/stale` is applied\n- After 30d of inactivity since `lifecycle/stale` was applied, `lifecycle/rotten` is applied\n- After 30d of inactivity since `lifecycle/rotten` was applied, the issue is closed\n\nYou can:\n- Mark this issue or PR as fresh with `/remove-lifecycle stale`\n- Mark this issue or PR as rotten with `/lifecycle rotten`\n- Close this issue or PR with `/close`\n- Offer to help out with [Issue Triage][1]\n\nPlease send feedback to sig-contributor-experience at [kubernetes/community](https://github.com/kubernetes/community).\n\n/lifecycle stale\n\n[1]: https://www.kubernetes.dev/docs/guide/issue-triage/",
+            "This looks like a \"duplicate\" of the issue here: https://github.com/kubernetes/kubernetes/issues/70044",
+            "The Kubernetes project currently lacks enough active contributors to adequately respond to all issues and PRs.\n\nThis bot triages issues and PRs according to the following rules:\n- After 90d of inactivity, `lifecycle/stale` is applied\n- After 30d of inactivity since `lifecycle/stale` was applied, `lifecycle/rotten` is applied\n- After 30d of inactivity since `lifecycle/rotten` was applied, the issue is closed\n\nYou can:\n- Mark this issue or PR as fresh with `/remove-lifecycle rotten`\n- Close this issue or PR with `/close`\n- Offer to help out with [Issue Triage][1]\n\nPlease send feedback to sig-contributor-experience at [kubernetes/community](https://github.com/kubernetes/community).\n\n/lifecycle rotten\n\n[1]: https://www.kubernetes.dev/docs/guide/issue-triage/",
+            "/remove-lifecycle rotten\r\nrelated issue https://github.com/kubernetes/kubernetes/issues/70044\r\n\r\nA similar failure scenario exists for CSI volumes.\r\nCurrently checking to see if I can track the fault and create a reliable reproducer :)",
+            "FTR - it seems that https://github.com/kubernetes/kubernetes/pull/96790 is dead, so it's still an issue.",
+            "I think the key here is that this issue occurs if the kubelet restarts. This points to a problem with volume reconstruction logic. cc @jingxu97 @gnufied \r\n@kubernetes/sig-storage-bugs ",
+            "The Kubernetes project currently lacks enough contributors to adequately respond to all issues and PRs.\n\nThis bot triages issues and PRs according to the following rules:\n- After 90d of inactivity, `lifecycle/stale` is applied\n- After 30d of inactivity since `lifecycle/stale` was applied, `lifecycle/rotten` is applied\n- After 30d of inactivity since `lifecycle/rotten` was applied, the issue is closed\n\nYou can:\n- Mark this issue or PR as fresh with `/remove-lifecycle stale`\n- Mark this issue or PR as rotten with `/lifecycle rotten`\n- Close this issue or PR with `/close`\n- Offer to help out with [Issue Triage][1]\n\nPlease send feedback to sig-contributor-experience at [kubernetes/community](https://github.com/kubernetes/community).\n\n/lifecycle stale\n\n[1]: https://www.kubernetes.dev/docs/guide/issue-triage/",
+            "/remove-lifecycle stale",
+            "Is this still an issue?(see below - yes *it is still reproducible*) I wonder if fixes @liggitt made in https://github.com/kubernetes/kubernetes/issues/105204 helped solve the issue. I wrote following script to try and reproduce it and I let it run for 3-4 hours and I could not see an single instance of pod stuck in terminating state:\r\n\r\n```bash\r\n#!/bin/bash\r\n\r\n/home/hekumar/redhat/kubernetes/_output/local/bin/linux/amd64/kubelet --v=3 --vmodule= --container-runtime=remote --hostname-override=127.0.0.1 --cloud-provider= --cloud-config= --bootstrap-kubeconfig=/var/run/kubernetes/kubelet.kubeconfig --kubeconfig=/var/run/kubernetes/kubelet-rotated.kubeconfig --container-runtime-endpoint=unix:///var/run/crio/crio.sock --config=/tmp/kubelet.yaml > /tmp/kubelet.log 2>&1 &\r\nkubelet_pid=$!\r\nsleep 20\r\necho \"Kubelet is running with pid ${kubelet_pid}\"\r\n\r\nwhile true\r\ndo\r\n    echo \"creating pods\"\r\n    kubectl create -f config_map_path_pod.yaml\r\n    kubectl wait --for=condition=ready pod -l app=test\r\n    # wait for 10s\r\n    sleep 10\r\n    # stop kubelet\r\n    echo \"Killing kubelet with pid ${kubelet_pid}\"\r\n    kill -9 \"${kubelet_pid}\"\r\n    kubectl delete -f config_map_path_pod.yaml --wait=true --timeout=2s\r\n    echo \"Starting Kubelet backup\"\r\n    /home/hekumar/redhat/kubernetes/_output/local/bin/linux/amd64/kubelet --v=3 --vmodule= --container-runtime=remote --hostname-override=127.0.0.1 --cloud-provider= --cloud-config= --bootstrap-kubeconfig=/var/run/kubernetes/kubelet.kubeconfig --kubeconfig=/var/run/kubernetes/kubelet-rotated.kubeconfig --container-runtime-endpoint=unix:///var/run/crio/crio.sock --config=/tmp/kubelet.yaml > /tmp/kubelet.log 2>&1 &\r\n    kubelet_pid=$!\r\n    echo \"Kubelet is running with pid ${kubelet_pid}\"\r\n    kubectl delete pod dapi-test-pod --wait=true --timeout=40s\r\n    if [ $? -eq 0 ]\r\n    then\r\n       echo \"Pod deleted successfully\"\r\n    else\r\n        echo \"Failed to delete pod\"\r\n        exit -1\r\n    fi\r\ndone\r\n```\r\n\r\nThe job history looks clean too - https://prow.k8s.io/job-history/gs/kubernetes-jenkins/logs/ci-kubernetes-e2e-gce-scale-performance ",
+            "Hmm, I take my previous comment back. It appears that the error condition is still a valid bug and reproducible. ",
+            "I was taking a look at reproducing and fixing this issue and wanted to post my findings. Basically what is happening is:\r\n\r\n1. Pods gets created. \r\n2. While pod was running secret is deleted.\r\n3. Kubelet gets restarted. \r\n4. Kubelet does reconstruction and volume gets added to DSOW. It would have got added to DSOW anyways, because pod was still running. The key thing is volume does not get added to ASOW during reconcile because secret/configmap is not found.\r\n5. Pod is deleted.\r\n6. Now the code here- https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go#L249 prevents the volume+pod from being removed from DSOW because pod never made it to ASOW. \r\n7. So pod_worker tries to terminate the container and pod, and most of it works fine. But kubelet is unable to fully terminate the pod because https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kubelet_volumes.go#L77 returns true.\r\n8. And hence pod is stuck in terminating state.\r\n\r\nThe problem is - we simply can't choose to skip adding volumes to DSOW if pod has deletionTimestamp, because that will result in volume *never* getting cleaned up. So fix proposed https://github.com/kubernetes/kubernetes/pull/96790 is not full proof.\r\n\r\nA real solution IMO is to add *all* pods+volumes in uncertain state during reconstruction, so as volumes can be removed from DSOW and volumes are still required to be cleaned up before pod can be terminated. @jsafrane has a PR that implements part of this solution - https://github.com/kubernetes/kubernetes/pull/108180 . I am looking in using it to fix this bug. \r\n\r\n",
+            "/assign\r\n",
+            "I'm still seeing this issue on Kubernetes v1.30.4 (deployed via Ctlptl/Kind):\r\n\r\n```\r\nOct 03 10:45:05 kind-control-plane kubelet[883]: E1003 10:45:05.721415     883 nestedpendingoperations.go:348] Operation for \"{volumeName:kubernetes.io/configmap/afc08fd7-2b4e-4c38-85fc-d4623f1aad65-log-config podName:afc08fd7-2b4e-4c38-85fc-d4623f1aad65 nodeName:}\" failed. No retries permitted until 2024-10-03 10:47:07.721403498 +0000 UTC m=+2117.364836695 (durationBeforeRetry 2m2s). Error: MountVolume.SetUp failed for volume \"log-config\" (UniqueName: \"kubernetes.io/configmap/afc08fd7-2b4e-4c38-85fc-d4623f1aad65-log-config\") pod \"test-kafka-broker-default-2\" (UID: \"afc08fd7-2b4e-4c38-85fc-d4623f1aad65\") : configmap \"test-kafka-broker-default\" not found\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 59007,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/reconciler/reconciler.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 271,
+            "original_line": 271,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "so we might still miss some cases that volumes that are attachable plugin, if here it is not marked as attached yet, and later mount failed?",
+                "I think if volume was attachable and node still holds the status in `volumeAttached` then - it should not be a problem. Could there be a case where volume is not even attached to the node and still requires cleanup? I think if someone force detached the volume then yeah we won't be cleaning the volume. I think it seems like a very edge case. ",
+                "if kubelet restarts, when volume will be marked as exist (attached) in actual state?",
+                "I have changed the code in `processReconstructedVolumes` to wait for volume to be marked as attached via `VerifyControllerAttached` function. This means that `processReconstructedVolumes` will be called as long as one or more volumes remain in `skippedDuringReconstruction` map. ",
+                "could you point me where the wait logic?",
+                "The wait logic is - the volume is only removed from `skippedDuringReconstruction` if it exists in ASOW.  So for volumes which were added to `skippedDuringReconstruction` during reconstruction and if volume does not exist (not even verified as attached) then volume is not removed from `skippedDuringReconstruction` and `processReconstructedVolumes` is called again for them.  \r\n\r\n",
+                "but when volume will be verified as attached? Only volume is in desired state already? If volume cannot be placed in desired state, it will not added as attached?",
+                "volume can be in desired state temporarily, but it might be removed quickly, and volume is not added in desired state."
+            ]
+        },
+        {
+            "hunk_id": 59013,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/cache/actual_state_of_world.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 375,
+            "original_line": 375,
+            "side": "RIGHT",
+            "original_position": 50,
+            "position": 50,
+            "subject_type": "line",
+            "review_comments": [
+                "if it is not in attachdVolumes, what does it mean? In what situation it might happen?",
+                "This is complementary to logic in reconciler. `CheckAndMarkVolumeAsUncertainViaReconstruction` should only get called for volumes which are considered attached.\r\n\r\nAnd hence if it does get called for volumes which are not attached at all then we are not marking them as mounted in uncertain state. \r\n\r\n"
+            ]
+        },
+        {
+            "hunk_id": 59014,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/cache/actual_state_of_world.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 415,
+            "original_line": 415,
+            "side": "RIGHT",
+            "original_position": 99,
+            "position": 90,
+            "subject_type": "line",
+            "review_comments": [
+                "how about we always use the newest information from opts passed no matter podObj exist or not?",
+                "okay updated to use opts always "
+            ]
+        },
+        {
+            "hunk_id": 59008,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/reconciler/reconciler.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 443,
+            "original_line": 443,
+            "side": "RIGHT",
+            "original_position": 115,
+            "position": 115,
+            "subject_type": "line",
+            "review_comments": [
+                "why it is called globalVolumeInfo? maybe add comment?",
+                "added"
+            ]
+        },
+        {
+            "hunk_id": 59015,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/reconciler/reconciler_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2285,
+            "original_line": 2285,
+            "side": "RIGHT",
+            "original_position": 85,
+            "position": 119,
+            "subject_type": "line",
+            "review_comments": [
+                "how about two pods are using same volume, but one deleted?",
+                "added an additional test for this."
+            ]
+        },
+        {
+            "hunk_id": 59004,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/cache/actual_state_of_world.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 450,
+            "original_line": 450,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 125,
+            "subject_type": "line",
+            "review_comments": [
+                "I think that successful mount should delete the volume from `foundDuringReconstruction` too. Or does it need to be there until the volume is deleted?",
+                "we could delete it from there, when mount finishes successfully.",
+                "fixed. Also added more tests that verify ASOW accurately. "
+            ]
+        },
+        {
+            "hunk_id": 59010,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/cache/actual_state_of_world_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 465,
+            "original_line": 465,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "Could you please add comment what does this test do/verify ?",
+                "added"
+            ]
+        },
+        {
+            "hunk_id": 59011,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/volume/util/operationexecutor/operation_generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 790,
+            "original_line": 790,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "will this situation occur? \r\n\r\n1. volume is mounted\r\n2. it triggered remount, but secret was deleted accidentally\r\n3. volume is marked as unmount?",
+                "I do not think this can happen, because if volume was previously marked as mounted, a mount failure will not mark volume as unmounted. Only if volume was in uncertain state, we change mount state. "
+            ]
+        },
+        {
+            "hunk_id": 59012,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/cache/actual_state_of_world_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 560,
+            "original_line": 560,
+            "side": "RIGHT",
+            "original_position": 111,
+            "position": 111,
+            "subject_type": "line",
+            "review_comments": [
+                "maybe return bool value and log it?",
+                "not sure if it will cause unnecessary noise in test output. Were you thinking of some specific case?",
+                "just want to have some log for the new logic we added. will it affect test output?",
+                "oh, it is in test file, nvm"
+            ]
+        },
+        {
+            "hunk_id": 59006,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/reconciler/reconciler.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 184,
+            "original_line": 184,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "add a comment it should be only executed once?"
+            ]
+        },
+        {
+            "hunk_id": 59003,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/reconciler/reconciler.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 769,
+            "original_line": 769,
+            "side": "RIGHT",
+            "original_position": 276,
+            "position": 287,
+            "subject_type": "line",
+            "review_comments": [
+                "`volumeState` param is not used",
+                "good catch. I also added a unit test for new stuff. "
+            ]
+        },
+        {
+            "hunk_id": 59005,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/cache/actual_state_of_world.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 233,
+            "original_line": 233,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "add comments about foundDuringReconstruction?"
+            ]
+        },
+        {
+            "hunk_id": 59009,
+            "commit_id": "835e8ccc76577b24376dee8b01b10dc2e273c969",
+            "original_commit_id": "5e14c5dfa93f4ef3a02ffc0b3d1338c5004dc652",
+            "path": "pkg/kubelet/volumemanager/reconciler/reconciler.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 763,
+            "original_line": 763,
+            "side": "RIGHT",
+            "original_position": 281,
+            "position": 281,
+            "subject_type": "line",
+            "review_comments": [
+                "why remove pod info in the log?",
+                "I removed pod info because here we are making volume as mounted globally and hence pod info does not matter much. But I can add it back. ",
+                "err - also I do not have pod information in `gvl` variable, so that was another reason to remove the pod info. I do not have pod info in gvl because it is `gvl.podVolumes[]` which contains individual pod information. Previously this code was kinda buggy and now it begs the question - if we are to add pod information for global volume mount, then which pod information should we print here? May be just the first one? ",
+                "will the pod information ever be logged anywhere?",
+                "yes pod information gets logged when *volume* is marked as mounted:\r\n\r\n```\r\nklog.V(4).InfoS(\"Volume is marked as mounted and added into the actual state\", \"pod\", klog.KObj(volume.pod), \"podName\", volume.podName, \"volumeName\", volume.volumeName)\r\n```\r\n"
+            ]
+        }
+    ]
+}

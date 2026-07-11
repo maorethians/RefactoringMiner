@@ -1,0 +1,89 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 77791,
+    "lang": "java",
+    "pr_title": "Label thread names with tracing info",
+    "pr_body": "This PR is a proposal to solve #74580 by adding the X-Opaque-Id and trace.id header values in the Thread name field while the wrapped Runnable is running.\r\n\r\nThe mentioned issue above has some discussion on the possible alternatives and their pros/cons.\r\n\r\nThe change is localized to the private wrapped runnable implementations inside ThreadContext. Looking at usages I think this should be good for all client use cases, but I'm not 100% sure, I might've missed a class of threads or thread pools that can hold the tracing headers and not be handled by the two wrapped runnable implementations.\r\n\r\nI also added a disclaimer in HotThreads that the tracing ids reported may not be accurate for short-lived request executions.\r\n\r\nCloses #74580",
+    "pr_comments": [
+        "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+        "@elasticmachine update branch",
+        "> Taking a step back, I wonder if what we're ultimately interested in is to somehow marry `_tasks` API output with `_hot_threads` output, i.e., have a notion of \"actively executing tasks\" in the system, which is reflected in both `tasks` and `_hot_threads` APIs (and possibly other places). `X-Opaque-ID` allows to somehow join up this information. If ultimately the more structured information is useful, perhaps an approach as I've outlined in [#74580 (comment)](https://github.com/elastic/elasticsearch/issues/74580#issuecomment-876405708) might be a better starting point. I'm also becoming less convinced that jstack/JFR/MissionControl or VisualVM support via thread name is really useful unless these tools help visualize how the thread name / tracing id has changed over time (e.g. does Mission control visualize this somehow?). `X-Opaque-ID` is useful in the context of `_hot_threads` as it directly gives you an idea about _expensive_ user operations (so should be as accurate as possible when it comes to the `X-Opaque-ID`).\r\n\r\nI agree that if multiple places in the code would benefit from having a notion of all currently active tasks/operations/threads, then having a shared common repository like a concurrent Map would be a better solution. We'll just need to oversize the map to avoid false contention for quick requests. \r\n\r\nMissionControl or VisualVM don't track thread names over time, but with real-time monitoring the thread names will still be useful, or when folks do thread dumps within the tool. I think naming the threads will be useful for many 3rd party tools, those 2 are just some examples. Heapdump analysis tools will benefit, you could tell the resident set per specific request-id. Another example is jstack, in case Elasticsearch is in a bad state and cannot complete the hot_threads call, jstack will likely still be able to dump the thread stacks, along with the thread names. ",
+        "Hi @ywelsch and @rjernst, I investigated the TransportService and it's uses of ThreadContext and it's true, there are few cases when we send a transport request or send a transport response that are not wrapped in one of the two context runnables, but simply run on the netty thread pool. The netty thread pool threads in these cases will not be labelled with any of the tracing ids.\r\n\r\nIf these cases with the TransportService are important to capture with tracing ids, then my solution is not workable as-is. Please let me know what you think, if this is a no-go, I think we should close this PR.\r\n\r\nWrapping only around the runnables is a very localized change, but it works only for the Elasticsearch thread pools. I guess it's independent of if we want to use a ConcurrentHashMap or name the threads, it's simple but doesn't cover exactly 100% of ThreadContext uses.\r\n\r\nThe alternative is to tap into the ThreadContext wrapping and unwrapping methods directly, using a ConcurrentHashMap rather than the thread name. I think @pgomulka already has a prototype for this approach.",
+        "Hi @grcevski, I've created a changelog YAML for you."
+    ],
+    "merged": false,
+    "created_at": "2021-09-16T22:40:27Z",
+    "issue_context": {
+        "number": 74580,
+        "title": "Include tracing headers in hot_threads output?",
+        "body": "When searches are causing high CPU load, it's common to consult `hot_threads` to find the source of expensive searches. Working backwards to the source can be difficult, as it requires detailed knowledge of how searches are executed, often at the Lucene level.\r\n\r\nWe support a special header `X-Opaque-Id` that allows clients to tag a request with context information. Kibana is currently working on passing `X-Opaque-Id` on all search requests, to surface the application and component that initiated the request (https://github.com/elastic/kibana/issues/101587). The header is already included in search slow logs and tasks output. Could we also add it to `hot_threads` to help debug the source of expensive queries?\r\n\r\nNote: I'm not familiar with the `hot_threads` implementation and am not sure how feasible this actually is.",
+        "comments": [
+            "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+            "Thanks @jtibshirani for the write up. @pgomulka is going to spend a bit of time investigating how we would implement this, and we'll discuss at the next core/infra team meeting. ",
+            "I am not sure we can achieve this with current infrastructure. Accessing X-Opaque-ID from other threads would require a public access to ThreadLocal.getMap(Thread t) or Thread.threadLocals - which are package private to java.lang package. I am also not sure that would be a great design anyway to access foreign threads private parts..\r\n\r\n@original-brownbear and @ywelsch Do you think this is achievable with `ThreadContext`? Or maybe you think there might be a totally different approach to this?\r\n",
+            "You would also first have to get ahold of the `ThreadContext` associated with the thread. And you would have to get ahold of the `Thread` object, as `HotThreads` is only operating on `ThreadInfo`, not `Thread`. From a quick look, the simplest way to implement something along the lines of what @jtibshirani asked would be to create a static concurrent map in `ThreadContext`, keyed by thread id (`long Thread.getId()`), update it whenever `ThreadContext.threadLocal` is updated, and then get the relevant information in `HotThreads` by doing a lookup on this map using `ThreadInfo.getThreadId`.",
+            "Hi @ywelsch, I had a chat with @pgomulka on this today and I'm wondering if it would be possible to avoid creating a shared concurrent map by modifying the Thread names when we stash and restore the ThreadContext? Essentially, all we really need to do is show the X-Opaque-ID in the thread dump and we can use the Thread name field for it. Right now a thread name would be something like: `elasticsearch[elastic][generic][T#2]`, which comes from the name of the thread pool I think, so the idea is to:\r\n\r\n- Save the original thread name on context stash into a thread local\r\n- Call Thread.currentThread().setName() and rename the current worker thread name to `elasticsearch[elastic][generic][T#2]: X-Opaque-ID: 123` \r\n- Put back the original name on context restore\r\n\r\nI'm new here so I may not understand the full scope of this kind of a change, but I can see some advantages if it was possible. We wouldn't have to run additional atomic operations of every request for an infrequent API call, HotThreads doesn't need to be modified and having the X-Opaque-ID in the thread name may come in handy during debugging, or while using other external tools like JFR/MissionControl or VisualVM.",
+            "Note that `hot_threads` is more than just a thread dump. It takes multiple samples for each thread in order to identify common parts in the stack traces over a period of time for a given thread. `HotThreads` currently assumes that the thread name is stable, just picking the name from one sample. If `X-Opaque-ID` is encoded into the thread name, and it changes from sample to sample, couldn't this now mislead users into thinking that the thread had spent all this effort in the context of a given opaque id whereas this was only applicable to a (small) subset of the samples?\r\n\r\nAlso, wouldn't the rename require you to parse the current thread name first, e.g. in order to find out what thread pool it belonged to (write/generic/...) so that you can emit the correct updated name?\r\n\r\nI agree that having the `X-Opaque-ID` in the thread name for debugging / external tools could be handy as well (unless these tools operate on multiple samples as well and assume a stable thread name to identify identical threads). I'm not sure what a good practice here is. I don't hold a strong opinion on this either way.",
+            "> Note that `hot_threads` is more than just a thread dump. It takes multiple samples for each thread in order to identify common parts in the stack traces over a period of time for a given thread. `HotThreads` currently assumes that the thread name is stable, just picking the name from one sample. If `X-Opaque-ID` is encoded into the thread name, and it changes from sample to sample, couldn't this now mislead users into thinking that the thread had spent all this effort in the context of a given opaque id whereas this was only applicable to a (small) subset of the samples?\r\n\r\nThis is a very valid point, thanks for bringing it up. We would have to extract all `X-Opaque-Id`s as we capture the thread stacks from the thread name and clean-up the opaque id from the thread name when we report it. I think it's similar to what we would need to do if we used a map, but with less String manipulation and clean-up. \r\n\r\nIn a sense, if we implemented this feature it would have to be taken with a grain of salt anyway. If there were 10, 50ms API calls on the same executor thread, for the default duration that the HotThreads sampler thread sleeps (500ms), we'd miss at least 9 of those Opaque-Ids with both solutions we have here. The only way to get 100% accurate would be via sliding time window id tracking in a list (per thread), with 1 second window, assuming nobody uses more than 500ms HotThreads interval. I think that kind of tracking would be very expensive inside ThreadContext. \r\n\r\nIn short, I think with short running requests we'll always be misleading the users on the X-Opaque-Id. Perhaps the solution is to word the messaging around the Id in the report so that it speaks to this potential uncertainty?  \r\n\r\n> Also, wouldn't the rename require you to parse the current thread name first, e.g. in order to find out what thread pool it belonged to (write/generic/...) so that you can emit the correct updated name?\r\n\r\nMy thinking here was to simply append the X-Opaque-Id to whatever the thread name already is. By default it's set by the pool, so we'd add to it. However, now that you mention this, I see a way to get around having to store/restore the original thread name in a ThreadLocal, by doing String.split(threadName, 'X-Opaque-Id') on the restore path and simply reverting the name to the first String in the resulting array. \r\n\r\n\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 37216,
+            "commit_id": "f47afb06895472a4a01a58cd6e4ea3e9520f85d0",
+            "original_commit_id": "f7143e2ca75bb936322673fe3f5cbb156f9062d9",
+            "path": "server/src/test/java/org/elasticsearch/common/util/concurrent/ThreadContextTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 725,
+            "original_line": 725,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Using `assertThat(name, containsString(\"some_id\"));` would make any failures more readable and actionable, since we would see what failed to match",
+                "Ah, good idea! Thanks!"
+            ]
+        },
+        {
+            "hunk_id": 37217,
+            "commit_id": "f47afb06895472a4a01a58cd6e4ea3e9520f85d0",
+            "original_commit_id": "f7143e2ca75bb936322673fe3f5cbb156f9062d9",
+            "path": "server/src/main/java/org/elasticsearch/common/util/concurrent/ThreadContext.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 672,
+            "original_line": 672,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "What's the point of this interface? Aren't these just all simple static methods?",
+                "You are right, these methods are effectively static methods. I used an interface with default methods to encapsulate the two 'static' methods for use only in the wrapped runnables, since they rely logically on the second undoing the naming of the first. "
+            ]
+        },
+        {
+            "hunk_id": 37218,
+            "commit_id": "f47afb06895472a4a01a58cd6e4ea3e9520f85d0",
+            "original_commit_id": "f7143e2ca75bb936322673fe3f5cbb156f9062d9",
+            "path": "server/src/main/java/org/elasticsearch/common/util/concurrent/ThreadContext.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 707,
+            "original_line": 707,
+            "side": "RIGHT",
+            "original_position": 84,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "I wonder if by just applying this to `ContextPreservingRunnable` and `ContextPreservingAbstractRunnable` we're missing some important places. Think for example about requests that are handled on the transport thread (using executor `SAME`), and which then set the headers using `setHeaders` (in particular the tracing ones). I also wonder about other nested calls of `stashContext` etc and whether there's a risk now that these would run / show under the wrong tracing id.",
+                "Thanks Yannik, this is exactly the sort of thing I wasn't sure about. Let me investigate the uses of the SAME executor and the transport thread to check if this works at all. "
+            ]
+        }
+    ]
+}

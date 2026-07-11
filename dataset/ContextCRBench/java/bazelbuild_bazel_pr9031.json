@@ -1,0 +1,64 @@
+{
+    "repo": "bazelbuild/bazel",
+    "pr_number": 9031,
+    "lang": "java",
+    "pr_title": "Introduce flag to conditionally disable BES artifact upload",
+    "pr_body": "Issue #8673 describes a pain point with the BES when dealing with large output artifacts from RE. This patch introduces a flag to the bazel CLI that conditionally disables BES upload for targets marked with `no-remote` or `no-cache` (even without builds without the bytes).\r\n\r\nWhen the flag `--bep_disable_artifact_upload` is provided, the BES artifact uploader will respect the tags when determining which outputs should be sent to the BES, and ignore files referenced by any events if the target that triggered that event is tagged with either of the aforementioned tags.\r\n\r\nThis significantly reduces build times in some cases, but is contingent on being able to mark all the offending targets as no-cache or no-remote. I understand that this may not be ideal for all use cases. Some potential solutions:\r\n\r\n1) make the flag enable or disable the functionality for _all_ targets, not just those with specific tags (this is the functionality present in the first commit in this patchset)\r\n2) make the tags that enable this functionality configurable\r\n3) introduce a new tag that controls this functionality\r\n\r\nCriticisms or opinions welcome.",
+    "pr_comments": [
+        "@arlyon thanks for the patch!\r\n\r\nI'd like to understand the issue that you are trying to solve better:\r\n\r\n- Are you using remote execution or remote caching?\r\n- If remote execution, why are you tagging targets with no-remote instead of using builds without the bytes?\r\n- Bazel currently has a bug where it always tries to upload files to the remote cache even if the cache already contains them. If this bug was fixed would you still need the flag you are proposing?\r\n\r\nThanks!\r\n\r\nP.S.: We have recently introduced `no-remote-cache` and `no-remote-exec`. I wonder if we could make it so that by default Bazel will never upload files to the remote cache for targets being tagged `no-remote` and `no-remote-cache`.",
+        "Hey @buchgr thanks for the follow up\r\n\r\n1) Both, with the BES enabled, but with build without the bytes disabled.\r\n2) From out testing, builds without the bytes is incompatible with out specific use case.\r\n3) Without remote execution (but with remote caching) the problem does not occur, likely due to the fact that BES and the Remote Cache share the same `ByteStreamUploader`, which is able to prevent duplicate file hashes from being submitted twice. When remote execution is introduced, this hash set is not consistent between the local bazel client and the remote execution server. I assume that that is the bug you are referring to?\r\n\r\nAfter some further discussion today, we discovered that this inconsistency is essentially what causes the symptoms that this PR fixes. A side effect of that being \"bursty\" event upload, and excessive CAS usage. Obviously fixing the root cause is better than this patch which merely addresses the symptoms. Is there an open issue for this that I can look at? I would be keen to fix it.",
+        "I think it may be better to push only the first commit (which globally disables artifact upload), which will resolve the duplicate upload problem until a proper fix is implemented.",
+        "@arlyon https://github.com/bazelbuild/bazel/issues/7630",
+        "@arlyon there's also `--bes_upload_mode=nowait_for_upload_complete` that might be of interest to you.",
+        "Hi @buchgr , I've just wanted to confirm you are ok with going with the first commit of this PR (which globally disables artifact upload and will solve the initial issue), until a more elaborated fix is implemented\r\n\r\n(We have tried `--bes_upload_mode=nowait_for_upload_complete` but It doesn't seem to solve the problem for us)",
+        "I don't think we can do that unfortunately as this will break BES for a lot of people. I think #7630 isn't that hard to fix but I don't have time for it this week :/.\r\n\r\nHere's how you can fix it:\r\n\r\n- Add an abstraction that allows sharing a set of hashes between `AbstractRemoteActionCache` and `BuildEventArtifactUploader`.\r\n- For every action output that `AbstractRemoteActionCache` downloads make an entry of its content hash in the set. In BuildEventArtifactUploader check if the hash of the file is in the set before doing the upload. If it's in the set you know the remote side has the data already.",
+        "If we were to get that patch up this week, would it be possible to hit the 1.0 merge window? I would like to start work on #7630 now, and aim to be done by Friday. In the case that it isn't, is it possible to get the first commit merged for that deadline with the guarantee that the full fix is in progress?\r\n\r\nThe first commit is transparent for anyone who doesn't enable the flag and will not break BES in that case. Those who do enable the flag disable artifact upload (keeping event upload in tact) and will only \"break\" the BES when they are using remote execution without caching at which point the artifacts are never uploaded to the CAS, and the BES references files that do not exist. It is assumed that those who are using the flag are aware of the consequences.",
+        "`ByteStreamUploader` also has some functionality to detect duplicate uploads; is it maybe an idea to have that also consult the same hash set (instead of duplicating the functionality)?",
+        "1.0 will be cut on September 2nd. I believe that this should be enough time.",
+        "Hey @buchgr after further investigation, while your proposal to fix #7630 does partially solve the problem (by removing duplicate uploads), there is an edge case; since the cached blob set is ephemeral, any files that are pulled from the local cache bypass it because they are never downloaded. In situations where all the needed files already exist in the local cache the BES will upload all the artifacts despite potentially also being in the CAS.\r\n\r\nA solution to this is to, on start, do a \"get missing blobs\" on the files in the local cache to determine which ones the CAS has and pre-populate our hashset from that. Does this seem reasonable?\r\n\r\nOther than that, the fix is working (and tested). I have updated the PR with the current WIP",
+        "> A solution to this is to, on start, do a \"get missing blobs\" on the files in the local cache to determine which ones the CAS has and pre-populate our hashset from that. Does this seem reasonable?\r\n\r\nThe \"get missing blobs\" call is a great idea. I believe this might be a good enough general fix and save us from maintaining the hashset. what do you think?",
+        "> The \"get missing blobs\" call is a great idea. I believe this might be a good enough general fix and save us from maintaining the hashset. what do you think?\r\n\r\nThe implementation I settled on is a hybrid. It maintains a hashset locally of hashes known to be cached, and for the digests it doesn't have an answer for it consults the CAS.\r\n\r\nI've pushed the two commits now, ready for initial review. The PR still contains the first commit from the original patchset because this fix does not completely eliminate upload of all artifacts (the final output for example is still uploaded). The original proposal (`--bep_disable_artifact_upload`) does, and has value as a feature (as opposed to this bug fix).",
+        "I'd prefer to only do a simple FindMissingBlobs() call in the BytestreamBuildEventArtifactUploader and leave other parts of the code untouched. My reasoning is that it's 1) simple 2) a strict improvement and good enough as far as we know.",
+        "Hey @buchgr thanks for the feedback, I've simplified the patch to do missing blob requests in the `ByteStreamBuildEventArtifactUploader`. There's a bit of messing around with futures because of a synchronization point due to the requirement that all the files to be submitted to the CAS are checked in a single missing blobs request but it is fairly easy to understand if you are familiar with Futures.\r\n\r\nKeen to hear your feedback and get this merged soon.\r\n\r\nnote: I'm fixing CI, will squash any additional commits once it passes",
+        "Thanks. Instead of duplicating the code for `getMissingDigests` could you reuse the one in GrpcRemoteCache?",
+        "Hey @buchgr I've incorporated your suggestions and fixed the failing CI test case. Let me know what you think.\r\n\r\nAlex",
+        "Hi @buchgr thanks very much for the reviews. Assuming you're happy with this set of reviews, can we get this in before the 1.0 cut (#8573) on Monday?",
+        "Is this really blocking for 1.0?",
+        "Yes it's a **big** performance issue. Many people disabled BES because of it. Will try to get it merged today.",
+        "@arlyon given that this needs to go in to Bazel *today* I have taken the liberty to create a PR based on your change https://github.com/bazelbuild/bazel/pull/9320 that addresses a few issues:\r\n\r\n* The getMissingDigests call must not be blocking\r\n* Moves the digestUtil.compute(...) to the thread pool\r\n* Does not introduce a flag to disable BES upload. I am not a fan of the idea as it complicates things quite a bit and I would like to see how far calling getMissingDigests gets us. We may revisit at a later point.",
+        "> @arlyon given that this needs to go in to Bazel _today_ I have taken the liberty to create a PR based on your change #9320 that addresses a few issues:\r\n> \r\n>     * The getMissingDigests call must not be blocking\r\n> \r\n>     * Moves the digestUtil.compute(...) to the thread pool\r\n> \r\n>     * Does not introduce a flag to disable BES upload. I am not a fan of the idea as it complicates things quite a bit and I would like to see how far calling getMissingDigests gets us. We may revisit at a later point.\r\n\r\nI had the call to `getMissingDigests` return a Future previously (and can revert it to do that) but changed it to just return the raw set because that is what `GrpcRemoteCache` does. Shame about the flag, but understandable. Glad to see this part get merged nonetheless. Feel free to close as you see fit.",
+        "This has been merged as https://github.com/bazelbuild/bazel/commit/120cd54c3cdb6e90470ffd3ff275531f776f54a8"
+    ],
+    "merged": false,
+    "created_at": "2019-09-03T13:59:51Z",
+    "issue_context": {
+        "number": 7630,
+        "title": "\"bes upload\" uploads unnecessary files",
+        "body": "### Description of the problem / feature request:\r\n\r\nBazel appears to attempt to upload every file referenced by BES to the CAS, even ones it just downloaded *from* the CAS. This is not harmful, but somewhat wasteful - one extra RPC per file, and at least one round-trip worth of file contents (more if the CAS implementation doesn't short-circuit `OK` blobs it already has without waiting).\r\n\r\n![image](https://user-images.githubusercontent.com/201307/53811762-10867600-3f28-11e9-892c-d281a2c05c90.png)\r\n\r\nConsider this an optimization request, but not super high priority.\r\n\r\n### Bugs: what's the simplest, easiest way to reproduce this bug? Please provide a minimal example if possible.\r\n\r\nRun a remote build with BES enabled, and look at the RPCs issued.\r\n\r\n### What operating system are you running Bazel on?\r\n\r\nLinux\r\n\r\n### What's the output of `bazel info release`?\r\n\r\n0.23.0\r\n",
+        "comments": [
+            "Thanks for the report. I have been wanting to fix this for a while, but it's never been a high enough priority. I ll probably get to this by the end of this week, because it's a strict requirement for \"Remote Builds without the Bytes\".",
+            "is this still an issue?",
+            "I have no idea. Let's call it obsolete - if it shows up again as material we can do something about it, but if either it's no longer happening, or it is but doesn't seem to be important for performance in practice, it's probably not worth spending time on."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 20447,
+            "commit_id": "ece4855b5c9c900c75d99ccfc9a2adabe766d2c2",
+            "original_commit_id": "58d3f175eedb8ed8b76f72f911b8d97b6ac6bb63",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploader.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 149,
+            "side": "RIGHT",
+            "original_position": 144,
+            "position": 144,
+            "subject_type": "line",
+            "review_comments": [
+                "That's a blocking call. This won't work unfortunately."
+            ]
+        }
+    ]
+}

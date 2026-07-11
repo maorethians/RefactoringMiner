@@ -1,0 +1,48 @@
+{
+    "repo": "rails/rails",
+    "pr_number": 54114,
+    "lang": "ruby",
+    "pr_title": "Don't eagerly compile StringJoin nodes",
+    "pr_body": "Fix: https://github.com/rails/rails/issues/54102\r\n\r\nIt really isn't necessary, but also the way it was done would cause bind variables to be lost, resulting in broken queries.\r\n",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2025-01-04T10:50:34Z",
+    "issue_context": {
+        "number": 54102,
+        "title": "SQLite3::MismatchException: datatype mismatch when querying with a join to a has_many relationship that has a scope",
+        "body": "### Steps to reproduce\r\nI'm not totally sure this is a completely minimal reproduction, but it does appear to require a query joining via a has_many relationship that has a scope that contains a join.\r\n\r\nI haven't observed this issue with PostgreSQL, only with SQLite.\r\n\r\n```ruby\r\nrequire \"bundler/inline\"\r\n\r\ngemfile(true) do\r\n  source \"https://rubygems.org\"\r\n\r\n  gem \"rails\", \"~> 7.2.2.1\"\r\n  gem \"sqlite3\", \"~> 2.5.0\"\r\nend\r\n\r\nrequire \"active_record/railtie\"\r\nrequire \"minitest/autorun\"\r\n\r\nENV[\"DATABASE_URL\"] = \"sqlite3::memory:\"\r\n\r\nclass TestApp < Rails::Application\r\n  config.load_defaults Rails::VERSION::STRING.to_f\r\n  config.eager_load = false\r\n  config.logger = Logger.new($stdout)\r\n  config.secret_key_base = \"secret_key_base\"\r\nend\r\n\r\nRails.application.initialize!\r\n\r\nActiveRecord::Schema.define do\r\n  create_table :instructors, force: true do |t|\r\n  end\r\n\r\n  create_table :instructor_roles, force: true do |t|\r\n    t.integer :instructor_id\r\n    t.integer :role_id\r\n    t.integer :student_id\r\n  end\r\n\r\n  create_table :roles, force: true do |t|\r\n  end\r\n\r\n  create_table :students, force: true do |t|\r\n    t.integer :status\r\n  end\r\nend\r\n\r\nclass Instructor < ActiveRecord::Base\r\n  has_many :instructor_roles, -> { active }\r\nend\r\n\r\nclass InstructorRole < ActiveRecord::Base\r\n  belongs_to :instructor\r\n  belongs_to :role\r\n  belongs_to :student\r\n\r\n  scope :active, -> {\r\n    joins(\"JOIN students ON instructor_roles.student_id = students.id\")\r\n    .where(\"students.status = ?\", 1)\r\n  }\r\nend\r\n\r\nclass Role < ActiveRecord::Base\r\n  has_many :instructor_roles\r\nend\r\n\r\nclass Student < ActiveRecord::Base\r\n  has_many :instructor_roles\r\nend\r\n\r\nclass BugTest < Minitest::Test\r\n  def test_association_stuff\r\n    # No error\r\n    ir = InstructorRole.active.first\r\n    # Raises an error\r\n    i = Instructor.joins(:instructor_roles).first\r\n  end\r\nend\r\n\r\n```\r\n\r\n### Expected behavior\r\nNot throw an exception.\r\n\r\n### Actual behavior\r\n`ActiveRecord::StatementInvalid: SQLite3::MismatchException: datatype mismatch`\r\n\r\n### System configuration\r\n**Rails version**: 7.2.2.1\r\n\r\n**Ruby version**: ruby 3.3.4 (2024-07-09 revision be1089c8ec) [arm64-darwin23]\r\n\r\nThis works in rails 7.1.5.1 and first appears in 7.2.0 (I haven't checked the beta or rc builds). It is still an issue in 8.0.1, but I can't currently update to 8.x due to other dependencies.\r\n",
+        "comments": [
+            "Bisected, error started appearing with commit 8e6a5deca626c944933211d7977f4e7e76869e74 which was part of #51139\r\n\r\ncc @byroot ",
+            "Hum. It's weird, it's like the bind argument get lost:\r\n\r\n```\r\nInstructor Load (0.1ms)\r\n SELECT \"instructors\".*\r\nFROM \"instructors\"\r\nINNER JOIN \"instructor_roles\" ON \"instructor_roles\".\"instructor_id\" = \"instructors\".\"id\"\r\nJOIN students ON instructor_roles.student_id = students.id\r\nAND (students.status = ?)\r\nORDER BY \"instructors\".\"id\" ASC\r\nLIMIT ?\r\n [[\"LIMIT\", 1]]\r\n```\r\n\r\n",
+            "Looks like the bug is similar on other adapters (the exception is different of course, but the cause is the same, a missing bind argument).",
+            "Alright, if I rewrite the scope as:\r\n\r\n```ruby\r\n  scope :active, -> {\r\n    joins(\"JOIN students ON instructor_roles.student_id = students.id\")\r\n    .where(students: { status: 1 })\r\n  }\r\n```\r\n\r\nIt also fails on `7.1.x`, which means it's a pre-existing \"bug\" (using quotes here because I've never seen `joins(:scope_name)`, so I don't know if it's supposed to work in the first place).\r\n\r\nIt was only working prior because using `.where(\"sql\", bind_arg)` would cause early interpolation of the bind arguments, but it appears that for late bound scopes, the bind arguments were never merged when using `.joins(:scope_name)`.\r\n\r\nI need to dig more in whether this is valid use of `.joins` or not.",
+            "> I need to dig more in whether this is valid use of `.joins` or not.\r\n\r\nNevermind, I just realized the scope is called from:\r\n\r\n```ruby\r\n  has_many :instructor_roles, -> { active }\r\n```",
+            "I tried with some pretty old versions, some are hard to run now, but the bug was there at least since 6.0. I'm not even sure association scopes with bind arguments ever worked. I took a quick glance at the code and I can't seem to see any attempt at carrying the bind values over.",
+            "I forgot to say, I don't know if I'll be able to fix this in a timely manner, so if you are in search of a workaround to be able to upgrade you can do:\r\n\r\n```ruby\r\n  scope :active, -> {\r\n    joins(\"JOIN students ON instructor_roles.student_id = students.id\")\r\n    .where(sanitize_sql_array([\"students.status = ?\", 1]))\r\n  }\r\n```",
+            "Interestingly:\r\n\r\n```ruby\r\n  scope :active, -> {\r\n    joins(:student).where(students: {status: 1})\r\n  }\r\n```\r\n\r\nAlso works. So the binds are copied in some cases, not clear why yet it isn't when using a SQL fragment to join.",
+            "Alright, backported to 8.0 and 7.2, you should be able to use the  `7-2-stable` branch until the fix is released.",
+            "@byroot stellar work, thank you. \ud83d\ude47",
+            "Thanks so much for the very speedy resolution (and the workarounds offered)!"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48447,
+            "commit_id": "ab08fcda1b0eff81bf61619f1ba4b9bf78586b5e",
+            "original_commit_id": "1b327ad4ed0fe5e8c2f1f795e2cf63f90a9833b5",
+            "path": "activerecord/lib/active_record/associations/join_dependency/join_association.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 41,
+            "original_line": 41,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "As a bonus, we no longer need to checkout the connection here. This was a big smell."
+            ]
+        }
+    ]
+}

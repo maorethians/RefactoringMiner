@@ -1,0 +1,60 @@
+{
+    "repo": "bazelbuild/bazel",
+    "pr_number": 16545,
+    "lang": "java",
+    "pr_title": "Make `bazel run` works with minimal mode",
+    "pr_body": "Always use `ToplevelArtifactsDownloader` when building without the bytes.\r\n\r\nIt checks the combination of current command (e.g. `build`, `run`, etc.) and download mode (e.g. `toplevel`, `minimal`) to decide whether download outputs for the toplevel targets or not.\r\n\r\nAlso in the `RunCommand`, we wait for the background downloads before checking the local filesystem.\r\n\r\nFixes #11920.",
+    "pr_comments": [
+        "@bazel-io flag"
+    ],
+    "merged": false,
+    "created_at": "2022-11-07T14:41:39Z",
+    "issue_context": {
+        "number": 11920,
+        "title": "UX: make --remote_download_output=minimal download the necessary files when invoking `bazel run`",
+        "body": "### Description of the problem / feature request:\r\n\r\nWhen using remote build exection, calling `bazel run sometarget --remote_download_output=minimal` doesn't make sense: Bazel will not dowload all the files required to run `sometarget`.\r\n\r\nI propose changing the behaviour of `--remote_download_output=minimal` to download files needed to run an action that is called with `bazel run`.\r\n\r\n### Feature requests: what underlying problem are you trying to solve with this feature?\r\n\r\nI'm trying to improve the user experience of Bazel.\r\n\r\nNot downloading the files needed to run a target passed to `bazel run` is never something that a user wants to do.\r\n\r\n### Any other information, logs, or outputs that you want to share?\r\n\r\nI think the behavior would still be consistent with the meaning of `--remote_download_output=minimal`. The documentation says:\r\n\r\n> If set to 'minimal' doesn't download any remote build outputs to the local machine, except the ones required by local actions.\r\n\r\nI believe it is fair to consider `sometarget` a local action when calling `bazel run sometarget`.",
+        "comments": [
+            "In https://github.com/bazelbuild/bazel/issues/12015#issuecomment-682330182, @allada said:\r\n\r\n> I suspect the problem is that you need the runfiles and minimal does not download runfiles by default.\r\n> \r\n> Try adding:\r\n> --build_runfile_links to the end of the cmdline.",
+            "Though the documentation says that the `--build_runfile_links` flag is true by default, and I can't seem to spot any other flag that would disable it.",
+            "I think the problem here is that `local action` in bazel means an action that runs during the execution phase. From my understanding the actual binary executed from a `bazel run` is not considered a `local action`. Minimal is mostly for CI in cases where everything is remote or for pipelines that one phase might heat up the cache for another pipeline action that might download the items from the CAS.\r\n\r\nYour use case `toplevel` should do exactly what you want.\r\n\r\nWe had a case where we execute ~50k jobs + ~2k  tests remotely and nothing locally. The problem is that we needed the `undeclared_outputs` of the tests so we could process some of the stats that our test harness creates, but `minimal` won't download these, so we use `toplevel` + `--nobuild_runfile_links` to accomplish our goal, but in your case I think `toplevel` gives exactly what you want.",
+            "> Minimal is mostly for CI in cases where everything is remote or for pipelines that one phase might heat up the cache for another pipeline action that might download the items from the CAS.\r\n\r\nI'm using `bazel run` after `bazel test` to build and push docker images (rules_docker) from CI. I think it'd be good to unbreak the `run` command with `minimal` because for `test` we'd avoid downloading stuff that happens with `toplevel`. I haven't measured the difference, but it's project specific too. Might be significant. Does that make sense?",
+            "I see, but since you are running `bazel test` first, why not use:\r\n```\r\nbazel test --remote_download_output=minimal\r\n...\r\nbazel run --remote_download_output=toplevel\r\n```\r\n\r\nYou can do this with automatically in a `.bazelrc` file. The down side is you'll probably need to do another analysis phase between `test` and `run`, but this is going to be unavoidable even if the bazel team fixed it.",
+            "I explicitly flagged this issue as a UX one because I don't believe it makes sense to let people run commands that will inherently not work.\r\n\r\nIf `bazel run` with `--remote_download_output=minimal` doesn't make sense, `bazel` would be better either erroring out or promoting the flag to `toplevel`.",
+            "Thanks @allada, adding the following to my `.bazelrc` for CI worked (for anyone who finds this issue here):\r\n```\r\nbuild --remote_download_minimal\r\nrun --remote_download_outputs=toplevel\r\n```\r\n\r\nI agree with what the issue description says - the current behavior is confusing for me, the end user. If, for whatever reason, it will not be fixed, it'd be great to at least detect this situation and explain how to fix it rather than just let the build fail with \"file not found\" errors.\r\n\r\nThank you for helping to understand what is going on and helping to fix it.",
+            "i just ran into this too, and had to set `run --remote_download_outputs=all`, as we are pushing different artifacts (like docker images) through a single runnable target with `multirun`. If one specifies `remote_download_toplevel`, `multirun` is available, but the docker images that it should push are not (so the runfiles are missing).\r\nThis can be mitigated by explicitly building these runfiles first, but that feels weird from a UX perspective.\r\n\r\nI would have expected Bazel to download all runfiles for a runnable target. \r\n\r\nTo me, \"minimal\" means \"only what is required\", and not \"nothing\". and for a `bazel run` action, the runnable target + all runfiles are required for it to work.\r\n\r\n(I do understand the explanation with the `local action`, but the UX is suboptimal here, especially for beginner users.)",
+            "@tommyknows, I have seen this happen before when we had a custom `rule` that was not properly declaring outputs. You may want to look into ensuring that if you are using custom `rule`s to ensure you are using `DefaultInfo` properly and possibly `providers`.  We had to do some logic like:\r\n```py\r\ndata_runfiles = ctx.runfiles(files = [...])\r\nif ctx.attr.data:\r\n  for item in ctx.attr.data:\r\n    data_runfiles = data_runfiles.merge(ctx.runfiles(files = item[DefaultInfo].files.to_list()))\r\n    data_runfiles = data_runfiles.merge(item[DefaultInfo].data_runfiles)\r\n    ...\r\nreturn [DefaultInfo(files = ..., data_runfiles = data_runfiles)]\r\n```\r\n\r\nIt took us quite some time to get this figured out, but at the end of the day doing some fancy `DefaultInfo`-foo solved the problem. Was it the right way? Not sure, but it did allow us to not have these problems any more.",
+            "With `--remote_dowload_output=toplevel`, I still see issues with run commands on 3.7.2.\r\n\r\nIf I have a `genrule` like this:\r\n\r\n```\r\ngenrule(\r\n    name = \"build-dump\",\r\n    srcs = [\r\n        \"//cmd/dump\",\r\n    ],\r\n    outs = [\"dump-copier\"],\r\n    cmd = \"echo '#!/bin/sh\\n\\ncp $(SRCS) $$1' > \\\"$@\\\"\",\r\n    executable = 1,\r\n)\r\n```\r\n\r\nI would have expected that `srcs` is pulled from the cache. Instead the genrule fails on the `dump` binary not being copied. Is that expected too?",
+            "I'm encountering the same behavior as described by @tommyknows and @rmohr: `bazel run --remote_download_toplevel <target>` does not download all the runfile dependencies of the given target.",
+            "@coeuvre how hard would this be to get fixed?",
+            "IIUC, there are two problems here:\r\n  1. For toplevel mode, runfiles of toplevel targets are not downloaded.\r\n  2. For minimal mode, `bazel run ...` doesn't work because files needed to run the target are not downloaded.\r\n\r\nI agree both issues should be fixed. I am looking into the solutions.",
+            "@coeuvre Any chance that this gets into 6.0?",
+            "I will try to cherry-pick this into 6.0.",
+            "@bazel-io flag",
+            "@bazel-io fork 6.0.0",
+            "I'm looking into this more also; I think adding confusion are that **genrule** don't have runfiles since they don't take a `data` attribute?\r\n\r\nSomething like:\r\n```\r\ngenrule(\r\n    name = \"write_file\",\r\n    outs = [\"a.txt\"],\r\n    cmd = \"echo 'hello, world!' > $@\",\r\n)\r\n\r\ngenrule(\r\n    name = \"echo\",\r\n    srcs = [\"a.txt\"],\r\n    outs = [\"echo.sh\"],\r\n    cmd = \"\"\"\r\ncat > $@ << 'EOF'\r\n#!/usr/bin/env bash\r\nset -e\r\ncat $(location :a.txt)\r\nEOF\r\n    \"\"\",\r\n    executable = True,\r\n)\r\n```\r\n\r\nWill never have runfiles and therefore either **minimal** or **toplevel** will be missing `a.txt`.\r\n@fmeum recommended [here](https://bazelbuild.slack.com/archives/CA31HN1T3/p1736552044736139?thread_ts=1736544537.604969&cid=CA31HN1T3) to do \"Try replacing $(location... with $$0.runfiles/$(rootpath... \" but again I don't think that works since the file isn't a runfile?\r\n\r\nIt could be that the bug is the following:\r\n**genrule** whom have `executable = True` should probably list their srcs as runfiles?\r\n(probably even transitive?)",
+            "> It could be that the bug is the following: genrule whom have executable = True should probably list their srcs as runfiles?\n\nThis issue is unrelated to BwoB, `genrule` just doesn't provide any runfiles other than the executable it generates. Placing `srcs` in runfiles is not correct most of the time as those files are build time inputs to the genrule commands and usually not meant to be data dependencies. Wrapping the generated file in an `sh_binary` is much cleaner. I could even see a point for deprecating `executable = True` on `genrule`.\n\n",
+            "> I could even see a point for deprecating executable = True on genrule\n\nShould I open an issue?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 20369,
+            "commit_id": "98862b10e29b1e859943190df1d4a434028d2b9d",
+            "original_commit_id": "4e66d9340037f0be83d7bc0fdd809a09344ab83f",
+            "path": "src/main/java/com/google/devtools/build/lib/runtime/commands/RunCommand.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 312,
+            "original_line": 309,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Add a comment here explaining why this is necessary (since a casual reader of RunCommand.java might not be familiar with BwoB).",
+                "Done."
+            ]
+        }
+    ]
+}

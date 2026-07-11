@@ -1,0 +1,187 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 15320,
+    "lang": "rust",
+    "pr_title": "Retain Rendering World (adopted)",
+    "pr_body": "- Adopted from #14449\r\n- Still fixes #12144.\r\n\r\n## Migration Guide\r\n\r\nThe retained render world is a complex change: migrating might take one of a few different forms depending on the patterns you're using.\r\n\r\nFor every example, we specify in which world the code is run. Most of the changes affect render world code, so for the average Bevy user who's using Bevy's high-level rendering APIs, these changes are unlikely to affect your code.\r\n\r\n### Spawning entities in the render world\r\n\r\nPreviously, if you spawned an entity with `world.spawn(...)`, `commands.spawn(...)` or some other method in the rendering world, it would be despawned at the end of each frame. In 0.15, this is no longer the case and so your old code could leak entities. This can be mitigated by either re-architecting your code to no longer continuously spawn entities (like you're used to in the main world), or by adding the `bevy_render::world_sync::TemporaryRenderEntity` component to the entity you're spawning. Entities tagged with `TemporaryRenderEntity` will be removed at the end of each frame (like before).\r\n\r\n### Extract components with `ExtractComponentPlugin`\r\n\r\n```\r\n// main world\r\napp.add_plugins(ExtractComponentPlugin::<ComponentToExtract>::default());\r\n```\r\n\r\n`ExtractComponentPlugin` has been changed to only work with synced entities. Entities are automatically synced if `ComponentToExtract` is added to them. However, entities are not \"unsynced\" if any given `ComponentToExtract` is removed, because an entity may have multiple components to extract. This would cause the other components to no longer get extracted because the entity is not synced. \r\n\r\nSo be careful when only removing extracted components from entities in the render world, because it might leave an entity behind in the render world. The solution here is to avoid only removing extracted components and instead despawn the entire entity. \r\n\r\n### Manual extraction using `Extract<Query<(Entity, ...)>>`\r\n\r\n```rust\r\n// in render world, inspired by bevy_pbr/src/cluster/mod.rs\r\npub fn extract_clusters(\r\n    mut commands: Commands,\r\n    views: Extract<Query<(Entity, &Clusters, &Camera)>>,\r\n) {\r\n    for (entity, clusters, camera) in &views {\r\n        // some code\r\n        commands.get_or_spawn(entity).insert(...);\r\n    }\r\n}\r\n```\r\nOne of the primary consequences of the retained rendering world is that there's no longer a one-to-one mapping from entity IDs in the main world to entity IDs in the render world. Unlike in Bevy 0.14, Entity 42 in the main world doesn't necessarily map to entity 42 in the render world. \r\n\r\nPrevious code which called  `get_or_spawn(main_world_entity)` in the render world (`Extract<Query<(Entity, ...)>>` returns main world entities). Instead, you should use `&RenderEntity` and `render_entity.id()` to get the correct entity in the render world. Note that this entity does need to be synced first in order to have a `RenderEntity`.\r\n\r\nWhen performing manual abstraction, this won't happen automatically (like with `ExtractComponentPlugin`) so add a `SyncToRenderWorld` marker component to the entities you want to extract.\r\n\r\nThis results in the following code:\r\n```rust\r\n// in render world, inspired by bevy_pbr/src/cluster/mod.rs\r\npub fn extract_clusters(\r\n    mut commands: Commands,\r\n    views: Extract<Query<(&RenderEntity, &Clusters, &Camera)>>,\r\n) {\r\n    for (render_entity, clusters, camera) in &views {\r\n        // some code\r\n        commands.get_or_spawn(render_entity.id()).insert(...);\r\n    }\r\n}\r\n\r\n// in main world, when spawning\r\nworld.spawn(Clusters::default(), Camera::default(), SyncToRenderWorld)\r\n```\r\n\r\n### Looking up `Entity` ids in the render world\r\n\r\nAs previously stated, there's now no correspondence between main world and render world `Entity` identifiers. \r\n\r\nQuerying for `Entity` in the render world will return the `Entity` id in the render world: query for `MainEntity` (and use its `id()` method) to get the corresponding entity in the main world.\r\n\r\nThis is also a good way to tell the difference between synced and unsynced entities in the render world, because unsynced entities won't have a `MainEntity` component.",
+    "pr_comments": [
+        "It looks like your PR is a breaking change, but you didn't provide a migration guide.\n\n  Could you add some context on what users should update when this change get released in a new version of Bevy?\n  It will be used to help writing the migration guide for the version. Putting it after a `## Migration Guide` will help it get automatically picked up by our tooling.",
+        "It's kinda unfortunate that all my previous comments can't be easily viewed with this new PR. What wasn't implemented/changed that I suggested?",
+        "@JMS55 The things I didn't adress are:\r\n- \"Should'nt we modify the clusterizer system to store RenderEntity on Clusters directly, instead of using another query here?\"\r\n- Mystery two lines in crates/bevy_pbr/src/lib at line 423 and 424\r\n- What happened with crates/bevy_sprite/src/mesh2d/mesh.rs ?\r\n- Footgun regarding adding SyncRenderWorld to spatial entities.\r\n- Shrinking the size of `pending` in world_sync.rs\r\n- Is recursive despawn appropriate for despawning unsynced entities? (again in world_sync)\r\n\r\nThe files you didn't review are:\r\n- crates/bevy_pbr/src/render/light.rs\r\n- crates/bevy_ui/src/render/mod.rs",
+        "> Mystery two lines in crates/bevy_pbr/src/lib at line 423 and **424**\r\n```rust\r\n        render_app.world_mut().observe(add_light_view_entities);\r\n        render_app.world_mut().observe(remove_light_view_entities);\r\n```\r\nThe first observer adds `LightViewEntities` to an extracted light, while the second observer despawns the entity if its `LightViewEntities` is removed. This plays into the `crates/bevy_pbr/src/render/light.rs` machinery, which in all honesty I also haven't found the time to fully understand it.",
+        "I've looked at the code again to write the migration guide and I've noticed two things:\r\n1. The reverse `MainEntity` mapping is not used currently. It could be removed, but it might be usefull for users. Unsure of what to do.\r\n2. I'm worried about the `SyncToRenderWorld` having to be added to everything you want to extract using the `ExtractComponentPlugin`. This might affect the general user base (not just the people messing around with rendering internals), so I'm thinking about using an observer to add `SyncToRenderWorld` automatically every time an extracted component is added. Maybe I can use required components for this? Not sure.",
+        "It's probably worth it to remove `MainEntity` unless there's a better reason to keep it. There probably a measurable cost to it, since the temp render entities now need to move that data every frame, rather than just moving from the empty archetype.",
+        "I've thought about it some more and I've decided to keep the `MainWorld(id)` component even when it's not currently used. The primary reason is that this component helps distinguish between synced entities and non-synced entities in the render world. Without it, there's no easy way of doing that.\r\nSecondly, it's exceptionally cheap to work with: When you are spawning an entity in the render world during sync, you might as well spawn it with something.\r\n\r\nEDIT: My apologies for being a little bit blunt in regards to the suggested nits I do and don't take into account. This is for reasons of time and patience: I don't have an infinite amount of either.",
+        "It's much appreciated; and I'm happy with how you're handling the review feedback. It's good to clearly discuss the feedback and split out what can be split into follow-up.",
+        "I've decided to use an observer to add `SyncToRenderWorld` automatically to every component that should be extracted. This has the obvious upside that users don't need to change how they use `ExtractComponentPlugin`, it will work identically as it did before the change. The downside, however, is a little subtle.\r\n\r\nIf you remove the component `ExtractComponent` from the entity, it will not automatically remove the `SyncToRenderWorld` component, making it so that entities are left synced when they shouldn't be. This means that the render world entity remains there, with the old data, which is potentially quite bad. If the entire entity with the `ExtractComponent` is removed, this is not a problem, because `SyncToRenderWorld` is also removed and the render world entity is despawned correctly.\r\n\r\n> Why don't you just add another observer that removes `SyncToRenderWorld` if the relevant `ExtractComponent` is removed?\r\n\r\nThis becomes a problem with an entity that has two extract components, say `Foo` and `Bar`. If we remove `Bar`, `SyncToRenderWorld` is removed and the corresponding render world entity is despawned. But wait a minute, we still care about `Foo`! Yup, that becomes an annoying problem, doesn't it?\r\n\r\n> Is there no way to fix this?\r\n\r\nYes there is, we could give `SyncToRenderWorld` a field that keeps track of the number of 'synced' components. So an entity with `Foo` and `Bar` would have a `SyncToRenderWorld(2)`, because it has two reasons to be synced. With some appropriate accounting with observers, this would all work.\r\n\r\n> Why are you not doing it then?\r\n\r\nBecause this whole system is so *so* ***so*** complicated and annoying. The sync system to begin with is a cludge built on a hack built on an etc etc. This is all to catch a very minor edge-case and I'm wondering if there is a better way. Or if we can just write a stern warning somewhere in the docs, maybe that's enough.",
+        "> Or if we can just write a stern warning somewhere in the docs, maybe that's enough.\r\n\r\nIMO removing `ExtractComponent` from an entity should be *vanishingly* rare: this is enough for me here.\r\n\r\nAs a note, trait queries would be a really clean fix to your problem of \"have we removed all of the relevant components of a generic type\", but those aren't upstreamed.\r\n\r\n> I've decided to use an observer to add SyncToRenderWorld automatically to every component that should be extracted.\r\n\r\nOne question though: why not use required components for this? The semantics seem to be identical, and this should be faster and more standard.",
+        "Last thank you to @re0312, I couldn't have done it without you.",
+        "I'll tackle the release notes for this. I think that getting something in place for this ASAP is important to help communicate these changes to the rendering devs and ease initial migration during the release candidate."
+    ],
+    "merged": true,
+    "created_at": "2024-09-21T23:28:10Z",
+    "issue_context": {
+        "number": 12144,
+        "title": "Render world blocking certain ecs developments",
+        "body": "Currently, there are at least two worlds in any given bevy app, the 'normal' world and the render world. The render world is responsible for rendering a scene to the screen. To keep the two worlds in sync, all the entities of the render world are removed at the end of a frame and in the subsequent frame the render world is 'rebuilt'.\r\n\r\nThere are [plans for the ecs](https://github.com/bevyengine/bevy/discussions/6493) (mainly involving Relations) that hinge on more things becoming entities. As entities become more fundamental (components as entities, queries as entities), it becomes a problem when the render world removes all entities in every frame.\r\n\r\nI'm mainly attempting to lift this problem from Discord (where it has been repeatedly discussed) to a slightly less transient and easier-to-read format.\r\n\r\nIf I got anything wrong, please tell me. While I think that this problem should be solved, it is sadly also a problem of which I don't know the full details.\r\n ",
+        "comments": [
+            "Thanks for creating a place to track this.\r\n\r\nThe main issue is that the render world currently guarantees that extracted entities from the main world will be able to use the same `Entity` id in the render world. This forces all entity and component data to be dropped each frame to make room for the entities from the main world. This is primarily a problem as mentioned above for using the ECS storage for things like queries, systems and most importantly components which is a requirement for flecs-like fragmenting relations, a long term goal of the project.\r\n\r\nSome proposed solutions include:\r\n1. Stop deleting entities in the render world entirely, move to a resource based render world where extracted data is not store in entities at all.\r\n2. Instead of ensuring ids match attach a `MainWorldEntity` component to render world entities to track the mapping and assign arbitrary ids. Then either:\r\n  a. Persist entities in the render world, only despawning them when the corresponding entity is despawned.\r\n  b. Despawn entities properly each frame (avoid using `SparseSet` components so entire tables can be dropped).\r\n  \r\nIn my opinion 2b is the only option I'm currently aware of that doesn't require a huge rearchitecting of the renderer, however I am aware there are some who want to pursue 1 or 2a for performance reasons unrelated to the blocked entitification of the ECS. I'm also sure there are more approaches I've forgotten or we haven't yet considered.\r\n\r\nRegardless I think we are united in wishing to move away from the current model and I'll be happy wherever we end up.",
+            "Additional constraint: The render world entity ID must be stable between frames. Lots of temporal rendering techniques require storing and retrieving data across multiple frames per entity.",
+            "> Additional constraint: The render world entity ID must be stable between frames. Lots of temporal rendering techniques require storing and retrieving data across multiple frames per entity.\r\n\r\nCould you use the value from the component in the place of the actual entity ID?\r\n\r\nAlternatively this does remind me of another implementation which is to split the address space and use a bit in the identifier to signify a foreign id. This involves a few intricacies with how high entity ids would interact with sparse sets and other ECS internals but we do need to resolve that for relations anyway.",
+            "> Could you use the value from the component in the place of the actual entity ID?\r\n\r\nWhat component? MainWorldEntity? Yes, so long as MainWorldEntity is stable across frames. I need to be able to do this basically:\r\n\r\n```rust\r\n// Resource\r\nlet mut last_frame_data_per_light = HashMap::new();\r\n\r\n// Current frame\r\nfor entity in light_query {\r\n     last_frame_data_per_light.insert(entity, foo);\r\n}\r\n\r\n// Next frame\r\nfor entity in light_query {\r\n   last_frame_data_per_light.get(entity); // Need to know some info about the light stored from last frame\r\n}\r\n```",
+            "My main concern for the render app is performance. In one sense moving away from using the ECS for the main mesh entity flow has been freeing to use whatever we find works best. For me at least it lets me focus on the data and how best to structure and access it to achieve fast rendering, rather than being constrained by how the ECS works.\r\n\r\nThat said, if there were to be an ECS world shared between the apps so that we could avoid extraction and could access everything that we need, that certainly seems interesting.\r\n\r\nAnd from the original post, 1 sounds ok, 2 sounds a bit clunky but could work. We don\u2019t use entities in the ECS sense much in the render app anymore in my opinion. Mostly views I think. The bulk of high frequency data is done with EntityHashMap in resources."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 684,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_render/src/world_sync.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 142,
+            "original_line": 138,
+            "side": "RIGHT",
+            "original_position": 138,
+            "position": 142,
+            "subject_type": "line",
+            "review_comments": [
+                "PERF: should we just separate this into 2 vecs, one for added and one for removed? Would potentially be faster.",
+                "This seems like a minor improvement at best and it would have to be benchmarked. Punting this to a potential follow-up PR."
+            ]
+        },
+        {
+            "hunk_id": 687,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_render/src/extract_component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 164,
+            "original_line": 164,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// # Warning\r\n///\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 686,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_pbr/src/render/light.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1021,
+            "original_line": 985,
+            "side": "RIGHT",
+            "original_position": 222,
+            "position": 207,
+            "subject_type": "line",
+            "review_comments": [
+                "There's this magic number of `6` here and below on line 998. This should be a constant with relevant name. I don't understand the code well enough myself to say why `6` was picker. Code seems to have been changed to fix a regression in the synty scene: https://github.com/bevyengine/bevy/pull/14449#issuecomment-2278205581",
+                "Did some discord archeology and found this comment:\r\n\r\n> re0312 \u2014 07/31/2024 9:31 PM\r\nI think I may have found the problem.we use EntityHashmap<ViewLightEntity, BinnedPhase>to manage the rendering items of each view_light, but due to view_light_entity is a temporary entity, it was depawned per frame so that the memory of its corresponding BinnedPhase cannot be reused.\r\n\r\nSo something to do with retaining the ViewLightEntities",
+                "crates/bevy_pbr/src/render/light.rs is an enigma that I need to take a closer look at. Thanks for the discord archaeology. I'll try to make sense of it.",
+                "6 is the number of sides a cube has, I figured it out, you're welcome\r\n\r\nI've added a comment, instead of a full variable name because 6 is also used as-is for that same person throughout the rest of the file."
+            ]
+        },
+        {
+            "hunk_id": 683,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 91,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "do we need to show `sync` here? Feems more an internal detail of extract to me.",
+                "I feel like it does since it is a distinct phase that's relevant for extraction."
+            ]
+        },
+        {
+            "hunk_id": 685,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_render/src/world_sync.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 102,
+            "original_line": 98,
+            "side": "RIGHT",
+            "original_position": 98,
+            "position": 102,
+            "subject_type": "line",
+            "review_comments": [
+                "PERF: I think I'm still of the opinion that it would be better to combine this with `RenderEntity` as a `RenderEntity(Option<Entity>)`. The reason for this is that adding `RenderEntity` later changes the archetype of anything with `SyncToRenderWorld`. It would probalby require the `id` method to panic which isn't ideal, but I think it would be worth it to avoid the archetype moves.\r\n\r\nI suggested this in the older pr, but got pushback.",
+                "Similar thing to what I said before, it's a perf improvement I don't have time for right now. Maybe a follow-up PR, but not now."
+            ]
+        },
+        {
+            "hunk_id": 688,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_render/src/world_sync.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 69,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "IMO we should cover `RenderEntity` and `MainEntity` here as well, since those are important parts of the puzzle."
+            ]
+        },
+        {
+            "hunk_id": 689,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_render/src/world_sync.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 130,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 125,
+            "position": 130,
+            "subject_type": "line",
+            "review_comments": [
+                "Tiny doc strings please."
+            ]
+        },
+        {
+            "hunk_id": 682,
+            "commit_id": "7831f35325c65b9b9e7a9177ee64d9d97d8e5e55",
+            "original_commit_id": "fc93e13c36155bb7ea2022731fa5119374aa8bba",
+            "path": "crates/bevy_core_pipeline/src/taa/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 355,
+            "original_line": 356,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "Shouldn't be fixed in this pr, but this is an uncached query and should get fixed."
+            ]
+        }
+    ]
+}

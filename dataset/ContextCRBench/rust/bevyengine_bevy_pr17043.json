@@ -1,0 +1,330 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 17043,
+    "lang": "rust",
+    "pr_title": "Add `Result` handling to `Commands` and `EntityCommands`",
+    "pr_body": "## Objective\r\n\r\nFixes #2004\r\nFixes #3845\r\nFixes #7118\r\nFixes #10166\r\n\r\n## Solution\r\n\r\n- The crux of this PR is the new `Command::with_error_handling` method. This wraps the relevant command in another command that, when applied, will apply the original command and handle any resulting errors.\r\n- To enable this, `Command::apply` and `EntityCommand::apply` now return `Result`.\r\n- `Command::with_error_handling` takes as a parameter an error handler of the form `fn(&mut World, CommandError)`, which it passes the error to.\r\n  - `CommandError` is an enum that can be either `NoSuchEntity(Entity)` or `CommandFailed(Box<dyn Error>)`.\r\n\r\n### Closures\r\n- Closure commands can now optionally return `Result`, which will be passed to `with_error_handling`.\r\n\r\n### Commands\r\n- Fallible commands can be queued with `Commands::queue_fallible` and `Commands::queue_fallible_with`, which call `with_error_handling` before queuing them (using `Commands::queue` will queue them without error handling).\r\n- `Commands::queue_fallible_with` takes an `error_handler` parameter, which will be used by `with_error_handling` instead of a command's default.\r\n- The `command` submodule provides unqueued forms of built-in fallible commands so that you can use them with `queue_fallible_with`.\r\n- There is also an `error_handler` submodule that provides simple error handlers for convenience.\r\n\r\n### Entity Commands\r\n- `EntityCommand` now automatically checks if the entity exists before executing the command, and returns `NoSuchEntity` if it doesn't.\r\n- Since all entity commands might need to return an error, they are always queued with error handling.\r\n- `EntityCommands::queue_with` takes an `error_handler` parameter, which will be used by `with_error_handling` instead of a command's default.\r\n- The `entity_command` submodule provides unqueued forms of built-in entity commands so that you can use them with `queue_with`.\r\n\r\n### Defaults\r\n- In the future, commands should all fail according to the global error handling setting. That doesn't exist yet though.\r\n- For this PR, commands all fail the way they do on `main`.\r\n- Both now and in the future, the defaults can be overridden by `Commands::override_error_handler` (or equivalent methods on `EntityCommands` and `EntityEntryCommands`).\r\n- `override_error_handler` takes an error handler (`fn(&mut World, CommandError)`) and passes it to every subsequent command queued with `Commands::queue_fallible` or `EntityCommands::queue`.\r\n- The `_with` variants of the queue methods will still provide an error handler directly to the command.\r\n- An override can be reset with `reset_error_handler`.\r\n\r\n## Future Work\r\n\r\n- After a universal error handling mode is added, we can change all commands to fail that way by default.\r\n  - Once we have all commands failing the same way (which would require either the full removal of `try` variants or just making them useless while they're deprecated), `queue_fallible_with_default` could be removed, since its only purpose is to enable commands having different defaults.",
+    "pr_comments": [
+        "Pinging @alice-i-cecile as requested. Not totally polished, but I felt like this could use some feedback/cooperation in regards to other fallible stuff going on.",
+        "I'm willing to eat a 5% (worst case) performance regression on Commands here. This is a huge usability problem with Bevy, and I'm convinced that we can't solve this without somehow regressing perf there. The big performance gains to be found here are in command batching anyways.",
+        "I'd like to do a proper review of this, if I can find the time. Writing this as a reminder to myself.",
+        "@engodev can I get your opinions on this work? I think I prefer the basic idea here over that of #11184. Making commands fallible by default (with commands that can't fail always returning `Ok(())`) feels like the right direction.",
+        "> @EngoDev can I get your opinions on this work? I think I prefer the basic idea here over that of #11184. Making commands fallible by default (with commands that can't fail always returning `Ok(())`) feels like the right direction.\r\n\r\nI agree with you, this approach makes a lot of sense. I do think we can find a more optimized solution though. Having proper error handling for commands is worth the 5% decrease in performance but I'm positive we can minimize it.\r\n\r\nI'll try to find time over the weekend to play around with this PR and give more based feedback.",
+        "I like this direction a lot, but I do have a gripe with `CommandErrorMode`. It seems to me like this should not be an enum, but rather just make everything an `Option<fn(&mut World, Box<dyn Error>)>`. Then we can have a hot path where it is `None` and the errors bubble up to the handler embedded in the schedule (through a fallible `ApplyDeferred`), and we can have a `#[cold]` path that calls the function as part of command application.\r\n\r\nYou have `queue_fallible` insert the `None` and something like a `queue_fallible_with(command, panic_on_error)` where `panic_on_error` is a normal function.\r\n\r\nThese are all suggestions mind you. You're doing great work, and I wouldn't block the current line of work over any of this. It just strikes me that using function pointers might be more extensible. It might also be lower overhead with a specific `#[cold]` path, idk.",
+        "Hmm, I'm trying to figure out what would even cause regressions here if it's not the #[cold] annotation. I feel like there hasn't been much change to the code paths for fake_commands and sized_commands_0_bytes. The only thing I really see is that we now need to drop the result from `command.apply`. Not sure what else it could be.\r\n\r\nhttps://github.com/bevyengine/bevy/pull/17043/files#diff-badf600e116f81aa58524486dea99ee4bb337143cca99a57339dda74f4661bc4R190",
+        "I think I'll revert `entity` anyway, handling the error there doesn't really fit and changing it to return `Result` would make a massive diff (344 references across 144 files...) which ought to be its own PR",
+        "How would y'all feel about something like this:\r\n\r\n```\r\npub mod handler {\r\n\tpub fn log_warning() -> fn(&mut World, Box<dyn Error>) {\r\n\t\t|_, error| warn!(\"{error}\")\r\n\t}\r\n\t[more of them]\r\n}\r\n\r\npub mod command {\r\n\tpub fn insert(impl Bundle) -> impl EntityCommand {\r\n\t\tmove |EntityWorldMut| {\r\n\t\t\t/*command code*/\r\n\t\t}\r\n\t}\r\n\t[more of them]\r\n}\r\n```\r\n\r\nSo that users could do this if they wanted:\r\n`commands.entity(entity).queue_with(command::insert(bundle), handler::log_warning());`\r\n\r\nI'm unsure what the stance is on using `pub mod` like namespaces.",
+        "Performance got better, somehow. Presumably the performance improvement ~from removing the `UnsafeWorldCell` (see #17115)~ was being negated by something before. Maybe it really was `Commands::entity`. This is compared to main:\r\n\r\n<details>\r\n<summary>Benchmarks</summary>\r\n\r\n![with_commanderror_1](https://github.com/user-attachments/assets/cb6e2491-bc91-47c7-ba33-9024993d5499)\r\n![with_commanderror_2](https://github.com/user-attachments/assets/bb3ec8e6-fd90-4405-9a60-ae6d4550cfdd)\r\n![with_commanderror_3](https://github.com/user-attachments/assets/f2b2554b-d85e-4bbf-b437-d99a4aabc873)\r\n\r\n</details>\r\n\r\nedit: I reverted the `EntityFetchError` changes and still get a similar benchmark result, so I'm not sure where the improvement came from.",
+        "Well that's very encouraging. I'll see if I can replicate.",
+        "@JoJoJet points out in discord (https://discord.com/channels/691052431525675048/1325887475729698837/1325917241396564069) that we may want to use concrete error types if possible.",
+        "I would also prefer concrete error types that get cast at the last minute if at all possible, but I don't feel that *has* to be done in this PR.",
+        "As the person who recommended using boxes I would feel kind of bad to block on changing to yet something else. So personally I would push for doing that as future work.",
+        "I only have a vague idea of how to implement that so this might not be true, but I think it would have to be less convenient for struct-based commands for that to work.\r\n\r\nI've tried to keep it so that, if you `impl Command for SomeStruct`, you still only have to implement `apply` and it'll just work. To have concrete errors, I think structs would have to do more work to implement `Command`.\r\n\r\nI don't know how much we still care about struct commands, I've just tried to avoid making them worse. If a decision-maker decides that they're not important, that's fine by me",
+        "I think that we can overwhelmingly move away from struct-based commands :) All of our internal experiments to move away from them have gone smoothly. Even when you need to capture data / settings, closures work fine.\r\n\r\nI don't mind regressing their UX there.",
+        "I'm going to wait until your PR is up to merge this (to reduce breakage on main), but I'm considering this \"ready-to-merge\" :)"
+    ],
+    "merged": true,
+    "created_at": "2025-01-06T18:08:29Z",
+    "issue_context": {
+        "number": 2004,
+        "title": "Configurable error handling in commands",
+        "body": "## What problem does this solve or what need does it fill?\r\n\r\nCommands (like removing components or despawning entities) may fail for various reasons. Right now, for the sake of idempotency (the same function applied twice should do the same thing as the function applied once), robustness and not spamming the user endlessly, these silently fail.\r\n\r\nThis is not always the desired behavior, and should be configurable at the call site.\r\n\r\n## Possible solutions\r\n\r\n### Approach to config\r\n\r\nGlobal config is convenient for reducing boilerplate, but the desired behavior may fail by call site.\r\n\r\nLocal config is useful for both debugging and persistent configuration.\r\n\r\n### Default behavior\r\n\r\nThis could panic, warn or fail silently.\r\n\r\n### Patterns\r\n\r\nMore methods: this is bad for API explosion.\r\n\r\nExtra argument: this is very verbose for common operations because Rust doesn't have default arguments\r\n\r\nBuilder pattern: nice, as long as we don't *have* to use it.\r\n\r\n## Additional context\r\n\r\n@Frizi, @BoxyUwU  and myself ran into this while discussing new commands for relations in https://github.com/bevyengine/rfcs/pull/18",
+        "comments": [
+            "The \"robustness\" argument actually backfires here in some circumstances. Things might not get done for various reason, but the logic might rely on them being done. That means we get extremally hard to detect bugs, and often impossible to solve when no opportunity to handle those failure modes is given.\r\n\r\nAn especially involved example comes from drafted relations RFC:\r\n```rust\r\ncommands.entity(target_mass).change_target::<Spring>(m1, m2);\r\n \r\n```\r\n\r\nHere we intend to modify `Spring` relation `target_mass -> m1` to `target_mass -> m2`. There are multiple ways it can fail:\r\n- the new target `m2` might not exist at command execution time, what should we do with relation `target_mass -> m1`?\r\n- the old target `m1` might already be deleted, which also deletes it's relations. We end up with no relation on pointing to `m2`.\r\n- any other combination of `m1`, `m2`, or `target_mass` can be deleted\r\n- there might be no relation to move (relation `target_mass -> m1` was not there to begin with)\r\n\r\nDoing nothing at all in all those situations by default is a little scary. Some of those failures might be unexpected, and influence correctness of implemented game logic if they happen. Saying \"things might get done if all stars align\" sounds very fragile and hard to rely on.\r\n\r\nAlso in some cases, there are still decisions to be made at the last second, like what to do with the relation that was supposed to be moved out, but there is nowhere to go?\r\n\r\nOne way to fix that would be to allow adding extra ``FnOnce + 'commands`` closure parameter to handle those failures.\r\n\r\n```rust\r\ncommands.entity(target_mass)\r\n\t.change_target::<Spring>(m1, m2)\r\n\t.on_failure(|failure_mode| {\r\n\t\tmatch failure_mode {\r\n\t\t\t// when move failed, remove relation that was supposed to be moved\r\n\t\t\tChangeTargetFailure::NewTargetMissing(decision) => decision.remove_relation(),\r\n\t\t\t// expected, do nothing\r\n\t\t\tChangeTargetFailure::OldTargetMissing | ChangeTargetFailure::RelationMissing => {},\r\n\t\t\t_ => panic!(\"unexpected failure {:?}\", failure_mode)\r\n\t\t}\r\n\t});\r\n```\r\nA lot of things to bikeshed here of course, but I hope this gets the general idea through.\r\n\r\nThis would allow logging on some unexpected behaviour, panic on straight up algorithm correctness violations, or do last-second decisions on what action to take. This of course applies not only to relations, but things like moving a component between entities or other actions that can fail.\r\n\r\nThings that can be done are of course limited by the closure lifetime, but this can be further expanded if needed. Adding some more context to that closure could possibly allow more complex behaviours in response to fails, e.g. by allowing to issue more commands.",
+            "I like the idea of having a callback for failures. This means that something more robust can be built with MPSC using `Sender` in the callback and another system that reads for failures from a `Receiver`. That way if a command fails, you can have more advanced error handling like updating the game state to an error state or changing how some entities are spawned or such.",
+            "In theory these callbacks could have arbitrary World access, as they would be executed during command application. They could even be Systems (although this would likely incur overhead if every entity needs to initialize the same system). That flexibility might also change if we ever adopt more granular command synchronization (ex: the \"stageless\" design we've been discussing). ",
+            "We should note #2219 as being an example of this issue directly affecting a developer and causing a quite bad UX. \r\nOnce I get settled on a better bevy-development-workflow, this appears to be once of the issues we should prioritize. \r\nI have some testing going locally for possible solutions to this and may present them in the near future.",
+            "> They could even be Systems\r\n\r\nI think that's a very good idea. We should do https://github.com/bevyengine/bevy/issues/2192 first, and then error handling could build on that?",
+            "> I think that's a very good idea. We should do #2192 first, and then error handling could build on that?\r\n\r\nI'm not the biggest fan of this necessarily, mostly because then we have to wrap the error handler in a `Box` where a currently implementation I'm working on doesn't require this extra allocation.\r\nAlso, a `Command` might have a specific `Error` type that it wants to hand the `error_handler` but this won't be easily done if the handler has to be a system.",
+            "If anyone if curious, I have an initial implementation of this at #2241",
+            "I've implemented a few simple methods (try_insert, try_remove and try_add_child) in this PR: https://github.com/Leafwing-Studios/Emergence/pull/765 externally.\r\n\r\nFeel free to steal it directly (MIT license) either for Bevy or your own projects. Works perfectly for what I need."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1004,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 103,
+            "original_line": 103,
+            "side": "RIGHT",
+            "original_position": 103,
+            "position": 103,
+            "subject_type": "line",
+            "review_comments": [
+                "Same here as in my other comment - this strikes me as the sort of method which should probably return a wrapper struct (i.e. `WithEntity<Self>`)."
+            ]
+        },
+        {
+            "hunk_id": 1057,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 179,
+            "original_line": 179,
+            "side": "RIGHT",
+            "original_position": 179,
+            "position": 179,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// A [`Command`] that consumes an iterator to add a series of [`Bundle`]s to a set of entities.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 1055,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 103,
+            "original_line": 103,
+            "side": "RIGHT",
+            "original_position": 103,
+            "position": 103,
+            "subject_type": "line",
+            "review_comments": [
+                "Same here as in my other comment - this strikes me as the sort of method which should probably return a wrapper struct (i.e. `WithEntity<Self>`)."
+            ]
+        },
+        {
+            "hunk_id": 1054,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 117,
+            "original_line": 84,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "We  need docs on `Commands` about how to set the error handler for the specific instance of this."
+            ]
+        },
+        {
+            "hunk_id": 1056,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 157,
+            "original_line": 157,
+            "side": "RIGHT",
+            "original_position": 157,
+            "position": 157,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// A [`Command`] that consumes an iterator to add a series of [`Bundle`]s to a set of entities.\r\n```",
+                "That kinda adds a weird space between the word and the s when rendered. I do that when they're both real things (like `Command` and `Commands`), but otherwise I think it's fine to make it prettier",
+                "Well, the main reason I wrote this suggestion (as well as my other suggestion of a similar type) is to request consistency, as the docs for the `spawn_batch` function just above this use the <code>[\\`MyStruct\\`]s</code> style.",
+                "I just copy-pasted that from the old helper function, didn't notice :P I'll take care of that",
+                "That works. Feel free to mark these two doc-comment reviews as resolved. :)"
+            ]
+        },
+        {
+            "hunk_id": 1058,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 111,
+            "original_line": 111,
+            "side": "RIGHT",
+            "original_position": 111,
+            "position": 111,
+            "subject_type": "line",
+            "review_comments": [
+                "Just so that I understand, `Command` is only implemented for functions of the type\r\n```\r\n|&mut World| -> core::Result<(), Box<dyn core::Error>>\r\n```\r\n\r\nIf I implemented my own custom Error enum, would \r\n```\r\n|&mut World| -> Result<(), MyError>\r\n```\r\nalso implement Command?\r\n",
+                "Nope, you would need to box it. Pretty sure `?` boxes things automatically if necessary. Unfortunate that the type gets erased, but I don't think there's a way around that"
+            ]
+        },
+        {
+            "hunk_id": 578,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 157,
+            "original_line": 157,
+            "side": "RIGHT",
+            "original_position": 157,
+            "position": 157,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// A [`Command`] that consumes an iterator to add a series of [`Bundle`]s to a set of entities.\r\n```",
+                "That kinda adds a weird space between the word and the s when rendered. I do that when they're both real things (like `Command` and `Commands`), but otherwise I think it's fine to make it prettier",
+                "Well, the main reason I wrote this suggestion (as well as my other suggestion of a similar type) is to request consistency, as the docs for the `spawn_batch` function just above this use the <code>[\\`MyStruct\\`]s</code> style.",
+                "I just copy-pasted that from the old helper function, didn't notice :P I'll take care of that",
+                "That works. Feel free to mark these two doc-comment reviews as resolved. :)"
+            ]
+        },
+        {
+            "hunk_id": 580,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 111,
+            "original_line": 111,
+            "side": "RIGHT",
+            "original_position": 111,
+            "position": 111,
+            "subject_type": "line",
+            "review_comments": [
+                "Just so that I understand, `Command` is only implemented for functions of the type\r\n```\r\n|&mut World| -> core::Result<(), Box<dyn core::Error>>\r\n```\r\n\r\nIf I implemented my own custom Error enum, would \r\n```\r\n|&mut World| -> Result<(), MyError>\r\n```\r\nalso implement Command?\r\n",
+                "Nope, you would need to box it. Pretty sure `?` boxes things automatically if necessary. Unfortunate that the type gets erased, but I don't think there's a way around that"
+            ]
+        },
+        {
+            "hunk_id": 1006,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 179,
+            "original_line": 179,
+            "side": "RIGHT",
+            "original_position": 179,
+            "position": 179,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// A [`Command`] that consumes an iterator to add a series of [`Bundle`]s to a set of entities.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 1007,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 111,
+            "original_line": 111,
+            "side": "RIGHT",
+            "original_position": 111,
+            "position": 111,
+            "subject_type": "line",
+            "review_comments": [
+                "Just so that I understand, `Command` is only implemented for functions of the type\r\n```\r\n|&mut World| -> core::Result<(), Box<dyn core::Error>>\r\n```\r\n\r\nIf I implemented my own custom Error enum, would \r\n```\r\n|&mut World| -> Result<(), MyError>\r\n```\r\nalso implement Command?\r\n",
+                "Nope, you would need to box it. Pretty sure `?` boxes things automatically if necessary. Unfortunate that the type gets erased, but I don't think there's a way around that"
+            ]
+        },
+        {
+            "hunk_id": 577,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 103,
+            "original_line": 103,
+            "side": "RIGHT",
+            "original_position": 103,
+            "position": 103,
+            "subject_type": "line",
+            "review_comments": [
+                "Same here as in my other comment - this strikes me as the sort of method which should probably return a wrapper struct (i.e. `WithEntity<Self>`)."
+            ]
+        },
+        {
+            "hunk_id": 1005,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 157,
+            "original_line": 157,
+            "side": "RIGHT",
+            "original_position": 157,
+            "position": 157,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// A [`Command`] that consumes an iterator to add a series of [`Bundle`]s to a set of entities.\r\n```",
+                "That kinda adds a weird space between the word and the s when rendered. I do that when they're both real things (like `Command` and `Commands`), but otherwise I think it's fine to make it prettier",
+                "Well, the main reason I wrote this suggestion (as well as my other suggestion of a similar type) is to request consistency, as the docs for the `spawn_batch` function just above this use the <code>[\\`MyStruct\\`]s</code> style.",
+                "I just copy-pasted that from the old helper function, didn't notice :P I'll take care of that",
+                "That works. Feel free to mark these two doc-comment reviews as resolved. :)"
+            ]
+        },
+        {
+            "hunk_id": 1003,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 117,
+            "original_line": 84,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "We  need docs on `Commands` about how to set the error handler for the specific instance of this."
+            ]
+        },
+        {
+            "hunk_id": 576,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 117,
+            "original_line": 84,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "We  need docs on `Commands` about how to set the error handler for the specific instance of this."
+            ]
+        },
+        {
+            "hunk_id": 579,
+            "commit_id": "4259e4d610efeb7b7304cd7a20a21bf3e91e1d12",
+            "original_commit_id": "a371ee3019348d35e2a4c6e14477c46802f8b1ca",
+            "path": "crates/bevy_ecs/src/system/commands/command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 179,
+            "original_line": 179,
+            "side": "RIGHT",
+            "original_position": 179,
+            "position": 179,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// A [`Command`] that consumes an iterator to add a series of [`Bundle`]s to a set of entities.\r\n```"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,143 @@
+{
+    "repo": "bazelbuild/bazel",
+    "pr_number": 22556,
+    "lang": "java",
+    "pr_title": "Deduplicate locally executed path mapped spawns ",
+    "pr_body": "When path mapping is enabled, different `Spawn`s in the same build can have identical `RemoteAction.ActionKey`s and can thus provide remote cache hits for each other. However, cache hits are only possible after the first local execution has concluded and uploaded its result to the cache. \r\n\r\nTo avoid unnecessary duplication of local work, the first `Spawn` for each `RemoteAction.ActionKey` is tracked until its results have been uploaded and all other concurrently scheduled `Spawn`s wait for it and then copy over its local outputs. \r\n\r\nFixes #21043",
+    "pr_comments": [
+        "@tjgq Gentle ping",
+        "I'll import this myself.",
+        "@bazel-io fork 7.3.0"
+    ],
+    "merged": false,
+    "created_at": "2024-07-04T09:50:13Z",
+    "issue_context": {
+        "number": 21043,
+        "title": "--experimental_output_paths=strip is not effective when actions are scheduled in parallel",
+        "body": "### Description of the feature request:\r\n\r\n\r\n`--experimental_output_paths=strip` can allow for a `exec` and `target` spawn to have the same input digest, and therefore be cache hits.  Unfortunately, because these actions frequently have identical or exactly duplicated input dependency graphs, it isn't uncommon that the two actions are scheduled at the same time, meaning the work is still duplicated.\r\n\r\nI'm not totally certain on the solution, but my first bad idea is that the spawn strategy should, if this flag is enabled, check to see if any sibling spawns match the input digest of spawn that is about to start executing, and if so somehow \"join\" the spawn results.\r\n\r\n### Which category does this issue belong to?\r\n\r\n\r\nLocal Execution\r\n\r\n### What underlying problem are you trying to solve with this feature?\r\n\r\n\r\nOur host and target platforms are identical, so all duplicated `[for tool]` actions are pure overhead.  This flag seems promising at reducing that overhead, but we still frequently see duplicated actions since the \"exec\" and \"target\" dependency chains tend to stay in sync, since one branch falling behind due to chance of the scheduler means it gets cache hits until it catches back up and starts duplicating execution again.",
+        "comments": [
+            "@coeuvre @tjgq If I understand the logic around `RemoteCacheClient` correctly, Bazel will not deduplicate inflight requests to the remote cache/executor - which makes sense without path mapping, as an action previously couldn't generate cache hits for other actions in the same build. Is this something you think could be changed easily, e.g. by tracking in-flight requests and returning a `Future` waiting for the result of the first one?\r\n\r\nCC @gregestren ",
+            "To be more concrete, this is the test case that we would want to pass:\r\n\r\n```diff\r\nfunction test_path_stripping_cache_hit_for_parallel_action() {\r\n  mkdir rules\r\n  cat > rules/defs.bzl <<'EOF'\r\ndef _platforms_split_transition_impl(settings, attr):\r\n    return [\r\n        {\"//command_line_option:platforms\": \"//rules:foo\"},\r\n        {\"//command_line_option:platforms\": \"//rules:bar\"},\r\n    ]\r\n\r\n_platforms_split_transition = transition(\r\n    implementation = _platforms_split_transition_impl,\r\n    inputs = [],\r\n    outputs = [\"//command_line_option:platforms\"],\r\n)\r\n\r\ndef _echo_impl(ctx):\r\n    out = ctx.actions.declare_file(ctx.label.name)\r\n    args = ctx.actions.args()\r\n    args.add(out)\r\n    ctx.actions.run_shell(\r\n        outputs = [out],\r\n        arguments = [args],\r\n        command = \"sleep 2 && echo '{}' > $1\".format(ctx.attr.msg, out.path),\r\n        execution_requirements = {\"supports-path-mapping\": \"1\"},\r\n    )\r\n    return [\r\n        DefaultInfo(files = depset([out])),\r\n    ]\r\n\r\necho = rule(\r\n    _echo_impl,\r\n    attrs = {\r\n        \"msg\": attr.string(),\r\n    },\r\n)\r\n\r\ndef _cat_impl(ctx):\r\n    out = ctx.actions.declare_file(ctx.label.name)\r\n    inputs = [file for src in ctx.attr.src for file in src[DefaultInfo].files.to_list()]\r\n    ctx.actions.run_shell(\r\n        inputs = inputs,\r\n        outputs = [out],\r\n        command = \"cat {} > {}\".format(\" \".join([f.path for f in inputs]), out.path),\r\n    )\r\n    return [\r\n        DefaultInfo(files = depset([out])),\r\n    ]\r\n\r\ncat = rule(\r\n    _cat_impl,\r\n    attrs = {\r\n        \"src\": attr.label(cfg = _platforms_split_transition),\r\n    },\r\n)\r\nEOF\r\n  cat > rules/BUILD << 'EOF'\r\nplatform(name = \"foo\", parents = [\"@local_config_platform//:host\"])\r\nplatform(name = \"bar\", parents = [\"@local_config_platform//:host\"])\r\nEOF\r\n\r\n  mkdir -p pkg\r\n  cat > pkg/BUILD <<'EOF'\r\nload(\"//rules:defs.bzl\", \"cat\", \"echo\")\r\n\r\necho(\r\n    name = \"gen_src\",\r\n    msg = \"Hello, Cache!\",\r\n)\r\n\r\ncat(\r\n    name = \"cat\",\r\n    src = \":gen_src\",\r\n)\r\nEOF\r\n\r\n  bazel build \\\r\n    --experimental_output_paths=strip \\\r\n    --remote_executor=grpc://localhost:${worker_port} \\\r\n    //pkg:cat &> $TEST_log || fail \"build failed unexpectedly\"\r\n  expect_log '2 remote[^ ]'\r\n  expect_log '1 remote cache hit'\r\n}\r\n```",
+            "> @coeuvre @tjgq If I understand the logic around `RemoteCacheClient` correctly, Bazel will not deduplicate inflight requests to the remote cache/executor - which makes sense without path mapping, as an action previously couldn't generate cache hits for other actions in the same build. Is this something you think could be changed easily, e.g. by tracking in-flight requests and returning a `Future` waiting for the result of the first one?\r\n\r\nI think this makes sense, yes.",
+            "Thinking some more about it: is this really worth doing if we assume that the remote executor is able to deduplicate identical concurrent requests on its own? The spec doesn't mandate it, but it does [hint](https://cs.opensource.google/bazel/bazel/+/master:third_party/remoteapis/build/bazel/remote/execution/v2/remote_execution.proto;l=1355;drc=e382abf33f1aedc18f19e9bf2bb2e407035f2c92) at the possibility, and I'd expect a well-optimized implementation to do so. (It's at least true of Google's internal equivalent of remote execution.)\r\n\r\nOn the Bazel side, we can't really save any pre-execution work (we need to calculate the action digest anyway to detect duplicates) nor post-execution work (we don't have the ability to deduplicate downloads of the same blob into many output locations, and even if we did, it would only matter for actions \"built with the bytes\"). So I think the gains would be solely in reduced (non-blob) network traffic, which I'm not sure is worth the extra complexity.",
+            "That's a good point! Since deduplication within a single build is really just a special case of general deduplication across concurrent builds for a remote executor, it's better positioned to do this than Bazel.\n\nHowever, this still leaves the case of local execution with a remote (or disk) cache. In this situation, I don't see how it would be possible for the cache to transparently deduplicate requests, given that it doesn't have control over whether and when the results of an action that incurred a cache miss will be uploaded. \n\n@tjgq Do you maybe see a way to push this kind of deduplication into the cache? If not, would you consider that to be a sensible addition?\n\n@DavidANeil I just noticed the \"Local execution\" category you chose for the issue. Are you using a remote cache together with local execution?",
+            "For local execution, I think the rough outline of \"keep a map of futures for in-flight executions, resolve the future on action upload, block on the future when downloading an identical action\" might be doable. But it's the sort of thing that I'd have to write to convince myself (for example, it's a little unclear to me what the failure path would look like).",
+            "We have some developers using local execution with remote cache.\r\nPersonally, I am using remote execution with the dynamic spawn strategy, (and `--noexperimental_dynamic_exclude_tools`)\r\nAnd our CI system uses only remote execution (except for the few actions we `no-remote-exec`).\r\n\r\nSo, ideally the solution would work for all 3 of those modes.",
+            "A fix for this issue has been included in [Bazel 7.3.0 RC1](https://github.com/bazelbuild/bazel/releases/tag/7.3.0rc1). Please test out the release candidate and report any issues as soon as possible.\r\nIf you're using Bazelisk, you can point to the latest RC by setting `USE_BAZEL_VERSION=7.3.0rc1`. Thanks!"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 20444,
+            "commit_id": "4e731129f44854167a59d236f48a6cd647fd8e45",
+            "original_commit_id": "ecd110bda22e67399195a7db3567544c0c301916",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionService.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1399,
+            "original_line": 1385,
+            "side": "RIGHT",
+            "original_position": 122,
+            "position": 136,
+            "subject_type": "line",
+            "review_comments": [
+                "Add a `@return` clause to the javadoc, documenting in particular the meaning of `null`."
+            ]
+        },
+        {
+            "hunk_id": 20441,
+            "commit_id": "4e731129f44854167a59d236f48a6cd647fd8e45",
+            "original_commit_id": "ecd110bda22e67399195a7db3567544c0c301916",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/SpawnResult.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 495,
+            "original_line": 491,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Add a comment explaining what motivates this."
+            ]
+        },
+        {
+            "hunk_id": 20442,
+            "commit_id": "4e731129f44854167a59d236f48a6cd647fd8e45",
+            "original_commit_id": "ecd110bda22e67399195a7db3567544c0c301916",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionService.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1350,
+            "original_line": 1346,
+            "side": "RIGHT",
+            "original_position": 83,
+            "position": 87,
+            "subject_type": "line",
+            "review_comments": [
+                "I think it's worth adding a comment here explaining why this only applies to local executions - for remote executions, we rely on the remote service to deduplicate for us."
+            ]
+        },
+        {
+            "hunk_id": 20446,
+            "commit_id": "4e731129f44854167a59d236f48a6cd647fd8e45",
+            "original_commit_id": "ecd110bda22e67399195a7db3567544c0c301916",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionService.java",
+            "start_line": 1431,
+            "original_start_line": 1417,
+            "start_side": "RIGHT",
+            "line": 1439,
+            "original_line": 1425,
+            "side": "RIGHT",
+            "original_position": 162,
+            "position": 176,
+            "subject_type": "line",
+            "review_comments": [
+                "FYI - I suspect that this has a chance of failing if we ever apply path mapping to test actions with multiple test attempts (which move spawn outputs to a different location after spawn execution). This is already a problem for async uploading, so whatever we end up doing to fix it should also apply here. No need to do anything about it for now.",
+                "That's a good catch. At least in its current form, path mapping for test actions wouldn't be very useful as top-level targets that differ in configuration typically do so intentionally, with at least some part of their transitive closure being different (as in, different file content). In this case, path mapping wouldn't help.",
+                "Yeah, agreed."
+            ]
+        },
+        {
+            "hunk_id": 20443,
+            "commit_id": "4e731129f44854167a59d236f48a6cd647fd8e45",
+            "original_commit_id": "ecd110bda22e67399195a7db3567544c0c301916",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionService.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1363,
+            "original_line": 1355,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 100,
+            "subject_type": "line",
+            "review_comments": [
+                "Add javadoc."
+            ]
+        },
+        {
+            "hunk_id": 20445,
+            "commit_id": "4e731129f44854167a59d236f48a6cd647fd8e45",
+            "original_commit_id": "ecd110bda22e67399195a7db3567544c0c301916",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionService.java",
+            "start_line": 1459,
+            "original_start_line": 1436,
+            "start_side": "RIGHT",
+            "line": 1461,
+            "original_line": 1438,
+            "side": "RIGHT",
+            "original_position": 175,
+            "position": 198,
+            "subject_type": "line",
+            "review_comments": [
+                "The `FileOutErr` is action-scoped, not spawn-scoped (see https://cs.opensource.google/bazel/bazel/+/master:src/main/java/com/google/devtools/build/lib/exec/AbstractSpawnStrategy.java;l=363;drc=d32202b20f82c17f75ee204d505b08f2160640f5), so I think this might incorrectly replay output unrelated to this spawn? Should we first introduce a separate Spawn-scoped `OutErr`?",
+                "This is correct, but I think that the distinction ends up not mattering for the path mapping use case. I added a comment explaining this, please let me know what you think.",
+                "I think this is good enough for now, thanks."
+            ]
+        }
+    ]
+}

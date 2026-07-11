@@ -1,0 +1,374 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 1525,
+    "lang": "rust",
+    "pr_title": "[Merged by Bors] - Bevy ECS V2",
+    "pr_body": "# Bevy ECS V2\r\n\r\nThis is a rewrite of Bevy ECS (basically everything but the new executor/schedule, which are already awesome). The overall goal was to improve the performance and versatility of Bevy ECS. Here is a quick bulleted list of changes before we dive into the details:\r\n\r\n* Complete World rewrite\r\n* Multiple component storage types:\r\n    * Tables: fast cache friendly iteration, slower add/removes (previously called Archetypes)\r\n    * Sparse Sets: fast add/remove, slower iteration\r\n* Stateful Queries (caches query results for faster iteration. fragmented iteration is _fast_ now)\r\n* Stateful System Params (caches expensive operations. inspired by @DJMcNab's work in #1364)\r\n* Configurable System Params (users can set configuration when they construct their systems. once again inspired by @DJMcNab's work)\r\n* Archetypes are now \"just metadata\", component storage is separate\r\n* Archetype Graph (for faster archetype changes)\r\n* Component Metadata\r\n    * Configure component storage type\r\n    * Retrieve information about component size/type/name/layout/send-ness/etc\r\n    * Components are uniquely identified by a densely packed ComponentId\r\n    * TypeIds are now totally optional (which should make implementing scripting easier)\r\n* Super fast \"for_each\" query iterators\r\n* Merged Resources into World. Resources are now just a special type of component\r\n* EntityRef/EntityMut builder apis (more efficient and more ergonomic)\r\n* Fast bitset-backed `Access<T>` replaces old hashmap-based approach everywhere\r\n* Query conflicts are determined by component access instead of archetype component access (to avoid random failures at runtime)\r\n    * With/Without are still taken into account for conflicts, so this should still be comfy to use\r\n* Much simpler `IntoSystem` impl\r\n* Significantly reduced the amount of hashing throughout the ecs in favor of Sparse Sets (indexed by densely packed ArchetypeId, ComponentId, BundleId, and TableId)\r\n* Safety Improvements\r\n    * Entity reservation uses a normal world reference instead of unsafe transmute\r\n    * QuerySets no longer transmute lifetimes\r\n    * Made traits \"unsafe\" where relevant\r\n    * More thorough safety docs\r\n* WorldCell\r\n    * Exposes safe mutable access to multiple resources at a time in a World \r\n* Replaced \"catch all\" `System::update_archetypes(world: &World)` with `System::new_archetype(archetype: &Archetype)`\r\n* Simpler Bundle implementation\r\n* Replaced slow \"remove_bundle_one_by_one\" used as fallback for Commands::remove_bundle with fast \"remove_bundle_intersection\"\r\n* Removed `Mut<T>` query impl. it is better to only support one way: `&mut T` \r\n* Removed with() from `Flags<T>` in favor of `Option<Flags<T>>`, which allows querying for flags to be \"filtered\" by default \r\n* Components now have is_send property (currently only resources support non-send)\r\n* More granular module organization\r\n* New `RemovedComponents<T>` SystemParam that replaces `query.removed::<T>()`\r\n* `world.resource_scope()` for mutable access to resources and world at the same time\r\n* WorldQuery and QueryFilter traits unified. FilterFetch trait added to enable \"short circuit\" filtering. Auto impled for cases that don't need it\r\n* Significantly slimmed down SystemState in favor of individual SystemParam state\r\n* System Commands changed from `commands: &mut Commands` back to `mut commands: Commands` (to allow Commands to have a World reference)\r\n\r\nFixes #1320\r\n\r\n## `World` Rewrite\r\n\r\nThis is a from-scratch rewrite of `World` that fills the niche that `hecs` used to. Yes, this means Bevy ECS is no longer a \"fork\" of hecs. We're going out our own!\r\n\r\n(the only shared code between the projects is the entity id allocator, which is already basically ideal)\r\n\r\nA huge shout out to @SanderMertens (author of [flecs](https://github.com/SanderMertens/flecs)) for sharing some great ideas with me (specifically hybrid ecs storage and archetype graphs). He also helped advise on a number of implementation details.\r\n\r\n## Component Storage (The Problem)\r\n\r\nTwo ECS storage paradigms have gained a lot of traction over the years:\r\n\r\n* **Archetypal ECS**: \r\n    * Stores components in \"tables\" with static schemas. Each \"column\" stores components of a given type. Each \"row\" is an entity.\r\n    * Each \"archetype\" has its own table. Adding/removing an entity's component changes the archetype.\r\n    * Enables super-fast Query iteration due to its cache-friendly data layout\r\n    * Comes at the cost of more expensive add/remove operations for an Entity's components, because all components need to be copied to the new archetype's \"table\"\r\n* **Sparse Set ECS**:\r\n    * Stores components of the same type in densely packed arrays, which are sparsely indexed by densely packed unsigned integers (Entity ids)\r\n    * Query iteration is slower than Archetypal ECS because each entity's component could be at any position in the sparse set. This \"random access\" pattern isn't cache friendly. Additionally, there is an extra layer of indirection because you must first map the entity id to an index in the component array.\r\n    * Adding/removing components is a cheap, constant time operation \r\n\r\nBevy ECS V1, hecs, legion, flec, and Unity DOTS are all \"archetypal ecs-es\". I personally think \"archetypal\" storage is a good default for game engines. An entity's archetype doesn't need to change frequently in general, and it creates \"fast by default\" query iteration (which is a much more common operation). It is also \"self optimizing\". Users don't need to think about optimizing component layouts for iteration performance. It \"just works\" without any extra boilerplate.\r\n\r\nShipyard and EnTT are \"sparse set ecs-es\". They employ \"packing\" as a way to work around the \"suboptimal by default\" iteration performance for specific sets of components. This helps, but I didn't think this was a good choice for a general purpose engine like Bevy because:\r\n\r\n1. \"packs\" conflict with each other. If bevy decides to internally pack the Transform and GlobalTransform components, users are then blocked if they want to pack some custom component with Transform.\r\n2. users need to take manual action to optimize\r\n\r\nDevelopers selecting an ECS framework are stuck with a hard choice. Select an \"archetypal\" framework with \"fast iteration everywhere\" but without the ability to cheaply add/remove components, or select a \"sparse set\" framework to cheaply add/remove components but with slower iteration performance.\r\n\r\n## Hybrid Component Storage (The Solution)\r\n\r\nIn Bevy ECS V2, we get to have our cake and eat it too. It now has _both_ of the component storage types above (and more can be added later if needed):\r\n\r\n* **Tables** (aka \"archetypal\" storage)\r\n    * The default storage. If you don't configure anything, this is what you get\r\n    * Fast iteration by default\r\n    * Slower add/remove operations\r\n* **Sparse Sets**\r\n    * Opt-in\r\n    * Slower iteration\r\n    * Faster add/remove operations\r\n\r\nThese storage types complement each other perfectly. By default Query iteration is fast. If developers know that they want to add/remove a component at high frequencies, they can set the storage to \"sparse set\":\r\n\r\n```rust\r\nworld.register_component(\r\n    ComponentDescriptor::new::<MyComponent>(StorageType::SparseSet)\r\n).unwrap();\r\n```\r\n\r\n## Archetypes\r\n\r\nArchetypes are now \"just metadata\" ... they no longer store components directly. They do store:\r\n\r\n* The `ComponentId`s of each of the Archetype's components (and that component's storage type)\r\n    * Archetypes are uniquely defined by their component layouts\r\n    * For example: entities with \"table\" components `[A, B, C]` _and_ \"sparse set\" components `[D, E]` will always be in the same archetype.\r\n* The `TableId` associated with the archetype\r\n    * For now each archetype has exactly one table (which can have no components),\r\n    * There is a 1->Many relationship from Tables->Archetypes. A given table could have any number of archetype components stored in it:\r\n        * Ex: an entity with \"table storage\" components `[A, B, C]` and \"sparse set\" components `[D, E]` will share the same `[A, B, C]` table as an entity with `[A, B, C]` table component and `[F]` sparse set components.\r\n        * This 1->Many relationship is how we preserve fast \"cache friendly\" iteration performance when possible (more on this later)\r\n* A list of entities that are in the archetype and the row id of the table they are in\r\n* ArchetypeComponentIds\r\n    * unique densely packed identifiers for (ArchetypeId, ComponentId) pairs\r\n    * used by the schedule executor for cheap system access control\r\n* \"Archetype Graph Edges\" (see the next section)  \r\n\r\n## The \"Archetype Graph\"\r\n\r\nArchetype changes in Bevy (and a number of other archetypal ecs-es) have historically been expensive to compute. First, you need to allocate a new vector of the entity's current component ids, add or remove components based on the operation performed, sort it (to ensure it is order-independent), then hash it to find the archetype (if it exists). And thats all before we get to the _already_ expensive full copy of all components to the new table storage.\r\n\r\nThe solution is to build a \"graph\" of archetypes to cache these results. @SanderMertens first exposed me to the idea (and he got it from @gjroelofs, who came up with it). They propose adding directed edges between archetypes for add/remove component operations. If `ComponentId`s are densely packed, you can use sparse sets to cheaply jump between archetypes.\r\n\r\nBevy takes this one step further by using add/remove `Bundle` edges instead of `Component` edges. Bevy encourages the use of `Bundles` to group add/remove operations. This is largely for \"clearer game logic\" reasons, but it also helps cut down on the number of archetype changes required. `Bundles` now also have densely-packed `BundleId`s. This allows us to use a _single_ edge for each bundle operation (rather than needing to traverse N edges ... one for each component). Single component operations are also bundles, so this is strictly an improvement over a \"component only\" graph.\r\n\r\nAs a result, an operation that used to be _heavy_ (both for allocations and compute) is now two dirt-cheap array lookups and zero allocations.\r\n\r\n## Stateful Queries\r\n\r\nWorld queries are now stateful. This allows us to:\r\n\r\n1. Cache archetype (and table) matches\r\n    * This resolves another issue with (naive) archetypal ECS: query performance getting worse as the number of archetypes goes up (and fragmentation occurs).\r\n2. Cache Fetch and Filter state\r\n    * The expensive parts of fetch/filter operations (such as hashing the TypeId to find the ComponentId) now only happen once when the Query is first constructed\r\n3. Incrementally build up state\r\n    * When new archetypes are added, we only process the new archetypes (no need to rebuild state for old archetypes)\r\n\r\nAs a result, the direct `World` query api now looks like this:\r\n\r\n```rust\r\nlet mut query = world.query::<(&A, &mut B)>();\r\nfor (a, mut b) in query.iter_mut(&mut world) {\r\n}\r\n```\r\n\r\nRequiring `World` to generate stateful queries (rather than letting the `QueryState` type be constructed separately) allows us to ensure that _all_ queries are properly initialized (and the relevant world state, such as ComponentIds). This enables QueryState to remove branches from its operations that check for initialization status (and also enables query.iter() to take an immutable world reference because it doesn't need to initialize anything in world).\r\n\r\nHowever in systems, this is a non-breaking change. State management is done internally by the relevant SystemParam.\r\n\r\n## Stateful SystemParams\r\n\r\nLike Queries, `SystemParams` now also cache state. For example, `Query` system params store the \"stateful query\" state mentioned above. Commands store their internal `CommandQueue`. This means you can now safely use as many separate `Commands` parameters in your system as you want. `Local<T>` system params store their `T` value in their state (instead of in Resources). \r\n\r\nSystemParam state also enabled a significant slim-down of SystemState. It is much nicer to look at now.\r\n\r\nPer-SystemParam state naturally insulates us from an \"aliased mut\" class of errors we have hit in the past (ex: using multiple `Commands` system params).\r\n\r\n(credit goes to @DJMcNab for the initial idea and draft pr here #1364)\r\n\r\n## Configurable SystemParams\r\n\r\n@DJMcNab also had the great idea to make SystemParams configurable. This allows users to provide some initial configuration / values for system parameters (when possible). Most SystemParams have no config (the config type is `()`), but the `Local<T>` param now supports user-provided parameters:\r\n\r\n```rust\r\n\r\nfn foo(value: Local<usize>) {    \r\n}\r\n\r\napp.add_system(foo.system().config(|c| c.0 = Some(10)));\r\n```\r\n\r\n## Uber Fast \"for_each\" Query Iterators\r\n\r\nDevelopers now have the choice to use a fast \"for_each\" iterator, which yields ~1.5-3x iteration speed improvements for \"fragmented iteration\", and minor ~1.2x iteration speed improvements for unfragmented iteration. \r\n\r\n```rust\r\nfn system(query: Query<(&A, &mut B)>) {\r\n    // you now have the option to do this for a speed boost\r\n    query.for_each_mut(|(a, mut b)| {\r\n    });\r\n\r\n    // however normal iterators are still available\r\n    for (a, mut b) in query.iter_mut() {\r\n    }\r\n}\r\n```\r\n\r\nI think in most cases we should continue to encourage \"normal\" iterators as they are more flexible and more \"rust idiomatic\". But when that extra \"oomf\" is needed, it makes sense to use `for_each`.\r\n\r\nWe should also consider using `for_each` for internal bevy systems to give our users a nice speed boost (but that should be a separate pr).\r\n\r\n## Component Metadata\r\n\r\n`World` now has a `Components` collection, which is accessible via `world.components()`. This stores mappings from `ComponentId` to `ComponentInfo`, as well as `TypeId` to `ComponentId` mappings (where relevant). `ComponentInfo` stores information about the component, such as ComponentId, TypeId, memory layout, send-ness (currently limited to resources), and storage type.\r\n\r\n## Significantly Cheaper `Access<T>`\r\n\r\nWe used to use `TypeAccess<TypeId>` to manage read/write component/archetype-component access. This was expensive because TypeIds must be hashed and compared individually. The parallel executor got around this by \"condensing\" type ids into bitset-backed access types. This worked, but it had to be re-generated from the `TypeAccess<TypeId>`sources every time archetypes changed.\r\n\r\nThis pr removes TypeAccess in favor of faster bitset access everywhere. We can do this thanks to the move to densely packed `ComponentId`s and `ArchetypeComponentId`s.\r\n\r\n## Merged Resources into World\r\n\r\nResources had a lot of redundant functionality with Components. They stored typed data, they had access control, they had unique ids, they were queryable via SystemParams, etc. In fact the _only_ major difference between them was that they were unique (and didn't correlate to an entity).\r\n\r\nSeparate resources also had the downside of requiring a separate set of access controls, which meant the parallel executor needed to compare more bitsets per system and manage more state.\r\n\r\nI initially got the \"separate resources\" idea from `legion`. I think that design was motivated by the fact that it made the direct world query/resource lifetime interactions more manageable. It certainly made our lives easier when using Resources alongside hecs/bevy_ecs. However we already have a construct for safely and ergonomically managing in-world lifetimes: systems (which use `Access<T>` internally).\r\n\r\nThis pr merges Resources into World:\r\n\r\n```rust\r\nworld.insert_resource(1);\r\nworld.insert_resource(2.0);\r\nlet a = world.get_resource::<i32>().unwrap();\r\nlet mut b = world.get_resource_mut::<f64>().unwrap();\r\n*b = 3.0;\r\n```\r\n\r\nResources are now just a special kind of component. They have their own ComponentIds (and their own resource TypeId->ComponentId scope, so they don't conflict wit components of the same type). They are stored in a special \"resource archetype\", which stores components inside the archetype using a new `unique_components` sparse set (note that this sparse set could later be used to implement Tags). This allows us to keep the code size small by reusing existing datastructures (namely Column, Archetype, ComponentFlags, and ComponentInfo). This allows us the executor to use a single `Access<ArchetypeComponentId>` per system. It should also make scripting language integration easier.\r\n\r\n_But_ this merge did create problems for people directly interacting with `World`. What if you need mutable access to multiple resources at the same time? `world.get_resource_mut()` borrows World mutably!\r\n\r\n## WorldCell\r\n\r\nWorldCell applies the `Access<ArchetypeComponentId>` concept to direct world access:\r\n\r\n```rust\r\nlet world_cell = world.cell();\r\nlet a = world_cell.get_resource_mut::<i32>().unwrap();\r\nlet b = world_cell.get_resource_mut::<f64>().unwrap();\r\n```\r\n\r\nThis adds cheap runtime checks (a sparse set lookup of `ArchetypeComponentId` and a counter) to ensure that world accesses do not conflict with each other. Each operation returns a `WorldBorrow<'w, T>` or `WorldBorrowMut<'w, T>` wrapper type, which will release the relevant ArchetypeComponentId resources when dropped.\r\n\r\nWorld caches the access sparse set (and only one cell can exist at a time), so `world.cell()` is a cheap operation. \r\n\r\nWorldCell does _not_ use atomic operations. It is non-send, does a mutable borrow of world to prevent other accesses, and uses a simple `Rc<RefCell<ArchetypeComponentAccess>>` wrapper in each WorldBorrow pointer. \r\n\r\nThe api is currently limited to resource access, but it can and should be extended to queries / entity component access.\r\n\r\n## Resource Scopes\r\n\r\nWorldCell does not yet support component queries, and even when it does there are sometimes legitimate reasons to want a mutable world ref _and_ a mutable resource ref (ex: bevy_render and bevy_scene both need this). In these cases we could always drop down to the unsafe `world.get_resource_unchecked_mut()`, but that is not ideal!\r\n\r\nInstead developers can use a \"resource scope\"\r\n\r\n```rust\r\nworld.resource_scope(|world: &mut World, a: &mut A| {\r\n})\r\n```\r\n\r\nThis temporarily removes the `A` resource from `World`, provides mutable pointers to both, and re-adds A to World when finished. Thanks to the move to ComponentIds/sparse sets, this is a cheap operation.\r\n\r\nIf multiple resources are required, scopes can be nested. We could also consider adding a \"resource tuple\" to the api if this pattern becomes common and the boilerplate gets nasty.\r\n\r\n## Query Conflicts Use ComponentId Instead of ArchetypeComponentId\r\n\r\nFor safety reasons, systems cannot contain queries that conflict with each other without wrapping them in a QuerySet. On bevy `main`, we use ArchetypeComponentIds to determine conflicts. This is nice because it can take into account filters:\r\n\r\n```rust\r\n// these queries will never conflict due to their filters\r\nfn filter_system(a: Query<&mut A, With<B>>, b: Query<&mut B, Without<B>>) {\r\n}\r\n```\r\n\r\nBut it also has a significant downside:\r\n```rust\r\n// these queries will not conflict _until_ an entity with A, B, and C is spawned\r\nfn maybe_conflicts_system(a: Query<(&mut A, &C)>, b: Query<(&mut A, &B)>) {\r\n}\r\n```\r\n\r\nThe system above will panic at runtime if an entity with A, B, and C is spawned. This makes it hard to trust that your game logic will run without crashing.\r\n\r\nIn this pr, I switched to using `ComponentId` instead. This _is_ more constraining. `maybe_conflicts_system` will now always fail, but it will do it consistently at startup. Naively, it would also _disallow_ `filter_system`, which would be a significant downgrade in usability. Bevy has a number of internal systems that rely on disjoint queries and I expect it to be a common pattern in userspace.\r\n\r\nTo resolve this, I added a new `FilteredAccess<T>` type, which wraps `Access<T>` and adds with/without filters. If two `FilteredAccess` have with/without values that prove they are disjoint, they will no longer conflict.\r\n\r\n## EntityRef / EntityMut\r\n\r\nWorld entity operations on `main` require that the user passes in an `entity` id to each operation:\r\n\r\n```rust\r\nlet entity = world.spawn((A, )); // create a new entity with A\r\nworld.get::<A>(entity);\r\nworld.insert(entity, (B, C));\r\nworld.insert_one(entity, D);\r\n```\r\n\r\nThis means that each operation needs to look up the entity location / verify its validity. The initial spawn operation also requires a Bundle as input. This can be awkward when no components are required (or one component is required).\r\n\r\nThese operations have been replaced by `EntityRef` and `EntityMut`, which are \"builder-style\" wrappers around world that provide read and read/write operations on a single, pre-validated entity:\r\n\r\n```rust\r\n// spawn now takes no inputs and returns an EntityMut\r\nlet entity = world.spawn()\r\n    .insert(A) // insert a single component into the entity\r\n    .insert_bundle((B, C)) // insert a bundle of components into the entity\r\n    .id() // id returns the Entity id\r\n\r\n// Returns EntityMut (or panics if the entity does not exist)\r\nworld.entity_mut(entity)\r\n    .insert(D)\r\n    .insert_bundle(SomeBundle::default());\r\n{\r\n    // returns EntityRef (or panics if the entity does not exist)\r\n    let d = world.entity(entity)\r\n        .get::<D>() // gets the D component\r\n        .unwrap();\r\n    // world.get still exists for ergonomics\r\n    let d = world.get::<D>(entity).unwrap();\r\n}\r\n\r\n// These variants return Options if you want to check existence instead of panicing \r\nworld.get_entity_mut(entity)\r\n    .unwrap()\r\n    .insert(E);\r\n\r\nif let Some(entity_ref) = world.get_entity(entity) {\r\n    let d = entity_ref.get::<D>().unwrap();\r\n}\r\n```\r\n\r\nThis _does not_ affect the current Commands api or terminology. I think that should be a separate conversation as that is a much larger breaking change.\r\n\r\n## Safety Improvements\r\n\r\n* Entity reservation in Commands uses a normal world borrow instead of an unsafe transmute\r\n* QuerySets no longer transmutes lifetimes\r\n* Made traits \"unsafe\" when implementing a trait incorrectly could cause unsafety\r\n* More thorough safety docs\r\n\r\n## RemovedComponents SystemParam\r\n\r\nThe old approach to querying removed components: `query.removed:<T>()` was confusing because it had no connection to the query itself. I replaced it with the following, which is both clearer and allows us to cache the ComponentId mapping in the SystemParamState:\r\n\r\n```rust\r\nfn system(removed: RemovedComponents<T>) {\r\n    for entity in removed.iter() {\r\n    }\r\n} \r\n```\r\n\r\n## Simpler Bundle implementation\r\n\r\nBundles are no longer responsible for sorting (or deduping) TypeInfo. They are just a simple ordered list of component types / data. This makes the implementation smaller and opens the door to an easy \"nested bundle\" implementation in the future (which i might even add in this pr). Duplicate detection is now done once per bundle type by World the first time a bundle is used.\r\n\r\n## Unified WorldQuery and QueryFilter types\r\n\r\n(don't worry they are still separate type _parameters_ in Queries .. this is a non-breaking change)\r\n\r\nWorldQuery and QueryFilter were already basically identical apis. With the addition of `FetchState` and more storage-specific fetch methods, the overlap was even clearer (and the redundancy more painful).\r\n\r\nQueryFilters are now just `F: WorldQuery where F::Fetch: FilterFetch`. FilterFetch requires `Fetch<Item = bool>` and adds new \"short circuit\" variants of fetch methods. This enables a filter tuple like `(With<A>, Without<B>, Changed<C>)` to stop evaluating the filter after the first mismatch is encountered. FilterFetch is automatically implemented for `Fetch` implementations that return bool.\r\n\r\nThis forces fetch implementations that return things like `(bool, bool, bool)` (such as the filter above) to manually implement FilterFetch and decide whether or not to short-circuit.\r\n\r\n## More Granular Modules\r\n\r\nWorld no longer globs all of the internal modules together. It now exports `core`, `system`, and `schedule` separately. I'm also considering exporting `core` submodules directly as that is still pretty \"glob-ey\" and unorganized (feedback welcome here).\r\n\r\n## Remaining Draft Work (to be done in this pr)\r\n\r\n* ~~panic on conflicting WorldQuery fetches (&A, &mut A)~~\r\n    * ~~bevy `main` and hecs both currently allow this, but we should protect against it if possible~~\r\n* ~~batch_iter / par_iter (currently stubbed out)~~\r\n* ~~ChangedRes~~\r\n    * ~~I skipped this while we sort out #1313. This pr should be adapted to account for whatever we land on there~~.\r\n* ~~The `Archetypes` and `Tables` collections use hashes of sorted lists of component ids to uniquely identify each archetype/table. This hash is then used as the key in a HashMap to look up the relevant ArchetypeId or TableId. (which doesn't handle hash collisions properly)~~\r\n* ~~It is currently unsafe to generate a Query from \"World A\", then use it on \"World B\" (despite the api claiming it is safe). We should probably close this gap. This could be done by adding a randomly generated WorldId to each world, then storing that id in each Query. They could then be compared to each other on each `query.do_thing(&world)` operation. This _does_ add an extra branch to each query operation, so I'm open to other suggestions if people have them.~~\r\n* ~~Nested Bundles (if i find time)~~\r\n\r\n## Potential Future Work\r\n\r\n* Expand WorldCell to support queries.\r\n* Consider not allocating in the empty archetype on `world.spawn()`\r\n    * ex: return something like EntityMutUninit, which turns into EntityMut after an `insert` or `insert_bundle` op\r\n    * this actually regressed performance last time i tried it, but in theory it should be faster\r\n* Optimize SparseSet::insert (see `PERF` comment on insert)\r\n* Replace SparseArray `Option<T>` with T::MAX to cut down on branching\r\n    * would enable cheaper get_unchecked() operations\r\n* upstream fixedbitset optimizations\r\n    * fixedbitset could be allocation free for small block counts (store blocks in a SmallVec)\r\n    * fixedbitset could have a const constructor \r\n* Consider implementing Tags (archetype-specific by-value data that affects archetype identity) \r\n    * ex: ArchetypeA could have `[A, B, C]` table components and `[D(1)]` \"tag\" component. ArchetypeB could have `[A, B, C]` table components and a `[D(2)]` tag component. The archetypes are different, despite both having D tags because the value inside D is different.\r\n    * this could potentially build on top of the `archetype.unique_components` added in this pr for resource storage.\r\n* Consider reverting `all_tuples` proc macro in favor of the old `macro_rules` implementation\r\n    * all_tuples is more flexible and produces cleaner documentation (the macro_rules version produces weird type parameter orders due to parser constraints)\r\n    * but unfortunately all_tuples also appears to make Rust Analyzer sad/slow when working inside of `bevy_ecs` (does not affect user code)\r\n* Consider \"resource queries\" and/or \"mixed resource and entity component queries\" as an alternative to WorldCell\r\n    * this is basically just \"systems\" so maybe it's not worth it\r\n* Add more world ops\r\n    * `world.clear()`\r\n    * `world.reserve<T: Bundle>(count: usize)`\r\n * Try using the old archetype allocation strategy (allocate new memory on resize and copy everything over). I expect this to improve batch insertion performance at the cost of unbatched performance. But thats just a guess. I'm not an allocation perf pro :)\r\n * Adapt Commands apis for consistency with new World apis \r\n\r\n## Benchmarks\r\n\r\nkey:\r\n\r\n* `bevy_old`: bevy `main` branch\r\n* `bevy`: this branch\r\n* `_foreach`: uses an optimized for_each iterator\r\n* ` _sparse`: uses sparse set storage (if unspecified assume table storage)\r\n* `_system`: runs inside a system (if unspecified assume test happens via direct world ops)\r\n\r\n### Simple Insert (from ecs_bench_suite)\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109245573-9c3ce100-7795-11eb-9003-bfd41cd5c51f.png)\r\n\r\n### Simpler Iter (from ecs_bench_suite)\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109245795-ffc70e80-7795-11eb-92fb-3ffad09aabf7.png)\r\n\r\n### Fragment Iter (from ecs_bench_suite)\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109245849-0fdeee00-7796-11eb-8d25-eb6b7a682c48.png)\r\n\r\n### Sparse Fragmented Iter\r\n\r\nIterate a query that matches 5 entities from a single matching archetype, but there are 100 unmatching archetypes\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109245916-2b49f900-7796-11eb-9a8f-ed89c203f940.png)\r\n \r\n### Schedule (from ecs_bench_suite)\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109246428-1fab0200-7797-11eb-8841-1b2161e90fa4.png)\r\n\r\n### Add Remove Component (from ecs_bench_suite)\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109246492-39e4e000-7797-11eb-8985-2706bd0495ab.png)\r\n\r\n\r\n### Add Remove Component Big\r\n\r\nSame as the test above, but each entity has 5 \"large\" matrix components and 1 \"large\" matrix component is added and removed\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109246517-449f7500-7797-11eb-835e-28b6790daeaa.png)\r\n\r\n\r\n### Get Component\r\n\r\nLooks up a single component value a large number of times\r\n\r\n![image](https://user-images.githubusercontent.com/2694663/109246129-87ad1880-7796-11eb-9fcb-c38012aa7c70.png)",
+    "pr_comments": [
+        "A change that you'd mentioned elsewhere, but didn't include in this list: exposing `Archetypes` etc as new `SystemParam`. Did this make it in?",
+        "It's awesome to see this all brought together. Outstanding thoughts:\r\n\r\n1. Remaining syntax inconsistencies on resources vs components: why do we need to use `Res<T>` and `ResMut<T>` when we can simply use `Query<&T>` and `Query<&mut T>`?\r\n\r\n2. The need for `resource_scope` makes me wonder if we should deprecate `Resources` as a distinct concept and use an enhanced version of the singleton entity pattern discussed in #1263 instead, storing each resource in its own entity with a single component (or maybe two, to mark it as a resource). It has a number of benefits, notably much better integration with the rest of the ECS, but we would need to preserve the current ease of accessing singleton entities with only one component (the current `Resource` pattern) in order for it to be a truly suitable replacement.\r\n\r\nThis would also mean adaption of the `Local` and `NonSend` patterns, but I'm not too worried about the complexity of that.\r\n\r\n3. > [EntityRef/EntityMut changes] do not affect the current Commands api or terminology. I think that should be a separate conversation as that is a much larger breaking change.\r\n\r\nI much prefer the new syntax: the effects are much clearer and it's more ergonomic for adding entities with 0 or 1 components. I'm strongly in favor of this change being copied over to `Commands`, especially since that will improve consistency. It should be done in a separate PR though, and listed in \"Potential Future Work\".\r\n\r\n4. > Consider implementing Tags (archetype-specific by-value data that affects archetype identity)\r\n\r\nThese sound a lot like minimal versions of indexes (#1205), but run into the issues discussed by Sander with the \"pluggable storage model\" approach: namely, you're blending concerns and that you often want to be able to index the same component in more than one way. I don't think this is a great approach to a very real issue.",
+        "@alice-i-cecile \r\n> A change that you'd mentioned elsewhere, but didn't include in this list: exposing Archetypes etc as new SystemParam. Did this make it in?\r\n\r\nIt didn't, but thats a trivial change. I see no reason not to include it. Thanks for the reminder! I just forgot.\r\n\r\n> Remaining syntax inconsistencies on resources vs components: why do we need to use Res<T> and ResMut<T> when we can simply use Query<&T> and Query<&mut T>?\r\n\r\nThe heart of it is that Queries iterate entities, but resources are not entities. We could implement this trivially by creating one entity for each resource (as you mentioned), but (1) it would perform worse (one extra layer of indirection) and (2) it would have implications for things like scene serialization (3) it would cause resources to show up in entity queries (which isn't necessarily a good thing) . I do think its worth investigating, but I'm not sure blurring the line even more is a good thing / id prefer it if we did it outside of this pr.\r\n\r\n>  This would also mean adaption of the Local and NonSend patterns, but I'm not too worried about the complexity of that.\r\n\r\nNonSend components on entities is actually non-trivial because world.despawn(entity) could happen on any thread (and you can't know going into it if the entity has nonsend components). we'd need to sort out a good error handling strategy. \r\n\r\n> I much prefer the new syntax: the effects are much clearer and it's more ergonomic for adding entities with 0 or 1 components. I'm strongly in favor of this change being copied over to Commands, especially since that will improve consistency. It should be done in a separate PR though, and listed in \"Potential Future Work\".\r\n\r\nyeah i do think we should re-visit Command apis, but theres a lot of paths we could take there (ex the typed commands we've discussed in the past), so its definitely worth tabling for later. Adding that to \"potential future work\" is a good idea.\r\n\r\n> These sound a lot like minimal versions of indexes (#1205), but run into the issues discussed by Sander with the \"pluggable storage model\" approach: namely, you're blending concerns and that you often want to be able to index the same component in more than one way. I don't think this is a great approach to a very real issue.\r\n\r\nI don't think its a \"pluggable storage\" (as described in the discord discussion) and it doesn't suffer from the \"multiple indices\" problem. You can have (and query for) any number of tags. Its just a different form of archetype identity other than \"has(component)\". I view it more as a more limited form of Sander's  relationship stuff (which are also typed values that affect archetype identity).",
+        "It seems that you accidentally added an empty file `out.rs`.",
+        "I'm trying to update `bevy_egui`, and I'm a little stuck with the changes to `Resources`.\r\nBefore, it was possible to do `Resources::get_mut(&self)` without mutable access to the resources, which is used e.g. in a render node impl in bevy_egui: https://github.com/mvlabat/bevy_egui/blob/271b42bfcae1b62f9b8fc45e8b491e2d2348276e/src/egui_node.rs#L169. Now that the `Resources` are merged into the `World` this isn't possible anymore, is that intentional?\r\n\r\nSome of these mutable resource uses could be moved into `Node::prepare`, but others require the `&mut dyn RenderContext` aswell.",
+        "I think you can use `world.cell()`.",
+        "That requires mutable access to the world aswell. If I understand correctly, `world.cell()` is for getting multiple mutable resources from a mutable world.",
+        "Bikeshedding:\r\n* `.config()` doesn't sound very descriptive to me. Something along the lines of `.initialize_parameter()` or `.init_arg()` would work better.\r\n* I feel `.insert()` and `.insert_bundle()` should be `.with()` and `.with_bundle()` instead, since they are used like builder methods.\r\n\r\n> I'm also considering exporting core submodules directly as that is still pretty \"glob-ey\" and unorganized (feedback welcome here).\r\n\r\nI'm in favor, nesting is deep and descriptive enough as it is with `bevy::ecs::module`.\r\n\r\n> The Archetypes and Tables collections use hashes of sorted lists of component ids to uniquely identify each archetype/table. This hash is then used as the key in a HashMap to look up the relevant ArchetypeId or TableId.\r\n\r\nWhat's the issue here?\r\n\r\n> It is currently unsafe to generate a Query from \"World A\", then use it on \"World B\" (despite the api claiming it is safe).\r\n\r\nShort of scoping them with upgraded `WorldCell`, I don't think the branch is avoidable.\r\n\r\n> Consider implementing Tags\r\n\r\nIf we do, we really should think up a better name - I've seen people misunderstand what they are and confuse them with marker components.\r\n\r\nI remember that when Legion shed its tags (I think that was a thing that happened, it's been a while) folks were talking about there not being a real usecase for them, citing the fate of the same feature in Unity. When this feature was suggested for `hecs`, @Ralith raised concerns that overreliance on tags could fragment archetypes more than necessary, impacting performance; stateful queries should help here, though.",
+        "Thanks for writing up these changes! I'll definitely be cribbing some of the ideas when I can find time...\r\n\r\n> stateful queries should help [optimize tags].\r\n\r\nThey don't do anything about the fundamental \"problem,\" which is that you're (intentionally!) fragmenting your archetypes. Since that's really the entire point of the feature, it's up to the user to do so iff it's beneficial, which is a nice option to have in theory but could be a footgun in practice, suggesting that the feature should be justified by a strong use case.",
+        "@Ratysz \r\n> .config() doesn't sound very descriptive to me. Something along the lines of .initialize_parameter() or .init_arg() would work better.\r\n\r\nI think `initialize_parameter` implies that you are actually setting the parameter, but that isn't actually true here. You are \"configuring\" the parameter (ex: setting the value of `SystemParamState::Config`). I'm happy to revisit the name of the associated type, but i do think the terminology should line up. At the very least we could make it more explicit: `config_params()`, `configure_parameters()`, `config_param_state()`, etc.\r\n\r\n> I feel .insert() and .insert_bundle() should be .with() and .with_bundle() instead, since they are used like builder methods.\r\n\r\nI _think_ I would like to reel in `with_x` in general as the \"builder operation prefix\". `with_x` instead of `add_x`, `insert_x`, `set_x`, etc erases \"operation type\" in favor of pointing out that the thing is a builder. Bevy uses builders in a lot of places, which means we're erasing a lot of useful context. Its worth coming up with a set of rules that accomplish a good balance between \"operation semantics\", \"ergonomics\", \"consistency\", and \"namespacing\". \"namespacing\" is a bit tricky. Some types have both builder and non-builder functions for the same operation. The current approach `with_x` vs `insert_x` solves that problem, but it comes at the cost of operation type erasure. And something like `with_insert_x` is pretty gross to read/grok/type.\r\n\r\nSome prior discussion / operation definitions:\r\nhttps://github.com/bevyengine/bevy/pull/1352#issuecomment-770095561\r\n\r\n> What's the issue here? [Archtype/Table hashes]\r\n\r\nThe issue is that HashMap falls back to Eq to resolve hash collisions. If we use an int hash as the key, the collision is \"resolved\" by treating the different items as \"the same\", even if they aren't.\r\n\r\nThe problem with using something like `struct ArchetypeKey { ids: Vec<ComponentId> }` as the key is that we need to allocate. My ideal solution would be to use HashMap::raw_entry, but that is unstable. The other solution (Cow everything) has the unfortunate side effect of either requiring double allocations for the component ids (not terrible given that this is a cached operation) or changing the internal component id lists in Archetype to Cow (which is also not the worst thing in the world).\r\n\r\n> If we do [add Tags], we really should think up a better name - I've seen people misunderstand what they are and confuse them with marker components.\r\n\r\nI think the primary motivator is to use them as \"indices\" (ex: give me everything with `Parent(x)`, `Handle<T>`, etc). We could call them that (and \"market\" them as such?).\r\n\r\nI think one of the big issues with the `legion` implementation was that tags were required in every spawn api. Users were forced to think about them.  \r\n\r\n> @Ralith raised concerns that overreliance on tags could fragment archetypes more than necessary, impacting performance; stateful queries should help here, though.\r\n\r\nYeah its worth measuring. Our sparse iteration performance is pretty great now, but it will still have some indirection in this case because Tags serve as \"non-table filters\", which means we can't directly iterate tables. We'd instead need to iterate archetypes like we do for sparse sets (which has the potential to jump around positions in tables, although in practice they still tend to glob up in cache friendly ways). I expect perf to still big pretty good, but not _as_ good as direct table iteration. But yeah maybe separate index storage is the right call.\r\n\r\n@alice-i-cecile  you volunteered to create issues for the \"potential future work\". \"Tags\" is probably a good place to start so we can move this conversation there.\r\n\r\n@jakobhellermann \r\n> I'm trying to update bevy_egui, and I'm a little stuck with the changes to Resources.\r\nBefore, it was possible to do Resources::get_mut(&self) without mutable access to the resources, which is used e.g. in a render node impl in bevy_egui. Now that the Resources are merged into the World this isn't possible anymore, is that intentional?\r\nSome of these mutable resource uses could be moved into Node::prepare, but others require the &mut dyn RenderContext aswell.\r\n\r\nAllowing mutable resource access to be \"bootstrapped\" from an `&Resource` without unsafe was technically unsound (because a schedule (which didn't use the old atomic access control) could be running while you are getting your mutable reference from &Resource). Node::prepare was added to give nodes a chance to interact with the World mutably before kicking off a (potentially) parallel graph run, which hopefully resolves most problems. The example you linked to should be resolvable that way. Can you send a link to something that can't be resolved with `prepare`?\r\n\r\n@Ralith\r\n\r\n> Thanks for writing up these changes! I'll definitely be cribbing some of the ideas when I can find time...\r\n\r\nFantastic. Lets keep this cross pollination going :heart: \r\n\r\n> They don't do anything about the fundamental \"problem,\" which is that you're (intentionally!) fragmenting your archetypes. Since that's really the entire point of the feature, it's up to the user to do so iff it's beneficial, which is a nice option to have in theory but could be a footgun in practice, suggesting that the feature should be justified by a strong use case\r\n\r\nAgreed. I think the \"strong\" use case becomes clear if we rename Tags to Indices (which could be used for basically anything). In this case it wouldn't actually fragment the Table these things are stored in (as tags would live in a separate storage), but it would fragment the access pattern (because we need to iterate Archetypes instead of directly iterating Tables). Its worth measuring the real cost and comparing that to other \"index\" implementations (such as storing the index->entity table elsewhere in something that doesn't affect archetype identity, which notably would _also_ fragment table access patterns).",
+        "> Allowing mutable resource access to be \"bootstrapped\" from an `&Resource` without unsafe was technically unsound (because a schedule (which didn't use the old atomic access control) could be running while you are getting your mutable reference from &Resource). Node::prepare was added to give nodes a chance to interact with the World mutably before kicking off a (potentially) parallel graph run, which hopefully resolves most problems. The example you linked to should be resolvable that way. Can you send a link to something that can't be resolved with `prepare`?\r\n\r\nThe three functions `process_asset_events`, `remove_unused_textures` and `init_textures` which get run inside the `Node::update` seem to be harder to do in `prepare`: https://github.com/mvlabat/bevy_egui/blob/271b42bfcae1b62f9b8fc45e8b491e2d2348276e/src/egui_node.rs#L180\r\n\r\nI'll look into to more tomorrow, maybe this could be done as a `SystemNode` instead.",
+        "Can you contribute \"Sparse Fragmented Iter\" to ecs_bench_suite?",
+        "@TomGillen sure thing! I think `get_component` is another good one to include.",
+        "@jakobhellermann \r\n\r\nYeah SystemNode seems like an option here. RenderResourcesNode is a SystemNode whose system interacts with the world mutably, creates resources using `Res<Box<dyn RenderResourceContext>>`, and queues up RenderContext commands using a command queue (whose reference is passed to the Node impl https://github.com/bevyengine/bevy/pull/1525/files#diff-454d965b87cfdc4fb81e3da21b073fe7545caa90469aa65fab5ab221db064025R403).\r\n\r\nAlternatively you could do the same thing in Node::prepare without a SystemNode (which might be easier given that you already have non-system code written).\r\n\r\nMost of the code that you linked to doesn't actually need the RenderContext. In prepare() I recommend using the RenderResourceContext world resource mentioned above to allocate gpu resources and queue up whatever RenderContext operations are required. Then Node::update() can just run those commands on the RenderContext.",
+        "Loving how the new `Archetypes`, `Components`, `Entities`, and `Bundles` SystemParams interact with Queries: https://github.com/bevyengine/bevy/pull/1525/commits/32be92b37b87d098783878f3dd47ff6d8557cf06",
+        "> Loving how the new Archetypes, Components, Entities, and Bundles SystemParams interact with Queries: 32be92b\r\n\r\nThose are pretty new SystemParams... Should be nice to reduce the need for exclusive systems :3",
+        "I opted to implement `par_for_each` / `par_for_each_mut` instead of `par_iter` for now, both because it should technically be faster and because the overall complexity cost was lower. We can follow up with `par_iter` later if needed. ",
+        "> Out of scope: perhaps DynHash labels should be factored out of bevy_ecs to allow using them elsewhere, like labelling timers?\r\n\r\nThey could be moved to bevy_utils for use in render nodes, but making them suitable for adding to world objects means implementing Reflect in a serializable way, which is non-trivial.",
+        "This is a \"last call\" message. If nobody expresses interest in further reviews I will merge this tomorrow. I'm happy to postpone if anyone wants to continue reviewing or new people want to dive in, but we need to keep moving forward on the 0.5 release.",
+        "I think the PR should emphasize that systems will use `Commands` instead of `&mut Commands` as parameters, that will break a lot of code with the unhelpful \"method not found\" error message.",
+        "There seems to be some issues running the alien_cake_addict example:\r\n\r\n- the cake often spawns in bottom left corner and cannot be eaten\r\n- the game over text doesn't show, printing warnings in the console\r\n```\r\nWARN bevy_ui::flex: Unstyled child in a UI entity hierarchy. You are using an entity without UI components as a child of an entity with UI components, results may be unexpected.\r\nWARN bevy_ui::flex: Styled child in a non-UI entity hierarchy. You are using an entity with UI components as a child of an entity without UI components, results may be unexpected.\r\n```\r\nIt does work on current main (`d9fb61d474518eba06d0c3dce5cb81db9f7ed66a`). I unfortunately don't have more time to debug it at the moment.",
+        "I am done with what was probably the last review round.",
+        "> There seems to be some issues running the alien_cake_addict example:\r\n\r\nAnother issue running this example, when restarting a game after losing, there's no light, no terrain, no alien, ... everything that happens in `on_state_enter` doesn't happen the second time through the state.\r\n\r\nFor cake placement, the `GlobalTransform` is not updated following the `Transform`. To reproduce it, eat the first cake, the second should be badly placed. This seems to occur when the entity is reused (with a new generation). If you don't eat the cake, it's despawned and respawned in the same frame, so no entity reuse, and no issue.\r\nAdding some debug logs to system `transform_propagate_system`, this system has the old entity (without the generation updated) and the new `Transform` in it's `root_query`. Query with change filter doesn't detect any change on it even though it's the new `Transform`.\r\n\r\nSo... probably something about entity reuse with a new generation?",
+        "@Davier  @mockersf  there was a logical error during entity recycling that set the generation to zero instead of the \"current\" generation. fixing this made all of the bugs mentioned above disappear for me. alien_cake_addict now works as expected for me. Thanks for investigating!",
+        "Alrighty feedback has been wrapped up and outstanding issues have been resolved. I'm merging this tonight unless someone tells me not to!",
+        "Yay!! :tada: I'm super excited about this update.\r\n\r\nGreat work @cart, and everybody else! It's amazing what's being accomplished here. :+1:",
+        "bors r+",
+        "Pull request successfully merged into main.\n\nBuild succeeded:\n  * [build-android](https://github.com/bevyengine/bevy/runs/2037991129)\n  * [build (nightly, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/2037991090)\n  * [build (stable, macos-latest)](https://github.com/bevyengine/bevy/runs/2037991080)\n  * [build (stable, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/2037991067)\n  * [build (stable, windows-latest)](https://github.com/bevyengine/bevy/runs/2037991055)\n  * [build-wasm (nightly, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/2037991021)\n  * [build-wasm (stable, ubuntu-latest)](https://github.com/bevyengine/bevy/runs/2037991009)\n  * [markdownlint](https://github.com/bevyengine/bevy/runs/2037990938)"
+    ],
+    "merged": false,
+    "created_at": "2021-03-03T15:15:36Z",
+    "issue_context": {
+        "number": 1320,
+        "title": "Less permissive component conflict allowance in system queries",
+        "body": "**What problem does this solve or what need does it fill?**\r\n\r\nThis is a follow-on tracking issue from #1316. In short: \r\n\r\nThere exist certain sets of queries within a single system that only work **_some_** of the time. This happens because they are allowed to run in ambiguous component access scenarios, triggering a panic at runtime only when there is an actual attempt to access conflicting components within an archetype (e.g. accessing a component while it is mutably borrowed). This permissiveness - allowing potentially conflicting queries to exist in a system - makes systems marginally easier to write, while creating \"invisible\" runtime errors. In addition, this permissiveness is especially dangerous to beginners who can get in the habit of creating systems with conflicting queries, without understanding why it's problematic.\r\n\r\nThe suggested changes would make Bevy less permissive of queries with component conflicts. This does not, to my knowledge, remove any functionality. Even if the most restrictive suggestion was implemented, systems that currently take advantage of this permissiveness can be fixed by wrapping conflicting queries in a `QuerySet`.\r\n\r\n**What solution would you like?**\r\n\r\nIn order of preference:\r\n\r\n1. Prevent the issue entirely through some architectural change which causes an error at compile time.\r\n2. Error out at runtime, informing the user of the potential conflict that needs to be resolved.\r\n3. Warn the user when this scenario is detected, but continue to allow execution at the risk of a panic.\r\n\r\nWhile (1) would require the most work and may not even be possible, users' IDEs would ideally inform them that their query is invalid while they're writing their code. This would be the least painful way to fully enforce the query component restrictions.\r\n\r\n(2) would delay this error to runtime, which could cause some frustration until the user has learned why it's happening. Fortunately, I think the query restriction is relatively simple to teach and understand (it mirrors mutable access fundamentals in rust). I think this is the most realistic solution in the short term, and it fully addresses the problem by preventing surprise panics entirely.\r\n\r\nI favor (3) the least because it is most likely to result in users ignoring the warnings until systems begin to mysteriously panic - at which point it might become a nightmare to debug.\r\n\r\n**What alternative(s) have you considered?**\r\n\r\n- Provide a more helpful panic message when this case is detected, with a suggested solution. Leave general behavior unchanged.\r\n- Do nothing. Stick it to the man. You can't tell me what to do, you're not my dad. I'm gonna access mutably borrowed components whether you like it or not!",
+        "comments": [
+            "(1) should definitely be possible, but involves quite a lot of type level programming. It seems there has been a concious desicion not to use to much type magic, I guess because of the increase in compile time and code complexity that normally comes with it. Nevertheless I would give it a try if it's ok with everyone.\r\n\r\nEDIT: Trying to come up with a prototype I noticed that detecting if two queries can apply to the same archetype is basically a [SAT-Problem](https://en.wikipedia.org/wiki/Boolean_satisfiability_problem) which means it can't be solved in polynomial time. This is not a huge problem since the number of variables (component types) is very small most of the time. But to detect which system truly can have conflicting queries would require implementing a simple SAT solver.\r\n\r\nThe alternative would be to use some heuristic, like treating `Or<(A, ...)>` as `(A, ...)` but this would of course mean that some valid systems would be flagged."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 102,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/query/access.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 18,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "This isn't a very intuitive name",
+                "Any suggestions? It is a combination of reads and writes. I don't have any better names than that",
+                "Unless we go with something abbreviated which will almost surely be _less_ obvious, it seems like `reads_and_writes` is about as explanatory as it get's and I don't feel like it's too long.",
+                "Hmm, in the context this feels like a list of the reads. `reads_and_writes` sounds like the accesses with mutable access. Having just a `reads` and `writes` (where the fact these also read is implicit) might be better.",
+                "yeah thats a reasonable take. lets roll with reads() and writes()"
+            ]
+        },
+        {
+            "hunk_id": 91,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_reflect/src/impls/bevy_ecs.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 13,
+            "original_line": 13,
+            "side": "LEFT",
+            "original_position": 17,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Why did you remove this? It could be useful I think.",
+                "+1, this is very useful for `bevy-inspector-egui`",
+                "We still have `reflect_component` (it just got renamed and now returns an Option instead of assuming valid entity indices). I removed the mutable variant because it requires mutably deref-ing `Mut<T>` (if we want to use the equivalent `EntityRef::get_unchecked_mut` method), which triggers change detection. It wasn't used anywhere internally, so I figured I'd leave it out until we had a use case that forced us to make a call on the change detection.\r\n\r\nGiven that bevy-inspector-egui uses it currently, I'm down to make a call here. I'm thinking that this _should_ trigger change detection and callers should only call `reflect_component_mut` if they intend to actually mutate the component.",
+                "Ah wait I just noticed we can't use `get_unchecked_mut` because the tracking pointer owns the reference. That doesn't change the conversation, we just need a custom impl.",
+                "Hmm `Mut<Reflect>` is also an option. That might actually be the right call.",
+                "Just re-added reflect_component_mut by adding a new ReflectMut tracking pointer for reflected components. This required moving the bevy_ecs reflect impls into bevy_ecs (which was a long time coming anyway)."
+            ]
+        },
+        {
+            "hunk_id": 97,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "benches/benches/bevy_ecs/stages.rs",
+            "start_line": 7,
+            "original_start_line": 7,
+            "start_side": "LEFT",
+            "line": 13,
+            "original_line": 13,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "This can be removed entirely if we're no longer interested in benchmarking the old executor."
+            ]
+        },
+        {
+            "hunk_id": 101,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/storage/blob_vec.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 67,
+            "original_line": 67,
+            "side": "RIGHT",
+            "original_position": 67,
+            "position": 67,
+            "subject_type": "line",
+            "review_comments": [
+                "this should probably be a regular `assert!` given it should be a cheap assert and it would be unsound if size was 0",
+                "`grow` is only called by `reserve` when the amount of available space is less than the expected amount. For zero sized types, the capacity is set to `usize::MAX` in `BlobVec::new`, so `grow` will never be reached for ZST's."
+            ]
+        },
+        {
+            "hunk_id": 94,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/storage/blob_vec.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 21,
+            "original_line": 21,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                swap_scratch: if item_layout.size() == 0 {\r\n                    UnsafeCell::new(NonNull::dangling()),\r\n                } else {\r\n                    blob_vec.swap_scratch =\r\n                        UnsafeCell::new(NonNull::new(std::alloc::alloc(item_layout)).unwrap());\r\n                }\r\n```\r\nJust in case there is a panic before `blob_vec.swap_scratch` is set this would prevent trying to deallocate a dangling pointer in the `BlobVec` drop impl. I don't think a panic is possible in between, but better safe than sorry."
+            ]
+        },
+        {
+            "hunk_id": 96,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/system/commands.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 371,
+            "original_line": 371,
+            "side": "LEFT",
+            "original_position": 385,
+            "position": 388,
+            "subject_type": "line",
+            "review_comments": [
+                "Same here."
+            ]
+        },
+        {
+            "hunk_id": 103,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/storage/sparse_set.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 92,
+            "original_line": 92,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 92,
+            "subject_type": "line",
+            "review_comments": [
+                "It did be nice if `sparse` could directly contain components of at most `size_of::<usize>()` bytes, but that will slow down things due to an extra check I think.",
+                "That is an interesting idea thats worth exploring (but maybe not in this pr :smile:)"
+            ]
+        },
+        {
+            "hunk_id": 89,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_transform/src/hierarchy/hierarchy_maintenance_system.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 10,
+            "original_line": 10,
+            "side": "LEFT",
+            "original_position": 14,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "Does this still apply?",
+                "It does. And I should actually revert most of the changes in this file. They were a reaction to using components for same-system query collision (prior to the FilteredAccess addition). FilteredAccess gives us the ability to use the old, nicer implementation.\r\n\r\nNice catch!",
+                "Ahh interesting. To make this work as expected, we need to ensure reads/writes in the `Access<T>` in `FilteredAccess<T>` also set the With flag in FilteredAccess. We should probably just expose `Access<T>` as read-only and then expose add_read/write operations on FilteredAccess"
+            ]
+        },
+        {
+            "hunk_id": 95,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/system/commands.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 232,
+            "original_line": 232,
+            "side": "LEFT",
+            "original_position": 254,
+            "position": 257,
+            "subject_type": "line",
+            "review_comments": [
+                "Without this it is possible that it becomes impossible to turn `example_system` into a system as the necessary signature changes like here.",
+                "hmm i have no clue why i removed this. maybe to check why a test was failing and I forgot to re-add it? regardless: nice catch. "
+            ]
+        },
+        {
+            "hunk_id": 98,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_core/src/time/fixed_timestep.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 53,
+            "original_line": 53,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Why this extra indirection? Is the impact impreceptible?",
+                "> Why this extra indirection?\r\n\r\nIt was that or add an unsafe `world.get_resource_unchecked_mut::<FixedTimesteps>()` call to `initialize` and `run_unsafe`. Expressing this as a system function also allows us to rely on the existing \"function system\" impl to populate the correct access parameters. One less safety thing to validate (which is notably missing the proper FixedTimesteps write access on `main`).   \r\n\r\n> Is the impact impreceptible?\r\n\r\nThe impact of Box vs directly running a system has been imperceptible for benchmarks in my experience (although I haven't tested this exact case)."
+            ]
+        },
+        {
+            "hunk_id": 93,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/storage/blob_vec.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 128,
+            "original_line": 128,
+            "side": "RIGHT",
+            "original_position": 136,
+            "position": 128,
+            "subject_type": "line",
+            "review_comments": [
+                "It would be nice to describe the action this performs in the doc comment."
+            ]
+        },
+        {
+            "hunk_id": 90,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_transform/src/hierarchy/child_builder.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 49,
+            "original_line": 49,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "Could `Commands` become a type that can be cloned? Semantically kind of like an `Arc<Mutex<&mut Vec<Command>>>`? That would allow writing this as `commands: Commands<'a>`.",
+                "I believe this was default behavior before 0.3 or 0.4, but it got removed to avoid unnecessry locking operations"
+            ]
+        },
+        {
+            "hunk_id": 100,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/storage/blob_vec.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 151,
+            "original_line": 151,
+            "side": "RIGHT",
+            "original_position": 151,
+            "position": 151,
+            "subject_type": "line",
+            "review_comments": [
+                "Can methods with easily verifiable safety conditions like this method get a `debug_assert!` for the safety condition? In this case `debug_assert!(index < self.len);`.",
+                "Good call. Funny story: adding a debug_assert for index validity to BlobVec::get_unchecked causes a panic in debug mode when dropping BlobVec. This is because we now set `self.len = 0` _before_ calling `self.get_unchecked(index)` for each item (for unwind safety). I guess the fix is to manually offset the pointer in `clear()` so we can still use the debug_assert elsewhere."
+            ]
+        },
+        {
+            "hunk_id": 105,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/world/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 46,
+            "original_line": 46,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "Could you add a comment that this is just a cache for use by `WorldCell`?"
+            ]
+        },
+        {
+            "hunk_id": 104,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/world/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 267,
+            "original_line": 267,
+            "side": "RIGHT",
+            "original_position": 264,
+            "position": 267,
+            "subject_type": "line",
+            "review_comments": [
+                "This can use `.empty()`, right?",
+                "Nope! `archetype.allocate()` requires a mutable reference."
+            ]
+        },
+        {
+            "hunk_id": 92,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/schedule/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5,
+            "original_line": 5,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Commented out code.",
+                "This one's on me, it shouldn't be here. Must've snuck in during the `DynHash` labels PR debacle, I was juggling multiple active changesets while trying to resolve spurious merge conflicts."
+            ]
+        },
+        {
+            "hunk_id": 99,
+            "commit_id": "e7116d26677e87fedcd1cbd198df5f79b5592b17",
+            "original_commit_id": "d9fb61d474518eba06d0c3dce5cb81db9f7ed66a",
+            "path": "crates/bevy_ecs/src/reflect.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 46,
+            "original_line": 46,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "\"Thread-local systems\" don't exist."
+            ]
+        }
+    ]
+}

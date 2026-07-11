@@ -1,0 +1,220 @@
+{
+    "repo": "astral-sh/uv",
+    "pr_number": 789,
+    "lang": "rust",
+    "pr_title": "pep440: rewrite the parser and make version comparisons cheaper",
+    "pr_body": "This PR builds on #780 by making both version parsing faster, and\r\nperhaps more importantly, making version comparisons much faster.\r\nOverall, these changes result in a considerable improvement for the\r\n`boto3.in` workload. Here's the status quo:\r\n\r\n```\r\n$ time puffin pip-compile --no-build --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/requirements/boto3.in\r\nResolved 31 packages in 34.56s\r\n\r\nreal    34.579\r\nuser    34.004\r\nsys     0.413\r\nmaxmem  2867 MB\r\nfaults  0\r\n```\r\n\r\nAnd now with this PR:\r\n\r\n```\r\n$ time puffin pip-compile --no-build --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/requirements/boto3.in\r\nResolved 31 packages in 9.20s\r\n\r\nreal    9.218\r\nuser    8.919\r\nsys     0.165\r\nmaxmem  463 MB\r\nfaults  0\r\n```\r\n\r\nThis particular workload gets stuck in pubgrub doing resolution, and\r\nthus benefits mightily from a faster `Version::cmp` routine. With that\r\nsaid, this change does also help a fair bit with \"normal\" runs:\r\n\r\n```\r\n$ hyperfine -w10 \\\r\n    \"puffin-base pip-compile --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/benchmarks/requirements.in\" \\\r\n    \"puffin-cmparc pip-compile --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/benchmarks/requirements.in\"\r\nBenchmark 1: puffin-base pip-compile --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/benchmarks/requirements.in\r\n  Time (mean \u00b1 \u03c3):     337.5 ms \u00b1   3.9 ms    [User: 310.5 ms, System: 73.2 ms]\r\n  Range (min \u2026 max):   333.6 ms \u2026 343.4 ms    10 runs\r\n\r\nBenchmark 2: puffin-cmparc pip-compile --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/benchmarks/requirements.in\r\n  Time (mean \u00b1 \u03c3):     189.8 ms \u00b1   3.0 ms    [User: 168.1 ms, System: 78.4 ms]\r\n  Range (min \u2026 max):   185.0 ms \u2026 196.2 ms    15 runs\r\n\r\nSummary\r\n  puffin-cmparc pip-compile --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/benchmarks/requirements.in ran\r\n    1.78 \u00b1 0.03 times faster than puffin-base pip-compile --cache-dir ~/astral/tmp/cache/ -o /dev/null ./scripts/benchmarks/requirements.in\r\n```\r\n\r\nThere is perhaps some future work here (detailed in the commit\r\nmessages), but I suspect it would be more fruitful to explore ways of\r\nmaking resolution itself and/or deserialization faster.\r\n\r\nFixes #373, Closes #396\r\n",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2024-01-05T14:37:34Z",
+    "issue_context": {
+        "number": 396,
+        "title": "lots of time is spent in allocation in `puffin-dev resolve-many` for the top PyPI packages",
+        "body": "One thing i'm seeing is that we are spending a lot of time in allocation, around 16% for `malloc` and 11.5% for `free` of total runtime for the top 1K pypi packages:\r\n\r\n![malloc](https://github.com/astral-sh/puffin/assets/456674/f0383638-9f7f-49e5-a04f-65ab4539ae31)\r\n\r\nThat jumps to about 18% for `malloc` and 13% for `free` in the top 4K.\r\n\r\nMy hypothesis for this is that we are allocating oodles of tiny little objects everywhere. For example, `Version` has two `Vec`s in it and `WheelFilename` adds many more allocs with more indirection. There are probably other places with lots of tiny little objects.\r\n\r\nThere are a variety of different approaches one can use to attack this problem (if we consider it a problem at all):\r\n\r\n* Try container types that use inline storage for small elements and fallback to the heap for bigger elements. I'm thinking about things like [`smallvec`](https://docs.rs/smallvec/latest/smallvec/). This is also known as a \"small string optimization\" (SSO). This might be a good first thing to try since I'm guessing it's quite relevant. I imagine many of the `Vec`s and `String`s in `WheelFilename` and `Version`, for example, are quite small.\r\n* We could try different allocators. It looks like ruff uses `mimalloc`. My system is using glibc's allocator which is generally pretty fast. So I wouldn't expect an enormous gain here.\r\n* We could try different allocation styles. For example, a bump allocator like [`bumpalo`](https://docs.rs/bumpalo/latest/bumpalo/). This will likely require some refactoring of the code.\r\n* We could try representational changes to our data types to make fewer allocations. For example, a `Version` could probably be represented as a `Vec<u8>` internally. This makes its representation more complex and _usually_ will incur some kind of perf penalty when you try to _use_ a `Vesion`. But it could speed up objection creation enough to make it a worthwhile trade.\r\n* We could use some kind of string interning to exploit cross-package redundancy. It is very likely for example that the total number of unique version strings is far smaller than the total number of version strings. Similarly for other things such as package names. (Since some packages have a lot of releases.)\r\n\r\nAnyway, this is just what I have off the top of my head. I'm actually not even certain that we want to solve this problem at all. But it is worth pointing out that some of the above remedies are much easier to try than others (`smallvec` should be quite easy to slot into the existing code and _could_ significantly reduce allocs).",
+        "comments": [
+            "Personal opinion is that I'd love to improve this and these ideas strike me as being in the right direction.",
+            "I'd love to try smallvec for `release`. We can also use `u32` instead of `usize` in there",
+            "We could also use an enum for `release` that captures the overwhelmingly common cases of 1, 2, or 3 segments.",
+            "That might be strictly more work. I recall `smallvec` introduces some overhead since you need to check if an element is on the stack or the heap, but I guess an enum would have the same problem :)",
+            "Perfwise we shouldn't see the difference, but `smallvec` would be more ergonomic with less effort",
+            "#399 gets a ~10% perf win by switching the global allocator. I did attempt a smallvec optimization experiment (as mentioned above) but couldn't observe any measurable win. I'm not 100% convinced that smallvec has no role to play and I'm sure there is more that can still be done here.",
+            "@BurntSushi - Should we close this when merging #789 or is there more that's worth tracking here?",
+            "Ah yeah that's a good point. Yeah, I don't think this specific issue still exists once #789 gets merged. (Or even before it to be honest. I think gratuitous allocation has been removed from the happy path for the most part already.)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 49600,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1642,
+            "original_line": 1642,
+            "side": "RIGHT",
+            "original_position": 1689,
+            "position": 1690,
+            "subject_type": "line",
+            "review_comments": [
+                "How does this compare to a `SmallVec::<[u64; 4]>`?",
+                "A lot less code. One fewer dependency. No use of `unsafe`. _Probably_ not much if any difference in perf. But I didn't test the last claim.",
+                "If `smallvec` were already a dependency of this crate, I probably would have used it. But this didn't feel like enough of a reason to add it all on its own IMO. Also, if this were a strictly internal crate with no plans to publish it back out into the world, I might have also used `smallvec`. But if this is going back out into the world, then I don't think it's worth passing on a dependency for `smallvec` here. IMO anyway."
+            ]
+        },
+        {
+            "hunk_id": 49595,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 749,
+            "original_line": 749,
+            "side": "RIGHT",
+            "original_position": 557,
+            "position": 791,
+            "subject_type": "line",
+            "review_comments": [
+                "This is ridiculously good! And the commentary is excellent!"
+            ]
+        },
+        {
+            "hunk_id": 49594,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1701,
+            "original_line": 1701,
+            "side": "RIGHT",
+            "original_position": 757,
+            "position": 1749,
+            "subject_type": "line",
+            "review_comments": [
+                "Interesting, so this is optimized for the case in which most versions don't contain any of the alphabetical characters?",
+                "Right. It saves us from needing to do a case insensitive comparison for every alphabetical version component.\r\n\r\nI wouldn't be surprised if this didn't make much of a difference in practice, since most versions are handled by the \"fast path\" in the parser."
+            ]
+        },
+        {
+            "hunk_id": 49598,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 245,
+            "original_line": 245,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 137,
+            "subject_type": "line",
+            "review_comments": [
+                "I will ask a dumb question: why `Arc` and not `Box`?",
+                "Oh, is it because `Arc` allows for cheap cloning...?",
+                "Do we want the `Arc` here or in `PubGrubVersion`? That is, would it have any disadvantages to only use it in `PubGrubVersion` so `Version` itself remains the \"real\" type / does the copy on write make a noticeable impact?",
+                "Yes, `Arc` makes cloning essentially free.\r\n\r\nI think `Version` is fine with an `Arc` inside of it, and it's hard for me to conceive of a way that copy-on-write would hurt things. I would expect that the vast majority of the time, when `Arc::make_mut` is called, an extra copy is _not_ made. (Since it's done as part of building a new `Version`.) And even then, in the cases where `Arc::make_mut` does make a copy, the caller would have had to make a copy anyway if `Arc` weren't used.\r\n\r\nI think there are really only two downsides to using `Arc` here. Firstly, it introduces an alloc in the happy path of building/parsing a version. Secondly, it requires using either `alloc` or `std`. I don't think the first makes too much of a difference, and I think the latter doesn't matter for this crate (unless you want to take in the direction of `core`-only, which would be quite tricky).",
+                "> does the copy on write make a noticeable impact?\r\n\r\nIt might help to clarify here: `Arc::make_mut` isn't quite just copy-on-write. It only makes a copy when the reference count is greater than 1. But if it's 1, and I suspect it usually will be in this context, then a mutable borrow with no copying can be handed out safely because exclusivity has been proven.\r\n\r\nTypically copy-on-write implies something closer to \"whenever one needs to write, you always copy first.\" And indeed, if that were the case here, it might make `Arc`-usage a little more suspicious."
+            ]
+        },
+        {
+            "hunk_id": 49596,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 509,
+            "original_line": 509,
+            "side": "RIGHT",
+            "original_position": 326,
+            "position": 535,
+            "subject_type": "line",
+            "review_comments": [
+                "Very interesting pattern.",
+                "\ud83e\udd2f cool"
+            ]
+        },
+        {
+            "hunk_id": 49599,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1253,
+            "original_line": 1253,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 1301,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm surprised you don't explicitly note what happens if it doesn't match that format since your docstrings are so thorough. Is it just obviously implied that it returns `None`?",
+                "That's fair. I added a sentence!"
+            ]
+        },
+        {
+            "hunk_id": 49592,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1754,
+            "original_line": 1754,
+            "side": "RIGHT",
+            "original_position": 810,
+            "position": 1807,
+            "subject_type": "line",
+            "review_comments": [
+                "That's neat."
+            ]
+        },
+        {
+            "hunk_id": 49601,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 620,
+            "original_line": 620,
+            "side": "RIGHT",
+            "original_position": 654,
+            "position": 654,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we add a fast path here that avoids calling into `cmp_slow` if both `self.inner` and `other.inner` point to the same `Arc`? ",
+                "Not sure. `cmp_slow` is designed to be called very infrequently (in practice), and I don't know the portion of comparisons that enter `cmp_slow` that have pointer equality internally. My prior is that the portion would be rather small, but I could be wrong. Especially for particular benchmarks that might hit `cmp_slow` more often than is intended. For example: https://github.com/astral-sh/puffin/pull/799"
+            ]
+        },
+        {
+            "hunk_id": 49593,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1461,
+            "original_line": 1461,
+            "side": "RIGHT",
+            "original_position": 512,
+            "position": 1509,
+            "subject_type": "line",
+            "review_comments": [
+                "So in this case, what ultimately happens to the separator? Now that we ate-and-then-reset for pre, then post, then dev? Like if you had a separator at the end of the version.",
+                "This runs at the end of the top-level parse routine:\r\n\r\n```\r\n        if !self.is_done() {\r\n            let remaining = String::from_utf8_lossy(&self.v[self.i..]).into_owned();\r\n            let version = self.into_pattern().version;\r\n            return Err(ErrorKind::UnexpectedEnd { version, remaining }.into());\r\n        }\r\n```\r\n\r\nSo basically, if by the time you have nothing left to try you still have stuff left to parse, you know you've hit a dead end and an invalid version."
+            ]
+        },
+        {
+            "hunk_id": 49597,
+            "commit_id": "106af0772d87a49d5a6b627a2734902f8e38d31b",
+            "original_commit_id": "08edbc9f60b71a2228088031dd2684d2c81f9e9c",
+            "path": "crates/pep440-rs/src/version.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 771,
+            "original_line": 771,
+            "side": "RIGHT",
+            "original_position": 579,
+            "position": 813,
+            "subject_type": "line",
+            "review_comments": [
+                "Interesting, this seems quite doable (but perhaps not critical).",
+                "Looking at the callers of `.release()`, we don't seem to have any arbitrary indexing, mostly either `.iter()` or `.to_vec()`, so would a `impl Iterator<u64>` also do?",
+                "You could very like make `impl Iterator<u64>` work, but it comes at the cost of convenience. See for example:\r\n\r\nhttps://github.com/astral-sh/puffin/blob/9d51b22e189d972c7bfe6902ca250dea4e040664/crates/puffin-cli/src/python_version.rs#L31-L59\r\n\r\nand\r\n\r\nhttps://github.com/astral-sh/puffin/blob/9d51b22e189d972c7bfe6902ca250dea4e040664/crates/puffin-resolver/src/pubgrub/specifier.rs#L39-L41\r\n\r\nThere are maybe a few other spots where an `impl Iterator<u64>` would be inconvenient. But not bad.\r\n\r\nI was also thinking about this from the perspective of this crate being an ecosystem crate. Using `&[u64]` is really nice. It's convenient. Composes well. Works with slice patterns."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,72 @@
+{
+    "repo": "vitejs/vite",
+    "pr_number": 9848,
+    "lang": "typescript",
+    "pr_title": "fix: ensure version query for direct node_modules imports",
+    "pr_body": "Fixes #7621\r\nFixes #2503 (with a different approach after reverting #2848)\r\nCloses #9730\r\n\r\nPotentially unblocks SvelteKit, as it will fix the issue described in #9828 if the direct node_modules import is in a JS source instead of a script tag. We aren't resolving the URL in script tags AFAICS, I'll check if this is something we should start doing. @Rich-Harris @benmccann would you confirm that this is something needed by SvelteKit, or it is just an artifact of how the reproduction was built (I'm assuming it is the later, and this PR may also then fix #9828)\r\n\r\n### Description\r\n\r\nWe mark non-optimized node_modules imports with a `?v={browserHash}` query [here](https://github.com/vitejs/vite/blob/5df788dfe2d89e541461e166f03afb38c2f1dd7e/packages/vite/src/node/plugins/resolve.ts#L769)\r\n```ts\r\n  if (skipOptimization) {\r\n    // excluded from optimization\r\n    // Inject a version query to npm deps so that the browser\r\n    // can cache it without re-validation, but only do so for known js types.\r\n    // otherwise we may introduce duplicated modules for externalized files\r\n    // from pre-bundled deps.\r\n    if (!isBuild) {\r\n      const versionHash = depsOptimizer!.metadata.browserHash\r\n      if (versionHash && isJsType) {\r\n        resolved = injectQuery(resolved, `v=${versionHash}`)\r\n      }\r\n    }\r\n  } \r\n```\r\nThis allows us to cache npm dependencies (even if they aren't optimized). See [here](https://github.com/vitejs/vite/blob/5df788dfe2d89e541461e166f03afb38c2f1dd7e/packages/vite/src/node/server/middlewares/transform.ts#L191)\r\n```ts\r\n  const depsOptimizer = getDepsOptimizer(server.config, false) // non-ssr\r\n  const type = isDirectCSSRequest(url) ? 'css' : 'js'\r\n  const isDep =\r\n    DEP_VERSION_RE.test(url) || depsOptimizer?.isOptimizedDepUrl(url)\r\n  return send(req, res, result.code, type, {\r\n    etag: result.etag,\r\n    // allow browser to cache npm deps!\r\n    cacheControl: isDep ? 'max-age=31536000,immutable' : 'no-cache',\r\n    headers: server.config.server.headers,\r\n    map: result.map\r\n  })\r\n```\r\nWe need the version query because once we re-optimize, we need to resend also the non-optimized node_modules files as they may have imported optimized modules so their imports needs to be rewritten to the new cached files.\r\n\r\nBefore this PR, we only added the version query to bare imports, and after #2848, also to relative imports of node_modules. After this PR, we are ensuring the version query also for all other ways to direct import a file in node_modules. \r\n\r\n---\r\n\r\n### What is the purpose of this pull request? <!-- (put an \"X\" next to an item) -->\r\n\r\n- [x] Bug fix\r\n- [ ] New Feature\r\n- [ ] Documentation update\r\n- [ ] Other",
+    "pr_comments": [
+        "@akryum I think this may also fix the issue behind #9661, but not the repro you provided. We need to check, as some of these paths depend on checking for `/node_modules/` in the path. Maybe you could check this PR with histoire directly.",
+        "[vite-ecosystem-ci run against this PR](https://github.com/vitejs/vite-ecosystem-ci/actions/runs/2930012379). This is also testing the new 3.1-beta.0 PRs (object hooks and parse5 for HTML). There are two fails, but looks unrelated to the PR:\r\n- Storybook has an issue with object hooks (@IanVS if you have some time, it would be good to check this out)\r\n- vite-setup-catalogue (@sapphi-red, would you check if this is due to other changes in the 3.1 beta?)",
+        "SvelteKit includes this in HTML:\r\n\r\n```html\r\n<script type=\"module\">\r\n  import { start } from '/node_modules/@sveltejs/kit/src/runtime/client/start.js';\r\n  // ...\r\n</script>\r\n```\r\n\r\nNothing else needs to import that file, but that file contains an import (which doesn't get `?v=xxx` appended) of another module...\r\n\r\n```js\r\nimport { error } from '../../index/index.js';\r\n```\r\n\r\n...that is also exported from the package, hence the double imports:\r\n\r\n```js\r\nimport { error } from '@sveltejs/kit';\r\n```\r\n\r\nIf this fix results in the imports inside `start.js` getting the `?v=xxx` treatment, then I think it should work for us.",
+        "It looks like what's breaking is this line within a custom plugin we wrote to process mdx:\r\n\r\n```\r\nawait reactRefresh?.transform!.call(this, modifiedCode, `${id}.jsx`, options);\r\n```\r\n\r\nWhich we borrowed heavily from vite-plugin-mdx: https://github.com/brillout/vite-plugin-mdx/blob/ee4a732f19bd8ee072dc5257b96c3012f2cd6d75/src/index.ts#L58-L63\r\n\r\nIt looks like this might be due to https://github.com/rollup/rollup/pull/4600.  But it looks like that wasn't intended to be breaking.  So, I'm not sure if there's something I need to change on my side (and alert @brillout to for his plugin as well), or if this is a bug in the rollup types.",
+        "I've tested this branch with a reproduction of https://github.com/sveltejs/kit/issues/5952, and it works perfectly! Thanks so much @patak-dev, this is excellent news",
+        "It seems it's a real regression of this PR. It does not happen with 3.1.0-beta.0.\r\n\r\nWhen using this branch with `file:`  (not `link:`), the following error happens.\r\n```\r\nUncaught ReferenceError: __DEFINES__ is not defined\r\n```\r\n\r\n1. `pnpm create vite`\r\n2. Select default for all options\r\n3. Add `pnpm.overrides`. Note that `file:` is used.\r\n   ```json\r\n   \"pnpm\": {\r\n     \"overrides\": {\r\n       \"vite\": \"file:/path/to/vite\"\r\n     }\r\n   }\r\n   ```\r\n4. `pnpm i`\r\n5. `pnpm dev`\r\n",
+        "@sapphi-red I couldn't reproduce the issue with your instructions on MacOS, but I think [vitejs/vite@`f7785ab` (#9848)](https://github.com/vitejs/vite/pull/9848/commits/f7785ab04e943f7504703c0f3cf6b05548e440a5) could fix this. Would you check if it works for you?",
+        "vite-setup-catalogue is now green \ud83c\udf89 \r\nhttps://github.com/vitejs/vite-ecosystem-ci/runs/8034598955?check_suite_focus=true",
+        "LGTM.\r\n\r\n(`vite-plugin-mdx` is deprecated so no probs on my end. Thanks for the ping.)",
+        "Ummm, I wonder why it didn't reproduce on macOS as ecosystem-ci runs on linux.\r\nPutting that aside, it worked on Windows, too. :tada:\r\n",
+        "@bluwy added tests in:\r\n- [fix: relative path + add tests](https://github.com/vitejs/vite/pull/9848/commits/0dd0e0c2e179ca1829d61232897525b3d72a6547)\r\n\r\nAlso, good call, there was a bug with importing using a relative path."
+    ],
+    "merged": true,
+    "created_at": "2022-08-27T08:15:51Z",
+    "issue_context": {
+        "number": 9828,
+        "title": "a script tag referencing node_modules does not get browserHash injected causing double-instantiation",
+        "body": "### Describe the bug\n\nI'm not sure if this is a bug or expected behaviour, but it's left me scratching my head and I'd love to know if there's a workaround at the very least.\r\n\r\nWhen a module is imported via a project-relative URL (`/node_modules/foo/index.js`) _and_ via a package name (`foo`), Vite resolves the latter to `/node_modules/foo/index.js?v=xyz123`, which causes the module to be instantiated twice. (In this example, `optimizeDeps.exclude = ['foo']`.)\r\n\r\nThis is causing headaches for SvelteKit users, as it causes failed `instanceof` checks. It _doesn't_ happen when the package in question is installed outside the directory (e.g. in a workspace root), because in that case both references are resolved to `/@fs/path/to/project/node_modules/foo/index.js`.\n\n### Reproduction\n\nhttps://github.com/Rich-Harris/vite-browserhash-repro\n\n### System Info\n\n```shell\nSystem:\r\n    OS: macOS 12.5.1\r\n    CPU: (10) arm64 Apple M1 Max\r\n    Memory: 178.69 MB / 32.00 GB\r\n    Shell: 5.8.1 - /bin/zsh\r\n  Binaries:\r\n    Node: 16.15.1 - ~/.nvm/versions/node/v16.15.1/bin/node\r\n    Yarn: 1.22.19 - ~/.nvm/versions/node/v16.15.1/bin/yarn\r\n    npm: 8.11.0 - ~/.nvm/versions/node/v16.15.1/bin/npm\r\n  Browsers:\r\n    Chrome: 104.0.5112.101\r\n    Chrome Canary: 107.0.5258.0\r\n    Firefox: 103.0.2\r\n    Safari: 15.6.1\r\n  npmPackages:\r\n    vite: ^3.0.9 => 3.0.9\n```\n\n\n### Used Package Manager\n\npnpm\n\n### Logs\n\n_No response_\n\n### Validations\n\n- [X] Follow our [Code of Conduct](https://github.com/vitejs/vite/blob/main/CODE_OF_CONDUCT.md)\n- [X] Read the [Contributing Guidelines](https://github.com/vitejs/vite/blob/main/CONTRIBUTING.md).\n- [X] Read the [docs](https://vitejs.dev/guide).\n- [X] Check that there isn't [already an issue](https://github.com/vitejs/vite/issues) that reports the same bug to avoid creating a duplicate.\n- [X] Make sure this is a Vite issue and not a framework-specific issue. For example, if it's a Vue SFC related bug, it should likely be reported to [vuejs/core](https://github.com/vuejs/core) instead.\n- [X] Check that this is a concrete bug. For Q&A open a [GitHub Discussion](https://github.com/vitejs/vite/discussions) or join our [Discord Chat Server](https://chat.vitejs.dev/).\n- [X] The provided reproduction is a [minimal reproducible example](https://stackoverflow.com/help/minimal-reproducible-example) of the bug.",
+        "comments": [
+            "Related issue, we may have a regression here https://github.com/vitejs/vite/issues/9661. We need to hash files (with `?v=` to be able to reload them after they have been re-optimized.\r\n\r\nFor the example that Rich added, if 'foo' is in optimizeDeps exclude, it may still import other dependencies (that have been optimized) so we still need to have a `?v=` on these excluded files.",
+            "> I'm not sure if this is a bug or expected behaviour\r\n\r\nIt is a bug, for reference, I added an explanation of why we need version queries in direct node_modules imports in the description of:\r\n- https://github.com/vitejs/vite/pull/9848",
+            "Sveltekit was fixed by #9848 but the repro in the OP is not fixed. This is happening because we are not injecting browserHash to script tags referencing a file in node_modules. (https://discord.com/channels/804011606160703521/804439875226173480/1172385782007353344)\r\n\r\nA workaround is to use `<script type=\"module\">import 'path/to/node_module/file'</script>` instead of `<script type=\"module\" src=\"path/to/node_module/file\"></script>`.\r\n\r\nI guess this would also be fixed if we make bare specifiers work in HTML in dev (#12260). Though I'm not sure if we are going to support that.\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50977,
+            "commit_id": "0dd0e0c2e179ca1829d61232897525b3d72a6547",
+            "original_commit_id": "5df788dfe2d89e541461e166f03afb38c2f1dd7e",
+            "path": "packages/vite/src/node/plugins/resolve.ts",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 178,
+            "original_line": 178,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "It looks like most of the codebase simply checks by `includes('node_modules')`. I think we can probably do the same for consistency even if there might be false positives. But I don't feel strongly otherwise if we don't change this too.",
+                "We have a good mix now, other places tests for `includes('/node_modules/')`. Let's merge this as I think we should be more strict on this check, and we could update places only checking for `'node_modules'` in future PRs."
+            ]
+        },
+        {
+            "hunk_id": 50961,
+            "commit_id": "0dd0e0c2e179ca1829d61232897525b3d72a6547",
+            "original_commit_id": "5df788dfe2d89e541461e166f03afb38c2f1dd7e",
+            "path": "packages/vite/src/node/plugins/resolve.ts",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 178,
+            "original_line": 178,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "It looks like most of the codebase simply checks by `includes('node_modules')`. I think we can probably do the same for consistency even if there might be false positives. But I don't feel strongly otherwise if we don't change this too.",
+                "We have a good mix now, other places tests for `includes('/node_modules/')`. Let's merge this as I think we should be more strict on this check, and we could update places only checking for `'node_modules'` in future PRs."
+            ]
+        }
+    ]
+}

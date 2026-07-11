@@ -1,0 +1,548 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 6503,
+    "lang": "rust",
+    "pr_title": "[Merged by Bors] - Pipelined Rendering",
+    "pr_body": "# Objective\r\n\r\n- Implement pipelined rendering\r\n- Fixes #5082\r\n- Fixes #4718\r\n\r\n## User Facing Description\r\n\r\nBevy now implements piplelined rendering! Pipelined rendering allows the app logic and rendering logic to run on different threads leading to large gains in performance.\r\n\r\n![image](https://user-images.githubusercontent.com/2180432/202049871-3c00b801-58ab-448f-93fd-471e30aba55f.png)\r\n*tracy capture of many_foxes example*\r\n\r\nTo use pipelined rendering, you just need to add the `PipelinedRenderingPlugin`. If you're using `DefaultPlugins` then it will automatically be added for you on all platforms except wasm. Bevy does not currently support multithreading on wasm which is needed for this feature to work. If you aren't using `DefaultPlugins` you can add the plugin manually.\r\n\r\n```rust\r\nuse bevy::prelude::*;\r\nuse bevy::render::pipelined_rendering::PipelinedRenderingPlugin;\r\n\r\nfn main() {\r\n    App::new()\r\n        // whatever other plugins you need\r\n        .add_plugin(RenderPlugin)\r\n        // needs to be added after RenderPlugin\r\n        .add_plugin(PipelinedRenderingPlugin)\r\n        .run();\r\n}\r\n```\r\n\r\nIf for some reason pipelined rendering needs to be removed. You can also disable the plugin the normal way.\r\n\r\n```rust\r\nuse bevy::prelude::*;\r\nuse bevy::render::pipelined_rendering::PipelinedRenderingPlugin;\r\n\r\nfn main() {\r\n    App::new.add_plugins(DefaultPlugins.build().disable::<PipelinedRenderingPlugin>());\r\n}\r\n```\r\n\r\n### A setup function was added to plugins\r\n\r\nA optional plugin lifecycle function was added to the `Plugin trait`. This function is called after all plugins have been built, but before the app runner is called. This allows for some final setup to be done. In the case of pipelined rendering, the function removes the sub app from the main app and sends it to the render thread.\r\n\r\n```rust\r\nstruct MyPlugin;\r\nimpl Plugin for MyPlugin {\r\n    fn build(&self, app: &mut App) {\r\n        \r\n    }\r\n    \r\n    // optional function\r\n    fn setup(&self, app: &mut App) {\r\n        // do some final setup before runner is called\r\n    }\r\n}\r\n```\r\n\r\n### A Stage for Frame Pacing\r\n\r\nIn the `RenderExtractApp` there is a stage labelled `BeforeIoAfterRenderStart` that systems can be added to.  The specific use case for this stage is for a frame pacing system that can delay the start of main app processing in render bound apps to reduce input latency i.e. \"frame pacing\". This is not currently built into bevy, but exists as `bevy`\r\n\r\n```text\r\n|-------------------------------------------------------------------|\r\n|         | BeforeIoAfterRenderStart | winit events | main schedule |\r\n| extract |---------------------------------------------------------|\r\n|         | extract commands | rendering schedule                   |\r\n|-------------------------------------------------------------------|\r\n```\r\n\r\n### Small API additions\r\n\r\n* `Schedule::remove_stage`\r\n* `App::insert_sub_app`\r\n* `App::remove_sub_app` \r\n* `TaskPool::scope_with_executor`\r\n\r\n## Problems and Solutions\r\n\r\n### Moving render app to another thread\r\n\r\nMost of the hard bits for this were done with the render redo. This PR just sends the render app back and forth through channels which seems to work ok. I originally experimented with using a scope to run the render task. It was cuter, but that approach didn't allow render to start before i/o processing. So I switched to using channels. There is much complexity in the coordination that needs to be done, but it's worth it. By moving rendering during i/o processing the frame times should be much more consistent in render bound apps. See https://github.com/bevyengine/bevy/issues/4691.\r\n\r\n### Unsoundness with Sending World with NonSend resources\r\n\r\nDropping !Send things on threads other than the thread they were spawned on is considered unsound. The render world doesn't have any nonsend resources. So if we tell the users to \"pretty please don't spawn nonsend resource on the render world\", we can avoid this problem.\r\n\r\nMore seriously there is this https://github.com/bevyengine/bevy/pull/6534 pr, which patches the unsoundness by aborting the app if a nonsend resource is dropped on the wrong thread. ~~That PR should probably be merged before this one.~~ For a longer term solution we have this discussion going https://github.com/bevyengine/bevy/discussions/6552.\r\n\r\n### NonSend Systems in render world\r\n\r\nThe render world doesn't have any !Send resources, but it does have a non send system. While Window is Send, winit does have some API's that can only be accessed on the main thread. `prepare_windows` in the render schedule thus needs to be scheduled on the main thread. Currently we run nonsend systems by running them on the thread the TaskPool::scope runs on. When we move render to another thread this no longer works.\r\n\r\nTo fix this, a new `scope_with_executor` method was added that takes a optional `TheadExecutor` that can only be ticked on the thread it was initialized on. The render world then holds a `MainThreadExecutor` resource which can be passed to the scope in the parallel executor that it uses to spawn it's non send systems on. \r\n\r\n### Scopes executors between render and main should not share tasks\r\n\r\nSince the render world and the app world share the `ComputeTaskPool`. Because `scope` has executors for the ComputeTaskPool a system from the main world could run on the render thread or a render system could run on the main thread. This can cause performance problems because it can delay a stage from finishing. See https://github.com/bevyengine/bevy/pull/6503#issuecomment-1309791442 for more details.\r\n\r\nTo avoid this problem, `TaskPool::scope` has been changed to not tick the ComputeTaskPool when it's used by the parallel executor. In the future when we move closer to the 1 thread to 1 logical core model we may want to overprovide threads, because the render and main app threads don't do much when executing the schedule.\r\n\r\n## Performance\r\n\r\nMy machine is Windows 11, AMD Ryzen 5600x, RX 6600\r\n\r\n### Examples\r\n\r\n#### This PR with pipelining vs Main\r\n\r\n> Note that these were run on an older version of main and the performance profile has probably changed due to optimizations\r\n\r\nSeeing a perf gain from 29% on many lights to 7% on many sprites.\r\n\r\n<html>\r\n<body>\r\n<!--StartFragment--><google-sheets-html-origin>\r\n\r\n\u00a0 | percent | \u00a0 | \u00a0 | Diff | \u00a0 | \u00a0 | Main | \u00a0 | \u00a0 | PR | \u00a0 | \u00a0\r\n-- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | --\r\ntracy frame time | mean | median | sigma | mean | median | sigma | mean | median | sigma | mean | median | sigma\r\nmany foxes | 27.01% | 27.34% | -47.09% | 1.58 | 1.55 | -1.78 | 5.85 | 5.67 | 3.78 | 4.27 | 4.12 | 5.56\r\nmany lights | 29.35% | 29.94% | -10.84% | 3.02 | 3.03 | -0.57 | 10.29 | 10.12 | 5.26 | 7.27 | 7.09 | 5.83\r\nmany animated sprites | 13.97% | 15.69% | 14.20% | 3.79 | 4.17 | 1.41 | 27.12 | 26.57 | 9.93 | 23.33 | 22.4 | 8.52\r\n3d scene | 25.79% | 26.78% | 7.46% | 0.49 | 0.49 | 0.15 | 1.9 | 1.83 | 2.01 | 1.41 | 1.34 | 1.86\r\nmany cubes | 11.97% | 11.28% | 14.51% | 1.93 | 1.78 | 1.31 | 16.13 | 15.78 | 9.03 | 14.2 | 14 | 7.72\r\nmany sprites | 7.14% | 9.42% | -85.42% | 1.72 | 2.23 | -6.15 | 24.09 | 23.68 | 7.2 | 22.37 | 21.45 | 13.35\r\n\r\n<!--EndFragment-->\r\n</body>\r\n</html>\r\n\r\n#### This PR with pipelining disabled vs Main\r\n\r\nMostly regressions here. I don't think this should be a problem as users that are disabling pipelined rendering are probably running single threaded and not using the parallel executor. The regression is probably mostly due to the switch to use `async_executor::run` instead of `try_tick` and also having one less thread to run systems on. I'll do a writeup on why switching to `run` causes regressions, so we can try to eventually fix it. Using try_tick causes issues when pipeline rendering is enable as seen [here](https://github.com/bevyengine/bevy/pull/6503#issuecomment-1380803518)\r\n\r\n<html>\r\n<body>\r\n<!--StartFragment--><google-sheets-html-origin>\r\n\r\n\u00a0 | percent | \u00a0 | \u00a0 | Diff | \u00a0 | \u00a0 | Main | \u00a0 | \u00a0 | PR no pipelining | \u00a0 | \u00a0\r\n-- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | --\r\ntracy frame time | mean | median | sigma | mean | median | sigma | mean | median | sigma | mean | median | sigma\r\nmany foxes | -3.72% | -4.42% | -1.07% | -0.21 | -0.24 | -0.04 | 5.64 | 5.43 | 3.74 | 5.85 | 5.67 | 3.78\r\nmany lights | 0.29% | -0.30% | 4.75% | 0.03 | -0.03 | 0.25 | 10.29 | 10.12 | 5.26 | 10.26 | 10.15 | 5.01\r\nmany animated sprites | 0.22% | 1.81% | -2.72% | 0.06 | 0.48 | -0.27 | 27.12 | 26.57 | 9.93 | 27.06 | 26.09 | 10.2\r\n3d scene | -15.79% | -14.75% | -31.34% | -0.3 | -0.27 | -0.63 | 1.9 | 1.83 | 2.01 | 2.2 | 2.1 | 2.64\r\nmany cubes | -2.85% | -3.30% | 0.00% | -0.46 | -0.52 | 0 | 16.13 | 15.78 | 9.03 | 16.59 | 16.3 | 9.03\r\nmany sprites | 2.49% | 2.41% | 0.69% | 0.6 | 0.57 | 0.05 | 24.09 | 23.68 | 7.2 | 23.49 | 23.11 | 7.15\r\n\r\n<!--EndFragment-->\r\n</body>\r\n</html>\r\n\r\n### Benchmarks\r\n\r\nMostly the same except empty_systems has got a touch slower. The maybe_pipelining+1 column has the compute task pool with an extra thread over default added. This is because pipelining loses one thread over main to execute systems on, since the main thread no longer runs normal systems.\r\n\r\n<details>\r\n<summary>Click Me</summary>\r\n\r\n```text\r\ngroup                                                             main                                         maybe-pipelining+1\r\n-----                                                             -------------------------                ------------------\r\nbusy_systems/01x_entities_03_systems                              1.07     30.7\u00b11.32\u00b5s        ? ?/sec      1.00     28.6\u00b11.35\u00b5s        ? ?/sec\r\nbusy_systems/01x_entities_06_systems                              1.10     52.1\u00b11.10\u00b5s        ? ?/sec      1.00     47.2\u00b11.08\u00b5s        ? ?/sec\r\nbusy_systems/01x_entities_09_systems                              1.00     74.6\u00b11.36\u00b5s        ? ?/sec      1.00     75.0\u00b11.93\u00b5s        ? ?/sec\r\nbusy_systems/01x_entities_12_systems                              1.03    100.6\u00b16.68\u00b5s        ? ?/sec      1.00     98.0\u00b11.46\u00b5s        ? ?/sec\r\nbusy_systems/01x_entities_15_systems                              1.11    128.5\u00b13.53\u00b5s        ? ?/sec      1.00    115.5\u00b11.02\u00b5s        ? ?/sec\r\nbusy_systems/02x_entities_03_systems                              1.16     50.4\u00b12.56\u00b5s        ? ?/sec      1.00     43.5\u00b13.00\u00b5s        ? ?/sec\r\nbusy_systems/02x_entities_06_systems                              1.00     87.1\u00b11.27\u00b5s        ? ?/sec      1.05     91.5\u00b17.15\u00b5s        ? ?/sec\r\nbusy_systems/02x_entities_09_systems                              1.04    139.9\u00b16.37\u00b5s        ? ?/sec      1.00    134.0\u00b11.06\u00b5s        ? ?/sec\r\nbusy_systems/02x_entities_12_systems                              1.05    179.2\u00b13.47\u00b5s        ? ?/sec      1.00    170.1\u00b13.17\u00b5s        ? ?/sec\r\nbusy_systems/02x_entities_15_systems                              1.01    219.6\u00b13.75\u00b5s        ? ?/sec      1.00    218.1\u00b12.55\u00b5s        ? ?/sec\r\nbusy_systems/03x_entities_03_systems                              1.10     70.6\u00b12.33\u00b5s        ? ?/sec      1.00     64.3\u00b10.69\u00b5s        ? ?/sec\r\nbusy_systems/03x_entities_06_systems                              1.02    130.2\u00b13.11\u00b5s        ? ?/sec      1.00    128.0\u00b11.34\u00b5s        ? ?/sec\r\nbusy_systems/03x_entities_09_systems                              1.00   195.0\u00b110.11\u00b5s        ? ?/sec      1.00    194.8\u00b11.41\u00b5s        ? ?/sec\r\nbusy_systems/03x_entities_12_systems                              1.01    261.7\u00b14.05\u00b5s        ? ?/sec      1.00    259.8\u00b14.11\u00b5s        ? ?/sec\r\nbusy_systems/03x_entities_15_systems                              1.00    318.0\u00b13.04\u00b5s        ? ?/sec      1.06   338.3\u00b120.25\u00b5s        ? ?/sec\r\nbusy_systems/04x_entities_03_systems                              1.00     82.9\u00b10.63\u00b5s        ? ?/sec      1.02     84.3\u00b10.63\u00b5s        ? ?/sec\r\nbusy_systems/04x_entities_06_systems                              1.01    181.7\u00b13.65\u00b5s        ? ?/sec      1.00    179.8\u00b11.76\u00b5s        ? ?/sec\r\nbusy_systems/04x_entities_09_systems                              1.04    265.0\u00b14.68\u00b5s        ? ?/sec      1.00    255.3\u00b11.98\u00b5s        ? ?/sec\r\nbusy_systems/04x_entities_12_systems                              1.00    335.9\u00b13.00\u00b5s        ? ?/sec      1.05   352.6\u00b115.84\u00b5s        ? ?/sec\r\nbusy_systems/04x_entities_15_systems                              1.00   418.6\u00b110.26\u00b5s        ? ?/sec      1.08   450.2\u00b139.58\u00b5s        ? ?/sec\r\nbusy_systems/05x_entities_03_systems                              1.07    114.3\u00b10.95\u00b5s        ? ?/sec      1.00    106.9\u00b11.52\u00b5s        ? ?/sec\r\nbusy_systems/05x_entities_06_systems                              1.08    229.8\u00b12.90\u00b5s        ? ?/sec      1.00    212.3\u00b14.18\u00b5s        ? ?/sec\r\nbusy_systems/05x_entities_09_systems                              1.03    329.3\u00b11.99\u00b5s        ? ?/sec      1.00    319.2\u00b12.43\u00b5s        ? ?/sec\r\nbusy_systems/05x_entities_12_systems                              1.06    454.7\u00b16.77\u00b5s        ? ?/sec      1.00    430.1\u00b13.58\u00b5s        ? ?/sec\r\nbusy_systems/05x_entities_15_systems                              1.03    554.6\u00b16.15\u00b5s        ? ?/sec      1.00   538.4\u00b123.87\u00b5s        ? ?/sec\r\ncontrived/01x_entities_03_systems                                 1.00     14.0\u00b10.15\u00b5s        ? ?/sec      1.08     15.1\u00b10.21\u00b5s        ? ?/sec\r\ncontrived/01x_entities_06_systems                                 1.04     28.5\u00b10.37\u00b5s        ? ?/sec      1.00     27.4\u00b10.44\u00b5s        ? ?/sec\r\ncontrived/01x_entities_09_systems                                 1.00     41.5\u00b14.38\u00b5s        ? ?/sec      1.02     42.2\u00b12.24\u00b5s        ? ?/sec\r\ncontrived/01x_entities_12_systems                                 1.06     55.9\u00b11.49\u00b5s        ? ?/sec      1.00     52.6\u00b11.36\u00b5s        ? ?/sec\r\ncontrived/01x_entities_15_systems                                 1.02     68.0\u00b12.00\u00b5s        ? ?/sec      1.00     66.5\u00b10.78\u00b5s        ? ?/sec\r\ncontrived/02x_entities_03_systems                                 1.03     25.2\u00b10.38\u00b5s        ? ?/sec      1.00     24.6\u00b10.52\u00b5s        ? ?/sec\r\ncontrived/02x_entities_06_systems                                 1.00     46.3\u00b10.49\u00b5s        ? ?/sec      1.04     48.1\u00b14.13\u00b5s        ? ?/sec\r\ncontrived/02x_entities_09_systems                                 1.02     70.4\u00b10.99\u00b5s        ? ?/sec      1.00     68.8\u00b11.04\u00b5s        ? ?/sec\r\ncontrived/02x_entities_12_systems                                 1.06     96.8\u00b11.49\u00b5s        ? ?/sec      1.00     91.5\u00b10.93\u00b5s        ? ?/sec\r\ncontrived/02x_entities_15_systems                                 1.02    116.2\u00b10.95\u00b5s        ? ?/sec      1.00    114.2\u00b11.42\u00b5s        ? ?/sec\r\ncontrived/03x_entities_03_systems                                 1.00     33.2\u00b10.38\u00b5s        ? ?/sec      1.01     33.6\u00b10.45\u00b5s        ? ?/sec\r\ncontrived/03x_entities_06_systems                                 1.00     62.4\u00b10.73\u00b5s        ? ?/sec      1.01     63.3\u00b11.05\u00b5s        ? ?/sec\r\ncontrived/03x_entities_09_systems                                 1.02     96.4\u00b10.85\u00b5s        ? ?/sec      1.00     94.8\u00b13.02\u00b5s        ? ?/sec\r\ncontrived/03x_entities_12_systems                                 1.01    126.3\u00b14.67\u00b5s        ? ?/sec      1.00    125.6\u00b12.27\u00b5s        ? ?/sec\r\ncontrived/03x_entities_15_systems                                 1.03    160.2\u00b19.37\u00b5s        ? ?/sec      1.00    156.0\u00b11.53\u00b5s        ? ?/sec\r\ncontrived/04x_entities_03_systems                                 1.02     41.4\u00b13.39\u00b5s        ? ?/sec      1.00     40.5\u00b10.52\u00b5s        ? ?/sec\r\ncontrived/04x_entities_06_systems                                 1.00     78.9\u00b11.61\u00b5s        ? ?/sec      1.02     80.3\u00b11.06\u00b5s        ? ?/sec\r\ncontrived/04x_entities_09_systems                                 1.02    121.8\u00b13.97\u00b5s        ? ?/sec      1.00    119.2\u00b11.46\u00b5s        ? ?/sec\r\ncontrived/04x_entities_12_systems                                 1.00    157.8\u00b11.48\u00b5s        ? ?/sec      1.01    160.1\u00b11.72\u00b5s        ? ?/sec\r\ncontrived/04x_entities_15_systems                                 1.00    197.9\u00b11.47\u00b5s        ? ?/sec      1.08   214.2\u00b134.61\u00b5s        ? ?/sec\r\ncontrived/05x_entities_03_systems                                 1.00     49.1\u00b10.33\u00b5s        ? ?/sec      1.01     49.7\u00b10.75\u00b5s        ? ?/sec\r\ncontrived/05x_entities_06_systems                                 1.00     95.0\u00b10.93\u00b5s        ? ?/sec      1.00     94.6\u00b10.94\u00b5s        ? ?/sec\r\ncontrived/05x_entities_09_systems                                 1.01    143.2\u00b11.68\u00b5s        ? ?/sec      1.00    142.2\u00b12.00\u00b5s        ? ?/sec\r\ncontrived/05x_entities_12_systems                                 1.00    191.8\u00b12.03\u00b5s        ? ?/sec      1.01    192.7\u00b17.88\u00b5s        ? ?/sec\r\ncontrived/05x_entities_15_systems                                 1.02    239.7\u00b13.71\u00b5s        ? ?/sec      1.00    235.8\u00b14.11\u00b5s        ? ?/sec\r\nempty_systems/000_systems                                         1.01     47.8\u00b10.67ns        ? ?/sec      1.00     47.5\u00b12.02ns        ? ?/sec\r\nempty_systems/001_systems                                         1.00  1743.2\u00b1126.14ns        ? ?/sec     1.01  1761.1\u00b170.10ns        ? ?/sec\r\nempty_systems/002_systems                                         1.01      2.2\u00b10.04\u00b5s        ? ?/sec      1.00      2.2\u00b10.02\u00b5s        ? ?/sec\r\nempty_systems/003_systems                                         1.02      2.7\u00b10.09\u00b5s        ? ?/sec      1.00      2.7\u00b10.16\u00b5s        ? ?/sec\r\nempty_systems/004_systems                                         1.00      3.1\u00b10.11\u00b5s        ? ?/sec      1.00      3.1\u00b10.24\u00b5s        ? ?/sec\r\nempty_systems/005_systems                                         1.00      3.5\u00b10.05\u00b5s        ? ?/sec      1.11      3.9\u00b10.70\u00b5s        ? ?/sec\r\nempty_systems/010_systems                                         1.00      5.5\u00b10.12\u00b5s        ? ?/sec      1.03      5.7\u00b10.17\u00b5s        ? ?/sec\r\nempty_systems/015_systems                                         1.00      7.9\u00b10.19\u00b5s        ? ?/sec      1.06      8.4\u00b10.16\u00b5s        ? ?/sec\r\nempty_systems/020_systems                                         1.00     10.4\u00b11.25\u00b5s        ? ?/sec      1.02     10.6\u00b10.18\u00b5s        ? ?/sec\r\nempty_systems/025_systems                                         1.00     12.4\u00b10.39\u00b5s        ? ?/sec      1.14     14.1\u00b11.07\u00b5s        ? ?/sec\r\nempty_systems/030_systems                                         1.00     15.1\u00b10.39\u00b5s        ? ?/sec      1.05     15.8\u00b10.62\u00b5s        ? ?/sec\r\nempty_systems/035_systems                                         1.00     16.9\u00b10.47\u00b5s        ? ?/sec      1.07     18.0\u00b10.37\u00b5s        ? ?/sec\r\nempty_systems/040_systems                                         1.00     19.3\u00b10.41\u00b5s        ? ?/sec      1.05     20.3\u00b10.39\u00b5s        ? ?/sec\r\nempty_systems/045_systems                                         1.00     22.4\u00b11.67\u00b5s        ? ?/sec      1.02     22.9\u00b10.51\u00b5s        ? ?/sec\r\nempty_systems/050_systems                                         1.00     24.4\u00b11.67\u00b5s        ? ?/sec      1.01     24.7\u00b10.40\u00b5s        ? ?/sec\r\nempty_systems/055_systems                                         1.05     28.6\u00b15.27\u00b5s        ? ?/sec      1.00     27.2\u00b10.70\u00b5s        ? ?/sec\r\nempty_systems/060_systems                                         1.02     29.9\u00b11.64\u00b5s        ? ?/sec      1.00     29.3\u00b10.66\u00b5s        ? ?/sec\r\nempty_systems/065_systems                                         1.02     32.7\u00b13.15\u00b5s        ? ?/sec      1.00     32.1\u00b10.98\u00b5s        ? ?/sec\r\nempty_systems/070_systems                                         1.00     33.0\u00b11.42\u00b5s        ? ?/sec      1.03     34.1\u00b11.44\u00b5s        ? ?/sec\r\nempty_systems/075_systems                                         1.00     34.8\u00b10.89\u00b5s        ? ?/sec      1.04     36.2\u00b10.70\u00b5s        ? ?/sec\r\nempty_systems/080_systems                                         1.00     37.0\u00b11.82\u00b5s        ? ?/sec      1.05     38.7\u00b11.37\u00b5s        ? ?/sec\r\nempty_systems/085_systems                                         1.00     38.7\u00b10.76\u00b5s        ? ?/sec      1.05     40.8\u00b10.83\u00b5s        ? ?/sec\r\nempty_systems/090_systems                                         1.00     41.5\u00b11.09\u00b5s        ? ?/sec      1.04     43.2\u00b10.82\u00b5s        ? ?/sec\r\nempty_systems/095_systems                                         1.00     43.6\u00b11.10\u00b5s        ? ?/sec      1.04     45.2\u00b10.99\u00b5s        ? ?/sec\r\nempty_systems/100_systems                                         1.00     46.7\u00b12.27\u00b5s        ? ?/sec      1.03     48.1\u00b11.25\u00b5s        ? ?/sec\r\n```\r\n</details>\r\n\r\n## Migration Guide\r\n\r\n### App `runner` and SubApp `extract` functions are now required to be Send \r\n\r\nThis was changed to enable pipelined rendering. If this breaks your use case please report it as these new bounds might be able to be relaxed.\r\n\r\n## ToDo\r\n\r\n* [x] redo benchmarking\r\n* [x] reinvestigate the perf of the try_tick -> run change for task pool scope\r\n\r\n",
+    "pr_comments": [
+        ">  Fix tests. A bunch of tests are broken because tests don't run on the main thread. Need to come up with a workaround for this.\r\n\r\nYou should be able to set the number of threads the tests are run with to 1 to force this to work :)",
+        "TIL that cfg(test) only works on the current workspace being tested. I tried to revert to the previous behavior of scope when testing (each instance of scope has it's own scope executor), but this only works for bevy_tasks when using cfg[test]. The only solution I've thought of so far is to put the code behind a feature flag instead. This would mean that any time a user wants to run tests on an `App` or `Stage` they'll need to enable the feature. This may be confusing as the failure mode currently is that the test deadlocks and times out. Maybe we could add a warning/panic for when test is enabled, but the feature flag is not on.",
+        "I think my plan for now is to change the MainThreadExecutor into a resource so it's not global and pass it into scope as an optional argument. A little less ergonomic API wise, but probably better than asking users to turn on a feature flag for testing.\r\n\r\n*edit: also a step backwards from global task pools, but* \u00af\\\\_(\u30c4)_/\u00af",
+        "Would we still want a task pool scope to run the render world if `!Send` resources didn't exist?\r\n\r\nOr would we just spawn a thread for the render world and park it until some signal arrives? (I would think so since ideally nothing blocks the main thread's event loop. We'd want app world running in another thread too.)",
+        "So I changed the approach a good bit. It's now spawning a long running task that is controlled through channels that send the rendering app back and forth. This change allows the rendering app to run during input processing and will help with more consistent frame times when the app is gpu bound.\r\n\r\n> Would we still want a task pool scope to run the render world if !Send resources didn't exist?\r\n\r\nNot sure. Right now `prepare_windows` is the only thing in the render schedule that needs to run on the main thread. It's not really using a !Send resource other than as a marker to force the system to run on the main thread. I haven't looked into what it's doing to know if this could be changed somehow.\r\n",
+        "When testing many_foxes I was getting really bad frame times when the animation_player (which is part of PostUpdate) ended up running on the render thread. This delays the render thread from making progress until that system is done running.\r\n\r\n![image](https://user-images.githubusercontent.com/2180432/201008532-47e85d01-bd1f-4f3e-91df-a8192e56fee4.png)\r\n\r\nAs a quick fix I've removed ticking the task stealing executors from scope. Seems to not hurt execution time on many_foxes and makes the tail latency much better. Below is a histogram of frame times. Yellow is before removing `executor.run` and red is with `executor.run` removed. You can see that this removes the outer peaks from the distribution with the mean remaining mostly the same.\r\n\r\n![image](https://user-images.githubusercontent.com/2180432/201006554-265b9d2b-9748-4e0e-b6eb-1f40a61596cf.png)\r\n\r\nThis probably hurts the micro benchmarks a lot, but I still need to run them and test some other examples",
+        "Taking this out of draft as the code is mostly ready. Still need to think about making inserting NonSend Resources unsafe still and investigate perf more.",
+        "> Holding off on approval until we have a solid grasp on the direction of how we're dealing with `!Send` soundness in `World`.\r\n\r\nShould we prioritize refactoring these `winit` interactions so they don't use `!Send` resources?\r\n\r\nWith the `ThreadExecutor` here (maybe a simpler, non-async version) and some `NonSend` container that stores all the `!Send` resources, we could proxy all `!Send` data accesses behind them.\r\n\r\nLike if `NonSend` was stored on `App`, and we left it on the main thread at startup, `World` can be `Send`. And we don't have to limit systems to a particular thread, just blocks of code that read `NonSend`.\r\n\r\nThe main thread is just running an event loop, so systems in other threads can send `FnMut(NonSend)` objects to the main thread executor, and they'll be processed at some point in the loop. Doesn't even have to be `async`. If the main thread is just `winit` and we kick the \"main\" and render worlds to their own dedicated threads, then the event loop can run as fast as necessary.",
+        "> I'd rather us just have a dedicated thread for running each app (main and subapp), and have them all use the ComputeTaskPool for their systems/tasks.\r\n\r\nA separate thread doesn't help the problem. The ComputeTaskPool::scope will still run systems from the other app on it's thread.",
+        "Removed the render task pool and changed the ComputeTaskPool scope to not tick the global executors when running the parallel executor. Perf is roughly the same.",
+        "@hymm can you add `Fixes #4718`? The shift away from spin-ticking to using `Executor::run` should resolve it.",
+        "FYI some combination of the changes in this PR + the changes to scope on main reintroduced the flaky test problem in bevy_transform.",
+        "So the flakiness was very similar to before. It got reintroduced by transform propagation becoming multithreaded and me removing the catch unwind. So the parallel transform propagation in panicking test can poison the scope in another test. I pushed a fix where I tried to keep the `executor.run`'s, but I'm not sure if the AssertUnwindSafe's are sound or not. Need to think about it more. Also should probably bench it just to see if it has much effect. I don't think it should as it's outside the hot loop.",
+        "ran a quick test with many_foxes and it seems to have improved the frame time a decent amount. Not sure what that's about.\r\n\r\n![image](https://user-images.githubusercontent.com/2180432/207783332-4fc20785-28a4-4163-97e0-76d52c28e837.png)\r\n",
+        "@alice-i-cecile I would still mark this as blocked until #6534 or something equivalent is merged. This implementation is unsound unless we're 100% certain `World: Send`.",
+        "So more about `AssertUnwindSafe`. When I remove the `AssertUnwindSafe`,  I get this note with the errors\r\n\r\n```text\r\n = note: `UnwindSafe` is implemented for `&[closure@async_executor::Runner<'_>::runnable::{closure#0}::{closure#0}]`, but not for `&mut [closure@async_executor::Runner<'_>::runnable::{closure#0}::{closure#0}]`\r\n ```\r\n\r\nbut not sure currently what is taking the Runner as &mut instead of &",
+        "> I'm not sure if the AssertUnwindSafe's are sound or not.\r\n\r\nUnwind safety is about not leaving something in a invalid state due to an unwind, not memory safety and undefined behavior. Given that async_executor is entirely safe code (sans the task spawning from async_task), we cannot be left in a state that could trigger UB outside of our own use of `unsafe`.\r\n\r\nThis generally seems OK? See https://stackoverflow.com/questions/65762689/how-can-assertunwindsafe-be-used-with-the-catchunwind-future. The issue seems to be from the FnMut closure passed to https://github.com/smol-rs/async-executor/blob/master/src/lib.rs#L659, everything else involved uses immutable references. Sans potential lock poisoning, I don't think it's possible to leave async_executor in an invalid state.",
+        "Remember to update the PR title :)",
+        "I wanted to check that my assumption that switching to async executor's run was still worth it over try_tick in the scope, since there have been a decent number of changes in this PR and main since I did that. \r\n\r\nFor the most part there are clear gains to using `run` over `try_tick`, except for many_cubes which has a small gain on the mean and a small loss on the median. I'm going to dig a little into the traces to see if I can understand what's happening there, but I don't expect that to change the PR. \r\n\r\nNegative numbers means the current PR version was faster.\r\n<html>\r\n<body>\r\n<!--StartFragment--><google-sheets-html-origin>\r\n\r\n\u00a0 | percent | \u00a0 | \u00a0 | Diff | \u00a0 | \u00a0 | PR run scope | \u00a0 | \u00a0 | PR try_tick scope | \u00a0 | \u00a0\r\n-- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | --\r\ntracy frame time | mean | median | sigma | mean | median | sigma | mean | median | sigma | mean | median | sigma\r\nmany foxes | -5.39% | -6.80% | 37.05% | -0.23 | -0.28 | 2.06 | 4.27 | 4.12 | 5.56 | 4.5 | 4.4 | 3.5\r\nmany lights | -5.91% | -6.77% | 25.90% | -0.43 | -0.48 | 1.51 | 7.27 | 7.09 | 5.83 | 7.7 | 7.57 | 4.32\r\nmany animated sprites | -4.11% | -2.23% | 4.34% | -0.96 | -0.5 | 0.37 | 23.33 | 22.4 | 8.52 | 24.29 | 22.9 | 8.15\r\n3d scene | -14.18% | -11.19% | -93.01% | -0.2 | -0.15 | -1.73 | 1.41 | 1.34 | 1.86 | 1.61 | 1.49 | 3.59\r\nmany cubes | -0.77% | 0.57% | -19.17% | -0.11 | 0.08 | -1.48 | 14.2 | 14 | 7.72 | 14.31 | 13.92 | 9.2\r\nmany sprites | -3.26% | -1.54% | 44.27% | -0.73 | -0.33 | 5.91 | 22.37 | 21.45 | 13.35 | 23.1 | 21.78 | 7.44\r\n\r\n<!--EndFragment-->\r\n</body>\r\n</html>\r\n\r\nI still need to redo these for current main and with pipelining disabled. Once I get those numbers I'll update the tables in the description.",
+        "Updated the PR description.\r\n\r\n> except for many_cubes which has a small gain on the mean and a small loss on the median\r\n\r\nMost of the loss seems to be in extract and applying the commands from extract. I do get why having another scope active with try_tick is a problem though.\r\n\r\n![image](https://user-images.githubusercontent.com/2180432/212397292-f05e9690-21e0-4d85-830d-a305f0c07302.png)\r\n\r\nAs seen in the above image the scope running on the render thread is running tasks as fast as prepare_systems can make them. This is leading to the other threads being starved of tasks and also slowing down prepare_systems due to increased contention on the global queue (which is mostly empty). Not 100% sure why we we don't see the benefit of this as much on many_cubes. Might just be things not lining up timing wise and extract being a little more single threaded.",
+        "(sorry my vscode got overexcited, i'm still going through)",
+        "@aevyrie do you see anything in this PR that is strongly blocking your considerations around pacing? If you see that things can be reworked or adjusted later for that kind of work, and I believe that should be possible one way or another, then I feel the pacing concerns do not block this, but I wanted to at least ask.\r\n\r\n@cart I feel that you should review this and for no good reason other than it being fun, you should get to push the bors button.",
+        "Not critical, no. I find the way `BeforeIoAfterRenderStart` is added to be a bit confusing. It would make a lot more sense if this was part of the default app event loop. IMO we should remove `BeforeIoAfterRenderStart` if it doesn't work for non-pipelined apps, and add it in a separate PR instead.",
+        "> It would make a lot more sense if this was part of the default app event loop. IMO we should remove BeforeIoAfterRenderStart if it doesn't work for non-pipelined apps, and add it in a separate PR instead.\r\n\r\nHmm. Might be better to just let the frame pacing plugin itself add the stages then. It'll need to be different between when pipelined rendering is enabled or not. With pipelined rendering you need to insert after the extract schedule, but with it disabled you need to add it to the end of the rendering schedule.",
+        "> framepacing would have to do its sleep after extract because that's technically the \"beginning\" of the next frame (before winit loads new input events).\r\n\r\nYup, this is exactly what I'm doing in `bevy_framepace`. It would be better if we could do it at the start of the event loop before polling, though I don't know by how much. I can look into how we can do this in another PR, though it will depend on if we intend to keep the winit and bevy update loops linked.",
+        "bors r+",
+        "Pull request successfully merged into main.\n\nBuild succeeded:\n  * [build-and-install-on-iOS](https://github.com/bevyengine/bevy/actions/runs/3963365491/jobs/6791108629)\n  * [build-android](https://github.com/bevyengine/bevy/actions/runs/3963365491/jobs/6791108805)\n  * [build (macos-latest)](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791109009)\n  * [build (ubuntu-latest)](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791108910)\n  * [build-wasm](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791219120)\n  * [build (windows-latest)](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791108811)\n  * [build-without-default-features (bevy)](https://github.com/bevyengine/bevy/actions/runs/3963365491/jobs/6791109239)\n  * [build-without-default-features (bevy_ecs)](https://github.com/bevyengine/bevy/actions/runs/3963365491/jobs/6791108991)\n  * [build-without-default-features (bevy_reflect)](https://github.com/bevyengine/bevy/actions/runs/3963365491/jobs/6791109130)\n  * [check-compiles](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791150216)\n  * [check-doc](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791109396)\n  * [check-missing-examples-in-docs](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791109501)\n  * [ci](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791109104)\n  * [markdownlint](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791139744)\n  * [msrv](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791219039)\n  * [run-examples](https://github.com/bevyengine/bevy/actions/runs/3963365495/jobs/6791109295)\n  * [run-examples-on-wasm](https://github.com/bevyengine/bevy/actions/runs/3963365491/jobs/6791109322)\n  * run-examples-on-windows-dx12"
+    ],
+    "merged": false,
+    "created_at": "2023-01-17T06:09:44Z",
+    "issue_context": {
+        "number": 5082,
+        "title": "Pipelined Rendering: Deferred Extraction Commands",
+        "body": "## What problem does this solve or what need does it fill?\r\nRunning commands can get expensive. They require significant amounts of time relative to just normal system query iteration and require exclusive access to the World they're being run on. Extract in particular currently has an exclusive hold on *both* main and render worlds and takes significant amounts of time in large or complex scenes.\r\n\r\n## What solution would you like?\r\nWhen pipelined rendering is enabled, instead of holding an exclusive lock on both worlds. Run read-only over the main world, and send the commands to the render world, deferring command application to run in parallel with the next game tick's game update.\r\n\r\n![image](https://user-images.githubusercontent.com/3137680/175370127-31528a6a-4c1c-433c-a17f-ebe7610a7c73.png)\r\n\r\nA benefit of this approach is that there is no explicit synchronization point here other than the start of the frame. The only downside is that we need a secondary storage to drain all CommandQueues into a single one to send to the Render World. This last part can be exceptionally fast as it's essentially a single `memcpy` per system.\r\n\r\n## What alternative(s) have you considered?\r\nExplicit synchronization point between main and render worlds.",
+        "comments": [
+            "How would backpressure be applied to simulation? What if simulation can run at 1000fps but we can only render at 30fps?\r\n\r\nIn general I feel like we should be trying to avoid having to apply lots of commands that take significant time due to causing the highest frequency entities (meshes, sprites) to be repeatedly moved between ECS tables and instead try to do as much in-place and in-parallel as we can. I think if we do that, then maybe the first frame isn\u2019t super fast or when a lot of entities are spawned or perhaps come into view, but the baseline should be fast. And even when inserting a bunch of new entities, if we avoid the moving between tables, we should still be able to do extraction pretty fast. I think preallocation, fast allocation, in-place writing of component data (not the current heap allocate and push components to vecs for each mesh/sprite/any extraction system to do a batch insertion except there are multiple of these) is the real solution to the problem of slow extraction. Don\u2019t you? And @cart?",
+            "> How would backpressure be applied to simulation? What if simulation can run at 1000fps but we can only render at 30fps?\r\n\r\nBoth are synchronized at the start of a frame, so if the simulation can run at 1ms but the render takes 32ms, the main thread will wait until the render has completed. As with normal pipelined rendering ,the game tick time is bounded by the slower of the two. This also gives more time to other intensive operations. If we have rollback networking, it may not be unusual to see the main world running 2-15 times faster than rendering.\r\n\r\n> In general I feel like we should be trying to avoid having to apply lots of commands that take significant time due to causing the highest frequency entities (meshes, sprites) to be repeatedly moved between ECS tables and instead try to do as much in-place and in-parallel as we can. \r\n\r\nI am tempted to agree there. Though in the case we *do* have a large update swath in a given frame, the explicit synchronization slows both the simulation and rendering instead of just one or the other. With that said, there is ample opportunity for optimizing commands. This can be seen with #5074, where deduplicating/collapsing archetype moves across commands also cuts down on the large components being moved from table to table.\r\n\r\n> I think preallocation, fast allocation, in-place writing of component data (not the current heap allocate and push components to vecs for each mesh/sprite/any extraction system to do a batch insertion except there are multiple of these)\r\n\r\nIn a way, this *is* doing the same thing as preallocating and writing to a change-detection-less RenderWorld. It's equivalent to writing a singular huge column/table that doesn't have the fragmentation issues of normal ECS storage, and is a copy/write once, leave unchanged operation. The original Destiny talk on this kind of architecture explicitly stated that the primary goal was to extract a small, cache-friendly set of buffers that the renderer could easily point into, which is in-line with this kind of approach: we write out a small pointer as a component (`DynamicUniformIndex<T>`) that points into small cache-friendly buffers (`ComponentUniforms<T>`). If we need that information, we can always index back into these buffers if need be. The only difference between this and directly inserting as ECS components is that copying it across World boundaries goes from moving the components 2+ times per component (into the command queue and then again into ECS storage) to once for a small index component and once globally for a copy of the pointer to the allocated buffer.\r\n\r\nAs it currently stands, we really only use the information stored in `MeshUniform` when queuing material meshes, and only for the transform's pose for distance calculation. The cost of copying a 128+ byte struct multiple times, both as commands for insertion and during table moves in ECS storage is difficult to justify, particularly when it *must* be accompanied by a handle *and* a dynamic uniform index to be rendered properly.",
+            "@james7132, is this issue still unresolved? Seems to have been taken care of by #4402.\r\n\r\n`Extract` only takes shared borrows on the main world, we avoid copying command queues since the render world runs it, and the main world is handed back before they're applied. If it wasn't already, `Extract` should be the only sync point between the worlds once they're running in parallel.\r\n\r\nAnd the main world being exclusively held during `Extract` doesn't seem like an issue. I could be missing something, but the main schedule will have finished or nearly finished its work by then."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 846,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": 49,
+            "original_start_line": 49,
+            "start_side": "RIGHT",
+            "line": 57,
+            "original_line": 57,
+            "side": "RIGHT",
+            "original_position": 57,
+            "position": 57,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm having trouble understanding this graphic. Is this implying the `extract` runs before the main schedule?\r\n\r\nMy mental model of how this works is something like this:\r\n```mermaid\r\nflowchart TB\r\n    subgraph CPU1\r\n    direction LR\r\n    a1[\"BeforeIoAfterRenderStart\"]-->a2[\"winit events\"]\r\n    a2-->a3[\"main schedule\"]\r\n    end\r\n    subgraph CPU2\r\n    direction LR\r\n    b1[\"extract commands\"]-->b2[\"rendering schedule\"]\r\n    end\r\n    CPU1--extract-->CPU2\r\n```",
+                "![image](https://user-images.githubusercontent.com/2180432/213009612-b5242d26-bb73-4d8a-9769-0e1a9cebc71b.png)\r\n\r\nI tried drawing some boxes around each frame's schedules. I was trying to illustrate in this diagram that the other schedules can't run without extract finishing. And the reverse is also true, extract can't start until the schedules in both threads finish. ",
+                "![image](https://user-images.githubusercontent.com/2180432/213020786-68bd9af5-210e-4cd1-a0bd-082b64cfc351.png)\r\n\r\nThere is a small lie in this diagram where app.update is actually called on a winit event too. Also slightly bad since you're usually render bound\r\n"
+            ]
+        },
+        {
+            "hunk_id": 850,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/lib.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 326,
+            "original_line": 326,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 56,
+            "subject_type": "line",
+            "review_comments": [
+                "Note that this \"remove stage\" pattern will likely need to change with stageless: https://github.com/bevyengine/bevy/pull/7267#discussion_r1081929422"
+            ]
+        },
+        {
+            "hunk_id": 839,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_ecs/src/schedule/executor_parallel.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 153,
+            "original_line": 159,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                    while  self.queued.count_ones(..) + self.running.count_ones(..) > 0 {\r\n```\r\n\r\nI find this framing of the logic much clearer.",
+                "Better yet, you can use `FixedBitset::is_clear` (NOT `is_empty`). It should be much faster due to not needing to use masks underneath or needing to use POPCOUNT instructions and supports early returns.\n\nI didn't comment on this before due it mostly being an indentation change, but if it's going to be changed, might as well be a bit more readable (and performant).",
+                "I don't think I should be changing this logic. The only change to this is indentation in this PR.",
+                "I'm fine with that. Feel free to resolve this."
+            ]
+        },
+        {
+            "hunk_id": 841,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 70,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "Needs doc strings. In particular, as a reader I'm wondering what happens if this plugin isn't included but other rendering plugins are."
+            ]
+        },
+        {
+            "hunk_id": 778,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 72,
+            "original_line": 71,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 72,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\r\nimpl Plugin for PipelinedRenderingPlugin {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 768,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 140,
+            "original_line": 107,
+            "side": "RIGHT",
+            "original_position": 90,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "not sure if this should be the compute or render task pool. `par_for_each` use in the render world is still using the compute task pool.",
+                "using the render pool here would give one more thread to render systems while using the compute task pool gives one more thread to parallel tasks"
+            ]
+        },
+        {
+            "hunk_id": 847,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/lib.rs",
+            "start_line": 198,
+            "original_start_line": 198,
+            "start_side": "RIGHT",
+            "line": 201,
+            "original_line": 201,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "Nice touch! :)"
+            ]
+        },
+        {
+            "hunk_id": 774,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_tasks/src/task_pool.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 288,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "This parameter isn't documented.",
+                "documented it."
+            ]
+        },
+        {
+            "hunk_id": 844,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_tasks/src/task_pool.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 288,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "This parameter isn't documented.",
+                "documented it."
+            ]
+        },
+        {
+            "hunk_id": 775,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 76,
+            "original_line": 75,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "maybe this should panic? i would guess in headless mode people won't add the PipelinedRenderPlugin either.",
+                "I added this specifically so the headless example just works. The other option would be to disable the plugin in that example.",
+                "the headless example doesn't include this plugin though (it uses `MinimalPlugins` which doesn't include render or pipelined).",
+                "sorry. it was the `no_renderer` example"
+            ]
+        },
+        {
+            "hunk_id": 848,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 72,
+            "original_line": 71,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 72,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\r\nimpl Plugin for PipelinedRenderingPlugin {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 779,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_app/src/app.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1072,
+            "original_line": 1072,
+            "side": "RIGHT",
+            "original_position": 107,
+            "position": 107,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we should just remove this in favor of `insert_sub_app`. The `insert` semantics are \"correct\" anyway whereas `add` is generally used for repeatable / non-overwriting actions. This function is _slightly_ more ergonomic, but SubApps aren't exactly a common pattern anyway.",
+                "I'd be ok with removing this. I'll make an issue for this, so it doesn't get lost. "
+            ]
+        },
+        {
+            "hunk_id": 776,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": 49,
+            "original_start_line": 49,
+            "start_side": "RIGHT",
+            "line": 57,
+            "original_line": 57,
+            "side": "RIGHT",
+            "original_position": 57,
+            "position": 57,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm having trouble understanding this graphic. Is this implying the `extract` runs before the main schedule?\r\n\r\nMy mental model of how this works is something like this:\r\n```mermaid\r\nflowchart TB\r\n    subgraph CPU1\r\n    direction LR\r\n    a1[\"BeforeIoAfterRenderStart\"]-->a2[\"winit events\"]\r\n    a2-->a3[\"main schedule\"]\r\n    end\r\n    subgraph CPU2\r\n    direction LR\r\n    b1[\"extract commands\"]-->b2[\"rendering schedule\"]\r\n    end\r\n    CPU1--extract-->CPU2\r\n```",
+                "![image](https://user-images.githubusercontent.com/2180432/213009612-b5242d26-bb73-4d8a-9769-0e1a9cebc71b.png)\r\n\r\nI tried drawing some boxes around each frame's schedules. I was trying to illustrate in this diagram that the other schedules can't run without extract finishing. And the reverse is also true, extract can't start until the schedules in both threads finish. ",
+                "![image](https://user-images.githubusercontent.com/2180432/213020786-68bd9af5-210e-4cd1-a0bd-082b64cfc351.png)\r\n\r\nThere is a small lie in this diagram where app.update is actually called on a winit event too. Also slightly bad since you're usually render bound\r\n"
+            ]
+        },
+        {
+            "hunk_id": 771,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 70,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "Needs doc strings. In particular, as a reader I'm wondering what happens if this plugin isn't included but other rendering plugins are."
+            ]
+        },
+        {
+            "hunk_id": 780,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/lib.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 326,
+            "original_line": 326,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 56,
+            "subject_type": "line",
+            "review_comments": [
+                "Note that this \"remove stage\" pattern will likely need to change with stageless: https://github.com/bevyengine/bevy/pull/7267#discussion_r1081929422"
+            ]
+        },
+        {
+            "hunk_id": 773,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_tasks/src/task_pool.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 360,
+            "original_line": 350,
+            "side": "RIGHT",
+            "original_position": 130,
+            "position": 146,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm growing increasingly concerned with the complexity of this function. It's getting to the point where it's legit hard to follow the logic within (on par with `Query::par_for_each`). Can we chunk this up in any way?",
+                "not in a very clean way. The problem is that all the execute_forever futures return different types, so you can't just put them in an if statement and return them or move the if statement into the execute_forever block. I could potentially make 3 different functions for getting the executors. Would at least look a little cleaner here, but I'm not sure if it's actually better. Let me know what you think:\r\n\r\n```rust\r\n            future::block_on(async move {\r\n                let get_results = async {\r\n                    let mut results = Vec::with_capacity(spawned_ref.len());\r\n                    while let Ok(task) = spawned_ref.pop() {\r\n                        results.push(task.await.unwrap());\r\n                    }\r\n\r\n                    results\r\n                };\r\n\r\n                let tick_task_pool_executor = tick_task_pool_executor || self.threads.is_empty();\r\n                if let Some(thread_ticker) = thread_executor.ticker() {\r\n                    if tick_task_pool_executor {\r\n                        Self::execute_local_global(thread_ticker, executor, get_results).await\r\n                    } else {\r\n                        Self::execute_local(thread_ticker, get_results).await\r\n                    }\r\n                } else if tick_task_pool_executor {\r\n                    Self::execute_global(executor, get_results).await\r\n                } else {\r\n                    get_results.await\r\n                }\r\n            })\r\n        }\r\n    }\r\n\r\n    async fn execute_local_global<'scope, 'ticker, T>(\r\n        thread_ticker: ThreadExecutorTicker<'scope, 'ticker>,\r\n        executor: &'scope async_executor::Executor<'scope>,\r\n        get_results: impl Future<Output = Vec<T>>,\r\n    ) -> Vec<T> {\r\n        // we restart the executors if a task errors. if a scoped\r\n        // task errors it will panic the scope on the call to get_results\r\n        let execute_forever = async move {\r\n            loop {\r\n                let tick_forever = async {\r\n                    loop {\r\n                        thread_ticker.tick().await;\r\n                    }\r\n                };\r\n\r\n                // we don't care if it errors. If a scoped task errors it will propagate\r\n                // to get_results\r\n                let _result = AssertUnwindSafe(executor.run(tick_forever))\r\n                    .catch_unwind()\r\n                    .await\r\n                    .is_ok();\r\n            }\r\n        };\r\n\r\n        execute_forever.or(get_results).await\r\n    }\r\n\r\n    async fn execute_local<'scope, 'ticker, T>(\r\n        thread_ticker: ThreadExecutorTicker<'scope, 'ticker>,\r\n        get_results: impl Future<Output = Vec<T>>,\r\n    ) -> Vec<T> {\r\n        let execute_forever = async {\r\n            loop {\r\n                let tick_forever = async {\r\n                    loop {\r\n                        thread_ticker.tick().await;\r\n                    }\r\n                };\r\n\r\n                let _result =\r\n                    AssertUnwindSafe(tick_forever).catch_unwind().await.is_ok();\r\n            }\r\n        };\r\n\r\n        execute_forever.or(get_results).await\r\n    }\r\n\r\n    async fn execute_global<'scope, T>(\r\n        executor: &'scope async_executor::Executor<'scope>,\r\n        get_results: impl Future<Output = Vec<T>>,\r\n    ) -> Vec<T> {\r\n        let execute_forever = async {\r\n            loop {\r\n                let _result =\r\n                    AssertUnwindSafe(executor.run(std::future::pending::<()>()))\r\n                        .catch_unwind()\r\n                        .await\r\n                        .is_ok();\r\n            }\r\n        };\r\n\r\n        execute_forever.or(get_results).await\r\n    }\r\n```\r\n    ",
+                "This generally looks better to me, since the distance between the branch is smaller now and the individual approaches to executing it are isolated.\n\nIt does make one raise a few questions about the spooky action at a distance a caught unwind would cause though due to the AssertUnwindSafe usage, but as mentioned before that probably isn't too much of an issue."
+            ]
+        },
+        {
+            "hunk_id": 838,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 140,
+            "original_line": 107,
+            "side": "RIGHT",
+            "original_position": 90,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "not sure if this should be the compute or render task pool. `par_for_each` use in the render world is still using the compute task pool.",
+                "using the render pool here would give one more thread to render systems while using the compute task pool gives one more thread to parallel tasks"
+            ]
+        },
+        {
+            "hunk_id": 777,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/lib.rs",
+            "start_line": 198,
+            "original_start_line": 198,
+            "start_side": "RIGHT",
+            "line": 201,
+            "original_line": 201,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "Nice touch! :)"
+            ]
+        },
+        {
+            "hunk_id": 840,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_ecs/src/schedule/executor_parallel.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 156,
+            "original_line": 162,
+            "side": "RIGHT",
+            "original_position": 79,
+            "position": 73,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                        if self.running.count_ones(..) > 0 {\r\n```",
+                "I don't think I should be changing this logic. The only change to this is indentation in this PR.",
+                "I'm fine with that. Feel free to resolve this."
+            ]
+        },
+        {
+            "hunk_id": 843,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_tasks/src/task_pool.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 360,
+            "original_line": 350,
+            "side": "RIGHT",
+            "original_position": 130,
+            "position": 146,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm growing increasingly concerned with the complexity of this function. It's getting to the point where it's legit hard to follow the logic within (on par with `Query::par_for_each`). Can we chunk this up in any way?",
+                "not in a very clean way. The problem is that all the execute_forever futures return different types, so you can't just put them in an if statement and return them or move the if statement into the execute_forever block. I could potentially make 3 different functions for getting the executors. Would at least look a little cleaner here, but I'm not sure if it's actually better. Let me know what you think:\r\n\r\n```rust\r\n            future::block_on(async move {\r\n                let get_results = async {\r\n                    let mut results = Vec::with_capacity(spawned_ref.len());\r\n                    while let Ok(task) = spawned_ref.pop() {\r\n                        results.push(task.await.unwrap());\r\n                    }\r\n\r\n                    results\r\n                };\r\n\r\n                let tick_task_pool_executor = tick_task_pool_executor || self.threads.is_empty();\r\n                if let Some(thread_ticker) = thread_executor.ticker() {\r\n                    if tick_task_pool_executor {\r\n                        Self::execute_local_global(thread_ticker, executor, get_results).await\r\n                    } else {\r\n                        Self::execute_local(thread_ticker, get_results).await\r\n                    }\r\n                } else if tick_task_pool_executor {\r\n                    Self::execute_global(executor, get_results).await\r\n                } else {\r\n                    get_results.await\r\n                }\r\n            })\r\n        }\r\n    }\r\n\r\n    async fn execute_local_global<'scope, 'ticker, T>(\r\n        thread_ticker: ThreadExecutorTicker<'scope, 'ticker>,\r\n        executor: &'scope async_executor::Executor<'scope>,\r\n        get_results: impl Future<Output = Vec<T>>,\r\n    ) -> Vec<T> {\r\n        // we restart the executors if a task errors. if a scoped\r\n        // task errors it will panic the scope on the call to get_results\r\n        let execute_forever = async move {\r\n            loop {\r\n                let tick_forever = async {\r\n                    loop {\r\n                        thread_ticker.tick().await;\r\n                    }\r\n                };\r\n\r\n                // we don't care if it errors. If a scoped task errors it will propagate\r\n                // to get_results\r\n                let _result = AssertUnwindSafe(executor.run(tick_forever))\r\n                    .catch_unwind()\r\n                    .await\r\n                    .is_ok();\r\n            }\r\n        };\r\n\r\n        execute_forever.or(get_results).await\r\n    }\r\n\r\n    async fn execute_local<'scope, 'ticker, T>(\r\n        thread_ticker: ThreadExecutorTicker<'scope, 'ticker>,\r\n        get_results: impl Future<Output = Vec<T>>,\r\n    ) -> Vec<T> {\r\n        let execute_forever = async {\r\n            loop {\r\n                let tick_forever = async {\r\n                    loop {\r\n                        thread_ticker.tick().await;\r\n                    }\r\n                };\r\n\r\n                let _result =\r\n                    AssertUnwindSafe(tick_forever).catch_unwind().await.is_ok();\r\n            }\r\n        };\r\n\r\n        execute_forever.or(get_results).await\r\n    }\r\n\r\n    async fn execute_global<'scope, T>(\r\n        executor: &'scope async_executor::Executor<'scope>,\r\n        get_results: impl Future<Output = Vec<T>>,\r\n    ) -> Vec<T> {\r\n        let execute_forever = async {\r\n            loop {\r\n                let _result =\r\n                    AssertUnwindSafe(executor.run(std::future::pending::<()>()))\r\n                        .catch_unwind()\r\n                        .await\r\n                        .is_ok();\r\n            }\r\n        };\r\n\r\n        execute_forever.or(get_results).await\r\n    }\r\n```\r\n    ",
+                "This generally looks better to me, since the distance between the branch is smaller now and the individual approaches to executing it are isolated.\n\nIt does make one raise a few questions about the spooky action at a distance a caught unwind would cause though due to the AssertUnwindSafe usage, but as mentioned before that probably isn't too much of an issue."
+            ]
+        },
+        {
+            "hunk_id": 770,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_ecs/src/schedule/executor_parallel.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 156,
+            "original_line": 162,
+            "side": "RIGHT",
+            "original_position": 79,
+            "position": 73,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                        if self.running.count_ones(..) > 0 {\r\n```",
+                "I don't think I should be changing this logic. The only change to this is indentation in this PR.",
+                "I'm fine with that. Feel free to resolve this."
+            ]
+        },
+        {
+            "hunk_id": 845,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_render/src/pipelined_rendering.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 76,
+            "original_line": 75,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "maybe this should panic? i would guess in headless mode people won't add the PipelinedRenderPlugin either.",
+                "I added this specifically so the headless example just works. The other option would be to disable the plugin in that example.",
+                "the headless example doesn't include this plugin though (it uses `MinimalPlugins` which doesn't include render or pipelined).",
+                "sorry. it was the `no_renderer` example"
+            ]
+        },
+        {
+            "hunk_id": 849,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_app/src/app.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1072,
+            "original_line": 1072,
+            "side": "RIGHT",
+            "original_position": 107,
+            "position": 107,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we should just remove this in favor of `insert_sub_app`. The `insert` semantics are \"correct\" anyway whereas `add` is generally used for repeatable / non-overwriting actions. This function is _slightly_ more ergonomic, but SubApps aren't exactly a common pattern anyway.",
+                "I'd be ok with removing this. I'll make an issue for this, so it doesn't get lost. "
+            ]
+        },
+        {
+            "hunk_id": 769,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_ecs/src/schedule/executor_parallel.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 153,
+            "original_line": 159,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                    while  self.queued.count_ones(..) + self.running.count_ones(..) > 0 {\r\n```\r\n\r\nI find this framing of the logic much clearer.",
+                "Better yet, you can use `FixedBitset::is_clear` (NOT `is_empty`). It should be much faster due to not needing to use masks underneath or needing to use POPCOUNT instructions and supports early returns.\n\nI didn't comment on this before due it mostly being an indentation change, but if it's going to be changed, might as well be a bit more readable (and performant).",
+                "I don't think I should be changing this logic. The only change to this is indentation in this PR.",
+                "I'm fine with that. Feel free to resolve this."
+            ]
+        },
+        {
+            "hunk_id": 772,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_tasks/src/task_pool.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 303,
+            "original_line": 292,
+            "side": "RIGHT",
+            "original_position": 72,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "This logic is hard to follow at first pass; I'd like a comment on this if/else block."
+            ]
+        },
+        {
+            "hunk_id": 842,
+            "commit_id": "0ebbde7e000067e67b3abfd53a40b74c7c5ec0a3",
+            "original_commit_id": "2f4cf768661839079f49fe5ef9527248a9131b95",
+            "path": "crates/bevy_tasks/src/task_pool.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 303,
+            "original_line": 292,
+            "side": "RIGHT",
+            "original_position": 72,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "This logic is hard to follow at first pass; I'd like a comment on this if/else block."
+            ]
+        }
+    ]
+}

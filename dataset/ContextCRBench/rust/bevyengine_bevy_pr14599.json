@@ -1,0 +1,70 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 14599,
+    "lang": "rust",
+    "pr_title": "Fix lightmaps break when deferred rendering is enabled",
+    "pr_body": "# Objective\r\n- Fixes https://github.com/bevyengine/bevy/issues/13552\r\n\r\n## Solution\r\n- Thanks for the guidance from @DGriffin91, the current solution is to transmit the light_map through the emissive channel to avoid increasing the bandwidth of deferred shading. \r\n- <del>Store lightmap sample result into G-Buffer and pass them into the `Deferred Lighting Pipeline`, therefore we can get the correct indirect lighting via the `apply_pbr_lighting` function.</del>\r\n- <del>The original G-Buffer lacks storage for lightmap data, therefore a new buffer is added. We can only use Rgba16Uint here due to the 32-byte limit on the render targets.</del>\r\n\r\n## Testing\r\n- Need to test all the examples that contains a prepass, with both the forward and deferred rendering mode.\r\n- I have tested the ones below.\r\n    - `lightmaps` (adjust the code based on the issue and check the rendering result)\r\n    - `transmission` (it contains a prepass)\r\n    - `ssr` (it also uses the G-Bufffer)\r\n    - `meshlet` (forward and deferred)\r\n    - `pbr`\r\n\r\n## Showcase\r\nBy updating the `lightmaps` example to use deferred rendering, this pull request enables correct rendering result of the Cornell Box.\r\n\r\n```\r\ndiff --git a/examples/3d/lightmaps.rs b/examples/3d/lightmaps.rs\r\nindex 564a3162b..11a748fba 100644\r\n--- a/examples/3d/lightmaps.rs\r\n+++ b/examples/3d/lightmaps.rs\r\n@@ -1,12 +1,14 @@\r\n //! Rendering a scene with baked lightmaps.\r\n \r\n-use bevy::pbr::Lightmap;\r\n+use bevy::core_pipeline::prepass::DeferredPrepass;\r\n+use bevy::pbr::{DefaultOpaqueRendererMethod, Lightmap};\r\n use bevy::prelude::*;\r\n \r\n fn main() {\r\n     App::new()\r\n         .add_plugins(DefaultPlugins)\r\n         .insert_resource(AmbientLight::NONE)\r\n+        .insert_resource(DefaultOpaqueRendererMethod::deferred())\r\n         .add_systems(Startup, setup)\r\n         .add_systems(Update, add_lightmaps_to_meshes)\r\n         .run();\r\n@@ -19,10 +21,12 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {\r\n         ..default()\r\n     });\r\n \r\n-    commands.spawn(Camera3dBundle {\r\n-        transform: Transform::from_xyz(-278.0, 273.0, 800.0),\r\n-        ..default()\r\n-    });\r\n+    commands\r\n+        .spawn(Camera3dBundle {\r\n+            transform: Transform::from_xyz(-278.0, 273.0, 800.0),\r\n+            ..default()\r\n+        })\r\n+        .insert(DeferredPrepass);\r\n }\r\n \r\n fn add_lightmaps_to_meshes(\r\n```\r\n\r\n<img width=\"1280\" alt=\"image\" src=\"https://github.com/user-attachments/assets/17fd3367-61cc-4c23-b956-e7cfc751af3c\">\r\n\r\n## Emissive Issue\r\n**The emissive light object appears incorrectly rendered because the alpha channel of emission is set to 1 in deferred rendering and 0 in forward rendering, leading to different emissive light result. Could this be a bug?**\r\n\r\n```wgsl\r\n// pbr_deferred_functions.wgsl - pbr_input_from_deferred_gbuffer\r\nlet emissive = rgb9e5::rgb9e5_to_vec3_(gbuffer.g);\r\nif ((pbr.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) != 0u) {\r\n    pbr.material.base_color = vec4(emissive, 1.0);\r\n    pbr.material.emissive = vec4(vec3(0.0), 1.0);\r\n} else {\r\n    pbr.material.base_color = vec4(pow(base_rough.rgb, vec3(2.2)), 1.0);\r\n    pbr.material.emissive = vec4(emissive, 1.0);\r\n}\r\n\r\n// pbr_functions.wgsl - apply_pbr_lighting\r\nemissive_light = emissive_light * mix(1.0, view_bindings::view.exposure, emissive.a);\r\n```\r\n",
+    "pr_comments": [
+        "Btw, maybe we should open another issue for the emissive issue?",
+        "Related: https://github.com/bevyengine/bevy/pull/13871",
+        "The output of the deferred pass is already too large. We can't afford to include an additional attachment. I think the lightmap data should be stored in the emissive channel as it is essentially emissive.",
+        "> The output of the deferred pass is already too large. We can't afford to include an additional attachment. I think the lightmap data should be stored in the emissive channel as it is essentially emissive.\n\nGood idea, the emissive object seems not need a lightmap, let me do some research and change the code. ",
+        "If we use the deferred.y to store emissive or lightmap, we need to add an extra bit to distinguish between them. Therefore we can no longer use `rgb9e5::vec3_to_rgb9e5_` to pack the emissive value, we need to pack it with the `pack_unorm4x8_`, there maybe loss of precision, is it affordable? Perhaps we should enable it only when a lightmap is included.\r\n\r\n**Note that the `pack_unorm4x8_` can only store color values between 0.0 to 1.0. Therefore, if the emissive component's value exceeds one, as in the EDR rendering, this presents a problem.**\r\n\r\n## Previous\r\n```rust\r\nlet deferred = vec4(\r\n    deferred_types::pack_unorm4x8_(vec4(base_color_srgb, in.material.perceptual_roughness)),\r\n    rgb9e5::vec3_to_rgb9e5_(emissive),\r\n    props,\r\n    deferred_types::pack_24bit_normal_and_flags(octahedral_normal, flags),\r\n);\r\n```\r\n\r\n## New\r\n```rust\r\nlet deferred = vec4(\r\n    deferred_types::pack_unorm4x8_(vec4(base_color_srgb, in.material.perceptual_roughness)),\r\n    deferred_types::pack_unorm4x8_(vec4(emissive_or_lightmap, has_lightmap)),\r\n    props,\r\n    deferred_types::pack_24bit_normal_and_flags(octahedral_normal, flags),\r\n);\r\n```",
+        "Both the emissive and the light map need the extra precision and range from rgb9e5. My recommendation is actually to sum the emissive and light map into the emissive channel as light maps are essentially emissive.\r\n\r\nYou'd want to pre-multiply it by the diffuse color as seen here: https://github.com/bevyengine/bevy/blob/0c7df881e72c1167060c170b09e02586fc74d85f/crates/bevy_pbr/src/render/pbr_functions.wgsl#L551\r\n\r\n",
+        "Hi @DGriffin91 , I have used the emissive channel to transmit the lightmap data. Could you please review the code? Thank you.",
+        "Hi @JMS55 , I have synchronized my code with upstream and made necessary adaptations for the changes in the emissive's alpha channel. Now the lightmap works perfectly without the emissive issues we discussed earlier.\r\n<img width=\"1280\" alt=\"image\" src=\"https://github.com/user-attachments/assets/99080b5f-d693-467e-b01c-2351372e6504\">\r\n\r\n",
+        "Hi @DGriffin91 , could you please help review these changes? Thank you.",
+        "Hi @IceSentry and @JMS55 , we need to keep the `LIGHTMAP` shader definition because the fragment shader defined in pbr.wgsl is invoked by the Prepass Pipeline. The lightmap data is derived through the pbr_input_from_standard_material function. It is essential to use the LIGHTMAP keyword to ensure the lightmap_light is correctly fetched.\r\n\r\n```wgsl\r\n// Invoked from Prepass Pipeline\r\nfn pbr_input_from_standard_material(\r\n    in: VertexOutput,\r\n    is_front: bool,\r\n) -> pbr_types::PbrInput {\r\n    // ...\r\n    #ifdef LIGHTMAP\r\n        pbr_input.lightmap_light = lightmap(\r\n            in.uv_b,\r\n            pbr_bindings::material.lightmap_exposure,\r\n            in.instance_index);\r\n    #endif\r\n    // ...\r\n}\r\n```"
+    ],
+    "merged": true,
+    "created_at": "2024-09-26T21:46:26Z",
+    "issue_context": {
+        "number": 13552,
+        "title": "Lightmaps break when deferred rendering is enabled",
+        "body": "## Bevy version\r\n\r\nLatest main\r\n\r\n## Relevant system information\r\n\r\nWindows 10\r\n\r\n```\r\nAdapterInfo { name: \"AMD Radeon RX 7900 XT\", vendor: 4098, device: 29772, device_type: DiscreteGpu, driver: \"AMD proprietary driver\", driver_info: \"24.5.1 (LLPC)\", backend: Vulkan }\r\n```\r\n\r\n## What you did\r\n\r\n- Go to the lightmaps example\r\n- Add  `.insert_resource(Msaa::Off)` and `.insert_resource(DefaultOpaqueRendererMethod::deferred())` to the app.\r\n- Add `.insert(DeferredPrepass)` or `.insert(ScreenSpaceReflectionsBundle::default())` to the camera.\r\n\r\n## What went wrong\r\n\r\nIt looks like this:\r\n![image](https://github.com/bevyengine/bevy/assets/23659539/573b706f-22d0-4f01-82d9-2156ef3a907d)\r\n\r\nOther lights seem to work as normal.\r\n",
+        "comments": [
+            "I can't edit the issue title, but @alice-i-cecile it's an issue with deferred, not SSR.\r\n\r\nIt seems like lightmaps are not added to the gbuffer.",
+            "Is this a regression since 0.13?",
+            "No, looks like 0.13 has the same issue",
+            "Thanks for checking. Unfortunate bug, but not blocking for the release of 0.14 then."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1414,
+            "commit_id": "86d00edfecab0c5be856fbb85c24f938ec1caae7",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_pbr/src/prepass/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 429,
+            "original_line": 429,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "This is currently never used in the shader so not sure it's necessary."
+            ]
+        },
+        {
+            "hunk_id": 1413,
+            "commit_id": "86d00edfecab0c5be856fbb85c24f938ec1caae7",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_pbr/src/prepass/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 428,
+            "original_line": 428,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this still needed?"
+            ]
+        }
+    ]
+}

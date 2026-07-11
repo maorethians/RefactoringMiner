@@ -1,0 +1,107 @@
+{
+    "repo": "bazelbuild/bazel",
+    "pr_number": 23382,
+    "lang": "java",
+    "pr_title": "Force synchronous upload and reuse of possibly modified spawn outputs",
+    "pr_body": "When an action may modify a spawn's outputs after execution, the upload of outputs to the cache and reuse for deduplicated actions need to happen synchronously directly after spawn execution to avoid a race.\r\n\r\nThis commit implements this for cache uploads by marking all actions with this property and simply disabling async upload for all spawns executed by such actions.\r\n\r\nFor output reuse, all executions deduplicated against the first one register atomically upon deduplication and cause the cache upload to wait for all of them to complete reuse. \r\n\r\nFixes #22501\r\nFixes #23288 \r\nWork towards #21578 \r\nCloses #23307 (no longer needed)",
+    "pr_comments": [
+        "FYI @aranguyen: We don't need to modify anything about how paths are rewritten in Java actions to benefit from execution deduplication with this change. We should still look into getting rid of the in-place modification for direct classpath header compilation to avoid the synchronous fallback introduced by this change.",
+        "@tjgq I have no idea how to test this short of running a large build in CI. I tested it manually on Bazel itself, with promising results: I no longer get any failures and build times improve noticeably.\r\n\r\nRepresentative build results for `bazel build //src/main/java/...` with an initially empty disk cache on an M3 MacBook:\r\n```\r\n# Baseline\r\nINFO: Elapsed time: 102.879s, Critical Path: 24.86s\r\nINFO: 5128 processes: 145 internal, 3076 darwin-sandbox, 1907 worker.\r\n\r\n# --experimental_worker_multiplex_sandboxing\r\nINFO: Elapsed time: 115.551s, Critical Path: 29.83s\r\nINFO: 5128 processes: 145 internal, 3076 darwin-sandbox, 1907 worker.\r\n\r\n# --experimental_worker_multiplex_sandboxing --experimental_output_paths=strip, with deduplication patched out\r\nINFO: Elapsed time: 95.024s, Critical Path: 27.01s\r\nINFO: 5128 processes: 1438 disk cache hit, 145 internal, 2375 darwin-sandbox, 1170 worker.\r\n\r\n# --experimental_worker_multiplex_sandboxing --experimental_output_paths=strip\r\nINFO: Elapsed time: 80.242s, Critical Path: 22.04s\r\nINFO: 5128 processes: 1367 disk cache hit, 145 internal, 2171 darwin-sandbox, 459 deduplicated, 986 worker.\r\n```\r\n\r\nI expect the sandboxing overhead to be lower on Linux, but even with the overhead, path mapping is substantially faster.",
+        "> I'm not going to insist too much because I know this might be a lot of effort, but: is there some way we can write a test to verify that a fast, async-unsafe spawn waits for a slow, concurrent one to reuse its outputs before proceeding?\r\n\r\nI added a Java test that relies on mocking to make `waitForAndReuseOutputs` controllably slow. I don't think it's guaranteed to catch the issue if it comes back, but I verified that removing the call to `awaitAllOutputReuse` makes it fail. \r\n\r\nThe problem is that we can't just make the other spawn slow (it doesn't run anyway), we need to make its output reuse slow. A more realistic test would be possible if we could somehow delay file system operations. Is that something that the test filesystem supports (say, stall updates to `/exec/root/bazel-bin/k8-opt/bin/output` on a synchronization barrier)? ",
+        "> > I'm not going to insist too much because I know this might be a lot of effort, but: is there some way we can write a test to verify that a fast, async-unsafe spawn waits for a slow, concurrent one to reuse its outputs before proceeding?\r\n> \r\n> I added a Java test that relies on mocking to make `waitForAndReuseOutputs` controllably slow. I don't think it's guaranteed to catch the issue if it comes back, but I verified that removing the call to `awaitAllOutputReuse` makes it fail.\r\n> \r\n> The problem is that we can't just make the other spawn slow (it doesn't run anyway), we need to make its output reuse slow. A more realistic test would be possible if we could somehow delay file system operations. Is that something that the test filesystem supports (say, stall updates to `/exec/root/bazel-bin/k8-opt/bin/output` on a synchronization barrier)?\r\n\r\nIt might be possible with a custom FileSystem implementation; see https://cs.opensource.google/bazel/bazel/+/master:src/test/java/com/google/devtools/build/lib/remote/ActionInputPrefetcherTestBase.java;l=134;drc=3fe227ff418ef81eb5f221625bfd90f52ac70150 for inspiration.",
+        "Thanks for the pointer, that looks pretty interesting. Since the main code path here goes through `FileSystemUtils.copyFile` and not a fixed method on `Path`, I think that the current approach may even be more robust though (I am looking into changing the implementation to use NIO).\r\n\r\nI added an assert that should make it less likely that the test fails open.",
+        "@bazel-io fork 7.4.0"
+    ],
+    "merged": false,
+    "created_at": "2024-08-27T11:45:19Z",
+    "issue_context": {
+        "number": 23288,
+        "title": "Race conditions with local action deduplication",
+        "body": "While testing path mapping on Bazel itself with 7.3.0, I just encountered the following exceptions:\r\n```\r\njava.lang.RuntimeException: Unrecoverable error while evaluating node 'ActionLookupData0{actionLookupKey=ConfiguredTargetKey{label=//src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller:v2, config=BuildConfigurationKey[153e20f2e3739e0fdcb3b5e06c3ec8614ec4e43b5ff5f93c78bf2a56108ee671]}, actionIndex=0}' (requested by nodes 'ArtifactNestedSetKey[4]@42667357', 'ArtifactNestedSetKey[3]@612534160', 'ArtifactNestedSetKey[8]@776188326')\r\n\tat com.google.devtools.build.skyframe.AbstractParallelEvaluator$Evaluate.run(AbstractParallelEvaluator.java:550)\r\n\tat com.google.devtools.build.lib.concurrent.AbstractQueueVisitor$WrappedRunnable.run(AbstractQueueVisitor.java:414)\r\n\tat java.base/java.util.concurrent.ForkJoinTask$RunnableExecuteAction.exec(Unknown Source)\r\n\tat java.base/java.util.concurrent.ForkJoinTask.doExec(Unknown Source)\r\n\tat java.base/java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(Unknown Source)\r\n\tat java.base/java.util.concurrent.ForkJoinPool.scan(Unknown Source)\r\n\tat java.base/java.util.concurrent.ForkJoinPool.runWorker(Unknown Source)\r\n\tat java.base/java.util.concurrent.ForkJoinWorkerThread.run(Unknown Source)\r\nCaused by: java.lang.IllegalStateException: Missing original path for mapped path bazel-out/darwin_arm64-fastbuild/bin/src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller/libcontroller-hjar.jar in bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller/libv2-hjar.jdeps\r\njdeps: dependency {\r\n  path: \"bazel-out/darwin_arm64-fastbuild/bin/src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller/libcontroller-hjar.jar\"\r\n  kind: EXPLICIT\r\n}\r\nrule_label: \"//src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller:v2\"\r\nsuccess: true\r\n\r\npath map: {bazel-out/cfg/bin/external/rules_java~/toolchains/platformclasspath.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_java~/toolchains/platformclasspath.jar, bazel-out/cfg/bin/src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller/libcontroller-hjar.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/src/main/java/com/google/devtools/build/lib/sandbox/cgroups/controller/libcontroller-hjar.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/errorprone/error_prone_annotations/2.24.1/header_error_prone_annotations-2.24.1.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/errorprone/error_prone_annotations/2.24.1/header_error_prone_annotations-2.24.1.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/errorprone/error_prone_type_annotations/2.23.0/header_error_prone_type_annotations-2.23.0.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/errorprone/error_prone_type_annotations/2.23.0/header_error_prone_type_annotations-2.23.0.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/github/stephenc/jcip/jcip-annotations/1.0-1/header_jcip-annotations-1.0-1.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/github/stephenc/jcip/jcip-annotations/1.0-1/header_jcip-annotations-1.0-1.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/code/findbugs/jsr305/3.0.2/header_jsr305-3.0.2.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/code/findbugs/jsr305/3.0.2/header_jsr305-3.0.2.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/guava/guava/33.0.0-jre/header_guava-33.0.0-jre.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/guava/guava/33.0.0-jre/header_guava-33.0.0-jre.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/guava/failureaccess/1.0.2/header_failureaccess-1.0.2.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/guava/failureaccess/1.0.2/header_failureaccess-1.0.2.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/header_listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/header_listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/com/google/j2objc/j2objc-annotations/2.8/header_j2objc-annotations-2.8.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/com/google/j2objc/j2objc-annotations/2.8/header_j2objc-annotations-2.8.jar, bazel-out/cfg/bin/external/rules_jvm_external~~maven~maven/org/checkerframework/checker-qual/3.42.0/header_checker-qual-3.42.0.jar=bazel-out/darwin_arm64-opt-exec-ST-fad1763555eb/bin/external/rules_jvm_external~~maven~maven/org/checkerframework/checker-qual/3.42.0/header_checker-qual-3.42.0.jar}\r\n\tat com.google.devtools.build.lib.rules.java.JavaCompileAction.createFullOutputDeps(JavaCompileAction.java:796)\r\n\tat com.google.devtools.build.lib.rules.java.JavaHeaderCompileAction.afterExecute(JavaHeaderCompileAction.java:147)\r\n\tat com.google.devtools.build.lib.analysis.actions.SpawnAction.execute(SpawnAction.java:262)\r\n\tat com.google.devtools.build.lib.skyframe.SkyframeActionExecutor$ActionRunner.executeAction(SkyframeActionExecutor.java:1159)\r\n\tat com.google.devtools.build.lib.skyframe.SkyframeActionExecutor$ActionRunner.run(SkyframeActionExecutor.java:1076)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionState.runStateMachine(ActionExecutionState.java:165)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionState.getResultOrDependOnFuture(ActionExecutionState.java:94)\r\n\tat com.google.devtools.build.lib.skyframe.SkyframeActionExecutor.executeAction(SkyframeActionExecutor.java:573)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionFunction.checkCacheAndExecuteIfNeeded(ActionExecutionFunction.java:862)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionFunction.computeInternal(ActionExecutionFunction.java:334)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionFunction.compute(ActionExecutionFunction.java:172)\r\n\tat com.google.devtools.build.skyframe.AbstractParallelEvaluator$Evaluate.run(AbstractParallelEvaluator.java:461)\r\n\t... 7 more\r\n```\r\n\r\nand\r\n\r\n```\r\njava.io.FileNotFoundException: /private/var/tmp/_bazel_fmeum/507738cfc7e6cde00e4a0230e9aa0722/execroot/_main/bazel-out/_tmp/actions/remote/175.tmp (No such file or directory)\r\n\tat com.google.devtools.build.lib.unix.NativePosixFiles.lstat(Native Method)\r\n\tat com.google.devtools.build.lib.unix.UnixFileSystem.statInternal(UnixFileSystem.java:212)\r\n\tat com.google.devtools.build.lib.unix.UnixFileSystem.stat(UnixFileSystem.java:201)\r\n\tat com.google.devtools.build.lib.vfs.Path.stat(Path.java:290)\r\n\tat com.google.devtools.build.lib.vfs.FileSystemUtils.moveFile(FileSystemUtils.java:456)\r\n\tat com.google.devtools.build.lib.remote.RemoteExecutionService.moveOutputsToFinalLocation(RemoteExecutionService.java:878)\r\n\tat com.google.devtools.build.lib.remote.RemoteExecutionService.waitForAndReuseOutputs(RemoteExecutionService.java:1473)\r\n\tat com.google.devtools.build.lib.remote.RemoteSpawnCache.lookup(RemoteSpawnCache.java:169)\r\n\tat com.google.devtools.build.lib.exec.AbstractSpawnStrategy.exec(AbstractSpawnStrategy.java:151)\r\n\tat com.google.devtools.build.lib.exec.AbstractSpawnStrategy.exec(AbstractSpawnStrategy.java:118)\r\n\tat com.google.devtools.build.lib.exec.SpawnStrategyResolver.exec(SpawnStrategyResolver.java:45)\r\n\tat com.google.devtools.build.lib.rules.java.JavaCompileAction.execute(JavaCompileAction.java:425)\r\n\tat com.google.devtools.build.lib.skyframe.SkyframeActionExecutor$ActionRunner.executeAction(SkyframeActionExecutor.java:1155)\r\n\tat com.google.devtools.build.lib.skyframe.SkyframeActionExecutor$ActionRunner.run(SkyframeActionExecutor.java:1068)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionState.runStateMachine(ActionExecutionState.java:166)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionState.getResultOrDependOnFuture(ActionExecutionState.java:95)\r\n\tat com.google.devtools.build.lib.skyframe.SkyframeActionExecutor.executeAction(SkyframeActionExecutor.java:559)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionFunction.checkCacheAndExecuteIfNeeded(ActionExecutionFunction.java:902)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionFunction.computeInternal(ActionExecutionFunction.java:349)\r\n\tat com.google.devtools.build.lib.skyframe.ActionExecutionFunction.compute(ActionExecutionFunction.java:190)\r\n\tat com.google.devtools.build.skyframe.AbstractParallelEvaluator$Evaluate.run(AbstractParallelEvaluator.java:467)\r\n\tat com.google.devtools.build.lib.concurrent.AbstractQueueVisitor$WrappedRunnable.run(AbstractQueueVisitor.java:435)\r\n\tat java.base/java.util.concurrent.ForkJoinTask$RunnableExecuteAction.exec(ForkJoinTask.java:1423)\r\n\tat java.base/java.util.concurrent.ForkJoinTask.doExec(ForkJoinTask.java:387)\r\n\tat java.base/java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(ForkJoinPool.java:1312)\r\n\tat java.base/java.util.concurrent.ForkJoinPool.scan(ForkJoinPool.java:1843)\r\n\tat java.base/java.util.concurrent.ForkJoinPool.runWorker(ForkJoinPool.java:1808)\r\n\tat java.base/java.util.concurrent.ForkJoinWorkerThread.run(ForkJoinWorkerThread.java:188)\r\n```\r\n\r\n_Originally posted by @fmeum in https://github.com/bazelbuild/bazel/discussions/22658#discussioncomment-10330250_",
+        "comments": [
+            "@bazel-io fork 7.3.1",
+            "The second issue is fixed by https://github.com/bazelbuild/bazel/pull/23296.\r\n\r\nThe first one is more difficult to solve: the Java compilation action runs two spawns and modifies or deletes outputs in multiple cases, both before falling back to the second spawn and after each spawn to rewrite the `.jdeps` file.\r\n\r\n@tjgq Do you happen to know how remote cache uploads interact with this logic? It seems like either they are robust against this kind of race and then local execution deduplication could reuse the same logic or they are potentially affected by this as well.",
+            "With the small fix in https://github.com/bazelbuild/bazel/pull/23296 as well as https://github.com/bazelbuild/bazel/pull/23307, which temporarily disables deduplication for Java actions, this problem should be gone at HEAD. If they get merged in time, we could even cherry-pick the rollforward with these two fixes into 7.3.1.",
+            "@bazel-io fork 7.3.1",
+            "@iancha1992 Please consider this a (very) soft blocker for 7.3.1 only: it would be great to get in if ready in time, but there is no need to block the release for it.",
+            "> @tjgq Do you happen to know how remote cache uploads interact with this logic? It seems like either they are robust against this kind of race and then local execution deduplication could reuse the same logic or they are potentially affected by this as well.\r\n\r\nI would not expect remote uploads to be robust; the upload logic assumes that, once an output file is created, it will not disappear for the remainder of the build.\r\n\r\nThis is also a problem for async uploading. At some point I'd like to find a general solution, but I think for the time being we should special-case our way out of it (as you're already doing in https://github.com/bazelbuild/bazel/pull/23307).",
+            "A fix for this issue has been included in [Bazel 7.4.0 RC1](https://github.com/bazelbuild/bazel/releases/tag/7.4.0rc1). Please test out the release candidate and report any issues as soon as possible.\r\nIf you're using Bazelisk, you can point to the latest RC by setting `USE_BAZEL_VERSION=7.4.0rc1`. Thanks!"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 20328,
+            "commit_id": "eb8af59d5b35e4e9fdb48658dc765e0261de25c2",
+            "original_commit_id": "f9ed0b03269ee5364f01e1d177129e4597ba0a48",
+            "path": "src/test/java/com/google/devtools/build/lib/remote/RemoteSpawnCacheTest.java",
+            "start_line": 804,
+            "original_start_line": 798,
+            "start_side": "RIGHT",
+            "line": 806,
+            "original_line": 800,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 83,
+            "subject_type": "line",
+            "review_comments": [
+                "As a sanity check, can we verify that this is only called for the second spawn?"
+            ]
+        },
+        {
+            "hunk_id": 20492,
+            "commit_id": "eb8af59d5b35e4e9fdb48658dc765e0261de25c2",
+            "original_commit_id": "f9ed0b03269ee5364f01e1d177129e4597ba0a48",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteSpawnCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 116,
+            "original_line": 116,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "I *think* that we don't need to do this atomically, we could CAS into the map and then register as separate steps. But I'm also not 100% sure and I guess this lambda is fast enough that it doesn't hurt.",
+                "I concur that it would probably be okay to (attempt to) register outside of the critical section, but let's not overthink it if it's not a performance issue."
+            ]
+        },
+        {
+            "hunk_id": 20493,
+            "commit_id": "eb8af59d5b35e4e9fdb48658dc765e0261de25c2",
+            "original_commit_id": "f9ed0b03269ee5364f01e1d177129e4597ba0a48",
+            "path": "src/test/java/com/google/devtools/build/lib/remote/RemoteSpawnCacheTest.java",
+            "start_line": 804,
+            "original_start_line": 798,
+            "start_side": "RIGHT",
+            "line": 806,
+            "original_line": 800,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 83,
+            "subject_type": "line",
+            "review_comments": [
+                "As a sanity check, can we verify that this is only called for the second spawn?"
+            ]
+        },
+        {
+            "hunk_id": 20327,
+            "commit_id": "eb8af59d5b35e4e9fdb48658dc765e0261de25c2",
+            "original_commit_id": "f9ed0b03269ee5364f01e1d177129e4597ba0a48",
+            "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteSpawnCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 116,
+            "original_line": 116,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "I *think* that we don't need to do this atomically, we could CAS into the map and then register as separate steps. But I'm also not 100% sure and I guess this lambda is fast enough that it doesn't hurt.",
+                "I concur that it would probably be okay to (attempt to) register outside of the critical section, but let's not overthink it if it's not a performance issue."
+            ]
+        }
+    ]
+}

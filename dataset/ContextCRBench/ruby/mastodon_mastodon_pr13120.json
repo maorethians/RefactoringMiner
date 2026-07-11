@@ -1,0 +1,48 @@
+{
+    "repo": "mastodon/mastodon",
+    "pr_number": 13120,
+    "lang": "ruby",
+    "pr_title": "Fix error within error when limiting backtrace to 3 lines",
+    "pr_body": "Alternative solution within Sidekiq middleware to be more DRY\r\n\r\nFix #13086, close #13113",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2020-03-01T03:52:03Z",
+    "issue_context": {
+        "number": 13086,
+        "title": "NoMethodError in LinkCrawlWorker ",
+        "body": "on v3.1.1\r\n\r\n```\r\nLinkCrawlWorker\t\r\nNoMethodError: undefined method `message' for \"Net::ReadTimeout with #<TCPSocket:(closed)>\":String\r\n\r\nLinkCrawlWorker\t\r\nNoMethodError: undefined method `message' for \"execution expired\":String\r\n\r\nLinkCrawlWorker\t\r\nNoMethodError: undefined method `message' for \"end of file reached\":String\r\n\r\nLinkCrawlWorker\t\r\nNoMethodError: undefined method `message' for \"Net::OpenTimeout\":String\r\n```\r\n",
+        "comments": [
+            "I\u2019ve noticed at least one of those in my own logs. Something isn\u2019t right, exceptions aren\u2019t strings but here clearly some of them have been converted to strings!\r\n\r\nThe thing is, it\u2019s impossible to raise an error that doesn\u2019t inherit from the StandardError class, so how does this happen? The C explanation doesn\u2019t work because Net::ReadTimeout would not appear in C code",
+            "I think these are came from uploading preview card thumbnails to object storage.",
+            "Going by other reports, the exception is probably raised by the following rescue block somehow catching an object that is actually a string:\r\nhttps://github.com/tootsuite/mastodon/blob/24cd2126c6cfb80844ef9ffbf61647b3d9afdc68/app/lib/request.rb#L77\r\n\r\nSince I've been completely unable to reproduce it, it is likely this is not coming from the `http` gem, but from the block passed to `perform` and executed in:\r\nhttps://github.com/tootsuite/mastodon/blob/24cd2126c6cfb80844ef9ffbf61647b3d9afdc68/app/lib/request.rb#L75\r\n\r\nSomething common to all reports I have seen is that those used external object storage, so I would blame the gem providing support for that\u2026\r\n\r\nFurthermore, as it seems to be indeed impossible to raise such an exception from ruby itself, this is probably a C extension doing that\u2026 since the exceptions are different, I suspect this is an issue with handling exceptions from Ruby functions the C extension would itself call (mostly through blocks), but I haven't found anything fishy so far\u2026",
+            "I am also getting LinkCrawlWorker jobs hanging (just freeze, without error message) on Sidekiq when processing some preview_card images but I can only randomly reproduce it with Docker. Problem present in testing both using local file system and remote object storage.",
+            "this sounds like a bug we should approach the ruby core team about....\n\nOn Fri, Feb 14, 2020, 6:30 PM Hugo Gameiro <notifications@github.com> wrote:\n\n> I am also getting LinkCrawlWorker jobs hanging (just freeze, without error\n> message) on Sidekiq when processing some preview_card images but I can only\n> randomly reproduce it with Docker. Problem present in testing both using\n> local file system and remote object storage.\n>\n> \u2014\n> You are receiving this because you are subscribed to this thread.\n> Reply to this email directly, view it on GitHub\n> <https://github.com/tootsuite/mastodon/issues/13086?email_source=notifications&email_token=AABZCV426ARNMK4TWSUJF5LRC4SSDA5CNFSM4KUMPIL2YY3PNVWWK3TUL52HS4DFVREXG43VMVBW63LNMVXHJKTDN5WW2ZLOORPWSZGOEL2ZBDQ#issuecomment-586518670>,\n> or unsubscribe\n> <https://github.com/notifications/unsubscribe-auth/AABZCV5QKGTMSD3B5U2HQHDRC4SSDANCNFSM4KUMPILQ>\n> .\n>\n",
+            "In order to try getting some context for where the bogus exceptions are raised, could you try applying the following patch and monitor logs for \u201cCaught exception was a String\u201d?\r\n\r\n```patch\r\ndiff --git a/app/lib/request.rb b/app/lib/request.rb\r\nindex c476e7785..20edc192f 100644\r\n--- a/app/lib/request.rb\r\n+++ b/app/lib/request.rb\r\n@@ -74,7 +74,12 @@ class Request\r\n \r\n       yield response if block_given?\r\n     rescue => e\r\n-      raise e.class, e.message, e.backtrace[0]\r\n+      if e.respond_to?(:message)\r\n+        raise e.class, e.message, e.backtrace[0]\r\n+      else\r\n+        Rails.logger.error \"Caught exception was a String: #{caller_locations.inspect}\"\r\n+        raise e\r\n+      end\r\n     ensure\r\n       http_client.close unless http_client.persistent?\r\n     end\r\n```",
+            "On my end making those changes to request.rb will not log any errors for the LinkCrawlWorker jobs stuck in Sidekiq but I am not entirely sure that my issue is the same as OP as I never got the exceptions. But it's a big coincidence that I am also having LinkCrawlWorker issues since v3.1.1",
+            "Just to confirm that my issue is not the same as OP, so my testing of the patched `request.rb` can be ignored. Solved my problem as explained https://github.com/tootsuite/mastodon/issues/9362#issuecomment-586936878",
+            "Thinking about it, the earlier patch probably wouldn't have given more info. We could, however, try accessing the last raised backtrace (`$@`), if it exists:\r\n\r\n```patch\r\ndiff --git a/app/lib/request.rb b/app/lib/request.rb\r\nindex c476e7785..20edc192f 100644\r\n--- a/app/lib/request.rb\r\n+++ b/app/lib/request.rb\r\n@@ -74,7 +74,12 @@ class Request\r\n \r\n       yield response if block_given?\r\n     rescue => e\r\n-      raise e.class, e.message, e.backtrace[0]\r\n+      if e.respond_to?(:message)\r\n+        raise e.class, e.message, e.backtrace[0]\r\n+      else\r\n+        Rails.logger.error \"Caught exception was a String: #{$@}\"\r\n+        raise e\r\n+      end\r\n     ensure\r\n       http_client.close unless http_client.persistent?\r\n     end\r\n```",
+            "After reading the Ruby source code quite a bit, it seems very unlikely to me that even a C extension would be able to raise a `String`.\r\n\r\nLooking at the `raise e.class, e.message, e.backtrace[0]` line, I have another theory: it is possible that the caught exception features a constructor that differs from \u201cregular\u201d exceptions, expecting, for instance, an `Exception` object instead of a string.\r\n\r\nIndeed, consider the following example:\r\n\r\n```ruby\r\nclass WrappedException < StandardError\r\n  def initialize(e)\r\n    super(e.message)\r\n  end\r\nend\r\n\r\nbegin\r\n  raise WrappedException.new(StandardError.new(\"foo\"))\r\nrescue => e\r\n  raise e.class, e.message, e.backtrace[0]\r\nend\r\n```\r\n\r\nThis will fail because `raise WrappedException, \"foo\", \"42\"` is roughly equivalent to `raise (WrappedException.new(\"foo\"), \"42\")`, which would fail with \u201cundefined method `message' for \"foo\":String (NoMethodError)\u201d\r\n\r\nNow, the backtrace seem to indicate this comes from our code, and not the constructor, but this might very well be because of Rails' [Backtrace Cleaner](https://api.rubyonrails.org/classes/ActiveSupport/BacktraceCleaner.html). Editing `config/initializers/backtrace_silencers.rb` to remove it might confirm this suspicion.",
+            "Yup, `Seahorse::ClientClient::NetworkingError` works exactly like that:\r\n\r\nhttps://github.com/aws/aws-sdk-ruby/blob/9257098cfd8a386e5424f998fcb5cd2d11222a1a/gems/aws-sdk-core/lib/seahorse/client/networking_error.rb#L3-L9"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50804,
+            "commit_id": "76e46f3489c13b4bbdd7d8c4a3b8ece51345f3a7",
+            "original_commit_id": "1314bba68a5f2d271312bad08f108e1ff56c2c00",
+            "path": "app/lib/sidekiq_error_handler.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 10,
+            "original_line": 10,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "For the Code Climate error \"Avoid rescuing without specifying an error class.\", we might be able to start `rescue`ing the following exceptions that have been recorded on my server in the last 24 hours:\r\n\r\n- HTTP::ConnectionError\r\n- HTTP::TimeoutError\r\n- Mastodon::UnexpectedResponseError\r\n- Stoplight::Error::RedLight (this might go elsewhere with the change in this PR)\r\n"
+            ]
+        }
+    ]
+}

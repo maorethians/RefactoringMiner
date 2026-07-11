@@ -1,0 +1,67 @@
+{
+    "repo": "prometheus/prometheus",
+    "pr_number": 9274,
+    "lang": "go",
+    "pr_title": "remote_write: shard up more when backlogged",
+    "pr_body": "Fixes #9178 \r\n\r\nChange the coefficient from 1% to 5%, so instead of targetting to clear the backlog in 100s we target 20s.\r\n\r\nAdd a unit test which drives the input parameters to `calculateDesiredShards()` very precisely, to illustrate the behaviour. \r\n\r\nAlso, round desired shards up before check - previously we would reject an increase from 2 to 2.5 as being\r\nwithin 30%; by rounding up first we see this as an increase from 2 to 3.\r\n\r\nRelated: #9236 (although I did not understand that proposal).  I suspect the unit test would be useful for that PR.",
+    "pr_comments": [
+        "> my one concern is that by quintupling the speed at which we catch up is there risk of greater oscillations happening?\r\n\r\nI tried to create conditions for oscillation in the unit test to check that; if you can suggest more please do.\r\n\r\nI think moving the `ceil()` call will help stop oscillation around low numbers of shards, because comparing the unrounded number meant it would shard up later, by which time the lag has got bigger.\r\n\r\nThe prohibition on sharding down with >10s lag must slow things down, but it does tend to mean the number we calculate once the lag is gone is at its lowest, hence we are setting things up to change again once lag builds up. Maybe a rule like \"don't shard down within 5 minutes of the last change\" would be better?\r\n\r\nRelated: it might be worth expressing the coefficient as \"50% per update\" (closer to what Callum asked) because I suspect that you always want that to be <100%.\r\n\r\nDo we know anyone who is good at control theory?",
+        "I agree, I think moving the `ceil()` call up will help as well. The main scenario I am worried about is if you catch up, then shard down you will automatically be a bit behind as it takes some time to reshard. That *could* cause sharding up again right away. I also think that would be mostly fixed by https://github.com/prometheus/prometheus/pull/8075.\r\n\r\nGenerally I am happy with this. Either way on expressing the coefficient as \"50% per update\" I slightly prefer being able to change the update frequency in your current implementation without having to worry about changing resharding logic, but not a strong preference.",
+        "Are you waiting on something from me here?",
+        "@cstyan and I were discussing this yesterday, we would like to test this in an internal cluster before merging. Probably easiest to discuss how to do that offline.",
+        "Update on 'test in an internal cluster': \r\nWe made a branch of Grafana Agent, building off a fork of Prometheus \r\nhttps://github.com/grafana/agent/blob/dev.improve-rw-sharding/go.mod#L111\r\nwith this PR included:\r\nhttps://github.com/grafana/prometheus/blob/9c127431b579/storage/remote/queue_manager.go#L816\r\nand this has been running in all Grafana Labs clusters since mid-December.\r\n\r\nIt definitely responds faster to a slowdown, which is the main thing I wanted; possibly too fast because you can get rapid up/down transients like this:\r\n![image](https://user-images.githubusercontent.com/8125524/148746641-e48b071d-ed34-4126-9764-34727d27735e.png)\r\n\r\nbut I think it's good enough to go.\r\n\r\nI'll rebase the branch and see if that makes CI happier.",
+        "Thank you for the charts, that seems reasonable to me. The quick shard up then drop back down is expected with the faster refresh. If it started jumping up and down repeatedly I would have been concerned.\r\n\r\n Do you know why in that example the agent sharded down to 5 at all? According to desired shards it shouldn't have so that's a bit concerning.",
+        "> Do you know why in that example the agent sharded down to 5 at all?\r\n\r\nI thought that too, but it's an artefact of the way the y-axis is drawn.  It actually went down to 7 - half-way between 5 and 10 on the y-axis.\r\n"
+    ],
+    "merged": true,
+    "created_at": "2021-08-30T20:53:13Z",
+    "issue_context": {
+        "number": 9178,
+        "title": "Remote-write should clear backlog much faster than 100 seconds",
+        "body": "## Proposal\r\nRemote-write should try to make up time faster, by putting more weight on the backlog of un-sent samples.\r\n\r\nHere, we first compute a coefficient of 0.1 divided by the sharding tick, which is 10 seconds, or 1/100, then apply this to the number of pending samples:\r\nhttps://github.com/prometheus/prometheus/blob/e8663a4eacd310f403ebf5ce492494652dd69379/storage/remote/queue_manager.go#L830-L834\r\nEffectively we target 100 seconds to clear the backlog.\r\n\r\nThe point seems to be aluded to here: https://github.com/prometheus/prometheus/issues/6333#issuecomment-555360746\r\n> I believe the weight of the samples pending within the calculation isn't enough, but again this is just my theory.\r\n\r\nhowever the source of this quote is not given.\r\n\r\nPersonally I find 100 seconds to be very long.  There are a couple of suggestions in #6333 that it should be \"a few scrapes\" or \"`batch_send_deadline` + 1m\" (65 seconds by default).\r\n\r\nI think I would be ok with 30 seconds. I don't really want to make it configurable since hardly anyone will configure it, but I guess that might be the easiest way to find the \"right\" value.",
+        "comments": [
+            "Open to any way you or @csmarchbanks think is a reasonable improvement, the sharding calculation has always been a bit over my head.\r\n\r\nMaybe either the integral calculation or the overall sharding calculation should weight the delay value more heavily, more like an exponential increase with delay rather than just linear?\r\n\r\n```\r\n// When behind we will try to catch up on a proporation of samples per tick.\r\n// This works similarly to an integral accumulator in that pending samples\r\n// is the result of the error integral.\r\nconst integralGain = 0.1 / float64(shardUpdateDuration/time.Second)\r\n```\r\nInclude delay somewhere in here :point_up:  or here :point_down: ?\r\n```\r\ndesiredShards = timePerSample * (dataInRate*dataKeptRatio + integralGain*dataPending)\r\n```\r\n",
+            "Changing the integral gain will change the 100s deadline proportionally, and is one way we could approach this. It does also mean that we could end up resharding more often, potentially in an oscillating manner. If we add to much gain we could get something that looks like Ki=2 in https://en.wikipedia.org/wiki/PID_controller#/media/File:Change_with_Ki.png. Happy to see some experiments run for this, and it could be that as long as we are using a few cycles and the moving averages everything will be great.\r\n\r\nI also still think just having some extra headroom in our shard calculations such that temporary spikes in latency do not cause resharding at all would provide value and quicker response at a very small cost of increased memory in the stable case. When oscillating as we can right now we would end up using all that memory anyway."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 49787,
+            "commit_id": "954c0e8020c1c86c1b5898778aacb7fa5ecc9341",
+            "original_commit_id": "2ce94ac19673a3f7faf164e9e078a79d4d52b767",
+            "path": "storage/remote/queue_manager.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 836,
+            "original_line": 836,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "should this not include `shardUpdateDuration` like the current calculation on the off chance we change the value of that constant in the future?",
+                "The new logic (5% of samples per second, catch up in 20s) doesn't depend on the shard update duration so I believe this is correct. The old logic was 10% per update duration."
+            ]
+        },
+        {
+            "hunk_id": 49788,
+            "commit_id": "954c0e8020c1c86c1b5898778aacb7fa5ecc9341",
+            "original_commit_id": "2ce94ac19673a3f7faf164e9e078a79d4d52b767",
+            "path": "storage/remote/queue_manager_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1089,
+            "original_line": 1089,
+            "side": "RIGHT",
+            "original_position": 182,
+            "position": 182,
+            "subject_type": "line",
+            "review_comments": [
+                "should this function also call `tick()` for `r`?",
+                "Currently `QueueManager.calculateDesiredShards()` calls `tick()` on the three `emwaRate`s owned by it, and `WriteStorage.run() ` calls `tick()` on the incoming samples rate.  So the test does it only for the latter.\r\n\r\nHowever your question does make me think that we shouldn't have this as a side-effect of `calculateDesiredShards()`. By moving the `tick()` calls to `updateShardsLoop()` we could remove that and then simplify the test to just set `lastRate`."
+            ]
+        }
+    ]
+}

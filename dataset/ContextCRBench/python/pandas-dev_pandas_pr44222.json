@@ -1,0 +1,89 @@
+{
+    "repo": "pandas-dev/pandas",
+    "pr_number": 44222,
+    "lang": "python",
+    "pr_title": "BUG: Min/max does not work for dates with timezones if there are missing values in the data frame",
+    "pr_body": "- [x] closes #44196 and #27794\r\n- [ ] tests added / passed\r\n- [ ] Ensure all linting tests pass, see [here](https://pandas.pydata.org/pandas-docs/dev/development/contributing_codebase.html#pre-commit) for how to run them\r\n- [x] whatsnew entry\r\n\r\nThis is an attempt at fixing the bug of wrong `min`/`max` aggregation with timezone aware data and at least one `pd.NaT` in the data to aggregate. While I still see quite a lot of weaknesses in my approach I want to elaborate why I did what I did, what the weaknesses of this approach are, how this might be handled better and why I didn't follow that path.\r\n\r\n#### Problem description\r\nTo fully understand the problem at hand, let's look at three different cases:\r\n\r\n```python\r\nimport pandas as pd\r\n# CASE 1\r\n# No Problem without NaT\r\nrng_with_tz = pd.date_range(start='2021-10-01T12:00:00+02:00', end='2021-10-02T12:00:00+02:00', freq='4H')\r\ndf_with_tz = pd.DataFrame(data={'A': rng_with_tz, 'B': rng_with_tz + pd.Timedelta(minutes=20)})\r\ndf_with_tz.max(axis=1)\r\n\r\n# No problem with timezone naive dataframe\r\n# CASE 2\r\nrng_tz_naive = pd.date_range(start='2021-10-01T12:00:00', end='2021-10-02T12:00:00', freq='4H')\r\ndf_tz_naive = pd.DataFrame(data={'A': rng_tz_naive, 'B': rng_tz_naive + pd.Timedelta(minutes=20)})\r\ndf_tz_naive.iloc[2, 1] = pd.NaT\r\ndf_tz_naive.max(axis=1)\r\n\r\n# Incorrect result and warning with timezone aware df\r\n# CASE 1\r\nrng_with_tz = pd.date_range(start='2021-10-01T12:00:00+02:00', end='2021-10-02T12:00:00+02:00', freq='4H')\r\ndf_with_tz = pd.DataFrame(data={'A': rng_with_tz, 'B': rng_with_tz + pd.Timedelta(minutes=20)})\r\ndf_with_tz.iloc[2, 1] = pd.NaT\r\ndf_with_tz.max(axis=1)\r\n```\r\n\r\nWhen one drills down into the first case no problems arise. The `max` call is handled down to [`pandas/core/nanops.py:reduction`](https://github.com/pandas-dev/pandas/blob/master/pandas/core/nanops.py#L1023) and is running through fine. In the second case one finds that in [`pandas/core/nanops.py:reduction`](https://github.com/pandas-dev/pandas/blob/master/pandas/core/nanops.py#L1023) right after the call to [`pandas/core/nanops.py:_get_values`](https://github.com/pandas-dev/pandas/blob/66ce5de55b4aa6d4ca8bef65318cc9e2381689f6/pandas/core/nanops.py#L257) one realizes that all values are cast to integers, even the `pd.NaT`. \r\nIn the third case one can see that the values aren't casted and `pd.NaT` is replaced by `-np.inf` which comes from [this line](https://github.com/pandas-dev/pandas/blob/66ce5de55b4aa6d4ca8bef65318cc9e2381689f6/pandas/core/nanops.py#L1051). This replacement is the reason for our error:\r\n```python\r\nTypeError: '>=' not supported between instances of 'Timestamp' and 'float'\r\n```\r\nwhen we try to [apply the max from numpy](https://github.com/pandas-dev/pandas/blob/66ce5de55b4aa6d4ca8bef65318cc9e2381689f6/pandas/core/nanops.py#L1042)\r\nwhich results from comparing `pd.Timestamp`s with `float`s (`np.inf`). This error is caught and all elements are converted into `np.nan`.\r\nThe reason behind the error is, that\r\n```python\r\n>>> import pandas as pd\r\n\r\n>>> rng_with_tz = pd.date_range(start='2021-10-01T12:00:00+02:00', end='2021-10-02T12:00:00+02:00', freq='4H')\r\n>>> rng_with_tz\r\nDatetimeIndex(['2021-10-01 12:00:00+02:00', '2021-10-01 16:00:00+02:00',\r\n               '2021-10-01 20:00:00+02:00', '2021-10-02 00:00:00+02:00',\r\n               '2021-10-02 04:00:00+02:00', '2021-10-02 08:00:00+02:00',\r\n               '2021-10-02 12:00:00+02:00'],\r\n              dtype='datetime64[ns, pytz.FixedOffset(120)]', freq='4H')\r\n>>> rng_with_tz.values.dtype\r\ndtype('<M8[ns]')\r\n \r\n>>> rng_with_tz = pd.date_range(start='2021-10-01T12:00:00+02:00', end='2021-10-02T12:00:00+02:00', freq='4H')\r\n>>> df_with_tz = pd.DataFrame(data={'A': rng_with_tz, 'B': rng_with_tz + pd.Timedelta(minutes=20)})\r\n>>> df_with_tz.values.dtype\r\ndtype('O')\r\n```\r\nthe `dtype` changes when using timezone aware data, though the `dtype`s of the single series is still `dtype('<M8[ns]')`. This has serious implications: In [`pandas/core/nanops.py:_get_values`](https://github.com/pandas-dev/pandas/blob/66ce5de55b4aa6d4ca8bef65318cc9e2381689f6/pandas/core/nanops.py#L257) the `if` condition in this line (https://github.com/pandas-dev/pandas/blob/66ce5de55b4aa6d4ca8bef65318cc9e2381689f6/pandas/core/nanops.py#L313) is `False` and no cast to happens but still the `pd.NaT` is replaced by `np.inf` which is the reason for the error stated above.\r\n\r\n#### Possible improvements on this PR\r\nIf we could change the `dtype` of the timezone aware DataFrame with missing values to the `numpy` dtype: `dtype('<M8[ns]')` we should be fine. But I have no idea how we can achieve that, since these are not `pandas` but `numpy` types we are talking about and I didn't really understand how `numpy` determines it`s types.\r\n\r\n#### Weaknesses of this PR\r\nThe assumption made while catching the exceptions aren't well tested (though all tests are passed) and there might be a better and more generic solution.",
+    "pr_comments": [
+        "@jbrockmendel one more thing: I don't quite understand how working blockwise could have solved this problem as [you hinted](https://github.com/pandas-dev/pandas/issues/27794#issuecomment-698084941). I checked the blocks and one of the blocks also contains the `pd.NaT` value with `dtype('O')` and the same problem will arise here. Could you give me an idea how this might work?",
+        "> Could you give me an idea how this might work?\r\n\r\nbc we don't fully support 2D EAs (@jreback: drink!), calling .values on a DataFrame with dt64tz dtypes upcasts to object, at which point things go off the rails.  If we were to operate directly on the blocks (as happens in the axis=0 case when we call `df._mgr.reduce`) this would work correctly.\r\n\r\nThree options come to mind here:\r\n\r\n1) recognize that the numeric_only=None case is deprecated so this use case will go away completely in 2.0.  Live with this bug in the interim.\r\n\r\n2) Patch the affected nanops function to handle NaT correctly when it sees object-dtype (best guess is this will involve passing `initial` to np.minimum.reduce` circa nanops L1042\r\n\r\n3) Re-write DataFrame._reduce axis=1 case to first iterate over `self._mgr.arrays` calling blk_func, then do the reduction on the resulting column arrays.",
+        "Hello @CloseChoice! Thanks for updating this PR. We checked the lines you've touched for [PEP\u00a08](https://www.python.org/dev/peps/pep-0008) issues, and found:\n\n\n\n\n\n\n\nThere are currently no PEP 8 issues detected in this Pull Request. Cheers! :beers: \n\n##### Comment last updated at 2021-11-07 16:08:07 UTC",
+        "@github-actions pre-commit",
+        "@jbrockmendel: I rewrote the reduce function for the `min` and `max` cases but had to adjust some tests, since we weren't consistent before, e.g.\r\n\r\n```python\r\nimport pandas as pd\r\nfrom pandas import Timedelta, Timestamp\r\n\r\n# test_oerators_timedelta64\r\ndf = pd.DataFrame({'A': {0: Timedelta('0 days 00:05:05'), 1: Timedelta('1 days 00:05:05'), 2: Timedelta('2 days 00:05:05')},\r\n                   'B': {0: Timedelta('-1 days +00:00:00'), 1: Timedelta('-1 days +00:00:00'), 2: Timedelta('-1 days +00:00:00')},\r\n                   'C': {0: 'foo', 1: 'foo', 2: 'foo'},\r\n                   'D': {0: 1, 1: 1, 2: 1},\r\n                   'E': {0: 1.0, 1: 1.0, 2: 1.0},\r\n                   'F': {0: Timestamp('2013-01-01 00:00:00'), 1: Timestamp('2013-01-01 00:00:00'), 2: Timestamp('2013-01-01 00:00:00')}})\r\n# the following two lines should result in the same output but this isn't the case on master\r\ndf.max(axis=1)\r\ndf.T.max(axis=0)\r\n```\r\n\r\nThis would also be fixed by the current state of the PR. Not sure it would be possible to rewrite all reduction operations like this but I could give it a try. Currently one test will fail which is connected issue xref #44336",
+        "@github-actions pre-commit",
+        "have you tried looking at core.nanops._get_values?  If I disable the masking L328-334 for object dtype, the motivating case works.  (15 other tests fail, so there's some more kinks to work out)",
+        "This pull request is stale because it has been open for thirty days with no activity. Please update or respond to this comment if you're still interested in working on this.",
+        "> have you tried looking at core.nanops._get_values? If I disable the masking L328-334 for object dtype, the motivating case works. (15 other tests fail, so there's some more kinks to work out)\r\n\r\ncan you try this",
+        "iirc this was close if you can merge main and move the note to 1.5",
+        "Thanks for the PR, but it appears to have gone stale. If interested in continuing please merge the main branch, address the review, and we can reopen."
+    ],
+    "merged": false,
+    "created_at": "2021-11-06T22:02:55Z",
+    "issue_context": {
+        "number": 44196,
+        "title": "BUG: .max(axis=1) is incorrect when DataFrame contains tz-aware timestamps and NaT",
+        "body": "### \n\n- [X] I have checked that this issue has not already been reported.\n\n- [X] I have confirmed this bug exists on the [latest version](https://pandas.pydata.org/docs/whatsnew/index.html) of pandas.\n\n- [ ] I have confirmed this bug exists on the master branch of pandas.\n\n\n### Reproducible Example\n\n```python\nimport pandas as pd\r\n\r\n# Incorrect result and warning with timezone aware df\r\nrng_with_tz = pd.date_range(start='2021-10-01T12:00:00+02:00', end='2021-10-02T12:00:00+02:00', freq='4H')\r\ndf_with_tz = pd.DataFrame(data={'A': rng_with_tz, 'B': rng_with_tz + pd.Timedelta(minutes=20)})\r\ndf_with_tz.iloc[2, 1] = pd.NaT\r\nprint(df_with_tz)\r\nprint(df_with_tz.max(axis=1))\r\n\r\n# No problem with timezone naive dataframe\r\nrng_tz_naive = pd.date_range(start='2021-10-01T12:00:00', end='2021-10-02T12:00:00', freq='4H')\r\ndf_tz_naive = pd.DataFrame(data={'A': rng_tz_naive, 'B': rng_tz_naive + pd.Timedelta(minutes=20)})\r\ndf_tz_naive.iloc[2, 1] = pd.NaT\r\nprint(df_tz_naive)\r\nprint(df_tz_naive.max(axis=1))\r\n\r\n# Also no problem on other axis\r\nprint(df_with_tz.transpose().max(axis=0))\r\n\r\n# And no problem without NaT\r\ndf_with_tz.iloc[2, 1] = df_with_tz.iloc[2, 0] + pd.Timedelta(minutes=20)\r\nprint(df_with_tz.max(axis=1))\n```\n\n\n### Issue Description\n\nUsing the `.max(axis=1)` operation on a dataframe with timezone aware datetime columns that contain at least one NaT\r\nproduces an incorrect result (and an obscure warning).\r\nThe issue occurs only when all conditions are met.  For example there is a workaround by operating on \r\nthe other axis via transpose like `df.transpose().max(axis=0)`.  Also dataframes with timezone naive columns do not show\r\n the problematic behaviour as do dataframes that do not contain NaTs.\r\n \n\n### Expected Behavior\n\nThe operation `df_with_tz.max(axis=1)` should return the max along columns thereby ignoring NaTs, similar to the same operation along rows (`axis=0`).\n\n### Installed Versions\n\n<details>\r\n\r\nINSTALLED VERSIONS\r\n------------------\r\ncommit           : 945c9ed766a61c7d2c0a7cbb251b6edebf9cb7d5\r\npython           : 3.9.7.final.0\r\npython-bits      : 64\r\nOS               : Windows\r\nOS-release       : 10\r\nVersion          : 10.0.14393\r\nmachine          : AMD64\r\nprocessor        : Intel64 Family 6 Model 85 Stepping 0, GenuineIntel\r\nbyteorder        : little\r\nLC_ALL           : None\r\nLANG             : None\r\nLOCALE           : de_DE.cp1252\r\n\r\npandas           : 1.3.4\r\nnumpy            : 1.20.3\r\npytz             : 2021.3\r\ndateutil         : 2.8.2\r\npip              : 21.3.1\r\nsetuptools       : 58.3.0\r\nCython           : None\r\npytest           : 6.2.5\r\nhypothesis       : None\r\nsphinx           : None\r\nblosc            : None\r\nfeather          : None\r\nxlsxwriter       : None\r\nlxml.etree       : None\r\nhtml5lib         : None\r\npymysql          : None\r\npsycopg2         : None\r\njinja2           : 3.0.2\r\nIPython          : None\r\npandas_datareader: None\r\nbs4              : None\r\nbottleneck       : None\r\nfsspec           : None\r\nfastparquet      : None\r\ngcsfs            : None\r\nmatplotlib       : 3.4.3\r\nnumexpr          : None\r\nodfpy            : None\r\nopenpyxl         : 3.0.9\r\npandas_gbq       : None\r\npyarrow          : None\r\npyxlsb           : None\r\ns3fs             : None\r\nscipy            : None\r\nsqlalchemy       : None\r\ntables           : None\r\ntabulate         : None\r\nxarray           : None\r\nxlrd             : None\r\nxlwt             : None\r\nnumba            : 0.54.1\r\n</details>\r\n",
+        "comments": [
+            "xref #27794",
+            "This looks like the same issue as https://github.com/pandas-dev/pandas/issues/27794 so closing in favor of that issue"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 62889,
+            "commit_id": "fe6c5ff5c14e1b2cf7f349945863a42c60cc203e",
+            "original_commit_id": "969b07c82a00bc2ee6c9028d2f2ea797632057c8",
+            "path": "pandas/tests/frame/test_reductions.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1827,
+            "original_line": 1830,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 82,
+            "subject_type": "line",
+            "review_comments": [
+                "same bugs probably also affect timedelta64 and PeriodDtype?  can you test those too?",
+                "I added tests for this cases but am not sure if I understood you correctly. This bug just appears for timezone aware data, afaik timedelta and PeriodDtype don't have timezone information, therefore I don't expect the bug to exist. Do you mean adding these types to a datetime column?"
+            ]
+        },
+        {
+            "hunk_id": 62888,
+            "commit_id": "fe6c5ff5c14e1b2cf7f349945863a42c60cc203e",
+            "original_commit_id": "969b07c82a00bc2ee6c9028d2f2ea797632057c8",
+            "path": "pandas/tests/frame/test_reductions.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1779,
+            "original_line": 1780,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "we try to avoid using concat in tests that aren't aimed at concat.  simpler to write this as\r\n\r\n```\r\ndf = pd.DataFrame({\r\n    \"A\": pd.date_range(start=\"2018-01-01\", end=\"2018-01-03\", tz=\"UTC\"),\r\n    \"B\": pd.date_range(start=\"2018-01-01\", end=\"2018-01-02\", tz=\"UTC\").insert(2, pd.NaT)\r\n})\r\n```",
+                "thanks, done."
+            ]
+        },
+        {
+            "hunk_id": 62890,
+            "commit_id": "fe6c5ff5c14e1b2cf7f349945863a42c60cc203e",
+            "original_commit_id": "969b07c82a00bc2ee6c9028d2f2ea797632057c8",
+            "path": "pandas/tests/frame/test_reductions.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1883,
+            "original_line": 1883,
+            "side": "RIGHT",
+            "original_position": 138,
+            "position": 138,
+            "subject_type": "line",
+            "review_comments": [
+                "Try period_range, or even just take the frame from the dt64tz case and to a .to_period(\"D\") on it"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,131 @@
+{
+    "repo": "vllm-project/vllm",
+    "pr_number": 4024,
+    "lang": "python",
+    "pr_title": "[Core] replace narrow-usage RayWorkerVllm to general WorkerWrapper to reduce code duplication",
+    "pr_body": "Currently, `set_cuda_visible_devices` is one step of worker initialization. It is too specific, and usage is very narrow.\r\n\r\nMeanwhile, some information during initialization is essentially lost after initialization, e.g. `local_rank` . We cannot retrieve `local_rank` information from `parallel_state` after initialization. (We can retrieve it from `worker`, but it is difficult to get the worker instance inside many files)\r\n\r\nThis PR first replaces narrow-usage `set_cuda_visible_devices` to general `update_environment_variables`. I would also like to pass `rank`/`local_rank` etc. information through environment variables, so that we can easily retrieve the information anywhere inside the code, without passing the information all the way from function to function. However, this change is larger, and I would like to hear more opinions.",
+    "pr_comments": [
+        "Can we fix #4029 by supporting choose `devices` in LLM. Users can pass `devices='0,1' ` to use that two devices.",
+        "After this refactor, `RayGPUExecutor` is only related to GPU with respect to `placement_group`. And we should easily extend it to support distributed inference for other devices.",
+        "TL;DR:\r\n\r\n1. support calling `_run_workers` with different args for each worker\r\n2. replace narrow-usage RayWorkerVllm to general WorkerWrapper, which can be used for future executor as well\r\n3. **greatly reduce code duplication**, by adding `use_dummy_driver` arg. e.g. for `get_node_and_gpu_ids`",
+        "@youkaichao @zhuohan123 any chance we could get https://github.com/vllm-project/vllm/pull/3466 merged first? I have been rebasing it for a couple of months now.\r\n\r\n~Looks like it needs another small rebase, I can do that shortly.~ now rebased again",
+        "Thanks for the review!\r\n\r\n> OK to have a small set of allowed env vars, but it's a bad idea to support arbitrary ones at interface level. fine to improve later.\r\n\r\nI'm thinking of adding a `vllm/flags.py` to hold all the global flags in a central place. Will do that later.\r\n\r\n> the benefit is that each worker implementation is more cleanly separated from each other, making future changes easier\r\n\r\nI didn't accept the change, because `self.worker_module_name` and `self.worker_class_name` are how `WorkerWrapperBase` works. It would sound very strange to put this code into utils."
+    ],
+    "merged": true,
+    "created_at": "2024-04-16T21:25:04Z",
+    "issue_context": {
+        "number": 4029,
+        "title": "[Usage]: Spread two big LLMs across four GPUs",
+        "body": "### Your current environment\n\nThis is about API usage rather than an environment issue.\n\n### How would you like to use vllm\n\nI want to run batch inference using two models in the same process and spread them across distinct GPUs.\r\n\r\nHere's an example code snippet i've been trying to figure out how to get correct:\r\n\r\n```python\r\nfrom vllm import LLM\r\n\r\nllm1 = LLM(\r\n    model=\"meta-llama/Llama-2-70b-hf\",\r\n    tensor_parallel_size=2\r\n)\r\nllm2 = LLM(\r\n    model=\"CohereForAI/c4ai-command-r-v01\",\r\n    tensor_parallel_size=2,\r\n)\r\n```\r\n\r\nIn this scenario, if I have 4 A100 80Gs on a single node, I should be able to fit model one on GPUs 1 and 2, then fit model two on GPUs 3 and 4.  I was hoping that Ray's backend would get this right but instead this doesn't work.  I typically run out of vRAM.\r\n\r\nIs there a way to configure two `LLM` instances such that they work on distinct subsets of my available GPUs all while running the same process?  Do I need to use `device` right?",
+        "comments": [
+            "I'd say first set only cuda 0 and 1 available and load llm 1, and then cuda 2 and 3 only and load llm2, and then just set all cudas available and keep going with that.",
+            "Can you elaborate this suggestion? The issue we saw when doing something like the code I wrote was ray runtime engine stalling when initializing a second time",
+            "Why not running them in two processes with different CUDA_VISIBLE_DEVICES?",
+            "Yes that is my backup plan if I need to.  I was just hoping I'd be able to do this without sub-processes",
+            "No, you don't want to do it in one process. It gives you no speedup compared with two processes. And it might be prone to bugs in distributed inference.",
+            "xref a similar discussion: https://github.com/vllm-project/vllm/issues/6155",
+            "Hey youkaichao, I'm facing the same problem where I have 4 A100 80Gs on a single node, and my script needs to be able to run two different models in one process. Would this be possible? I added you on Linkedin, maybe we can chat further there?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 22218,
+            "commit_id": "1e30d89f97e294a49232b11b1496bcbff2a4a404",
+            "original_commit_id": "d150e4f89f9da5b093511227449ad940a9a82a52",
+            "path": "vllm/worker/worker_base.py",
+            "start_line": 108,
+            "original_start_line": 109,
+            "start_side": "RIGHT",
+            "line": 114,
+            "original_line": 115,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "At a high-level, we should discourage passing configuration / data via environment variables because it allows for a lot of complexity that isn't subject to documentation / visibility / common abstractions that a config object would be subject to. Basically, we don't want to give the ability for external contributors to add additional configuration space very easily. An example of this is the Ray DAG vLLM integration, which is very hidden because it's not in a config object. https://github.com/vllm-project/vllm/blob/e95cd879598b834f85e70ebcd23db316ae430540/vllm/executor/ray_gpu_executor.py#L24-L27\r\n\r\nAnother example is that `CUDA_VISIBLE_DEVICES` semantics may only work for a subset of backends; the way each backend configures which devices to use can be different. Then we have a cambrian explosion of env vars to manage devices..\r\n\r\nAlternatives:\r\n* Allow a whitelist of env vars that we're confident apply for all vLLM backends, e.g. MPI's `RANK`/`LOCAL_RANK`/`WORLD_SIZE`/etc\r\n* Take standard vLLM config and allow each backend to interpret / apply it (e.g. `set_visible_devices` API instead of `update_environment_variables`)",
+                "I explicitly use environment variable, because it is not coupled with vllm internal data structure. see https://github.com/vllm-project/vllm/pull/3904 for example. It is quite common in distributed setting to set these common environment variables and global data structure. They are meat to be global. It is quite a pain if we want to pass then from function arguments, because each modification will need to pass them from the very top function to the very bottom function, and is unnecessarily tedious. See https://learningsystems.slack.com/archives/C05AGDSRXU5/p1712893317174879?thread_ts=1712890806.922209&cid=C05AGDSRXU5 .",
+                "Agree! and I won't block the PR on it -- but to raise vLLM quality as we have more backends, we should be careful with global state https://softwareengineering.stackexchange.com/questions/148108/why-is-global-state-so-evil\r\n\r\nOK to have a small set of allowed env vars, but it's a bad idea to support arbitrary ones at interface level. fine to improve later."
+            ]
+        },
+        {
+            "hunk_id": 22220,
+            "commit_id": "1e30d89f97e294a49232b11b1496bcbff2a4a404",
+            "original_commit_id": "d150e4f89f9da5b093511227449ad940a9a82a52",
+            "path": "vllm/worker/worker_base.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 93,
+            "original_line": 92,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "We should strive for composition over inheritance to limit the coupling of the implementations to the interface; otherwise we invite undesired coupling which makes some changes difficult.",
+                "I don't get it. Can you elaborate on this?",
+                "The thinking goes like this:\r\n1. The purpose of an interface is to minimally couple different implementations.\r\n2. Different implementations may have common logic, and this common logic can be put in the abstract class\r\n3. It is good to avoid this because it violates (1); the coupling goes beyond the minimal interface definition\r\n4. The alternative to inheritance is to have utility classes / functions and compose their usage within the different implementations. [example](https://chat.openai.com/share/6ff20436-023f-4ff6-9f2a-8925cb268d3d)\r\n\r\nIt is not a hard rule as it's impossible to completely decouple different components but a good design principle.\r\n\r\nI'll still approve this PR without it; however the benefit is that each worker implementation is more cleanly separated from each other, making future changes easier."
+            ]
+        },
+        {
+            "hunk_id": 22217,
+            "commit_id": "1e30d89f97e294a49232b11b1496bcbff2a4a404",
+            "original_commit_id": "d150e4f89f9da5b093511227449ad940a9a82a52",
+            "path": "tests/distributed/test_pynccl.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 36,
+            "side": "LEFT",
+            "original_position": 13,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "Why don't we just use `os.environ.update`?",
+                "added warning if some env variables already exist. I think it has better user experience."
+            ]
+        },
+        {
+            "hunk_id": 22219,
+            "commit_id": "1e30d89f97e294a49232b11b1496bcbff2a4a404",
+            "original_commit_id": "d150e4f89f9da5b093511227449ad940a9a82a52",
+            "path": "vllm/worker/worker_base.py",
+            "start_line": 133,
+            "original_start_line": 133,
+            "start_side": "RIGHT",
+            "line": 140,
+            "original_line": 140,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "Until we have another example of this happening, this should live in the Ray-specific worker wrapper",
+                "This is in general the case for rpc framework, where we have the driver worker both running models and check health/get return result from other workers.",
+                "OK makes sense!"
+            ]
+        },
+        {
+            "hunk_id": 22221,
+            "commit_id": "1e30d89f97e294a49232b11b1496bcbff2a4a404",
+            "original_commit_id": "d150e4f89f9da5b093511227449ad940a9a82a52",
+            "path": "vllm/worker/worker_base.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 116,
+            "original_line": 117,
+            "side": "RIGHT",
+            "original_position": 46,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we add some docstrings?",
+                "fixed in [21be004](https://github.com/vllm-project/vllm/pull/4024/commits/21be00449f892f6480b95e54d2cd94db1c46d720).",
+                "This is a comment, docstrings look [like this](https://chat.openai.com/share/6cee29eb-f90b-4ae6-ac17-1464d24470bc) (this degree of formality is overkill for this method..)\r\n\r\nPython doc tooling will then take the first statement (if it's a string) and expose it for auto doc generation\r\n\r\nexample:\r\nhttps://github.com/vllm-project/vllm/blob/d150e4f89f9da5b093511227449ad940a9a82a52/vllm/core/block/cpu_gpu_block_allocator.py#L155-L167"
+            ]
+        }
+    ]
+}

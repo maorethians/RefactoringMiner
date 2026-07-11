@@ -1,0 +1,43 @@
+{
+    "repo": "rails/rails",
+    "pr_number": 45911,
+    "lang": "ruby",
+    "pr_title": "[ActiveStorage] Return \"Range Not Satisfiable\" return code for partial downloads with incorrect range",
+    "pr_body": "Fixes #45890 (see there for all the details).\r\ncc @skipkayhil \r\n",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2022-08-30T21:18:37Z",
+    "issue_context": {
+        "number": 45890,
+        "title": "ActiveStorage: Partial downloads with incorrect range throw a RoutingError and 404 not found",
+        "body": "### Steps to reproduce\r\n```ruby\r\nrequire 'bundler/inline'\r\n\r\ngemfile(true) do\r\n  source 'https://rubygems.org'\r\n\r\n  git_source(:github) { |repo| \"https://github.com/#{repo}.git\" }\r\n\r\n  # Activate the gem you are reporting the issue against.\r\n  gem 'rails', '~> 7.0.0'\r\n  gem 'sqlite3'\r\nend\r\n\r\nrequire 'active_record/railtie'\r\nrequire 'active_storage/engine'\r\nrequire 'tmpdir'\r\n\r\nclass TestApp < Rails::Application\r\n  config.root = __dir__\r\n  config.eager_load = false\r\n  config.session_store :cookie_store, key: 'cookie_store_key'\r\n  secrets.secret_key_base = 'secret_key_base'\r\n  config.hosts << 'www.example.com'\r\n\r\n  config.logger = Logger.new($stdout)\r\n  Rails.logger  = config.logger\r\n\r\n  config.active_storage.service = :local\r\n  config.active_storage.service_configurations = {\r\n    local: {\r\n      root: Dir.tmpdir,\r\n      service: 'Disk'\r\n    }\r\n  }\r\nend\r\n\r\nENV['DATABASE_URL'] = 'sqlite3::memory:'\r\n\r\nRails.application.initialize!\r\n\r\nrequire ActiveStorage::Engine.root.join('db/migrate/20170806125915_create_active_storage_tables.rb').to_s\r\n\r\nActiveRecord::Schema.define do\r\n  CreateActiveStorageTables.new.change\r\n\r\n  create_table :users, force: true\r\nend\r\n\r\nclass User < ActiveRecord::Base\r\n  has_one_attached :pdf\r\nend\r\n\r\nrequire 'minitest/autorun'\r\n\r\n# Download a file with incorrect partial byte range\r\nclass PartialDownloadTest < ActionDispatch::IntegrationTest\r\n  test 'Partial download' do\r\n    user = User.create!(\r\n      pdf: {\r\n        content_type: 'application/pdf',\r\n        filename: 'dummy.pdf',\r\n        io: ::StringIO.new(SecureRandom.random_bytes(1000))\r\n      }\r\n    )\r\n    # Get URL for download\r\n    get \"/#{Rails.application.routes.url_helpers.rails_blob_path(user.pdf, only_path: true)}\"\r\n    assert_response :redirect\r\n    # Download with non-existing range\r\n    get(response.location, headers: { 'Range' => 'bytes=10000-10000' })\r\n    # Should respond with status 416 Range not satisfiable, but throws a RoutingError and responds with 404 not found\r\n    assert_response 416\r\n  end\r\nend\r\n```\r\n\r\n### Expected behavior\r\nWhen a browser asks for a part of a file that doesn't exist (Safari is prone to doing this), the response should be 416 'Range not satisfiable'.\r\n\r\n### Actual behavior\r\nThe response is 404 'Not found' and an ActionController::RoutingError occurs.\r\n\r\n### System configuration\r\n**Rails version**: 7.0.3.1\r\n\r\n**Ruby version**: 3.0.2p107\r\n",
+        "comments": [
+            "The problem is:\r\n1. Active Storage uses `Rack::File` to serve files\r\nhttps://github.com/rails/rails/blob/d66441f39127c284c2fc7ac9bfe3e8270b115033/activestorage/app/controllers/active_storage/disk_controller.rb#L14\r\nhttps://github.com/rails/rails/blob/d66441f39127c284c2fc7ac9bfe3e8270b115033/activestorage/app/controllers/concerns/active_storage/file_server.rb\r\n2. Rack sets `X-Cascade => pass` when we have incorrect ranges\r\nhttps://github.com/rack/rack/blob/856c4f9a81c3c1e73b02a0c2937225aaeef5ff64/lib/rack/files.rb#L89-L93\r\n3. When this header is set, rails's router tries other routes to match the request and fails\r\nhttps://github.com/rails/rails/blob/d66441f39127c284c2fc7ac9bfe3e8270b115033/actionpack/lib/action_dispatch/journey/router.rb#L52-L62\r\n\r\nSo, maybe we should not set the `X-Cascade` header in the 2-nd step from the rack? From my understanding, `X-Cascade` header is to say (from middlewares, for example) something like: \"I can't handle this request, try to handle it by yourself if you can\". But the \"Byte range unsatisfiable\" error seems like the fatal error and should be reported directly without retries.  ",
+            "> So, maybe we should not set the `X-Cascade` header in the 2-nd step from the rack? From my understanding, `X-Cascade` header is to say (from middlewares, for example) something like: \"I can't handle this request, try to handle it by yourself if you can\". But the \"Byte range unsatisfiable\" error seems like the fatal error and should be reported directly without retries.\r\n\r\nI agree we probably shouldn't be passing this header, but I'm not sure we should be trying to change Rack. I think it would be easiest to not include \"X-Cascade\" when copying headers in stream_file: https://github.com/rails/rails/blob/d66441f39127c284c2fc7ac9bfe3e8270b115033/activestorage/app/controllers/concerns/active_storage/file_server.rb#L10-L12 or manually clearing it after copying.\r\n\r\n(As a side note, we should ensure we don't set \"X-Cascade\" or \"x-cascade\" since Rack 3 will be downcasing headers)",
+            "Looking at the spec https://httpwg.org/specs/rfc7233.html#header.range \r\n\r\n> If all of the preconditions are true, the server supports the Range header field for the target resource, and the specified range(s) are invalid or unsatisfiable, the server SHOULD send a [416 (Range Not Satisfiable)](https://httpwg.org/specs/rfc7233.html#status.416) response.\r\n\r\nSeems like Rack is the appropriate place for this fix?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48345,
+            "commit_id": "bc2aad4ae46431bf7aeb2bfb4bce06d711c28851",
+            "original_commit_id": "02f3b999a0d89f37fe70af5248c50d97d848c131",
+            "path": "activestorage/app/controllers/concerns/active_storage/file_server.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 16,
+            "original_line": 16,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        response.headers.delete(\"X-Cascade\", \"x-cascade\") if status == 416\r\n```\r\nSince we aren't using the return value, I think it makes sense to use Ruby `Hash#delete` over Rails `Hash#except!`\r\n\r\nOther than that \ud83d\udc4d from me",
+                "I wanted to make it one-liner, but `Hash#delete` accepts only one argument :(",
+                "Ah, right. Maybe `response.headers.delete_if { |header| [\"X-Cascade\", \"x-cascade\"].include?(header) } if status == 416` ? \r\n\r\nI definitely agree `except!` looks the cleanest. I think if we keep `except!` we should add `require \"active_support/core_ext/hash/except\"` to ensure the extension is loaded",
+                "Good catch! Added a missing require.  "
+            ]
+        }
+    ]
+}

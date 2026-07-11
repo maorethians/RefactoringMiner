@@ -1,0 +1,84 @@
+{
+    "repo": "apache/airflow",
+    "pr_number": 26100,
+    "lang": "python",
+    "pr_title": "Split out and handle 'params' in mapped operator",
+    "pr_body": "Allow using `params` in expanding kwargs. Fix #24014.\r\n\r\nSyntax unlocked:\r\n\r\n```python\r\n# Two tasks with params={\"a\": 1} and params={\"b\": 2}.\r\nMyOperator.partial(task_id=\"t\").expand(params=[{\"a\": 1}, {\"b\": 2}])\r\n\r\n# Two tasks with params={\"a\": 0, \"b\": 1} and params={\"a\": 0, \"b\": 2}.\r\n# DAG-level params are also merged. If there are duplicated keys, the\r\n# priority is mapped -> task-partial -> DAG.\r\nMyOperator.partial(task_id=\"t\", params={\"a\": 0}).expand(params=[{\"b\": 1}, {\"b\": 2}])\r\n```\r\n\r\n",
+    "pr_comments": [
+        "~~This is going to conflict with #26702 and I want to get that one in first for 2.4.1.~~ Resolved, should be ready for 2.5.0."
+    ],
+    "merged": true,
+    "created_at": "2022-09-07T22:04:56Z",
+    "issue_context": {
+        "number": 24014,
+        "title": "Task mapping against 'params'",
+        "body": "### Apache Airflow version\n\n2.3.1 (latest released)\n\n### What happened\n\nImporting a DAG using `PostgresOperator` with `expand(params=[...])` fails, claiming `params` was already specified as a partial argument, even though it wasn't.\n\n### What you think should happen instead\n\nThe DAG imports successfully.\n\n### How to reproduce\n\n```python\r\nfrom pathlib import Path\r\nimport pendulum\r\nfrom airflow.providers.postgres.operators.postgres import PostgresOperator\r\nfrom airflow.decorators import dag, task\r\n\r\n\r\n@dag(\r\n    start_date=pendulum.datetime(2021, 11, 19, tz=\"UTC\"),\r\n    schedule_interval=\"@daily\",\r\n    catchup=False,\r\n)\r\ndef test():\r\n    query_values = [{\"a\": 1}, {\"a\": 2}]\r\n\r\n    PostgresOperator.partial(\r\n        task_id=\"simple_select\",\r\n        sql=\"SELECT {{ params.a }}\",\r\n    ).expand(params=query_values)\r\n\r\ntest_dag = test()\r\n```\r\n\r\nException during import:\r\n```\r\nBroken DAG: [/usr/local/airflow/dags/test_dag.py] Traceback (most recent call last):\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/mappedoperator.py\", line 199, in expand\r\n    prevent_duplicates(self.kwargs, mapped_kwargs, fail_reason=\"mapping already partial\")\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/mappedoperator.py\", line 139, in prevent_duplicates\r\n    raise TypeError(f\"{fail_reason} argument: {duplicated_keys.pop()}\")\r\nTypeError: mapping already partial argument: params\r\n```\n\n### Operating System\n\nmacOS 12.4\n\n### Versions of Apache Airflow Providers\n\n```apache-airflow-providers-postgres==4.1.0```\n\n### Deployment\n\nAstronomer\n\n### Deployment details\n\n_No response_\n\n### Anything else\n\n_No response_\n\n### Are you willing to submit PR?\n\n- [ ] Yes I am willing to submit a PR!\n\n### Code of Conduct\n\n- [X] I agree to follow this project's [Code of Conduct](https://github.com/apache/airflow/blob/main/CODE_OF_CONDUCT.md)\n",
+        "comments": [
+            "~~PostgresOperator is misusing `params`. This argument should be renamed.~~ Edit: Wrong operator, I was remembering something else.\r\n\r\nUnfortunately `params` cannot be mapped at the time, since the value is currently needed in the scheduler, when the operator expansion is not resolved. We may change this in the future.",
+            "> Unfortunately `params` cannot be mapped at the time, since the value is currently needed in the scheduler, when the operator expansion is not resolved. We may change this in the future.\r\n\r\nIs there a way to raise exception that will explain to the user that the chosen parameter for expand is not supported?",
+            "It\u2019s possible, but not particularly doable unfortunately, since it\u2019s difficult to tell apart what the user puts in when a function is called. With a function like this:\r\n\r\n```python\r\ndef foo(a=None): pass\r\n```\r\n\r\nWe don\u2019t have a good way to tell if user called `foo(a=None)` or `foo()`. I\u2019m putting together a PR to make the message slightly more vague so it\u2019s at least not misleading, and add some documentation to explain it.",
+            "Oh, actually we already mention this in the documentation:\r\n\r\n> Some arguments are not mappable and must be passed to `partial()`, such as `task_id`, `queue`, `pool`, and most other arguments to `BaseOperator`.\r\n\r\nhttps://airflow.apache.org/docs/apache-airflow/stable/concepts/dynamic-task-mapping.html",
+            "In this particular example the fix is to use `parameters` not `params` for the PostgresOperator https://airflow.apache.org/docs/apache-airflow-providers-postgres/stable/_api/airflow/providers/postgres/operators/postgres/index.html#airflow.providers.postgres.operators.postgres.PostgresOperator\r\n\r\n![image](https://user-images.githubusercontent.com/34150/171360783-60ef4639-a40f-4bda-a4bd-b22b016b779c.png)\r\n",
+            "> In this particular example the fix is to use `parameters` not `params` for the PostgresOperator https://airflow.apache.org/docs/apache-airflow-providers-postgres/stable/_api/airflow/providers/postgres/operators/postgres/index.html#airflow.providers.postgres.operators.postgres.PostgresOperator\r\n\r\nYes, indeed. The original DAG I ran into the problem with was using different types of queries, such as `DELETE FROM {table_fqn} WHERE {column} = {value};`.\r\nIn that example, I can't use `parameters` for `{table_fqn}` as `%(table_fqn)s` will wrap the value in single quotes, resulting in an SQL syntax error. Using `params` gives me the plain value instead.\r\n\r\nSee also this [Stack Overflow post](https://stackoverflow.com/questions/70228542/how-to-force-airflow-not-to-put-single-quotes-around-rendered-name-in-postgresop) from another user.\r\n\r\nRight now, I'm using a Python task as a workaround and then pass it directly to the `sql` paramer of the `PostgresOperator`:\r\n```python\r\n@task\r\ndef generate_sql(policy):\r\n    return Path('include/data_retention_delete.sql') \\\r\n        .read_text(encoding=\"utf-8\").format(table_fqn=policy[0],\r\n                                            column=policy[1],\r\n                                            value=policy[2],\r\n                                           )\r\n\r\n@dag(\r\n    start_date=pendulum.datetime(2021, 11, 19, tz=\"UTC\"),\r\n    schedule_interval=\"@daily\",\r\n    catchup=False,\r\n)\r\ndef data_retention_delete():\r\n    sql_statements = generate_sql.expand(policy=get_policies())\r\n\r\n    PostgresOperator.partial(\r\n        task_id=\"delete_partition\",\r\n        postgres_conn_id=\"cratedb_connection\",\r\n    ).expand(sql=sql_statements)\r\n```",
+            "@hammerhead See the \"Anything else\" section of #24388, but you should be able to still map via `parameters` for the `DELETE` DML in a Jinja-templated SQL using `{{ task.mapped_kwargs.parameters[ti.map_index].<attribute>}}` as a workaround.\r\n\r\nAssuming the desired SQL `DELETE FROM {table_fqn} WHERE {column} = {value};`, you could try:\r\n\r\n```python\r\nsql = \"\"\"\r\nDELETE FROM {{ task.mapped_kwargs.parameters[ti.map_index].table_fqn }}\r\nWHERE {{ task.mapped_kwargs.parameters[ti.map_index].column }} = {{ task.mapped_kwargs.parameters[ti.map_index].value }};\"\"\"\r\n\r\nPostgresOperator.partial(\r\n    task_id=\"delete_partitions\",\r\n    postgres_conn_id=\"cratedb_connection\",\r\n    sql=sql,\r\n).expand(parameters=[\r\n    {\"table_fqn\": \"tbl1\", \"column\": \"col1\", \"value\": \"val1\"},\r\n    {\"table_fqn\": \"tbl2\", \"column\": \"col2\", \"value\": \"val3\"},\r\n)\r\n```\r\nDoes this help?",
+            "Thanks, @josh-fell, the example you provided does work.\r\nHowever, I couldn't apply it successfully to our implementation, in which the value of `parameters` is provided by another task:\r\n```python\r\n    @task\r\n    def parameter_values():\r\n        # in our original implementation, this is a database query using pg_hook\r\n        return [\r\n            {\"table_fqn\": \"raw_metrics\", \"column\": \"ts_day\", \"value\": \"v1\"},\r\n        ]\r\n\r\n\r\n    sql = \"\"\"\r\n    DELETE FROM {{ task.mapped_kwargs.parameters[ti.map_index].table_fqn }}\r\n    WHERE {{ task.mapped_kwargs.parameters[ti.map_index].column }} = {{ task.mapped_kwargs.parameters[ti.map_index].value }};\"\"\"\r\n\r\n    PostgresOperator.partial(\r\n        task_id=\"delete_partitions\",\r\n        postgres_conn_id=\"cratedb_connection\",\r\n        sql=sql,\r\n    ).expand(parameters=parameter_values())\r\n```\r\n\r\nThis fails with an error related to XCom lookups:\r\n```\r\n[2022-06-22, 07:54:34 UTC] {taskinstance.py:1889} ERROR - Task failed with exception\r\nTraceback (most recent call last):\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/taskinstance.py\", line 1451, in _run_raw_task\r\n    self._execute_task_with_callbacks(context, test_mode)\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/taskinstance.py\", line 1555, in _execute_task_with_callbacks\r\n    task_orig = self.render_templates(context=context)\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/taskinstance.py\", line 2212, in render_templates\r\n    rendered_task = self.task.render_template_fields(context)\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/mappedoperator.py\", line 726, in render_template_fields\r\n    self._do_render_template_fields(\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/utils/session.py\", line 68, in wrapper\r\n    return func(*args, **kwargs)\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/abstractoperator.py\", line 344, in _do_render_template_fields\r\n    rendered_content = self.render_template(\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/abstractoperator.py\", line 391, in render_template\r\n    return render_template_to_string(template, context)\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/utils/helpers.py\", line 296, in render_template_to_string\r\n    return render_template(template, context, native=False)\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/utils/helpers.py\", line 291, in render_template\r\n    return \"\".join(nodes)\r\n  File \"<template>\", line 14, in root\r\n  File \"/usr/local/lib/python3.9/site-packages/jinja2/sandbox.py\", line 303, in getitem\r\n    return obj[argument]\r\n  File \"/usr/local/lib/python3.9/site-packages/airflow/models/xcom_arg.py\", line 77, in __getitem__\r\n    raise ValueError(f\"XComArg only supports str lookup, received {type(item).__name__}\")\r\nValueError: XComArg only supports str lookup, received int\r\n```",
+            "@uranusjr Could you add this to your todo list to fix please?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 54131,
+            "commit_id": "e9b58612fbd32531d378725d5088de02dbbfa620",
+            "original_commit_id": "b6c5189dadb9c09967ec53c8bca1832852c5500e",
+            "path": "airflow/models/baseoperator.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 309,
+            "original_line": 309,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "\u2026 but pass them to this separate attribute."
+            ]
+        },
+        {
+            "hunk_id": 54132,
+            "commit_id": "e9b58612fbd32531d378725d5088de02dbbfa620",
+            "original_commit_id": "b6c5189dadb9c09967ec53c8bca1832852c5500e",
+            "path": "airflow/decorators/base.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 363,
+            "original_line": 363,
+            "side": "LEFT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "And this line is deleted since it\u2019s now no-op."
+            ]
+        },
+        {
+            "hunk_id": 54130,
+            "commit_id": "e9b58612fbd32531d378725d5088de02dbbfa620",
+            "original_commit_id": "b6c5189dadb9c09967ec53c8bca1832852c5500e",
+            "path": "airflow/models/baseoperator.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 256,
+            "original_line": 256,
+            "side": "LEFT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "So we don\u2019t set the default params in `partial_kwargs`\u2026"
+            ]
+        }
+    ]
+}

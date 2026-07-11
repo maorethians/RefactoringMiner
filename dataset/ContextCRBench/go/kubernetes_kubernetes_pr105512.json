@@ -1,0 +1,61 @@
+{
+    "repo": "kubernetes/kubernetes",
+    "pr_number": 105512,
+    "lang": "go",
+    "pr_title": "Fix check for subpath source",
+    "pr_body": "Fix https://github.com/kubernetes/kubernetes/issues/105472\r\n\r\n\r\nI have verified that this fixes CSI/NFS and other volume types and at the same time it keeps older behaviour for configmaps/secrets etc. This code relies on the fact that most volume types create a mount point in `/var/lib/kubelet/pods/xxxx/volumes/` when being mounted. The check here won't work for volume types that don't create mount point for main volume (but it is not a regression, at least). For configmaps etc - no bind mount is created unless user specifies subpaths.\r\n\r\nFor NFS volume with fix:\r\n\r\n```\r\n9660:I1006 18:38:53.488871  766496 subpath_linux.go:122] Skipping bind-mounting subpath /var/lib/kubelet/pods/f7b2da79-86eb-4a66-a9f8-5f3853c708be/volume-subpaths/manual-pv/sandbox/0, volumePath: /var/lib/kubelet/pods/f7b2da79-86eb-4a66-a9f8-5f3853c708be/volumes/kubernetes.io~nfs/manual-pv, path: /var/lib/kubelet/pods/f7b2da79-86eb-4a66-a9f8-5f3853c708be/volumes/kubernetes.io~nfs/manual-pv/foobar\r\n```\r\n\r\n```release-note\r\nDo not unmount and mount subpath bind mounts during container creation unless bind mount changes\r\n```\r\n\r\n",
+    "pr_comments": [
+        "/sig storage\r\n",
+        "/kind bug\r\n",
+        "/assign @msau42 @jingxu97 ",
+        "/retest",
+        "/assigne @fatedier ",
+        "/priority important-soon\r\n/triage accepted\r\n",
+        "/lgtm",
+        "/hold\r\nuntil @msau42 has a chance to look",
+        "> Is it possible to add an e2e test where it would have failed for persistent volume types without this fix?\r\n\r\nDo we need a test similar to https://github.com/kubernetes/kubernetes/blob/master/test/e2e/storage/testsuites/subpath.go#L320?",
+        "@msau42 So I have been looking at getting e2e going for the scenario where pod will fail to start without the fix and I think it is pretty difficult because it requires container-runtime to timeout in `CreateContainer` call and it must hold on to subpath bind mount so as subsequent calls can not unmount the subpath bind mount. I was able to reproduce this bug with a hacked version of CRIO - https://github.com/haircommander/cri-o/commit/e69436817973f0bd765f9ef4dc7956ac73ca017e but getting it in an e2e is problematic.\r\n\r\nI tried various approaches such as - create two containers with the pod writing to same subpath and cause one container to fail the healthcheck (like how we do in our current e2e) while the other container is still using it. But since subpath bind mounts are on per-container basis, this does not reproduces the problem. ",
+        "So IIUC, this issue mainly happens if the container runtime times out on the client side but is still running on the server side (because it's chcon, for example). This would mainly happen for persistent volumes that have a lot of files. And persistent volumes do not require remounting like the atomic writer types.",
+        "[APPROVALNOTIFIER] This PR is **APPROVED**\n\nThis pull-request has been approved by: *<a href=\"https://github.com/kubernetes/kubernetes/pull/105512#\" title=\"Author self-approved\">gnufied</a>*\n\nThe full list of commands accepted by this bot can be found [here](https://go.k8s.io/bot-commands?repo=kubernetes%2Fkubernetes).\n\nThe pull request process is described [here](https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process)\n\n<details >\nNeeds approval from an approver in each of these files:\n\n- ~~[pkg/volume/util/subpath/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/pkg/volume/util/subpath/OWNERS)~~ [gnufied]\n\nApprovers can indicate their approval by writing `/approve` in a comment\nApprovers can cancel approval by writing `/approve cancel` in a comment\n</details>\n<!-- META={\"approvers\":[]} -->",
+        "@msau42 @jsafrane I have updated the code to use `os.SameFile` to compare bindmount target (i.e subpath bind mount kubelet creates) with subpath directory/file inside the volume. Since a bind mount has same inode number, device numbers as original file - this check should work. If subpath inside volume however changes (but bind mount does not), then they will mismatch and whenever container is restarted, it will cause old subpath bind mount to unmount and mounted again. PTAL.\r\n",
+        "lgtm. Giving @msau42 a chance to review.",
+        "/hold cancel\r\n",
+        "/lgtm\r\n/hold\r\ncan you update the release note?",
+        "done.\r\n/hold cancel\r\n",
+        "Unrelated failure:\r\n\r\n```\r\ngoroutine 676 [running]:\r\nk8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/util/runtime.logPanic({0x50c15a0, 0x89ad100})\r\n\t/home/prow/go/src/k8s.io/kubernetes/_output/local/go/src/k8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/util/runtime/runtime.go:74 +0xe6\r\nk8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/util/runtime.HandleCrash({0x0, 0x0, 0x461107})\r\n\t/home/prow/go/src/k8s.io/kubernetes/_output/local/go/src/k8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/util/runtime/runtime.go:48 +0xb0\r\npanic({0x50c15a0, 0x89ad100})\r\n\t/usr/local/go/src/runtime/panic.go:1047 +0x266\r\nk8s.io/kubernetes/pkg/kubelet.TestSyncLabels.func1.2()\r\n```\r\n/retest\r\n"
+    ],
+    "merged": true,
+    "created_at": "2021-11-10T16:45:18Z",
+    "issue_context": {
+        "number": 105472,
+        "title": "subpath sources never match when containers are re-created",
+        "body": "When we merged - https://github.com/kubernetes/kubernetes/pull/89629/files#diff-22883616376d6c596f9b6338dc1e7bc72064315dfe8d4ebc784946ba58e1c0a1R117 we introduced comparison of subpath sources:\r\n\r\n```golang\r\nif mntInfo.Root != subpath.Path {\r\n  // unmount first\r\n}\r\n```\r\n\r\nBut subpaths source comparison never works properly for all volume types, even if subpath and source remains unchaged. This is because we are comparing wrong things. \r\n\r\nFor a given volume - `subpath.Path` is usually:\r\n\r\n```\r\n/var/lib/kubelet/pods/417178d6-f74c-4cab-b49d-73c1c1052777/volumes/kubernetes.io~csi/pvc-04501ad5-1295-4430-b672-5184045d5d24/mount/foobar\r\n```\r\n\r\nBut according `/proc/self/mountinfo` - the root is - `/foobar`. \r\n\r\n\r\n\r\nThis means that - if creation of a container times out, then another container can not start until  old container exits, because subapth comparison above will be false and kubelet will try to umount the subpath bind mount and it will keep failing with \"device is busy\" errors. So subpath bind mount can not be reused at all. \r\n\r\nThis is sort of expensive, for containers that use selinux. Because it means each container creation will potentially run recursive chcon again on the entire subpath etc.\r\n\r\n\r\n",
+        "comments": [
+            "@gnufied: This issue is currently awaiting triage.\n\nIf a SIG or subproject determines this is a relevant issue, they will accept it by applying the `triage/accepted` label and provide further guidance.\n\nThe `triage/accepted` label can be added by org members by writing `/triage accepted` in a comment.\n\n\n<details>\n\nInstructions for interacting with me using PR comments are available [here](https://git.k8s.io/community/contributors/guide/pull-requests.md).  If you have questions or suggestions related to my behavior, please file an issue against the [kubernetes/test-infra](https://github.com/kubernetes/test-infra/issues/new?title=Prow%20issue:) repository.\n</details>",
+            "/sig node\r\n/sig storage\r\n",
+            "cc @msau42 @jsafrane @jingxu97 @rphillips ",
+            "/remove-sig node"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 57097,
+            "commit_id": "467bcd8b89ecbdb917148cfc4ff9f1d9b8e0e21d",
+            "original_commit_id": "b56dc434583ca7123c4c66b8d9d505dd97f896e5",
+            "path": "pkg/volume/util/subpath/subpath_linux_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 986,
+            "original_line": 986,
+            "side": "RIGHT",
+            "original_position": 66,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "Just a suggestion for temp dirs + defer for `os.RemoveAll`\r\n```\r\nt.Run(test.name, func (t *testing.T){\r\n    base, err = ioutil.TempDir()\r\n    if err {...}\r\n    defer os.RemoveAll(base)\r\n```\r\n",
+                "fixed."
+            ]
+        }
+    ]
+}

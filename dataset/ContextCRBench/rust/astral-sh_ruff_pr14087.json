@@ -1,0 +1,119 @@
+{
+    "repo": "astral-sh/ruff",
+    "pr_number": 14087,
+    "lang": "rust",
+    "pr_title": "Remove AST-node dependency from `FunctionType` and `ClassType`",
+    "pr_body": "## Summary\r\n\r\n\r\nThis PR improves Red Knot's incremental computation by:\r\n\r\n* Making `FunctionType::return_type` and `ClassType::explicit_bases` salsa queries. I suspect this is where the main performance improvement comes from. Making these two functions salsa queries prevents that the class or function's node (accessed through `definition.node`) is marked as a dependency at the callee side. Instead, the callee only depends on whatever the return type or bases are. \r\n* Removing `FunctionType::definition` and `ClassType::definition` and instead use `semantic_index.definition(..)` to lookup the type's definition lazily. This ensures that deserializing a type doesn't require deserializing the AST as well. \r\n* Remove `ScopeId::node` and move it to `Scope::node`. Same as for `FunctionType::definition`. Moving the `Node` from the `ScopeId` to the definition allows deserializing the `ScopeId` without deserializing the AST node. This is important because both `FunctionType` and `ClassType` have a `ScopeId` field.\r\n\r\nFixes https://github.com/astral-sh/ruff/issues/14054\r\n\r\n## Test Plan\r\n\r\n`cargo test`\r\n",
+    "pr_comments": [
+        "<!-- generated-comment ecosystem -->\n## `ruff-ecosystem` results\n### Linter (stable)\n\u2705 ecosystem check detected no linter changes.\n\n### Linter (preview)\n\u2705 ecosystem check detected no linter changes.\n\n\n",
+        "## [CodSpeed Performance Report](https://codspeed.io/astral-sh/ruff/branches/micha/remove-ast-dependencies-from-type)\n\n### Merging #14087 will **improve performances by 12.36%**\n\n<sub>Comparing <code>micha/remove-ast-dependencies-from-type</code> (eb97246) with <code>main</code> (9dddd73)</sub>\n\n\n\n### Summary\n\n`\u26a1 1` improvements\n`\u2705 31` untouched benchmarks\n\n\n\n\n### Benchmarks breakdown\n\n|     | Benchmark | `main` | `micha/remove-ast-dependencies-from-type` | Change |\n| --- | --------- | ----------------------- | ------------------- | ------ |\n| \u26a1 | `red_knot_check_file[incremental]` | 4.6 ms | 4.1 ms | +12.36% |\n",
+        "Lol what",
+        "@carljm I agree that a test would be nice. I added one for call inference although I'm not sure how valuable it is because it is rather fragile (a slight change to inference will break the test itself). \r\n\r\nI don't know how to write the ideal test that:\r\n\r\n* Exercises most language features\r\n* Asserts that `infer_definition_types` or `infer_expression_types` is never called for any other file than the file to which the comment was added. \r\n\r\nThe problem here is that salsa doesn't provide the necessary reflection API to answer the second question. We could log all events but that test is likely going to break with every inference test AND it's kind of impossible to tell from a `ExpressionId` to which file it belongs. \r\n\r\nI don't mind adding more tests if you have suggestions on how to test this, but I'll leave it at what I have for now. I do think that our benchmarks do a decent job at this anyway. I would hope that we would investigate a 12% perf regression ;)\r\n\r\nI don't think there's a way to test deserialization in a meaningful before salsa adds persistent caching support.",
+        "The added test looks good to me, thank you!"
+    ],
+    "merged": true,
+    "created_at": "2024-11-04T15:20:27Z",
+    "issue_context": {
+        "number": 14054,
+        "title": "[red-knot] Remove `Definition` from `Class` and `FunctionType`",
+        "body": "The `ClassType` and `FunctionType` both store a back reference to their origin definition, and the definition holds on to the AST node. This is problematic because `Type`s are visible cross-module:\r\n\r\n* If a `Type` changes (no longer compares equal), it requires redoing type inference for all dependent types (modules). This gets worse because `Type`s flow and compose. E.g., every union containing a `ClassType` would have to be thrown away if the node's AST location changes (and, in turn, all results that depend on that Union...). Fortunately, this currently works thanks to Salsa tracking each struct field on its own. However, it will break if we change to use coarse-grained salsa dependencies for better performance.\r\n* Incrementally checking a program after restoring from a persistent cache shouldn't require reparsing any unchanged modules. Instead, Red Knot resolves the types directly from the cache. For this to work efficiently, it's important that `Type`s have no backreference to the AST. Otherwise, deserializing the `Type` requires reparsing the module or storing and deserializing the AST in/from the persistent cache. But it's not just the cost of deserialization; this also comes at a cost that Red Knot now holds on to ASTs that are never needed. It shouldn't be necessary to revisit the AST of standard library modules after they've been type-checked. \r\n\r\n",
+        "comments": [
+            "We should also remove `ScopeId` from `ClassType` because it has a reference to `node`.\r\n\r\nAnother approach to removing `Definition` and `ScopeId` (which both seem useful) is to decouple `Definition` and `ScopeId` from the AST node. That seems like a better solution to avoid similar foot-guns in the future."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 68490,
+            "commit_id": "eb97246301ae4e056b281130d65a2b581f4ec0ab",
+            "original_commit_id": "9dddd73c292b477fc96fbb6ff233cd46c7caa3ca",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1889,
+            "original_line": 1889,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 64,
+            "subject_type": "line",
+            "review_comments": [
+                "The issue without this being a salsa query is that the calling-query suddenly depends on the function's ast (and, therefore, the file). \r\n\r\nIn the case of our benchmark: `_parser.py` calls `match_to_datetime` which is defined in `_re.py`. Now, it shouldn't be necessary to recheck `_parser.py` because no type in `_re.py` changed. However, Salsa had to recheck every callsite because the `return_type` query accessed the `definition.kind(db)` which is the AST node of the `match_to_datetime` and its AST has changed (not really, but we use `no_eq`...) \r\n\r\nI verified that making `return_ty` is the reason for the perf improvement by removing the `#[salsa::tracked]`.\r\n\r\n"
+            ]
+        },
+        {
+            "hunk_id": 68494,
+            "commit_id": "eb97246301ae4e056b281130d65a2b581f4ec0ab",
+            "original_commit_id": "9dddd73c292b477fc96fbb6ff233cd46c7caa3ca",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": 1974,
+            "original_start_line": 1851,
+            "start_side": "RIGHT",
+            "line": 1976,
+            "original_line": 1976,
+            "side": "RIGHT",
+            "original_position": 102,
+            "position": 102,
+            "subject_type": "line",
+            "review_comments": [
+                "FWIW I'm not sure I see the need for this wrapper method right now -- everything compiles for me with this diff applied to your branch. I also doubt that we'll start accessing the bases from more places in the future; in 99% of cases, you really want to iterate over the MRO rather than the bases. However, I don't feel strongly; I'm okay with keeping it for now.\r\n\r\n```diff\r\ndiff --git a/crates/red_knot_python_semantic/src/types.rs b/crates/red_knot_python_semantic/src/types.rs\r\nindex b33d0fe4f..7ce85fb19 100644\r\n--- a/crates/red_knot_python_semantic/src/types.rs\r\n+++ b/crates/red_knot_python_semantic/src/types.rs\r\n@@ -1835,7 +1835,7 @@ impl<'db> ClassType<'db> {\r\n             })\r\n     }\r\n \r\n-    /// Return an iterator over the inferred types of this class's *explicit* bases.\r\n+    /// Return the inferred types of this class's *explicit* bases.\r\n     ///\r\n     /// Note that any class (except for `object`) that has no explicit\r\n     /// bases will implicitly inherit from `object` at runtime. Nonetheless,\r\n@@ -1848,12 +1848,8 @@ impl<'db> ClassType<'db> {\r\n     ///\r\n     /// Were this not a salsa query, then the calling query\r\n     /// would depend on the class's AST and rerun for every change in that file.\r\n-    fn explicit_bases(self, db: &'db dyn Db) -> &[Type<'db>] {\r\n-        self.explicit_bases_query(db)\r\n-    }\r\n-\r\n     #[salsa::tracked(return_ref)]\r\n-    fn explicit_bases_query(self, db: &'db dyn Db) -> Box<[Type<'db>]> {\r\n+    fn explicit_bases(self, db: &'db dyn Db) -> Box<[Type<'db>]> {\r\n         let class_stmt = self.node(db);\r\n \r\n         if class_stmt.type_params.is_some() {\r\ndiff --git a/crates/red_knot_python_semantic/src/types/mro.rs b/crates/red_knot_python_semantic/src/types/mro.rs\r\nindex ea298478f..5af11eccd 100644\r\n--- a/crates/red_knot_python_semantic/src/types/mro.rs\r\n+++ b/crates/red_knot_python_semantic/src/types/mro.rs\r\n@@ -40,7 +40,7 @@ impl<'db> Mro<'db> {\r\n     }\r\n \r\n     fn of_class_impl(db: &'db dyn Db, class: ClassType<'db>) -> Result<Self, MroErrorKind<'db>> {\r\n-        let class_bases = class.explicit_bases(db);\r\n+        let class_bases = &**class.explicit_bases(db);\r\n \r\n         match class_bases {\r\n             // `builtins.object` is the special case:\r\n```",
+                "I want to keep the `explicit_bases` function so that the return type is `&[Type]` over `&Box<[Type]>`  (I prefer more code at the definition side over more code at the call site)",
+                "I'm fine with that, but just so I understand fully: does that just give us better ergonomics? or is there also a perf/generated code benefit?",
+                "It's just ergonomics. A slice return type is more ergonomic than a `Box<[Type]>` (whether we use a `Box` or `Vec` internally is an implementation detail)"
+            ]
+        },
+        {
+            "hunk_id": 68491,
+            "commit_id": "eb97246301ae4e056b281130d65a2b581f4ec0ab",
+            "original_commit_id": "9dddd73c292b477fc96fbb6ff233cd46c7caa3ca",
+            "path": "crates/red_knot_python_semantic/src/types/infer.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 447,
+            "original_line": 447,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "oh, thanks! I meant to add this TODO before merging, but forgot."
+            ]
+        },
+        {
+            "hunk_id": 68493,
+            "commit_id": "eb97246301ae4e056b281130d65a2b581f4ec0ab",
+            "original_commit_id": "9dddd73c292b477fc96fbb6ff233cd46c7caa3ca",
+            "path": "crates/red_knot_python_semantic/src/types/mro.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 296,
+            "original_line": 296,
+            "side": "RIGHT",
+            "original_position": 68,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    /// in the bases list of the class's [`ruff_python_ast::StmtClassDef`] node.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 68492,
+            "commit_id": "eb97246301ae4e056b281130d65a2b581f4ec0ab",
+            "original_commit_id": "9dddd73c292b477fc96fbb6ff233cd46c7caa3ca",
+            "path": "crates/red_knot_python_semantic/src/types/mro.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 281,
+            "original_line": 281,
+            "side": "RIGHT",
+            "original_position": 59,
+            "position": 59,
+            "subject_type": "line",
+            "review_comments": [
+                "I'd just do\r\n\r\n```suggestion\r\n    /// in the bases list of the class's [`ruff_python_ast::StmtClassDef`] node.\r\n```"
+            ]
+        }
+    ]
+}

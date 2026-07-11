@@ -1,0 +1,120 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 120280,
+    "lang": "java",
+    "pr_title": "Don't reject docs as duplicates if they have different metrics",
+    "pr_body": "Adds a new component to the _id in TSDS containing a hash of time_series_metric field names\r\n\r\nfixes https://github.com/elastic/elasticsearch/issues/99123",
+    "pr_comments": [
+        "Pinging @elastic/es-storage-engine (Team:StorageEngine)",
+        "Hi @felixbarny, I've created a changelog YAML for you.",
+        "We discussed the following: https://github.com/elastic/elasticsearch/pull/120280#discussion_r1923925576 in another meeting and the behaviour mentioned is an unwanted side effect of this change. \r\n\r\nWe talked about anther way to deal with accepting documents with the same tsid and timestamp but different metrics and that is via updates with upserts (meaning index if not exist and otherwise update). Since logically this is an update. However currently data streams don't allow any other operation type than create and we are unsure of the performance impact of bulk with updates operations(instead of create ops).\r\n\r\nHowever tsdb data streams could support updates (and other operation types), because of the fact that tsdb data streams always route to the same backing index (using `@timestamp` field). Additionally with tsdb we already generate an _id based the document's content (dimension fields and `@timestamp`), so the optimizations we do for create ops with auto generated ids don't apply here, so perhaps change bulk api's operation type from create to update with upsert will not be too much.",
+        "I'm closing this as non-viable according to the reasoning in the comment above."
+    ],
+    "merged": false,
+    "created_at": "2025-01-21T10:44:55Z",
+    "issue_context": {
+        "number": 99123,
+        "title": "Missing metric name in tsid results in TSDB duplicate detection dropping data",
+        "body": "### Elasticsearch Version\n\n8.7 and above\n\n### Installed Plugins\n\n_No response_\n\n### Java Version\n\n_bundled_\n\n### OS Version\n\nAll\n\n### Problem Description\n\nThis issue has been observed while integrating Prometheus remotes writes into time series database. It happens as a result of batching happening before metrics are written to TSDB. If we have two (consecutive) batches (possibly with other batches in between) writing the second batch might fail due to TSDB duplicate detection in case the first one had the same set of dimensions (names and values)and timestamp. This happens because of the way we generate \"the primary key\" for documents stored in TSDB.\r\n\r\nEach document is identified by a pair `(_tsid, timestamp)` so clients can generate batches that include metrics with the same _tsid and timestamp. Note also that clients might do pre-aggregation of metrics on the timestamp field which might result in more chances of duplications because documents are generated at specific points in time.\r\n\r\nExample\r\n\r\nBatch 1\r\n```\r\n...\r\n{\"@timestamp\": \"2021-04-28T18:00:00.000Z\" , \"region\": \"us-east-2\", \"host\": \"foo\", \"pod\": \"fb58e236-48af-11ee-be56-0242ac120002\", \"gauge\": 10} \r\n...\r\n```\r\n\r\nBatch 2\r\n```\r\n...\r\n{\"@timestamp\": \"2021-04-28T18:00:00.000Z\" , \"region\": \"us-east-2\", \"host\": \"foo\", \"pod\": \"fb58e236-48af-11ee-be56-0242ac120002\", \"counter\": 10} \r\n...\r\n```\r\n\r\nHere we have two metrics, `gauge` and `counter` whose dimensions (names and values) are the same.\r\n\r\nThe _tsid for the first batch is the same as the _tsid of the second batch, something similar to:\r\n```\r\nregion=us-east2:host=foo:pod=fb58e236-48af-11ee-be56-0242ac120002\r\n```\r\n\r\nAlso the `timestamp` is the same.\r\n\r\nThe result is that duplicate detection kicks in, rejecting the second batch as a duplicate.\r\n\r\nIntegrations are working-around this issue by adding the metric name as an additional \"dummy\" dimension field. In that case the gauge and counter metric have a different name, which results in a different _tsid which results in writing two documents with different _tsid (and same timestamp). Adding this additional dimension (metric name), anyway, results in two documents being stored instead of one resulting in tsdb storage overhead.\r\n\r\nThis is considered a bug since we reject data as a result of incorrect duplicate detection. The two batches include data about two different metrics even if they share the same set of dimensions (_tsid). The contract of metric protocols, such as Prometheus remote write or OTLP metrics is that the metric name is part of the identity of a time series.\r\n\r\n\r\n\n\n### Steps to Reproduce\n\nJust try to index two documents with the same dimensions, each with a different set of metrics, for instance one with a counter and one with a gauge.\n\n### Logs (if relevant)\n\n_No response_",
+        "comments": [
+            "Pinging @elastic/es-analytics-geo (Team:Analytics)",
+            "A solution that can work in the short term is introducing additional component that generates the _id for time series documents. In [this issue](https://github.com/elastic/elasticsearch/issues/95389#issuecomment-1515797213), we mention that another timestamp could be used as an additional component to the _id. This would allow indexing a document with same tsid and timestamp (but different metric fields) in the same data stream",
+            "I think the solution here is to make the name of the metrics part of the _tsid. This makes more sense to me rather than relying on the _id as the metric name is part of the identity of a time series. But currently, we don't treat it that way.",
+            "Have we tried adding jitter to the timestamp, to avoid conflicts? This should also play well with downsampling; we'll have no extra dimension values while the metric values will fall into the same bucket and get aggregated.",
+            "Maybe we're mixing two different things here. This is not the issue about late arrivals and offsets that we've talked about in the context of aggregated trace metrics.\r\n\r\nWhile we can think of workarounds for this issue, we do need to acknowledge that this is a bug that needs fixing. We're not taking the metric names into account in defining the time series when we need to.\r\n\r\nMore specifically, we're violating the first bullet point in the OpenTelemetry Timeseries Model specification:\r\n\r\n> In this low-level metrics data model, a Timeseries is defined by an entity consisting of several metadata properties:\r\n>\r\n> * Metric name\r\n> * Attributes (dimensions)\r\n> * Value type of the point (integer, floating point, etc)\r\n> * Unit of measurement",
+            "Iiuc, the solution above with the timestamp jitter should address the duplicate detection issue. This is just a workaround, I agree that we need to get the right fix in place here - although I'd rather we don't include more field names in the `tsid` as this has performance implications. \r\n\r\nFwiw I'm not sure this is a violation of the model. The metric name _is_ part of the metadata properties, just not part of the key - unless I'm mistaken about the definition of \"metadata\".",
+            "But what is the jitter we want to apply here? A random one? We don't necessarily know if there's a second batch coming.",
+            "Right now, the workaround is to manually add the metric names into the _tsid by creating a hash of the metric names via the fingerprint processor. See also https://github.com/elastic/integrations/blob/5261e0c6579e1bba856a129c0392de5749627914/packages/prometheus/data_stream/remote_write/elasticsearch/ingest_pipeline/default.yml.",
+            "Right, maybe something as simple as a random within [-50ms, 50ms]. If the batches are sent every 10s or so, this should have a negligible impact when there's a single batch.",
+            "Here's another integration where the TSDB migration is blocked due to this issue: https://github.com/elastic/integrations/issues/6568#issuecomment-1741085205",
+            "To be more precise I think we are also breaking that contract because we don't take into account the metric type and unit of measurements. I guess this might be ok if some form of naming convention is used when defining the metric name such as `heap_memory_bytes_total` versus `heap_memory_kilobytes_total` because the name already include the metric unit of measurement. This is also REQUIRED in a way for Elasticsearch because we would not support indexing two fields with the same name and different type.\r\n\r\nAnyway if an integration wants to use the same name for two metrics but using different unit of measurement and/or different value type we are back to the same issue...two different metrics with same _tsid. Take for instance the following example (written as if it is an Elasticsearch mapping which normally would not work as said above)\r\n\r\n```\r\n\"disk_storage_total\": {\r\n   \"type\": long,\r\n   \"metric_type\": \"counter\",\r\n   \"meta\": {\r\n      \"unit\": \"bytes\"\r\n   }\r\n},\r\n\"disk_storage_total\": {\r\n   \"type\": integer,\r\n   \"metric_type\": \"counter\",\r\n   \"meta\": {\r\n      \"unit\": \"kilobytes\"\r\n   }\r\n}\r\n```\r\n\r\nIn this case we would not be able to index those metrics. So probably there is no integration doing this but I guess the fact that it is possible means we have find a way to support it.",
+            "You're right that we technically violate that, at the moment, too. However, these kinds of conflicts are far less common compared to different documents with the same dimensions.\r\n\r\nI've discussed the issue regarding the different units with @axw the other day. He brought up that we could map the unit to a well-known/special dimension when dealing with OTel data. That way we'd be compliant with the OTel spec.",
+            "IINM, this is not resolved by https://github.com/elastic/elasticsearch/pull/98023",
+            "Pinging @elastic/es-storage-engine (Team:StorageEngine)",
+            "There's also a similar issue with OTel metrics. We do group metrics with the same set of dimensions (and the same unit) in a single document at the moment. However, there's no guarantee that all metrics are sent in the same batch, and the batches could be split up further within the OTel collector. For example, via the [`batchprocessor`](https://github.com/open-telemetry/opentelemetry-collector/tree/main/processor/batchprocessor).\n\nAnother use case where we recently ran into this bug is when we wanted to add a [`_doc_count`](https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-doc-count-field.html) field for histogram metrics. Adding the doc count necessitates that each metric is stored in a separate document (as each histogram may have a different count). However, that would trigger this duplicate detection bug.",
+            "This is also affecting support for [CloudWatch Metric Streams](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Metric-Streams.html): https://github.com/elastic/integrations/pull/11239#issuecomment-2372815977\n\nBasically the same as what Felix described above: metrics may be delivered in two separate requests to the backend, with the same timestamp & dimensions, but non-overlapping sets of metrics.",
+            "I've gotten multiple other reports of data rejections from OpenTelemetry collectors. While we haven't fully gotten to the bottom of it, it seems very likely that metrics with the same dimensions and timestamps end up in different batches and thus, can't be grouped to the same document.",
+            "I have looked at this a bit more and evaluated options to either add the hash of metric names to the `_tsid` or the `_id`.\n\nIt would be relatively straightforward to add the metric names in `_tsid`. However, it's not guaranteed that the same set of metrics always end up in the same document. Due to batching or the introduction of new metrics, the way metrics are grouped into a single document, and therefore the `_tsid` can change. This is especially problematic for calculating counter rates as the time series for the same counter would frequently change.\n\nAnother solution would be to add a hash of the metric names to the `_id`. As the `_id` gets synthesized from other fields at read time to save storage, we'd need to store the metric name hash as another metadata field in doc values. The potentially bigger issue is the impact it has on how densely metrics can be stored on disk. Say we have metric fields `a` and `b`, which are stored in separate documents but they have the same `_tsid`. Therefore, they'd roughly be stored alternating on disk. I'm not sure which effect that has on the doc_values storage of metric `a`, for example, would it go from dense to sparse, where every other entry is empty (because every other document contains a value for metric `b`)? If that's really the case, what impact would that have on the storage and on aggregations?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 35697,
+            "commit_id": "8394841dd06a84a7c248914cdf914d98c596130d",
+            "original_commit_id": "04b5b7a8a65c837c93d751a3b1cd65ff6046d1cc",
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/TsidExtractingIdFieldMapper.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 112,
+            "original_line": 112,
+            "side": "RIGHT",
+            "original_position": 46,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "Curious to see the impact on disk usage because of this. I suspect most documents with a time series block will have the same set of metrics and therefor a same hash?",
+                "I think so, too. But probably we should also sort by _ts_metric_names_hash in addition to _tsid and @timestamp, to aid with compression in case there are docs with different metrics. This would presumably also make the metric doc values more dense, as it would ensure docs with the same set of populated metric fields are stored in proximity. WDYT?",
+                "I don't think it's worth adding this to the sort config, the values will be different hashes so we won't get much by sorting. Besides, the metrics will be different.",
+                "The sort config I was thinking about is `_tsid` (asc), `_ts_metric_names_hash` (asc), `@timestamp` (desc). The metric names hash would act as a kind-of tie breaker when the `_tsid` is the same. It would sort documents with the same set of metrics in proximity to one another. This should make their doc_values more dense. It would also make run-length-encoding for `_ts_metric_names_hash` more effective. Storage-wise, the effect would be similar to having a separate `_tsid` for documents with different metrics with the benefit that we can still properly detect counter rate resets as the `_tsid` doesn't actually change.\r\n\r\n\r\n"
+            ]
+        },
+        {
+            "hunk_id": 35698,
+            "commit_id": "8394841dd06a84a7c248914cdf914d98c596130d",
+            "original_commit_id": "04b5b7a8a65c837c93d751a3b1cd65ff6046d1cc",
+            "path": "server/src/main/java/org/elasticsearch/common/lucene/uid/VersionsAndSeqNoResolver.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 172,
+            "original_line": 172,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Would 4 bytes suffice here? I assume these conflicts are fairly infrequent in the first place.",
+                "I think that's probably fine, yes. The question is which hashing algorithm to use that produces a 32 bit value. Let's discuss that on your comment on `RoutingPathFields`."
+            ]
+        },
+        {
+            "hunk_id": 35699,
+            "commit_id": "8394841dd06a84a7c248914cdf914d98c596130d",
+            "original_commit_id": "04b5b7a8a65c837c93d751a3b1cd65ff6046d1cc",
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/RoutingPathFields.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 99,
+            "original_line": 99,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 49,
+            "subject_type": "line",
+            "review_comments": [
+                "These seem expensive.. how about using (XORing?) the `hashCode()` of each string?",
+                "This is what we're doing for the _tsid as well but with a re-used buffer, so that we don't need to allocate a separate buffer for each string in order to hash it. The benefit is that we can use a hash (murmurhash3) with a better distribution/fewer collisions compared to `hashCode`, the tradeoff is performance. But if we're not too concerned about collisions, we could also just use `TreeSet#hashCode`, or a variation that uses XOR'ing or multiplying each string's hash code by 31 (similar to how `String#hashCode` works)."
+            ]
+        },
+        {
+            "hunk_id": 35696,
+            "commit_id": "8394841dd06a84a7c248914cdf914d98c596130d",
+            "original_commit_id": "04b5b7a8a65c837c93d751a3b1cd65ff6046d1cc",
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/TimeSeriesMetricNamesHashFieldMapper.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 59,
+            "original_line": 59,
+            "side": "RIGHT",
+            "original_position": 59,
+            "position": 59,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe make this similar to `TimeSeriesRoutingHashFieldType`? Overtime doc values and field data support was added to it.",
+                "Is that so that we can expose the `_ts_metric_names_hash` to users? As this is an internal field, I'm not sure we'd want to do that. What would be the benefits of that?"
+            ]
+        }
+    ]
+}

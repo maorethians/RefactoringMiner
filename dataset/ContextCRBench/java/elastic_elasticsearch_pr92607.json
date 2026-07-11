@@ -1,0 +1,91 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 92607,
+    "lang": "java",
+    "pr_title": "Forbid empty CountDown",
+    "pr_body": "Today when using a `CountDown` callers must take responsibility for proper handling of the case where the count starts out at zero, because in this case the `countDown()` and `fastForward()` methods should never be called and will never return `true`. Fundamentally a `new CountDown(0)` doesn't really make sense, and it's a bit of a trap for the unwary, so with this commit we forbid it and adapt the handful of places which would create such an object.\r\n\r\nCloses #92196",
+    "pr_comments": [
+        "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+        "@elasticmachine test this please",
+        "Actually don't look at this too closely, I have a plan for fixing these bad callers in a better way. Watch this space...",
+        "This is good to review now. I recommend ignoring whitespace in the diffs."
+    ],
+    "merged": true,
+    "created_at": "2023-01-09T21:53:14Z",
+    "issue_context": {
+        "number": 92196,
+        "title": "`new CountDown(0)` is trappy and should be forbidden",
+        "body": "Today in a few places we create a `new CountDown(0)`. This is kind of trappy because it will never return `true` from `#countDown()` or `#fastForward()` which risks never completing whatever action needs completing unless the caller handles the empty case specially.\r\n\r\nWe should refactor the places that do this so that they all avoid creating an empty `CountDown`, instead just handling the fact that the action is already complete:\r\n\r\n- [ ] `TransportIndicesShardStoresAction$AsyncShardStoresInfoFetches`\r\n- [ ] `ClearScrollController`\r\n- [ ] `TransportBroadcastReplicationAction#doExecute`\r\n- [ ] `Realms#usageStats`\r\n\r\nOnce we've done that, we can forbid the creation of an empty `CountDown`.",
+        "comments": [
+            "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+            "Would a better solution be to make a factory method that returns an already-completed `CountDown` when init'd with `0`? It might be valid to wait for 0 tasks in certain situations, and rather than special-casing that, just let `CountDown` handle it (but properly)?",
+            "Hmm, looking closer, it is tricky, as `CountDown` is currently edge-triggered...",
+            "So, I've considered this a bit more.\r\n\r\nThere are some situations where it is ok to initialise `CountDown` with 0 - this indicates you are not expecting any count down or fallback - no operations are going on. You might still want to access `isCountedDown`, or it's just easier to create `CountDown` and not special-case it.\r\n\r\nIn this situation, it is then a proper programming error to call `countDown` or `fastForward` - you told countdown there were no operations happening, but then an operation happened. So you've screwed up somewhere, and you need to fix the bug.\r\n\r\nI note that both `TransportIndicesShardStoresAction$AsyncShardStoresInfoFetches` and `ClearScrollController` correctly ensure `countDown` is not called when it is zero - so those uses are ok.\r\n\r\nTo this end, #92388 deliberately makes this bug in your code visible, so you know about it and fix it (it passes all tests).\r\n\r\nWhat do you think?",
+            "I'd rather keep these as assertion errors to make it clearer that it really is an error to do this, rather than something that makes sense to catch and handle. I'm ok with also throwing something if assertions are disabled, but I don't think this helps much.\r\n\r\nYou're right that many callers in `main` today construct the potentially-bad `CountDown` object and then work around the special case. I think this is trappy. It caught me out in a PR on which I was working: I forgot the special case, and that caused a leak. Fortunately a test showed me my mistake before anything bad happened, but that won't be true in all cases.\r\n\r\nYou always have to have special handling for the empty case because of the edge-triggering, and the point here is that I think we should handle the special case _before_ even constructing the trappy object. Compare, for instance, `GroupedActionListener` which does prevent this kind of misuse.",
+            "So I looked at all the places that an empty countdown could be created in server, and added extra checks - https://github.com/elastic/elasticsearch/commit/7bcb6c033e14276fee847cf6af266416a0b94152\r\n\r\nI'm really not sure this change is worth it, a lot of the uses are of the pattern\r\n\r\n    CountDown remaining = new CountDown(elements.size());\r\n    for (var e : elements) {\r\n        ...\r\n        if (remaining.countDown()) {\r\n            ...\r\n        }\r\n    }\r\n\r\nin which case it's harmless that the empty countdown is created, as nothing uses it - and adding an extra check beforehand is a bit superfluous. Or it's just not assigning a CountDown variable, and leaving it as `null` - which then is a NPE waiting to happen if you do try to access it erroneously, no different to `IllegalStateException` thrown from the class itself. \r\n\r\nIs there a specific class you had in mind that this change would work well with?",
+            "Yes replacing them with `null` is not helping, in fact it's a bit worse because a NPE is not as strong as the `AssertionError` you get today.\r\n\r\nExpanding the pattern you mention a bit, I see a lot of this:\r\n\r\n```\r\nCountDown remaining = new CountDown(elements.size());\r\nfor (var e : elements) {\r\n    ...\r\n    if (remaining.countDown()) {\r\n        listener.onResponse(...);\r\n    }\r\n}\r\n```\r\n\r\nThat's dangerous, it means if `elements` is empty then that listener leaks. See for instance `org.elasticsearch.transport.RemoteClusterService#collectNodes` - it's very much non-obvious that this method just silently doesn't work if you give it an empty set of `clusters`. Fortunately all its callers today get it right, but I feel we should much more visibly explode in these situations instead.",
+            "In that specific class, the checks are in the _callers_ of `collectNodes` that does not call that method if `clusters` is empty - and I saw that a lot, which is why there are so few changes in that example commit. So `collectNodes` should really have an assert at the top that `clusters` is not empty.\r\n\r\nI agree this problem should be made clearer, but the majority of the existing uses already handle this properly, meaning there's not actually much to change in the uses here. So then we need to make sure that any modifications that use `CountDown` incorrectly fail as loudly as possible. How about this:\r\n1. Scan existing uses, fix any egregious errors, and add some asserts where it's not entirely clear it's safe.\r\n2. Add `IllegalStateException` alongside the assertion in `CountDown` to fail more obviously if incorrectly used in the future.",
+            "The unsafe thing I would like to prevent is effectively the snippet in my previous message, and the only way I can see to do that would be to forbid `new CountDown(0)`. It's not a huge change, there's a few spots where we need to move the special-case handling before the line which makes the now-forbidden object.\r\n\r\nI know we do this right in all the places today, my concern is about as-yet-unwritten code.",
+            "I agree that `new CountDown(0)` is trappy, and given the sample usages it's not immediately obvious that the _count_ is actually _0_ or not.  But there is some limited usage of a _0_ count, e.g. for `isCountedDown`. And there is a desire to avoid the proliferation of _null_ by sidestepping the assignment of a CountDown instance.\r\n\r\nMaybe there is a sweetspot here, where we ban the anonymous creation of instances with a zero count, but allow a singleton. The singleton still asserts when `countDown` or `fastForward` is called. If desired, code can use `EMPTY` rather than leaving the field unassigned.\r\n\r\n```\r\ndiff --git a/server/src/main/java/org/elasticsearch/common/util/concurrent/CountDown.java b/server/src/main/java/org/elasticsearch/common/util/concurrent/CountDown.java\r\nindex 17611f4372b..3df68c13d62 100644\r\n--- a/server/src/main/java/org/elasticsearch/common/util/concurrent/CountDown.java\r\n+++ b/server/src/main/java/org/elasticsearch/common/util/concurrent/CountDown.java\r\n@@ -25,13 +25,24 @@ public final class CountDown {\r\n     private final int originalCount;\r\n \r\n     public CountDown(int count) {\r\n-        if (count < 0) {\r\n-            throw new IllegalArgumentException(\"count must be greater or equal to 0 but was: \" + count);\r\n+        if (count <= 0) {\r\n+            throw new IllegalArgumentException(\"count must be greater than 0 but was: \" + count);\r\n         }\r\n         this.originalCount = count;\r\n         this.countDown = new AtomicInteger(count);\r\n     }\r\n \r\n+    private CountDown() {\r\n+        this.originalCount = -1;\r\n+        this.countDown = new AtomicInteger(0);\r\n+    }\r\n+\r\n+    private static final CountDown EMPTY = new CountDown();\r\n+\r\n+    public static CountDown empty() {\r\n+        return EMPTY;\r\n+    }\r\n+\r\n     /**\r\n      * Decrements the count-down and returns <code>true</code> iff this call\r\n      * reached zero otherwise <code>false</code>\r\n```",
+            "So that would result in code lines like\r\n\r\n    this.expectedOps = shards.isEmpty() ? CountDown.empty() : new CountDown(shards.size());\r\n\r\n    CountDown countDown = totalClusters.isEmpty() ? CountDown.empty() : new CountDown(totalClusters);\r\n\r\nWhy not just have a method:\r\n\r\n    public static CountDown of(int count) {\r\n        return count == 0 ? CountDown.empty() : new CountDown(count);\r\n    }",
+            "I agree that this doesn't help. The empty case is special, and it needs special handling in all cases. However I don't see any examples where we actually need to construct the empty `CountDown` up front, I think everywhere we can move the special-case handling up and just get rid of the whole concept of an empty countdown.",
+            ">I think everywhere we can move the special-case handling up and just get rid of the whole concept of an empty countdown.\r\n\r\nSeems ok, to me."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 35941,
+            "commit_id": "a448a6ce8a2081b6c8f7cb6939384231bf0faafe",
+            "original_commit_id": "7f96c6b5bc830ee5ef29a65ddd340f1f768915a2",
+            "path": "server/src/main/java/org/elasticsearch/action/admin/indices/shards/TransportIndicesShardStoresAction.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 260,
+            "original_line": 260,
+            "side": "RIGHT",
+            "original_position": 164,
+            "position": 164,
+            "subject_type": "line",
+            "review_comments": [
+                "This method had no business being a member of `InternalAsyncFetch`, this change just moves it up a level."
+            ]
+        },
+        {
+            "hunk_id": 35940,
+            "commit_id": "a448a6ce8a2081b6c8f7cb6939384231bf0faafe",
+            "original_commit_id": "7f96c6b5bc830ee5ef29a65ddd340f1f768915a2",
+            "path": "server/src/main/java/org/elasticsearch/action/admin/indices/shards/TransportIndicesShardStoresAction.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 229,
+            "original_line": 229,
+            "side": "RIGHT",
+            "original_position": 133,
+            "position": 133,
+            "subject_type": "line",
+            "review_comments": [
+                "This method had no business being a member of `InternalAsyncFetch`, this change just moves it up a level."
+            ]
+        },
+        {
+            "hunk_id": 35942,
+            "commit_id": "a448a6ce8a2081b6c8f7cb6939384231bf0faafe",
+            "original_commit_id": "7f96c6b5bc830ee5ef29a65ddd340f1f768915a2",
+            "path": "server/src/main/java/org/elasticsearch/action/admin/indices/shards/TransportIndicesShardStoresAction.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 279,
+            "original_line": 279,
+            "side": "RIGHT",
+            "original_position": 183,
+            "position": 183,
+            "subject_type": "line",
+            "review_comments": [
+                "This method had no business being a member of `InternalAsyncFetch`, this change just moves it up a level."
+            ]
+        }
+    ]
+}

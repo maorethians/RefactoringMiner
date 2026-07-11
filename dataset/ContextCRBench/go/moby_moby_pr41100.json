@@ -1,0 +1,62 @@
+{
+    "repo": "moby/moby",
+    "pr_number": 41100,
+    "lang": "go",
+    "pr_title": "Fix windows log file rotation with readers",
+    "pr_body": "This fixes the case where log rotation fails on Windows while there are\r\nclients reading container logs.\r\n\r\nFixes https://github.com/moby/moby/issues/40999\r\n",
+    "pr_comments": [
+        "Seeing some failures on Windows RS5;\r\n\r\n```\r\n=== RUN   TestReadLog/tail_exact\r\n    --- FAIL: TestReadLog/tail_exact (0.00s)\r\n        local_test.go:146: assertion failed: error is not nil: error opening rotated log file: error opening file: The system cannot find the file specified.\r\n\r\n=== RUN   TestReadLog/tail_less_than_available\r\n    --- FAIL: TestReadLog/tail_less_than_available (0.00s)\r\n        local_test.go:156: assertion failed: error is not nil: error opening rotated log file: error opening file: The system cannot find the file specified.\r\n\r\n=== RUN   TestReadLog/tail_more_than_available\r\n    --- FAIL: TestReadLog/tail_more_than_available (0.00s)\r\n        local_test.go:164: assertion failed: error is not nil: error opening rotated log file: error opening file: The system cannot find the file specified.\r\n```",
+        "I see the problem. It's an error handling issue with `openFile`",
+        "Should be fixed now.",
+        "Hmm.. one failure remaining on RS5;\r\n\r\n```\r\n=== RUN   TestCheckCapacityAndRotate\r\n--- FAIL: TestCheckCapacityAndRotate (0.01s)\r\n    logfile_test.go:294: assertion failed: error is not nil: rename C:\\Users\\ContainerAdministrator\\AppData\\Local\\Temp\\TestCheckCapacityAndRotate612011099\\log214931454 C:\\Users\\ContainerAdministrator\\AppData\\Local\\Temp\\TestCheckCapacityAndRotate612011099\\log214931454.1: Access is denied.\r\n```",
+        "I do not know why this is failing now... It didn't fail until I changed to not wrap the error from open...",
+        "Ok, so I had to change the this to evict log readers when there is an error rotating files.\r\nI found that in this scenario:\r\n\r\n1. Client opens log stream\r\n2. Rotation occurs\r\n3. Rotation occurs again\r\n\r\nOn step 3, the rotation will fail when it is trying to rename the current file.\r\nIt will either get an \"Access is denied\" error, or \"file is being used by another process\" error.\r\n\r\nSo on step 3, when an error occurs, it will evict readers and try again (a few times until successful || max retries).\r\n\r\nThe thinking here is allowing the container to make progress is more important than the log reader reading the logs.\r\nWe can't really seamlessly transfer the log reader without dropping logs anyway, so take the simpler route and have the client reconnect.\r\nWe pass the eviction error along to the client.\r\n\r\nWithout this change, log rotation is essentially broken on Windows if there are active log consumers.",
+        "Added a 2nd commit to fix some race conditions in the loggerutils tests.\r\nAdditionally, I think I fixed the flakey test. See commit for details.",
+        "@kevpar @kolyshkin ptal",
+        "And split up commits for easier review.",
+        "All green.",
+        "@kevpar @kolyshkin ptal",
+        "@kolyshkin nits are addressed; PTAL",
+        "@kevpar @kolyshkin @tonistiigi ptal",
+        "I don't have much context on this code, but the issue I'm aware of should be fixed by switching to do file opens with `FILE_SHARE_DELETE`. It looks like this PR consistently uses the `open`/`openFile` wrappers which do so, so LGTM.",
+        "All green!"
+    ],
+    "merged": true,
+    "created_at": "2020-11-05T19:54:58Z",
+    "issue_context": {
+        "number": 40999,
+        "title": "Windows log rotation errors with active readers",
+        "body": "On Windows, when the daemon attempts to rotate logs, if there is an active reader, the rotation fails.\r\nThis failure was totally unrecoverable until https://github.com/moby/moby/pull/40920\r\nHowever that PR only allows the daemon to recover after an error.\r\n\r\nThe issue occurs when the daemon tries to rename a file that a log reader (e.g. `docker logs` client) has open.\r\nThis should have, based on the best info I've found, been fixed by using FILE_SHARE_DELETE (https://github.com/moby/moby/pull/39974), however that does not seem to be the case.\r\nFurthermore, I've tried to apply this same change to all file opens in that package and still hit the same issue.\r\n\r\nWhat this means right now is that if there is a `docker logs` client open and log rotation is enabled, if a file is ready for rotation then log writes will error out until the log client is gone.",
+        "comments": [
+            "Help wanted",
+            "@cpuguy83 What is the actual error when rotating? Does moving/deleting the log file fail with ERROR_SHARING_VIOLATION, or does something else fail?\r\n\r\nI think every process that has the log file open will need to have FILE_SHARE_DELETE added to their flags. Is it possible something has it open that isn't using this flag?",
+            "The actual error is \"the file is being used by another process\".\r\nThe only process that has the file open would be dockerd.\r\nI have tried to ensure that `FILE_SHARE_DELETE` is applied everywhere but ran into the same issue, which makes me suspect that we aren't doing this correctly.",
+            "If you're seeing \"The process cannot access the file because it is being used by another process.\", then that's ERROR_SHARING_VIOLATION.\r\n\r\nIf you use [Sysinternals Process Explorer](https://docs.microsoft.com/en-us/sysinternals/downloads/process-explorer), you should be able to ctrl-f and search for the log file path, and see if anything else has it open.",
+            "I'm certain it's only docker that has it open, because as soon as the client disconnect we can rotate the logs again.",
+            "Could you link me to where the writing and reading/rotating of the log file occurs? I can take a look to see if I have any ideas.",
+            "Error occurs in the rotate call: https://github.com/moby/moby/blob/89382f2f20745b9e63bed6c066f104980dff4396/daemon/logger/loggerutils/logfile.go#L182-L222\r\n\r\nRead is here: https://github.com/moby/moby/blob/89382f2f20745b9e63bed6c066f104980dff4396/daemon/logger/loggerutils/logfile.go#L323\r\n\r\nThe read is what I tried to patch to make sure we open with FILE_SHARE_DELETE (the other code should already be doing this).",
+            "It looks like `ReadLogs` is still using `os.Open` instead of `openFile`, so I don't think it will have FILE_SHARE_DELETE set. I think if you change this to use `openFile` it might fix the issue.\r\n\r\nhttps://github.com/moby/moby/blob/master/daemon/logger/loggerutils/logfile.go#L325",
+            "Thanks... I sear I tried this and it didn't work, but I might have missed a spot.\r\n\r\nConfirmed it works with this change: https://github.com/moby/moby/pull/41100"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 31478,
+            "commit_id": "b102d4637c7354916c7e965c04d3710763743771",
+            "original_commit_id": "bb23f1bf61cb49c5aa3f7df934d79c305afb7c8c",
+            "path": "daemon/logger/loggerutils/logfile.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 214,
+            "original_line": 214,
+            "side": "RIGHT",
+            "original_position": 100,
+            "position": 100,
+            "subject_type": "line",
+            "review_comments": [
+                "~~If `fname.1` already exists, this will potentially be the same issue, right?  Should this use `i` or `i+1` instead?~~\r\n(Sorry I'm not more familiar with this code to know whether this even makes sense :see_no_evil:)\r\n\r\nDiscussed on maintainer call, this isn't relevant. :+1:"
+            ]
+        }
+    ]
+}

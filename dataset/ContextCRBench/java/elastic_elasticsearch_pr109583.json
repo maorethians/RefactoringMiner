@@ -1,0 +1,299 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 109583,
+    "lang": "java",
+    "pr_title": "ESQL: INLINESTATS",
+    "pr_body": "This implements `INLINESTATS`. Most of the heavy lifting is done by `LOOKUP`, with this change mostly adding a new abstraction to logical plans, an interface I'm calling `Phased`. Implementing this interface allows a logical plan node to cut the query into phases. `INLINESTATS` implements it by asking for a \"first phase\" that's the same query, up to `INLINESTATS`, but with `INLINESTATS` replaced with `STATS`. The next phase replaces the `INLINESTATS` with a hash join on the results of the first phase.\r\n\r\nSo, this query:\r\n```\r\nFROM foo\r\n| EVAL bar = a * b\r\n| INLINESTATS m = MAX(bar) BY b\r\n| WHERE m = bar\r\n| LIMIT 1\r\n```\r\n\r\ngets split into\r\n```\r\nFROM foo\r\n| EVAL bar = a * b\r\n| STATS m = MAX(bar) BY b\r\n```\r\n\r\nfollowed by\r\n```\r\nFROM foo\r\n| EVAL bar = a * b\r\n| LOOKUP (results of m = MAX(bar) BY b) ON b\r\n| WHERE m = bar\r\n| LIMIT 1\r\n```\r\n\r\n\r\nHere's an example of the syntax:\r\n```\r\n$ curl -k -XDELETE -u'elastic:password' 'http://localhost:9200/test'\r\n$ for a in {0..99}; do\r\n    echo -n $a\r\n    rm -f /tmp/bulk\r\n    for b in {0..999}; do\r\n        echo '{\"index\": {}}' >> /tmp/bulk\r\n        echo '{\"a\": '$a', \"b\": '$b'}' >> /tmp/bulk\r\n    done\r\n    curl -s -k -XPOST -u'elastic:password' -HContent-Type:application/json 'http://localhost:9200/test/_bulk?pretty' --data-binary @/tmp/bulk | grep errors\r\ndone\r\n$ curl -s -k -XPOST -u'elastic:password' -HContent-Type:application/json 'http://localhost:9200/test/_forcemerge?max_num_segments=1&pretty'\r\n$ curl -s -k -XPOST -u'elastic:password' -HContent-Type:application/json 'http://localhost:9200/test/_refresh?pretty'\r\n$ curl -k -XPOST -u'elastic:password' -HContent-Type:application/json http://localhost:9200/_query?pretty -d'{\r\n    \"query\": \"FROM test | INLINESTATS m=MAX(a * b) BY b | WHERE m == a * b | SORT a DESC, b DESC | LIMIT 1\",\r\n    \"profile\": true\r\n}'\r\n{\r\n  \"columns\" : [\r\n    {\r\n      \"name\" : \"a\",\r\n      \"type\" : \"long\"\r\n    },\r\n    {\r\n      \"name\" : \"b\",\r\n      \"type\" : \"long\"\r\n    },\r\n    {\r\n      \"name\" : \"m\",\r\n      \"type\" : \"long\"\r\n    }\r\n  ],\r\n  \"values\" : [\r\n    [\r\n      99,\r\n      999,\r\n      98901\r\n    ]\r\n```\r\n\r\nCloses #107589",
+    "pr_comments": [
+        "This is riddled with NOCOMMITs, as any good prototype deserves to be.\r\n\r\nIt's also not clear that this is the right way to go about this. I mean, cutting the request into two *is* the right way to do it, I think. The reworking of the callbacks to make that possible seems like the sane way to do that.\r\n\r\nBut from a planning side, this is an \"interesting\" choice. We analyze the `INLINESTATS` call, but then don't run the optimizer on it at all - that seems bad. OTOH, we *do* run the optimizer on the two halves of the query. That seems good.",
+        "I've extracted #110445 out of this one so I can get it and not have to deal with merge conflicts.",
+        "![image](https://github.com/elastic/elasticsearch/assets/215970/bd634055-9877-44a6-9a87-eea82fc09e13)\r\n",
+        "There's a fun bug that I'm going to probably leave for a followup:\r\n```\r\nFROM airports\r\n| INLINESTATS min_scalerank=MIN(scalerank) BY type\r\n| MV_EXPAND type\r\n| WHERE scalerank == MV_MIN(scalerank);\r\n```\r\n\r\nHits the rule execution limit. It started from a typo - I meant to do `scalerank == MV_MIN(min_scalerank)` but didn't. And then it hit the rule execution limit. Then I removed extra commands from the query until I got to more minimal recreation.",
+        "I'm leaving this test case out because it doesn't work yet:\r\n```\r\ninlineStatsUnionAggInline\r\nrequired_capability: union_types\r\nrequired_capability: inlinestats\r\n\r\nFROM sample_data, sample_data_str\r\n| INLINESTATS count = COUNT(CIDR_MATCH(TO_IP(client_ip), \"172.21.0.0/24\") OR NULL) BY @timestamp\r\n| SORT client_ip ASC, @timestamp ASC\r\n| LIMIT 4\r\n;\r\n```",
+        "Pinging @elastic/es-analytical-engine (Team:Analytics)",
+        "Pinging @elastic/kibana-esql (ES|QL-ui)",
+        "Followup issue: https://github.com/elastic/elasticsearch/issues/110923",
+        "Hi @nik9000, I've created a changelog YAML for you. *Note* that since this PR is labelled `release highlight`, you need to update the changelog YAML to fill out the extended information sections.",
+        "I'm going to push a test for `profile` to this one. We capture the results profiles for all phases and that's good and important.",
+        "I think the NPE with this query\r\n\r\n\r\n```\r\nFROM employees\r\n| INLINESTATS max_salary = MAX(salary) by languages \r\n| KEEP emp_no, languages, max_salary\r\n```\r\n\r\nis due to [PhysicalPlanOptimizer.ProjectAwayColumns](https://github.com/elastic/elasticsearch/blob/main/x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/optimizer/PhysicalPlanOptimizer.java#L122-L127).\r\nIn this case, `rhs` and `lhs` contain the same fields, so removing one of the two we also remove the other one (that we'll need later in the planning).\r\n\r\nWe could fix it by just checking that we are not removing something we still need, eg.\r\n\r\n```\r\nif (p instanceof HashJoinExec join) {\r\n    attributes.removeAll(join.addedFields());\r\n    for (Attribute rhs : join.rightFields()) {\r\n        if (join.leftFields().stream().anyMatch(x -> x.semanticEquals(rhs)) == false) {\r\n            attributes.remove(rhs);\r\n        }\r\n    }\r\n}\r\n```",
+        "I tried this against `nyc_taxis` and it's working pretty well. I tried writing a fairly small INLINESTATS.\r\n```\r\nwhile time curl -HContent-Type:application/json -XPOST -uelastic:password localhost:9200/_query?pretty -d'{\r\n    \"profile\": true,\r\n    \"query\": \"FROM nyc_taxis | INLINESTATS a=AVG(fare_amount) BY passenger_count | WHERE fare_amount > a | STATS COUNT(*)\"\r\n}' | tee out; do echo -n ; done\r\n```\r\n\r\nThat takes about a second.  If you take the times from the output:\r\n```\r\njq '[.profile.drivers[].operators[] | {\r\n        operator,\r\n        nanos: (.status.processing_nanos + .status.process_nanos + .status.aggregation_nanos + .status.hash_nanos),\r\n    }] | sort_by(.nanos)' out\r\n```\r\n\r\nYou get it spending most of the time performing the lookup part of the join:\r\n```\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT], entries=10, size=864b}, keys=[passenger_count], mapping=[1]]\",\r\n    \"nanos\": 896830117\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT], entries=10, size=864b}, keys=[passenger_count], mapping=[1]]\",\r\n    \"nanos\": 1006208435\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT], entries=10, size=864b}, keys=[passenger_count], mapping=[1]]\",\r\n    \"nanos\": 1165030794\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT], entries=10, size=864b}, keys=[passenger_count], mapping=[1]]\",\r\n    \"nanos\": 1173068625\r\n  }\r\n```\r\n\r\nIf you make it intentionally worse like so:\r\n```\r\n while time curl -HContent-Type:application/json -XPOST -uelastic:password localhost:9200/_query?pretty -d'{\r\n    \"profile\": true,\r\n    \"query\": \"FROM nyc_taxis | INLINESTATS a=AVG(fare_amount) BY passenger_count, total_amount | WHERE fare_amount > a | STATS COUNT(*)\"\r\n```\r\n\r\nIt takes about 10 seconds. There are a lot of `total_amount`s. Here's the runtimes:\r\n```\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT, 1:DOUBLE], entries=80473, size=3.9mb}, keys=[passenger_count, total_amount], mapping=[1, 2]]\",\r\n    \"nanos\": 3059240033\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=PackedValuesBlockHash{groups=[1:INT, 2:DOUBLE], entries=48908, size=2.1mb}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 3069974199\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=PackedValuesBlockHash{groups=[1:INT, 2:DOUBLE], entries=49142, size=2.1mb}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 3104720977\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT, 1:DOUBLE], entries=80473, size=3.9mb}, keys=[passenger_count, total_amount], mapping=[1, 2]]\",\r\n    \"nanos\": 3232667218\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:INT, 1:DOUBLE], entries=80473, size=3.9mb}, keys=[passenger_count, total_amount], mapping=[1, 2]]\",\r\n    \"nanos\": 3521781424\r\n  }\r\n```\r\n\r\nLike in the other case we're spending most of the time looking up positions for the implicit JOIN, though the hash agg itself takes about the same amount of time. That's pretty expected, really.",
+        "Here's another fun one:\r\n```\r\nwhile time curl -HContent-Type:application/json -XPOST -uelastic:password localhost:9200/_query?pretty -d'{\r\n    \"profile\": true,\r\n    \"query\": \"FROM nyc_taxis | EVAL d = DATE_TRUNC(1 day, pickup_datetime) | INLINESTATS a=AVG(fare_amount) BY d | WHERE fare_amount > a | STATS COUNT(*) BY d\"\r\n}' | tee out; do echo -n ; done\r\n```\r\n\r\nThat's about four seconds. The operators show:\r\n```\r\n  {\r\n    \"operator\": \"ValuesSourceReaderOperator[fields = [fare_amount]]\",\r\n    \"nanos\": 265748767\r\n  },\r\n  {\r\n    \"operator\": \"ColumnLoad[values=a:DOUBLE, positions=4]\",\r\n    \"nanos\": 318110478\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=LongBlockHash{channel=2, entries=283, seenNull=false}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 324100509\r\n  },\r\n  {\r\n    \"operator\": \"ColumnLoad[values=a:DOUBLE, positions=4]\",\r\n    \"nanos\": 357678833\r\n  },\r\n  {\r\n    \"operator\": \"ColumnLoad[values=a:DOUBLE, positions=4]\",\r\n    \"nanos\": 411740136\r\n  },\r\n  {\r\n    \"operator\": \"ColumnLoad[values=a:DOUBLE, positions=4]\",\r\n    \"nanos\": 429439347\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=LongBlockHash{channel=2, entries=283, seenNull=false}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 453400645\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:LONG], entries=365, size=27.8kb}, keys=[d], mapping=[2]]\",\r\n    \"nanos\": 511739270\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=LongBlockHash{channel=2, entries=318, seenNull=false}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 531829132\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=LongBlockHash{channel=2, entries=220, seenNull=false}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 609663233\r\n  },\r\n  {\r\n    \"operator\": \"HashAggregationOperator[blockHash=LongBlockHash{channel=2, entries=267, seenNull=false}, aggregators=[GroupingAggregator[aggregatorFunction=SumDoubleGroupingAggregatorFunction[channels=[3]], mode=INITIAL], GroupingAggregator[aggregatorFunction=CountGroupingAggregatorFunction[channels=[3]], mode=INITIAL]]]\",\r\n    \"nanos\": 610130961\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:LONG], entries=365, size=27.8kb}, keys=[d], mapping=[2]]\",\r\n    \"nanos\": 748904555\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:LONG], entries=365, size=27.8kb}, keys=[d], mapping=[2]]\",\r\n    \"nanos\": 1010541128\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:LONG], entries=365, size=27.8kb}, keys=[d], mapping=[2]]\",\r\n    \"nanos\": 1071067734\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:LONG], entries=365, size=27.8kb}, keys=[d], mapping=[2]]\",\r\n    \"nanos\": 1288085166\r\n  },\r\n  {\r\n    \"operator\": \"RowInTableLookup[PackedValuesBlockHash{groups=[0:LONG], entries=365, size=27.8kb}, keys=[d], mapping=[2]]\",\r\n    \"nanos\": 1349373240\r\n  }\r\n```\r\n\r\nThis reads to me as the join being the most expensive part. We can certainly improve that. Especially in cases like this where the data we're joining against has some predictable pattern.",
+        "> I have one question for you: do we have any lower level mechanisms that guarantee that the two phases run on the same data? I expected some PIT logic, but maybe we handle it already?\r\n\r\nI don't. I'll add that to the list of followups. We don't really need an explicit PIT because we're already on the data nodes. But we can use something like what _search uses to wedge open the readers. That feels like a neat trick to steal.",
+        "> FROM employees\r\n> | INLINESTATS max_salary = MAX(salary) by languages \r\n> | KEEP emp_no, languages, max_salary\r\n\r\n@luigidellaquila I pushed a CSV test with this and it seems to be working. I wonder what's up!",
+        "> > FROM employees\r\n> > | INLINESTATS max_salary = MAX(salary) by languages\r\n> > | KEEP emp_no, languages, max_salary\r\n> \r\n> @luigidellaquila I pushed a CSV test with this and it seems to be working. I wonder what's up!\r\n\r\nApparently the additioinal [SORT](https://github.com/elastic/elasticsearch/pull/109583/commits/887b9ce6643a2076f94beb519bdd8f2025375156#diff-a5ed793b796c14ec1f92807242ff2376e16888c8cf7627a4f6a8f57f23ed843aR309) makes it work. \r\nIf you re-write the query moving the SORT right after the FROM, you'll see the failure\r\n\r\n```\r\nFROM employees\r\n| SORT emp_no ASC\r\n| INLINESTATS max_salary = MAX(salary) by languages\r\n| KEEP emp_no, languages, max_salary\r\n| LIMIT 3;\r\n```",
+        "I was wondering about **something** else yesterday, but I _think_ that **something** is somewhat related to [this TODO](https://github.com/elastic/elasticsearch/pull/109583/files#diff-2c689d9c0606d310fd36a603064f43cb4b23d356f08983fbdb98c65e76e6919dR1124). **Why is this \"split\" of plans done after the analysis and not after the logical optimization?**\r\n\r\nI am asking this because any potential optimizations that let things pass through a stats/inlinestats do not happen anymore. I quickly looked over the logical optimization rules:\r\n- PropagateEvalFoldables should do its job over Aggregates as well in the very near future, but the way the plans are split now, this rule will have a per-sub-plan wide visibility, but I think it should have a per-root-plan wide visibility somehow\r\n- SkipQueryOnLimitZero might need to adapt and \"duplicate\" the `limit 0` to all the descending plans, to avoid unnecessary operations (joins essentially), if the end result will be thrown away\r\n- PushDownAndCombineFilters can push down some filters past aggregates. This won't happen anymore for `inlinestats`.\r\n- maybe others, I checked only a few of them.\r\n\r\nAlso, related to the [\"experimental\" nature of `inlinestats`](https://github.com/elastic/elasticsearch/pull/109583/files#r1679306373), there may be some unforeseen consequences of having split plans with regards to the optimizer. Some of these are definitely non breaking (the query returns no error and no exception) and are strictly optimizations, but some of them may result in inconsistencies (not all the optimization rules are in fact optimizations) and return an exception or error that we didn't expect.\r\nThe high level of uncertainty here is the one that's most concerning imo. Also, the amount of work for the followups is unknown to me.\r\n\r\nLeaving all these aside, this is an awesome feature, highly sought-after and it should be taken for a test drive.",
+        "> Hey, I just realized: there's likely a whole host of weird edge cases that can happen due to the multi-phase approach:\r\n> \r\n>     * field caps response might not be up to date anymore, resp.\r\n\r\nMappings in ES can only change in a way that makes them \"bigger\". So I think this is *mostly* safe.\r\n\r\n> \r\n>     * index/enrich resolution might become invalid between first and second phase (indices might be deleted or updated)\r\n\r\nI think both of these are problems between field caps and runtime too. I *think* these are ok and we have to mostly think about error messages.\r\n\r\nExcept deleting an index. That one we have a solution for. Or, rather, we *can* have a solution for it. See below on data change.\r\n\r\n> \r\n>     * data nodes might crash or restart\r\n\r\nYeah. At the moment we just lose queries then. Same for _search.\r\n\r\n>     * the first phase's result might cause CBE or OOM\r\n\r\nSame as above. I do want to check on the error messages for circuit breaker exceptions from a phase though.\r\n> \r\n>     * data is ingested at a fast pace - at what point do we consider the inconsistency between the phases' results inacceptable?\r\n\r\nThis is something I stuck in a follow-up. _search has a mechanism where it keeps the `IndexReader` open between phases. We might wish to use that mechanism too. Especially if we want to use `Phased` to make a `FetchPhase`. But there are downsides. We could leave a lot of file handles open, for example. And indices can't be deleted between request. But you get the same view for both requests. The same documents. Even deleted documents aren't deleted in your view. It's quite repeatable-read.\r\n\r\nI think we should think about adopting this but I want to hold it until a follow up. Because I think we have something useful here even if we don't turn it on. But I think deciding what to do here is a blocker for GA.\r\n\r\n\r\n",
+        "> **Why is this \"split\" of plans done after the analysis and not after the logical optimization?**\r\n\r\nI'm 99% sure we have to split after analysis. But we could split after logical optimization - but if we do, I think we need to rerun logical optimization on the new plans. The `firstPhase` and the combined results. I think there's important stuff that can happen there.\r\n\r\nAs to the partial/incomplete nature of things - my hope was that by firing the sub-queries through the same stack of optimizations it would be safe. So long as each sub-plan is a valid LogicalPlan. In this case the the \"firstPhase\" is a normal ES query without the implicit `LIMIT`. And the last phase is pretty much a normal query with a `LOOKUP` in it. The case where we support the non-grouped merge is a bit unique, but not too different.",
+        "NOCOMMIT: Link the new javadocs for Phased and EsqlSession into the package level javadoc.",
+        "> NOCOMMIT: Link the new javadocs for Phased and EsqlSession into the package level javadoc.\r\n\r\nPushed a link.",
+        "I've put this behind a feature flag and removed `release highlight` because it's not super clear that this'll get un-feature flagged in 8.16.\r\n\r\nThere are a bunch of extra follow ups. I had a conversation with @costin about moving around how we trigger the Phased nature. The plan now is to merge this as is and rework some things.\r\n\r\nI'm going to push a few more tests and see if we can land this. Folks can experiment with it some more while we finish up.",
+        "Release tests look unrelated. We'll fight with them as fight comes up.\r\n",
+        "FTR, I've raised an meta ticket to track my progress at #112266",
+        "@costin would it be possible to update this blog https://www.elastic.co/search-labs/blog/esql-piped-query-language-goes-ga to note that `INLINESTATS` is not yet available/will only be available in `8.16.0`?",
+        "I'm removing the `>feature` tag from this. This was the first commit for this, but the feature wasn't finish and still isn't. Exciting as it is, there's still the stuff in the meta issue to finish before we ungate this thing."
+    ],
+    "merged": true,
+    "created_at": "2024-07-16T12:32:00Z",
+    "issue_context": {
+        "number": 107589,
+        "title": "Support inline stats",
+        "body": "We'd like the ability to enrich rows with the results of a `STATS` command. For example, say you have this:\r\n\r\n| a |  b |\r\n| -:| --:|\r\n| 1 | 10 |\r\n| 1 | 20 |\r\n| 2 | 20 |\r\n| 2 | 15 |\r\n\r\nrunning `INLINESTATS MIN(b) BY a` should make\r\n\r\n| a |  b | MIN(b) |\r\n| -:| --:| ------:|\r\n| 1 | 10 |     10 |\r\n| 1 | 20 |     10 |\r\n| 2 | 20 |     15 |\r\n| 2 | 15 |     15 |",
+        "comments": [
+            "Pinging @elastic/es-analytical-engine (Team:Analytics)",
+            "We're planning to implement this by splitting the query into two commands internally, then running them in a row. So, this:\r\n```\r\nFROM foo\r\n| INLINESTATS MIN(b) BY a\r\n| WHERE b == MIN(b)\r\n```\r\n\r\nbecomes these two:\r\n```\r\nFROM foo\r\n| STATS MIN(b) BY a\r\n\r\n----and----\r\nFROM foo\r\n| LOOKUP _inlinestatsresults_ ON a\r\n| WHERE b == MIN(b)\r\n```\r\n\r\nThat `LOOKUP` command is being implemented here: #107987. It's my first step to getting this in.\r\n\r\n",
+            "The main limitation of this approach is that the results of the first `STATS` result has to be small enough you can push it across the wire. That's going to be true in plenty of cases, but at some point we'll need to deal with results that don't fit. Those cases are harder and probably all want some ability to spill to disk. ",
+            "Little update as we're closing in on doing this: we plan to limit queries to a single `INLINESTATS` for now.\r\n\r\nWe plan to have just the single approach that phases the results. This approach is the best when processing lots of data - you can compare individual docs to the `AVG` of some values of a bucket they fall into. That's good. But if, say, you have `STATS | INLINESTATS` then this query plan is silly - `STATS` results have to be buffered already - we should read from `STATS` twice. But we have to start somewhere and this case seems less important than the case where you *start* with an INLINESTATS.\r\n\r\n",
+            "There's also a limit on the amount of space the results of the first phase can have - at least in the proposal we're starting with. That will always be some limit, but for now the limit is 1mb. We'd like to lift that limit, but it's similar to the limit on the space in the `TABLES` parameter.\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 35801,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/aggregation/table/RowInTableLookup.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 42,
+            "original_line": 42,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "The next few files make debugging an error I hit while working on this easier."
+            ]
+        },
+        {
+            "hunk_id": 35813,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/parser/LogicalPlanBuilder.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 336,
+            "original_line": 336,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Do snapshot builds actually enable this feature flag? I think we only enable the capability, not this feature flag here, when running as snapshot?"
+            ]
+        },
+        {
+            "hunk_id": 35802,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/analysis/Analyzer.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 404,
+            "original_line": 401,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "I've just boiled out an interface that let's us analyze `Aggregate` and `InlineStats`. They are the same at this phase."
+            ]
+        },
+        {
+            "hunk_id": 35805,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/InlineStats.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 234,
+            "original_line": 175,
+            "side": "RIGHT",
+            "original_position": 150,
+            "position": 209,
+            "subject_type": "line",
+            "review_comments": [
+                "Isn't it a bit late to do it here? As I understand it, we already computed everything and got the data into the coordinator.\r\nI guess it's better to have a limit than not have anything; just to understand it",
+                "In an ideal world we wouldn't have a limit here but we don't have proper accounting for `Block`s in the request objects - they don't use the Breaker at all. So doing this copy shifts it out of tracking-land. I think it's important to get the tracking right before we GA this so I'm adding that to the follow-ups list. I want to keep it out of this PR because I don't really know how to do it and it's going to touch a bunch of stuff."
+            ]
+        },
+        {
+            "hunk_id": 35807,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/Phased.java",
+            "start_line": 98,
+            "original_start_line": 52,
+            "start_side": "RIGHT",
+            "line": 102,
+            "original_line": 56,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 102,
+            "subject_type": "line",
+            "review_comments": [
+                "You can also use `forEachUp` with a class token.\r\n```suggestion\r\n        plan.forEachUp(Phased.class, t -> {\r\n            if (firstPhase.get() == null) {\r\n                firstPhase.set(t.firstPhase());\r\n            }\r\n        });\r\n```\r\nAlso applies below.",
+                "That doesn't work here because `Phased` is an interface and not a subclass of `Node`. I'd have to fiddle with the signature of `forEachUp` in ways with a pretty wide blast radius....",
+                "Ah, you're right, sorry!"
+            ]
+        },
+        {
+            "hunk_id": 35804,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/aggregation/table/RowInTableLookup.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 41,
+            "original_line": 41,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Can this happen? Should it be an assert?",
+                "Either/or is fine. It's a programming error if you get this, yeah. But we've thrown `IllegalArgumentException` for those in the past."
+            ]
+        },
+        {
+            "hunk_id": 35806,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/session/EsqlSession.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 142,
+            "original_line": 142,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "I agree with Andrei's observation: we should probably extract the first phase after logical optimization - otherwise we have no possibility of e.g. pushing down filters on the group for inline stats:\r\n```\r\nFROM idx\r\n| INLINE STATS max(x) BY y\r\n| WHERE y > 0\r\n```\r\nIt's clearly better to run this as\r\n```\r\nFROM idx\r\n| WHERE y > 0\r\n| INLINE STATS max(x) BY y\r\n```\r\nas the filter can be pushed to Lucene.\r\n\r\nSimilarly, two INLINESTATS after another should be combined into a single INLINESTATS whenever possible - this may require some moving around of logical plan nodes, but certainly cannot/shouldn't be done in the analyzer phase.\r\n\r\nIMHO, we should make a follow-up PR that moves the phase exctraction after logical optimization.\r\n\r\n(Theoretically, we could even go as far as extracting the first phase after physical optimization; that'd be consistent with how we split out fragments from the plan, i.e. the local logical plan to be executed on the data node. Not sure this is necessary, though.)",
+                "I felt like doing it with a LogicalPlan was right because each child query is valid and can get optimized.\r\n\r\nBut it does make sense to do the logical optimization first.",
+                "I think the current way is not wrong, it just prevents phased plan nodes to ever be subject to logical optimizations; and the first phase can never profit from knowing that a part of the result it generates are irrelevant, because the first phase gets currently optimized completely independently.\r\n\r\nSince phased plan nodes are generally expensive, I think we'll want and have to optimize them.",
+                "We're going to save this stuff for the follow up - it's filed under \" Run logical plan optimization before splitting the phases. \""
+            ]
+        },
+        {
+            "hunk_id": 35811,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/Phased.java",
+            "start_line": 53,
+            "original_start_line": 53,
+            "start_side": "RIGHT",
+            "line": 54,
+            "original_line": 54,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "<3"
+            ]
+        },
+        {
+            "hunk_id": 35810,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/InlineStats.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 189,
+            "original_line": 186,
+            "side": "RIGHT",
+            "original_position": 73,
+            "position": 164,
+            "subject_type": "line",
+            "review_comments": [
+                "Yeahp, this should work and is conceptually a bit nicer (IMHO) than doing that down in the physical mapping!"
+            ]
+        },
+        {
+            "hunk_id": 35803,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/InlineStats.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 159,
+            "original_line": 139,
+            "side": "RIGHT",
+            "original_position": 114,
+            "position": 134,
+            "subject_type": "line",
+            "review_comments": [
+                "These two methods are the real magic. And the shared code in `Phased` and `EsqlSession`.",
+                "See class level javadoc for what's happening here."
+            ]
+        },
+        {
+            "hunk_id": 35812,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plugin/EsqlPlugin.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 83,
+            "original_line": 83,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "What's the implication of having both, a snapshot-only capability, and a feature flag? Wouldn't the former suffice?",
+                "The feature flag is \"bigger\" than only running in snapshots. You can turn on the flag in a release build and this will work."
+            ]
+        },
+        {
+            "hunk_id": 35809,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/InlineStats.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 165,
+            "original_line": 153,
+            "side": "RIGHT",
+            "original_position": 128,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "Nit: we don't _really_ need the `schema` here; we should be able to know this ahead of time. More specifically, I think `schema` should always be the same as `firstPhase.output()`.\r\n\r\nIf we want to keep `schema` around because it's the _actual_ schema of the results (that makes sense!), maybe we should add a check here that throws IllegalState if the actual schema doesn't match the expected schema (i.e. firstPhase.output())`. I can see bugs crawling up into this in cases where an optimization pruned some columns from the first phase's physical plan and now stuff doesn't match and we don't create the correct columns and the multi-phased nature makes this hard to debug.\r\n\r\nAdditionally, we could add an assertion into `Phased.applyResultsFromFirstPhase`: when it finds the phased plan, it could check that the first phase's output is _contained_ (as an AttributeSet) in the result's `schema`.",
+                "This one's kind of annoying - we don't need the schema - but it's not always simple to rebuild it - it comes from the first phase and it's pretty convenient to have. I think we could assert that it lines up though.",
+                "I think using the schema from the first phase is reasonable, but throwing an IllegalArgumentException if the schema doesn't line up with what we expected will make our lives much easier, esp. if this should blow up in production.",
+                "Thanks Nik, this is much better now!\r\n\r\nI have one last nit: the check is slightly insufficient because\r\n```\r\nfirstPhase().output().equals(schema) == false\r\n```\r\nwill not look at the name ids (they are not checked in `NamedExpression.equals()`, nor in `NamedExpression`'s descendants). The plan may become inconsistent if the name ids do not line up, even if the first phase produces the correct names and data types. I think what we need is a little helper that we should call here.\r\n```\r\npublic static equalsAndSemanticEquals(List<Attribute> left, List<Attribute> right) {\r\n    if (left.equals(right) == false) {\r\n        return false;\r\n    }\r\n    for (int i = 0; i < left.size(); i++) {\r\n        if (left.get(i).semanticEquals(right.get(i)) == false) {\r\n            return false;\r\n        }\r\n    }\r\n    return true;\r\n}\r\n```\r\nWe could put that into the `Expressions` class (not `Expression`).\r\n\r\nEither this, or we ignore name ids from the first phase: in `ungroupedNextPhase` we already do this, because we obtain the name ids from the `aggregates`. In `groupedNextPhase`, however, we put the `schema`'s attributes directly as the attributes of the local relation."
+            ]
+        },
+        {
+            "hunk_id": 35808,
+            "commit_id": "a6ec9be11184e6ab3b9897d0bc19d18c0a80487f",
+            "original_commit_id": "0b9b2a915be595ce64ddd1fadd66854c991128f6",
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/Phased.java",
+            "start_line": 104,
+            "original_start_line": 58,
+            "start_side": "RIGHT",
+            "line": 106,
+            "original_line": 60,
+            "side": "RIGHT",
+            "original_position": 60,
+            "position": 106,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Hmm, instead of setting the first phase to analyzed here, we could, more cleanly, set all plan nodes to analyzed in `EsqlSession.analyzedPlan`. `Phased` expects an already analyzed plan and maybe shouldn't just pretend that any first phase it sees is analyzed.",
+                "It's not pretending! It's assuming....\r\n\r\nIt's assuming that if `firstPhase` sees an analyzed plan then it'll return an analyzed plan. But the plan transformation stuff doesn't do all that by default. Rewriting a plan doesn't copy the `analyzed` flag. So I reset it here.\r\n\r\n>  set all plan nodes to analyzed in EsqlSession.analyzedPlan\r\n\r\nI make that change in this PR I believe.\r\n\r\n",
+                "Calling `setAnalyzed` there raised my eyebrows, as well, and I did dig into the line of code when I reviewed the PR. I don't have any other better ideas other than what's in there already."
+            ]
+        }
+    ]
+}

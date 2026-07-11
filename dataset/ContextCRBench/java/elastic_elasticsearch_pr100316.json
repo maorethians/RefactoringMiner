@@ -1,0 +1,130 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 100316,
+    "lang": "java",
+    "pr_title": "Parallelize stale index deletion",
+    "pr_body": "After deleting a snapshot today we clean up all the now-dangling indices\r\nsequentially, which can be rather slow. With this commit we parallelize\r\nthe work across the whole `SNAPSHOT` pool on the master node.\r\n\r\nCloses #61513\r\n\r\nCo-authored-by: Piyush Daftary <pdaftary@amazon.com>",
+    "pr_comments": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Hi @DaveCTurner, I've created a changelog YAML for you.",
+        "@elasticmachine please run elasticsearch-ci/part-1",
+        "I'm slightly concerned about the lack of backpressure in this area, we could in theory end up with an ever-increasing pile of delete work in the queue; previously that would eventually have blocked all the snapshot threads but with this change even that doesn't happen any more. I've raised this point for discussion with the team.",
+        "One possible solution would be to preserve today's behaviour of always blocking at least one `SNAPSHOT` thread for each cleanup operation, so that falling behind would still eventually end up with all the `SNAPSHOT` threads processing deletes, slowing down subsequent snapshots. Obviously we don't just want to pause that thread, but we could use it to eagerly steal work from the queue:\r\n\r\n```diff\r\ndiff --git a/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java b/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\r\nindex fa699a76fadd..f7f9ed22efe4 100644\r\n--- a/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\r\n+++ b/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\r\n@@ -147,6 +147,7 @@ import java.util.concurrent.ConcurrentHashMap;\r\n import java.util.concurrent.Executor;\r\n import java.util.concurrent.LinkedBlockingQueue;\r\n import java.util.concurrent.TimeUnit;\r\n+import java.util.concurrent.atomic.AtomicBoolean;\r\n import java.util.concurrent.atomic.AtomicLong;\r\n import java.util.concurrent.atomic.AtomicReference;\r\n import java.util.function.Consumer;\r\n@@ -1194,6 +1195,28 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp\r\n                 }));\r\n             }\r\n         }\r\n+\r\n+        // dedicate a single SNAPSHOT thread for this work, so that if we fall too far behind with deletes then eventually we stop taking\r\n+        // snapshots too\r\n+        threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(new AbstractRunnable() {\r\n+            @Override\r\n+            protected void doRun() {\r\n+                final AtomicBoolean isDone = new AtomicBoolean(true);\r\n+                final Releasable ref = () -> isDone.set(true);\r\n+                ActionListener<Releasable> nextTask;\r\n+                while ((nextTask = staleBlobDeleteRunner.takeNextTask()) != null) {\r\n+                    isDone.set(false);\r\n+                    nextTask.onResponse(ref);\r\n+                    assert isDone.get();\r\n+                }\r\n+            }\r\n+\r\n+            @Override\r\n+            public void onFailure(Exception e) {\r\n+                logger.error(\"unexpected failure while processing deletes on dedicated snapshot thread\", e);\r\n+                assert false : e;\r\n+            }\r\n+        });\r\n     }\r\n\r\n     /**\r\n```",
+        "@elasticmachine please run elasticsearch-ci/part-2",
+        "Thanks both!"
+    ],
+    "merged": true,
+    "created_at": "2023-10-09T10:33:57Z",
+    "issue_context": {
+        "number": 61513,
+        "title": "Make snapshot deletion faster",
+        "body": "<!--\r\nGitHub is reserved for bug reports and feature requests; it is not the place\r\nfor general questions. If you have a question or an unconfirmed bug , please\r\nvisit the [forums](https://discuss.elastic.co/c/elasticsearch).  Please also\r\ncheck your OS is [supported](https://www.elastic.co/support/matrix#show_os).\r\nIf it is not, the issue is likely to be closed.\r\n\r\nFor security vulnerabilities please only send reports to security@elastic.co.\r\nSee https://www.elastic.co/community/security for more information.\r\n\r\nPlease fill in the following details to help us reproduce the bug:\r\n-->\r\n\r\n**Elasticsearch version** (`bin/elasticsearch --version`): 7.6 onwards\r\n\r\n**JVM version** (`java -version`): Java 14\r\n\r\n**OS version** (`uname -a` if on a Unix-like system): CentOs\r\n\r\n\r\n\r\n\r\n\r\nIn Elasticsearch, snapshot deletion is a multithreaded synchronous **master node** operation. The sequence of the delete operation goes as follows:\r\n\r\n```\r\n1. Master node receives snapshot deletion request and registers a listener for snapshot deletion.\r\n2. If snapshot (for which delete request is received) is in progress, stop the shard snapshot \r\n3. Update the cluster state with snapshot deletion entry (SnapshotDeletionsInProgress).\r\n4. Fetch snapshot entry from s3 repository.\r\n5. Get list of all children folder in repository under indices folder path\r\n6. Update the shard state metadata in repository for all shards of the snapshot that is to be deleted and compute shards to be deleted from repository\r\n7. Remove the snapshot from the list of existing snapshots in repository\r\n8. Update new generations: \r\n    1. Update the index shard generations (new  generations) of all updated shard folders to next generation in Repository \r\n    2. Update the index-N to this new  generations in repository and make index.latest point to this new Index-N\r\n    3. Update the new  generations in cluster state \r\n9. Run Cleanup operation \r\n    1. Delete repository root level snap-UUID and meta-UUID file of deleting snapshot \r\n    2. Delete stale indices folder from repository which are not referenced by any snapshots\r\n    3. List shard level list of files to be deleted from repository\r\n    4. Remove shard level files (in bulk delete fashion) from repository that are not referenced \r\n10. Update the cluster state by removing the snapshot entry and call back on the listeners\r\n11. Listener called back which in turn responds back to the user indicating snapshot deletion is complete\r\n\r\n```\r\n\r\nCurrent implementation of \"step 9.2 : Delete stale indices\" : cleanupStaleIndices() is very slow . Snapshot deletion [code](https://github.com/elastic/elasticsearch/blob/v7.9.0/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java#L974) deletes each stale indices from repository one after another **synchronously** . \r\n\r\nWith current implementation we tried to measure time taken to delete a snapshot for a cluster with 3 masters of type r5.12xlarge and 50 data nodes of type i3.4xlarge with 1601 indices and 8001 shards and  4.8 TB data. IT takes approximately **31 minutes** to delete such snapshot.\r\n\r\n\u00a0 | Shards # | Indices # | Snapshot Creation Time(Avg) | Snapshot Deletion Time(Avg)\r\n-- | -- | -- | -- | --\r\nCurrent Implementation | 8001 | 1601 | 8.4 min | 31.1 min\r\n\r\n**Current flow diagram of cleanupStaleIndices :**\r\n\r\n![Existing_Flow_Master_Delete1](https://user-images.githubusercontent.com/9053059/91132903-2b8bff00-e662-11ea-9cf3-58314adf3d93.jpg)\r\n\r\n\r\nThis step to cleanup stale indices can be speed up with either of the following approaches : \r\n\r\n# Suggested Optimizations\r\n## Approach1 : \r\n\r\n\r\nInstead of making snapshot delete of stale indices a single threaded operation we make it **multithreaded** operation and delete multiple stale indices in parallel using SNAPSHOT thread pool's workers. \r\nWhen deletion of all the stale indices are complete , we return back the DeleteResult as response of method [cleanupStaleIndices()](https://github.com/elastic/elasticsearch/blob/v7.9.0/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java#L974)\r\n\r\nWith above Approach1 time taken to delete a snapshot for similar cluster with 3 masters of type r5.12xlarge and 50 data nodes of type i3.4xlarge with 1601 indices and 8001 shards and  4.8 TB data. IT takes approximately **only 9.8 minutes** to delete such snapshot.\r\n\r\nI noted system resource utilizations such is CPU, system memory of master node. There was no major change in resource utilizations in Approach1 compared to Current  implementation\r\n \r\n**Approach1 Optimization Vs Current Implementation comparison** :\r\n\u00a0 | Shards # | Indices # | Snapshot Creation Time(Avg) | Snapshot Deletion Time(Avg)\r\n-- | -- | -- | -- | --\r\nApproach1 Optimization | 8001 | 1601 | 6.9 min | 9.86 min\r\nCurrent Implementation | 8001 | 1601 | 6.8 min | 31.1 min\r\n\r\n\r\n**Approach1 Optimization flow diagram of cleanupStaleIndices :**\r\n\r\n![Existing_Flow_Master_Delete-Approach-1 (1)](https://user-images.githubusercontent.com/9053059/91140270-6e4ed680-e664-11ea-9b4a-918a61b8a997.jpg)\r\n\r\n\r\n\r\n\r\n## Approach2 : \r\n\r\nInstead of deleting snapshot stale indices synchronously, we can completely make the method [cleanupStaleIndices()](https://github.com/elastic/elasticsearch/blob/v7.9.0/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java#L974) **asynchronous** . When method is invoked to delete list of stale indices, send back the response immediately and do the snapshot deletion of stale indices in background (Using SNAPSHOT threadpool workers ). \r\n\r\nWith above Approach2 time taken to delete a snapshot for similar cluster with 3 masters of type r5.12xlarge and 50 data nodes of type i3.4xlarge with 1601 indices and 8001 shards and  4.8 TB data. IT takes approximately **only 8 seconds** to delete such snapshot.\r\n\r\n\r\n\r\n\r\n\u00a0 | Shards # | Indices # | Snapshot Creation Time(Avg) | Snapshot Deletion Time(Avg)\r\n-- | -- | -- | -- | --\r\nApproach2 Optimization | 8001 | 1601 | 6.8 min | 8 sec\r\nCurrent Delete | 8001 | 1601 | 8.4 min | 31.1 min\r\n\r\n\r\nIn Approach2 if because of master node failure, if deletion of stale indices fails , then these stale indices will be deleted in next snapshot deletion iteration , as these are stale indices and are not been referenced by any snapshots.\r\n\r\nTo track the progress of stale indices cleanup in background, a new status can be added in cluster state (Open for suggestion on how we can track the progress of stale indices cleanup)  \r\n \r\n**Approach2 Optimization flow diagram of cleanupStaleIndices : **\r\n\r\n![Existing_Flow_Master_Delete-Approach-2 (2)](https://user-images.githubusercontent.com/9053059/91143102-d30b3080-e666-11ea-93f4-14f28a706452.jpg)\r\n\r\n\r\n\r\n\r\n \r\n\r\n\r\n\r\n\r\n\r\n**I want to take feedback from community on above 2 snapshot deletion optimization approaches  before raising PR .**\r\n",
+        "comments": [
+            "Pinging @elastic/es-distributed (:Distributed/Snapshot/Restore)",
+            "Thanks for raising this @piyushdaftary The fact that we only execute this single-threaded really isn't all that optimal I agree and can lead to some very suboptimal situations as in your example. \r\nI would also agree that parallelising this across indices on the `SNAPSHOT` pool is a reasonable fix. We should go with option 1 here and not push the execution in the background (I in fact suggested doing that in the past and we rejected the idea eventually for various user experience reasons). If you want, feel free to give option 1 a go :) If not I'm happy to implement this quickly as well next week, it should be a fairly simple change I think.",
+            "Thanks @original-brownbear  . I will raise the PR with implementation of Approach1.\r\n\r\n",
+            "Ugh, I suffer from this slowness so much right now, thanks for raising it! \r\n\r\nI have a snapshot repo to clean up of 3 years of snapshots every 2 hours and well so far it goes with a speed of 2 snapshots a day. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 37775,
+            "commit_id": "3673d40f8cca5f5844f62579f7dcc4a9a9d91a31",
+            "original_commit_id": "ff08e0208d5248418c1bf80eb259d95429c19bc1",
+            "path": "server/src/main/java/org/elasticsearch/common/util/concurrent/AbstractThrottledTaskRunner.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 163,
+            "original_line": 163,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "Why not have an overload version of `runSyncTasksEagerly()` that just use the TaskRunner's own executor for the eager run as well?",
+                "Yes that could work too. I'm going to wait and see on that idea tho, I'd rather do one or the other, and the choice depends on whether we have other users that want to do something else or whether everyone just forks another task on `AbstractThrottledTaskRunner#executor`."
+            ]
+        },
+        {
+            "hunk_id": 37773,
+            "commit_id": "3673d40f8cca5f5844f62579f7dcc4a9a9d91a31",
+            "original_commit_id": "ff08e0208d5248418c1bf80eb259d95429c19bc1",
+            "path": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/RepositoriesIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 315,
+            "original_line": 301,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "This is a cool test and I learnt a few tips and tricks from it. But it does not test the new parallelization change. Do we care?",
+                "This test is largely from the original contributor, but I think it's a reasonable test to write. I've played around with a few ideas for testing the new threading more precisely but it seems pretty tricky, and kinda doesn't matter so much as long as we do actually do the work somehow. I think I had an idea for a test tho.",
+                "Ok my idea seems to work, see `testCleanupStaleBlobsConcurrency` added in b56455c12cc845958808978b6627d2778558037e (sorry for the force-push)"
+            ]
+        },
+        {
+            "hunk_id": 37774,
+            "commit_id": "3673d40f8cca5f5844f62579f7dcc4a9a9d91a31",
+            "original_commit_id": "ff08e0208d5248418c1bf80eb259d95429c19bc1",
+            "path": "server/src/test/java/org/elasticsearch/common/util/concurrent/AbstractThrottledTaskRunnerTests.java",
+            "start_line": 190,
+            "original_start_line": 188,
+            "start_side": "RIGHT",
+            "line": 191,
+            "original_line": 189,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 58,
+            "subject_type": "line",
+            "review_comments": [
+                "For my learning:\r\n1. Why do we need assert the queue is empty here? We already asserted it has 0 size four lines above. I don't see how the queue size can increase after all tasks are enqueued?\r\n2. In the existing `assertNoRunningTasks`, why is it necessary to spawn a batch of `Runnable`s before verify `runningTasks` size is 0? We already verified that the `queue` is empty. It seems to me that just verify `runningTasks` is sufficient? Also running the extra `Runnable` does not guarantee that they actually excercise every thread in the pool. So not sure the purpose here.",
+                "Really we're just doing the same as the other tests here, verifying that the task runner is completely finished at the end of the test.\r\n\r\nIn `assertNoRunningTasks()` we need to wait for all the tasks spawned by the `AbstractThrottledTaskRunner` to completely finish before we can be sure the running task count is zero. That's because we call `runningTasks.decrementAndGet()` after completing each task, so when e.g. `executedCountDown` completes the count will not have reached zero yet. In order to make sure that the thread pool is completely free from all its current work, we enqueue N barrier tasks, which must therefore all be waiting on the barrier at the same time.\r\n\r\nPut differently, if you remove that and run the tests in a loop then you should see them fail occasionally.\r\n\r\nI'll add a comment.",
+                "Sorry for dragging on this point. But I think this threads flushing behaviour is not necessary for this test because the `releasable` is used in a try-with-resource block and should be released before `executedCountDown` finishes. This behaviour is needed for `testEnqueueSpawnsNewTasksUpToMax` because it [explicitly closes the releasable after the countDown](https://github.com/elastic/elasticsearch/blob/055df9a104a646cbb12db0b4d11ccaf6ecba6ffa/server/src/test/java/org/elasticsearch/common/util/concurrent/AbstractThrottledTaskRunnerTests.java#L118-L119). If I flip the order, it also runs successfully 10K times without the thread flushing logic.",
+                "Ah hm I see what you mean now. Yes I think you're right we could simplify this if we made sure to release all the task refs before allowing that test to proceed."
+            ]
+        },
+        {
+            "hunk_id": 37772,
+            "commit_id": "3673d40f8cca5f5844f62579f7dcc4a9a9d91a31",
+            "original_commit_id": "ff08e0208d5248418c1bf80eb259d95429c19bc1",
+            "path": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/RepositoriesIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 322,
+            "original_line": 308,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "For my knowledge: I noticed this is the existing pattern in this file. But are these logging necessary? I seem to remember there were discussions about we should prefer for less logging in tests due to some CI infrastucture cost?",
+                "Yeah not really necessary IMO although it isn't really too bad here, this test triggers actions in ES that emit quite a lot of logs too."
+            ]
+        },
+        {
+            "hunk_id": 37771,
+            "commit_id": "3673d40f8cca5f5844f62579f7dcc4a9a9d91a31",
+            "original_commit_id": "ff08e0208d5248418c1bf80eb259d95429c19bc1",
+            "path": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java",
+            "start_line": 1188,
+            "original_start_line": 1176,
+            "start_side": "RIGHT",
+            "line": 1206,
+            "original_line": 1194,
+            "side": "RIGHT",
+            "original_position": 100,
+            "position": 93,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we want to keep this and above in their own separate methods as how they are now? Fewer nesting levels could be helpful?",
+                "I inlined these because we ended up having to pass really quite a lot of parameters in, and it wasn't really even a coherent set of parameters so much as just \"the things needed to run this method\". It's still less than one screenful (on my screen anyway) and nicely exposes the execution pattern, so tbh I prefer it as it is now.",
+                "This is actually kind of a code smell throughout this class (and the snapshot codebase more generally). I have been working on a refactoring that should help simplify things in this area and will open a followup in the next few days."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,73 @@
+{
+    "repo": "rails/rails",
+    "pr_number": 45476,
+    "lang": "ruby",
+    "pr_title": "Defer constant loading of `ActiveRecord::DestroyAssociationAsyncJob` via a String instead of a class constant",
+    "pr_body": "### Summary\r\n\r\nCloses #45434.\r\n\r\n- Removes the assignment of `ActiveRecord::DestroyAssociationAsyncJob` from the ActiveJob Railtie.\r\n- Avoids referencing the Job constants until `ActiveSupport.on_load(:active_job)` has been triggered.\r\n- ~~Uses nested `ActiveSupport.on_loads` which are ok, according to https://github.com/rails/rails/issues/45434#issuecomment-1164711433~~\r\n- Deprecates `ActiveRecord::ActiveJobRequiredError` and will either raise a `NameError` (if the job class is unloadable) or a `ActiveRecord::ConfigurationError` (if dependent: :destroy_async`  is declared on an association but there is no job class configured)",
+    "pr_comments": [
+        "@jonathanhefner Thank you for the feedback! At your suggestion, I split this into 2 PRs. \r\n\r\n- This PR contains the job assignment for ActiveRecord.\r\n- #45486 contains the job assignment for ActionMailer.",
+        "A better fix would always accept strings in the configuration and only convert to a constant in the first time the value is used, and cache it.",
+        "@rafaelfranca Thank you! I changed the implementation to use a String value as you suggested. I wanted to maintain the `class_attribute` behavior of allowing child classes to set a new value without changing the parent's value, but I struggled a bit to keep it compact. Do you know a better class_attribute-memoization strategy than this?\r\n\r\nIf you're okay with my implementation approach, I could also extract this to a concern to better organize/group the related behavior. And then do the same for #45486.",
+        "> I do have objections. We have load hooks exactly to allow us to avoid checking if a component is defined or not. This setting was being set in Active Job exactly to avoid the problem of the application to run without destroy_association_async_job being set because ActiveJob::Base wan't loaded.\r\n>\r\n> I don't think this PR is correct.\r\n\r\nShouldn't both load hooks still be necessary if the initializer was in Active Job? I thought `ActiveJob::Base` shouldn't be defined until after initializers run whether they are defined in Active Record or Active Job railties",
+        "@skipkayhil I know the answer to this. Rafael is correct.\r\n\r\nWith the development autoloader, `ActiveRecord::Railtie` and `ActiveJob::Railtie` both are loaded during initialization, but neither of them directly load `ActiveRecord::Base` or `ActiveJob::Base`. It's not until those classes/children are touched by something within the application will they be loaded. This confused me for a bit, but also notable is that `on_load('active_record')` is triggered when `ActiveRecord::Base` is loaded, as is `on_load('active_job')` is triggered by `ActiveJob::Base`. These can be deferred by the application server quite a while (in my applications it's usually `devise_for` in the `routes.rb` file that loads `ActiveRecord::Base`, but without that, it can be indefinite if a controller doesn't touch a model); same with `ActiveJob::Base`. \r\n\r\nIn the nested initializers I initially proposed, it is possible for `ActiveRecord::Base` to be loaded _without_ loading `ActiveJob::Base` and thus one could call `ActiveRecord::base.destroy_association_async_job` without the `on_load('active_job')` necessarily being called, leading to the value being undefined.\r\n",
+        "Documenting the goals here because I have learned _a ton_ about autoloading and rails boot/initialization through the conversation. Thank you!\r\n\r\n- Avoid statically referencing autoloaded abstract classes like `ActiveRecord::Base` or `ActiveJob::Base` (or their children) to avoid autoloading them prematurely during boot or unnecessarily in Development.\r\n- Because `ActiveRecord::Base` and `Activejob::Base` are autoloaded, we can't rely on their `on_load('...')` hooks respectively _ever_ triggering in Development.\r\n- Eagerload (e.g. eager autoload) as many classes as possible in in Production. Application files are eagerloaded (e.g. MyModel, MyJob, etc.) but their parent abstract classes (e.g. `ActiveRecord::Base`) are not eagerloaded. I presume we want to avoid eagerloading those abstract classes if they will not be needed.\r\n- We don't want to create a hard dependency between ActiveRecord and ActiveJob. If ActiveJob isn't present, ActiveRecord shouldn't have broken behavior; and vice-versa.\r\n- Speculative: I think that an application should be able to provide an ActiveJob-compatible _interface_, without ActiveJob being present\r\n- I would like the pattern used here to be applicable to other community gems (which why I didn't like the ActiveRecord configuration living in ActiveJob; community gems can't do that).\r\n\r\nI think I can thread all these needles with a few changes :-)",
+        "@rafaelfranca @jonathanhefner I think I have addressed all of your comments on this PR and it's ready for re-review. ",
+        "@jonathanhefner I integrated your deprecation suggestions. That also spurred me to add a changelog entry too. This has been a great experience, I've learned something new with every comment \ud83d\ude05 ",
+        "Thank you @jonathanhefner. I really appreciate the help \u2764\ufe0f  This gives me a lot to think about when it comes to #45486 \ud83d\ude04 ",
+        "Thank *you*, @bensheldon!  And thank you for your work on [GoodJob](https://github.com/bensheldon/good_job) (linking for anyone who hasn't seen it)! :heart:\r\n\r\nI will take a pass at #45486 tomorrow. :raised_hands: \r\n"
+    ],
+    "merged": true,
+    "created_at": "2022-07-11T20:26:18Z",
+    "issue_context": {
+        "number": 45434,
+        "title": "Defer constant loading ActiveRecord `destroy_association_async_job` during Rails initialization",
+        "body": "ActiveRecord's `destroy_association_async_job` currently loads an ActiveJob Job constant during ActiveRecord's initialization. Introduced in #40157\r\n\r\nhttps://github.com/rails/rails/blob/4d5a570cfe1890f71a1d198a5fe40d528f2b60d4/activejob/lib/active_job/railtie.rb#L45-L47\r\n\r\nThat means that loading ActiveRecord triggers loading the Job constant, which triggers initializing ActiveJob, which then triggers initializing the ActiveJob adapter. I have seen this cause an autoloading deadlock if somewhere during this chain an ActiveRecord constant is touched.\r\n\r\nA similar autoload chain is also present with [`ActionMailer.delivery_job`](https://github.com/rails/rails/blob/1003e974ed9cdae6a057a1857374bceb09b34a7b/actionmailer/lib/action_mailer/railtie.rb#L44-L46) but I have yet to see it deadlock (probably because people are less likely to reference an ActionMailer constant in their ActiveJob configuration).\r\n\r\nAside: I also think that the ActiveJob initializer linked above should be inverted such that it lives in ActiveRecord and is assigned `on_load(:active_job)`; that makes it more consistent with ActionMailers Railtie behavior. I don't think this impacts the autoload behavior though, just an observation.\r\n\r\n### Expected behavior\r\n\r\nThis loading could be deferred if instead of a constant, `destroy_association_async_job` was configured with a string that was then constantized when the behavior is invoked.\r\n",
+        "comments": [
+            "Related: https://github.com/rails/rails/blob/21acc7bfb6e12f66b6b61a3548e971c64ff7f546/actiontext/lib/action_text/engine.rb#L62-L66 a nested load hook was added to Action Text to tackle a similar issue. However, I'm not sure how safe that is as I think its tying the functionality to load order",
+            "@skipkayhil thank you for that! I'm thinking that maybe the problem here is not the _constant_ but is the load order, and the simpler issue is actually what I referred to as an aside:\r\n\r\n>  I also think that the ActiveJob initializer linked above should be inverted such that it lives in ActiveRecord and is assigned on_load(:active_job)",
+            "Hmm, the inversion could be interesting. I _think_ it still ends up complicated because the configuration is defined on `ActiveRecord::Base`, and we shouldn't be loading that during initialization.\r\n\r\nFor example:\r\nhttps://github.com/rails/rails/blob/2f5dcb7255e59fdf093fb92b681a737ebab99520/activerecord/lib/active_record/railtie.rb#L76-L78\r\n\r\nEven in the Active Record Railtie we need the Active Record load hook",
+            "I agree this needs the https://github.com/rails/rails/issues/45434#issuecomment-1163602303 treatment. It's safe: `on_load` will fire immediately if the specified component is already loaded.\r\n\r\nI do tend to agree it feels like this line would better live in AR, with the job class etc. /cc @rafaelfranca ",
+            "> It's safe: `on_load` will fire immediately if the specified component is already loaded.\r\n\r\n\ud83d\ude4f thank you for the confirmation, I opened a PR to document this: #45453"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48574,
+            "commit_id": "8fceabd1e857f5babf4ba1ff0174b564fc372d84",
+            "original_commit_id": "f002cada62bd6bad9a9b5a6f4ac1da7473a72b13",
+            "path": "activerecord/lib/active_record/errors.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 11,
+            "original_line": 11,
+            "side": "LEFT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "If we want to remove this exception we need to deprecate first.",
+                "I added a deprecation:\r\n\r\nhttps://github.com/rails/rails/pull/45476/files#diff-805517f2e613a421493817fa15ecd42e583caf1b4f6f6972ec6e8103f41e04a2R12\r\n\r\n...and a test:\r\n\r\nhttps://github.com/rails/rails/pull/45476/files#diff-0045b3212d324439c6e30bef62094dcf2654863b9ccd93ef2367cec9f135e044R42-R49 ",
+                "I added a deprecation:\r\n\r\nhttps://github.com/rails/rails/pull/45476/files#diff-805517f2e613a421493817fa15ecd42e583caf1b4f6f6972ec6e8103f41e04a2R12\r\n\r\n...and a test:\r\n\r\nhttps://github.com/rails/rails/pull/45476/files#diff-0045b3212d324439c6e30bef62094dcf2654863b9ccd93ef2367cec9f135e044R42-R49 "
+            ]
+        },
+        {
+            "hunk_id": 48573,
+            "commit_id": "8fceabd1e857f5babf4ba1ff0174b564fc372d84",
+            "original_commit_id": "f002cada62bd6bad9a9b5a6f4ac1da7473a72b13",
+            "path": "railties/test/application/configuration_test.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2674,
+            "original_line": 2674,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "Good idea! :+1:\r\n"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,87 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 81831,
+    "lang": "java",
+    "pr_title": "[ML] Improve cleanup for model snapshot upgrades",
+    "pr_body": "If a model snapshot upgrade persistent task is cancelled then\r\nwe now kill any associated C++ process. Previously the C++ process\r\ncould hang indefinitely.\r\n\r\nAdditionally, ML feature reset now cancels any in-progress model\r\nsnapshot upgrades before cleaning up job data, and deleting an\r\nanomaly detection job cancels any in-progress model snapshot\r\nupgrades associated with that job before cleaning up the job's\r\ndata.\r\n\r\nFixes #81578",
+    "pr_comments": [
+        "Pinging @elastic/ml-core (Team:ML)"
+    ],
+    "merged": true,
+    "created_at": "2021-12-17T20:26:36Z",
+    "issue_context": {
+        "number": 81578,
+        "title": "[ML] Model snapshot upgrade processes need better cleanup/cancellation functionality",
+        "body": "While working on #81519 I noticed a few things about model snapshot upgrades related to cancellation and cleanup:\r\n\r\n1. If a model snapshot upgrade persistent task gets cancelled then we don't explicitly kill the associated `autodetect` process.  That process will _probably_ exit pretty soon when its named pipes disconnect from the JVM, but there's no guarantee.  Cancelling the persistent task should explicitly kill the native process.\r\n2. Deleting a job should cancel any model snapshot upgrade tasks for that job before it tries to delete other data.\r\n3. If errors occur in the node operation of a model snapshot upgrade then they shouldn't be logged as errors or generate audit messages if the persistent task has been cancelled.  We've seen with other types of persistent task that these spurious errors can cause noise, confusion and unnecessary support cases, so we should take steps to silence them.\r\n4. I couldn't see how model snapshot upgrade tasks that get set to `failed` ever get removed from cluster state.  Although they'll do nothing, they cause clutter in the cluster state.  This could get bad if some other problem causes a user to repeatedly try upgrading model snapshots and all fail to upgrade for some reason.  For other persistent tasks we have the idiom that force-closing or force-stopping them removes the persistent task from cluster state.  We need _something_ to eventually remove failed model snapshot upgrades from cluster state.",
+        "comments": [
+            "Pinging @elastic/ml-core (Team:ML)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 37577,
+            "commit_id": "9c4112e6284eecfe735bdfb4649959d596ff331a",
+            "original_commit_id": "2274d276005a0598aad42e6c3e33f2a82133bd04",
+            "path": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ml/action/CancelJobModelSnapshotUpgradeAction.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 33,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    public static final String NAME = \"cluster:internal/xpack/ml/job/model_snapshots/upgrade/cancel\";\r\n```\r\n\r\nSince there is no rest layer for this, it seems prudent to be internal.",
+                "I intentionally made this `admin` instead of `internal`.  Although there's no REST layer today it's possible that we might need to add one in the future, say if we ever want the UI to be able to clean up a failed upgrade.\r\n\r\nThe reason we've used `internal` instead of `admin` in the past is to make it hard for users of the transport client to call the API, even though it's easy for them to write the code to call it.  Since there's nothing inherently wrong with calling this endpoint if you want to clean up failed upgrades I don't think that's a problem in this case.  (Plus it's only in 7.17 that the transport client will even exist - after that lack of a REST layer will make this impossible to call.)  I will add a comment to say this.\r\n\r\nPart of the reason I didn't add a REST layer in this PR was because it's being added so late in the 7.x development cycle and it's not strictly essential at the moment.",
+                "`internal` conveys a message even if just a convention. If this was to become a public API with a REST interface we would create a new `admin` wrapper action that calls this one and have this action `internal`. We have many internal APIs called this way. \r\n\r\nI don't consider this a blocker on the PR but there is a path for making `internal` APIs public, if you think it likely there will be a REST API then keep it `admin` otherwise it makes more sense to be `internal`.",
+                "I think it's 50/50 whether this will be made public in the future.\r\n\r\n> If this was to become a public API with a REST interface we would create a new `admin` wrapper action that calls this one and have this action `internal`.\r\n\r\nThis seems like needless baggage to me.  The wrapper action would literally call the internal action and do nothing else.  It would just be extra boilerplate code.\r\n\r\n> `internal` conveys a message even if just a convention.\r\n\r\nIt's only the ML team that has ever done this.  All the internal actions of core Elasticsearch start with either `admin` or `monitor`.  (For example look at the persistent tasks actions.)  The original reason why the ML team did this was to make transport client users think twice before calling an API that was intended to be internal.  Of course this only had an effect if security was enabled, but it was in the days of X-Pack as a separate plugin where ML users were likely to be using security but most users weren't using security.  It was also in the days before the transport client was deprecated so we were more worried about transport client users accidentally automating things they shouldn't.\r\n\r\nBe as I said in the comment I added to the code, in this case we wouldn't really care if a transport client user did call this action.  It doesn't do something low level that will mess up the cluster if called at the wrong time.  It's an action that _could_ be external, just isn't at the moment.",
+                "I agree that as the transport client is not used directly any more we don't really gain much by calling the action `internal`.",
+                "Its good we had this discussion then as `internal` is a convention we have been using for a long time. If we chose to stop doing this then we have already established the usage of naming internal actions internal e.g. `InternalInferModelAction` perhaps we can switch to that convention for actions that are purely internal.  \r\n\r\n",
+                "The key difference with this action is that it doesn't _need_ to be internal.  It should be possible to make it external in the future with as little extra effort as possible.  Whereas `InternalInferModelAction` is specifically designed to be internal, and it would cause problems if people ever started calling it externally.  An action that's more similar to this one is `DeleteExpiredDataAction`, where its primary purpose is to be called by the daily maintenance task, but it doesn't hurt to call it externally.  `DeleteExpiredDataAction` does have a corresponding REST endpoint, but if we'd wanted to avoid that initially to avoid yet another endpoint that shows up in our list of documented endpoints then we could have deferred adding the REST endpoint to a release after the action was added.",
+                "> It's only the ML team that has ever done this. All the internal actions of core Elasticsearch start with either admin or monitor.\r\n\r\n> I agree that as the transport client is not used directly any more we don't really gain much by calling the action internal.\r\n\r\nI was replying to these points stating that the original reason for using `internal` no longer applies and that and suggesting it can be discontinued with the demise of the transport client. \r\n",
+                "> I was replying to these points stating that the original reason for using `internal` no longer applies and that and suggesting it can be discontinued with the demise of the transport client.\r\n\r\nYes, sure, for new actions we can discontinue it.  But for the existing ones that contain `internal` changing it is a non-trivial piece of work, so we might as well leave them as-is."
+            ]
+        },
+        {
+            "hunk_id": 37578,
+            "commit_id": "9c4112e6284eecfe735bdfb4649959d596ff331a",
+            "original_commit_id": "2274d276005a0598aad42e6c3e33f2a82133bd04",
+            "path": "x-pack/plugin/security/qa/operator-privileges-tests/src/javaRestTest/java/org/elasticsearch/xpack/security/operator/Constants.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 155,
+            "original_line": 155,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        \"cluster:internal/xpack/ml/job/model_snapshots/upgrade/cancel\",\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 37579,
+            "commit_id": "9c4112e6284eecfe735bdfb4649959d596ff331a",
+            "original_commit_id": "2274d276005a0598aad42e6c3e33f2a82133bd04",
+            "path": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportCancelJobModelSnapshotUpgradeAction.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 78,
+            "original_line": 78,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "Why not use a `SimpleIdsMatcher` for job IDs and save a call to `expandJobs`",
+                "`expandJobs` handles `allow_no_match`.  It's impossible in this action for `allow_no_match` to work with the snapshot IDs, because the upgrade tasks are ephemeral and stopping a stopped thing is not an error.  But `allow_no_match` _can_ work with the job IDs.\r\n\r\nThis also ties in with https://github.com/elastic/elasticsearch/pull/81831#discussion_r772515647 because if we were only ever going to use this action internally then it wouldn't be so important to support `allow_no_match` at all.  But I can imagine in the future we might want to call this action from an enhanced UI.  We'll need to add a REST endpoint at that time and it's nice if the machinery of `allow_no_match` is available.  The way `allow_no_match` is handled for jobs in this action is the same as in the recently added model snapshot upgrades stats action.",
+                "There is a difference to the GET stats API which enforces that the snapshot IDs are also matched. \r\n\r\nhttps://github.com/elastic/elasticsearch/blob/master/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportGetJobModelSnapshotsUpgradeStatsAction.java#L110\r\n\r\n",
+                "I think what I've done is as sensible as it can be given the way the persistent tasks appear and disappear.\r\n\r\nConsider these scenarios:\r\n\r\n### 1\r\n- User asks for stats for job foo, upgrade of snapshot 1\r\n- Job foo doesn't exist\r\n- We return not found\r\n- This isn't controversial\r\n\r\n### 2\r\n- User asks for stats for job foo, upgrade of snapshot 1\r\n- Job foo exists but snapshot 1 isn't being upgraded\r\n- We return not found\r\n- This one is potentially controversial, as the snapshot upgrade might only just have finished, but since it's not running we cannot return any stats.  The only things we could do to make this better would be (1) persist stats for snapshot upgrades that have finished or (2) make upgrading a snapshot into a multi-step process where you first open the upgrade, then later close it (like you do for jobs).  Both of these things bring considerable extra baggage to the upgrade process.\r\n\r\n### 3\r\n- User asks for stats for job foo, upgrade of snapshot 1\r\n- Job foo exists and snapshot 1 is being upgraded\r\n- We return the stats\r\n- This isn't controversial\r\n\r\n### 4\r\n- User asks to cancel upgrade of snapshot 1 for job foo\r\n- Job foo doesn't exist\r\n- We return not found\r\n- This isn't controversial\r\n\r\n### 5\r\n- User asks to cancel upgrade of snapshot 1 for job foo\r\n- Job foo exists but snapshot 1 isn't being upgraded\r\n- We do nothing and return success\r\n- This one is potentially controversial, but the end state is what the user wanted and the snapshot upgrade _might_ have just finished in between the user listing the upgrades in progress and asking to cancel this one.  This is also consistent with closing a closed job is not an error and stopping a stopped datafeed is not an error.\r\n\r\n### 6\r\n- User asks to cancel upgrade of snapshot 1 for job foo\r\n- Job foo exists and snapshot 1 is being upgraded\r\n- We cancel the upgrade and return success\r\n- This isn't controversial\r\n\r\nI don't think there's a better way."
+            ]
+        }
+    ]
+}

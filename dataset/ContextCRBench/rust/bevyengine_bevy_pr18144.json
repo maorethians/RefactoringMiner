@@ -1,0 +1,70 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 18144,
+    "lang": "rust",
+    "pr_title": "BevyError: Bevy's new catch-all error type",
+    "pr_body": "## Objective\r\n\r\nFixes #18092\r\n\r\nBevy's current error type is a simple type alias for `Box<dyn Error + Send + Sync + 'static>`. This largely works as a catch-all error, but it is missing a critical feature: the ability to capture a backtrace at the point that the error occurs. The best way to do this is `anyhow`-style error handling: a new error type that takes advantage of the fact that the `?` `From` conversion happens \"inline\" to capture the backtrace at the point of the error.\r\n\r\n## Solution\r\n\r\nThis PR adds a new `BevyError` type (replacing our old `std::error::Error` type alias), which uses the \"from conversion backtrace capture\" approach:\r\n\r\n```rust\r\nfn oh_no() -> Result<(), BevyError> {\r\n    // this fails with Rust's built in ParseIntError, which\r\n    // is converted into the catch-all BevyError type\r\n    let number: usize = \"hi\".parse()?;\r\n    println!(\"parsed {number}\");\r\n    Ok(())\r\n}\r\n```\r\n\r\nThis also updates our exported `Result` type alias to default to `BevyError`, meaning you can write this instead:\r\n\r\n```rust\r\nfn oh_no() -> Result {\r\n    let number: usize = \"hi\".parse()?;\r\n    println!(\"parsed {number}\");\r\n    Ok(())\r\n}\r\n```\r\n\r\nWhen a BevyError is encountered in a system, it will use Bevy's default system error handler (which panics by default). BevyError does custom \"backtrace filtering\" by default, meaning we can cut out the _massive_ amount of \"rust internals\", \"async executor internals\", and \"bevy system scheduler internals\" that show up in backtraces. It also trims out the first generally-unnecssary `From` conversion backtrace lines that make it harder to locate the real error location. The result is a blissfully simple backtrace by default:\r\n\r\n![image](https://github.com/user-attachments/assets/7a5f5c9b-ea70-4176-af3b-d231da31c967)\r\n\r\nThe full backtrace can be shown by setting the `BEVY_BACKTRACE=full` environment variable. Non-BevyError panics still use the default Rust backtrace behavior.\r\n\r\nOne issue that prevented the truly noise-free backtrace during panics that you see above is that Rust's default panic handler will print the unfiltered (and largely unhelpful real-panic-point) backtrace by default, in _addition_ to our filtered BevyError backtrace (with the helpful backtrace origin) that we capture and print. To resolve this, I have extended Bevy's existing PanicHandlerPlugin to wrap the default panic handler. If we panic from the result of a BevyError, we will skip the default \"print full backtrace\" panic handler. This behavior can be enabled and disabled using the new `error_panic_hook` cargo feature in `bevy_app` (which is enabled by default).\r\n\r\nOne downside to _not_ using `Box<dyn Error>` directly is that we can no longer take advantage of the built-in `Into` impl for strings to errors. To resolve this, I have added the following:\r\n\r\n```rust\r\n// Before\r\nErr(\"some error\")?\r\n\r\n// After\r\nErr(BevyError::message(\"some error\"))?\r\n```\r\n\r\nWe can discuss adding shorthand methods or macros for this (similar to anyhow's `anyhow!(\"some error\")` macro), but I'd prefer to discuss that later.\r\n\r\nI have also added the following extension method:\r\n\r\n```rust\r\n// Before\r\nsome_option.ok_or(\"some error\")?;\r\n\r\n// After\r\nsome_option.ok_or_message(\"some error\")?;\r\n```\r\n\r\nI've also moved all of our existing error infrastructure from `bevy_ecs::result` to `bevy_ecs::error`, as I think that is the better home for it\r\n\r\n## Why not anyhow (or eyre)?\r\n\r\nThe biggest reason is that `anyhow` needs to be a \"generically useful error type\", whereas Bevy is a much narrower scope. By using our own error, we can be significantly more opinionated. For example, anyhow doesn't do the extensive (and invasive) backtrace filtering that BevyError does because it can't operate on Bevy-specific context, and needs to be generically useful.\r\n\r\nBevy also has a lot of operational context (ex: system info) that could be useful to attach to errors. If we have control over the error type, we can add whatever context we want to in a structured way. This could be increasingly useful as we add more visual / interactive error handling tools and editor integrations.\r\n\r\nAdditionally, the core approach used is simple and requires almost no code. anyhow clocks in at ~2500 lines of code, but the impl here uses 160. We are able to boil this down to exactly what we need, and by doing so we improve our compile times and the understandability of our code.",
+    "pr_comments": [
+        "I would prefer `bevy::Error` over `bevy::BevyError` to avoid namespace stuttering. Users can always `use bevy::Error as BevyError` if they have multiple error types going on in one file. I don't feel this strongly, so feel free to ignore me.",
+        "> I would prefer `bevy::Error` over `bevy::BevyError` to avoid namespace stuttering. Users can always `use bevy::Error as BevyError` if they have multiple error types going on in one file. I don't feel this strongly, so feel free to ignore me.\r\n\r\nI don't like shadowing core types / traits like this, even though I know it's a common practice. It doesn't work well with glob imports (like from a prelude), it's harder to review in PRs / skim at a glance, and they're much harder for beginners to google.",
+        "Good reasons! Web-searchability is useful and being a core type is quite a special status.",
+        "> I don't like shadowing core types / traits like this, even though I know it's a common practice.\r\n\r\nWorth noting we are already doing this with our specialized `Result` alias. It won't conflict with the default `Result` because it's just adding defaults, but it could conflicts with other aliases, such as the one from anyhow.",
+        "will `BevyError` be only used on `bevy_ecs`? wouldn't it be better to have it at `bevy_error`?",
+        "> will BevyError be only used on bevy_ecs? wouldn't it be better to have it at bevy_error?\r\n\r\nWe can consider breaking it out, but it increases the difficulty of consuming it, and there isn't really much of a use for it outside of the ECS context. I'd prefer to defer this until there is a real use case that justifies the added consumption cost.",
+        "> One downside to _not_ using `Box<dyn Error>` directly is that we can no longer take advantage of the built-in `Into` impl for strings to errors.\r\n\r\nWould `impl From<&str> for BevyError` make that work again?  Would it make sense to have that impl?  ",
+        "I think we should try out @chescock's idea, but once that's explored I have no objections to merging this. Tests would always be nice, but I don't think they're essential.",
+        "I want to try and make an example using `error-stack` just to have a point of comparison, no commitment ",
+        "> Would impl From<&str> for BevyError make that work again? Would it make sense to have that impl?\r\n\r\nThis conflicts with the blanket `From<E: Error>` impl, which we need.",
+        "> This conflicts with the blanket `From<E: Error>` impl, which we need.\r\n\r\nBut then how does it work for `Box<dyn Error>`???  ... Oh, I see, `std` is cheating by using a negative impl\r\n\r\n```rust\r\n// This is required to make `impl From<&str> for Box<dyn Error>` and `impl<E> From<E> for Box<dyn Error>` not overlap.\r\n#[stable(feature = \"error_in_core_neg_impl\", since = \"1.65.0\")]\r\nimpl !crate::error::Error for &str {}\r\n```\r\n\r\nI think `impl<E> From<E> for BevyError where Box<dyn Error>: From<E>` is legal, but then you wouldn't be able to put the backtrace inside the box.  Makes sense!  ",
+        "I like the direction of this! As a potential bonus feature: I have seen other panic handlers/error types (e.g. color-eyre's) that also capture spans from tracing. Would this be useful for bevy as well?",
+        "> As a potential bonus feature: I have seen other panic handlers/error types (e.g. color-eyre's) that also capture spans from tracing. Would this be useful for bevy as well?\r\n\r\nThis sounds useful to me! Worth exploring in a followup."
+    ],
+    "merged": true,
+    "created_at": "2025-03-03T22:41:43Z",
+    "issue_context": {
+        "number": 18092,
+        "title": "Bevy's Error type should capture a useful backtrace",
+        "body": "As mentioned in #14275 and #17273, Bevy needs to output useful backtraces when its systems fail. Currently, it fails with a backtrace captured at the _error handling site_ not _where the error occurs_.  We need to use the From-conversion anyhow-style backtrace capture for our error type, either by using anyhow directly or by implementing it ourselves. ",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 872,
+            "commit_id": "b79538f800bf223e4bb8cd7e2edff3b09885e501",
+            "original_commit_id": "06cb5c5fd9436f27ec72a8810c1b5ae90be957e4",
+            "path": "crates/bevy_ecs/src/error/bevy_error.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 75,
+            "original_line": 97,
+            "side": "RIGHT",
+            "original_position": 97,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "could we add a test for the string filtering? It feels like it'd be pretty fragile to code changes and rust changes.",
+                "Writing this test in a way that is actually useful involves setting the RUST_BACKTRACE env variable from the test, which is unsafe to do as it could run in parallel. I'm cool with just accepting that though"
+            ]
+        },
+        {
+            "hunk_id": 873,
+            "commit_id": "b79538f800bf223e4bb8cd7e2edff3b09885e501",
+            "original_commit_id": "06cb5c5fd9436f27ec72a8810c1b5ae90be957e4",
+            "path": "crates/bevy_app/src/panic_handler.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 51,
+            "original_line": 50,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "A quick comment about why this behavior needs to be different on web would go a long way to making me feel confident in maintaining this section.",
+                "The wasm section relies on [console_error_panic_hook](https://github.com/rustwasm/console_error_panic_hook) , which provides better backtrace support in js engines \n"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,46 @@
+{
+    "repo": "rails/rails",
+    "pr_number": 53723,
+    "lang": "ruby",
+    "pr_title": "Preserve duplicate columns in `ActiveRecord::Base#select`",
+    "pr_body": "Fixes #53715 (see there for the problem description).",
+    "pr_comments": [
+        "How should `posts = Post.select(:id, :id); posts.merge(posts)` behave?",
+        "I think it should behave the same way. Changed the code to reflect that."
+    ],
+    "merged": true,
+    "created_at": "2024-11-23T13:51:03Z",
+    "issue_context": {
+        "number": 53715,
+        "title": "`#select` generates wrong number of columns when `Arel::Nodes::Quoted` has the same value",
+        "body": "### Steps to reproduce\r\n\r\n```ruby\r\n# frozen_string_literal: true\r\n\r\nrequire \"bundler/inline\"\r\n\r\ngemfile(true) do\r\n  source \"https://rubygems.org\"\r\n\r\n  gem \"rails\"\r\n  gem \"sqlite3\"\r\nend\r\n\r\nrequire \"active_record\"\r\nrequire \"minitest/autorun\"\r\nrequire \"logger\"\r\n\r\nActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\r\nActiveRecord::Base.logger = Logger.new(STDOUT)\r\n\r\nActiveRecord::Schema.define do\r\n  create_table :users, force: true\r\nend\r\n\r\nclass User < ActiveRecord::Base\r\nend\r\n\r\nclass BugTest < Minitest::Test\r\n  def test_ok\r\n    query = User.all.select([Arel::Nodes::Quoted.new('a'), Arel::Nodes::Quoted.new('b')]).to_sql\r\n\r\n    assert_equal(\"SELECT 'a', 'b' FROM \\\"users\\\"\", query)\r\n  end\r\n\r\n  def test_ng\r\n    query = User.all.select([Arel::Nodes::Quoted.new('a'), Arel::Nodes::Quoted.new('a')]).to_sql\r\n\r\n    assert_equal(\"SELECT 'a', 'a' FROM \\\"users\\\"\", query)\r\n  end\r\nend\r\n```\r\n\r\n### Expected behavior\r\nPass the tests\r\n\r\n### Actual behavior\r\n```\r\n  1) Failure:\r\nBugTest#test_ng:\r\n--- expected\r\n+++ actual\r\n@@ -1 +1 @@\r\n-\"SELECT 'a', 'a' FROM \\\"users\\\"\"\r\n+\"SELECT 'a' FROM \\\"users\\\"\"\r\n```\r\n\r\n### System configuration\r\n**Rails version**: 7.2.1.1\r\n\r\n**Ruby version**: 3.2.2\r\n",
+        "comments": [
+            "Looks like this is not an easily fixable. Can you describe a real-world example where this is/was a problem?",
+            "Here's an example:\r\n\r\n```\r\n# frozen_string_literal: true\r\n\r\nrequire \"bundler/inline\"\r\n\r\ngemfile(true) do\r\n  source \"https://rubygems.org\"\r\n\r\n  gem \"rails\"\r\n  gem \"sqlite3\"\r\nend\r\n\r\nrequire \"active_record\"\r\nrequire \"minitest/autorun\"\r\nrequire \"logger\"\r\n\r\nActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\r\nActiveRecord::Base.logger = Logger.new(STDOUT)\r\n\r\nActiveRecord::Schema.define do\r\n  create_table :users, force: true do |t|\r\n    t.timestamp :activated_at\r\n    t.timestamp :deleted_at\r\n  end\r\n\r\n  create_table :posts, force: true do |t|\r\n    t.string :title\r\n    t.string :body\r\n  end\r\n\r\n  create_table :comments, force: true do |t|\r\n    t.string :body\r\n  end\r\n\r\n  create_table :notices, force: true do |t|\r\n    t.references :user, foreign_key: true\r\n    t.references :action_user, foreign_key: { to_table: :users }\r\n    t.references :target, polymorphic: true\r\n    t.integer :notice_type, null: false\r\n    t.string :message\r\n  end\r\nend\r\n\r\nclass User < ActiveRecord::Base\r\n  has_many :notices, dependent: :destroy\r\n\r\n  scope :active, -> {\r\n    where.not(activated_at: nil)\r\n     .where(deleted_at: nil)\r\n  }\r\n  scope :notice_recipients, -> (*_args) {\r\n    active\r\n    # Actually, there are some complex search conditions here\r\n  }\r\nend\r\n\r\nclass Post < ActiveRecord::Base\r\n  def build_notice_message\r\n    \"New post!\" # Actually, there are some message generation here, i.e. I18n\r\n  end\r\nend\r\n\r\nclass Comment < ActiveRecord::Base\r\n  def build_notice_message\r\n    \"New comment!\" # Actually, there are some message generation here, i.e. I18n\r\n  end\r\nend\r\n\r\nclass Notice < ActiveRecord::Base\r\n  belongs_to :user\r\n  belongs_to :action_user, class_name: 'User'\r\n  belongs_to :target, polymorphic: true\r\n\r\n  enum :notice_type, { create_post: 0, create_comment: 1 }\r\n\r\n  class << self\r\n    COLUMNS = %i[action_user_id target_type target_id notice_type message].freeze\r\n\r\n    def publish_all(notice_type, action_user, target)\r\n      base_attrs = build(action_user:, target:, notice_type:, message: target.build_notice_message).attributes_for_database\r\n\r\n      im = Arel::InsertManager.new(arel_table)\r\n      im.ast.columns = [arel_table[:user_id]] + COLUMNS.map { |f| arel_table[f] }\r\n      insert_into = im.to_sql\r\n\r\n      recipients = User.notice_recipients(notice_type, action_user, target)\r\n      select_columns = [:id] + COLUMNS.map { |c| Arel::Nodes.build_quoted(base_attrs[c.to_s]) }\r\n      select_from = recipients.select(select_columns).to_sql\r\n\r\n      connection.execute(\"#{insert_into} #{select_from}\")\r\n    end\r\n  end\r\nend\r\n\r\nclass BugTest < Minitest::Test\r\n  def teardown\r\n    Notice.delete_all\r\n    Comment.delete_all\r\n    Post.delete_all\r\n    User.delete_all\r\n  end\r\n\r\n  # It usually works fine\r\n  def test_ok\r\n    User.create(id: 1, activated_at: Time.current)\r\n    User.create(id: 2, activated_at: Time.current)\r\n    User.create(id: 3, activated_at: Time.current)\r\n    Post.create(id: 4, title: \"Title\", body: \"Body\")\r\n    Notice.publish_all(:create_post, User.find(2), Post.find(4))\r\n\r\n    expected = [\r\n      [User.find(1), User.find(2), Post.find(4)],\r\n      [User.find(2), User.find(2), Post.find(4)],\r\n      [User.find(3), User.find(2), Post.find(4)],\r\n    ]\r\n    assert_equal(expected, Notice.all.map { |x| [x.user, x.action_user, x.target] })\r\n  end\r\n\r\n  # But, it complains about 'ActiveRecord::StatementInvalid: SQLite3::SQLException: 5 values for 6 columns'\r\n  # in case of some ids are the same value by chance\r\n  # (It also happens when notice_type enum value coincided with other id)\r\n  def test_ng\r\n    User.create(id: 1, activated_at: Time.current)\r\n    User.create(id: 2, activated_at: Time.current)\r\n    User.create(id: 3, activated_at: Time.current)\r\n    Comment.create(id: 2, body: \"Comment\")\r\n    Notice.publish_all(:create_comment, User.find(2), Comment.find(2))\r\n\r\n    expected = [\r\n      [User.find(1), User.find(2), Comment.find(2)],\r\n      [User.find(2), User.find(2), Comment.find(2)],\r\n      [User.find(3), User.find(2), Comment.find(2)],\r\n    ]\r\n    # Fails\r\n    assert_equal(expected, Notice.all.map { |x| [x.user, x.action_user, x.target] })\r\n  end\r\nend\r\n```\r\n\r\n----\r\n\r\nBy the way, I hope to ActiveRecord (or Arel) will support `INSERT INTO ... SELECT FROM ...` syntax somehow.",
+            "The specific problem I illustrated was solved by creating a junction table between users and notices.\r\n\r\nBut still, the original issue seems like a bug to me.",
+            "Had you tried https://api.rubyonrails.org/classes/ActiveRecord/Relation.html#method-i-insert_all ? Looks like your are trying to reimplement that method.",
+            "Yes, I've already tried it. That looks like:\r\n\r\n```Ruby\r\nCOLUMNS = %w[action_user_id target_type target_id notice_type message].freeze\r\n\r\ndef publish_all(notice_type, action_user, target)\r\n  base_attrs = build(action_user:, target:, notice_type:, message: target.build_notice_message)\r\n    .attributes_for_database\r\n    .slice(*COLUMNS)\r\n  User.notice_recipients(notice_type, action_user, target).find_in_batches do |recipients|\r\n    Notice.insert_all(recipients.map { |user| { user_id: user.id, **base_attrs } })\r\n  end\r\nend\r\n```\r\n\r\nHowever, there are some drawbacks to this approach:\r\n\r\n- It requires retrieving all recipients from the database.\r\n- It necessitates build large arrays.\r\n- `insert_all` generates very long SQL queries.\r\n\r\nAs a result, there were performance issues compared to the approach of using `INSERT INTO ... SELECT FORM`.",
+            "I opened a PR, I was worrying if it will introduce some unwanted behavior. But all the tests passed and it looks more correct for me to not try be smart by deduplicating selected columns, because it is fine in SQL to provide the same column/expression in `SELECT` multiple times."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48323,
+            "commit_id": "e93a128e17cdf25700fd21af521ac584e0685824",
+            "original_commit_id": "04a63ad9b6575de8434be6dc39d62eb8cca1ee4c",
+            "path": "activerecord/test/cases/relation_test.rb",
+            "start_line": 300,
+            "original_start_line": 300,
+            "start_side": "RIGHT",
+            "line": 301,
+            "original_line": 301,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm ok to allow explicit `select(:id, :id)` duplication, but it is not the expected behavior that values that users has not touched are duplicated each time `merge` is called. Fixed by 31d3caece6be5511dbfb5269f926dcf1648b59ac."
+            ]
+        }
+    ]
+}

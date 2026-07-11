@@ -1,0 +1,137 @@
+{
+    "repo": "apache/airflow",
+    "pr_number": 43243,
+    "lang": "python",
+    "pr_title": "Migrate `TaskInstance` to UUID v7 primary key",
+    "pr_body": "closes https://github.com/apache/airflow/issues/43161 part of [AIP-72](https://github.com/orgs/apache/projects/405).\r\n\r\nAs part of the ongoing work for [AIP-72: Task Execution Interface](https://cwiki.apache.org/confluence/display/AIRFLOW/AIP-72+Task+Execution+Interface+aka+Task+SDK), we are migrating the task_instance table to use a UUID primary key. This change is being made to simplify task instance identification, especially when communicating between the executor and workers.\r\n\r\nCurrently, the primary key of task_instance is a composite key consisting of `dag_id, task_id, run_id, and map_index` as shown below. This migration introduces a **UUID v7** column (`id`) as the new primary key. \r\n\r\nhttps://github.com/apache/airflow/blob/b4269f33c7151e6d61e07333003ec1e219285b07/airflow/models/taskinstance.py#L1815-L1819\r\n\r\n##  Why UUID v7?\r\n\r\nThe UUID v7 format was chosen because of its improved temporal sorting capabilities. For existing records, UUID v7 will be generated using either the queued_dttm, start_date, or the current timestamp.\r\n\r\n<img width=\"792\" alt=\"image\" src=\"https://github.com/user-attachments/assets/ba68c9ae-4f9d-4cd2-8504-1b671d23ef6c\">\r\n\r\n(From [this blog post](https://www.toomanyafterthoughts.com/uuids-are-bad-for-database-index-performance-uuid7).)\r\n\r\n## Changes \r\n\r\n1. **Migrated Primary Key to UUID v7**  \r\n   - Replaced the composite primary key (`dag_id`, `task_id`, `run_id`, `map_index`) with a UUID v7 `id` field, ensuring temporal sorting and simplified task instance identification.\r\n\r\n2. **Database-Specific UUID v7 Functions** for DB Migrations  \r\n   - Added UUID v7 functions for each database, just for DB migration since generating uuid's on Python and then storing it in DB can be slow:\r\n      - **PostgreSQL**: Uses `pgcrypto` for generation with fallback.\r\n      - **MySQL**: Custom deterministic UUID v7 function.\r\n      - **SQLite**: Utilizes `uuid6` Python package.\r\n\r\n3. **Updated Constraints and Indexes**  \r\n   - Added `UniqueConstraint` on (`dag_id`, `task_id`, `run_id`, `map_index`) for compatibility.\r\n   - Modified foreign key constraints for the new primary key, handling downgrades to restore previous constraints.\r\n\r\n4. **Model and API Adjustments**  \r\n   - Updated `TaskInstance` model to use UUID v7 as the primary key via [`uuid6`](https://pypi.org/project/uuid6/) library, that has uuid7 ! \ud83d\ude04 .\r\n   - Adjusted REST API, views, and queries to support UUID-based lookups.\r\n   - Modified tests for compatibility with the new primary key.\r\n\r\n\r\n## Issues identified\r\n\r\nAfter updating the primary key on the `TaskInstance` model to a UUID7 `id` field (from the composite primary key of `[\"dag_id\", \"task_id\", \"run_id\", \"map_index\"]`), I have now run into issues  in testing and session management:\r\n\r\n1. **`session.merge()` Compatibility**  \r\n\r\n    The `session.merge()` function operates strictly on primary keys as mentioned in [this SQLAlchemy docs](https://docs.sqlalchemy.org/en/20/orm/session_state_management.html#merging), which means it no longer recognizes the unique constraint on `[\"dag_id\", \"task_id\", \"run_id\", \"map_index\"]` to identify existing `TaskInstance` records. This leads to issues in cases where `session.merge()` was previously used to either update or insert TaskInstance records, as it now fails to locate the intended record by the unique constraint.\r\n\r\n    Example:\r\n \r\n     https://github.com/apache/airflow/blob/b2ecb6c9caacd2ca7a2c1519ca892b19b2bb35fb/tests/models/test_dag.py#L2013-L2026\r\n\r\n    A possible workaround would be to follow `session.merge()` calls with `refresh_from_db()` to ensure the instance has the latest state:  \r\n   ```python\r\n   task_instance_1 = session.merge(TaskInstance(task=t_1, run_id=dagrun_1.run_id, state=ti_state_begin))\r\n   task_instance_1.refresh_from_db()  # Update instance with current DB state\r\n   ```\r\n\r\n\r\n2. **`session.get()` usage with `TaskInstanceKey`**  \r\n\r\n    Similarly, `session.get()` and other primary key-based session operations now rely solely on the `id` UUID rather than the composite fields. This results in errors when accessing or sorting records based on the previous composite fields, as `session.get()` cannot match identifiers to `TaskInstance` records by the unique constraint.\r\n\r\n    **Current code in main**:\r\n\r\n    https://github.com/apache/airflow/blob/78ff0a99700125121b7f0647023503750f14a11b/tests/models/test_cleartasks.py#L742\r\n\r\n    I have been changing those references from `TaskInstanceKey` in Database calls with `ti.id`, example:\r\n\r\n   https://github.com/apache/airflow/blob/cca7ce0fd66b01293e21221d1dd9332312a4cb66/tests/models/test_cleartasks.py#L742\r\n\r\n3. **Airflow REST API calls which filters TIs**  \r\n    \r\n    Similar to (2) above, some of our REST API call filters TI records based on current primary key as below:\r\n     https://github.com/apache/airflow/blob/78ff0a99700125121b7f0647023503750f14a11b/airflow/api_connexion/endpoints/task_instance_endpoint.py#L536-L537\r\n\r\n     I am changing that to `session.scalars(select(TI).where(...))..one_or_none()` queries. For example, the above code is changed to the following in this PR.\r\n     https://github.com/apache/airflow/blob/3c61ba7157bce0dd9d7456670e7ba553be046d6e/airflow/api_connexion/endpoints/task_instance_endpoint.py#L536-L540\r\n\r\n## TODOs\r\n\r\n- [x] Check if the DB user has permissions to add CREATE extension for Postgres as we install `pgcrypto`\r\n- [x] Convert the raw SQL for dropping the primary key (CASCADE) into an Alembic operation. This will allow capturing foreign key constraints and managing them in a downgrade scenario. MySQL does not support dropping foreign keys using CASCADE with primary keys anyway.\r\n- [x] Ensure foreign key constraints are re-added during downgrades after the primary key has been changed back to the composite key.\r\n- [x] SQLite Support: Add SQLite support for UUID v7 generation using the [uuid6 Python package](https://pypi.org/project/uuid6/).\r\n- [x] Add changes to `TaskInstance` model file to add `id`\r\n\r\n## Future Work\r\n- [ ] Evaluate if the `task_instance_history` table requires similar updates for UUID v7 compatibility. (https://github.com/apache/airflow/issues/43437)\r\n- [ ] **Batch Updates**: Investigate batch processing for updating UUIDs to avoid long locks on large datasets. Maybe run with batches of 10000 rows???  -- TBD. We can also run some benchmarks once we do that. (https://github.com/apache/airflow/issues/43438)\r\n- [ ] Determine if including `try_number` in the `UniqueConstraint` improves index efficiency. (https://github.com/apache/airflow/issues/43439)\r\n",
+    "pr_comments": [
+        "A neat trick to avoid the need for pgcrypto extension: https://brandur.org/fragments/secure-bytes-without-pgcrypto\r\n\r\nThough `uuid_send()` fn it uses doesn't exist on Pg10, it only comes from Pg11 onwards. However I do think it's reasonable to say 12 or 13 is the min required Pg version for Airflow 3 (Postgres only supports v13 onwards).\r\n\r\nOh, Pg 12 is officially all we support anyway, so I think using the `uuid_send()` function approach could work fine.",
+        "## Issues identified\r\n\r\nAfter updating the primary key on the `TaskInstance` model to a UUID7 `id` field (from the composite primary key of `[\"dag_id\", \"task_id\", \"run_id\", \"map_index\"]`), I have now run into issues  in testing and session management:\r\n\r\n1. **`session.merge()` Compatibility**  \r\n\r\n    The `session.merge()` function operates strictly on primary keys as mentioned in [this SQLAlchemy docs](https://docs.sqlalchemy.org/en/20/orm/session_state_management.html#merging), which means it no longer recognizes the unique constraint on `[\"dag_id\", \"task_id\", \"run_id\", \"map_index\"]` to identify existing `TaskInstance` records. This leads to issues in cases where `session.merge()` was previously used to either update or insert TaskInstance records, as it now fails to locate the intended record by the unique constraint.\r\n\r\n    Example:\r\n \r\n     https://github.com/apache/airflow/blob/b2ecb6c9caacd2ca7a2c1519ca892b19b2bb35fb/tests/models/test_dag.py#L2013-L2026\r\n\r\n    A possible workaround would be to follow `session.merge()` calls with `refresh_from_db()` to ensure the instance has the latest state:  \r\n   ```python\r\n   task_instance_1 = session.merge(TaskInstance(task=t_1, run_id=dagrun_1.run_id, state=ti_state_begin))\r\n   task_instance_1.refresh_from_db()  # Update instance with current DB state\r\n   ```\r\n\r\n\r\n2. **`session.get()` usage with `TaskInstanceKey`**  \r\n\r\n    Similarly, `session.get()` and other primary key-based session operations now rely solely on the `id` UUID rather than the composite fields. This results in errors when accessing or sorting records based on the previous composite fields, as `session.get()` cannot match identifiers to `TaskInstance` records by the unique constraint.\r\n\r\n    **Current code in main**:\r\n\r\n    https://github.com/apache/airflow/blob/78ff0a99700125121b7f0647023503750f14a11b/tests/models/test_cleartasks.py#L742\r\n\r\n    I have been changing those references from `TaskInstanceKey` in Database calls with `ti.id`, example:\r\n\r\n   https://github.com/apache/airflow/blob/cca7ce0fd66b01293e21221d1dd9332312a4cb66/tests/models/test_cleartasks.py#L742\r\n\r\n3. **Airflow REST API calls which filters TIs**  \r\n    \r\n    Similar to (2) above, some of our REST API call filters TI records based on current primary key as below:\r\n     https://github.com/apache/airflow/blob/78ff0a99700125121b7f0647023503750f14a11b/airflow/api_connexion/endpoints/task_instance_endpoint.py#L536-L537\r\n\r\n     I am changing that to `session.scalars(select(TI).where(...))..one_or_none()` queries. For example, the above code is changed to the following in this PR.\r\n     https://github.com/apache/airflow/blob/3c61ba7157bce0dd9d7456670e7ba553be046d6e/airflow/api_connexion/endpoints/task_instance_endpoint.py#L536-L540",
+        "I do think long-term/by release of 3.0 TaskInstanceHistory should also have a uuid.",
+        "> Yeah, our use of `session.merge()` in Airflow is v. bad :(\r\n\r\nAgree. This is one of the reasons I wanted to avoid all those db-schema changes for the initial proposal of multi-team and proposed the team-id prefix, becaue I was afraid we are going to have similar ripple-effects that will result in rewriting big part of our database code. Which seem that it was a pretty justified worry.",
+        "BTW. One of the ways it could be helped - we **could** potentially generate the unique id by hashing the remaining fields - with appropriate hashing algorithm, we could have very low probability of collision (and maybe we could implement a mechanism to detect collisions and implement handling of those collision in similar ways they are handled in hash maps) - that would be another way how we could approach it (and there the merge code could be simpler and still use session.merge()\r\n\r\nBut this one also comes with it's own set of difficulties and collision handling is likely going to be complex. But I thought it's worth menioning it here as an option.",
+        "One problem with generating the unique hash with other fields, is that it will be even **more** difficult to add new fields, so probably getting rid of session.merge() everywhere and replacing it with our own way of merging objects and database entries by retrieving the unique id based on the unique fields from the DB before merging is likely a long-term better approach.",
+        "@potiuk Yeah, I considered hashing but it is bad for Databases for indexing and, as a result, querying since it won't have temporal properties apart from Collision Handling complexity. \r\n\r\nUUID v7 is explicitly designed to support distributed databases with high insert rates due to its temporal ordering.\r\n\r\n> BTW. One of the ways it could be helped - we **could** potentially generate the unique id by hashing the remaining fields - with appropriate hashing algorithm, we could have very low probability of collision (and maybe we could implement a mechanism to detect collisions and implement handling of those collision in similar ways they are handled in hash maps) - that would be another way how we could approach it (and there the merge code could be simpler and still use session.merge()\r\n> \r\n> But this one also comes with it's own set of difficulties and collision handling is likely going to be complex. But I thought it's worth menioning it here as an option.\r\n\r\n",
+        "> Yeah, our use of `session.merge()` in Airflow is v. bad :(\r\n\r\nIndeed",
+        "> UUID v7 is explicitly designed to support distributed databases with high insert rates due to its temporal ordering.\r\n\r\nYep. that settles it as well. We would have to implement our hashing in similar way (if possible at all)"
+    ],
+    "merged": true,
+    "created_at": "2024-10-28T00:38:48Z",
+    "issue_context": {
+        "number": 43161,
+        "title": "Make Task Instance primary key be a UUID",
+        "body": "As part of [AIP-72](https://cwiki.apache.org/confluence/display/AIRFLOW/AIP-72+Task+Execution+Interface+aka+Task+SDK), we want to pass the Task Instance to the worker. Currently, the primary key of TI is a combination of `dag_id, task_id, run_id, map_index`.\r\n\r\nhttps://github.com/apache/airflow/blob/b4269f33c7151e6d61e07333003ec1e219285b07/airflow/models/taskinstance.py#L1815-L1819\r\n\r\nInstead of sending the entire key from the executor to worker via API-server, ideally the API server can just send over a TI UUID and the worker then uses it to fetch the correct TI to execute. \r\n\r\nWe want to add a single column pk of a UUID, and should use UUID v7 (as it has better temporal sorting behaviours than the random v4). For the migration to update existing rows we can use v4 which most DBs have natively. \r\n\r\nThe scope of this GitHub issue is to add UUIDs -- but not use it anywhere in the codebase yet until we need it on the Task Execution API server. We will keep the \"denormalized\" columns of dag_id and run_id for easier searching/querying.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 54780,
+            "commit_id": "0f5dc0a0e496a38d53003ee9dc2941af0d8c9b74",
+            "original_commit_id": "8a6b1fc4e0ab8ba42cc47d8390fcd62a41e924dd",
+            "path": "providers/tests/openlineage/extractors/test_manager.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 316,
+            "original_line": 316,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "The reason for this is explained in [**Issues identified Point (1)**](https://github.com/apache/airflow/pull/43243#issuecomment-2439774584)\r\n"
+            ]
+        },
+        {
+            "hunk_id": 54783,
+            "commit_id": "0f5dc0a0e496a38d53003ee9dc2941af0d8c9b74",
+            "original_commit_id": "8a6b1fc4e0ab8ba42cc47d8390fcd62a41e924dd",
+            "path": "tests/models/test_cleartasks.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 600,
+            "original_line": 600,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "The reason for this is explained in [**Issues identified Point (2)**](https://github.com/apache/airflow/pull/43243#issuecomment-2439774584)\r\n"
+            ]
+        },
+        {
+            "hunk_id": 54781,
+            "commit_id": "0f5dc0a0e496a38d53003ee9dc2941af0d8c9b74",
+            "original_commit_id": "8a6b1fc4e0ab8ba42cc47d8390fcd62a41e924dd",
+            "path": "tests/api_connexion/endpoints/test_task_instance_endpoint.py",
+            "start_line": 1986,
+            "original_start_line": 1986,
+            "start_side": "RIGHT",
+            "line": 1994,
+            "original_line": 1994,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "The reason for this and other changes in this file is explained in [**Issues identified Point (2)**](https://github.com/apache/airflow/pull/43243#issuecomment-2439774584)\r\n"
+            ]
+        },
+        {
+            "hunk_id": 54784,
+            "commit_id": "0f5dc0a0e496a38d53003ee9dc2941af0d8c9b74",
+            "original_commit_id": "8a6b1fc4e0ab8ba42cc47d8390fcd62a41e924dd",
+            "path": "tests/jobs/test_local_task_job.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 906,
+            "original_line": 906,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "Wondering if the `refresh_from_db` could be moved to the `TaskInstance` constructor somehow as an optional operation?",
+                "That feels a weird one to be added to the constructor though. At some point, we should just do a better Session & State management in Airflow with the `provide_session`, `session.merge` shenanigans."
+            ]
+        },
+        {
+            "hunk_id": 54779,
+            "commit_id": "0f5dc0a0e496a38d53003ee9dc2941af0d8c9b74",
+            "original_commit_id": "8a6b1fc4e0ab8ba42cc47d8390fcd62a41e924dd",
+            "path": "airflow/api_connexion/endpoints/task_instance_endpoint.py",
+            "start_line": 536,
+            "original_start_line": 536,
+            "start_side": "RIGHT",
+            "line": 540,
+            "original_line": 540,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "The reason for this and other changes in this file are explained in [**Issues identified Point (3)**](https://github.com/apache/airflow/pull/43243#issuecomment-2439774584)\r\n"
+            ]
+        },
+        {
+            "hunk_id": 54782,
+            "commit_id": "0f5dc0a0e496a38d53003ee9dc2941af0d8c9b74",
+            "original_commit_id": "8a6b1fc4e0ab8ba42cc47d8390fcd62a41e924dd",
+            "path": "tests/jobs/test_local_task_job.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 956,
+            "original_line": 956,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "The reason for this and other changes in this file is explained in [**Issues identified Point (1)**](https://github.com/apache/airflow/pull/43243#issuecomment-2439774584)\r\n"
+            ]
+        }
+    ]
+}

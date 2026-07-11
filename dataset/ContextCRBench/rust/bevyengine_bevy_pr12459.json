@@ -1,0 +1,48 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 12459,
+    "lang": "rust",
+    "pr_title": "send Unused event when asset is actually unused",
+    "pr_body": "# Objective\r\n\r\nfix #12344\r\n\r\n## Solution\r\n\r\nuse existing machinery in track_assets to determine if the asset is unused before firing Asset::Unused event\r\n\r\n~~most extract functions use `AssetEvent::Removed` to schedule deletion of render world resources. `RenderAssetPlugin` was using `AssetEvent::Unused` instead.\r\n`Unused` fires when the last strong handle is dropped, even if a new one is created. `Removed` only fires when a new one is not created.\r\nas far as i can see, `Unused` is the same as `Removed` except for this \"feature\", and that it also fires early if all handles for a loading asset are dropped (`Removed` fires after the loading completes). note that in that case, processing based on `Loaded` won't have been done anyway.\r\ni think we should get rid of `Unused` completely, it is not currently used anywhere (except here, previously) and i think using it is probably always a mistake.\r\ni also am not sure why we keep loading assets that have been dropped while loading, we should probably drop the loader task as well and remove immediately.~~",
+    "pr_comments": [
+        "this was added in https://github.com/bevyengine/bevy/pull/10520 to allow removing assets from the cpu side and keeping them on the gpu side",
+        "> i think we should get rid of Unused completely, it is not currently used anywhere (except here, previously) and i think using it is probably always a mistake.\r\n\r\nAgreed. Different PR of course, so then we can ship this in 0.13.1.\r\n\r\n> i also am not sure why we keep loading assets that have been dropped while loading, we should probably drop the loader task as well and remove immediately.\r\n\r\nThis makes sense to me too.",
+        "@JMS55 on discord: \r\n> That doesn't seem right. The whole point was I added unused in 0.13 specifically so we would know when to drop a render asset without using removed, as we'll remove it even though it's still in use by the GPU ...\r\n\r\ni missed that `Removed` is also fired on extract when RenderAssetUsages is `!MAIN_WORLD`.\r\n\r\nso instead we can use the existing logic for processing the automatic removal (in `track_assets`) to determine whether to send the `Unused` event, as well as whether to attempt to unload the asset.",
+        "i think the resending of `not_ready` events might break this. i reworked it to use a local instead of resending, but that requires DropEvent to be `pub` or track_assets to be `pub(crate)` - is it a breaking change to make a type public?",
+        ">  is it a breaking change to make a type public\r\n\r\nNo :)",
+        "> i think the resending of `not_ready` events might break this. i reworked it to use a local instead of resending, but that requires DropEvent to be `pub` or track_assets to be `pub(crate)` - is it a breaking change to make a type public?\r\n\r\nnope, the code is fine, sorry. i think this is good as is",
+        "Tbh I'm having a hard time reviewing this, as the code is a bit confusing. I'm not quite sure I understand the implications of moving it around like this.",
+        "> Tbh I'm having a hard time reviewing this, as the code is a bit confusing. I'm not quite sure I understand the implications of moving it around like this.\r\n\r\nHave a look at the related issue. the important thing is that the process_handle_drop call checks whether new handles have been created since the drop event was fired, before removing the asset. We now perform that check before sending the unused event as well. "
+    ],
+    "merged": true,
+    "created_at": "2024-03-17T19:12:09Z",
+    "issue_context": {
+        "number": 12344,
+        "title": "Asset will wrongly unload while strong handle is alive under certain circumstances",
+        "body": "## Bevy version\r\n0.13\r\n\r\n## What you did\r\nIn my tests the app has two states(A and B), and an entity with a sprite. when switching states, this entity will be despawned in `OnExit(State::A)`, and spawn a new one entity is identical to the prior one in `OnEnter(State::B)`.\r\n\r\n## What went wrong\r\n\r\nWhen respawning it, the sprite will disappear(actually it is there, but the sprite is empty).\r\n\r\nThis didn't happen in 0.12 version.\r\n\r\n## Additional information\r\n\r\nHere is my test code(need a custom image as `test.png`):\r\n``` rust\r\nuse bevy::prelude::*;\r\nuse bevy::render::camera::ScalingMode;\r\n\r\n#[derive(Component)]\r\nstruct Marker;\r\n\r\n#[derive(States, Default, Debug, PartialEq, Eq, Hash, Clone, Copy)]\r\nenum State {\r\n    #[default]\r\n    A,\r\n    B,\r\n}\r\n\r\nfn main() {\r\n    App::new()\r\n        .add_plugins((DefaultPlugins.set(WindowPlugin {\r\n            primary_window: Some(Window {\r\n                resolution: (960.0, 540.0).into(),\r\n                resizable: false,\r\n                ..default()\r\n            }),\r\n            ..default()\r\n        }),))\r\n        .init_state::<State>()\r\n        .add_systems(Startup, setup)\r\n        .add_systems(OnExit(State::A), exit_a)\r\n        .add_systems(OnEnter(State::B), enter_b)\r\n        .add_systems(Update, switch)\r\n        //.add_plugin(EditorPlugin::default())\r\n        .run();\r\n}\r\n\r\nfn setup(mut cmd: Commands, asset_server: Res<AssetServer>) {\r\n    cmd.spawn(Camera2dBundle {\r\n        projection: OrthographicProjection {\r\n            scaling_mode: ScalingMode::AutoMin {\r\n                min_width: 960.,\r\n                min_height: 540.,\r\n            },\r\n            ..Camera2dBundle::default().projection\r\n        },\r\n        ..default()\r\n    });\r\n    cmd.spawn((\r\n        SpriteBundle {\r\n            texture: asset_server.load(\"sprites/test.png\"),\r\n            ..default()\r\n        },\r\n        Marker,\r\n    ));\r\n}\r\n\r\nfn switch(mouse: Res<ButtonInput<MouseButton>>, mut next_state: ResMut<NextState<State>>) {\r\n    if mouse.just_pressed(MouseButton::Left) {\r\n        next_state.set(State::B)\r\n    }\r\n}\r\n\r\nfn exit_a(mut cmd: Commands, q: Query<Entity, With<Marker>>) {\r\n    cmd.entity(q.single()).despawn();\r\n}\r\n\r\nfn enter_b(mut cmd: Commands, asset_server: Res<AssetServer>) {\r\n    cmd.spawn((SpriteBundle {\r\n        sprite: Sprite {\r\n            custom_size: Some((960., 540.).into()),\r\n            ..default()\r\n        },\r\n        texture: asset_server.load(\"sprites/test.png\"),\r\n        ..default()\r\n    },));\r\n}\r\n```\r\n\r\nAfter click state will switch, and the sprite entity will \"disappear\".\r\n\r\nMy assumption is that image asset unloaded the sprite in `OnExit(State::A)`, but it didn't load it again in `OnEnter(State::B)`.\r\n\r\n",
+        "comments": [
+            "Addendum:\r\nThe \"unloaded\" asset actually has a strong handle(you can get it with `asset_server.get_handle()`), but the image itself is empty.\r\nIf you add the handle to a resource(like lock it between state changes), then the image is fine.\r\n\r\nSo I'll rename this issue"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1821,
+            "commit_id": "6a886c3fccbb9e6396ddb16033fb3b5211dffd1b",
+            "original_commit_id": "a9ca8491aa3f2dc99116e63d67a0625afe6e738d",
+            "path": "crates/bevy_asset/src/assets.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 563,
+            "original_line": 562,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we expand this comment a bit with the context you put in your last comment to me? That this is a check to see if a new handle has been created in the same frame after the last one was dropped, meaning it's not _actually_ unused.\r\n\r\nAlso, what does \"or the asset doesn't exist\" mean here?",
+                "it's what the comment in the process_handle_drop function says. i don't know a scenario where it would happen."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,327 @@
+{
+    "repo": "pandas-dev/pandas",
+    "pr_number": 36357,
+    "lang": "python",
+    "pr_title": "REF: Dispatch string methods to ExtensionArray",
+    "pr_body": "This is a large refactor of our string methods. The goal is to have the `Series.str` accessor dispatch the actual compute down to the ExtensionArray. The motivation is to allow a Series backed by Arrow memory to use the Arrow string kernel (e.g. `Series.str.lower()` on an Arrow-backed StringArray should eventually call `pyarrow.compute.utf8_lower()`.)\r\n\r\nTo facilitate this, I made the following changes\r\n\r\n1. Split `core/strings.py` into a sub package:\r\n  - `core/strings/accessor.py`: Implements the `Series.str` accessor, which (mostly) just delegates to the EA and wraps\r\n  - `core/strings/object_array.py`: Implements the string methods for object-type ndarray. \r\n  - `core/strings/categorical.py`, `core/strings/string_array.py`, implements categorical & StringArray-specific methods\r\n2. Defines a new `ExtensionArray._str` extension point. This is where EAs get to take over and use their compute\r\n\r\nNote that there are a few methods like `cat`, `extract`, and `extractall` that don't yet dispatch. I need to look into them a bit more, there implementation is a bit confusing.\r\n\r\nCloses https://github.com/pandas-dev/pandas/issues/36216",
+    "pr_comments": [
+        "Making sure I understand: core.strings.accessor is mostly a cut/paste of the existing core.strings?  strings.object_array corresponds to the ndarray[object]-backed StringArray we use now?\r\n\r\nIs strings.categorical for a Categorical backed by a StringArray or a StringArray backed by a Categorical?  Something else?\r\n\r\nIs the accessor central to what you're doing here, or could in principle be separate?  I expect to have an opinion about this, but am not there yet.",
+        "> core.strings.accessor is mostly a cut/paste of the existing core.strings\r\n\r\nNot quite. Anywhere you see things like \r\n\r\n```python\r\ndef method(self, ...):\r\n    result = self._array._str.method(...)\r\n    return self._wrap_result(result)\r\n```\r\n\r\nthat `result = self._array._str.method` was previously something like `map(self._array, func)`, or something like `return str_method`.\r\n\r\nThe core methods `map_object` and `map_na` which were previously in `strings.py` were moved to `ObjectArrayMethods._map` and `StringArrayMethods._map`.\r\n\r\n> Is strings.categorical for a Categorical backed by a StringArray or a StringArray backed by a Categorical? Something else?\r\n\r\nIt's for a supporting `Series[Categorical].str` and `CategoricalIndex.str`. Which I think is just a Categorical containing strings (object-dtype index for the categories).\r\n\r\n> Is the accessor central to what you're doing here, or could in principle be separate?\r\n\r\nI assume you mean the `_str` accessor on ExtensionArrays, since that's what's new? It's central in the sense that it and inheritance is the mechanism I've used to dispatch. We could do it other ways.",
+        "> I assume you mean the _str accessor on ExtensionArrays, since that's what's new? It's central in the sense that it and inheritance is the mechanism I've used to dispatch. We could do it other ways.\r\n\r\nIn the past we've been very conservative about adding things to EA.  I'd find this easier to think about if that could be considered orthogonally.",
+        "> In the past we've been very conservative about adding things to EA. I'd find this easier to think about if that could be considered orthogonally.\r\n\r\nJust to clarify, I wouldn't consider this isn't part of the official EA interface (I'm not adding it to the docs, for example). If someone comes along with another EA for storing string arrays and want access to the pandas' `.str` namespace, then I'm happy to discuss adding it to the interface. Right now, we just have the 3-4ish internal users in pandas (object-dtype, string dtype, categorical, and soon ArrowStringArray).\r\n\r\nWe just need some way to translate `Series.str.<method>` to \"call the right <method> for a Series backed by this extension array\". If you feel strongly about not adding this private attribute to `StringArray` and `Categorical`, then we can make a proxy similar to the `ObjectProxy` defined in `object_array.py`. It's just an unnecessary layer for the other cases, since we already have an extension array.",
+        "So I think our two options are either\r\n\r\n1. Attach an accessor to string EAs\r\n\r\n```python\r\nclass BaseStringArrayMethods(abc.ABC):\r\n     def __init__(self, array: ExtensionArray):\r\n        self._array = array\r\n\r\nclass ObjectProxy(ExtensionArray):\r\n   _str = CachedAccessor(\"str\", ObjectArrayMethods)\r\n```\r\n\r\n2. A mixin, where we prefex each method with some string (to disambiguate from regular methods of the same name).\r\n\r\n```python\r\nclass StringMethodsMixin:\r\n    def _str_isnumber(self):\r\n        ...\r\n\r\n    def _str_repeat(self, n):\r\n        ...\r\n\r\nclass StringArray(ExtensionArray, StringMethodsMixin):\r\n    ...\r\n```\r\n\r\nSounds like people are roughly prefer the second version?",
+        "Not easily, since it's more of a split than a move. Right now the `pandas/core/strings.py` contains\r\n\r\n1. The Series.str accessor (the class StringMethods and its function signatures)\r\n2. The *implementations* of these methods on arrays (the bodies of StringMethod's methods, all the top-level `str_<method>` methods, `na_map`, `map_object`, `map_na`.\r\n\r\nThis PR moves the `StringMethods` accessor to `pandas/core/strings/accessor.py` and the implementations to `pandas/core/strings/{base,object_array,string_array,categorical}.py`",
+        "> Updated to use a mixin (`ObjectStringArrayMixin`) that implements the pandas string methods on object-dtype ndarrays. EAs implementing the string methods (StringArray, Categorical, and PandasArray for object-dtype strings) inherit from that.\r\n\r\nare there concrete mixin's for each of these (even they are empty). I think the structure is not very clear at all.\r\n\r\nPlease somewhere can you put a diagram of the inheriteance pattern. someone who sees this will be totally confused by the indirection.",
+        "> Please somewhere can you put a diagram of the inheriteance pattern\r\n\r\nAdded a note to `pandas/core/strings/__init__.py` for the overall layout. The tldr is `Series.str.<method>` calls `Series.array._str_<method>`.\r\n\r\nThe inheritence is\r\n\r\n```python\r\n# BaseStringArrayMethods  # the base ABC\r\n#  - ObjectStringArrayMixin  # most of the implementation\r\n#     - StringArray\r\n#     - PandasArray\r\n#     - Categorical\r\n```\r\n\r\n",
+        "> > Please somewhere can you put a diagram of the inheriteance pattern\r\n> \r\n> Added a note to `pandas/core/strings/__init__.py` for the overall layout. The tldr is `Series.str.<method>` calls `Series.array._str_<method>`.\r\n> \r\n> The inheritence is\r\n> \r\n> ```python\r\n> # BaseStringArrayMethods  # the base ABC\r\n> #  - ObjectStringArrayMixin  # most of the implementation\r\n> #     - StringArray\r\n> #     - PandasArray\r\n> #     - Categorical\r\n> ```\r\n\r\ngreat.\r\n\r\nlet me re-look again, but conceptually looked good.",
+        "@ivanovmg your suggestions to change some of the implementations are fine, but probably not appropriate for this PR. Right now I'm trying to limit the changes to what's necessary for allowing EAs to controls the implementation, so not changing any of the implementations. Those would be good as followup work.",
+        "@TomAugspurger needs a merge of master\r\n\r\nOtherwise remaining comments?",
+        "Fixed the merge conflicts. This should be good on my end.",
+        "> can pandas/core/strings.py be deleted?\r\n\r\nYeah, apparently it was restored while I was fixing merge conflicts.",
+        "Just the ARM timeout. Anything else here?",
+        "thanks @TomAugspurger really nice. sorry for the long review time :->",
+        "Thanks, no worries. This wasn't especially easy to review since it was a\nlarge diff that didn't just move stuff around.\n\nOn Wed, Sep 30, 2020 at 7:22 AM Jeff Reback <notifications@github.com>\nwrote:\n\n> thanks @TomAugspurger <https://github.com/TomAugspurger> really nice.\n> sorry for the long review time :->\n>\n> \u2014\n> You are receiving this because you were mentioned.\n> Reply to this email directly, view it on GitHub\n> <https://github.com/pandas-dev/pandas/pull/36357#issuecomment-701355322>,\n> or unsubscribe\n> <https://github.com/notifications/unsubscribe-auth/AAKAOIUPLTPQTZCQFFTSW5LSIMPKFANCNFSM4RLS5ONA>\n> .\n>\n",
+        "FYI, I used this PR in `fletcher` https://github.com/xhochy/fletcher/pull/196 and it works quite nicely. Will now use that to add string algorithms that are now in Arrow bit-by-bit.",
+        "@xhochy Cool! If fletcher is using it then we should probably add it to the public API. Probably just importing it in `pandas.api.extensions`.",
+        "Unless we only want fletcher to use it for now .. (which still keeps it easier to change the implementation, given the good ties with the fletcher developers?)",
+        "I'm going to use it a bit more and see if I run into troubles while overloading it with the Arrow methods. If there are issues, we can easier to breaking changes as long as it is a private API."
+    ],
+    "merged": true,
+    "created_at": "2020-09-23T23:15:30Z",
+    "issue_context": {
+        "number": 36216,
+        "title": "Refactor StringMethods for extension arrays",
+        "body": "This is an issue to track a refactor of StringMethods that'll be necessary for ArrowStringArray to use pyarrow compute algorithms.\r\n\r\nWe'll need to update StringMethods\r\n\r\n1. Extract the array from the Series / Index\r\n2. Dispatch the string methods\r\n3. Wrap the result\r\n\r\nSo in my proposal, we'll have something like\r\n\r\n```python\r\nclass StringMethods:\r\n    def __init__(self, data, ...):\r\n        self._array = data.array\r\n        ...\r\n\r\n    def upper(self):\r\n        return self._wrap_result(self._array._str.upper())\r\n```\r\n\r\ncc @xhochy. I have a branch started and will hopefully finish it off this week.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 63942,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/arrays/categorical.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2311,
+            "original_line": 2318,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "why do these need to be here?",
+                "or rather if you explain / show *how* these are called on the appropriate object",
+                "@TomAugspurger I would maybe add a comment / docstring here to explain this is overriding the method of `ObjectStringArrayMixin` to ensure the string functions are only applied on the categories and not on the densified values",
+                "yep thanks",
+                "the reason i am asking for this is that our accessor dispatch is already a bit opaque and this is going once step further"
+            ]
+        },
+        {
+            "hunk_id": 63946,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/object_array.py",
+            "start_line": 94,
+            "original_start_line": 94,
+            "start_side": "RIGHT",
+            "line": 103,
+            "original_line": 103,
+            "side": "RIGHT",
+            "original_position": 103,
+            "position": 103,
+            "subject_type": "line",
+            "review_comments": [
+                "Different approach is used in ``_str_find_``. Not a big deal, but could be aligned."
+            ]
+        },
+        {
+            "hunk_id": 63943,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/accessor.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2947,
+            "original_line": 2945,
+            "side": "RIGHT",
+            "original_position": 2945,
+            "position": 2947,
+            "subject_type": "line",
+            "review_comments": [
+                "why is this here, rather than in the mixins themseleves? e.g. they know there type",
+                "It is here because it is only used in this file .. \r\n(but that depends on where the implementation for `extract` ends up)",
+                "This is only used in `str_extract`, which isn't currently dispatched (it exists on master as well)."
+            ]
+        },
+        {
+            "hunk_id": 63949,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/arrays/categorical.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2323,
+            "original_line": 2323,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "does this mean \"we are assuming sep is not in self.categories\", or \"sep might not be in self.categories\"?",
+                "sep might not be in self.categories."
+            ]
+        },
+        {
+            "hunk_id": 63939,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/__init__.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 32,
+            "original_line": 4,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 32,
+            "subject_type": "line",
+            "review_comments": [
+                "Import here also the other classes that are used outside of pandas.core.strings (`StringArrayMethods`, `CategoricalStringMethods`) ?",
+                "The others are gone now that we're using a methods mixing & inheritance."
+            ]
+        },
+        {
+            "hunk_id": 63938,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/object_array.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 361,
+            "original_line": 348,
+            "side": "RIGHT",
+            "original_position": 348,
+            "position": 361,
+            "subject_type": "line",
+            "review_comments": [
+                "@simonjayhawkins any idea why mypy is failing here?\r\n\r\n```\r\npandas/core/strings/object_array.py:348: error: Item \"None\" of \"Optional[Series]\" has no attribute \"astype\"  [union-attr]\r\n```\r\n\r\nI would have thought the `assert isinstance(arr, Series)` would make this pass. Declaring `arr: Series = ...` doesn't fix it either.",
+                "Not sure why. but sep is Any, and `sep + arr + sep` is resolving to Any and arr is reset back to the original type for arr.\r\n\r\n`arr = cast(Series, sep + arr + sep)` fixes till we have the binops typed and we can track the cast.\r\n\r\nyou could also do this instead of the earlier assert so that once Literal is used and the return type of fillna is correct for inplace, we can track the cast."
+            ]
+        },
+        {
+            "hunk_id": 63948,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/base.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 9,
+            "original_line": 9,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe necessary to add abstractmethod ``_str_map``.",
+                "Is is necessary to keep both ``BaseStringArrayMethods`` and ``ObjectStringArrayMixin`` if the only class inherited from it is ``ObjectStringArrayMixin``? I  would suggest to move implementation from the child into the parent class and add abstract method ``_str_map``. Unless there is a clear vision on the future extension of ``BaseStringArrayMethods``.",
+                "Our Arrow-backed StringArray (which is motivating this PR) will have separate implementations for most methods. It will inherit directly from BaseStringArrayMethods."
+            ]
+        },
+        {
+            "hunk_id": 63940,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/accessor.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2966,
+            "original_line": 2964,
+            "side": "RIGHT",
+            "original_position": 2964,
+            "position": 2966,
+            "subject_type": "line",
+            "review_comments": [
+                "so for example why is this in accessor.py and not somewhere else ? e.g. like a shared string library? this is doing work but not directly related to the accessors.",
+                "See @TomAugspurger note in the top post: \r\n\r\n> Note that there are a few methods like cat, extract, and extractall that don't yet dispatch. I need to look into them a bit more, there implementation is a bit confusing.\r\n\r\nIf those require a more extensive refactor of the method itself to use the same mechanism as the other methods, then that might be better as a separate follow-up PRs",
+                "ok i understand and that is fine. but for the purposes of this PR it is very confusing to put essentially an implementation in the accessor.py, rather than in the concrete classes themselves. alt put them in a separete module for now.",
+                "> it is very confusing to put essentially an implementation in the accessor.py\r\n\r\nI don't think this is confusing, as `extract` is a method of the accessor defined above in this file .. Note that before this PR *all* implementations were in the file where the accessor was defined.",
+                "Right.\r\n\r\nThe issue with `extract` specifically is that it operates on the Series rather than the Array. The dispatched functions are all dispatching to the array. I'm sure that we can eventually dispatch to the array by extracting the relevant pieces, but that would be a bit larger change. I've tried to keep the changes here as small as possible (despite the size of the diff) by just moving things and adding just the necessary new pieces.",
+                "ok fair enough, can you create an issue to separate these other methods (maybe with check boxes) & align witht he strutcure)"
+            ]
+        },
+        {
+            "hunk_id": 63952,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/tests/test_strings.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 731,
+            "original_line": 731,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "can you also create an issue to either make pandas/tests/strings/test_object.py or add a fixture to support th emultiple implementations (maybe better)"
+            ]
+        },
+        {
+            "hunk_id": 63951,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/__init__.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "much more clear, thanks"
+            ]
+        },
+        {
+            "hunk_id": 63947,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/object_array.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 159,
+            "original_line": 159,
+            "side": "RIGHT",
+            "original_position": 159,
+            "position": 159,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably ``n = max(n, 0)``, but maybe not.."
+            ]
+        },
+        {
+            "hunk_id": 63941,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/arrays/numpy_.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 385,
+            "original_line": 407,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "not pd.NA?",
+                "This is for `object` dtype strings (the default), not `string` dtype, so those are still using np.nan (or None)",
+                "And StringArray overrides it to be pd.NA"
+            ]
+        },
+        {
+            "hunk_id": 63944,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/object_array.py",
+            "start_line": 125,
+            "original_start_line": 125,
+            "start_side": "RIGHT",
+            "line": 126,
+            "original_line": 126,
+            "side": "RIGHT",
+            "original_position": 126,
+            "position": 126,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this local variable ``upper_pat`` necessary?"
+            ]
+        },
+        {
+            "hunk_id": 63945,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/object_array.py",
+            "start_line": 105,
+            "original_start_line": 105,
+            "start_side": "RIGHT",
+            "line": 106,
+            "original_line": 106,
+            "side": "RIGHT",
+            "original_position": 106,
+            "position": 106,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably would be even better to extract helper methods for extracting ``f`` with_regex and without_regex case."
+            ]
+        },
+        {
+            "hunk_id": 63950,
+            "commit_id": "cb2fb24439c69a040d2f1eec144c514cdf27d1f2",
+            "original_commit_id": "8f26d872b4181d8ee008cddf911bf8b9716ee8be",
+            "path": "pandas/core/strings/base.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 77,
+            "subject_type": "line",
+            "review_comments": [
+                "could `# pragma: no cover` all of these"
+            ]
+        }
+    ]
+}

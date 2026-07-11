@@ -1,0 +1,76 @@
+{
+    "repo": "netty/netty",
+    "pr_number": 14332,
+    "lang": "java",
+    "pr_title": "AdaptiveByteBufAllocator: Make pooling of AdaptiveByteBuf magazine local",
+    "pr_body": "Motivation:\r\n\r\nTo reduce the usage of FastThreadLocal and make the AdaptiveByteBufAllocator also play nice with virtual threads we should just pool the AdapativeByteBuf instances in the Magazines itself.\r\n\r\nModifications:\r\n\r\n- Remove usage of Recycler for pooling AdaptiveByteBuf\r\n- Use a bounded MPSC queue that is stored in the Magazine itself for pooling these instances\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/14279\r\n",
+    "pr_comments": [
+        "This implements the idea of @franz1981 ",
+        "How about we hold this until after 4.1.114?",
+        "Sure thing... no hurry at all.",
+        "I cleared the milestone ",
+        "See https://github.com/netty/netty/pull/14414",
+        "Let's close this in favor of https://github.com/netty/netty/pull/14414"
+    ],
+    "merged": false,
+    "created_at": "2024-09-13T13:13:15Z",
+    "issue_context": {
+        "number": 14279,
+        "title": "Don't use Netty recyclers for the adaptive ByteBuf pool, but leverage magazine-local ones",
+        "body": "Currently the adaptive pool is splitting the allocation by:\r\n- creating/reusing an \"empty\" `AdaptiveByteBuf`, at https://github.com/netty/netty/blob/c0fdb8e9f8f256990e902fcfffbbe10754d0f3dd/buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java#L193\r\n- filling it with some complex logic, at https://github.com/netty/netty/blob/c0fdb8e9f8f256990e902fcfffbbe10754d0f3dd/buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java#L417\r\n\r\nThis is nice, but suboptimal for non `FastThreadLocalThread`s as reported at #14272 (see https://github.com/netty/netty/issues/14272#issuecomment-2326620742).\r\n\r\nInstead, it would be better to have 2 recyclers:\r\n1. attached to non event-loop magazines - It's fine(ish) to reuse the existing `Recycler` too if we don't want to create an extra type\r\n2. attached to the `Magazine` (lazily) - https://github.com/netty/netty/blob/c0fdb8e9f8f256990e902fcfffbbe10754d0f3dd/buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java#L223: which access is already protected by a lock and it allow release to happen from other threads\r\n\r\nFor the former, just reusing the existing logic is fine - while for the latter it is important to find the appropriate quiescient state to release such.\r\nClearly the issue will be that an explosion of magazine (due to lack of CPU resources i.e. when the allocators are from a non Netty event loop and they oversubscribe the system) will likely cause an explosion of magazine-locals recyclers - which means more memory; but the benefits, perf-wise should be obvious.\r\n",
+        "comments": [
+            "@chrisvest @normanmaurer wdyt?",
+            "@franz1981 hmm... I wonder why we not always just use the `Recycler` as we do as of today in `PooledByteBufAllocator` ?",
+            "Also /cc @chrisvest for my question :)",
+            "@normanmaurer this is because of virtual threads: these threads are supposely abundant and created while never been cached - allocating the whole `ThreadLocal` stuff there will kill perf -> see https://github.com/FasterXML/jackson-core/issues/919\r\n\r\nThe thing is that I see no point to pooling per thread, given that until the magazine is avaialble and \"owned\" there is no point to allocating an empty wrapper",
+            "@franz1981 maybe you can do a PR to better show your idea... ",
+            "@franz1981 also we could just use a methodhandle to check if the thread is virtual or not and based on it use the recycler or not via using `Thread.currentThread.isVirtual()`. The method handle will ensure we can still support java8 ",
+            "@normanmaurer fully agree - it was what i do in other libs - but the problem si that recyclers retain lot of garbage and most of the time higher level frameworks/libs have blocking thread pools as well with TONS of half-idle threads, which can get destroyed and recreated while active again...\r\nhaving all of them to retain N direct buffers from being used elsewhere or released, usually cost memory/RSS. \r\nHere we're lucky that is just a wrapper, so maybe we can make an exception...\r\nBut in general, that's why I prefer users to have a conscious choice and extends FastThreadLocalThread: it means they really need that ",
+            "@franz1981 not sure about that... I think both approaches have trade-offs . That said I am looking forward to see a PR with your ideas :) ",
+            "If magazines can directly recycle AdaptiveByteBufs without the traditional Recycler machinery, then we could perhaps also reduce some of the event-loop special-case code in the allocator.\r\n\r\nI don't understand the \"explosion of magazines\" problem that you are anticipating, @franz1981. The ByteBufs being recycled or not should not impact the number of magazines floating around, no?",
+            "Let's say you have a blocking thread pool which grows due to a sudden burst of parallel work, it \"could\" cause magazine expansion due to 3 failures in a row to acquire the stamped lock; if later on these threads die (which is not uncommon for elastic thead pools), given that the buffer wrappers doesn't belong to them, they won't GC'd but will still be bound to the newly allocated magazine.",
+            "@chrisvest if you are fine with this proposal - which I believe you got perfectly despite my poor language to explain it - fell free to send a PR or I will do it in the next week(s)...sadly right now I'm a bit overwhelmed...\r\nThe good thing of this is that recycling can be made fast like this, for ANY thread, including virtual ones, and will compensate with https://github.com/netty/netty/pull/14322 which had a performance impact - atomic ops in the hot path are never free (!)",
+            "I think the \"downside\" of this approach would be:\r\n\r\n- AdapativeByteBuf pooling will be per magazine, which might result into more objects pooled.\r\n- The queue that is used for pooling would need to be MPSC as the offer might happen from any thread (there is no guarantees on which thread might call `release(...)`.  that said we could use some form of `relaxedOffer(...)` I guess \r\n\r\nI am not saying its worse then what we have as of today but something to keep in mind. ",
+            "yeah @normanmaurer fully agree on both points; My suggestion was to let any threads (virtual, event loops, whatever) to have the same mechanism to recycle such `AdapativeByteBuf`.\r\nVirtual threads cannot really use `ThreadLocal`s for pooling if not with big performance problems and not using pooling is equally bad...\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50659,
+            "commit_id": "abf3989074441f967c6c27288fc183306651e21a",
+            "original_commit_id": "5a9b28a4157f79bb69331b0979e73c2eb8b2bb3f",
+            "path": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 252,
+            "original_line": 252,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 92,
+            "subject_type": "line",
+            "review_comments": [
+                "Please note that with the current implementation we would always stay in the same chunk when trying to increase the capacity. ",
+                "That's not going to work so well, since we pointer-bump allocate from chunks."
+            ]
+        },
+        {
+            "hunk_id": 50658,
+            "commit_id": "abf3989074441f967c6c27288fc183306651e21a",
+            "original_commit_id": "5a9b28a4157f79bb69331b0979e73c2eb8b2bb3f",
+            "path": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 119,
+            "original_line": 119,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "I am open for suggestions :D "
+            ]
+        }
+    ]
+}

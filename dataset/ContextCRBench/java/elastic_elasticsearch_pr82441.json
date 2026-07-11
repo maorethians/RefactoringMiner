@@ -1,0 +1,68 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 82441,
+    "lang": "java",
+    "pr_title": "Fix enrich cache corruption bug",
+    "pr_body": "The enrich cache currently uses `SearchResponse` as cache value,\r\nwhich contains the hits used by the enrich processor for enrichment.\r\nWhat is actually used is by the enrich processor is `SearchHit.getSourceAsMap()`,\r\nwhich is a map of maps representation of a search hit.\r\n\r\nThe problem is that this map is mutable and the map of maps is directly\r\npassed into `IngestDocument` and at the same time this is cached by the\r\nenrich cache via `SearchResponse` cache value. Any processor that modifies\r\nthe content added by the enrich processor, also changes the map of maps\r\nrepresentation of a search hit in the cache. This corrupts the cache,\r\nbecause if this the enrich cache serves a cache entry for the same key,\r\na different snippet added to the document being enriched.\r\n\r\nThe following changes have been made to fix this bug:\r\n* Use `List<Map<?, ?>>` as cache value for the enrich cache.\r\n* Upon caching lookup / search, make an immutable deep copy of `SearchHit.getSourceAsMap()`.\r\n* Upon serving an entry from the cache, make a normal deep copy,\r\n  so the enrichent can be safely modified by subsequent processors.\r\n\r\nCloses #82340",
+    "pr_comments": [
+        "Pinging @elastic/es-data-management (Team:Data Management)",
+        ">I currently lean towards keeping this method, since the code duplication is minimal and it is targeted for creating a deep copy of search hits. But if we keep this method then we need a good unit test for it as well. What do you think?\r\n\r\n@martijnvg, that sounds good to me. You might be able to repurpose some of the existing unit tests for `IngestDocument::deepCopy` for this method.",
+        "## \ud83d\udc94 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| \u274c |  8.0  | Commit could not be cherrypicked due to conflicts |\n| \u274c |  7.17  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 82441`"
+    ],
+    "merged": true,
+    "created_at": "2022-01-11T23:10:26Z",
+    "issue_context": {
+        "number": 82340,
+        "title": "Enrich Processor Cache can be Corrupted by Processors that Mutate a Document (E.g. Rename)",
+        "body": "Using the enrich processor in a pipeline with a rename or other processor that mutates the mutable maps backing an ingest document can corrupt the caches in the enrich processor.\r\n\r\nAn easy reproducer for this goes as follows:\r\n\r\nhave the following enrich policy:\r\n\r\n```\r\nPUT /_enrich/policy/device-enrich-policy\r\n{\r\n  \"match\": {\r\n    \"indices\": \"devices-idx\",\r\n    \"match_field\": \"host.ip\",\r\n    \"enrich_fields\": [\r\n      \"device.name\",\r\n      \"host.ip\"\r\n    ]\r\n  }\r\n}\r\n```\r\n\r\nadd a document to the backing index as such:\r\n\r\n```\r\nPOST devices-idx/_doc\r\n{\r\n  \"host\": {\r\n    \"ip\": \"10.151.80.8\"\r\n  },\r\n  \"device\": {\r\n    \"name\": \"bla\"\r\n  }\r\n}\r\n```\r\n\r\n... then execute the enrich policy.\r\n\r\n... and finally execute following pipeline simulation:\r\n\r\n``` \r\nPOST _ingest/pipeline/_simulate\r\n{\r\n  \"pipeline\": {\r\n    \"processors\": [\r\n      {\r\n        \"enrich\": {\r\n          \"policy_name\": \"device-enrich-policy\",\r\n          \"field\": \"host.ip\",\r\n          \"target_field\": \"_tmp.device\",\r\n        }\r\n      },\r\n      {\r\n        \"rename\" : {\r\n          \"field\" : \"_tmp.device.device.name\",\r\n          \"target_field\" : \"device.name\",\r\n        }\r\n      }\r\n    ]\r\n  },\r\n  \"docs\": [\r\n    {\r\n      \"_source\": {\r\n        \"host\": {\r\n          \"ip\": \"10.151.80.8\"\r\n        }\r\n      }\r\n    }\r\n  ]\r\n}\r\n```\r\n\r\nthis will show the expected result of having the device name added under `_tmp.device`.\r\n\r\nNow adjust to a simpler pipeline:\r\n\r\n```\r\nPOST _ingest/pipeline/_simulate\r\n{\r\n  \"pipeline\": {\r\n    \"processors\": [\r\n      {\r\n        \"enrich\": {\r\n          \"policy_name\": \"device-enrich-policy\",\r\n          \"field\": \"host.ip\",\r\n          \"target_field\": \"_tmp\"\r\n        }\r\n      }\r\n    ]\r\n  },\r\n  \"docs\": [\r\n    {\r\n      \"_source\": {\r\n        \"host\": {\r\n          \"ip\": \"10.151.80.8\"\r\n        }\r\n      }\r\n    }\r\n  ]\r\n}\r\n```\r\n\r\nwhich you would expect to show the same result because `device.name` would just be copied under `_tmp`.\r\n\r\n\r\nWhat you do get instead is:\r\n\r\n```\r\n{\r\n  \"docs\" : [\r\n    {\r\n      \"doc\" : {\r\n        \"_index\" : \"_index\",\r\n        \"_type\" : \"_doc\",\r\n        \"_id\" : \"_id\",\r\n        \"_source\" : {\r\n          \"host\" : {\r\n            \"ip\" : \"10.151.80.8\"\r\n          },\r\n          \"_tmp\" : {\r\n            \"host\" : {\r\n              \"ip\" : \"10.151.80.8\"\r\n            },\r\n            \"device\" : { }\r\n          }\r\n        },\r\n        \"_ingest\" : {\r\n          \"timestamp\" : \"2022-01-07T16:21:55.868673023Z\"\r\n        }\r\n      }\r\n    }\r\n  ]\r\n}\r\n```\r\n\r\nThis is explained by the fact that the rename processor mutates the map that it works with. It removes and adds a field to a document. This map though is also referenced by: `org.elasticsearch.search.SearchHit#sourceAsMap` which is cached. \r\n\r\n-> rename processor mutates that map by mutating the ingest document from the first run -> cache is corrupted.\r\n\r\nThis was observed in a complicated to debug user issue where a pipeline would randomly fail during simulate like this for no apparent reason. Digging through the diags it turned out that the same enrich policy was used in another pipeline followed by the rename processor in the way described above, thus corrupting the policy's cache repeatedly.",
+        "comments": [
+            "Pinging @elastic/es-data-management (Team:Data Management)",
+            "Seems like we had this issue before with copy_from as well:\r\n\r\nhttps://github.com/elastic/elasticsearch/pull/69349",
+            "I am experiencing this issue as well. Talked it out with the community: https://elasticstack.slack.com/archives/CNTP6NLTZ/p1641779140142600\r\n\r\nWould very much like to be able to get this fixed. :) Good find!!!",
+            "Good find @original-brownbear! This is a very sneaky bug. I think the enrich processor should make a deep copy of the _source before inserting it to the IngestDocument.",
+            "> I think the enrich processor should make a deep copy of the _source before inserting it to the IngestDocument.\r\n\r\nSounds good. Additionally we could also look into making whatever we store in the cache immutable to prevent this kind of bug going forward (also looks like we could get away with storing just the search hit map and not the full search hit). Just some thoughts.",
+            "> Additionally we could also look into making whatever we store in the cache immutable to prevent this kind of bug going forward\r\n\r\n+1, we should try to recursively wrap the _source in an immutable map when adding a cache entry.\r\n\r\n> also looks like we could get away with storing just the search hit map and not the full search hit)\r\n\r\nYes, this makes sense. The value of cache should be `List<Map<?, ?>>`, in case multiple hits were returned."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 34917,
+            "commit_id": "1dec2dc12065d5a05b2aaa5d5980b3b4684eb9c5",
+            "original_commit_id": "31adaf24e89c58e61293aa8ee12007c505c8eb15",
+            "path": "x-pack/plugin/enrich/src/main/java/org/elasticsearch/xpack/enrich/EnrichCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 153,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 93,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm not as familiar with all the data types that may be present in the map from a `SearchHit`, but `IngestDocument::deepCopy` handles a couple types that this method does not. ([link](https://github.com/elastic/elasticsearch/blob/master/server/src/main/java/org/elasticsearch/ingest/IngestDocument.java#L742))",
+                "Initially I looked at the `IngestDocument#deepCopy(...)`  method, but then realised that some of the data type (e.g. `Set`, `long[]`, `Date`) are never in the search hit. The `SearchHit.getSourceAsMap()` method uses `XContentHelper#convertToMap(...)` method, which eventually invokes `AbstractXContentParser#readValueUnsafe(...)` via `XContentParser#map()` method and I think the mentioned types are never produced by the `readValueUnsafe()` method.\r\n\r\nI think we can reuse `IngestDocument#deepCopy(...)`. There is some code duplication between the two methods. But this method will then need to be modified to optionally wrap list / map in an unmodifiable wrapper and this would only be used by `EnrichCache`. I currently lean towards keeping this method, since the code duplication is minimal and it is targeted for creating a deep copy of search hits. But if we keep this method then we need a good unit test for it as well. What do you think?"
+            ]
+        },
+        {
+            "hunk_id": 34916,
+            "commit_id": "1dec2dc12065d5a05b2aaa5d5980b3b4684eb9c5",
+            "original_commit_id": "31adaf24e89c58e61293aa8ee12007c505c8eb15",
+            "path": "x-pack/plugin/enrich/src/main/java/org/elasticsearch/xpack/enrich/EnrichCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 53,
+            "original_line": 52,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "I was thinking, maybe we store the enrich hits as byte[]? And then upon retrieval we parse it into `List<Map<?, ?>>`. \r\n\r\nWe already do some work here just before storing a cache entry (recursively make an immutable copy of the search hits (just to catch anyone trying to corrupt the cache) ) and when serving from this cache (recursively make a mutable copy of the search hits). \r\n\r\nI think if we cache the byte[] representation of search hits we save some heap space. At the cost of some additional operations when serving from cache or adding a new entry to cache. But that should be ok, since we already do some extra work making deep copies.",
+                "It is hard to guess for me what the right tradeoff is in terms of the cache size vs compute cost here. Bute note, even a deep copy will be far cheaper than deserialisation that's for sure. I think instinctively I'd rather go for a deep copy because that saves memory after retrieval because all the strings (at least the map keys) will be shared instead of recreated on parsing over and over.",
+                "I see, this makes sense. Let's stick with creating a deep copy each time an entry from the cache is used."
+            ]
+        }
+    ]
+}

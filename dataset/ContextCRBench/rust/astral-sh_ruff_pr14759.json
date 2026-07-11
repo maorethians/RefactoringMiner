@@ -1,0 +1,250 @@
+{
+    "repo": "astral-sh/ruff",
+    "pr_number": 14759,
+    "lang": "rust",
+    "pr_title": "[red-knot] Statically known branches (first take)",
+    "pr_body": "## Summary\r\n\r\nRendered version of the test suite including a proper introduction to the topic / motivation: [**click**](https://github.com/astral-sh/ruff/blob/david/statically-known-branches/crates/red_knot_python_semantic/resources/mdtest/statically-known-branches.md).\r\n\r\nThis changeset adds support for precise type-inference and boundness-handling of definitions inside control-flow branches with statically-known conditions, i.e. test-expressions whose truthiness we can unambiguously infer as *always false* or *always true*. In code:\r\n\r\n```py\r\nx = 1\r\n\r\nif \"z\" in \"haystack\":  # Literal[False]\r\n    x = 2\r\n\r\nreveal_type(x)  # revealed: Literal[1]\r\n```\r\n\r\nand:\r\n\r\n```py\r\nx = 1\r\n\r\nif \"y\" in \"haystack\":  # Literal[True]\r\n    x = 2\r\n\r\nreveal_type(x)  # revealed: Literal[2]\r\n```\r\n\r\nOne option to implement this would have been to add special handling for a limited set of test-expressions in semantic index-building. We would then analyze expressions like `sys.version_info >= (x, y)`, `typing.TYPE_CHECKING`, `True` and `False` without any type inference and consequently close down (or unconditionally open) branches whose truthiness we can analyze in this way. This would simplify the implementation, but is much less general than the approach taken here.\r\n\r\nInstead, we collect all necessary information during semantic index building, and then re-analyze the control flow during type-checking. The way this works is by recording the list of 'active' branching conditions for each introduced binding. Consider this example:\r\n\r\n```py\r\nif test1:\r\n    x = 1  # active conditions: [test1]\r\n\r\n    if test2:\r\n        x = 2  # active conditions: [test1, test2]\r\n\r\nif test3:\r\n    x = 3  # active conditions: [test3]\r\n\r\nuse(x)\r\n```\r\n\r\nIn semantic-index building, when we reach the `use(x)` statement, we have three live bindings. But when we later analyze the test-conditions in type inference, we may potentially conclude that some of them are not present/visible.\r\n\r\nOne possibility to do so is to detect test-conditions to be *always false*. For example, if `test3` is statically known to be false, we can infer that the `x = 3` branch is never taken. This binding is then not considered in type inference and in boundness-handling. For the `x = 2` binding, we need to consider the possibility that *either* `test1` *or* `test2` can be statically false. In summary, if any of the active branching conditions is statically false, the binding is cancelled.\r\n\r\nAnother possibility is that we can infer a test-condition to be *always true*. This can also hide bindings. For example, if we can infer `test2` to always be true, we know that the `x = 1` binding is never visible. This is slightly more complex to handle, as we haven't even seen the `test2` condition when we analyze the `x = 1` binding in semantic-index building.\r\n\r\nThe way we solve this in type-inference is by going through all live bindings in reverse order (starting at `x = 3`), stopping whenever we detect a binding that is *unconditionally visible*. A binding is unconditionally visible if all of its active conditions are statically known to be true. This is slightly complicated by the fact that we have unconditional branching as well. For example, consider:\r\n\r\n```py\r\nif test1:\r\n    for _ in iterable():\r\n        x = 1\r\n```\r\n\r\nThis binding is *not* unconditionally visible, even if `test1` is always true, as the loop body may never be executed. This is currently handled by adding a `BranchingCondition::Unconditional` marker to the active conditions of the binding, which always evaluates to an ambiguous truthiness.\r\n\r\nSome of this might sound similar to what we achieve with the `may_be_unbound` and `may_be_undeclared` flags. However, the new mechanism does not allow us to get rid of these flags, as there are also cases like this:\r\n```py\r\nif test:  # type: bool\r\n    x = 1\r\nelse:\r\n    x = 2\r\n```\r\nThe symbol `x` is always bound, but seeing the `x = 1` or `x = 2` definitions with a branching condition of `test: bool` is not enough to see that. We also need the global information that these two branches will be merged (where we logically OR the two `may_be_unbound = false` flags to a global `may_be_unbound = false`).\r\n\r\nThis branch also includes:\r\n- statically-known branches handling for Boolean expressions and while loops\r\n- support for `typing.TYPE_CHECKING`\r\n- support for narrowing in `while` loops\r\n- new `target-version` requirements in some Markdown tests which were now required due to the understanding of `sys.version_info` branches.\r\n\r\ncloses #12700 \r\ncloses #14170\r\ncloses #14861\r\n\r\n## Test plan\r\n\r\n- New Markdown tests for the main feature in `statically-known-branches.md`\r\n- New Markdown tests for `typing.TYPE_CHECKING` in `known_constants.md`\r\n- New Markdown tests for `while`-loop narrowing in `narrow/while.md`\r\n- Regression test for boundness-handling in while loops\r\n- Adapted tests for `EllipsisType`, `Never`, etc\r\n\r\n## Performance investigation\r\n\r\n(thanks to @MichaReiser for some input!)\r\n\r\n### Measurements\r\n\r\nI can reproduce the regression locally. It's not as pronounced as on codspeed, which could be attributed to the fact that the codspeed results do not involve any I/O overhead (they are based on CPU counters, not wall time). So the local results might be \"diluted\" a bit:\r\n\r\n**tomllib**, -13%\r\n\r\n| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |\r\n|:---|---:|---:|---:|---:|\r\n| `./red_knot_main` | 21.8 \u00b1 1.5 | 18.8 | 27.0 | 1.00 |\r\n| `./red_knot_feature` | 24.6 \u00b1 1.6 | 21.2 | 29.1 | 1.13 \u00b1 0.11 |\r\n\r\n**Black codebase**, -7%\r\n\r\n| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |\r\n|:---|---:|---:|---:|---:|\r\n| `./red_knot_main` | 123.4 \u00b1 5.4 | 115.6 | 135.4 | 1.00 |\r\n| `./red_knot_feature` | 131.6 \u00b1 3.5 | 123.7 | 137.3 | 1.07 \u00b1 0.05 |\r\n\r\n### Analysis (ongoing)\r\n\r\n* With this feature enabled, we need to perform more work. For every binding/declaration, we need to infer the type of all active branching conditions and call `Type::bool` on it (which may involve looking up other symbols). This can entail loading entire new modules. For example: in the `tomllib` benchmark, we do not need to resolve `sys` on main, but we do on this branch. The reason for this are various `sys.version_info >= (M, m)` conditions in `builtins.pyi` which now need to be resolved. I tried to account for this by adding a `import sys; sys.version_info` line in a local copy of `tomllib`, so the version on main would also have to import `sys`. This reduces the difference from 13% to 11%, but the comparison is still not fair. There are a lot more symbol-lookups on this feature branch (mostly `__bool__`).\r\n* In semantic-index building, we need to collect, store (and clone, when snapshotting) more information with the addition of the branching-condition data.\r\n\r\n## To do\r\n\r\n- [ ] Investigate performance regression\r\n",
+    "pr_comments": [
+        "## [CodSpeed Performance Report](https://codspeed.io/astral-sh/ruff/branches/david%2Fstatically-known-branches)\n\n### Merging #14759 will **degrade performances by 21.62%**\n\n<sub>Comparing <code>david/statically-known-branches</code> (0a0e5e6) with <code>main</code> (c3a64b4)</sub>\n\n\n\n### Summary\n\n`\u274c 2` regressions  \n`\u2705 30` untouched benchmarks  \n\n\n> :warning: _Please fix the performance issues or [acknowledge them on CodSpeed](https://codspeed.io/astral-sh/ruff/branches/david%2Fstatically-known-branches)._\n\n### Benchmarks breakdown\n\n|     | Benchmark | `main` | `david/statically-known-branches` | Change |\n| --- | --------- | ----------------------- | ------------------- | ------ |\n| \u274c | `red_knot_check_file[cold]` | 68 ms | 86.8 ms | -21.62% |\n| \u274c | `red_knot_check_file[incremental]` | 4.2 ms | 4.4 ms | -4.31% |\n",
+        "<!-- generated-comment ecosystem -->\n## `ruff-ecosystem` results\n### Linter (stable)\n\u2705 ecosystem check detected no linter changes.\n\n### Linter (preview)\n\u2705 ecosystem check detected no linter changes.\n\n\n",
+        "> (It is possible I'm rehashing here something we already discussed in 1:1 that doesn't work, in which case I apologize for wasting your time rehashing it. Alternatively, if this does make sense, I apologize for not thinking through this carefully enough to suggest it earlier in our 1:1s!)\r\n\r\nI appreciate the comment either way. It's also possible we discussed it and I simply didn't fully understand everything.\r\n\r\n> The constraints system already has the ability to add a constraint to all currently-live definitions. I think this is all we need, _if_ we add the constraints at the right moment.\r\n\r\n> We would create a new `VisibilityConstraint` kind of constraint\r\n\r\n> Right before we merge the two control flow paths (so at the _end_ of the `if` block) we would add a positive `VisibilityConstraint(test)` to all live definitions in the \"branch taken\" path [\u2026], and add a negative `VisibilityConstraint(~test)` to all live definitions in the \"branch not taken\" path [\u2026].\r\n\r\nLet's consider this example:\r\n```py\r\nx = 1\r\n\r\nif True:\r\n    if flag:\r\n        x = 2\r\n```\r\nThe correct thing to do is to consider both of these bindings to be potentially visible, i.e. we should infer `Literal[1, 2]`. But if I understand correctly, you would apply a `VisibilityConstraint(~True)` to the `x = 1` binding due to the outer condition. This would render the `x = 1` binding invisible.\r\n\r\nThe inner condition does not play a role here because the `flag` constraint vanishes as soon as we merge control flow at the end of the inner `if`. If that's confusing, we can also consider something like:\r\n```py\r\nx = 1\r\n\r\nif True:\r\n    try:\r\n        may_raise_value_error()\r\n        x = 2\r\n    except ValueError:\r\n        pass\r\n```",
+        "> if I understand correctly, you would apply a `VisibilityConstraint(~True)` to the `x = 1` binding due to the outer condition. This would render the `x = 1` binding invisible.\r\n\r\nThat constraint would be applied in the outer path, but it would disappear in the outer flow merge because `x = 1` is also live from the inner control flow path, without that constraint. So in this example we would still see `x = 1` as live and infer `Literal[1, 2]`.\r\n\r\nBut there is still a problem here; not a problem of \"not enough visibility\" but one of \"too much visibility\". The logic we use for narrowing \"a constraint only applies to a definition after merge if it applies from both paths\" is not adequate for visibility. In this example:\r\n\r\n```py\r\nx = 1\r\nif True:\r\n    if True:\r\n        x = 2\r\n```\r\n\r\nWe would have `V(~outerTrue)` for `x = 1` in the outer path, and both `V(outerTrue)` and `V(~innerTrue)` for it in the inner path. All of these would disappear in the outer flow merge, because none of them apply in both paths, so we'd wrongly see `x = 1` as visible. What we actually would need is to preserve a disjunction of the constraints from both paths: `V(~outerTrue) OR (V(outerTrue) AND V(~innerTrue))`.\r\n\r\nI think this approach of building up a binary decision diagram of constraints is a reliable way to get the right answer, but it no longer fits cleanly into the existing narrowing-constraints infrastructure in the use-def map; it will require something new.",
+        "> I think it would be great to have a test that demonstrates that statically-known dead branches don't emit diagnostics (or at least demonstrate that they do and have a TODO that we have to handle it)\r\n\r\nI think for now this will need to be a test showing we don't suppress diagnostics, with a TODO. (Or we can just file an issue for it and skip the test and TODO.) Detecting dead code is a related, but somewhat different, problem than the one this PR tries to tackle.",
+        "Now that this has gone back into Draft and we are exploring other implementation strategies -- it might also make sense to extract the narrowing support for `while` loops and `match` statements into separate PRs, to focus the scope on just the statically-known branches part?"
+    ],
+    "merged": false,
+    "created_at": "2024-12-12T08:54:42Z",
+    "issue_context": {
+        "number": 12700,
+        "title": "[red-knot] statically-known branches",
+        "body": "In cases like `if True:` or `if False:` (or any case where we know the truthiness of a branch test), we should assume that only the possible branch is taken.\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 67970,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 346,
+            "original_line": 346,
+            "side": "RIGHT",
+            "original_position": 249,
+            "position": 239,
+            "subject_type": "line",
+            "review_comments": [
+                "TODO ;)"
+            ]
+        },
+        {
+            "hunk_id": 68561,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/types/static_truthiness.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 31,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 31,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n#[derive(Debug)]\r\npub(crate) struct StaticTruthiness {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 68551,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/semantic_index/use_def/symbol_state.rs",
+            "start_line": 97,
+            "original_start_line": 97,
+            "start_side": "RIGHT",
+            "line": 102,
+            "original_line": 102,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we push a branching condition for every live binding? If we're only pushing an entry for bindings that are known to be always false or true, then I think it might be worth to consider using a `HashMap` instead (or a `Vec` and to linear search) because most code will only have very few \"conditions\" (the list is not dense).",
+                "> Do we push a branching condition for every live binding? If we're only pushing an entry for bindings that are known to be always false or true\r\n\r\nWe don't know that yet while building the semantic index. So we push an empty branching conditions bitset for every binding we encounter.\r\n\r\n> it might be worth to consider using a HashMap instead (or a Vec and to linear search) because most code will only have very few \"conditions\" (the list is not dense).\r\n\r\nI guess you are imagining a ScopedDefinitionId => BitSet HashMap?\r\n\r\nThere are two questions here:\r\n* How many bindings come with branching conditions attached?\r\n* For those that do, out of the set of all possible branching conditions, how many are set for this binding?\r\n\r\nIs the concern that there are many bindings without any branching conditions? Or that there are many conditions and bindings usually only refer to a sparse subset?\r\n\r\nIf it's the former, I'm not sure that is the case. For every given scope, variables that appear directly in that scope would not have any branching conditions attached. But every binding that appears inside a `try` block, any kind of loop, an `if` block etc. would have at least one such branching condition.",
+                "> If it's the former, I'm not sure that is the case. For every given scope, variables that appear directly in that scope would not have any branching conditions attached. But every binding that appears inside a try block, any kind of loop, an if block etc. would have at least one such branching condition.\r\n\r\nOkay, I wasn't aware of that. My assumption was that we'd only push a condition if:\r\n\r\n* It's known to be true\r\n* It's known to be false\r\n* An enclosing condition is known to be true or false (to now flag that it's unknown)\r\n\r\nI then assumed that this is relatively rare and that a different representation might be faster because it is just \"empty\" for most scopes."
+            ]
+        },
+        {
+            "hunk_id": 68559,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/semantic_index/use_def/symbol_state.rs",
+            "start_line": 223,
+            "original_start_line": 223,
+            "start_side": "RIGHT",
+            "line": 224,
+            "original_line": 224,
+            "side": "RIGHT",
+            "original_position": 181,
+            "position": 181,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't fully crasp how this works yet, so I might be very wrong here. \n\nI understand that we'll now iterate from the back when ever looking up a binding. Does that mean that checking now becomes `O(n^2)` if we have something like\n\n```python\nx = 1\nx += 1 # (iterates over x = 1)\nx += 1 # (iterates over x +1, x=1)\nx += 1 # (iterates over x + 1, x + 1, x = 1)\n... \n```\n",
+                "> Does that mean that checking now becomes `O(n^2)` if we have something like\r\n\r\nI don't think so. We would only ever iterate over one *live* binding in this example. Rewriting using `x = x + 1` to distinguish stores and reads:\r\n```py\r\nx = 1   # binding 1\r\nx = x + 1  # binding 2; read of x only has one visible binding: 1\r\nx = x + 1  # binding 3; read of x only has one visible binding: 2\r\n```\r\n\r\nIn general, we never iterate over more bindings than we did before on this branch (there is more work to be done in each iteration though). We only changed the order of the iteration. But we might iterate over *fewer* bindings due to short circuiting in an example like this:\r\n```py\r\nx = 1\r\n\r\nif True:\r\n    x = 2\r\n\r\nx\r\n```\r\nPreviously, we would iterate over both bindings of `x`. Now, while iterating in reverse, we can stop at the `x = 2` binding, because nothing else is visible \"beyond\" this binding."
+            ]
+        },
+        {
+            "hunk_id": 68558,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/semantic_index/use_def/symbol_state.rs",
+            "start_line": 97,
+            "original_start_line": 97,
+            "start_side": "RIGHT",
+            "line": 102,
+            "original_line": 102,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we push a branching condition for every live binding? If we're only pushing an entry for bindings that are known to be always false or true, then I think it might be worth to consider using a `HashMap` instead (or a `Vec` and to linear search) because most code will only have very few \"conditions\" (the list is not dense).",
+                "> Do we push a branching condition for every live binding? If we're only pushing an entry for bindings that are known to be always false or true\r\n\r\nWe don't know that yet while building the semantic index. So we push an empty branching conditions bitset for every binding we encounter.\r\n\r\n> it might be worth to consider using a HashMap instead (or a Vec and to linear search) because most code will only have very few \"conditions\" (the list is not dense).\r\n\r\nI guess you are imagining a ScopedDefinitionId => BitSet HashMap?\r\n\r\nThere are two questions here:\r\n* How many bindings come with branching conditions attached?\r\n* For those that do, out of the set of all possible branching conditions, how many are set for this binding?\r\n\r\nIs the concern that there are many bindings without any branching conditions? Or that there are many conditions and bindings usually only refer to a sparse subset?\r\n\r\nIf it's the former, I'm not sure that is the case. For every given scope, variables that appear directly in that scope would not have any branching conditions attached. But every binding that appears inside a `try` block, any kind of loop, an `if` block etc. would have at least one such branching condition.",
+                "> If it's the former, I'm not sure that is the case. For every given scope, variables that appear directly in that scope would not have any branching conditions attached. But every binding that appears inside a try block, any kind of loop, an if block etc. would have at least one such branching condition.\r\n\r\nOkay, I wasn't aware of that. My assumption was that we'd only push a condition if:\r\n\r\n* It's known to be true\r\n* It's known to be false\r\n* An enclosing condition is known to be true or false (to now flag that it's unknown)\r\n\r\nI then assumed that this is relatively rare and that a different representation might be faster because it is just \"empty\" for most scopes."
+            ]
+        },
+        {
+            "hunk_id": 68554,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/types/static_truthiness.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 31,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 31,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n#[derive(Debug)]\r\npub(crate) struct StaticTruthiness {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 67971,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/types/static_truthiness.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 31,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 31,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n#[derive(Debug)]\r\npub(crate) struct StaticTruthiness {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 67969,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/semantic_index/use_def/symbol_state.rs",
+            "start_line": 223,
+            "original_start_line": 223,
+            "start_side": "RIGHT",
+            "line": 224,
+            "original_line": 224,
+            "side": "RIGHT",
+            "original_position": 181,
+            "position": 181,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't fully crasp how this works yet, so I might be very wrong here. \n\nI understand that we'll now iterate from the back when ever looking up a binding. Does that mean that checking now becomes `O(n^2)` if we have something like\n\n```python\nx = 1\nx += 1 # (iterates over x = 1)\nx += 1 # (iterates over x +1, x=1)\nx += 1 # (iterates over x + 1, x + 1, x = 1)\n... \n```\n",
+                "> Does that mean that checking now becomes `O(n^2)` if we have something like\r\n\r\nI don't think so. We would only ever iterate over one *live* binding in this example. Rewriting using `x = x + 1` to distinguish stores and reads:\r\n```py\r\nx = 1   # binding 1\r\nx = x + 1  # binding 2; read of x only has one visible binding: 1\r\nx = x + 1  # binding 3; read of x only has one visible binding: 2\r\n```\r\n\r\nIn general, we never iterate over more bindings than we did before on this branch (there is more work to be done in each iteration though). We only changed the order of the iteration. But we might iterate over *fewer* bindings due to short circuiting in an example like this:\r\n```py\r\nx = 1\r\n\r\nif True:\r\n    x = 2\r\n\r\nx\r\n```\r\nPreviously, we would iterate over both bindings of `x`. Now, while iterating in reverse, we can stop at the `x = 2` binding, because nothing else is visible \"beyond\" this binding."
+            ]
+        },
+        {
+            "hunk_id": 68552,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/semantic_index/use_def/symbol_state.rs",
+            "start_line": 223,
+            "original_start_line": 223,
+            "start_side": "RIGHT",
+            "line": 224,
+            "original_line": 224,
+            "side": "RIGHT",
+            "original_position": 181,
+            "position": 181,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't fully crasp how this works yet, so I might be very wrong here. \n\nI understand that we'll now iterate from the back when ever looking up a binding. Does that mean that checking now becomes `O(n^2)` if we have something like\n\n```python\nx = 1\nx += 1 # (iterates over x = 1)\nx += 1 # (iterates over x +1, x=1)\nx += 1 # (iterates over x + 1, x + 1, x = 1)\n... \n```\n",
+                "> Does that mean that checking now becomes `O(n^2)` if we have something like\r\n\r\nI don't think so. We would only ever iterate over one *live* binding in this example. Rewriting using `x = x + 1` to distinguish stores and reads:\r\n```py\r\nx = 1   # binding 1\r\nx = x + 1  # binding 2; read of x only has one visible binding: 1\r\nx = x + 1  # binding 3; read of x only has one visible binding: 2\r\n```\r\n\r\nIn general, we never iterate over more bindings than we did before on this branch (there is more work to be done in each iteration though). We only changed the order of the iteration. But we might iterate over *fewer* bindings due to short circuiting in an example like this:\r\n```py\r\nx = 1\r\n\r\nif True:\r\n    x = 2\r\n\r\nx\r\n```\r\nPreviously, we would iterate over both bindings of `x`. Now, while iterating in reverse, we can stop at the `x = 2` binding, because nothing else is visible \"beyond\" this binding."
+            ]
+        },
+        {
+            "hunk_id": 67968,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/semantic_index/use_def/symbol_state.rs",
+            "start_line": 97,
+            "original_start_line": 97,
+            "start_side": "RIGHT",
+            "line": 102,
+            "original_line": 102,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we push a branching condition for every live binding? If we're only pushing an entry for bindings that are known to be always false or true, then I think it might be worth to consider using a `HashMap` instead (or a `Vec` and to linear search) because most code will only have very few \"conditions\" (the list is not dense).",
+                "> Do we push a branching condition for every live binding? If we're only pushing an entry for bindings that are known to be always false or true\r\n\r\nWe don't know that yet while building the semantic index. So we push an empty branching conditions bitset for every binding we encounter.\r\n\r\n> it might be worth to consider using a HashMap instead (or a Vec and to linear search) because most code will only have very few \"conditions\" (the list is not dense).\r\n\r\nI guess you are imagining a ScopedDefinitionId => BitSet HashMap?\r\n\r\nThere are two questions here:\r\n* How many bindings come with branching conditions attached?\r\n* For those that do, out of the set of all possible branching conditions, how many are set for this binding?\r\n\r\nIs the concern that there are many bindings without any branching conditions? Or that there are many conditions and bindings usually only refer to a sparse subset?\r\n\r\nIf it's the former, I'm not sure that is the case. For every given scope, variables that appear directly in that scope would not have any branching conditions attached. But every binding that appears inside a `try` block, any kind of loop, an `if` block etc. would have at least one such branching condition.",
+                "> If it's the former, I'm not sure that is the case. For every given scope, variables that appear directly in that scope would not have any branching conditions attached. But every binding that appears inside a try block, any kind of loop, an if block etc. would have at least one such branching condition.\r\n\r\nOkay, I wasn't aware of that. My assumption was that we'd only push a condition if:\r\n\r\n* It's known to be true\r\n* It's known to be false\r\n* An enclosing condition is known to be true or false (to now flag that it's unknown)\r\n\r\nI then assumed that this is relatively rare and that a different representation might be faster because it is just \"empty\" for most scopes."
+            ]
+        },
+        {
+            "hunk_id": 68560,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 346,
+            "original_line": 346,
+            "side": "RIGHT",
+            "original_position": 249,
+            "position": 239,
+            "subject_type": "line",
+            "review_comments": [
+                "TODO ;)"
+            ]
+        },
+        {
+            "hunk_id": 68553,
+            "commit_id": "0a0e5e686f65a34b7b409555baac9ad60c590ac2",
+            "original_commit_id": "c3a64b44b7ab8742f4fe3630cd9751104d9f78d2",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 346,
+            "original_line": 346,
+            "side": "RIGHT",
+            "original_position": 249,
+            "position": 239,
+            "subject_type": "line",
+            "review_comments": [
+                "TODO ;)"
+            ]
+        }
+    ]
+}

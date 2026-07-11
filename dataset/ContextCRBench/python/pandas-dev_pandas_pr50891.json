@@ -1,0 +1,80 @@
+{
+    "repo": "pandas-dev/pandas",
+    "pr_number": 50891,
+    "lang": "python",
+    "pr_title": "API: Timestamp and Timedelta .value changing in 2.0",
+    "pr_body": "- [ ] closes #49076 (Replace xxxx with the GitHub issue number)\r\n- [ ] [Tests added and passed](https://pandas.pydata.org/pandas-docs/dev/development/contributing_codebase.html#writing-tests) if fixing a bug or adding a new feature\r\n- [ ] All [code checks passed](https://pandas.pydata.org/pandas-docs/dev/development/contributing_codebase.html#pre-commit).\r\n- [ ] Added [type annotations](https://pandas.pydata.org/pandas-docs/dev/development/contributing_codebase.html#type-hints) to new arguments/methods/functions.\r\n- [ ] Added an entry in the latest `doc/source/whatsnew/vX.X.X.rst` file if fixing a bug or adding a new feature.\r\n",
+    "pr_comments": [
+        "failed test:\r\n```\r\nFAILED pandas/tests/io/json/test_pandas.py::TestPandasContainer::test_date_index_and_values[date-True-epoch] - assert '{\"1577836800...null,\"a\":\"a\"}' == '{\"1577836800...null,\"a\":\"a\"}'\r\n  - {\"1577836800000\":1577836800000,\"null\":null,\"a\":\"a\"}\r\n  ?                                 ^^^^\r\n  + {\"1577836800000\":1577836800000,\"-6858695778871\":null,\"a\":\"a\"}\r\n  ?   \r\n```\r\n\r\ncan't get my head round it - cc @jbrockmendel @WillAyd in case you have any ideas, else I'll keep at it\r\n\r\nrenaming `.value` affects _so_ much of the codebase..",
+        "> can't get my head round it - cc @jbrockmendel @WillAyd in case you have any ideas, else I'll keep at it\r\n\r\nbest guess is in objToJSON.c there are a couple of `get_long_attr(item, \"value\")` calls that might not be caught by grepping for `.value`",
+        "I think the JSON module returns garbage values because of https://github.com/pandas-dev/pandas/issues/49756\r\n\r\nIf you look, there are some branches in the code that do something like: \r\n\r\n```c\r\n            if (PyObject_HasAttrString(item, \"value\")) {\r\n                // see test_date_index_and_values for case with non-nano\r\n                nanosecVal = get_long_attr(item, \"value\");\r\n            } else {\r\n                if (PyDelta_Check(item)) {\r\n                    nanosecVal = total_seconds(item) *\r\n                                 1000000000LL;  // nanoseconds per second\r\n                } else {\r\n                    // datetime.* objects don't follow above rules\r\n                    nanosecVal = PyDateTimeToEpoch(item, NPY_FR_ns);\r\n                }\r\n            }\r\n```\r\n\r\nFor the timedelta, this goes into `total_seconds` which is implemented as such:\r\n\r\n```c\r\nstatic npy_float64 total_seconds(PyObject *td) {\r\n    npy_float64 double_val;\r\n    PyObject *value = PyObject_CallMethod(td, \"total_seconds\", NULL);\r\n    double_val = PyFloat_AS_DOUBLE(value);\r\n    Py_DECREF(value);\r\n    return double_val;\r\n}\r\n```\r\n\r\nI'm guessing that the object doesn't actually have `total_seconds` defined, and you end up getting pretty crazy results. \r\n\r\ncc @lithomas1 who may be interested",
+        "As the master of code checks @MarcoGorelli if you had some kind of idea on how to set up CI so that all `result = PyObject_...` C functions are immediately followed by an `if (result == NULL) { // handle error }` that could help us clean up our extensions. Otherwise its probably worth doing a manual review of things as a pre-cursor to this PR",
+        "Thanks, `get_long_attr(item, \"value\")` was indeed the part I needed to change! \r\n\r\n> As the master of code checks @MarcoGorelli if you had some kind of idea on how to set up CI so that all result = PyObject_... C functions are immediately followed by an if (result == NULL) { // handle error } that could help us clean up our extensions\r\n\r\n\ud83d\ude04 I'll take a look",
+        "> gonna block myself here, want to make sure this is really what's desired, as then the public method `.value` would become unavailable for old dates: [#49076 (comment)](https://github.com/pandas-dev/pandas/issues/49076#issuecomment-1408481395)\r\n\r\nhave amended the error message to suggest using `asm8` if nanoseconds aren't what they're after",
+        "thanks - @jbrockmendel can confirm but I don't think this (non-nano timestamp) would've been available anyway in 1.5.x",
+        "> I don't think this (non-nano timestamp) would've been available anyway in 1.5.x\r\n\r\ncorrect",
+        "thanks @MarcoGorelli "
+    ],
+    "merged": true,
+    "created_at": "2023-02-04T00:36:36Z",
+    "issue_context": {
+        "number": 49076,
+        "title": "API: Timestamp and Timedelta .value changing in 2.0",
+        "body": "```python\r\nimport pandas as pd\r\nimport numpy as np\r\n\r\ndt = np.datetime64(\"2016-01-01\", \"ms\")\r\nts = pd.Timestamp(dt)\r\n\r\n>>> ts.value\r\n1451606400000        # <- 2.0/main\r\n1451606400000000000  # <- 1.x\r\n```\r\n\r\nIn previous versions .value has always been in nanoseconds.  By changing the reso we get with some Timestamp/Timedelta inputs, we change the .value, which is technically public API.\r\n\r\nOne option would be just to document the change in .value behavior along with the other breaking changes docs.\r\n\r\nAnother would be to use e.g. `._value` internally and keep `.value` as representing nanos.\r\n",
+        "comments": [
+            "Probably least disruptive to have `.value` continue to represent nanos.\r\n\r\nPersonally, I was never fond of the vague meaning of `.value` and could use this as an opportunity to deprecate in favor of `Timestamp.to_epoch` #14772 and `Timedelta.to_something`",
+            "The Arrow CI was failing because of this (in combination with the changes parsing of strings in `Timestamp(..)`, https://github.com/pandas-dev/pandas/issues/50704). Now, the failure was only because of using `.value` in a test to construct the expected result, and that is something easy to update. \r\nHowever, I also looked into our actual conversion code, and it seems we _do_ use `.value` to access the integer value, and we do assume that this is always nanoseconds at the moment (https://github.com/apache/arrow/blob/2b50694c10e09e4a1343b62c6b5f44ad4403d0e1/python/pyarrow/src/arrow/python/python_to_arrow.cc#L360-L365)\r\n\r\nIt's a bit of a corner case (and so apparently also not covered by a test, since we didn't get a failure for this), but can be triggered by converting a list of Timestamp objects (or object dtype array), and explicitly passing a nanoseconds timestamp type:\r\n\r\n```\r\n# using current pandas main branch\r\n>>> pa.array([pd.Timestamp(\"2012-01-01 09:01:02\")], type=pa.timestamp(\"ns\"))\r\n<pyarrow.lib.TimestampArray object at 0x7f46ce55ec80>\r\n[\r\n  1970-01-01 00:00:01.325408462\r\n]\r\n\r\n# triggering the pd.Timestamp to be nanosecond resolution -> correct result\r\n>>> pa.array([pd.Timestamp(\"2012-01-01 09:01:02.000000000\")], type=pa.timestamp(\"ns\"))\r\n<pyarrow.lib.TimestampArray object at 0x7f46ac585480>\r\n[\r\n  2012-01-01 09:01:02.000000000\r\n]\r\n```\r\n\r\nThis could be fixed on the pyarrow side by checking the unit of the Timestamp, and only using `.value` when it is actually nanoseconds, and otherwise falling back to interpreting it as datetime.datetime and getting the components that way. \r\n\r\nBut it would break current pyarrow releases, so if we want to change `.value`, ideally we would wait a bit longer with that to give time for pyarrow to update for this. \r\n\r\nSo to summarize, I agree with the above that the easiest would be to keep `.value` as returning nanoseconds, always, regardless the actual unit. \r\n\r\nBut long term it would be good to have _some_ way to get the raw underlying integer (that is more efficient that building up this value from the components, as we do for datetime.datetime objects). But this could indeed also be a method, as suggested by @mroeschke ",
+            "+1 on @mroeschke 's suggestion\r\n\r\nI'll work on `.value` today",
+            "Two bikeshed thoughts to what to use instead of `.value` internally: 1) using `asi8` would allow for some code-sharing with DTA/DTI/TDA/TDI, 2) having something distinctive would make it easier to grep for places where we use it.",
+            "For now, in https://github.com/pandas-dev/pandas/pull/50891, I just made it `_value`\r\n\r\nI wasn't quite prepared for how many files it would involve changing",
+            "@jorisvandenbossche @jbrockmendel @mroeschke are we sure this is a good idea?\r\n\r\nBecause then the public-facing `.value` would be unavailable for old timestamps, e.g. `Timestamp('300-01-01 00:00:00')`, because it would overflow (and this is what motivated the introduction of non-nanosecond resolution)",
+            "i guess we'd document that it is for nanos-only and direct users to use e.g. .asm8.view('i8') more generally",
+            "sure, I'll add that to the error message\r\n\r\n`Timedelta` doesn't support non-nano reso yet, right? If so, perhaps I'll hold off timedelta changes for now then, that'll reduce the diff and make review a bit easier",
+            "Timedelta supports non-nano, but doesn't do inference on strings",
+            "thanks - how do I set it? I'm seeing\r\n```\r\nIn [6]: Timedelta(days=1, unit='s').unit\r\nOut[6]: 'ns'\r\n```",
+            "ah got it, nvm\r\n```\r\nIn [2]: Timedelta(days=1, unit='s').as_unit('s').unit\r\nOut[2]: 's'\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 63255,
+            "commit_id": "ea4d8989774fd14235c273149df28dd29196927d",
+            "original_commit_id": "1efc2d7464cc8f951b82106031acbe51f6febf69",
+            "path": "pandas/core/indexes/interval.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 549,
+            "original_line": 549,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "looks like 1) this scalar path might not be necessary? and 2) there may be baked-in assumptions about everything being nano",
+                "good call - shall we make logic changes in a separate PR? I've opened https://github.com/pandas-dev/pandas/issues/51196 about this nanosecond assumption here",
+                "separate PR seems fine",
+                "sure, thanks - any objections here? shall we move forward before merge conflicts arise?"
+            ]
+        },
+        {
+            "hunk_id": 63254,
+            "commit_id": "ea4d8989774fd14235c273149df28dd29196927d",
+            "original_commit_id": "1efc2d7464cc8f951b82106031acbe51f6febf69",
+            "path": "pandas/core/arrays/_ranges.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 49,
+            "original_line": 49,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "im a bit concerned about this.  we have a unit keyword that i think is implicitly assuming unit == start.unit == end.unit",
+                "no wait, never mind, this is doing the right thing given that concern."
+            ]
+        }
+    ]
+}

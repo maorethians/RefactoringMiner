@@ -1,0 +1,1177 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 17398,
+    "lang": "rust",
+    "pr_title": "Relationships (non-fragmenting, one-to-many)",
+    "pr_body": "This adds support for one-to-many non-fragmenting relationships (with planned paths for fragmenting and non-fragmenting many-to-many relationships). \"Non-fragmenting\" means that entities with the same relationship type, but different relationship targets, are not forced into separate tables (which would cause \"table fragmentation\").\r\n\r\nFunctionally, this fills a similar niche as the current Parent/Children system. The biggest differences are:\r\n\r\n1. Relationships have simpler internals and significantly improved performance and UX. Commands and specialized APIs are no longer necessary to keep everything in sync. Just spawn entities with the relationship components you want and everything \"just works\".\r\n2. Relationships are generalized. Bevy can provide additional built in relationships, and users can define their own.\r\n\r\n**REQUEST TO REVIEWERS**: _please don't leave top level comments and instead comment on specific lines of code. That way we can take advantage of threaded discussions. Also dont leave comments simply pointing out CI failures as I can read those just fine._\r\n\r\n## Built on top of what we have\r\n\r\nRelationships are implemented on top of the Bevy ECS features we already have: components, immutability, and hooks. This makes them immediately compatible with all of our existing (and future) APIs for querying, spawning, removing, scenes, reflection, etc. The fewer specialized APIs we need to build, maintain, and teach, the better.\r\n\r\n## Why focus on one-to-many non-fragmenting first?\r\n\r\n1. This allows us to improve Parent/Children relationships immediately, in a way that is reasonably uncontroversial. Switching our hierarchy to fragmenting relationships would have significant performance implications. ~~Flecs is heavily considering a switch to non-fragmenting relations after careful considerations of the performance tradeoffs.~~ _(Correction from @SanderMertens: Flecs is implementing non-fragmenting storage specialized for asset hierarchies, where asset hierarchies are many instances of small trees that have a well defined structure)_\r\n2. Adding generalized one-to-many relationships is currently a priority for the [Next Generation Scene / UI effort](https://github.com/bevyengine/bevy/discussions/14437). Specifically, we're interested in building reactions and observers on top. \r\n\r\n## The changes\r\n\r\nThis PR does the following:\r\n\r\n1. Adds a generic one-to-many Relationship system\r\n3. Ports the existing Parent/Children system to Relationships, which now lives in `bevy_ecs::hierarchy`. The old `bevy_hierarchy` crate has been removed.\r\n4. Adds on_despawn component hooks\r\n5. Relationships can opt-in to \"despawn descendants\" behavior, meaning that the entire relationship hierarchy is despawned when `entity.despawn()` is called. The built in Parent/Children hierarchies enable this behavior, and `entity.despawn_recursive()` has been removed.\r\n6. `world.spawn` now applies commands after spawning. This ensures that relationship bookkeeping happens immediately and removes the need to manually flush. This is in line with the equivalent behaviors recently added to the other APIs (ex: insert).\r\n7. Removes the ValidParentCheckPlugin (system-driven / poll based) in favor of a `validate_parent_has_component` hook.\r\n\r\n## Using Relationships\r\n\r\nThe `Relationship` trait looks like this:\r\n\r\n```rust\r\npub trait Relationship: Component + Sized {\r\n    type RelationshipTarget: RelationshipTarget<Relationship = Self>;\r\n    fn get(&self) -> Entity;\r\n    fn from(entity: Entity) -> Self;\r\n}\r\n```\r\n\r\nA relationship is a component that:\r\n\r\n1. Is a simple wrapper over a \"target\" Entity.\r\n2. Has a corresponding `RelationshipTarget` component, which is a simple wrapper over a collection of entities. Every \"target entity\" targeted by a \"source entity\" with a `Relationship` has a `RelationshipTarget` component, which contains every \"source entity\" that targets it.  \r\n\r\nFor example, the `Parent` component (as it currently exists in Bevy) is the `Relationship` component and the entity containing the Parent is the \"source entity\". The entity _inside_ the `Parent(Entity)` component is the \"target entity\". And that target entity has a `Children` component (which implements `RelationshipTarget`).\r\n\r\nIn practice, the Parent/Children relationship looks like this:\r\n\r\n```rust\r\n#[derive(Relationship)]\r\n#[relationship(relationship_sources = Children)]\r\npub struct Parent(pub Entity);\r\n\r\n#[derive(RelationshipTarget)]\r\n#[relationship_sources(relationship = Parent)]\r\npub struct Children(Vec<Entity>);\r\n```\r\n\r\nThe Relationship and RelationshipTarget derives automatically implement Component with the relevant configuration (namely, the hooks necessary to keep everything in sync).\r\n\r\nThe most direct way to add relationships is to spawn entities with relationship components:\r\n\r\n```rust\r\nlet a = world.spawn_empty().id();\r\nlet b = world.spawn(Parent(a)).id();\r\n\r\nassert_eq!(world.entity(a).get::<Children>().unwrap(), &[b]);\r\n```\r\n\r\nThere are also convenience APIs for spawning more than one entity with the same relationship:\r\n\r\n```rust\r\nworld.spawn_empty().with_related::<Children>(|s| {\r\n    s.spawn_empty();\r\n    s.spawn_empty();\r\n})\r\n```\r\n\r\nThe existing `with_children` API is now a simpler wrapper over `with_related`. This makes this change largely non-breaking for existing spawn patterns.\r\n\r\n```rust\r\nworld.spawn_empty().with_children(|s| {\r\n    s.spawn_empty();\r\n    s.spawn_empty();\r\n})\r\n```\r\n\r\nThere are also other relationship APIs, such as `add_related` and `despawn_related`.\r\n\r\n## Automatic recursive despawn via the new on_despawn hook\r\n\r\n`RelationshipTarget` can opt-in to \"despawn descendants\" behavior, which will despawn all related entities in the relationship hierarchy:\r\n\r\n```rust\r\n#[derive(RelationshipTarget)]\r\n#[relationship_sources(relationship = Parent, despawn_descendants)]\r\npub struct Children(Vec<Entity>);\r\n```\r\n\r\nThis means that `entity.despawn_recursive()` is no longer required. Instead, just use `entity.despawn()` and the relevant related entities will also be despawned.\r\n\r\nTo despawn an entity _without_ despawning its parent/child descendants, you should remove the `Children` component first, which will also remove the related `Parent` components:\r\n\r\n```rust\r\nentity\r\n    .remove::<Children>()\r\n    .despawn()\r\n```\r\n\r\nThis builds on the on_despawn hook introduced in this PR, which is fired when an entity is despawned (before other hooks).\r\n\r\n## Relationships are the source of truth\r\n\r\n`Relationship` is the _single_ source of truth component. `RelationshipTarget` is merely a reflection of what all the `Relationship` components say. By embracing this, we are able to significantly improve the performance of the system as a whole. We can rely on component lifecycles to protect us against duplicates, rather than needing to scan at runtime to ensure entities don't already exist (which results in quadratic runtime). A single source of truth gives us constant-time inserts. This does mean that we cannot directly spawn populated `Children` components (or directly add or remove entities from those components). I personally think this is a worthwhile tradeoff, both because it makes the performance much better _and_ because it means theres exactly one way to do things (which is a philosophy we try to employ for Bevy APIs).\r\n\r\nAs an aside: treating both sides of the relationship as \"equivalent source of truth relations\" does enable building simple and flexible many-to-many relationships. But this introduces an _inherent_ need to scan (or hash) to protect against duplicates. [`evergreen_relations`](https://github.com/EvergreenNest/evergreen_relations) has a very nice implementation of the \"symmetrical many-to-many\" approach. Unfortunately I think the performance issues inherent to that approach make it a poor choice for Bevy's default relationship system. \r\n\r\n## Followup Work\r\n\r\n* Discuss renaming `Parent` to `ChildOf`. I refrained from doing that in this PR to keep the diff reasonable, but I'm personally biased toward this change (and using that naming pattern generally for relationships).\r\n* [Improved spawning ergonomics](https://github.com/bevyengine/bevy/discussions/16920)\r\n* Consider adding relationship observers/triggers for \"relationship targets\" whenever a source is added or removed. This would replace the current \"hierarchy events\" system, which is unused upstream but may have existing users downstream. I think triggers are the better fit for this than a buffered event queue, and would prefer not to add that back.\r\n* Fragmenting relations: My current idea hinges on the introduction of \"value components\" (aka: components whose type _and_ value determines their ComponentId, via something like Hashing / PartialEq). By labeling a Relationship component such as `ChildOf(Entity)` as a \"value component\",  `ChildOf(e1)` and `ChildOf(e2)` would be considered \"different components\". This makes the transition between fragmenting and non-fragmenting a single flag, and everything else continues to work as expected.\r\n* Many-to-many support\r\n    * Non-fragmenting: We can expand Relationship to be a list of entities instead of a single entity. I have largely already written the code for this.\r\n    * Fragmenting: With the \"value component\" impl mentioned above, we get many-to-many support \"for free\", as it would allow inserting multiple copies of a Relationship component with different target entities.\r\n\r\nFixes #3742 (If this PR is merged, I think we should open more targeted followup issues for the work above, with a fresh tracking issue free of the large amount of less-directed historical context)\r\nFixes #17301\r\nFixes #12235 \r\nFixes #15299\r\nFixes #15308 \r\n\r\n## Migration Guide\r\n\r\n* Replace `ChildBuilder` with `ChildSpawnerCommands`.\r\n* Replace calls to `.set_parent(parent_id)` with `.insert(Parent(parent_id))`.\r\n* Replace calls to `.replace_children()` with `.remove::<Children>()` followed by `.add_children()`. Note that you'll need to manually despawn any children that are not carried over.\r\n* Replace calls to `.despawn_recursive()` with `.despawn()`.\r\n* Replace calls to `.despawn_descendants()` with `.despawn_related::<Children>()`.\r\n* If you have any calls to `.despawn()` which depend on the children being preserved, you'll need to remove the `Children` component first.\r\n",
+    "pr_comments": [
+        "I misrepresented the scope of the Flecs effort to switch to non-fragmenting relations (sorry @SanderMertens!). I've replaced the relevant text in the description with the following text:\r\n\r\n> Flecs is implementing non-fragmenting storage specialized for asset hierarchies, where asset hierarchies are many instances of small trees that have a well defined structure",
+        "Would it be more general to implement the macro like this? This can also work with one way relation from parent to child.\r\n```rust\r\n#[derive(Component)]\r\n#[relationship_sources(relationship = Parent)]\r\npub struct Children(#[despawns] Vec<Entity>);\r\n```\r\n\r\nSo this means a simple one way relationship\r\n\r\n```rust\r\n#[derive(Component)]\r\npub struct Children(#[despawns] Vec<Entity>);\r\n```\r\n\r\nAnd this removes `Parent` and set the child entities free instead.\r\n\r\n```rust\r\n#[derive(Component)]\r\n#[relationship_sources(relationship = Parent)]\r\npub struct Children(Vec<Entity>);\r\n```\r\n",
+        "# Migration Guide\r\n\r\n* Replace `ChildBuilder` with `ChildSpawnerCommands`.\r\n* Replace calls to `.set_parent(parent_id)` with `.insert(Parent(parent_id))`.\r\n* Replace calls to `.replace_children()` with `.remove::<Children>()` followed by `.add_children()`. Note that you'll need to manually despawn any children that are not carried over.\r\n* Replace calls to `.despawn_recursive()` with `.despawn()`.\r\n* Replace calls to `.despawn_descendants()` with `.despawn_related::<Children>()`.\r\n* If you have any calls to `.despawn()` which depend on the children being preserved, you'll need to remove the `Children` component first.",
+        "> Would it be more general to implement the macro like this? This can also work with one way relation from parent to child.\r\n\r\nThis is an interesting thought. I do like that it lets people tweak the other aspects of the Component (ex: pick the storage). I'm on board!",
+        "@cart I have no concerns about this at this stage and we have plenty of community review; feel free to merge when you feel it's ready.\r\n",
+        "Could we offer users some advice on migrating the removed `HierarchyEvent`?"
+    ],
+    "merged": true,
+    "created_at": "2025-01-16T02:37:37Z",
+    "issue_context": {
+        "number": 12235,
+        "title": "Use component lifecycle hooks to make `Parent` + `Children` hierarchy code simpler and more robust",
+        "body": "## What problem does this solve or what need does it fill?\r\n\r\n`bevy_hierarchy`'s internals are complex, performance-critical, and have panicking unsafe code in them.\r\nThe core reason for this is that we *cannot* let the graph become invalid: this leads to wasted work, subtle bugs and huge amounts of user frustration. And because we use `unsafe` code internally that relies on the assumption of validity for soundness, this can become a soundness problem.\r\n\r\nThey're painful to maintain, and nearly impossible to replicate externally for other hierarchy-like code that wants to uphold these same variants.\r\n\r\n## What solution would you like?\r\n\r\n#10756 adds component lifecycle hooks: operations that take effect when components are added or removed.\r\n\r\nWe should replace the existing complex code in `bevy_hierarchy` with this idiom, being sure to benchmark and optimize performance.\r\n\r\n## What alternative(s) have you considered?\r\n\r\nWe could wait until the fabled day that relations (#3742) finally gets shipped.\r\n\r\n## Additional context\r\n\r\nThis has been widely anticipated as one of the key benefits of that PR: I'm recording it here to make sure we don't forget (and can coordinate work).\r\n\r\nWhile the user-facing API is *also* pretty gnarly and inconsistent, I'd like to leave that for future work to make sure that the correctness-sensitive internals get the review attention it needs.",
+        "comments": [
+            "Is this just using hooks for cleanup? Like removing dangling, despawn recursive, etc?",
+            "Yeah, I think that's about all we'll be able to do currently.",
+            "If we don't allow users to mutably access the components directly we can enforce an always up to date hierarchy by only allowing commands to modify it. Although this would be an access pattern that I don't believe bevy currently uses anywhere.",
+            "That's what I do for aery. Private `Component` with public `QueryData`. I can't think of any use cases where people would be modifying hierarchy edges manually but if there are it should be a straight forward migration because automatically inserted sync points exist now.",
+            "I did most of the work for this a while ago as I was testing the hooks PR.\nThe current state of hooks makes it a little unfortunate but we can discuss that when I have the PR ready",
+            "Awesome, thank you @irate-devil :) And yeah, ironing out the kinks of the component hooks API is a big part of why I'm keen to do this.",
+            "Doing this is going to require making `Children` & `Parent` private and exposing `QueryData` structs for them. Since `entity.get::<Children>()`/`entity.get::<Parent>()` will no longer be possible with this change  #13375 should be merged first otherwise this causes breakage that's annoying to work around.",
+            "EDIT: Tabbed over to the wrong issue!",
+            "What is the point of using hooks if we restrict access to commands? Can't we just do the cleanup in the commands?",
+            "The fix for this has been marked for 0.16, probably should do the same here.",
+            "There is one more advantage of using hooks for hierarchy.\nRight now `OnAdd` observers and hooks don't have access to hierarchy since it updates later. It's quite limiting when you want to react on spawning in hierarchy-related way. The workaround for this is to listen for `Parent` insertion and then check if specific component is also present which is not very convenient."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1202,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 213,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "An `ON_DESPAWN` hook is also a great outcome form this PR in of itself. I assume there's negligible performance impacts from the addition of this hook? ",
+                "We can benchmark, but I don't expect significant degradation.",
+                "I wouldn't expect any problems either, agreed."
+            ]
+        },
+        {
+            "hunk_id": 702,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_text/src/text.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 511,
+            "original_line": 511,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "If we impl `Deref` for `Parent` we should be able to revert these changes and reduce breakage in the engine and for users.",
+                "I personally think `**` is _significantly_ nastier and would prefer to remove it. Reducing breakage is nice, but im not sure deferring this pain (if we agree that it is inevitable) will be particularly beneficial.",
+                "Given that `Entity` doesn't have any meaningful methods on it, I think that's a reasonable position to take.",
+                "Although I guess another reasonable position to take is that a Deref impl doesn't really hurt anyone and we can always just not use it by convention. Nevermind I'll add it in the interest of keeping breakage down, and just stop using it in engine code."
+            ]
+        },
+        {
+            "hunk_id": 1213,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_text/src/text.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 511,
+            "original_line": 511,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "If we impl `Deref` for `Parent` we should be able to revert these changes and reduce breakage in the engine and for users.",
+                "I personally think `**` is _significantly_ nastier and would prefer to remove it. Reducing breakage is nice, but im not sure deferring this pain (if we agree that it is inevitable) will be particularly beneficial.",
+                "Given that `Entity` doesn't have any meaningful methods on it, I think that's a reasonable position to take.",
+                "Although I guess another reasonable position to take is that a Deref impl doesn't really hurt anyone and we can always just not use it by convention. Nevermind I'll add it in the interest of keeping breakage down, and just stop using it in engine code."
+            ]
+        },
+        {
+            "hunk_id": 1209,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "@mockersf just suggested that we auto-generate RelationshipSources on behalf of the developer. So this:\r\n\r\n```rust\r\n#[derive(Component)]\r\n#[relationship(relationship_sources = Children, despawn_descendants)]\r\npub struct Parent(pub Entity);\r\n```\r\n\r\nThis would fully generate the `Children` struct and the relevant derives.\r\n\r\nSome pros:\r\n\r\n1. It reduces a lot of boilerplate for the cases that don't need customization\r\n2. Implementing the RelationshipSources side is a bit complicated. Ex: it needs to wrap a single unnamed field, which needs to be private, it needs to point back to the relationship via the `relationship_sources` attribute, to be compatible with the current scene system it needs to support MapEntities/VisitEntities, etc.\r\n3. We could still support direct derives / normal configuration by making it possible to opt-out of manual generation (ex: via a `manual_relationship_sources` flag).\r\n\r\nSome cons:\r\n\r\n1. It means by default the user has less control over the type. They cannot derive new traits (nicely) while they are using auto-generation, add requires, define the component storage type, etc. They also cannot naturally write documentation for it.\r\n2. It has a \"weirdness factor\". The `Children` type is no longer directly specified in code.\r\n\r\nCurious what yall think! I do like the reduced burden for simple cases, but I do also suspect that some use cases will benefit from the manual generation.",
+                "Given that I'm pretty sure we want the manual mode no matter what, maybe we should punt this to a followup PR.",
+                "Yeah, I would 100% punt this. I don't think I like it anyways; implicitly defined types are painful to work with for docs / go-to-definition / traits."
+            ]
+        },
+        {
+            "hunk_id": 1755,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/world/component_constants.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 17,
+            "original_line": 17,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "This doesn't seem to have been added to `World::bootstrap`, so the component ID won't be set correctly.",
+                "Hmm interesting that the relevant recursive despawn tests still pass. Probably just getting lucky on the id allocation :)\r\n\r\nI'll fix this."
+            ]
+        },
+        {
+            "hunk_id": 1212,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_source_collection.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "We should add an impl for (and benchmark using) `SmallVec<Entity>` here. Most children lists are going to be *small*.\r\n\r\n`EntityHashSet` would also be a really nice alternative.",
+                "Agreed. Although I think that might be better off as followup work."
+            ]
+        },
+        {
+            "hunk_id": 1849,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_source_collection.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "We should add an impl for (and benchmark using) `SmallVec<Entity>` here. Most children lists are going to be *small*.\r\n\r\n`EntityHashSet` would also be a really nice alternative.",
+                "Agreed. Although I think that might be better off as followup work."
+            ]
+        },
+        {
+            "hunk_id": 1851,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 293,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably not something that should be done in this PR, but do we also want an `on_spawn` hook for completeness? There's already nice symmetry with `on_add`/`on_remove` and `on_insert`/`on_replace` (or `on_discard` if we want to rename it to that)",
+                "Worth discussing, but I can't personally think of a spawn use case that wouldn't be better off in OnAdd or OnInsert. Given that every hook has a cost associated with it, we need real use cases to justify their existence.\r\n\r\nPart of me thinks we might even be better off hard-coding the \"recursive despawn\" logic rather than using hooks, as I also can't think of a use case for on_despawn other than recursive despawn."
+            ]
+        },
+        {
+            "hunk_id": 1848,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 13,
+            "original_line": 13,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "I am extremely pleased to see these generalized and baked into bevy_ecs :D"
+            ]
+        },
+        {
+            "hunk_id": 1838,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "benches/benches/bevy_ecs/entity_cloning.rs",
+            "start_line": 145,
+            "original_start_line": 145,
+            "start_side": "LEFT",
+            "line": 145,
+            "original_line": 145,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Massively better developer experience IMO. Having hierarchy \"just be components\" that the user can add or remove like anything else is fantastic for teaching."
+            ]
+        },
+        {
+            "hunk_id": 697,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "`Parent` and `Children` definitely need docs before we ship this."
+            ]
+        },
+        {
+            "hunk_id": 1841,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 297,
+            "original_line": 201,
+            "side": "RIGHT",
+            "original_position": 201,
+            "position": 297,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we have tests on the EntityWorldMut methods introduced in this file?"
+            ]
+        },
+        {
+            "hunk_id": 698,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "@mockersf just suggested that we auto-generate RelationshipSources on behalf of the developer. So this:\r\n\r\n```rust\r\n#[derive(Component)]\r\n#[relationship(relationship_sources = Children, despawn_descendants)]\r\npub struct Parent(pub Entity);\r\n```\r\n\r\nThis would fully generate the `Children` struct and the relevant derives.\r\n\r\nSome pros:\r\n\r\n1. It reduces a lot of boilerplate for the cases that don't need customization\r\n2. Implementing the RelationshipSources side is a bit complicated. Ex: it needs to wrap a single unnamed field, which needs to be private, it needs to point back to the relationship via the `relationship_sources` attribute, to be compatible with the current scene system it needs to support MapEntities/VisitEntities, etc.\r\n3. We could still support direct derives / normal configuration by making it possible to opt-out of manual generation (ex: via a `manual_relationship_sources` flag).\r\n\r\nSome cons:\r\n\r\n1. It means by default the user has less control over the type. They cannot derive new traits (nicely) while they are using auto-generation, add requires, define the component storage type, etc. They also cannot naturally write documentation for it.\r\n2. It has a \"weirdness factor\". The `Children` type is no longer directly specified in code.\r\n\r\nCurious what yall think! I do like the reduced burden for simple cases, but I do also suspect that some use cases will benefit from the manual generation.",
+                "Given that I'm pretty sure we want the manual mode no matter what, maybe we should punt this to a followup PR.",
+                "Yeah, I would 100% punt this. I don't think I like it anyways; implicitly defined types are painful to work with for docs / go-to-definition / traits."
+            ]
+        },
+        {
+            "hunk_id": 1205,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 259,
+            "original_line": 259,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Would it be worth adding `despawn_recursive` here so it can be marked as deprecated? Or maybe copy over the original trait and mark that?",
+                "Good call. I added the methods directly to EntityCommands / EntityWorldMut. The trait path is already broken, so I don't see much sense in keeping it around. This feels like a reasonable middle ground."
+            ]
+        },
+        {
+            "hunk_id": 700,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 13,
+            "original_line": 13,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "I am extremely pleased to see these generalized and baked into bevy_ecs :D"
+            ]
+        },
+        {
+            "hunk_id": 1764,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_source_collection.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "We should add an impl for (and benchmark using) `SmallVec<Entity>` here. Most children lists are going to be *small*.\r\n\r\n`EntityHashSet` would also be a really nice alternative.",
+                "Agreed. Although I think that might be better off as followup work."
+            ]
+        },
+        {
+            "hunk_id": 1215,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 62,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason this is called `Relationship` and not `Relation`? I like the latter more since it's shorter",
+                "I suppose relationship is more accurate when describing specific instances of relations, though I'm also a fan of short names.\r\nhttps://www.britannica.com/dictionary/eb/qa/relations-and-relationship"
+            ]
+        },
+        {
+            "hunk_id": 1753,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "benches/benches/bevy_ecs/entity_cloning.rs",
+            "start_line": 145,
+            "original_start_line": 145,
+            "start_side": "LEFT",
+            "line": 145,
+            "original_line": 145,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Massively better developer experience IMO. Having hierarchy \"just be components\" that the user can add or remove like anything else is fantastic for teaching."
+            ]
+        },
+        {
+            "hunk_id": 1766,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 293,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably not something that should be done in this PR, but do we also want an `on_spawn` hook for completeness? There's already nice symmetry with `on_add`/`on_remove` and `on_insert`/`on_replace` (or `on_discard` if we want to rename it to that)",
+                "Worth discussing, but I can't personally think of a spawn use case that wouldn't be better off in OnAdd or OnInsert. Given that every hook has a cost associated with it, we need real use cases to justify their existence.\r\n\r\nPart of me thinks we might even be better off hard-coding the \"recursive despawn\" logic rather than using hooks, as I also can't think of a use case for on_despawn other than recursive despawn."
+            ]
+        },
+        {
+            "hunk_id": 703,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 293,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably not something that should be done in this PR, but do we also want an `on_spawn` hook for completeness? There's already nice symmetry with `on_add`/`on_remove` and `on_insert`/`on_replace` (or `on_discard` if we want to rename it to that)",
+                "Worth discussing, but I can't personally think of a spawn use case that wouldn't be better off in OnAdd or OnInsert. Given that every hook has a cost associated with it, we need real use cases to justify their existence.\r\n\r\nPart of me thinks we might even be better off hard-coding the \"recursive despawn\" logic rather than using hooks, as I also can't think of a use case for on_despawn other than recursive despawn."
+            ]
+        },
+        {
+            "hunk_id": 1206,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "Generic relations can be circular and there is nothing really preventing it.\r\nSo majority of these methods could create infinite loops.\r\n\r\nAlso \r\n - `root_ancestor `\r\n - `iter_leaves `\r\n - `iter_siblings `\r\n - `iter_descendants`\r\n - `iter_ancestors`\r\n\r\nMake sense when talking about Child/Parent relationships, in other type of relationship it might not make sense, specially circular ones.",
+                "I added some warnings here. I'm not sure this is the kind of constraint we should add at the \"relationship API level\", as I don't really think paying the loop detection cost is worth it, so it wouldn't actually be enforced."
+            ]
+        },
+        {
+            "hunk_id": 1765,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_text/src/text.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 511,
+            "original_line": 511,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "If we impl `Deref` for `Parent` we should be able to revert these changes and reduce breakage in the engine and for users.",
+                "I personally think `**` is _significantly_ nastier and would prefer to remove it. Reducing breakage is nice, but im not sure deferring this pain (if we agree that it is inevitable) will be particularly beneficial.",
+                "Given that `Entity` doesn't have any meaningful methods on it, I think that's a reasonable position to take.",
+                "Although I guess another reasonable position to take is that a Deref impl doesn't really hurt anyone and we can always just not use it by convention. Nevermind I'll add it in the interest of keeping breakage down, and just stop using it in engine code."
+            ]
+        },
+        {
+            "hunk_id": 1839,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 213,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "An `ON_DESPAWN` hook is also a great outcome form this PR in of itself. I assume there's negligible performance impacts from the addition of this hook? ",
+                "We can benchmark, but I don't expect significant degradation.",
+                "I wouldn't expect any problems either, agreed."
+            ]
+        },
+        {
+            "hunk_id": 1207,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 126,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 126,
+            "subject_type": "line",
+            "review_comments": [
+                "The pattern that users have come up with is to create a panicking constructor in the `Default` impl. I don't think that would work here though, since you need to actually create an instance.\r\n\r\nWe *could* store an `Option` inside, but that's a fair bit of UX pain.",
+                "Note that this is carryover from the current hierarchy/scene code. I don't feel any particular inclination to sort this out here."
+            ]
+        },
+        {
+            "hunk_id": 1845,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "`Parent` and `Children` definitely need docs before we ship this."
+            ]
+        },
+        {
+            "hunk_id": 1767,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 62,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason this is called `Relationship` and not `Relation`? I like the latter more since it's shorter",
+                "I suppose relationship is more accurate when describing specific instances of relations, though I'm also a fan of short names.\r\nhttps://www.britannica.com/dictionary/eb/qa/relations-and-relationship"
+            ]
+        },
+        {
+            "hunk_id": 1842,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 259,
+            "original_line": 259,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Would it be worth adding `despawn_recursive` here so it can be marked as deprecated? Or maybe copy over the original trait and mark that?",
+                "Good call. I added the methods directly to EntityCommands / EntityWorldMut. The trait path is already broken, so I don't see much sense in keeping it around. This feels like a reasonable middle ground."
+            ]
+        },
+        {
+            "hunk_id": 1850,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_text/src/text.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 511,
+            "original_line": 511,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "If we impl `Deref` for `Parent` we should be able to revert these changes and reduce breakage in the engine and for users.",
+                "I personally think `**` is _significantly_ nastier and would prefer to remove it. Reducing breakage is nice, but im not sure deferring this pain (if we agree that it is inevitable) will be particularly beneficial.",
+                "Given that `Entity` doesn't have any meaningful methods on it, I think that's a reasonable position to take.",
+                "Although I guess another reasonable position to take is that a Deref impl doesn't really hurt anyone and we can always just not use it by convention. Nevermind I'll add it in the interest of keeping breakage down, and just stop using it in engine code."
+            ]
+        },
+        {
+            "hunk_id": 1847,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 81,
+            "side": "RIGHT",
+            "original_position": 81,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "This feels like a weird place for this method. I'd kinda prefer making `on_insert` etc methods for `Component` (and removing the awkward `register_component_hooks` API), and then generating those methods in the `Component` trait with the `Relationship` derive macro.",
+                "Tracked in #17411."
+            ]
+        },
+        {
+            "hunk_id": 1756,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 297,
+            "original_line": 201,
+            "side": "RIGHT",
+            "original_position": 201,
+            "position": 297,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we have tests on the EntityWorldMut methods introduced in this file?"
+            ]
+        },
+        {
+            "hunk_id": 1757,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 259,
+            "original_line": 259,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Would it be worth adding `despawn_recursive` here so it can be marked as deprecated? Or maybe copy over the original trait and mark that?",
+                "Good call. I added the methods directly to EntityCommands / EntityWorldMut. The trait path is already broken, so I don't see much sense in keeping it around. This feels like a reasonable middle ground."
+            ]
+        },
+        {
+            "hunk_id": 696,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 126,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 126,
+            "subject_type": "line",
+            "review_comments": [
+                "The pattern that users have come up with is to create a panicking constructor in the `Default` impl. I don't think that would work here though, since you need to actually create an instance.\r\n\r\nWe *could* store an `Option` inside, but that's a fair bit of UX pain.",
+                "Note that this is carryover from the current hierarchy/scene code. I don't feel any particular inclination to sort this out here."
+            ]
+        },
+        {
+            "hunk_id": 1211,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 13,
+            "original_line": 13,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "I am extremely pleased to see these generalized and baked into bevy_ecs :D"
+            ]
+        },
+        {
+            "hunk_id": 1754,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 213,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "An `ON_DESPAWN` hook is also a great outcome form this PR in of itself. I assume there's negligible performance impacts from the addition of this hook? ",
+                "We can benchmark, but I don't expect significant degradation.",
+                "I wouldn't expect any problems either, agreed."
+            ]
+        },
+        {
+            "hunk_id": 1208,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "`Parent` and `Children` definitely need docs before we ship this."
+            ]
+        },
+        {
+            "hunk_id": 1759,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 126,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 126,
+            "subject_type": "line",
+            "review_comments": [
+                "The pattern that users have come up with is to create a panicking constructor in the `Default` impl. I don't think that would work here though, since you need to actually create an instance.\r\n\r\nWe *could* store an `Option` inside, but that's a fair bit of UX pain.",
+                "Note that this is carryover from the current hierarchy/scene code. I don't feel any particular inclination to sort this out here."
+            ]
+        },
+        {
+            "hunk_id": 1762,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 81,
+            "side": "RIGHT",
+            "original_position": 81,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "This feels like a weird place for this method. I'd kinda prefer making `on_insert` etc methods for `Component` (and removing the awkward `register_component_hooks` API), and then generating those methods in the `Component` trait with the `Relationship` derive macro.",
+                "Tracked in #17411."
+            ]
+        },
+        {
+            "hunk_id": 1204,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 297,
+            "original_line": 201,
+            "side": "RIGHT",
+            "original_position": 201,
+            "position": 297,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we have tests on the EntityWorldMut methods introduced in this file?"
+            ]
+        },
+        {
+            "hunk_id": 1840,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/world/component_constants.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 17,
+            "original_line": 17,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "This doesn't seem to have been added to `World::bootstrap`, so the component ID won't be set correctly.",
+                "Hmm interesting that the relevant recursive despawn tests still pass. Probably just getting lucky on the id allocation :)\r\n\r\nI'll fix this."
+            ]
+        },
+        {
+            "hunk_id": 691,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 213,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "An `ON_DESPAWN` hook is also a great outcome form this PR in of itself. I assume there's negligible performance impacts from the addition of this hook? ",
+                "We can benchmark, but I don't expect significant degradation.",
+                "I wouldn't expect any problems either, agreed."
+            ]
+        },
+        {
+            "hunk_id": 692,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/world/component_constants.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 17,
+            "original_line": 17,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "This doesn't seem to have been added to `World::bootstrap`, so the component ID won't be set correctly.",
+                "Hmm interesting that the relevant recursive despawn tests still pass. Probably just getting lucky on the id allocation :)\r\n\r\nI'll fix this."
+            ]
+        },
+        {
+            "hunk_id": 1843,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "Generic relations can be circular and there is nothing really preventing it.\r\nSo majority of these methods could create infinite loops.\r\n\r\nAlso \r\n - `root_ancestor `\r\n - `iter_leaves `\r\n - `iter_siblings `\r\n - `iter_descendants`\r\n - `iter_ancestors`\r\n\r\nMake sense when talking about Child/Parent relationships, in other type of relationship it might not make sense, specially circular ones.",
+                "I added some warnings here. I'm not sure this is the kind of constraint we should add at the \"relationship API level\", as I don't really think paying the loop detection cost is worth it, so it wouldn't actually be enforced."
+            ]
+        },
+        {
+            "hunk_id": 1201,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "benches/benches/bevy_ecs/entity_cloning.rs",
+            "start_line": 145,
+            "original_start_line": 145,
+            "start_side": "LEFT",
+            "line": 145,
+            "original_line": 145,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Massively better developer experience IMO. Having hierarchy \"just be components\" that the user can add or remove like anything else is fantastic for teaching."
+            ]
+        },
+        {
+            "hunk_id": 693,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 297,
+            "original_line": 201,
+            "side": "RIGHT",
+            "original_position": 201,
+            "position": 297,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we have tests on the EntityWorldMut methods introduced in this file?"
+            ]
+        },
+        {
+            "hunk_id": 690,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "benches/benches/bevy_ecs/entity_cloning.rs",
+            "start_line": 145,
+            "original_start_line": 145,
+            "start_side": "LEFT",
+            "line": 145,
+            "original_line": 145,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Massively better developer experience IMO. Having hierarchy \"just be components\" that the user can add or remove like anything else is fantastic for teaching."
+            ]
+        },
+        {
+            "hunk_id": 704,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 62,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason this is called `Relationship` and not `Relation`? I like the latter more since it's shorter",
+                "I suppose relationship is more accurate when describing specific instances of relations, though I'm also a fan of short names.\r\nhttps://www.britannica.com/dictionary/eb/qa/relations-and-relationship"
+            ]
+        },
+        {
+            "hunk_id": 1852,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 62,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason this is called `Relationship` and not `Relation`? I like the latter more since it's shorter",
+                "I suppose relationship is more accurate when describing specific instances of relations, though I'm also a fan of short names.\r\nhttps://www.britannica.com/dictionary/eb/qa/relations-and-relationship"
+            ]
+        },
+        {
+            "hunk_id": 1846,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "@mockersf just suggested that we auto-generate RelationshipSources on behalf of the developer. So this:\r\n\r\n```rust\r\n#[derive(Component)]\r\n#[relationship(relationship_sources = Children, despawn_descendants)]\r\npub struct Parent(pub Entity);\r\n```\r\n\r\nThis would fully generate the `Children` struct and the relevant derives.\r\n\r\nSome pros:\r\n\r\n1. It reduces a lot of boilerplate for the cases that don't need customization\r\n2. Implementing the RelationshipSources side is a bit complicated. Ex: it needs to wrap a single unnamed field, which needs to be private, it needs to point back to the relationship via the `relationship_sources` attribute, to be compatible with the current scene system it needs to support MapEntities/VisitEntities, etc.\r\n3. We could still support direct derives / normal configuration by making it possible to opt-out of manual generation (ex: via a `manual_relationship_sources` flag).\r\n\r\nSome cons:\r\n\r\n1. It means by default the user has less control over the type. They cannot derive new traits (nicely) while they are using auto-generation, add requires, define the component storage type, etc. They also cannot naturally write documentation for it.\r\n2. It has a \"weirdness factor\". The `Children` type is no longer directly specified in code.\r\n\r\nCurious what yall think! I do like the reduced burden for simple cases, but I do also suspect that some use cases will benefit from the manual generation.",
+                "Given that I'm pretty sure we want the manual mode no matter what, maybe we should punt this to a followup PR.",
+                "Yeah, I would 100% punt this. I don't think I like it anyways; implicitly defined types are painful to work with for docs / go-to-definition / traits."
+            ]
+        },
+        {
+            "hunk_id": 694,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/system/commands/entity_command.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 259,
+            "original_line": 259,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Would it be worth adding `despawn_recursive` here so it can be marked as deprecated? Or maybe copy over the original trait and mark that?",
+                "Good call. I added the methods directly to EntityCommands / EntityWorldMut. The trait path is already broken, so I don't see much sense in keeping it around. This feels like a reasonable middle ground."
+            ]
+        },
+        {
+            "hunk_id": 1203,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/world/component_constants.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 17,
+            "original_line": 17,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "This doesn't seem to have been added to `World::bootstrap`, so the component ID won't be set correctly.",
+                "Hmm interesting that the relevant recursive despawn tests still pass. Probably just getting lucky on the id allocation :)\r\n\r\nI'll fix this."
+            ]
+        },
+        {
+            "hunk_id": 1761,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "@mockersf just suggested that we auto-generate RelationshipSources on behalf of the developer. So this:\r\n\r\n```rust\r\n#[derive(Component)]\r\n#[relationship(relationship_sources = Children, despawn_descendants)]\r\npub struct Parent(pub Entity);\r\n```\r\n\r\nThis would fully generate the `Children` struct and the relevant derives.\r\n\r\nSome pros:\r\n\r\n1. It reduces a lot of boilerplate for the cases that don't need customization\r\n2. Implementing the RelationshipSources side is a bit complicated. Ex: it needs to wrap a single unnamed field, which needs to be private, it needs to point back to the relationship via the `relationship_sources` attribute, to be compatible with the current scene system it needs to support MapEntities/VisitEntities, etc.\r\n3. We could still support direct derives / normal configuration by making it possible to opt-out of manual generation (ex: via a `manual_relationship_sources` flag).\r\n\r\nSome cons:\r\n\r\n1. It means by default the user has less control over the type. They cannot derive new traits (nicely) while they are using auto-generation, add requires, define the component storage type, etc. They also cannot naturally write documentation for it.\r\n2. It has a \"weirdness factor\". The `Children` type is no longer directly specified in code.\r\n\r\nCurious what yall think! I do like the reduced burden for simple cases, but I do also suspect that some use cases will benefit from the manual generation.",
+                "Given that I'm pretty sure we want the manual mode no matter what, maybe we should punt this to a followup PR.",
+                "Yeah, I would 100% punt this. I don't think I like it anyways; implicitly defined types are painful to work with for docs / go-to-definition / traits."
+            ]
+        },
+        {
+            "hunk_id": 1214,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/macros/src/component.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 293,
+            "original_line": 293,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably not something that should be done in this PR, but do we also want an `on_spawn` hook for completeness? There's already nice symmetry with `on_add`/`on_remove` and `on_insert`/`on_replace` (or `on_discard` if we want to rename it to that)",
+                "Worth discussing, but I can't personally think of a spawn use case that wouldn't be better off in OnAdd or OnInsert. Given that every hook has a cost associated with it, we need real use cases to justify their existence.\r\n\r\nPart of me thinks we might even be better off hard-coding the \"recursive despawn\" logic rather than using hooks, as I also can't think of a use case for on_despawn other than recursive despawn."
+            ]
+        },
+        {
+            "hunk_id": 1760,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 62,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "`Parent` and `Children` definitely need docs before we ship this."
+            ]
+        },
+        {
+            "hunk_id": 1210,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 81,
+            "side": "RIGHT",
+            "original_position": 81,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "This feels like a weird place for this method. I'd kinda prefer making `on_insert` etc methods for `Component` (and removing the awkward `register_component_hooks` API), and then generating those methods in the `Component` trait with the `Relationship` derive macro.",
+                "Tracked in #17411."
+            ]
+        },
+        {
+            "hunk_id": 695,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "Generic relations can be circular and there is nothing really preventing it.\r\nSo majority of these methods could create infinite loops.\r\n\r\nAlso \r\n - `root_ancestor `\r\n - `iter_leaves `\r\n - `iter_siblings `\r\n - `iter_descendants`\r\n - `iter_ancestors`\r\n\r\nMake sense when talking about Child/Parent relationships, in other type of relationship it might not make sense, specially circular ones.",
+                "I added some warnings here. I'm not sure this is the kind of constraint we should add at the \"relationship API level\", as I don't really think paying the loop detection cost is worth it, so it wouldn't actually be enforced."
+            ]
+        },
+        {
+            "hunk_id": 1763,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 13,
+            "original_line": 13,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "I am extremely pleased to see these generalized and baked into bevy_ecs :D"
+            ]
+        },
+        {
+            "hunk_id": 1758,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "Generic relations can be circular and there is nothing really preventing it.\r\nSo majority of these methods could create infinite loops.\r\n\r\nAlso \r\n - `root_ancestor `\r\n - `iter_leaves `\r\n - `iter_siblings `\r\n - `iter_descendants`\r\n - `iter_ancestors`\r\n\r\nMake sense when talking about Child/Parent relationships, in other type of relationship it might not make sense, specially circular ones.",
+                "I added some warnings here. I'm not sure this is the kind of constraint we should add at the \"relationship API level\", as I don't really think paying the loop detection cost is worth it, so it wouldn't actually be enforced."
+            ]
+        },
+        {
+            "hunk_id": 701,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/relationship_source_collection.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "We should add an impl for (and benchmark using) `SmallVec<Entity>` here. Most children lists are going to be *small*.\r\n\r\n`EntityHashSet` would also be a really nice alternative.",
+                "Agreed. Although I think that might be better off as followup work."
+            ]
+        },
+        {
+            "hunk_id": 699,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/relationship/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 81,
+            "side": "RIGHT",
+            "original_position": 81,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "This feels like a weird place for this method. I'd kinda prefer making `on_insert` etc methods for `Component` (and removing the awkward `register_component_hooks` API), and then generating those methods in the `Component` trait with the `Relationship` derive macro.",
+                "Tracked in #17411."
+            ]
+        },
+        {
+            "hunk_id": 1844,
+            "commit_id": "a2d0e57b0e4de49775569f24bec3a63fcb43a6bb",
+            "original_commit_id": "72f70745c5883b0530a42241200c7aa2acf7230e",
+            "path": "crates/bevy_ecs/src/hierarchy.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 126,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 126,
+            "subject_type": "line",
+            "review_comments": [
+                "The pattern that users have come up with is to create a panicking constructor in the `Default` impl. I don't think that would work here though, since you need to actually create an instance.\r\n\r\nWe *could* store an `Option` inside, but that's a fair bit of UX pain.",
+                "Note that this is carryover from the current hierarchy/scene code. I don't feel any particular inclination to sort this out here."
+            ]
+        }
+    ]
+}

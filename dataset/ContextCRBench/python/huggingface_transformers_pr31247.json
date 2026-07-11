@@ -1,0 +1,153 @@
+{
+    "repo": "huggingface/transformers",
+    "pr_number": 31247,
+    "lang": "python",
+    "pr_title": "Add torch.compile Support For Mamba",
+    "pr_body": "`torch.compile` support for mamba! Closes #31246 ",
+    "pr_comments": [
+        "It seems that the mamba cache is not compatible with the current cache design used in `generate`, but we have to initialize the cache before we step into `model.forward` in order to make dynamo happy, and I think a specific conditional check for mamba in `get_cache` might not be what we want because it's too specific a patch. We can let user specify and create a mamba cache when using `torch.compile`, or is there any way to solve this so that we set the cache for users in `gerenate`? @ArthurZucker ",
+        "The docs for this PR live [here](https://moon-ci-docs.huggingface.co/docs/transformers/pr_31247). All of your documentation changes will be reflected on that endpoint. The docs are available until 30 days after the last update.",
+        "Could you share benchmark results? ",
+        "> Could you share benchmark results?\r\n\r\nSure, with `mamba-1.4b` on a single `A100-SXM4-80GB` in `float16, batch_size=1` inference mode, time is for per token generation:\r\n\r\n- slow_foward\r\n<img width=\"1084\" alt=\"Screen Shot 2024-06-07 at 20 19 37\" src=\"https://github.com/huggingface/transformers/assets/32992656/3568757f-db34-4763-9de9-f8db309958c2\">\r\n\r\n- cuda_kernel_forward\r\n<img width=\"1084\" alt=\"Screen Shot 2024-06-07 at 20 20 43\" src=\"https://github.com/huggingface/transformers/assets/32992656/3557790b-3df9-4ee0-bf73-abe739bc040d\">\r\n\r\n- compile\r\n<img width=\"1084\" alt=\"Screen Shot 2024-06-07 at 20 22 11\" src=\"https://github.com/huggingface/transformers/assets/32992656/854b71ac-90ad-476a-91ec-0a463745c53f\">\r\n\r\nAnd here is the function I used for benchmarking\r\n```python\r\n@torch.no_grad\r\ndef perf():\r\n    tokenizer = AutoTokenizer.from_pretrained(\"state-spaces/mamba-1.4b-hf\")\r\n    tokenizer.pad_token = tokenizer.eos_token\r\n    inputs = tokenizer(\"Hey how are you doing today ? \" * 100, return_tensors=\"pt\", padding=True).to('cuda')\r\n\r\n    model = MambaForCausalLM.from_pretrained(\"state-spaces/mamba-1.4b-hf\", torch_dtype=torch.float16)\r\n    model.config.use_cache = True\r\n    model.to('cuda')    \r\n\r\n    input_ids = inputs.input_ids\r\n    cache = MambaCache(model.config, 1, device=input_ids.device)\r\n    start = torch.cuda.Event(enable_timing=True)\r\n    end = torch.cuda.Event(enable_timing=True)\r\n\r\n    logits = model(input_ids, cache_params = cache).logits\r\n    next_token = torch.argmax(logits[:, -1], dim=-1)[:, None]\r\n\r\n    model.forward = torch.compile(model.forward, mode=\"reduce-overhead\", fullgraph=True)\r\n    torch.cuda.synchronize()\r\n    for i in range(10):\r\n        start.record()\r\n        logits = model(next_token.clone(), cache_params = cache).logits\r\n        next_token = torch.argmax(logits[:, -1], dim=-1)[:, None]\r\n\r\n        end.record()\r\n        torch.cuda.synchronize()\r\n        print(f'Step {i}, Total time: {start.elapsed_time(end)} ms, next_token = {next_token.int()}')\r\n\r\n```\r\n\r\nAs we can see from the results above, it takes a lot of time for the first and second decoding step, and actually in my script I skipped compile for the very first prefilling stage because it takes forever(nearly one hour) to compile, so if we only focus on the decoding phase, then we get a steady `8x` speedup\r\neven if comparing with cuda kernel implementation",
+        "@ArthurZucker @zhenglongjiepheonix \r\n\r\nRegarding the need to initialize the cache before the forward pass/outside `generate`: I've hit the same issue in the end-to-end `generate` compilation PR. On top of this, we are getting an increasing number of caches with different kwargs, pushing all complexity into `generate`. I'd really like for us to initialize caches outside `generate` by default, it is causing many needless headaches :D We can (and should), however, create an external function to initialize the cache and add it in a way that automagically handles it in the `pipelines` ",
+        "> @ArthurZucker @zhenglongjiepheonix\r\n> \r\n> Regarding the need to initialize the cache before the forward pass/outside `generate`: I've hit the same issue in the end-to-end `generate` compilation PR. On top of this, we are getting an increasing number of caches with different kwargs, pushing all complexity into `generate`. I'd really like for us to initialize caches outside `generate` by default, it is causing many needless headaches :D We can (and should), however, create an external function to initialize the cache and add it in a way that automagically handles it in the `pipelines`\r\n\r\nI agree, I think a model agonistic PR should be opened addressing the cache setting issue if we want compile on `generate`, currently I think all caches are set within `generate`? ",
+        "Another concern regarding centralized cache initialization is, if we can avoid doing specific condition checks like\r\n```python\r\nif model is mamba:\r\n    cache = MambaCache(...)\r\n```\r\nbecause sometimes caches that different models need are inherently different and can't be unified, currently I am doing this for mamba by initializing cache inside its own `prepare_inputs_for_generation`,\r\nI think this decentralized way of initializing caches can divide the complexity of cache initialization in a sense, but it might be against the whole `generate` compile stuff @ArthurZucker @gante ",
+        "> currently I think all caches are set within generate?\r\n\r\nNot all caches -- for instance, `SinkCache` is initialized as you exemplified above (outside `generate`). Passing a cache instance to `generate` is the API that's guaranteed to work all the time, even with custom classes :)\r\n\r\n__________________________\r\n\r\nRegarding centralization: if we centralize, we force `generate` to hold a large if/else functions, including checks for specific models like mamba. We could break it up by making special models overwrite the cache initialization function. However, caches are growing so quickly in so many directions that I'm wary of pushing all the logic into `generate`, at least for now \ud83d\udc40 Having the caches being externally initialized also makes the code more modular, and much easier to add new caches (remember: the field is growing fast!)",
+        "Mmmm TBH it's quite simple to just have a mapping from `cache_implementation` to `CacheCls`. For example for mamba you set `cache_implementation = \"mamba\"` / automatically infer or just have it in the MambaConfig. \r\n\r\nLet's think simple here, cache config was already introduce, we just need to init with the general cache config object, and pass in the model's config. \r\n\r\nno? ",
+        "Maybe let's forget about cache API refactor in this PR because the main point is about compile, I will try setting mamba cache by doing specific conditional check in `generate`, again related with `cache_position` we might need some shape-specific rather than value-specific checks in order to know whether we are in prefill or decoding phase if we don't want boolen flags @ArthurZucker @gante ",
+        "There is no need for a refactor here! You already have this : \r\n```python \r\ndef _get_cache(self, cache_implementation: str, max_batch_size: int, max_cache_len: int) -> Cache:\r\n        \"\"\"\r\n        Sets a cache for `generate`, that will persist across calls. A new cache will only be initialized a\r\n        new `generate` call requires a larger cache.\r\n\r\n        Returns the resulting cache object.\r\n        \"\"\"\r\n        cache_cls: Cache = NEED_SETUP_CACHE_CLASSES_MAPPING[cache_implementation]\r\n        if cache_implementation == \"sliding_window\":\r\n            max_cache_len = min(self.config.sliding_window, max_cache_len)\r\n\r\n```\r\nso the mamba cache should simply fit there no? ",
+        "> There is no need for a refactor here! You already have this :\r\n> \r\n> ```python\r\n> def _get_cache(self, cache_implementation: str, max_batch_size: int, max_cache_len: int) -> Cache:\r\n>         \"\"\"\r\n>         Sets a cache for `generate`, that will persist across calls. A new cache will only be initialized a\r\n>         new `generate` call requires a larger cache.\r\n> \r\n>         Returns the resulting cache object.\r\n>         \"\"\"\r\n>         cache_cls: Cache = NEED_SETUP_CACHE_CLASSES_MAPPING[cache_implementation]\r\n>         if cache_implementation == \"sliding_window\":\r\n>             max_cache_len = min(self.config.sliding_window, max_cache_len)\r\n> ```\r\n> \r\n> so the mamba cache should simply fit there no?\r\n\r\nNo, `max_cache_len` does not make sense for mamba, and another issue is  we need `cache_params` instead of `past_key_values`",
+        "Looks good! ",
+        "Congrats on the merge! \ud83d\udd25 "
+    ],
+    "merged": true,
+    "created_at": "2024-07-09T19:30:29Z",
+    "issue_context": {
+        "number": 31246,
+        "title": "We Need Compile Support For Mamba!",
+        "body": "### Feature request\n\nThis feature adds `torch.compile` support for mamba archtecture\n\n### Motivation\n\nThe motivation is that by supporting compile on mamba, we can get faster inference speed and better throughput even if we don't have high performance specified mamba kernels installed!\n\n### Your contribution\n\nI will be implementing this feature",
+        "comments": [
+            "cc @ArthurZucker "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 65713,
+            "commit_id": "78c8c1ca0e3245efbf77104a0ee4126d581058a1",
+            "original_commit_id": "6f40a213eb10e38a5f242d0645519d413d32d798",
+            "path": "src/transformers/generation/utils.py",
+            "start_line": 1441,
+            "original_start_line": 1442,
+            "start_side": "RIGHT",
+            "line": 1442,
+            "original_line": 1443,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "nice that is is this easy to fix use ! "
+            ]
+        },
+        {
+            "hunk_id": 65710,
+            "commit_id": "78c8c1ca0e3245efbf77104a0ee4126d581058a1",
+            "original_commit_id": "6f40a213eb10e38a5f242d0645519d413d32d798",
+            "path": "src/transformers/models/mamba/modeling_mamba.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 145,
+            "original_line": 218,
+            "side": "RIGHT",
+            "original_position": 104,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "perfect"
+            ]
+        },
+        {
+            "hunk_id": 65709,
+            "commit_id": "78c8c1ca0e3245efbf77104a0ee4126d581058a1",
+            "original_commit_id": "6f40a213eb10e38a5f242d0645519d413d32d798",
+            "path": "src/transformers/models/mamba/modeling_mamba.py",
+            "start_line": 248,
+            "original_start_line": 248,
+            "start_side": "LEFT",
+            "line": 252,
+            "original_line": 252,
+            "side": "LEFT",
+            "original_position": 143,
+            "position": 115,
+            "subject_type": "line",
+            "review_comments": [
+                "this is most probably not gonna be backward compatible. But ready to do so if perf are a lot better!",
+                "can you please elaborate more on why it's not backward compatible? ",
+                "sorry, since we keep the cache, and update it , it should be BC. "
+            ]
+        },
+        {
+            "hunk_id": 65711,
+            "commit_id": "78c8c1ca0e3245efbf77104a0ee4126d581058a1",
+            "original_commit_id": "6f40a213eb10e38a5f242d0645519d413d32d798",
+            "path": "src/transformers/models/mamba/modeling_mamba.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 223,
+            "original_line": 294,
+            "side": "RIGHT",
+            "original_position": 168,
+            "position": 124,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            if cache_position[0] >= 0:\r\n```",
+                "the shape of the kernel is 4, there is no reason for the cache position to be of the same shape",
+                "Please see rational commented above for the condition check",
+                "might be worth adding a comment in the code to explain the trick. \r\nMore in favor of using cache position[0] to detect decoding if it works, if not then a small comment! "
+            ]
+        },
+        {
+            "hunk_id": 65712,
+            "commit_id": "78c8c1ca0e3245efbf77104a0ee4126d581058a1",
+            "original_commit_id": "6f40a213eb10e38a5f242d0645519d413d32d798",
+            "path": "src/transformers/models/mamba/modeling_mamba.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 560,
+            "original_line": 628,
+            "side": "RIGHT",
+            "original_position": 264,
+            "position": 224,
+            "subject_type": "line",
+            "review_comments": [
+                "should just be the length of the input",
+                "I set it to be able to know whether we are in prefill or decoding stage in a dynamo friendly way",
+                "Okay. `cache_postions[0] > 0` breaks full graph  I gues?",
+                "yes"
+            ]
+        },
+        {
+            "hunk_id": 65714,
+            "commit_id": "78c8c1ca0e3245efbf77104a0ee4126d581058a1",
+            "original_commit_id": "6f40a213eb10e38a5f242d0645519d413d32d798",
+            "path": "src/transformers/models/mamba/modeling_mamba.py",
+            "start_line": 663,
+            "original_start_line": 664,
+            "start_side": "RIGHT",
+            "line": 667,
+            "original_line": 668,
+            "side": "RIGHT",
+            "original_position": 308,
+            "position": 301,
+            "subject_type": "line",
+            "review_comments": [
+                "I think there might be a more compile friendly way to do this, but that will be a todo. https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8/edit#heading=h.ivdr7fmrbeab might have answers, since I do not, LGTM for now!\r\n",
+                "Yes, it's just a matter of making it use data-independent ops, it could either be a flag or using shape-dependent way to see which stage it is in, I think a bool flag in `forward` will also do the trick, but we have introduced `cache_position` in order to address this anyway, another way of thinking this is we are kind of altering the length of hidden states by apply padding(positive or negative) before we update the cache, so we need to make sure the `cache_position` is aligned with the hidden states after padding rather than before padding",
+                "got it thanks! "
+            ]
+        }
+    ]
+}

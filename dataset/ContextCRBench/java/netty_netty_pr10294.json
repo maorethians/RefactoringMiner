@@ -1,0 +1,64 @@
+{
+    "repo": "netty/netty",
+    "pr_number": 10294,
+    "lang": "java",
+    "pr_title": "Guard against re-entrancy issues while draining AbstractCoalescingBuf\u2026",
+    "pr_body": "\u2026ferQueue\r\n\r\nMotivation:\r\n\r\nAbstractCoalescingBufferQueue had a bug which could lead to an empty queue while still report bytes left. This was due the fact that we decremented the pending bytes before draining the queue one-by-one. The problem here is that while the queue is drained we may notify the promise which may add again buffers to the queue for which we never decrement the bytes while we drain these\r\n\r\nModifications:\r\n\r\n- Decrement the pending bytes every time we drain a buffer from the queue\r\n- Add unit tests\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/10286",
+    "pr_comments": [
+        "/cc @Entea",
+        "@netty-bot test this please "
+    ],
+    "merged": true,
+    "created_at": "2020-05-14T15:44:55Z",
+    "issue_context": {
+        "number": 10286,
+        "title": "Memory allocation in a loop that leads to a crash",
+        "body": "Hello! Thanks everyone for maintaining such a great project!\r\n\r\nWe've been using netty (via grpc-java) and have seen multiple failures of services. The failure pattern is always the same: under moderate traffic of only 1 tcp connection and 2 streams (via haproxy, but that's another story) grpc-server starts filling up direct memory and old-gen and service crumbles within few minutes.\r\n\r\nThe heap dump showed 20gb of `io.netty.channel.ChannelOutboundBuffer$Entry` objects being queued up, with a strange pattern: 0 bytes (`EmptyByteBuf`) followed by 9 byte `PooledUnsafeDirectByteBuf`, repeating over and over.\r\n\r\nLooking through the source code @sergey-ushakov came up with an observation, that this could only happen if one of the buffers queued up in `CoalescingBufferQueue` could be somehow altered without reflecting it in #readableBytes property. Under these circumstances, `io.netty.handler.codec.http2.DefaultHttp2RemoteFlowController.FlowState#writeAllocatedBytes` can go into an endless loop:\r\n```\r\n                while (!cancelled && (frame = peek()) != null) {\r\n                    int maxBytes = min(allocated, writableWindow());\r\n                    if (maxBytes <= 0 && frame.size() > 0) {\r\n                        break;\r\n                    }\r\n                    writeOccurred = true;\r\n                    int initialFrameSize = frame.size();\r\n                    try {\r\n                        frame.write(ctx, max(0, maxBytes));\r\n                        // -> Here, frame size gets stuck with a positive number, that is never changed.\r\n                        if (frame.size() == 0) {\r\n                            // -> remove never happens!\r\n                            pendingWriteQueue.remove();\r\n                            frame.writeComplete();\r\n                        }\r\n                    } finally {\r\n                        // -> here, allocated is never altered, because initialFrameSize == frame.size()\r\n                        allocated -= initialFrameSize - frame.size();\r\n                    }\r\n                }\r\n```\r\n\r\n### Expected behavior\r\nThe http2 stream should be closed, if `CoalescingBufferQueue` is somehow damaged.\r\n\r\n### Actual behavior\r\n`DefaultHttp2RemoteFlowController.FlowState#writeAllocatedBytes` gets stuck in an endless loop and consumes all available memory.\r\n\r\n### Steps to reproduce\r\nThe original cause is unknown (and I guess haproxy somehow sent something wrong to netty stack). \r\nThe endless loop issue can be reproduced by manually incrementing`CoalescingBufferQueue#readableBytes` in a debugger.\r\n\r\n### Minimal yet complete reproducer code (or URL to code)\r\nN/A\r\n\r\n### Netty version\r\n4.1.x\r\n\r\n### JVM version (e.g. `java -version`)\r\n```\r\njava -version\r\nopenjdk version \"11.0.6\" 2020-01-14\r\nOpenJDK Runtime Environment oracle (build 11.0.6)\r\nOpenJDK 64-Bit Server VM oracle (build 11.0.6, mixed mode)\r\n```\r\n### OS version (e.g. `uname -a`)\r\n```\r\nuname -a\r\nLinux 4.9.0-8-amd64 #1 SMP Debian 4.9.110-3+deb9u6 (2018-10-08) x86_64 GNU/Linux\r\n```",
+        "comments": [
+            "@Entea PTAL https://github.com/netty/netty/pull/10294"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50534,
+            "commit_id": "462dbb87b3552bfa143c992a305ee122a7aa5f1e",
+            "original_commit_id": "2183b37892851dc5d993652a3b9d88f11015366d",
+            "path": "transport/src/main/java/io/netty/channel/AbstractCoalescingBufferQueue.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 343,
+            "original_line": 343,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 56,
+            "subject_type": "line",
+            "review_comments": [
+                "consider just doing `buffer.release()` now that you have the cast, this code is in a try/catch and will ensure all elements are drained.",
+                "let's just keep it as it is for now to keep the changes to a minimum"
+            ]
+        },
+        {
+            "hunk_id": 50533,
+            "commit_id": "462dbb87b3552bfa143c992a305ee122a7aa5f1e",
+            "original_commit_id": "2183b37892851dc5d993652a3b9d88f11015366d",
+            "path": "transport/src/main/java/io/netty/channel/AbstractCoalescingBufferQueue.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 232,
+            "original_line": 232,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "If you suppose that\r\n\"while the queue is drained we may notify the promise which may add again buffers to the queue\", the fix seems not correct enough.\r\n\r\nThrere is raise condition between incrementReadableBytes\r\n```\r\nint nextReadableBytes = readableBytes + increment;\r\n...\r\nreadableBytes = nextReadableBytes;\r\n```\r\nand decrementReadableBytes\r\n`readableBytes -= decrement;`\r\n\r\nSeems to me #readableBytes should be AtomicInteger.\r\n\r\nassert readableBytes == 0; // looks cool\r\n",
+                "@progulin maybe I am missing something but this is only meant to be used by a single thread. What race you are talking about ?",
+                "I supposed writeAndRemoveAll/releaseAndCompleteAll is one thread and another which does add/addFirst.\r\nIf single thread is used, there is no sence to duplicate decrementReadableBytes() calls.\r\nUnpached version set readableBytes to zero `decrementReadableBytes(readableBytes);` and clear queue into cycle `for (;;)`. The same does patched.\r\n",
+                "@progulin yes all is the single threaded... Sorry I have no idea what you are talking about. The problem is the promise may be notified and so the `ChannelFutureListener` may call `add(...)` while we are in the for loop. All of this is in the same thread. Just run the unit test with the unpatched version and you will see it fails. ",
+                "> ChannelFutureListener may call add(...)\r\n\r\nUgu! Now I see. Thank you. Great patch.\r\n"
+            ]
+        }
+    ]
+}

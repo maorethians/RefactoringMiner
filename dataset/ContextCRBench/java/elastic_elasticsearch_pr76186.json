@@ -1,0 +1,151 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 76186,
+    "lang": "java",
+    "pr_title": "Track cancellable tasks by parent ID",
+    "pr_body": "Today when cancelling a task with its descendants we perform a linear\r\nscan through all the tasks looking for the few that have the right\r\nparent ID. With potentially hundreds of thousands of tasks this takes\r\nquite some time, particularly if there are many tasks to cancel.\r\n\r\nThis commit introduces a second map that tracks the tasks by their\r\nparent ID so that it's super-cheap to find the descendants that need to\r\nbe cancelled.\r\n\r\nCloses #75316",
+    "pr_comments": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "My biggest concern with this right now is the `can_match` phase of a search which I believe will make a child task of the same parent for every shard on a node. That might be hundreds of shards, and updating the new map is O(N^2) in the number of children. It might be ok since these tasks are handled directly on the transport worker thread which naturally limits the concurrency (to 6 by default) but that seems pretty implicit. It'd be awfully nice if we batched these up at the node level instead tho.",
+        "I wrote a simple benchmark:\r\n\r\n<details>\r\n\r\n```\r\n/*\r\n * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\r\n * or more contributor license agreements. Licensed under the Elastic License\r\n * 2.0 and the Server Side Public License, v 1; you may not use this file except\r\n * in compliance with, at your election, the Elastic License 2.0 or the Server\r\n * Side Public License, v 1.\r\n */\r\n\r\npackage org.elasticsearch.benchmark.tasks;\r\n\r\nimport org.elasticsearch.common.Randomness;\r\nimport org.elasticsearch.tasks.CancellableTask;\r\nimport org.elasticsearch.tasks.CancellableTasksTracker;\r\nimport org.elasticsearch.tasks.Task;\r\nimport org.elasticsearch.tasks.TaskId;\r\nimport org.openjdk.jmh.annotations.Benchmark;\r\nimport org.openjdk.jmh.annotations.BenchmarkMode;\r\nimport org.openjdk.jmh.annotations.Fork;\r\nimport org.openjdk.jmh.annotations.Measurement;\r\nimport org.openjdk.jmh.annotations.Mode;\r\nimport org.openjdk.jmh.annotations.OutputTimeUnit;\r\nimport org.openjdk.jmh.annotations.Param;\r\nimport org.openjdk.jmh.annotations.Scope;\r\nimport org.openjdk.jmh.annotations.Setup;\r\nimport org.openjdk.jmh.annotations.State;\r\nimport org.openjdk.jmh.annotations.Warmup;\r\n\r\nimport java.util.ArrayList;\r\nimport java.util.List;\r\nimport java.util.concurrent.TimeUnit;\r\n\r\nimport static java.util.Collections.emptyMap;\r\n\r\n@Warmup(iterations = 5)\r\n@Measurement(iterations = 7)\r\n@BenchmarkMode(Mode.AverageTime)\r\n@OutputTimeUnit(TimeUnit.NANOSECONDS)\r\n@State(Scope.Thread)\r\n@Fork(value = 1)\r\npublic class CancellableTasksTrackerBenchmark {\r\n\r\n    @Param({\"30000\", \"3000\", \"300\", \"30\", \"3\"})\r\n    private int parentCount;\r\n\r\n    @Param({\"1000\", \"100\", \"10\", \"1\"})\r\n    private int childCountPerParent;\r\n\r\n    private List<BenchmarkTask> benchmarkTasks;\r\n    private CancellableTasksTracker<String> cancellableTasksTracker;\r\n    private TaskId targetParent;\r\n\r\n    @Setup\r\n    public void createTasks() {\r\n        final int taskCount = parentCount * childCountPerParent;\r\n        benchmarkTasks = new ArrayList<>(taskCount);\r\n        for (int i = 0; i < taskCount; i++) {\r\n            benchmarkTasks.add(new BenchmarkTask(i % parentCount, i / parentCount, i));\r\n        }\r\n        Randomness.shuffle(benchmarkTasks);\r\n        cancellableTasksTracker = new CancellableTasksTracker<>(String.class, String[]::new);\r\n        targetParent = new TaskId(\"node\", parentCount / 2);\r\n    }\r\n\r\n    @Benchmark\r\n    public long trackTasks() {\r\n        for (BenchmarkTask benchmarkTask : benchmarkTasks) {\r\n            cancellableTasksTracker.put(benchmarkTask.task, benchmarkTask.payload);\r\n        }\r\n\r\n        final long count = cancellableTasksTracker.getByParent(targetParent).count();\r\n\r\n        if (count != childCountPerParent) {\r\n            throw new AssertionError(\"wrong count: \" + count);\r\n        }\r\n\r\n        for (BenchmarkTask benchmarkTask : benchmarkTasks) {\r\n            cancellableTasksTracker.remove(benchmarkTask.task);\r\n        }\r\n\r\n        return count;\r\n    }\r\n\r\n    private static class BenchmarkTask {\r\n        final int parentIndex;\r\n        final int childIndex;\r\n        final Task task;\r\n        final String payload;\r\n\r\n        public BenchmarkTask(int parentIndex, int childIndex, long taskId) {\r\n            this.parentIndex = parentIndex;\r\n            this.childIndex = childIndex;\r\n            this.task = new CancellableTask(taskId, \"test\", \"action\", \"\", new TaskId(\"node\", parentIndex), emptyMap());\r\n            this.payload = \"task-\" + taskId + \"-child-\" + childIndex + \"-parent-\" + parentIndex;\r\n        }\r\n    }\r\n}\r\n```\r\n</details>\r\n\r\nThese times track adding and then removing all the tasks; even with 30000 parent tasks each with 1000 child tasks the mean overhead per task is ~2.2\u00b5s.\r\n\r\n```\r\n(childCountPerParent)  (parentCount)  Mode  Cnt            Score            Error  Units  Mean overhead\r\n                 1000          30000  avgt    7  67980271397.429 \u00b1 4994967681.178  ns/op        2266 ns\r\n                 1000           3000  avgt    7   4569715417.524 \u00b1 2111582392.913  ns/op        1523 ns\r\n                 1000            300  avgt    7    246249754.634 \u00b1    2054156.379  ns/op         820 ns\r\n                 1000             30  avgt    7     21136582.188 \u00b1    4286645.660  ns/op         704 ns\r\n                 1000              3  avgt    7      1602687.020 \u00b1      67016.293  ns/op         534 ns\r\n                  100          30000  avgt    7   3136513434.357 \u00b1   92213951.212  ns/op        1045 ns\r\n                  100           3000  avgt    7    120281883.393 \u00b1    4909672.536  ns/op         400 ns\r\n                  100            300  avgt    7      8515642.306 \u00b1     442334.003  ns/op         283 ns\r\n                  100             30  avgt    7       587387.451 \u00b1      27483.477  ns/op         195 ns\r\n                  100              3  avgt    7        47650.830 \u00b1        587.080  ns/op         158 ns\r\n                   10          30000  avgt    7    142939788.670 \u00b1    9858893.675  ns/op         476 ns\r\n                   10           3000  avgt    7      5624404.751 \u00b1     386408.517  ns/op         187 ns\r\n                   10            300  avgt    7       425179.307 \u00b1      13136.734  ns/op         141 ns\r\n                   10             30  avgt    7        37709.674 \u00b1       2988.665  ns/op         125 ns\r\n                   10              3  avgt    7         3535.776 \u00b1        173.179  ns/op         117 ns\r\n                    1          30000  avgt    7      4452360.723 \u00b1     494622.243  ns/op         148 ns\r\n                    1           3000  avgt    7       391214.089 \u00b1      18580.306  ns/op         130 ns\r\n                    1            300  avgt    7        46769.278 \u00b1      16795.350  ns/op         155 ns\r\n                    1             30  avgt    7         3648.374 \u00b1        468.714  ns/op         121 ns\r\n                    1              3  avgt    7          385.357 \u00b1         30.390  ns/op         128 ns\r\n```",
+        "I reverted the \"optimisation\" for the one-item case because the same benchmark indicates it's actually slightly slower, even in the runs when there's only one child task per parent.\r\n\r\n```\r\n(childCountPerParent)  (parentCount)  Mode  Cnt            Score            Error  Units  Mean overhead\r\n                 1000          30000  avgt    7  67134033515.714 \u00b1 5033933634.050  ns/op        2238 ns\r\n                 1000           3000  avgt    7   4236755545.619 \u00b1   61234713.992  ns/op        1412 ns\r\n                 1000            300  avgt    7    232844652.583 \u00b1    4661204.334  ns/op         776 ns\r\n                 1000             30  avgt    7     18675622.451 \u00b1     560322.362  ns/op         623 ns\r\n                 1000              3  avgt    7      1530250.913 \u00b1      14278.994  ns/op         510 ns\r\n                  100          30000  avgt    7   2956281942.714 \u00b1   62127970.363  ns/op         985 ns\r\n                  100           3000  avgt    7    104351606.728 \u00b1    1645461.830  ns/op         348 ns\r\n                  100            300  avgt    7      7655082.583 \u00b1     103660.312  ns/op         255 ns\r\n                  100             30  avgt    7       521039.197 \u00b1      18967.814  ns/op         174 ns\r\n                  100              3  avgt    7        43946.254 \u00b1        266.907  ns/op         146 ns\r\n                   10          30000  avgt    7    145160690.114 \u00b1    3963524.892  ns/op         484 ns\r\n                   10           3000  avgt    7      5117603.806 \u00b1     187243.301  ns/op         171 ns\r\n                   10            300  avgt    7       421472.832 \u00b1      11077.558  ns/op         140 ns\r\n                   10             30  avgt    7        36384.819 \u00b1        814.380  ns/op         121 ns\r\n                   10              3  avgt    7         3518.711 \u00b1        177.121  ns/op         117 ns\r\n                    1          30000  avgt    7      4274559.294 \u00b1      70630.509  ns/op         142 ns\r\n                    1           3000  avgt    7       389427.491 \u00b1       8577.194  ns/op         130 ns\r\n                    1            300  avgt    7        36697.487 \u00b1        666.284  ns/op         122 ns\r\n                    1             30  avgt    7         3421.890 \u00b1        103.902  ns/op         114 ns\r\n                    1              3  avgt    7          366.648 \u00b1          3.457  ns/op         122 ns\r\n```",
+        "The version in 76ed88962f3 (== 03cf0a9) is a slight improvement at larger child counts and ~no difference otherwise.\r\n\r\n```\r\n(childCountPerParent)  (parentCount)  Mode  Cnt            Score            Error  Units  Mean overhead\r\n                 1000          30000  avgt    7  57538573339.000 \u00b1 1104612283.253  ns/op        1918 ns\r\n                 1000           3000  avgt    7   4003685036.000 \u00b1  198740962.106  ns/op        1335 ns\r\n                 1000            300  avgt    7    219989120.589 \u00b1    8365899.700  ns/op         733 ns\r\n                 1000             30  avgt    7     16874024.911 \u00b1     193951.882  ns/op         562 ns\r\n                 1000              3  avgt    7      1327812.381 \u00b1      80334.396  ns/op         443 ns\r\n                  100          30000  avgt    7   2852655991.393 \u00b1   57674477.573  ns/op         951 ns\r\n                  100           3000  avgt    7    119850366.740 \u00b1    1403569.814  ns/op         400 ns\r\n                  100            300  avgt    7      7668485.509 \u00b1     136576.566  ns/op         256 ns\r\n                  100             30  avgt    7       472136.967 \u00b1      13905.206  ns/op         157 ns\r\n                  100              3  avgt    7        37112.812 \u00b1        177.624  ns/op         124 ns\r\n                   10          30000  avgt    7    140966921.858 \u00b1    1561421.755  ns/op         470 ns\r\n                   10           3000  avgt    7      5151352.980 \u00b1     280335.160  ns/op         172 ns\r\n                   10            300  avgt    7       397245.162 \u00b1       8335.522  ns/op         132 ns\r\n                   10             30  avgt    7        34949.180 \u00b1        800.483  ns/op         116 ns\r\n                   10              3  avgt    7         3360.763 \u00b1        178.012  ns/op         112 ns\r\n                    1          30000  avgt    7      4236124.666 \u00b1     139988.026  ns/op         141 ns\r\n                    1           3000  avgt    7       415290.801 \u00b1       4607.121  ns/op         138 ns\r\n                    1            300  avgt    7        37496.980 \u00b1        983.645  ns/op         125 ns\r\n                    1             30  avgt    7         3541.204 \u00b1        295.871  ns/op         118 ns\r\n                    1              3  avgt    7          378.129 \u00b1          8.648  ns/op         126 ns\r\n```"
+    ],
+    "merged": true,
+    "created_at": "2021-08-09T09:03:45Z",
+    "issue_context": {
+        "number": 75316,
+        "title": "Performance regression starting from 7.8.0 when too many search requests closes before getting result",
+        "body": "\r\n\r\n**Elasticsearch version** (`bin/elasticsearch --version`):\r\n`7.10.2`\r\n\r\n**Plugins installed**: []\r\n\r\n**JVM version** (`java -version`):\r\n```\r\nopenjdk 15.0.1 2020-10-20\r\nOpenJDK Runtime Environment AdoptOpenJDK (build 15.0.1+9)\r\nOpenJDK 64-Bit Server VM AdoptOpenJDK (build 15.0.1+9, mixed mode, sharing)\r\n```\r\n\r\n**OS version** (`uname -a` if on a Unix-like system):\r\n`Linux HOSTNAME 3.10.0-1160.31.1.el7.x86_64 #1 SMP Thu Jun 10 13:32:12 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux`\r\n\r\n**Description of the problem including expected versus actual behavior**:\r\nAfter the upgrade of the ES from 7.6.2 to 7.10.2 one of our clusters become degraded a lot in terms of latency and throughput. After a big and long investigation, I [found the suspect](https://github.com/elastic/elasticsearch/commit/61e5350e770966172cd64430661eeb903bc94518). It looks like starting from 7.8.0, we have this performance regression, even in the latest 7.13.3.\r\nOur cluster has a unique workload that is used mainly for testing purposes. We are evaluating ElasticSearch as a DB backed for our app, and to gather some performance metrics in the long run, we have a \"shadow traffic,\" which has mirror requests from our production app to ES, but if the gateway can get a response faster from its main data source than from ES, it will close request, and Nginx shows that as 499 status code. As a side-effect, I can't use almost any /_cat API requests. This is the example:\r\n\r\n```\r\n$ > time curl -sS localhost:9200/_cat/tasks | awk '{print $1}' | sort | uniq -c\r\n0.01user 0.15system 6:01.05elapsed 0%CPU (0avgtext+0avgdata 1232maxresident)k\r\n0inputs+0outputs (0major+350minor)pagefaults 0swaps\r\n 256591 cluster:admin/tasks/cancel\r\n   2243 cluster:admin/tasks/cancel[n]\r\n     23 cluster:monitor/nodes/info\r\n     39 cluster:monitor/nodes/stats\r\n      1 cluster:monitor/stats\r\n     18 cluster:monitor/tasks/lists\r\n     83 cluster:monitor/tasks/lists[n]\r\n 121370 indices:data/read/msearch\r\n 121370 indices:data/read/search\r\n     10 indices:data/read/search[can_match]\r\n      3 indices:data/read/search[phase/fetch/id]\r\n    141 indices:data/read/search[phase/query]\r\n   2243 internal:admin/tasks/ban\r\n``` \r\n\r\nWhile cluster has a load of search requests - I can't get much from it. Latency skyrockets from 400ms(99 percentile) to 20seconds - 120seconds ( 99percentile ) \r\n\r\n\r\n**Steps to reproduce**:\r\n\r\nI was able to write [simple script](https://gist.github.com/libbkmz/199891acb668f6fff6a677d47f29b85d) which can reproduce the issue, unfortunately, one active instance is not enough, and to simulate our real production shadow workload, I have had to run 5 instances to get stuck in [setBan method](https://github.com/elastic/elasticsearch/blob/v7.10.2/server/src/main/java/org/elasticsearch/tasks/TaskManager.java#L354). Also, I'm attaching java flame graph captured by async-profiler for this particular problem. [es_setban_bug.flamegraph.html.gz](https://github.com/elastic/elasticsearch/files/6812577/es_setban_bug.flamegraph.html.gz)\r\n\r\nMoreover, I don't know how good our search query parameters, but this one is very intensive, and we have a lot of queries like this, and I'm able to reproduce the issue with such a simple script. \r\n\r\nOur cluster has 83 nodes in total, with 73 of data nodes, 3 master nodes, and 6 proxy nodes. However, we found some issues with our hardware, and we were using only 1 proxy node for more than 2 months. So, all the ES requests come to a single ES instance with flags `it` only on version 7.10.2. But using more than 1 proxy node doesn't help at all - the outcome is the same...\r\n",
+        "comments": [
+            "Pinging @elastic/es-distributed (Team:Distributed)",
+            "The flame graph shows spending ~25% of the total time collecting the children of the banned parent:\r\n\r\n<img width=\"965\" alt=\"image\" src=\"https://user-images.githubusercontent.com/5058284/125584372-89f6c076-2344-400a-a63d-8894c45c208a.png\">\r\n\r\nA linear search through 250k cancellable tasks will take some time indeed:\r\n\r\nhttps://github.com/elastic/elasticsearch/blob/68817d7ca29c264b3ea3f766737d81e2ebb4028c/server/src/main/java/org/elasticsearch/tasks/TaskManager.java#L393-L396\r\n\r\n",
+            "> A linear search through 250k cancellable tasks will take some time indeed:\r\n\r\nAnd this number grows...\r\n\r\nWhen I run only one instance of the script, ES can \"chew\" it for a long period of time without an increase in latencies and the number of tasks. However, after adding couple more instances of the workload script, the length of the tasks queue goes to the sky. After I got these results,  I couldn't get any more output from /_cat/tasks even after 30 minutes of waiting by curl.... Only after I stopped my scripts, I got the results immediately... ",
+            "> After I got these results, I couldn't get any more output from /_cat/tasks even after 30 minutes of waiting by curl\r\n\r\nI suspect this is better (or at least different) in 7.13 thanks to  #71171.",
+            "My production setup consists of ~80 boxes with 2 CPUs and 16threads in each. 128GB RAM on each. So, I still have 5 threads for the MANAGEMENT pool.\r\nI have upgraded the cluster from 7.10.2 to 7.13.3. And now it behaves even worse. After starting the workload script, I can't receive any /_cat API after I stopped the script even after 30 minutes. So, I can't share the _cat/tasks numbers with 7.13.3 ... \r\n\r\nThe flame graph shows worse time consumption for `setBan`. [es_7.13.3.setBan.flamegraph.html.gz](https://github.com/elastic/elasticsearch/files/6831975/es_7.13.3.setBan.flamegraph.html.gz)\r\n\r\n<img width=\"1680\" alt=\"image\" src=\"https://user-images.githubusercontent.com/1144960/125977124-4356fed4-0e18-4e98-84b3-ebc38806d72e.png\">\r\n\r\n\r\n\r\n\r\nAlso, it looks like I get data loss on a different cluster because of the `setBan` bugs...\r\n`Cannot send ban for tasks with the parent [...:...] to the node [...]`\r\n\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 36269,
+            "commit_id": "e0ea7a10cfe3ec337405cf5efa1c058bf8eececc",
+            "original_commit_id": "574211654da444930a19acc8dda95495e1328fed",
+            "path": "server/src/test/java/org/elasticsearch/tasks/CancellableTasksTrackerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 66,
+            "original_line": 64,
+            "side": "RIGHT",
+            "original_position": 64,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "I am not entirely sure we would ever see state==2 in other threads, I would think it would be ok for the JVM to optimize it away.\r\n\r\nThis is possibly even true for the entire `actionThread` since there is no synchronization with the watch threads here. The watch threads may only see the the final output. I would advocate a yield should help, but that is outside JMM I think.",
+                "Ah, an earlier iteration had some assertions in between these calls. In theory you're right that it would be legitimate for the compiler to collapse these tests to something fairly trivial, but in practice they do cover many interleavings and the other threads do indeed observe `state==2` cases. Just try adding bugs :) I'll add a `yield` anyway."
+            ]
+        },
+        {
+            "hunk_id": 36268,
+            "commit_id": "e0ea7a10cfe3ec337405cf5efa1c058bf8eececc",
+            "original_commit_id": "574211654da444930a19acc8dda95495e1328fed",
+            "path": "server/src/main/java/org/elasticsearch/tasks/CancellableTasksTracker.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 34,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 31,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we extend `TaskAssertions.assertAllCancellableTasksAreCancelled` and perhaps even `ESIntegTestCase` to verify that the two maps are in sync after tests have completed (at least that the `byParentId` map only contains items that are also in the `byTaskId` map).\r\n\r\nWe could consider doing it in an assertion too but doing it concurrently while running might be difficult?",
+                "Yes I don't think we can express any true invariants very easily; I added an eventually-true assertion in 9554f12527d2253f43ac6858f126a56b4d445582."
+            ]
+        },
+        {
+            "hunk_id": 36273,
+            "commit_id": "e0ea7a10cfe3ec337405cf5efa1c058bf8eececc",
+            "original_commit_id": "574211654da444930a19acc8dda95495e1328fed",
+            "path": "server/src/main/java/org/elasticsearch/tasks/CancellableTasksTracker.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 26,
+            "original_line": 23,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "Can `empty` be a constant? It doesn't seems to modified anywhere and it's used in `Arrays.copyOf`.",
+                "Again I didn't find a way to do so, but you're welcome to show me how :)",
+                "Why does this have to be a generic, `T == CancellableTaskHolder` is the only use case we have isn't it?",
+                "Yeah in production, I didn't want to make `CancellableTaskHolder` public just for the tests and I don't think it makes a performance difference. I could be persuaded.",
+                "> I don't think it makes a performance difference. I could be persuaded.\r\n\r\nNah there isn't any difference I think lets leave it as is then IMO :) "
+            ]
+        },
+        {
+            "hunk_id": 36271,
+            "commit_id": "e0ea7a10cfe3ec337405cf5efa1c058bf8eececc",
+            "original_commit_id": "574211654da444930a19acc8dda95495e1328fed",
+            "path": "server/src/test/java/org/elasticsearch/tasks/CancellableTasksTrackerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 178,
+            "original_line": 174,
+            "side": "RIGHT",
+            "original_position": 174,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "I think we should also check the more trivial case where no parent id is set.",
+                "Maybe I misunderstand, I think we already do?\r\n\r\n```\r\n                    rarely() ? TaskId.EMPTY_TASK_ID : randomFrom(parentTaskIds),\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 36270,
+            "commit_id": "e0ea7a10cfe3ec337405cf5efa1c058bf8eececc",
+            "original_commit_id": "574211654da444930a19acc8dda95495e1328fed",
+            "path": "server/src/test/java/org/elasticsearch/tasks/CancellableTasksTrackerTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 79,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 79,
+            "subject_type": "line",
+            "review_comments": [
+                "Should this not always run at least until state.get() ==4 (and then another round)?",
+                "I found that this sometimes noticeably added to the test runtime, we spent ages doing this loop before actually doing the useful work. Again, in practice this covers what we care about."
+            ]
+        },
+        {
+            "hunk_id": 36272,
+            "commit_id": "e0ea7a10cfe3ec337405cf5efa1c058bf8eececc",
+            "original_commit_id": "574211654da444930a19acc8dda95495e1328fed",
+            "path": "server/src/main/java/org/elasticsearch/tasks/CancellableTasksTracker.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 34,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 31,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "Does it make sense to store tasks as `List<T>` instead of `T[]` for the clarity sake if we don't do any specific optimizations? We could simplify code by relying on the `List` API for copying and inserting data instead of `Arrays.copyOf` and `Arrays.copyOfRange`",
+                "I didn't find a better `List<T>`-based implementation myself, but I'm open to ideas. Would you pull this branch, flesh out your suggestion, push it to your fork and then link to it here?",
+                "@DaveCTurner Pushed it here! https://github.com/arteam/elasticsearch/commit/a2bdcfbd80b37f509586f4aadf7922dab8da909e",
+                "We can also consider using `merge` instead of `concat` for Lists to make the addition operation more concise \r\nhttps://github.com/arteam/elasticsearch/commit/a50401fa7b5f77b7c638f624b27b89ea619f002c",
+                "The benchmarks indicate that https://github.com/arteam/elasticsearch/commit/a2bdcfbd80b37f509586f4aadf7922dab8da909e is a few nanoseconds quicker for the 1-child case but quite substantially slower otherwise (I skipped the 30k-parent cases because they add a lot to the runtime for no real benefit):\r\n\r\n```\r\n(childCountPerParent)  (parentCount)  Mode  Cnt            Score           Error  Units  Mean overhead\r\n                 1000          30000                     SKIPPED\r\n                 1000           3000  avgt    7  25940199095.000 \u00b1 142227031.895  ns/op        8647 ns     \r\n                 1000            300  avgt    7   2392018166.114 \u00b1  30498397.694  ns/op        7973 ns     \r\n                 1000             30  avgt    7    218739912.786 \u00b1   1249128.187  ns/op        7291 ns     \r\n                 1000              3  avgt    7     22607793.973 \u00b1    111531.112  ns/op        7536 ns     \r\n                  100          30000                     SKIPPED\r\n                  100           3000  avgt    7    418881040.660 \u00b1  20161249.132  ns/op        1396 ns     \r\n                  100            300  avgt    7     35457186.201 \u00b1    417486.108  ns/op        1182 ns     \r\n                  100             30  avgt    7      3033577.940 \u00b1     97236.034  ns/op        1011 ns     \r\n                  100              3  avgt    7       299040.083 \u00b1     18249.359  ns/op         997 ns     \r\n                   10          30000                     SKIPPED\r\n                   10           3000  avgt    7     12848626.628 \u00b1    235736.397  ns/op         428 ns     \r\n                   10            300  avgt    7       855412.478 \u00b1      5594.042  ns/op         285 ns     \r\n                   10             30  avgt    7        82910.096 \u00b1      2885.424  ns/op         276 ns     \r\n                   10              3  avgt    7         7580.669 \u00b1        28.137  ns/op         253 ns     \r\n                    1          30000                     SKIPPED\r\n                    1           3000  avgt    7       302676.158 \u00b1      8294.205  ns/op         101 ns     \r\n                    1            300  avgt    7        29608.966 \u00b1       889.803  ns/op          99 ns     \r\n                    1             30  avgt    7         2935.642 \u00b1        42.769  ns/op          98 ns     \r\n                    1              3  avgt    7          310.498 \u00b1         1.610  ns/op         103 ns     \r\n```\r\n\r\nThis code is on a fairly hot path, every time a search touches a shard it will register and unregister a cancellable task for instance, a cluster could be handling thousands of searches per second each touching thousands of shards, so I think it's worth dropping to the raw arrays even if it is a bit harder to read.\r\n\r\nI'd also be concerned about the additional memory usage and GC workload, we're making and growing an `ArrayList` in each `.stream().filter(item -> item != oldItem).collect(Collectors.toList())`, which adds quite some overhead, although I will admit I haven't measured this.\r\n",
+                "That sounds alright! I think it totally makes sense to use raw arrays in hot paths :+1: "
+            ]
+        }
+    ]
+}

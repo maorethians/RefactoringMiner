@@ -1,0 +1,59 @@
+{
+    "repo": "pola-rs/polars",
+    "pr_number": 10140,
+    "lang": "rust",
+    "pr_title": "feat(rust): serialize flags",
+    "pr_body": "fix #9956 \r\n\r\nVery much work in progress, but wanted to get feedback before going further. Serializing the flags is straightforward as we can add them to the map. \r\n\r\nDeserialization however not so much:\r\n\r\n- The bit flags can be of different types (ChunkedArray<T> / CategoricalChunked) hence we would need a common ground or create a temporary representation (e.g. Enum of all bitsettings). I choose the first, but this exposes u8 to the outside.\r\n\r\n- Where to implement setting the flags. I choose to not do it on the series directly as not all ChunkedXXX implementations necessarily have flags. This would slightly complicate deserialization as we have to first construct the chunkedarray, alter the bit flags and then call `.into_series`",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2023-07-31T06:22:15Z",
+    "issue_context": {
+        "number": 9956,
+        "title": "Dataframe flags are not preserved by pickling/unpickling",
+        "body": "### Checks\n\n- [X] I have checked that this issue has not already been reported.\n\n- [X] I have confirmed this bug exists on the [latest version](https://pypi.org/project/polars/) of Polars.\n\n\n### Reproducible example\n\n```python\r\n>>> import pickle\r\n>>> df1 = pl.DataFrame({\"x\": [1, 2, 3]}).set_sorted(\"x\"); df1[\"x\"].flags\r\n{'SORTED_ASC': True, 'SORTED_DESC': False}\r\n>>> df2 = pickle.loads(pickle.dumps(df1)); df2[\"x\"].flags\r\n{'SORTED_ASC': False, 'SORTED_DESC': False}\r\n```\r\n\n\n### Issue description\n\nWhen running long-running computations such as data retrieval, I sometimes use caching strategies such as `functools.lru_cache` or `diskcache.Cache` to cache the results with minimum efforts.\r\nOftentimes these tools use `pickle` for serializing/deserializing, but it seems like this doesn't preserve the flags, and in particular the \"SORTED_*\" ones.\r\nA typical use case would be something like:\r\n\r\n```python\r\nimport diskcache\r\n\r\ncache = diskcache.Cache(mycachedir)\r\n\r\n@cache.memoize(expire=3600)\r\ndef get_latest_data(id: str) -> pl.DataFrame:\r\n    # do a very slow thing\r\n    return df.set_sorted(\"time\")\r\n\r\ndef get_analyzed_data(id: str) -> pl.DataFrame:\r\n    data = get_latest_data(id: str)\r\n    # do something using the sorted property of data\r\n    # ERROR\r\n```\r\n\r\nI traced this issue back to the pickling/unpickling behaviour I displayed above, but I'm not sure _why_ that happens.\r\nIf that's an easy fix that would certainly make my life much easier.\r\nOtherwise I'm guessing I could try and come up with my own parquet-based on-disk caching utility, but that would be a big overhead compared to the example above.\r\nI could also keep doing that I'm doing, always rerunning `.sort(\"x\")` whenever it is needed, but that's making the code very verbose and potentially slower than usual (I do a _lot_ of asof joins!).\n\n### Expected behavior\n\n```python\r\nassert df2[\"x\"].flags == {'SORTED_ASC': False, 'SORTED_DESC': False}\r\n```\n\n### Installed versions\n\n<details>\r\n\r\n```\r\n--------Version info---------\r\nPolars:              0.18.7\r\nIndex type:          UInt32\r\nPlatform:            Windows-10-10.0.19045-SP0\r\nPython:              3.11.2 (tags/v3.11.2:878ead1, Feb  7 2023, 16:38:35) [MSC v.1934 64 bit (AMD64)]\r\n\r\n----Optional dependencies----\r\nadbc_driver_sqlite:  <not installed>\r\nconnectorx:          0.3.2a7\r\ndeltalake:           <not installed>\r\nfsspec:              2023.6.0\r\nmatplotlib:          3.7.2\r\nnumpy:               1.25.0\r\npandas:              1.5.3\r\npyarrow:             12.0.1\r\npydantic:            <not installed>\r\nsqlalchemy:          2.0.19\r\nxlsx2csv:            0.8.1\r\nxlsxwriter:          <not installed>\r\n```\r\n\r\n</details>\r\n",
+        "comments": [
+            "It should be pretty straightforward to add the settings flags to the serde implementations for the chunked_arrays. `polars/polars-core/src/serde/chunked_array.rs`",
+            "Yes, it is. We should add the flags to the serde struct we serialize."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 53237,
+            "commit_id": "2427fd90e8df628a2dca35aa40b8a93c475a15bf",
+            "original_commit_id": "0161b8c2021071714bfcba8f15996d2d59e08731",
+            "path": "crates/polars-core/src/series/implementations/boolean.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 28,
+            "original_line": 28,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "Nice! On a next PR we can remove `_set_sorted_flag` and `_get_sorted_flag` from the `dyn Trait` and simply dispatch that from the `Series` struct to these `_get_flags` and `_set_flags`. Saves 2 entries in the vtable."
+            ]
+        },
+        {
+            "hunk_id": 53236,
+            "commit_id": "2427fd90e8df628a2dca35aa40b8a93c475a15bf",
+            "original_commit_id": "0161b8c2021071714bfcba8f15996d2d59e08731",
+            "path": "crates/polars-core/src/serde/series.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 232,
+            "original_line": 232,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "We can write this a little more functional:\r\n\r\n\r\n```rust\r\nbit_settings.map_or(\r\n    Ok(s),\r\n    |s| s.set_flags(f)\r\n          .map_err(|_| de::Error::custom(\"bit flags are corrupt\"))) // custom of no capitals in error msg\r\n);\r\n\r\nOr maybe the order of these arguments swapped. :thinking: (didn't compile it)\r\n```",
+                "This would not work AFAIK as the `Ok(s)` moves the value and you can not reuse it again. Also `set_flags()` does not return the series so we would need to add an extra statement.\r\n\r\nHappy to convert to something more idiomatic but can not come up with it",
+                "Ah, right. Then we can at least do the `map_err` part. "
+            ]
+        }
+    ]
+}

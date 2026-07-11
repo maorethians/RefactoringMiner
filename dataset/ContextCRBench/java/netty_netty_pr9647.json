@@ -1,0 +1,77 @@
+{
+    "repo": "netty/netty",
+    "pr_number": 9647,
+    "lang": "java",
+    "pr_title": "Fix DnsNameResolver TCP fallback test and message leaks",
+    "pr_body": "Motivation\r\n\r\nA memory leak related to DNS resolution was reported in #9634, specifically linked to the TCP retry fallback functionality that was introduced relatively recently. Upon inspection it's apparent that there\r\nare some error paths where the original UDP response might not be fully released, and more significantly the TCP response actually leaks every time on the fallback success path.\r\n\r\nIt turns out that a bug in the unit test meant that the intended TCP fallback path was not actually exercised, so it did not expose the main leak in question.\r\n\r\nModifications\r\n\r\n- Fix `DnsNameResolverTest#testTruncated0` dummy server fallback logic to first read transaction id of retried query and use it in replayed response\r\n- Adjust semantic of internal `DnsQueryContext#finish` method to always take refcount ownership of passed in envelope\r\n- Reorder some logic in `DnsResponseHandler` fallback handling to verify the context of the response is expected, and ensure that the query response are either released or propagated in all cases. This also reduces a number of redundant retain/release pairings\r\n\r\nResult\r\n\r\nFixes #9634",
+    "pr_comments": [
+        "Can one of the admins verify this patch?",
+        "The changes look bigger than they are due to some reordering and indentation changes, recommend viewing diff with `w=1` :)",
+        "@netty-bot test this please ",
+        "@njhill please rebase ",
+        "@normanmaurer addressed comments, PTAL",
+        "@netty-bot test this please ",
+        "@dziemba can you verify this one as well ?",
+        "@normanmaurer I've built a local snapshot from this branch (fa84a02fb) and ran the reproduction script and some additional internal test suites we have. \r\n\r\nLooks all good now, no more leaks \ud83c\udf89 \r\n\r\nThanks a lot for the quick fix! ",
+        "@netty-bot test this please "
+    ],
+    "merged": true,
+    "created_at": "2019-10-10T19:07:54Z",
+    "issue_context": {
+        "number": 9634,
+        "title": "DNS Resolver leaking direct memory",
+        "body": "### Expected behavior\r\n\r\nDNS resolver does not leak direct memory when buffers are freed correctly.\r\n\r\n### Actual behavior\r\n\r\nMemory is leaked, JVM runs out of direct memory.\r\n\r\n```\r\n[error] Exception in thread \"main\" io.netty.resolver.dns.DnsNameResolverException: [/10.0.2.3:53] failed to send a query via UDP (no stack trace available)\r\n[error] Caused by: io.netty.handler.codec.EncoderException: io.netty.util.internal.OutOfDirectMemoryError: failed to allocate 16777216 byte(s) of direct memory (used: 234881024, max: 239075328)\r\n```\r\nfull stacktrace: https://gist.github.com/dziemba/ffeb8f2c3b131a74c042746151ac05c0\r\n\r\n### Steps to reproduce\r\n\r\n- Use `DnsNameResolver.resolveAll` to query SRV records for a name that contains a lot of answers (e.g. `hugedns.test.dziemba.net`)\r\n-  Run query repeatedly and `.release()` returned DNS records. \r\n- Watch java process memory usage increase until it finally throws with `io.netty.util.internal.OutOfDirectMemoryError`\r\n\r\nIt might be important that the DNS response is large so it gets truncated and then retried via TCP.\r\n\r\n### Minimal yet complete reproducer code (or URL to code)\r\n\r\nhttps://gist.github.com/dziemba/c904d227d105b6fc7cf00495257fbb40\r\n- run with `-Xmx128m -XX:MaxDirectMemorySize=4m` to make it fail quickly\r\n- will fail as described after around 100-200 iterations (with above settings)\r\n- sometimes it fails with actual network errors, re-run a few times if that happens\r\n\r\n### Netty version\r\n\r\n`4.1.42.Final`\r\n\r\n### JVM version (e.g. `java -version`)\r\n```\r\nopenjdk version \"1.8.0_222\"\r\nOpenJDK Runtime Environment (AdoptOpenJDK)(build 1.8.0_222-b10)\r\nOpenJDK 64-Bit Server VM (AdoptOpenJDK)(build 25.222-b10, mixed mode)\r\n```\r\n\r\nI was not able to reproduce this on Java 11 or 12.\r\n\r\n### OS version (e.g. `uname -a`)\r\n\r\n```\r\nDarwin wopro3 18.7.0 Darwin Kernel Version 18.7.0: Tue Aug 20 16:57:14 PDT 2019; root:xnu-4903.271.2~2/RELEASE_X86_64 x86_64\r\n```\r\n\r\nI also tried to reproduce this on Linux. It shows the same error behavior (fails after 100 runs of the test script) but does not output the `OutOfDirectMemoryError` for some reason...",
+        "comments": [
+            "@dziemba could you also try running it with `-Dio.netty.leakDetection.level=paranoid`?",
+            "@normanmaurer I think the problem might be here: https://github.com/netty/netty/blob/68673b652e422df6db462afb8c8f3ce9413c5c90/resolver-dns/src/main/java/io/netty/resolver/dns/DnsNameResolver.java#L1219\r\n\r\nUnless I'm missing something, it doesn't look like there's any release corresponding to this retain in the later callbacks. Also it would in any case be better to replace this line with just `msg = null;` - no need to retain if releasing immediately after.\r\n\r\nSomething like this, though maybe with some more try/finallys: 82da56c77f90c572f0dbbfcb408c780e506d42ca",
+            "@njhill Here's a complete debug log with paranoid leak detection:\r\n\r\nhttps://gist.github.com/dziemba/b55e1a5bea461d9ac6114cc0ae74b078",
+            "@njhill @dziemba imho the retain() is correct here. I will need to look into this in more detail.",
+            "@normanmaurer apologies I was kind of conflating two different observations. I agree the retain() as currently stands is correct, it could just be replaced by `msg = null` as a small optimization (this is separate to the problem at hand). My other point was that there may not always be a corresponding release() but now agree that's not what's happening in this case.\r\n\r\nI looked a bit closer and think I found the issue(s)... will open a PR soon.",
+            "@njhill ok cool... Will not spend more time on this then and just wait for your PR :)",
+            "@normanmaurer @dziemba please see #9479 \r\n\r\nFYI the main leak in the current code is here - the result of the future needs to be released, since the `finish` method that it's passed to does not take ref-count ownership: https://github.com/netty/netty/blob/4dc1eccf60252f8a690610c20495ed095e274d3a/resolver-dns/src/main/java/io/netty/resolver/dns/DnsNameResolver.java#L1302",
+            "Thank you for fixing this! \u2764\ufe0f ",
+            "@dziemba no problem, thank you for reporting it with so much detail"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50712,
+            "commit_id": "1abe18d0ea5723221656fce96a9d8aaf57646398",
+            "original_commit_id": "bd8cea644a07890f5bada18ddff0a849b58cd861",
+            "path": "resolver-dns/src/main/java/io/netty/resolver/dns/DnsNameResolver.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1247,
+            "original_line": 1252,
+            "side": "RIGHT",
+            "original_position": 141,
+            "position": 137,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: why not add these also in the `ChannelInitializer` above ?",
+                "@normanmaurer the latter one can't be done there since it references `tcpCtx` which is only created post-connect. But also none of the handlers are needed anyhow unless/until the channel connects successfully. I actually first tried to remove the `ChannelInitializer` completely, but `Bootstrap` requires at least one handler to be provided - maybe we could reconsider that requirement?\r\n\r\nI did just realize though that the `ChannelInitializer` can be replaced with the single handler that it adds - a small simplification. I just pushed another commit to do that.\r\n\r\nI'm also fine with adding it back along with the first two handlers if you would prefer that, but the last one needs to be here I think if we are to keep the query context verification."
+            ]
+        },
+        {
+            "hunk_id": 50711,
+            "commit_id": "1abe18d0ea5723221656fce96a9d8aaf57646398",
+            "original_commit_id": "bd8cea644a07890f5bada18ddff0a849b58cd861",
+            "path": "resolver-dns/src/test/java/io/netty/resolver/dns/DnsNameResolverTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2762,
+            "original_line": 2762,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "@njhill can we also verify that this line returns false (add a `assertFalse`):\r\nhttps://github.com/netty/netty/blob/a95d04bb2f6b5f9d000f22b4daa36b5b1f12935b/resolver-dns/src/test/java/io/netty/resolver/dns/DnsNameResolverTest.java#L2901",
+                "@normanmaurer do you mean that it should return true (no more refs left)? I just tried with false and it fails :)",
+                "yes sorry... `true` :)"
+            ]
+        }
+    ]
+}

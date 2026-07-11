@@ -1,0 +1,201 @@
+{
+    "repo": "astral-sh/uv",
+    "pr_number": 2430,
+    "lang": "rust",
+    "pr_title": "Add support for PyTorch-style local version semantics",
+    "pr_body": "## Summary\r\n\r\nThis PR adds limited support for PEP 440-compatible local version testing. Our behavior is _not_ comprehensively in-line with the spec. However, it does fix by _far_ the biggest practical limitation, and resolves all the issues that've been raised on uv related to local versions without introducing much complexity into the resolver, so it feels like a good tradeoff for me.\r\n\r\nI'll summarize the change here, but for more context, see [Andrew's write-up](https://github.com/astral-sh/uv/issues/1855#issuecomment-1967024866) in the linked issue.\r\n\r\nLocal version identifiers are really tricky because of asymmetry. `==1.2.3` should allow `1.2.3+foo`, but `==1.2.3+foo` should not allow `1.2.3`. It's very hard to map them to PubGrub, because PubGrub doesn't think of things in terms of individual specifiers (unlike the PEP 440 spec) -- it only thinks in terms of ranges. \r\n\r\nRight now, resolving PyTorch and friends fails, because...\r\n\r\n- The user provides requirements like `torch==2.0.0+cu118` and `torchvision==0.15.1+cu118`.\r\n- We then match those exact versions.\r\n- We then look at the requirements of `torchvision==0.15.1+cu118`, which includes `torch==2.0.0`.\r\n- Under PEP 440, this is fine, because `torch @ 2.0.0+cu118` should be compatible with `torch==2.0.0`.\r\n- In our model, though, it's not, because these are different versions. If we change our comparison logic in various places to allow this, we risk breaking some fundamental assumptions of PubGrub around version continuity.\r\n- Thus, we fail to resolve, because we can't accept both `torch @ 2.0.0` and `torch @ 2.0.0+cu118`.\r\n\r\nAs compared to the solutions we explored in https://github.com/astral-sh/uv/issues/1855#issuecomment-1967024866, at a high level, this approach differs in that we lie about the _dependencies_ of packages that rely on our local-version-using package, rather than lying about the versions that exist, or the version we're returning, etc.\r\n\r\nIn short:\r\n\r\n- When users specify local versions upfront, we keep track of them. So, above, we'd take note of `torch` and `torchvision`.\r\n- When we convert the dependencies of a package to PubGrub ranges, we check if the requirement matches `torch` or `torchvision`. If it's an`==`, we check if it matches (in the above example) for `torch==2.0.0`. If so, we _change_ the requirement to `torch==2.0.0+cu118`. (If it's `==` some other version, we return an incompatibility.)\r\n\r\nIn other words, we selectively override the declared dependencies by making them _more specific_ if a compatible local version was specified upfront.\r\n\r\nThe net effect here is that the motivating PyTorch resolutions all work. And, in general, transitive local versions work as expected.\r\n\r\nThe thing that still _doesn't_ work is: imagine if there were _only_ local versions of `torch` available. Like, `torch @ 2.0.0` didn't exist, but `torch @ 2.0.0+cpu` did, and `torch @ 2.0.0+gpu` did, and so on. `pip install torch==2.0.0` would arbitrarily choose one one `2.0.0+cpu` or `2.0.0+gpu`, and that's correct as per PEP 440 (local version segments should be completely ignored on `torch==2.0.0`). However, uv would fail to identify a compatible version. I'd _probably_ prefer to fix this, although candidly I think our behavior is _ok_ in practice, and it's never been reported as an issue.\r\n\r\nCloses https://github.com/astral-sh/uv/issues/1855.\r\n\r\nCloses https://github.com/astral-sh/uv/issues/2080.\r\n\r\nCloses https://github.com/astral-sh/uv/issues/2328.\r\n",
+    "pr_comments": [
+        "No need to review yet. I need to work on the tests.",
+        "What's the right order of operations for packse? These tests all pass locally, but I need to publish the updated index for them to pass on CI.",
+        "BTW `pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu` _does_ work, because there's a version in there without a local tag!",
+        "> BTW `pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu` _does_ work, because there's a version in there without a local tag!\r\n\r\nInteresting. It doesn't work for me:\r\n\r\n```\r\n$ uv pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu\r\n  x No solution found when resolving dependencies:\r\n  `-> Because torch==2.1.0 is unusable because no wheels are available with a matching Python ABI and you require torch==2.1.0, we can conclude that the requirements are unsatisfiable.\r\n```\r\n\r\nIIRC, it's because there aren't any wheels for x86-64 Linux without local version segments. But there are wheels without local version segments for aarch64 Linux (and macOS IIRC)."
+    ],
+    "merged": true,
+    "created_at": "2024-03-15T03:25:17Z",
+    "issue_context": {
+        "number": 1855,
+        "title": "Local version identifiers are not ignored when testing version equality",
+        "body": "<!--\r\nThank you for taking the time to report an issue! We're glad to have you involved with uv.\r\n\r\nIf you're filing a bug report, please consider including the following information:\r\n\r\n* A minimal code snippet that reproduces the bug.\r\n* The command you invoked (e.g., `uv pip sync requirements.txt`), ideally including the `--verbose` flag.\r\n* The current uv platform.\r\n* The current uv version (`uv --version`).\r\n-->\r\n\r\nPlatform: Ubuntu 22.04\r\n`uv` version: 0.1.6 (da3a7ec8)\r\n\r\nSpill-over from #1853, while checking that `--editable` gave the intended behavior on that ticket, I discovered that `uv` seems to be including local version identifiers of candidates when considering a requirement that has no local version identifier\r\n\r\n```\r\n$ uv pip install --find-links https://download.pytorch.org/whl/torch_stable.html \"torch==2.0.0+cu118\" \"torchvision==0.15.1+cu118\"\r\n  \u00d7 No solution found when resolving dependencies:\r\n  \u2570\u2500\u25b6 Because torchvision==0.15.1+cu118 depends on torch==2.0.0 and you require torch==2.0.0+cu118, we can conclude that root==0a0.dev0 and torchvision==0.15.1+cu118\r\n      are incompatible.\r\n      And because you require torchvision==0.15.1+cu118, we can conclude that the requirements are unsatisfiable.\r\n```\r\n\r\nThe [PyPA `Version Specifiers` standard](https://packaging.python.org/en/latest/specifications/version-specifiers/#version-matching) (and [PEP 440](https://peps.python.org/pep-0440/#version-matching) before it) states that:\r\n\r\n> If the specified version identifier is a public version identifier (no local version label), then the local version label of any candidate versions MUST be ignored when matching versions.\r\n>\r\n> If the specified version identifier is a local version identifier, then the local version labels of candidate versions MUST be considered when matching versions, with the public version identifier being matched as described above, and the local version label being checked for equivalence using a strict string equality comparison.\r\n\r\nMy understanding of that passage is that `torchvision` depends on `torch==2.0.0` (i.e. it declares its dependency against a public version identifier), so the equality comparison MUST ignore any local version identifier (like `+cu118`) when considering candidate versions of `torch`.\r\n\r\nAs I understand it, the current behavior of `uv` would be correct if `torchvision` declared a dependency on `torch==2.0.0+\u2026` that had a local segment that was not _exactly_ `+cu118`, but it's doing the wrong thing for the public version identifier.\r\n\r\n(As an aside, I'm not sure what `root==0a0.dev0` is about? Perhaps some kind of meta-requirement associated with my entire request? I don't think it's related to the failure here, but I do find it confusing in the report)",
+        "comments": [
+            "Thanks! @BurntSushi - do you mind taking a look?",
+            "My first thought was something like:\r\n\r\n```diff\r\n--- a/crates/pep440-rs/src/version.rs\r\n+++ b/crates/pep440-rs/src/version.rs\r\n@@ -564,7 +564,19 @@ impl Version {\r\n         }\r\n\r\n         // release is equal, so compare the other parts\r\n-        sortable_tuple(self).cmp(&sortable_tuple(other))\r\n+        match sortable_tuple(self).cmp(&sortable_tuple(other)) {\r\n+            Ordering::Less => return Ordering::Less,\r\n+            Ordering::Equal => {},\r\n+            Ordering::Greater => return Ordering::Greater,\r\n+        }\r\n+\r\n+        // post- and pre-releases are equal, so compare the local\r\n+        match (self.local(), other.local()) {\r\n+            ([], []) => Ordering::Equal,\r\n+            ([], _) => Ordering::Equal,\r\n+            (_, []) => Ordering::Equal,\r\n+            (a, b) => a.cmp(b),\r\n+        }\r\n     }\r\n }\r\n\r\n@@ -2203,7 +2215,7 @@ pub(crate) fn compare_release(this: &[u64], other: &[u64]) -> Ordering {\r\n /// aN, bN, rcN, <no suffix (final)>, .postN but also, you can have dev/post\r\n /// releases on beta releases, so we make a three stage ordering: ({dev: 0, a:\r\n /// 1, b: 2, rc: 3, (): 4, post: 5}, <preN>, <postN or None as smallest>, <devN\r\n-/// or Max as largest>, <local>)\r\n+/// or Max as largest>)\r\n ///\r\n /// For post, any number is better than none (so None defaults to None<0),\r\n /// but for dev, no number is better (so None default to the maximum). For\r\n@@ -2211,10 +2223,10 @@ pub(crate) fn compare_release(this: &[u64], other: &[u64]) -> Ordering {\r\n /// implementation\r\n ///\r\n /// [pep440-suffix-ordering]: https://peps.python.org/pep-0440/#summary-of-permitted-suffixes-and-relative-ordering\r\n-fn sortable_tuple(version: &Version) -> (u64, u64, Option<u64>, u64, &[LocalSegment]) {\r\n+fn sortable_tuple(version: &Version) -> (u64, u64, Option<u64>, u64) {\r\n     match (version.pre(), version.post(), version.dev()) {\r\n         // dev release\r\n-        (None, None, Some(n)) => (0, 0, None, n, version.local()),\r\n+        (None, None, Some(n)) => (0, 0, None, n),\r\n         // alpha release\r\n         (\r\n             Some(PreRelease {\r\n@@ -2223,7 +2235,7 @@ fn sortable_tuple(version: &Version) -> (u64, u64, Option<u64>, u64, &[LocalSegm\r\n             }),\r\n             post,\r\n             dev,\r\n-        ) => (1, n, post, dev.unwrap_or(u64::MAX), version.local()),\r\n+        ) => (1, n, post, dev.unwrap_or(u64::MAX)),\r\n         // beta release\r\n         (\r\n             Some(PreRelease {\r\n@@ -2232,7 +2244,7 @@ fn sortable_tuple(version: &Version) -> (u64, u64, Option<u64>, u64, &[LocalSegm\r\n             }),\r\n             post,\r\n             dev,\r\n-        ) => (2, n, post, dev.unwrap_or(u64::MAX), version.local()),\r\n+        ) => (2, n, post, dev.unwrap_or(u64::MAX)),\r\n         // alpha release\r\n         (\r\n             Some(PreRelease {\r\n@@ -2241,11 +2253,11 @@ fn sortable_tuple(version: &Version) -> (u64, u64, Option<u64>, u64, &[LocalSegm\r\n             }),\r\n             post,\r\n             dev,\r\n-        ) => (3, n, post, dev.unwrap_or(u64::MAX), version.local()),\r\n+        ) => (3, n, post, dev.unwrap_or(u64::MAX)),\r\n         // final release\r\n-        (None, None, None) => (4, 0, None, 0, version.local()),\r\n+        (None, None, None) => (4, 0, None, 0),\r\n         // post release\r\n-        (None, Some(post), dev) => (5, 0, Some(post), dev.unwrap_or(u64::MAX), version.local()),\r\n+        (None, Some(post), dev) => (5, 0, Some(post), dev.unwrap_or(u64::MAX)),\r\n     }\r\n }\r\n```",
+            "That seems reasonable but I'm hitting an error in the lazy version map, maybe something to do with equal comparators but different hashes...?",
+            "PubGrub requires a \"root\" package so `root` is a fake package that requires that the user asks for. I'm confused as it should never appear in errors like this, we usually replace the name. I can look into that part.",
+            "Only guessing, but I guess that proposed fix is too symmetrical\r\n\r\n- `==1.2.3` should allow `1.2.3+local`\r\n- `==1.2.3+local` should not allow `1.2.3`",
+            "One temporary workaround using overrides: https://github.com/astral-sh/uv/issues/1497#issuecomment-1959429864",
+            "OK, so I've been looking into this recently, and after a ~day of yak-shaving to get tests working, I've had a chance to dig in a bit more. I was specifically digging into this in the context of #1497, but I believe that issue and this one are at least connected and likely share the same underlying problem.\r\n\r\nIndeed, as [@dimbleby put it](https://github.com/astral-sh/uv/issues/1855#issuecomment-1958993836):\r\n\r\n> `==1.2.3` should allow `1.2.3+local`\r\n> `==1.2.3+local` should not allow `1.2.3`\r\n\r\nToday, the latter is true in `uv` but the former is not. I believe this is a critical part of this issue that makes it somewhat different from how we deal with pre-releases.\r\n\r\nThis is somewhat subtle, because in our PEP 440 crate, we do actually handle this case correctly:\r\n\r\nhttps://github.com/astral-sh/uv/blob/20253cd04570e3c6e02caf01814a126acf5b0c37/crates/pep440-rs/src/version_specifier.rs#L413-L424\r\n\r\nBut in our resolver, that `contains` method (AFAIK) is not actually used. I'm not sure that it can be. The resolver really only speaks about ranges of versions. It doesn't itself understand (again, AFAIK, I'm not yet an expert on our resolution code) that it's not just a range of versions, but a particular kind of constraint whose interpretation depends on not just on the specific operator used in the constraint, but what the version being tested looks like. That is, the relationship isn't symmetric. I'm not sure if resolution can really deal with that notion. AFAIK, our handling of pre-releases doesn't have this asymmetry problem.\r\n\r\nWith all that said, I did try a couple things to see what happens.\r\n\r\nThe first thing I tried was to modify candidate selection:\r\n\r\nhttps://github.com/astral-sh/uv/blob/20253cd04570e3c6e02caf01814a126acf5b0c37/crates/uv-resolver/src/candidate_selector.rs#L169-L176\r\n\r\nI modified it by changing the candidate version to always have its local segment stripped. (This is not fully correct since sometimes we do want to compare the local segments, specifically, when the version constraint itself has a local segment in it. But it does fix #1497.) So that means if we find a candidate with version `1.2.3+foo`, we will return it as `1.2.3`. This ended up not working because it introduces two different distributions in resolution with exactly identical version numbers. While our test suite passes, it's largely because we don't have good coverage for local versions. Once I added a few basic tests, it was easy to see failures manifest as deadlocks. This is because I didn't do anything to handle the conflict of two different distributions with identical versions. I'm still not sure how to handle that.\r\n\r\nThe second modification I made (which also fixes #1497) was also to candidate selection. In this case however, instead of returning a candidate with the local segment stripped, the candidate is always returned with its actual version, as it is in the status quo. Instead, all I did was change `range.contains(version)` to `range.contains(version.without_local())`. That is, our candidate selector becomes more permissive by making `==1.2.3` match `1.2.3+foo` while still returning a candidate with its original version, `1.2.3+foo`, in tact. While this fixes #1497 and passes our existing test suite, some basic extra testing with local versions also reveals this approach to not work either. In this case, I can't fully explain the test failure (it causes resolution to panic) because I don't understand it enough yet, but at a conceptual level, it makes sense to me that it wouldn't work. Namely, by doing this, we are kind of lying to the resolver by returning a candidate that doesn't actually satisfy the range given. (Well, we _want_ it to, but `range.contains(version)` will return false while `range.contains(version.without_local())` will return true.) So if something else in resolution relies on the fact that the version we return satisfies the range given, then we will have broken an invariant.\r\n\r\nIn discussion with @charliermarsh a couple days ago, he suggested taking an approach similar to pre-releases where we allow local versions of packages _only_ if the version specifier itself also has a local segment. This would mean that something like `uv pip install 'torch==2.1.1' --index-url https://download.pytorch.org/whl/cpu` would still fail, but @SnoopJ's command in the OP of this issue should succeed since the versions as given to install contain the local segment. We could in theory make this work by keeping track of any pinned dependencies using local versions in the constraint (similar to what we do for pre-releases) and propagate this information to candidate selection. Then in candidate selection, we could permit _only_ that version to pass through candidate selection. But, in order to avoid lying to the caller, we'd need to strip the local segment from the version. I believe this will run into the same problem as my first approach above: this will end up deadlocking (and perhaps hit other issues) because the version of the candidate returned doesn't actually match the version of the distribution for that version.\r\n\r\n_However_, one key thing with @charliermarsh's approach is that because of the existence of the constraint `==1.2.3+foo`, we know that precisely only one version of `1.2.3` can be returned by the candidate selector. So at least in theory, there won't be a conflict between two different distributions with the same version number. But the practical issue of the candidate version mismatching the version of the distribution remains. This could possibly be fixed, but we'd still need to be careful to _not_ let `1.2.3+foo` get into the resolver since it will not match `==1.2.3` which may exist elsewhere in the dependency requirements (as is, I believe, the case in this issue).\r\n\r\nIt _almost_ seems like what we want is some kind of version-wrapper type that permits ignoring local segments for `==` comparisons. And this version would be returned by candidate selection. But I don't know enough about the resolver to know whether that's a sound approach or not.\r\n\r\nFor now, I'm going to clean up my `packse` tests and get those merged. They will be marked as \"unsatisfiable\" though, even though we probably want at least some of them to be satisfiable. Otherwise I'm not totally clear on how to proceed here. One more expensive avenue to explore here is how `pip` deals with these cases since `pip` does work with these local versions. Although it's not a foregone conclusion that `pip`'s approach will mix well with the PubGrub style of resolution.",
+            "I'm going to pick this back up, wish me luck.",
+            "This will be supported in the next release via https://github.com/astral-sh/uv/pull/2430."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 49721,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/pubgrub/dependencies.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 22,
+            "original_line": 22,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do we have this lint on? I feel like we just ignore it.",
+                "We should probably have fewer arguments \ud83d\ude02 "
+            ]
+        },
+        {
+            "hunk_id": 49711,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/resolver/locals.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 173,
+            "original_line": 173,
+            "side": "RIGHT",
+            "original_position": 165,
+            "position": 173,
+            "subject_type": "line",
+            "review_comments": [
+                "What do you think about adding some units tests for the routines in this module?",
+                "Good call."
+            ]
+        },
+        {
+            "hunk_id": 49722,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/resolver/locals.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 173,
+            "original_line": 173,
+            "side": "RIGHT",
+            "original_position": 165,
+            "position": 173,
+            "subject_type": "line",
+            "review_comments": [
+                "What do you think about adding some units tests for the routines in this module?",
+                "Good call."
+            ]
+        },
+        {
+            "hunk_id": 49607,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/pubgrub/dependencies.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 22,
+            "original_line": 22,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do we have this lint on? I feel like we just ignore it.",
+                "We should probably have fewer arguments \ud83d\ude02 "
+            ]
+        },
+        {
+            "hunk_id": 49710,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/pubgrub/dependencies.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 22,
+            "original_line": 22,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do we have this lint on? I feel like we just ignore it.",
+                "We should probably have fewer arguments \ud83d\ude02 "
+            ]
+        },
+        {
+            "hunk_id": 49606,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/pubgrub/dependencies.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 146,
+            "original_line": 146,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "`locals.get` should be free (the hash map short-circuits if it's empty) unless local dependencies were declared."
+            ]
+        },
+        {
+            "hunk_id": 49720,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/pubgrub/dependencies.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 146,
+            "original_line": 146,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "`locals.get` should be free (the hash map short-circuits if it's empty) unless local dependencies were declared."
+            ]
+        },
+        {
+            "hunk_id": 49608,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/resolver/locals.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 173,
+            "original_line": 173,
+            "side": "RIGHT",
+            "original_position": 165,
+            "position": 173,
+            "subject_type": "line",
+            "review_comments": [
+                "What do you think about adding some units tests for the routines in this module?",
+                "Good call."
+            ]
+        },
+        {
+            "hunk_id": 49709,
+            "commit_id": "5a319e0f012bb6f7301d3381ed8c357b9e10af27",
+            "original_commit_id": "62fdd3db5912d93024a079433d1d21a95e35b11d",
+            "path": "crates/uv-resolver/src/pubgrub/dependencies.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 146,
+            "original_line": 146,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "`locals.get` should be free (the hash map short-circuits if it's empty) unless local dependencies were declared."
+            ]
+        }
+    ]
+}

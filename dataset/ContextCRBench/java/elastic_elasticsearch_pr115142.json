@@ -1,0 +1,75 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 115142,
+    "lang": "java",
+    "pr_title": "Attempt to clean up index before remote transfer",
+    "pr_body": "If a node crashes during recovery, it may leave temporary files behind that can consume disk space, which may be needed to complete recovery. So we attempt to clean up the index before transferring files from a recovery source. We first attempt to call the store's `cleanupAndVerify` method, which removes anything not referenced by the latest local commit. If that fails, because the local index isn't in a state to produce a local commit, then we fall back to removing temporary files by name.\r\n\r\nCloses #104473\r\n",
+    "pr_comments": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Hi @bcully, I've created a changelog YAML for you.",
+        "I'm doing this as part of onboarding, and don't really have any idea what I'm doing yet. Any kind of feedback is welcome.",
+        "@Tim-Brooks @DaveCTurner gentle reminder for a rereview, thanks!",
+        "@elasticmachine update branch",
+        "Pinging @elastic/es-distributed-indexing (Team:Distributed Indexing)",
+        "## \ud83d\udc9a Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| \u2705 |  [8.x](https://github.com/elastic/elasticsearch/pull/116854)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/116854\">](https://github.com/elastic/elasticsearch/pull/116854) |"
+    ],
+    "merged": true,
+    "created_at": "2024-10-29T04:38:01Z",
+    "issue_context": {
+        "number": 104473,
+        "title": "Clean up extra/temp files before file-based recovery",
+        "body": "If a node crashes part-way through a recovery then it may leave some temp files on disk. A subsequent recovery attempt will eventually clean up any unnecessary files but that cleanup happens towards the end of the recovery process, after making a new copy of the shard on disk, and it's possible that there may not be space for all this data because of the space wasted on old temp files.\r\n\r\nToday one of the preparatory steps on a recovery target is to replay any safe operations from the local translog and then flush to make a new safe commit, which happens before we even start to copy any data from the recovery source. After successfully making that new safe commit I think it'd be reasonable to do another cleanup step to discard anything that isn't referenced from that commit, which would include any temporary files from a previous recovery. I suspect we might also be able to clean some things up before replaying the local translog.",
+        "comments": [
+            "Pinging @elastic/es-distributed (Team:Distributed)",
+            "An alternative might be to try to reuse any files transferred in a previous recovery attempt, and only clean those that we wouldn't retransmit?",
+            "That's true, but I'd rather we didn't introduce any extra complexity in this area unless we're sure it's needed.",
+            "Maybe the simplest, safest thing to do is to only delete known temp files (anything starting with `RECOVERY_PREFIX` (`recovery.`). This can be done at any time before transfer and doesn't have any dependencies on the state of a local commit?",
+            "Yes I think that's safe and covers most of the problem.\n\nI'd be interested to know if there's a simple way to ask Lucene to delete any cruft it might have left over from any commit or merge that was running at the point in time that the shard failed. It's possible that it cleans this all up as part of calling `IndexWriter#commit()` anyway. I took a quick look and saw evidence that it does some cleanup at this point, but didn't dig deeply enough to determine whether that cleanup catches everything.",
+            "I suppose we could attempt to call `cleanupAndVerify` if we can produce a snapshot locally, which I think should take care of failed merges etc? If that fails (e.g., because there's no segments file or something) we can fall back to deleting temp files by name."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 36774,
+            "commit_id": "3fc0a718f164b3e962af6b849ebf6f38210a141a",
+            "original_commit_id": "77a7c9c2e285d8b23933245d16b869bada272be7",
+            "path": "server/src/internalClusterTest/java/org/elasticsearch/recovery/TruncatedRecoveryIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 117,
+            "side": "RIGHT",
+            "original_position": 53,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm pretty sure we can get ride of this and just add the send behavior from primary -> unlucky",
+                "I'm not following this. I was using this to get the shard path on disk where I could scribble junk files and then check they were removed. It did seem a little indirect - is there a nicer way?"
+            ]
+        },
+        {
+            "hunk_id": 36775,
+            "commit_id": "3fc0a718f164b3e962af6b849ebf6f38210a141a",
+            "original_commit_id": "77a7c9c2e285d8b23933245d16b869bada272be7",
+            "path": "server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 407,
+            "original_line": 408,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "I think I might prefer to restrict this `catch` just to exceptions from `indexShard.snapshotStoreMetadata()` rather than from `cleanupAndVerify()` too. If `cleanupAndVerify()` fails then that seems like it maybe should be fatal?\r\n\r\nAlso could we use `org.elasticsearch.index.store.Store.MetadataSnapshot#EMPTY` to represent the snapshot if we cannot get a proper `MetadataSnapshot`? Any file re-use during recovery is going to require a valid `MetadataSnapshot`, so failing here means that the directory contents are of no further use.",
+                "Tim made a similar comment, to which I replied above. There is some logic in `cleanFiles` that inspects the exception generated by the block containing `cleanupAndVerify` and does a deeper clean in some cases. Looking at it again, I think it's not just an optimization. We'd probably need to replicate that to avoid having to worry about corrupt directories that we can never make forward progress on because we never get a chance to deep clean them.\r\n\r\nIs it always true that the files are useless if we can't get a metadata snapshot? I had been thinking that for instance we might have transferred a bunch of data files previously but not the root segment file. In that case, after transferring the segment file we could reuse the data files already transferred?",
+                "> Is it always true that the files are useless if we can't get a metadata snapshot?\r\n\r\nYes I think so, we treat a failure as if the store is empty, see how we compute `metadataSnapshot` in `org.elasticsearch.indices.recovery.PeerRecoveryTargetService#getStartRecoveryRequest` and then use this data (alone) to compute the collection of files to recover in the implementations of `org.elasticsearch.indices.recovery.plan.RecoveryPlannerService#computeRecoveryPlan`.\r\n\r\nI mean you're right, in principle we could work harder to determine which exact files we do/don't have and avoid a little extra data transfer sometimes. But we don't: this is already on a failure path, and not a particularly well-trodden one, so there's no need for heroic optimizations.",
+                "I thought a bit more about this and am inclined to use `Store.MetadataSnapshot#EMPTY` when `snapshotStoreMetadata()` throws. Interestingly, when I tried it, I found that `store.cleanupAndVerify` appears to throw on an empty directory, [here](https://github.com/elastic/elasticsearch/blob/8efd08b019b9160f5e703520c6ce3b6a9f92cfbd/server/src/main/java/org/elasticsearch/index/store/Store.java#L699):\r\n\r\n```\r\n...\r\nCaused by: java.io.FileNotFoundException: no segments* file found in store(ByteSizeCachingDirectory(ElasticsearchMockDirectoryWrapper(NIOFSDirectory@/Users/brendan/dev/elasticsearch/server/build/testrun/internalClusterTest/temp/org.elasticsearch.recovery.TruncatedRecoveryIT_31340047D7FA1434-001/tempDir-002/node_t4/indices/QuuB7D0wSki7rj5uryRXWQ/4/index lockFactory=org.apache.lucene.store.NativeFSLockFactory@b7a4d9))): files: [write.lock]\r\n\tat org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:801)\r\n\tat org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:757)\r\n\tat org.apache.lucene.index.SegmentInfos.readLatestCommit(SegmentInfos.java:535)\r\n\tat org.apache.lucene.index.SegmentInfos.readLatestCommit(SegmentInfos.java:519)\r\n\tat org.elasticsearch.common.lucene.Lucene.readSegmentInfos(Lucene.java:116)\r\n\tat org.elasticsearch.index.store.Store.readSegmentsInfo(Store.java:224)\r\n\tat org.elasticsearch.index.store.Store$MetadataSnapshot.loadFromIndexCommit(Store.java:822)\r\n\tat org.elasticsearch.index.store.Store.getMetadata(Store.java:298)\r\n\tat org.elasticsearch.index.store.Store.getMetadata(Store.java:263)\r\n\tat org.elasticsearch.index.store.Store.cleanupAndVerify(Store.java:699)\r\n...\r\n```\r\n\r\nGiven the name of the variable being assigned here is `metadataOrEmpty` it seems like it might be a bug, and we just haven't tested against an empty snapshot. If you agree, I'll attempt to fix that and go with this approach of falling back to `Empty`.",
+                "https://github.com/elastic/elasticsearch/pull/116059 adds support for empty stores to `Store#cleanupAndVerify`",
+                "after making `cleanupAndVerify` handle an empty snapshot, I've taken your suggestion and treated the directory as having an empty snapshot if we fail to load one."
+            ]
+        }
+    ]
+}

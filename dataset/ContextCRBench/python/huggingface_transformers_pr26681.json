@@ -1,0 +1,370 @@
+{
+    "repo": "huggingface/transformers",
+    "pr_number": 26681,
+    "lang": "python",
+    "pr_title": "Generate: New `Cache` abstraction and Attention Sinks support",
+    "pr_body": "Closes #26553\r\n\r\nHello!\r\n\r\n# What does this PR do?\r\nI had a few hours on Saturday to work up a draft version of the updated KV caching mechanism as discussed in #26553. Ideally, this should allow Attention Sinks (https://github.com/tomaarsen/attention_sinks) / StreamingLLM (https://arxiv.org/abs/2309.17453) to be easily implemented in a third-party or in transformers directly. \r\n\r\nThe implementation doesn't work well yet, as the VRAM usage quickly shoots up after generating even just 8 tokens. This is probably some bug that I haven't had time for yet. There's a few other comments that I have on specific sections of code, so I'll write some comments below.\r\n\r\n## Goal for this draft\r\nThe intention for this draft is to continue discussion about whether this is moving in the right direction, and to determine the scope (e.g. do we want to include this updated `Cache` for all architectures that use KV caching?). \r\n\r\n## Before submitting\r\n- [ ] This PR fixes a typo or improves the docs (you can dismiss the other checks if that's the case).\r\n- [x] Did you read the [contributor guideline](https://github.com/huggingface/transformers/blob/main/CONTRIBUTING.md#start-contributing-pull-requests),\r\n      Pull Request section?\r\n- [x] Was this discussed/approved via a Github issue or the [forum](https://discuss.huggingface.co/)? Please add a link\r\n      to it if that's the case.\r\n- [ ] Did you make sure to update the documentation with your changes? Here are the\r\n      [documentation guidelines](https://github.com/huggingface/transformers/tree/main/docs), and\r\n      [here are tips on formatting docstrings](https://github.com/huggingface/transformers/tree/main/docs#writing-source-documentation).\r\n- [ ] Did you write any new necessary tests?\r\n\r\n## Who can review?\r\n\r\n@patrickvonplaten \r\n@gante\r\n@LysandreJik \r\n@Guangxuan-Xiao\r\n\r\n- Tom Aarsen\r\n",
+    "pr_comments": [
+        "@patrickvonplaten @gante \r\nBased on your feedback, I intend to make the following changes (when I have a bit more time). \r\n\r\n1. move `layer_idx` to `update(key_states, value_states, layer_idx)` rather than storing it as a class attribute on `Cache`. This also involves adding `layer_idx` as class attributes to e.g. `LlamaAttention` and `LlamaDecoderLayer`. This also removes the `set_layer_index` magic from `Cache`.\r\n2. convert `past_key_values` to Cache instance (if not already) at the start of LlamaAttention.forward. This avoids all `isinstance(...)` calls in `LlamaAttention`, and removes the need for the black magicky `__bool__`.\r\n3. convert back to tuple of tuples when returning if some `use_legacy_cache` flag is True. (should this flag be propagated all the way up to `LlamaModel`?)\r\n4. use separate `key_cache` and `value_cache` dicts in the `Cache` instance for efficiency (removes a `torch.cat`) and simplicity.\r\n\r\nRegarding https://github.com/huggingface/transformers/pull/26681#discussion_r1350368080 I would have to experiment. There might be options, but they'll probably be slower than necessary.",
+        "`past_key_values` and caching will be an incredible feature.\r\n\r\nTwo PRs should be made irrelevant if this merges: https://github.com/huggingface/transformers/pull/25086  https://github.com/huggingface/transformers/pull/17574",
+        "> @patrickvonplaten @gante Based on your feedback, I intend to make the following changes (when I have a bit more time).\r\n> \r\n> 1. move `layer_idx` to `update(key_states, value_states, layer_idx)` rather than storing it as a class attribute on `Cache`. This also involves adding `layer_idx` as class attributes to e.g. `LlamaAttention` and `LlamaDecoderLayer`. This also removes the `set_layer_index` magic from `Cache`.\r\n> 2. convert `past_key_values` to Cache instance (if not already) at the start of LlamaAttention.forward. This avoids all `isinstance(...)` calls in `LlamaAttention`, and removes the need for the black magicky `__bool__`.\r\n> 3. convert back to tuple of tuples when returning if some `use_legacy_cache` flag is True. (should this flag be propagated all the way up to `LlamaModel`?)\r\n> 4. use separate `key_cache` and `value_cache` dicts in the `Cache` instance for efficiency (removes a `torch.cat`) and simplicity.\r\n> \r\n> Regarding [#26681 (comment)](https://github.com/huggingface/transformers/pull/26681#discussion_r1350368080) I would have to experiment. There might be options, but they'll probably be slower than necessary.\r\n\r\nSounds great!",
+        "Addressed the various comments. Beyond that, I also made `past_key_values.update(key, value, idx)` returns `key, value` as you'd expect. Manual generation (i.e. repeated calling of a `LlamaForCausalLM` instance with the `past_key_values`) works well, I even see a ~2% speedup, but don't quote me on that speedup. `model.generate` doesn't work yet because `use_legacy_flag` defaults to None, i.e. Falsey, and `model.generate` doesn't work with the cache yet. @patrickvonplaten @gante Should we go for:\r\n1. Immediately update `model.generate` to work with Cache instances or,\r\n2. Insert `use_legacy_cache=True` as default for `model.generate` until this can be removed in some later PR?\r\n\r\nThis is all under the assumption that the PR is heading in the right direction \ud83d\ude04 \r\n\r\nAs a heads up, the sink cache does not work yet. I still need to do some experiments to see if I can store rotated keys and back-rotate + forward-rotate them when the cached keys are requested, rather than storing non-rotated keys. That is what I'll work on next. \r\n\r\nThat leaves me with an additional question: each architecture requires slightly different key rotations. I'd like to implement this to be sufficiently adaptable, e.g. allowing architecture-specific functionality in `src/transformers/models/<architecture>/cache_utils.py`. However, what the relation to classes or functions in this file should be to the `src/transformers/cache_utils.py` cache classes is still unclear to me. In short: how do we allow an architecture to e.g. have slightly different implementations for the `SinkCache` or the `DynamicCache`?\r\n\r\n- Tom Aarsen",
+        "Hey @tomaarsen \ud83d\udc4b \r\n\r\n### `generate` compatibility\r\nRe `generate` compatibility: usually, I'm pro small PRs, tackling one problem at a time. However, since `generate` is the main gate to LLMs in `transformers`, and caching is only needed for auto-regressive generation, day 0 support is important -- at least `gready_search` and `sample` should be operational by the time this PR can be merged. Otherwise, we might get ourselves in a position where we realize we need to rewrite a significant part of `Cache`/`generate` to enable them together, which is very undesirable. However, I'm pro having this PR enabling the new cache on a single model (Llama) and taking care of the other models later as needed \ud83e\udd17 I can also give a hand on the `generate` side, when we are happy with the state of the PR with the exception of `generate`.\r\n\r\n### model-specific cache changes\r\nI do expect some models to require different code to convert back and forth from the legacy cache format (not all models have the same cache format, there are ~5% of them have slight differences e.g. [see this in BLOOM](https://github.com/huggingface/transformers/blob/288bf5c1d2844e89a2a87aeee90033532335e2e6/src/transformers/models/bloom/modeling_bloom.py#L504)). You are also writing that RoPE-based models may also need custom logic. \r\n\r\nThe model-specific cache modification part is an important design decision that will have an impact over many versions of `transformers` to come, so I'd also like to hear your thoughts @tomaarsen @patrickvonplaten \r\n\r\nEDIT: what follows bellow is my \"plan B\" suggestion, read my next comment for the \"plan A\" :D\r\nTo me, that suggests five things:\r\n1) a model may need to subclass the base `Cache` to implement its own nuances regarding the cache format\r\n2) despite the above, the cache operations and output format are standardized for each type of cache, so we would benefit from a strong base class (as we do in the config files or in the base pretrained class).\r\n3) I suspect the model-specific changes for the cache would be small, so we could keep them in the modeling file. We can always move to a new file if needed :)\r\n4) Because of 1), each model would have to implement a thin wrapper class to the instantiable cache classes, even if the base class is fully compatible. This also goes in line with our philosophy in `tramsformers` where each model implements its own model-specific operations.\r\n5) Because of 4), in practice, each model defines its own cache. This means users are free to write their own custom caches -- power to the users \ud83d\udcaa \r\n\r\n",
+        "Upon some shower thoughts, I've come across an alternative plan for the model-specific cache modification problem -- easier to implement and that would result in more readable code. \r\n\r\nInstead of the base `Cache` holding the code to convert to and from the legacy format (which then requires subclassing at each model, if it has a different legacy cache format), the conversion logic could be held in model-specific functions to convert to and from the legacy format. In other words, each model would implement a `to_legacy_cache` and a `from_legacy_cache`, and the different types of `Cache` would be immediately available to the model with no further modifications!",
+        "> lding the code to convert to and from the legacy format (which then requires subclassing at each model, if it has a different legacy cache format)\r\n\r\nAgree here! Think it would be better if we only have a few selected cache classes that work for all models. The functions `from_legacy_cache` and `to_legacy_cache` indeed need to be model specific, so I think they can be just stand-alone functions in each `modeling_....py` file. \r\n\r\n=> Thus, I think we can:\r\n- a) Have all `Cache` classes in a general `generation/cache.py` file. These general cache implementations should be identical for all models\r\n- b) For backwards compatibility each model needs specific `from_legacy_cache` and `to_legacy_cache` functions, but they don't need to be part of the Cache class IMO, they can just be stand-alone functions in each model class so that they are easier to deprecate going forward.",
+        "I just noticed that Joao's message has been edited, and I missed Patrick's message, so my response doesn't make much sense anymore - I deleted it.\r\n\r\nI also prefer the `from_legacy_cache` and `to_legacy_cache` implementations. I'll get on it.",
+        "@gante  @tomaarsen  This is really a good abstraction of kv_cache to enable window context and be compatible to the legacy kv_cache. But for the memory footprint, the 'torch.cat' are still needed when update the cache and reorder_cache using 'index_select' is also there with beam search.  \r\nDo you have a plan to use the pre-allocate buffer to avoid 'torch.cat'?  The pre-allocated buffer should be compatible with semantic of your Cache.  For the cache.update operation,  token slots from the pre-allocated buffer are needed to store key/value token states. ",
+        "I removed the commits regarding changing the order of the caches based on @gante's recommendation. He is working on more changes for this PR here: https://github.com/tomaarsen/transformers/pull/1",
+        "@liangan1 both are issues in the near-future roadmap, with this cache abstraction being a requirement! \ud83d\ude4c \r\n\r\nFirst we will work on pre-allocated buffers (a subclass of `Cache`), which result in significant speedups (especially with `torch.compile`). Then we will simplify beam search into an XLA-friendly method, just like in our TF and JAX implementations.",
+        "> @liangan1 both are issues in the near-future roadmap, with this cache abstraction being a requirement! \ud83d\ude4c\r\n> \r\n> First we will work on pre-allocated buffers (a subclass of `Cache`), which result in significant speedups (especially with `torch.compile`). Then we will simplify beam search into an XLA-friendly method, just like in our TF and JAX implementations.\r\n\r\nWow, cool. Can you share more details about your roadmap? e.g., the pre-allocate buffers. In fact, we also have implemented a indirect access kv_cache in [Intel-extension-for-pytorch optimization for LLM](https://intel.github.io/intel-extension-for-pytorch/cpu/latest/tutorials/llm.html#indirect-access-kv-cache)  which can be used for both greedy and beam and we are pleasure to contribute code if I can know your design about the pre-allocated buffer.",
+        "> Should we roll out the new cache feature for the most important models and aim to get this PR in soon ?\r\n\r\nYes! @gante has picked up the work in https://github.com/tomaarsen/transformers/pull/1 to get `generate()` working, and has proposed to implement the cache for Llama, Mistral and Persimmon + some tests. Once he has completed that work, I can merge it into this PR, and we can get it merged into `main`.\r\n\r\nDoes that sound like a plan?",
+        "This PR is now generate-compatible, and has tests to ensure the two formats are interchangeable \ud83d\udcaa \r\n\r\nThe suggested review order is `cache_utils.py` -> `modeling_llama.py` -> `test_utils.py` -> others\r\n\r\n@patrickvonplaten in the added test, we confirm that the two formats are interchangeable: they can be converted back and forth and be manipulated the same way. However, under the hood, the updated models use the new cache internally. It would be best to add a long slow test to key models (Llama and Mistral here) before merging this PR, correct?\r\n\r\n@tomaarsen can you confirm that the attention sinks are working as expected?",
+        "The docs for this PR live [here](https://moon-ci-docs.huggingface.co/docs/transformers/pr_26681). All of your documentation changes will be reflected on that endpoint.",
+        "@patrickvonplaten applied the suggested changes \ud83d\udc4d  I agree they the full abstraction will be better in the long run.\r\n\r\nTwo minor modifications over your suggestions:\r\n1. Replaced the `__init__` `warn` by `warning_once`, otherwise the user would get `n_layers` repeated warnings\r\n2. In the beam methods, to check against `Cache`, we needed to perform the check before calling `_reorder_cache`",
+        "Will review tomorrow ! ",
+        "@ArthurZucker depending on your answer to [this comment](https://github.com/huggingface/transformers/pull/26681#discussion_r1411079517), the PR will move very differently -- I'll wait for your answer before continuing :)",
+        "Ready for a new round of reviews. IMO, it's now much better than before: no new flags, `generate` compatibility for any `Cache` subclass, among others.\r\n\r\n@patrickvonplaten @ArthurZucker:\r\n- There is no more `use_legacy_cache` flag. If `past_key_values` is a `Cache` instance (which can be an empty cache), the model sticks to that format. No flags to deprecate in the future :)\r\n- Because of the point above, if we pass  `past_key_values=some_cache_instance` to `generate`, it will use that cache instance (and, therefore, format). `generate` is ready to receive static caches! See the generation test for an example.\r\n- The caches now accept a `cache_kwargs` dictionary in `update` (its is not a `**dict`). It is the responsibility of each subclass to process this dictionary. It should gives us plenty of room (and flexibility) to grow without exploding the signature.\r\n- `Cache` has a `reorder_cache` method, as suggested. This also means we can start thinking about standardizing cache formats and removing per-model functions;\r\n- Added tons of docstrings\r\n\r\n@tomaarsen:\r\n- Added support for partial rotation in `SinkCache`. An extra set of eyes there would be appreciated! :)\r\n\r\n~\u26a0\ufe0f There is a bug with beam search + legacy cache format. I suspect it is a subtle dimension-related bug, but the PR can be reviewed while I chase it.~ EDIT: bug sorted",
+        "I've ran perplexity tests for Attention Sinks with Persimmon, Llama and Mistral, and they all look good in terms of performance, VRAM and latency. I plan to do some more tests with Phi tomorrow, but I assume it's all good other than the above 3 comments.\r\nI'll also try to use SinkCache with `generate`.",
+        "Let's get this one in for the release no? cc @ArthurZucker @amyeroberts @LysandreJik ",
+        "Yep \r\n",
+        "I am going to trigger the CI now (with a reabse on main in order to include the fix #27887",
+        "https://github.com/huggingface/transformers/actions/runs/7129508785",
+        "@tomaarsen Great work! Looks like the current implementation cannot handle case **input_length > window_length** at least for some models (mistral) \r\nDo I miss anything? Thanks! \r\n\r\n```\r\ncache = SinkCache(window_length=1024, num_sink_tokens=4)\r\ngen_out = model.generate(**inputs, do_sample=False, max_new_tokens=10, \r\n                         use_cache=True,\r\n                         past_key_values=cache, \r\n                         pad_token_id=tokenizer.eos_token_id)\r\ndecoded = tokenizer.batch_decode(gen_out, skip_special_tokens=True)\r\n```\r\nSupporse inputs is of torch.Size([1, 15759]). It will raise\r\n`RuntimeError: shape '[-1, 15759]' is invalid for input of size 1024`\r\nwhen it trys to reshape position_ids\r\n\r\n```\r\nFile ~/anaconda3/envs/llm/lib/python3.8/site-packages/transformers/models/mistral/modeling_mistral.py:984, in MistralModel.forward(self, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict)\r\n    982     position_ids = position_ids.unsqueeze(0).view(-1, seq_length)\r\n    983 else:\r\n--> 984     position_ids = position_ids.view(-1, seq_length).long()\r\n```",
+        "Not sure it was tested fro mistral! Can you open a separate issue with a full reproducer? \ud83e\udd17 ",
+        "@fayejf You might want to look at this paper, too - handling extremely long inputs in a streaming fashion: [Leave No Context Behind: Efficient Infinite Context Transformers with Infini-attention](https://arxiv.org/abs/2404.07143).\r\n\r\n> 1B model that was fine-tuned on up to 5K sequence length passkey instances solved the 1M length problem.",
+        "@ArthurZucker It seems that even with Llama2, passing in SinkCache to `generate` causes errors.\r\n\r\nI'm using transformers 4.39.3 and the Llama2 model was loaded using the following code:\r\n\r\n```\r\nfrom transformers import AutoConfig, LlamaForCausalLM, AutoTokenizer\r\n\r\nmodel_id = \"meta-llama/Llama-2-7b-hf\"\r\nmodel = LlamaForCausalLM.from_pretrained(\r\n      model_id, low_cpu_mem_usage=True, device_map='auto',\r\n      torch_dtype=torch.bfloat16)\r\nmodel = model.eval()\r\ntokenizer = AutoTokenizer.from_pretrained(model_id)\r\ntokenizer.pad_token = tokenizer.eos_token\r\ntokenizer.padding_side = 'left'\r\n```\r\n\r\nThe SinkCache was passed to generate as in @fayejf's script. I am not sure if this is the correct way to use SinkCache:\r\n\r\n```\r\nfrom transformers import SinkCache\r\n\r\nprefix = 'Hello world!'\r\ninputs = tokenizer(prefix, return_tensors='pt').to(device)\r\n\r\ncache = SinkCache(window_length=1024, num_sink_tokens=4)\r\ngen_out = model.generate(**inputs, do_sample=False, max_new_tokens=256,\r\n                         use_cache=True,\r\n                         past_key_values=cache,\r\n                         pad_token_id=tokenizer.pad_token_id)\r\ndecoded = tokenizer.batch_decode(gen_out, skip_special_tokens=True)\r\n```\r\n\r\nThe code caused `TypeError: object of type 'SinkCache' has no len()` as a result of this `DynamicCache.from_legacy_cache` call (see the stack trace below). Looks like you are familiar with the `StaticCache` stuff, any suggestions on how to get around this? Thanks in advance!\r\n\r\n```\r\nFile /miniconda3/envs/pytorch2/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py:977, in LlamaModel.forward(self, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict, cache_position)\r\n    975 if use_cache:  # kept for BC (cache positions)\r\n    976     if not isinstance(past_key_values, StaticCache):\r\n--> 977         past_key_values = DynamicCache.from_legacy_cache(past_key_values)\r\n    978         past_seen_tokens = past_key_values.get_seq_length()\r\n    980 if cache_position is None:\r\n\r\nFile /miniconda3/envs/pytorch2/lib/python3.10/site-packages/transformers/cache_utils.py:181, in DynamicCache.from_legacy_cache(cls, past_key_values)\r\n    179 cache = cls()\r\n    180 if past_key_values is not None:\r\n--> 181     for layer_idx in range(len(past_key_values)):\r\n    182         key_states, value_states = past_key_values[layer_idx]\r\n    183         cache.update(key_states, value_states, layer_idx)\r\n```\r\n\r\n\r\n ",
+        "> @fayejf You might want to look at this paper, too - handling extremely long inputs in a streaming fashion: [Leave No Context Behind: Efficient Infinite Context Transformers with Infini-attention](https://arxiv.org/abs/2404.07143).\r\n> \r\n> > 1B model that was fine-tuned on up to 5K sequence length passkey instances solved the 1M length problem.\r\n\r\n@MoonRide303 Thanks for sharing! very interesting paper!",
+        "@ArthurZucker I was with 4.38.2 and haven't got a chance to test it with latest release. But looks like @explanare have seen similar issues. I also tried with llama model and I've seen legacy cache error as well. \r\n\r\nI'm not sure if I'm using SinkCache correctly. I didn't find any doc for it unfortuantely. :(\r\nI follow the way in test file. ",
+        "> @ArthurZucker It seems that even with Llama2, passing in SinkCache to `generate` causes errors.\r\n> \r\n> I'm using transformers 4.39.3 and the Llama2 model was loaded using the following code:\r\n> \r\n> ```\r\n> from transformers import AutoConfig, LlamaForCausalLM, AutoTokenizer\r\n> \r\n> model_id = \"meta-llama/Llama-2-7b-hf\"\r\n> model = LlamaForCausalLM.from_pretrained(\r\n>       model_id, low_cpu_mem_usage=True, device_map='auto',\r\n>       torch_dtype=torch.bfloat16)\r\n> model = model.eval()\r\n> tokenizer = AutoTokenizer.from_pretrained(model_id)\r\n> tokenizer.pad_token = tokenizer.eos_token\r\n> tokenizer.padding_side = 'left'\r\n> ```\r\n> \r\n> The SinkCache was passed to generate as in @fayejf's script. I am not sure if this is the correct way to use SinkCache:\r\n> \r\n> ```\r\n> from transformers import SinkCache\r\n> \r\n> prefix = 'Hello world!'\r\n> inputs = tokenizer(prefix, return_tensors='pt').to(device)\r\n> \r\n> cache = SinkCache(window_length=1024, num_sink_tokens=4)\r\n> gen_out = model.generate(**inputs, do_sample=False, max_new_tokens=256,\r\n>                          use_cache=True,\r\n>                          past_key_values=cache,\r\n>                          pad_token_id=tokenizer.pad_token_id)\r\n> decoded = tokenizer.batch_decode(gen_out, skip_special_tokens=True)\r\n> ```\r\n> \r\n> The code caused `TypeError: object of type 'SinkCache' has no len()` as a result of this `DynamicCache.from_legacy_cache` call (see the stack trace below). Looks like you are familiar with the `StaticCache` stuff, any suggestions on how to get around this? Thanks in advance!\r\n> \r\n> ```\r\n> File /miniconda3/envs/pytorch2/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py:977, in LlamaModel.forward(self, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict, cache_position)\r\n>     975 if use_cache:  # kept for BC (cache positions)\r\n>     976     if not isinstance(past_key_values, StaticCache):\r\n> --> 977         past_key_values = DynamicCache.from_legacy_cache(past_key_values)\r\n>     978         past_seen_tokens = past_key_values.get_seq_length()\r\n>     980 if cache_position is None:\r\n> \r\n> File /miniconda3/envs/pytorch2/lib/python3.10/site-packages/transformers/cache_utils.py:181, in DynamicCache.from_legacy_cache(cls, past_key_values)\r\n>     179 cache = cls()\r\n>     180 if past_key_values is not None:\r\n> --> 181     for layer_idx in range(len(past_key_values)):\r\n>     182         key_states, value_states = past_key_values[layer_idx]\r\n>     183         cache.update(key_states, value_states, layer_idx)\r\n> ```\r\n\r\nI got the same error with Llama2 using 4.38.2 following code [here](https://colab.research.google.com/drive/1S0oIPaqxAVp0oWEwTadhZXDjhWiTyF12?usp=sharing#scrollTo=fwxG9OFAV4Qv). Also tried `transformers==4.39.0`, got the same error.\r\n```\r\nFile \"/opt/conda/envs/dn/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py\", line 982, in forward\r\n    past_key_values = DynamicCache.from_legacy_cache(past_key_values)\r\n  File \"/opt/conda/envs/dn/lib/python3.10/site-packages/transformers/cache_utils.py\", line 166, in from_legacy_cache\r\n    for layer_idx in range(len(past_key_values)):\r\nTypeError: object of type 'SinkCache' has no len()\r\n```",
+        "cc @gante as well as we broke it ",
+        "Will might be fixed by #30476. Only tuples should be going that path ",
+        "@fayejf @ys-zong @ArthurZucker \r\n\r\n`SinkCache` is operational on `main` with Mistral and a few other models (especially non-RoPE models). Llama and Llama-dependent models + `SinkCache` is fixed in [this PR](https://github.com/huggingface/transformers/pull/30581), which hopefully will get merged soon \ud83e\udd17 \r\n\r\nApologies for this temporary issue, we had to break a few eggs (sink cache) to make an omelet (torch.compile support) :D\r\n\r\nEdit: merged, let me know if you run into issues!",
+        "Hi @tomaarsen I just came across this line https://github.com/huggingface/transformers/blob/main/src/transformers/cache_utils.py#L979 in your PR and wonder why the condition for cache growing is  `key_states.shape[-2] + self.get_seq_length(layer_idx) < self.window_length`?  To my understanding even if the conditon is `<=` the new key states can still safely grow into the window size without need to evict.  Is there any logic that the codition must be `<`?  Thanks!\r\n"
+    ],
+    "merged": true,
+    "created_at": "2023-11-22T09:19:47Z",
+    "issue_context": {
+        "number": 26553,
+        "title": "Implement StreamingLLM/Windowed Attention with Attention Sinks",
+        "body": "### Feature request\n\nHello!\r\n\r\nI would love to see StreamingLLM/ Windowed Attention with Attention Sinks implemented, as proposed in https://arxiv.org/abs/2309.17453. \r\nThe primary author (@Guangxuan-Xiao) has also released the code here: https://github.com/mit-han-lab/streaming-llm\r\nAnd I've adapted that code to a drop-in replacement of `transformers` to allow people to use it: https://github.com/tomaarsen/attention_sinks\r\n(e.g.\r\n```python\r\nfrom attention_sinks import AutoModel\r\n\r\nmodel = AutoModel.from_pretrained(\"meta-llama/Llama-2-7b-hf\", device_map=\"auto\")\r\n```\r\n)\r\n\r\n---\r\n<img width=\"1905\" alt=\"schemes\" src=\"https://github.com/huggingface/transformers/assets/37621491/26aae4d4-9f12-4ff1-b746-e3576491f6a6\">\r\n\r\nThe paper shows that adapting windowed attention such that the first 4 tokens of the input sequence are always in the window, allows any tested LLM (Llama 2, MPT, Falcon, Pythia) to scale to endless inputs without catastropic perplexity increases. All without doing any form of retraining.\r\nWith other words, scaling any pretrained LLM to infinite sequence length is as simple as:\r\n1. Converting the attention to windowed attention.\r\n2. Using a special cache for the windowed attention that always keeps the first 4 (by default) tokens in the cache.\r\n\r\nUsing this elementary approach, the authors were able to keep various LLM models stable when feeding them with (!) 4 million tokens.\r\n![image](https://github.com/huggingface/transformers/assets/37621491/1bb658ee-329b-4631-9114-172ab6a11915)\r\n\n\n### Motivation\n\nMaximum sequence lengths have been an important topic for a while now, with solutions ranging from RoPE to LongLoRA to YaRN, but each of these have their limits, and some also require retraining/additional training. This windowed attention with attention sinks seems to completely solve this problem, and it would be an extremely valuable addition.\r\n\r\nI can vouch for the results in the paper. I've gotten these results for Llama 2 7B using [my own implementation](https://github.com/tomaarsen/attention_sinks):\r\n![llama_2_7b_ppl_vram](https://github.com/tomaarsen/attention_sinks/assets/37621491/1b99f29e-8d8d-4677-bef6-6a6e041776f6)\r\n\n\n### Your contribution\n\nYes. I would love to help implement this into core transformers rather than in [my drop-in implementation](https://github.com/tomaarsen/attention_sinks). However, I would like to discuss:\r\n\r\n1. Whether this feature is a good fit for `transformers`.\r\n2. Where we store the code for converting each model (e.g. Llama, Pythia, Falcon) to windowed attention. See e.g. [this file](https://github.com/tomaarsen/attention_sinks/blob/main/attention_sinks/models/llama/pos_shift.py) for an example.\r\n3. Where we store the code with applying the Attention Sink KV Cache after a forward call. see e.g. [this file](https://github.com/tomaarsen/attention_sinks/blob/main/attention_sinks/models/llama/modeling_llama.py) for an example.\r\n\r\nThe primary author of the paper has also expressed interest in a `transformers` implementation [here](https://github.com/mit-han-lab/streaming-llm/issues/5#issuecomment-1744116440).\r\n\r\n- Tom Aarsen",
+        "comments": [
+            "Hey @tomaarsen, very cool feature and implementation!\r\n\r\nThis definitely looks like a good fit for `transformers`, or at least it should be of very high value for the community to have access to attention sinks very easily.\r\n\r\nKeeping a drop-in implementation up to date on the long term is hard to do, so I would recommend we move towards a utility function for now that could eventually be upstreamed into `transformers` once it has developed a bit more.\r\n\r\nSo instead of the current\r\n\r\n```py\r\nfrom attention_sinks import AutoModel\r\n\r\nmodel = AutoModel.from_pretrained(\"meta-llama/Llama-2-7b-hf\", device_map=\"auto\")\r\n```\r\n\r\nhow about something like\r\n\r\n```python\r\nfrom attention_sinks import convert_model_attention_to_sinks\r\nfrom transformers import AutoModel\r\n\r\nmodel = AutoModel.from_pretrained(\"meta-llama/Llama-2-7b-hf\", device_map=\"auto\")\r\nmodel = convert_model_attention_to_sinks(model)\r\n```\r\n?\r\n\r\n---\r\n\r\nEventually, the API could take two different directions:\r\n1. Either we develop it similarly to the existing `BetterTransformers` support -> It depends on the `optimum` library being installed in the environment, and offers the method `model.to_bettertransformers()` to convert the model to the right format\r\n2. Either we add support for it directly in the `from_pretrained` method like we do for Flash Attention: `AutoModel.from_pretrained(\"meta-llama/Llama-2-7b-hf\", use_flash_attention_2=True)`\r\n\r\nThe first path is likely the most scalable; we would work a bit on the model definition to enable \"plugins\" from third-party library, enabling support for many third-party tools. The second one would offer support in core transformers directly, but for this we would really want validation across many models first.\r\n\r\ncc @ArthurZucker @younesbelkada @patrickvonplaten @ydshieh ",
+            "Hello!\r\n\r\nI'm glad that you've open to the idea of adding this to `transformers`! I think it would be of enormous value.\r\nFirst of all, I agree that the implementation of \r\n```python\r\nfrom attention_sinks import AutoModel\r\n\r\nmodel = AutoModel.from_pretrained(\"meta-llama/Llama-2-7b-hf\", device_map=\"auto\")\r\n```\r\nis not workable long-term, but I think a solution similar to BetterTransformers in `optimum` is viable. People can approach the third-party application (e.g. optimum in the case of BetterTransformers, or `attention_sinks`), and propose the conversion method to add Attention Sinks to whatever architecture isn't supported yet. The goal/scope of the third party would then essentially be to act as a dictionary mapping architectures to conversion functions (rather than also providing `AutoModel`, `AutoModelForCausalLM`, `LlamaModel`, etc.).\r\n\r\nOn `transformers` we would have a conversion method (e.g. `add_attention_sinks`), which applies the conversion from the third party, if it exists. This might be preferable from an API perspective to your option 2, as this method can be given args and kwargs, such as the `attention_sink_size` (e.g. the first 4 tokens) and `window_size` (e.g. 1020 tokens). Adding more args and kwargs is more scalable in this way, as we can't just willy-nilly add these kwargs to `transformers` `AutoModel.from_pretrained`. This is important to consider, as the research on this is extremely new - so we might require more arguments in the future as the research expands.\r\n\r\nI'm curious to hear your thoughts on this.\r\n\r\nFor reference, today I will be adding support for MPT, Falcon, Pythia alongside my existing Llama support to [`attention_sinks`](https://github.com/tomaarsen/attention_sinks).\r\n\r\n- Tom Aarsen",
+            "[Brainstorming] I'm wondering whether we could use this issue as a catalyst to improve our cache / past key value design we have in Transformers as it needs to be updated anyways soon (cc @gante as well).\r\n\r\n@tomaarsen do you think we could support StreamingLLM to every model just by defining a \"StreamingLLM/AttentionSink\" cache that can be passed to the forward method (as `past_key_values`) and that would then take care of correctly creating the past key values at each step.\r\n\r\nHere a GitHub gist of what I'm thinking of: https://gist.github.com/patrickvonplaten/7411f84b8a2cca3bc8e63df315d7d618\r\n\r\nIn short, this would entail some more fundamental changes to Transformers (essentially that every attention layer would call `cache.update(...)` if past_key_values is an object of type Cache), but I think this is something we want to do anyways to allow for torch.compile to work better. Also we would then give generate a new function argument `generate(..., cache=cache)` that can be optionally be passed.\r\n\r\nWould be curious to hear what you think about this idea! At this stage is definitely still pure brainstorming, but I think this could be a cool long-term solution that would also be quite easy to implement",
+            "@patrickvonplaten \r\n\r\nI'm afraid that your proposal would not quite be enough to implement the AttentionSink approach in all models. In addition to the cache, the approach requires that the position IDs are shifted in the window. To give a toy example: 4 attention sink tokens, window size of 6, and the text is just a space separated alphabet, then the model sees:\r\n```\r\nA\r\nA B\r\nA B C\r\nA B C D\r\nA B C D E\r\nA B C D E F\r\nA B C D E F G\r\nA B C D E F G H \r\nA B C D E F G H I\r\nA B C D E F G H I J\r\nA B C D F G H I J K\r\nA B C D G H I J K L\r\nA B C D H I J K L M\r\n...\r\n```\r\nWith these position IDs:\r\n```\r\n0\r\n0 1\r\n0 1 2\r\n0 1 2 3\r\n0 1 2 3 4\r\n0 1 2 3 4 5\r\n0 1 2 3 4 5 6\r\n0 1 2 3 4 5 6 7\r\n0 1 2 3 4 5 6 7 8\r\n0 1 2 3 4 5 6 7 8 9\r\n0 1 2 3 4 5 6 7 8 9\r\n0 1 2 3 4 5 6 7 8 9\r\n0 1 2 3 4 5 6 7 8 9\r\n...\r\n```\r\ni.e. the position IDs get shifted (or rather, they don't get shifted) as the window moves. \r\n\r\nOr from the paper itself (Section 3.2, page 5):\r\n> When determining the relative distance and adding positional information to tokens, StreamingLLM\r\nfocuses on positions within the cache rather than those in the original text. This distinction is crucial\r\nfor StreamingLLM\u2019s performance. For instance, if the current cache has tokens [0, 1, 2, 3, 6, 7, 8]\r\nand is in the process of decoding the 9th token, the positions assigned are [0, 1, 2, 3, 4, 5, 6, 7], rather\r\nthan the positions in the original text, which would be [0, 1, 2, 3, 6, 7, 8, 9].\r\n\r\n---\r\n\r\nIn practice, this is somewhat simple. For Mistral it requires changing this rotary position embedding application here:\r\nhttps://github.com/huggingface/transformers/blob/2c7b26f5083becb429bdae4c919feca28fdf5699/src/transformers/models/mistral/modeling_mistral.py#L273\r\nInto one that only updates the query_states, e.g.\r\n```python\r\nquery_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)\r\n```\r\nwith\r\n```python\r\ndef apply_rotary_pos_emb_single(x, cos, sin, position_ids):\r\n    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.\r\n    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]\r\n    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]\r\n    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]\r\n    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]\r\n    x_embed = (x * cos) + (rotate_half(x) * sin)\r\n    return x_embed\r\n```\r\nThen, we update the key and value states using the cache, followed by an update to the cache. Only after that's done, do we update the `key_states` with \"faked\" position IDs:\r\n```python\r\nkey_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0)\r\nkey_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)\r\n```\r\n\r\nI took these snippets from my `attention_sinks` [here](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/attention_sinks/models/mistral/pos_shift.py#L51-L66) and [here](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/attention_sinks/models/mistral/pos_shift.py#L17C1-L24C19). I'd recommend checking out these sources as these snippets might be confusing without their context.\r\n\r\n---\r\n\r\nThe tl:dr is essentially that we need 2 changes to implement Attention Sink correctly:\r\n1. Update the model architecture to shift the position IDs.\r\n2. Update the Attention Sink KV Cache using the `past_key_values` from every `...Model.forward` call.\r\n\r\nYour proposal would be a very elegant solution for the second part of the implementation, but not yet the former. I do the former in my `pos_shift.py` files for [Mistral](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/attention_sinks/models/mistral/pos_shift.py), [Falcon](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/attention_sinks/models/falcon/pos_shift.py), [GPT-NeoX](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/attention_sinks/models/gpt_neox/pos_shift.py) and [Llama](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/attention_sinks/models/llama/pos_shift.py).\r\n\r\nSidenote: I added support for Mistral, GPT-NeoX, Falcon and MPT to [`attention_sinks`](https://github.com/tomaarsen/attention_sinks) \ud83c\udf89\r\nIf the model perplexities are anything to go by, then it works great for everything that I've tried:\r\n\r\n<details><summary>Perplexity & VRAM plots</summary>\r\n\r\n| Llama 2 7B | Falcon 7B |\r\n|:-------------:|:-------------:|\r\n| ![llama_2_7b_ppl_vram_plotted](https://github.com/tomaarsen/attention_sinks/assets/37621491/8d2e5b88-7158-41ac-8b3a-5a7abe38020d)  | ![falcon_7b_ppl_vram_plotted](https://github.com/tomaarsen/attention_sinks/assets/37621491/1be07370-6de7-4a7e-b5ab-3092a5ecb412)  |\r\n| **MPT 7B** | **Pythia 6.9B** |\r\n| ![mpt_7b_ppl_vram_plotted](https://github.com/mit-han-lab/streaming-llm/assets/37621491/c96cff66-92a3-43ab-bc21-40232f2740a0) | ![pythia_6 8b_ppl_vram_plotted](https://github.com/tomaarsen/attention_sinks/assets/37621491/b0fee168-fa5a-457d-9e27-8395eb6dfb38) |\r\n| **Mistral 7B** | |\r\n| ![mistral_7b_ppl_vram_plotted](https://github.com/microsoft/torchscale/assets/37621491/3a4c5634-cc1b-42d1-a35a-afb376a4f970) | |\r\n</details>\r\n\r\n- Tom Aarsen",
+            "Great point about the position_ids, I indeed didn't think about this enough. \r\n\r\nAlso super nice to see that the other LLMs also work great with StreamingLLM's approach! Very encouraging! \r\n\r\nTaking a step back here, I guess there are different levels of support we could offer for StreamingLLM:\r\n\r\n---------------------\r\n\r\n- 1.) No real native support in Transformers\r\nThis corresponds a bit to what we have now and what is proposed [here](https://github.com/huggingface/transformers/issues/26553#issuecomment-1744384031) . The advantage is that we don't need to do any changes to Transformers and that your package can nicely be leveraged. However, keeping it up to date is challenging.\r\n\r\n---------------------\r\n- 2.) Native support in Transformers but only for a \"model.forward-level\". In the end of the day `generate` is just a method that calls forward multiple times and many libraries that depend on Transformers implement their own generate method.\r\nSo in a first step it would be great to support StreamingLLM for every model's forward method so that one only has to change the generate method. \r\n\r\nWe can achieve this by following the design as described [here](https://github.com/huggingface/transformers/issues/26553#issuecomment-1745349158) \r\n\r\nfor the cache, *i.e.*:\r\n\r\n> 2. Update the Attention Sink KV Cache using the past_key_values from every ...Model.forward call.\r\n\r\nNow for:\r\n\r\n> 1. Update the model architecture to shift the position IDs.\r\n\r\nit's indeed trickier!\r\n\r\nOne approach to handle this here could be to add an optional `key_position_ids` function argument here: https://github.com/huggingface/transformers/blob/2f3ea08a077ba3133fa8a604b22436cad250b055/src/transformers/models/falcon/modeling_falcon.py#L429 \r\n\r\nThis would then propagate all the way to `apply_rotary_pos_emb`: https://github.com/huggingface/transformers/blob/2f3ea08a077ba3133fa8a604b22436cad250b055/src/transformers/models/llama/modeling_llama.py#L207 \r\n\r\nthat would default to `position_ids` if not specified. This way the user could at every forward call for generate pass the correct, but different position_ids for query and key respectively. For the user this could then look as follows:\r\n\r\n```py\r\ncache = SinkCache(window_length=256, num_sink_tokens=3)\r\n\r\nquery_pos_ids = ...\r\nkey_pos_ids = ....\r\nmodel(input_ids, position_ids=query_pos_ids, key_position_ids=key_pos_ids, cache=cache)\r\n```\r\n\r\n---------------------\r\n\r\n- 3.) The last step would then be to support streamingLLM natively in Transformers with `generate`. If we have finished 2.) This could also be done relatively easily e.g. we could just allow the user to pass:\r\n\r\n```py\r\ncache = SinkCache(window_length=256, num_sink_tokens=3)\r\n```\r\n\r\nto generate:\r\n\r\n```py\r\nmodel.generate(\"....\", cache=cache)\r\n```\r\n\r\nand regarding the position_ids it would also require only a small change in https://github.com/huggingface/transformers/blob/2f3ea08a077ba3133fa8a604b22436cad250b055/src/transformers/models/llama/modeling_llama.py#L1093 to correct the position ids for generation. \r\n\r\n**Questions**:\r\n\r\nChanging all the position_ids logic just for StreamingLLM might be a tough sell given that the method is still relatively new, but if it can be nicely done I think it'd be ok to extend the forward and `prepare_inputs_for_generation` method. \r\n\r\nWhat do you think here @tomaarsen ? \r\n\r\nIn that regard some questions:\r\n- a) It would be great to also give the user a simple way to support Windowed Attention and Sliding Windowed Attention with recomputation in Transformes - do you know how the `position_ids` would need to be treated here? In a similar way as it's done for StreamingLLM? \r\n- b) As far as I can see streaming LLM is implemented only for models that use RoPE position scaling. Do you think it should also work with Alibi (Falcon's default is Alibi position ids) or GPT2 (vanilla position ids)? \r\nIt would be cool to gauge if the changes to the position ids needed here could be solved in a similar design as described above.",
+            "Apologies for the delay, it a busy day at work today. \r\nI'll go over each of your options:\r\n\r\n> 1.) No real native support in Transformers\r\n\r\nAlthough I'm definitely open to maintaining a third party package, it is not feasible for `transformers` as it stands right now. For each architecture I have to:\r\n1. \u2705 Wrap the forward of the `...Model` with a cache update, which I can implement fairly elegantly.\r\n2. \u274c Completely replace the entire forward method of all `...Attention` classes to update the position IDs.\r\n\r\nThis requires me to completely pin each `attention_sinks` version to a very specific `transformers` version, which is not really viable, as much as I think it would be fun to maintain a plugin of `transformers`.\r\n\r\n---\r\n\r\n> 2.) Native support in Transformers but only for a \"model.forward-level\".\r\n\r\nThis is my personal preference intuitively. \r\n\r\nBeyond that, generation doesn't work out of the box even with the forward methods correctly updated. I've encountered two noteworthy problems:\r\n1. The `attention_mask` in `_update_model_kwargs_for_generation` grows with a \"1\" for every token generated. Once the Sink KV Cache starts removing samples then this causes a shape mismatch. Easy fix here: https://github.com/tomaarsen/attention_sinks/blob/f46e63101fa74c6095e986c33284217c34a9fd88/attention_sinks/generation/utils.py#L38-L41\r\n\r\n2. The `model.generate` method does not return the `past_key_values`, preventing any form of multi-step generation (which is the primary use case of the Attention Sink approach: being able to keep prompting your model over and over and over without it losing fluency). If we update the cache like discussed prior, then this problem could be resolved by the user passing a Cache instance to `model.generate` which holds the updated `past_key_values`. This cache instance can then be reused for future `model.generate` calls.\r\n\r\n---\r\n\r\nI think that the key_position_ids idea should work. An alternative is that rotating and caching is implemented in a method, so that only this method can be overridden by a third party (i.e. \"attention_sinks\") to provide this functionality.\r\n\r\nEdit: Another alternative is a parameter on the `cache` class for `cache_before_rotate` which determines whether to cache before (like in Attention Sink) or after (normal) rotating.\r\n\r\n---\r\n\r\nAs for your questions, I also invite @Guangxuan-Xiao to answer here, but I'll do my best to answer:\r\n\r\n* a) I've implemented the window attention in the exact same way as attention_sinks, but just with using 0 sink tokens. That said, I'm not confident that this is the correct approach, as there's a chance that the position IDs should not be shifted for window attention. Perhaps @Guangxuan-Xiao can comment on this. \r\nAlso, for Sliding Window Attention, is that the form where each layer of the model can see a slightly different window?\r\n\r\n* b) Yes, it works for ALiBi. In fact, the MPT implementation is simplest of all - I don't need to override any forward method at all, I just need to call the cache update after every MPTModel.forward. Some proof:\r\n> StreamingLLM\u2019 design is versatile and can be seamlessly incorporated into any autoregressive language model that employs relative positional encoding, such as RoPE (Su et al., 2021) and ALiBi (Press et al., 2022).\r\n\r\nAnd some more info on the implementation:\r\n> For encoding like RoPE, we cache the Keys of tokens prior to introducing the rotary transformation. Then, we apply position transformation to the keys in the rolling cache at each decoding phase. On the other hand, integrating with ALiBi is more direct. Here, the contiguous linear bias is applied instead of a \u2019jumping\u2019 bias to the attention scores. This method of assigning positional embedding within the cache is crucial to StreamingLLM\u2019s functionality, ensuring that the model operates efficiently even beyond its pre-training attention window size.\r\n\r\nFor GPT2, I'd have to have a quick look at the implementation. I see it's a bit different than the modern LLMs, e.g. with `GPT2LMHeadModel` instead of `GPT2ForCausalLM`. However, I think we need rotary embeddings.\r\n\r\n---\r\n\r\nQuasi-related: I've been pointed to a similar paper that does something very similar: https://arxiv.org/abs/2308.16137\r\n> It involves only a \u039b-shaped attention mask (to avoid excessive attended tokens) and a distance limit (to avoid unseen distances) while requiring no parameter updates or learning. We find it applicable to a variety of LLMs using relative-position encoding methods. LM-Infinite is computationally efficient with O(n) time and space, and demonstrates consistent text generation fluency and quality to as long as 128k tokens on ArXiv and OpenWebText2 datasets, with 2.72x decoding speedup. We will make the codes publicly available following publication. \r\n\r\nThis \"\u039b-shaped attention mask\" is kind of like always attending to the first tokens (i.e. the sink tokens) and \"a distance limit\" sounds like a window size.\r\n\r\n- Tom Aarsen",
+            "Thanks for mentioning our work (https://arxiv.org/abs/2308.16137) \"LM-Infinite: Simple On-the-Fly Length Generalization for Large Language Models\" a month ago! I also noticed the striking similarities between the two methods: (1) we both use a $\\Lambda$-shaped attention mask, which is equivalent to \"sink tokens\" + nearest tokens, and (2) we both re-arrange the distance, which we referred to as a \"distance limit\" while they refer to as \"When determining the relative distance and adding positional information to tokens, StreamingLLM focuses on positions within the cache rather than those in the original text\" in Section 3.2.\r\n\r\nWe are happy to share an implementation here: https://github.com/Glaciohound/LM-Infinite, which you might be interested in having a check.\r\n\r\nSomewhat surprisingly, in the StreamingLLM's implementation, even when doing context encoding (such as calculating perplexity of a sequence), they feed tokens one by one (as can be observed [here](https://github.com/tomaarsen/attention_sinks/blob/c6f78f3d88cb151915cd744059091ee7949f10af/benchmark/perplexity.py#L56-L62) and [here](https://github.com/mit-han-lab/streaming-llm/blob/main/examples/eval_long_ppl.py#L76-L81)). In the contrary, our implementation offers a \"sequence\" mode encoding functionality just as normal language models, which avoids looping through the sequence and provide a great computational efficiency. This is thanks to our [specialized attention kernel implementation](https://github.com/Glaciohound/LM-Infinite/blob/main/models/lambda_attention.py).\r\n\r\nI am also very interested in helping to integrate these papers in HuggingFace Transformers. If you need any further information or help from technical side, please do not hesitate to let me know.",
+            "Also @gante ",
+            "@patrickvonplaten I've created a draft PR in #26681 using the `Cache` that you envisioned. The implementation for the Attention Sink Cache should be fairly simple then. \r\n\r\nAlso, I ran more experiments over the weekend:\r\n* The method does not trivially work for vanilla attention, as the next token still needs to have the \"next\" position, which means that the entire KV cache would have to be recomputed with the position IDs shifted to the left to make \"space\" for the next token.\r\n* I have very strong suspicions, though I haven't tested it yet, that Windowed Attention with Attention Sinks/StreamingLLM should work with Flash Attention 2 for Llama \ud83c\udf89 \r\n\r\nI have a Hugging Face blogpost with more experiments on Attention Sinks coming out soon.\r\n\r\n- Tom Aarsen",
+            "@tomaarsen @patrickvonplaten \r\n\r\nThis is awesome! In this way, the PR provides a general cache module reusable for other models as well, which is of great help to the whole community and future developers for other models.\r\n\r\nWhat is left to be done is compatibility with `backward` and sequence forwarding/classification support for long sequences, which I am more than happy to help on! Current implementation here is optimized for generation. To also let users forwarding and backwarding long sequences (such as encoding long contexts or for classification on long document, an inevitable need when users do large-scale pre-training or deployment) without token-by-token forwards, [our code snippet used in LM-Switch](https://github.com/huggingface/transformers/pull/26667) can serve as a starting point for encoding (happy to merge our codes!). After that, Sinks/StreamingLLM can continue using the cached features (theoretically compatible) for generation.\r\n\r\n- Chi Han",
+            "I'd love to continue working on this.",
+            "Of course @tomaarsen .\r\n\r\nYou can delete the bot comment (I guess you know it \ud83d\ude04 ) - and welcome to the team!\r\n",
+            "Thank you! \u2764\ufe0f",
+            "@tomaarsen @Glaciohound \r\nHi! Thanks for all the efforts you have put into making this work.\r\nI was wondering if there have been any updates regarding this issue, particularly about forwarding long sequences.\r\n\r\nThanks in advance!"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 66467,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "tests/test_modeling_common.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 560,
+            "original_line": 560,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "This was redundant with L565 (from the unmodified file). The lines below, such as `config.use_cache = False`, had no effect since `config` was overwritten in L565\r\n\r\nThis was causing the test to fail, since it was using the cache (and it shouldn't)."
+            ]
+        },
+        {
+            "hunk_id": 66468,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/cache_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 50,
+            "original_line": 50,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 50,
+            "subject_type": "line",
+            "review_comments": [
+                "I'd be more in favor of moving all of the following methods:\r\n`__init__`\r\n`__getitem__`\r\n`__iter__`\r\n`__len__`\r\n`get_seq_length`\r\n`to_legacy_cache`\r\n`from_legacy_cache`\r\n\r\n to `DynamicCache` \r\n\r\nbecause:\r\n- a) We only need backward comp for the dynamic cache and IMO should restrict future Cache implementations to inherit these methods - that would be confusing for new users\r\n- b) IMO `Cache` should a purely abstract object - i.e. it should only have abstract methods that raise `NotImplementedError(...)`\r\n- c) SinkCache should not inherit methods that it then needs to overwrite and call with `super()` such as `get_seq_length` => this is not very readable and makes life hard for people that want to implement their own cache.\r\n- d) I don't think every cache will have the following a list of tuples as `self.key_cache` - when we add the compiled cache we want to have a purely tensor-based key and value cache",
+                "Makes sense \ud83d\udc4d \r\n\r\nIt does add a few extra steps in the transition. `generate` will need a few touches (e.g. cache manipulation in beam search), but we can add them along the way.\r\n\r\nIn the long run, it is indeed better if we go on this route!"
+            ]
+        },
+        {
+            "hunk_id": 66473,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": 293,
+            "original_start_line": 288,
+            "start_side": "RIGHT",
+            "line": 295,
+            "original_line": 295,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                f\"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will \"\r\n                \" lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` \"\r\n                \"when creating this class.\"\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66472,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/cache_utils.py",
+            "start_line": 5,
+            "original_start_line": 5,
+            "start_side": "RIGHT",
+            "line": 6,
+            "original_line": 6,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\nfrom abc import ABC\r\n\r\nclass Cache(ABC):\r\n```",
+                "(nit) Why use `ABC` here? :sweat_smile: I'm really not a fan of the ABC package as it adds zero functionality and for people that don't know the package it adds unnecessary logic that needs to be looked up.\r\n\r\nWhen I see a class that has only functions that return `NotImplementedError` and a docstring that says \"This is an abstract class\" that's all I need and better than having a `ABC` abstraction ",
+                "I have zero strong opinion on ABC, let's use `NotImplementedError` and a good docstring then! "
+            ]
+        },
+        {
+            "hunk_id": 66476,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/cache_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 270,
+            "original_line": 270,
+            "side": "RIGHT",
+            "original_position": 255,
+            "position": 270,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                rerotation_cos, rerotation_sin = self.get_rerotation_cos_sin(key_states, cos, sin)\r\n```\r\nIncorrect method name"
+            ]
+        },
+        {
+            "hunk_id": 66477,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 910,
+            "original_line": 910,
+            "side": "RIGHT",
+            "original_position": 161,
+            "position": 162,
+            "subject_type": "line",
+            "review_comments": [
+                "thanks! "
+            ]
+        },
+        {
+            "hunk_id": 66469,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/deprecated/open_llama/modeling_open_llama.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 863,
+            "original_line": 863,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "ok!"
+            ]
+        },
+        {
+            "hunk_id": 66480,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": 909,
+            "original_start_line": 909,
+            "start_side": "RIGHT",
+            "line": 913,
+            "original_line": 913,
+            "side": "RIGHT",
+            "original_position": 165,
+            "position": 165,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        if use_cache:\r\n            use_legacy_cache = not isinstance(past_key_values, Cache) and past_key_values is not None\r\n            if use_legacy_cache:\r\n                past_key_values = DynamicCache.from_legacy_cache(past_key_values)\r\n            elif past_key_values is None:\r\n                past_key_values = DynamicCache()\r\n            past_key_values_length = past_key_values.get_seq_length()\r\n```\r\n\r\nThis has probably been discussed already but here I am: here in the first forward pass when using `generate`, we have `past_key_values` being None, and `use_legacy_cache` evaluates to `True`. This results in `from_legacy_cache` and `to_legacy_cache` being called at each decoding iteration. Is this intended for now?\r\n\r\nAlternatively `DynamicCache()` may be initialized in `generation/utils.py` in case we care only about `generate` using the new cache implementation.\r\n\r\nit's not clear to me why, but the proposed suggestion I give actually makes generation slower. Any idea what's happening?",
+                "Hey @fxmarty! Glad to hear that it is compatible with the optimum ONNX export \ud83d\udc9b \r\n\r\nDefaulting to the old cache type is intentional: for all intents and purposes, if we were to use (and return) a `DynamicCache` by default it would technically be an API change, so it has to go through a deprecation cycle. However, since caching touches many types of models and is used in lots of places, I want users to experiment with the feature and report bugs before placing the warning (like you just did with optimum ONNX export!). For instance, I'm fairly confident that we need code changes for the cache to support encoder-decoder models -- it has no room for the cross-attention atm. \r\n\r\nAs for your suggestion being slower: no clue \ud83d\udc40 The conversion is pretty fast though, no tensors are created, so it should be cheap to leave it as is for a couple of minor `transformers` versions"
+            ]
+        },
+        {
+            "hunk_id": 66481,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": 293,
+            "original_start_line": 293,
+            "start_side": "RIGHT",
+            "line": 295,
+            "original_line": 295,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "this warning needs some TLC - the current \"will to errors\" doesn't parse. Thank you!\r\n\r\ndid you mean \"will lead to errors\" perhaps? i.e. missing \"lead\"\r\n\r\n",
+                "You're right! I'll take care of it. Thanks @stas00 ",
+                "@tomaarsen FYI adding this fix to the next cache PR (adding support to encoder-decoder models), no need to open a PR :)\r\n\r\n@stas00 thanks for flagging! \ud83e\udd17 "
+            ]
+        },
+        {
+            "hunk_id": 66482,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/persimmon/modeling_persimmon.py",
+            "start_line": 841,
+            "original_start_line": 841,
+            "start_side": "RIGHT",
+            "line": 842,
+            "original_line": 842,
+            "side": "RIGHT",
+            "original_position": 226,
+            "position": 226,
+            "subject_type": "line",
+            "review_comments": [
+                "@tomaarsen When does this case happen?"
+            ]
+        },
+        {
+            "hunk_id": 66475,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": 987,
+            "original_start_line": 960,
+            "start_side": "RIGHT",
+            "line": 989,
+            "original_line": 989,
+            "side": "RIGHT",
+            "original_position": 200,
+            "position": 219,
+            "subject_type": "line",
+            "review_comments": [
+                "I probably forgot / missed some context so a good place to add a comment ! \ud83d\ude05 I am not sure I understand why we need have this logic because the legacy cache is the `DynamicCache` which will behave like a tuple if returned thus not breaking the API + being compatible with generate. (unless it was not compatible?)\r\n\r\nAlso not sure I understand why anyone would pass `use_legacy_cache` which should just be deduced by the type of the cache, tuple -> legacy, else not legacy. WDYT? ",
+                "@ArthurZucker It behaves exactly like the old cache in the situations stipulated within `transformers`, but it is a new object type -- therefore technically a breaking change \ud83d\ude22 \r\n\r\nI'm more than happy to proceed without this flag and jump straight into the new format. We can release it in v4.36 and see if anyone complains \ud83d\udc40 \r\n\r\nLMK if you agree, in which case I will remove this flag.",
+                "cc: I'd like to hear @patrickvonplaten's opinion as well, as he proposed the flag.\r\n\r\nAlso, thanks again a bunch @gante for picking up this PR from me. ",
+                "I'm in favor of keeping the flag and slowly deprecating the tuple cache - don't see a big problem with having a flag"
+            ]
+        },
+        {
+            "hunk_id": 66470,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 401,
+            "original_line": 401,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n             if self.layer_idx is None:\r\n                 raise ValueError(f\"The cache structure has changed since version XXX. If you are using {self.__class__.__name__} for auto-regressive decoding with k/v caching, please make sure to initialize the attention class with a layer index.\")\r\n            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66478,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": 1147,
+            "original_start_line": 1142,
+            "start_side": "RIGHT",
+            "line": 1148,
+            "original_line": 1148,
+            "side": "RIGHT",
+            "original_position": 264,
+            "position": 265,
+            "subject_type": "line",
+            "review_comments": [
+                "that's specific to the sink cache no? ",
+                "It will be for the fixed-length cache as well :D And windowed attention can probably make use of it too",
+                "alright :) "
+            ]
+        },
+        {
+            "hunk_id": 66479,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "tests/generation/test_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1910,
+            "original_line": 1910,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "nice test! "
+            ]
+        },
+        {
+            "hunk_id": 66474,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/cache_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 149,
+            "side": "RIGHT",
+            "original_position": 105,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "Alright with me, but given that the cos / sin part is specific to ROPE again, would probably have a general sink cache and a RopeSinkCache to separate the logic. WDYT @patrickvonplaten.\r\n",
+                "I'd leave as is, I'd maybe just add some comments that `cos` / `sin` are only needed because of RoPE"
+            ]
+        },
+        {
+            "hunk_id": 66471,
+            "commit_id": "ee60b1cc13e2819ef31e69952c0b6f616bd724b8",
+            "original_commit_id": "52746922b044806db4df4fe40c4e85c17ee4b49a",
+            "path": "src/transformers/models/llama/modeling_llama.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 290,
+            "original_line": 290,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        self.layer_idx = layer_idx\r\n        \r\n        if layer_idx is None:\r\n            logger.warn(\"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and can lead to errors during the forward call. Please make sure to provide a `layer_idx` when creating this class.\")\r\n```",
+                "Added `warning_once` instead, to avoid a giant list of repeated warnings :)"
+            ]
+        }
+    ]
+}

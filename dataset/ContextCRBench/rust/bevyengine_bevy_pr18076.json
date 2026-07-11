@@ -1,0 +1,63 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 18076,
+    "lang": "rust",
+    "pr_title": "Recursive run_system",
+    "pr_body": "# Objective\r\n\r\nFixes #18030\r\n\r\n## Solution\r\n\r\nWhen running a one-shot system, requeue the system's command queue onto the world's command queue, then execute the later.\r\n\r\nIf running the entire command queue of the world is undesired, I could add a new method to `RawCommandQueue` to only apply part of it.\r\n\r\n## Testing\r\n\r\nSee the new test.\r\n\r\n---\r\n\r\n## Showcase\r\n\r\n```rust\r\n#[derive(Resource)]\r\npub struct Test {\r\n    id: SystemId,\r\n    counter: u32,\r\n}\r\n\r\nlet mut world = World::new();\r\nlet id = world.register_system(|mut commands: Commands, mut test: ResMut<Test>| {\r\n    print!(\"{:?} \", test.counter);\r\n    test.counter -= 1;\r\n    if test.counter > 0 {\r\n        commands.run_system(test.id);\r\n    }\r\n});\r\nworld.insert_resource(Test { id, counter: 5 });\r\nworld.run_system(id).unwrap();\r\n```\r\n\r\n```\r\n5 4 3 2 1 \r\n```",
+    "pr_comments": [
+        "Oh hey, I remember being annoyed by this and not being able to figure out how to fix it when I was working on the MVP one-shot systems. Definitely a bug."
+    ],
+    "merged": true,
+    "created_at": "2025-03-05T03:57:16Z",
+    "issue_context": {
+        "number": 18030,
+        "title": "One shot system cannot recursively call itself",
+        "body": "## Bevy version\n\n0.15.3\n\n## What you did\n\nI was creating a effect system that run one shot system, and can take effect as parameters to run them from that one shot system (which mean i can call the same one shot system from the same system, but it's not rly recursive)\n\n## What went wrong\nI discovered that you cannot call X one shot system from the same system\n\n## Isolated minimal example\n\n```rust\nuse bevy::{ecs::system::SystemId, prelude::*};\n\nfn main() {\n    let mut app = App::new();\n    let id = app.register_system(one_shot_system);\n\n    app.add_plugins(DefaultPlugins);\n    \n    app.insert_resource(TestRes {\n        id: id,\n        counter: 5\n    });\n\n    app.add_systems(Startup, test_startup);\n    app.run();\n}\n\npub fn test_startup(mut commands: Commands, test: Res<TestRes>) {\n    commands.run_system(test.id);\n}\n\n#[derive(Resource)]\npub struct TestRes {\n    id: SystemId,\n    counter: u32\n}\n\npub fn one_shot_system(mut commands: Commands, mut test: ResMut<TestRes>) {\n    println!(\"{:?}\", test.counter);\n    test.counter = test.counter-1;\n\n    if test.counter > 0 {\n        commands.run_system(test.id);\n    }\n}\n```\n\nThis only call one_shot_sytem once and the commands.run_system inside it do nothing.\n\n\n\nOf course this is not rly my use case but it's the same bug in the end.\n\nApparently i can just go with observers since i was told they can recursivly call themself, which i tried to avoid since in my use case it's mean 500 entities, one for each effect), but in the end it's probably nothing and have 0 perf issue.\n\nBut i wanted to know if this was intended or not cause it's documented nowhere (or i'm blind, it's a posibility i just have reading issues).\n\nI think this happens cause the system may be removed from the world while it's executed",
+        "comments": [
+            "> I think this happens cause the system may be removed from the world while it's executed\n\nYup. The problem is that applying a command queue requires exclusive access to it (both because running commands consumes them and to clear the queue), and a system's command queue is stored in the system itself.\n\nTo fix this, I think need to move the command queue out of the system and then double buffer them. Iirc flecs uses a thread-local queue?\n\n> Apparently i can just go with observers since i was told they can recursivly call themself, which i tried to avoid since in my use case it's mean 500 entities, one for each effect), but in the end it's probably nothing and have 0 perf issue.\n\nShould be fine, as entities shouldn't hurt performance just by existing.",
+            "There's a note about this on [`World::run_system`](https://docs.rs/bevy/latest/bevy/ecs/prelude/struct.World.html#method.run_system).\n\nAfter some testing it looks like you *can* make it work with a custom `System` implementation that unconditionally uses `System::queue_deferred` instead of `System::apply_deferred`. This may have other consequences, so I wouldn't recommend it.\n\n<details>\n\n```rust\nuse std::borrow::Cow;\n\nuse bevy::{\n    ecs::{\n        archetype::ArchetypeComponentId,\n        component::{ComponentId, Tick},\n        query::Access,\n        schedule::InternedSystemSet,\n        system::{FunctionSystem, IntoSystem, ReadOnlySystemParam, SystemId},\n        world::{DeferredWorld, unsafe_world_cell::UnsafeWorldCell},\n    },\n    prelude::*,\n};\n\nfn main() {\n    let mut app = App::new();\n    let id = app.register_system(QueueFunctionSystem {\n        inner: IntoSystem::into_system(one_shot_system),\n    });\n\n    app.add_plugins(DefaultPlugins);\n\n    app.insert_resource(TestRes { id: id, counter: 5 });\n\n    app.add_systems(Startup, test_startup);\n    app.run();\n}\n\npub fn test_startup(mut commands: Commands, test: Res<TestRes>) {\n    commands.run_system(test.id);\n}\n\n#[derive(Resource)]\npub struct TestRes {\n    id: SystemId,\n    counter: u32,\n}\n\npub fn one_shot_system(mut commands: Commands, mut test: ResMut<TestRes>) {\n    println!(\"{:?}\", test.counter);\n    test.counter = test.counter - 1;\n\n    if test.counter > 0 {\n        let id = test.id;\n        commands.queue(move |world: &mut World| {\n            world.commands().run_system(id);\n        });\n    }\n}\n\nstruct QueueFunctionSystem<Marker, F: SystemParamFunction<Marker>> {\n    inner: FunctionSystem<Marker, F>,\n}\n\nimpl<Marker, F> System for QueueFunctionSystem<Marker, F>\nwhere\n    Marker: 'static,\n    F: SystemParamFunction<Marker>,\n{\n    type In = F::In;\n    type Out = F::Out;\n\n    #[inline]\n    fn name(&self) -> Cow<'static, str> {\n        self.inner.name()\n    }\n\n    #[inline]\n    fn component_access(&self) -> &Access<ComponentId> {\n        self.inner.component_access()\n    }\n\n    #[inline]\n    fn archetype_component_access(&self) -> &Access<ArchetypeComponentId> {\n        self.inner.archetype_component_access()\n    }\n\n    #[inline]\n    fn is_send(&self) -> bool {\n        self.inner.is_send()\n    }\n\n    #[inline]\n    fn is_exclusive(&self) -> bool {\n        self.inner.is_send()\n    }\n\n    #[inline]\n    fn has_deferred(&self) -> bool {\n        self.inner.has_deferred()\n    }\n\n    #[inline]\n    unsafe fn run_unsafe(\n        &mut self,\n        input: SystemIn<'_, Self>,\n        world: UnsafeWorldCell,\n    ) -> Self::Out {\n        unsafe { self.inner.run_unsafe(input, world) }\n    }\n\n    #[inline]\n    fn apply_deferred(&mut self, world: &mut World) {\n        // Queue instead of applying\n        self.inner.queue_deferred(world.into());\n    }\n\n    #[inline]\n    fn queue_deferred(&mut self, world: DeferredWorld) {\n        self.inner.queue_deferred(world);\n    }\n\n    #[inline]\n    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> bool {\n        unsafe { self.inner.validate_param_unsafe(world) }\n    }\n\n    #[inline]\n    fn initialize(&mut self, world: &mut World) {\n        self.inner.initialize(world);\n    }\n\n    fn update_archetype_component_access(&mut self, world: UnsafeWorldCell) {\n        self.inner.update_archetype_component_access(world);\n    }\n\n    #[inline]\n    fn check_change_tick(&mut self, change_tick: Tick) {\n        self.inner.check_change_tick(change_tick);\n    }\n\n    fn default_system_sets(&self) -> Vec<InternedSystemSet> {\n        self.inner.default_system_sets()\n    }\n\n    fn get_last_run(&self) -> Tick {\n        self.inner.get_last_run()\n    }\n\n    fn set_last_run(&mut self, last_run: Tick) {\n        self.inner.set_last_run(last_run);\n    }\n}\n\nunsafe impl<Marker, F> ReadOnlySystem for QueueFunctionSystem<Marker, F>\nwhere\n    Marker: 'static,\n    F: SystemParamFunction<Marker>,\n    F::Param: ReadOnlySystemParam,\n{\n}\n```\n\n</details>",
+            "> There's a note about this on [`World::run_system`](https://docs.rs/bevy/latest/bevy/ecs/prelude/struct.World.html#method.run_system).\n> \n> After some testing it looks like you _can_ make it work with a custom `System` implementation that unconditionally uses `System::queue_deferred` instead of `System::apply_deferred`. This may have other consequences, so I wouldn't recommend it.\n\nGuess i have to use Observer for anything that can call itself, haven't tested them yet so i hope they support recursive.\n\nEntities have 0 cost if they do nothing right ? (outside the few bits of memory), i can have as many observers i want ?\n\n\nAlso i'm not sure if i should close this issue. Not rly used to the github ecosystem to know.",
+            "Definitely a bug! Please leave this open."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1136,
+            "commit_id": "c5e8a6762eeb7679e026e4c15fcd6a7c97f1adc7",
+            "original_commit_id": "058497e0bb79abbc3a1037c8669591e715996271",
+            "path": "crates/bevy_ecs/src/system/system_registry.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 359,
+            "original_line": 359,
+            "side": "RIGHT",
+            "original_position": 72,
+            "position": 72,
+            "subject_type": "line",
+            "review_comments": [
+                "I thought commands were only run at sync points? Not after any system has been run?",
+                "We are at a sync point, in the sense that we have an exclusive reference to the world. Before this PR, commands queued by the system were executed here via `System::run`.\r\n\r\nThere is a difference in behavior though: Previously, only the commands queued by the system were applied (which might include running other systems and their commands); now, this includes commands that were already queued before the system was run. I've documented it, but if we think the previous behavior is less surprising, I'll add a method to `CommandQueue` to only apply part of it and use it here. I'd do that in a followup PR though because it also involves unsafe and I want to keep it easy to review.",
+                "All good I mostly asked for my own understanding. "
+            ]
+        },
+        {
+            "hunk_id": 1135,
+            "commit_id": "c5e8a6762eeb7679e026e4c15fcd6a7c97f1adc7",
+            "original_commit_id": "058497e0bb79abbc3a1037c8669591e715996271",
+            "path": "crates/bevy_ecs/src/system/system.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 94,
+            "original_line": 94,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "This is a useful API to expose!  The single-threaded executor has some unsafe code and a special case for exclusive systems because it wants exactly this behavior: \r\n\r\nhttps://github.com/bevyengine/bevy/blob/b73811d40e477503119d13f423fc49bcaec2af42/crates/bevy_ecs/src/schedule/executor/single_threaded.rs#L116\r\n\r\nIt might be worth doing a follow-up to use `run_without_applying_deferred` there.  "
+            ]
+        }
+    ]
+}

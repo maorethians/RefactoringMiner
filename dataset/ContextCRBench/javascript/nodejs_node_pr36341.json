@@ -1,0 +1,85 @@
+{
+    "repo": "nodejs/node",
+    "pr_number": 36341,
+    "lang": "javascript",
+    "pr_title": "Always available FIPS options",
+    "pr_body": "This is continuation of #35019, rebased on current master. I have taken it over from @voxik.\r\n\r\n## Additional changes\r\n\r\n`fipsMode` constant was replaced by (hopefully) internal binding to `FIPS_selftest()` OpenSSL function.\r\nThe binding is called `testFipsCrypto()` and it simply returns 1 or 0 based on the FIPS status reported by OpenSSL.\r\nThe relevant tests were adjusted to rely on this in place of the original constant.\r\n\r\n## Open problems\r\n\r\nThere is still the issue of reporting errors in `InitCryptoOnce()`:\r\n\r\n```cpp\r\n/* Override FIPS settings in cnf file, if needed. */\r\nunsigned long err = 0;  // NOLINT(runtime/int)\r\nif (per_process::cli_options->enable_fips_crypto ||\r\n    per_process::cli_options->force_fips_crypto) {\r\n  if (0 == FIPS_mode() && !FIPS_mode_set(1)) {\r\n    err = ERR_get_error();\r\n  }\r\n}\r\nif (0 != err) {\r\n  fprintf(stderr,\r\n          \"openssl fips failed: %s\\n\",\r\n          ERR_error_string(err, nullptr));\r\n  UNREACHABLE();\r\n}\r\n```\r\n\r\nThe `UNREACHABLE()` section is not so unreachable anymore \ud83d\ude09.\r\nUnfortunately, I was not able to figure out better way to report an error \u2013 anything similar to `return ThrowCryptoError(env, err)` requires a reference to the environment, which AFAIK is not available in the `InitCryptoOnce()`.\r\n\r\nAny pointers?\r\n\r\n---\r\n\r\nFixes #34903; obsoletes/closes #35019.\r\n",
+    "pr_comments": [
+        " > Any pointers?\r\n\r\nWould something like this work perhaps?\r\n```console\r\ndiff --git a/src/crypto/crypto_util.cc b/src/crypto/crypto_util.cc\r\nindex a238b84e7e..759e829000 100644\r\n--- a/src/crypto/crypto_util.cc\r\n+++ b/src/crypto/crypto_util.cc\r\n@@ -120,10 +120,9 @@ void InitCryptoOnce() {\r\n     }\r\n   }\r\n   if (0 != err) {\r\n-    fprintf(stderr,\r\n-            \"openssl fips failed: %s\\n\",\r\n-            ERR_error_string(err, nullptr));\r\n-    UNREACHABLE();\r\n+    Isolate* isolate = Isolate::GetCurrent();\r\n+    Environment* env = Environment::GetCurrent(isolate);\r\n+    return ThrowCryptoError(env, err, ERR_error_string(err, nullptr));\r\n   }\r\n \r\n   // Turn off compression. Saves memory and protects against CRIME attacks.\r\ndiff --git a/src/node_crypto.cc b/src/node_crypto.cc\r\nindex d25387f142..2ce5f211fb 100644\r\n--- a/src/node_crypto.cc\r\n+++ b/src/node_crypto.cc\r\n@@ -31,6 +31,7 @@ namespace node {\r\n using v8::Context;\r\n using v8::Local;\r\n using v8::Object;\r\n+using v8::TryCatch;\r\n using v8::Value;\r\n \r\n namespace crypto {\r\n@@ -39,10 +40,14 @@ void Initialize(Local<Object> target,\r\n                 Local<Value> unused,\r\n                 Local<Context> context,\r\n                 void* priv) {\r\n+  Environment* env = Environment::GetCurrent(context);\r\n+  TryCatch try_catch{env->isolate()};\r\n   static uv_once_t init_once = UV_ONCE_INIT;\r\n   uv_once(&init_once, InitCryptoOnce);\r\n-\r\n-  Environment* env = Environment::GetCurrent(context);\r\n+  if (try_catch.HasCaught() && !try_catch.HasTerminated()) {\r\n+    try_catch.ReThrow();\r\n+    return;\r\n+  }\r\n \r\n   AES::Initialize(env, target);\r\n   CipherBase::Initialize(env, target);\r\n\r\n```\r\nWith this patch and using `--enable-fips` when there is no fips support available would result in:\r\n```console\r\n$ ./out/Debug/node --enable-fips -p 'crypto.constants.OPENSSL_VERSION_NUMBER'\r\nnode:internal/bootstrap/loaders:140\r\n      mod = bindingObj[module] = getInternalBinding(module);\r\n                                 ^\r\n\r\nError: error:0F06D065:common libcrypto routines:FIPS_mode_set:fips mode not supported\r\n    at internalBinding (node:internal/bootstrap/loaders:140:34)\r\n    at node:crypto:50:5\r\n    at NativeModule.compileForInternalLoader (node:internal/bootstrap/loaders:283:7)\r\n    at nativeModuleRequire (node:internal/bootstrap/loaders:312:14)\r\n    at get (node:internal/modules/cjs/helpers:158:21)\r\n    at [eval]:1:1\r\n    at Script.runInThisContext (node:vm:133:18)\r\n    at Object.runInThisContext (node:vm:310:38)\r\n    at node:internal/process/execution:77:19\r\n    at [eval]-wrapper:6:22 {\r\n  library: 'common libcrypto routines',\r\n  function: 'FIPS_mode_set',\r\n  reason: 'fips mode not supported',\r\n  code: 'ERR_OSSL_CRYPTO_FIPS_MODE_NOT_SUPPORTED'\r\n}\r\n\r\n```\r\n",
+        "@danbev Thanks, the `Isolate::GetCurrent(); Environment::GetCurrent(isolate);` calls were exactly what I was looking for :slightly_smiling_face:\r\n\r\nNow I can get a proper look at the failing tests.",
+        "Cleaned the history a bit and rebased on master. If the checks pass, this should be ready for review.",
+        "CI: https://ci.nodejs.org/job/node-test-pull-request/35059/",
+        "CI: https://ci.nodejs.org/job/node-test-pull-request/35107/",
+        "CI: https://ci.nodejs.org/job/node-test-pull-request/35353/",
+        "@khardix there still seem to be a few related tests that are failing: test.parallel/test-cli-node-print-help\r\ntest.parallel/test-process-env-allowed-flags-are-documented\r\n\r\nin https://ci.nodejs.org/job/node-test-commit-linux-containered/nodes=ubuntu1804_sharedlibs_debug_x64/24501/",
+        "Just noting this is still on my backlog, hopefully I can get back to this within a week again.",
+        "I'm currently unable to reproduce the test failures locally. I have rebased the changes on current master; let's see what the CI thinks.",
+        "@mhdawson Well, now it seems to pass; only macOS ran out of memory. Unless any changes are requested, I'm considering this ready to be merged.\r\n",
+        "CI: https://ci.nodejs.org/job/node-test-pull-request/36054/",
+        "It seems that macOS still has some timeout-related issues\u2026\r\n\r\nOther than that, @danbev, what do you think about the test changes?",
+        "CI run: https://ci.nodejs.org/job/node-test-pull-request/36360/",
+        "CI: https://ci.nodejs.org/job/node-test-pull-request/36360/",
+        "CI run is good, landing.",
+        "Landed in f392ac0bbe3f"
+    ],
+    "merged": false,
+    "created_at": "2021-02-11T05:17:09Z",
+    "issue_context": {
+        "number": 34903,
+        "title": "Drop `#ifdef NODE_FIPS_MODE` wherever possible",
+        "body": "Drop `#ifdef NODE_FIPS_MODE` wherever possible, because it does not make sense to guard FIPS code by `#ifdef NODE_FIPS_MODE`, when this ifdef is immediately followed by `FIPS_mode()`. It would make sense if the `FIPS_mode()` is not defined depending on OpenSSL settings, but that is not the case. I believe that removing the guards would help our users to get more precise information about FIPS settings from calls such as `node -p 'crypto.getFips()'`. This would also help to resolve [this]( https://bugzilla.redhat.com/show_bug.cgi?id=1847529) ticket.",
+        "comments": [
+            "@mhdawson @danbev ",
+            "And since I am here, it would be also nice to revisit [this code](https://github.com/nodejs/node/blob/0dae5d93809450a7dce1f9370473a1ffc480657d/lib/crypto.js#L45) and get the information from `FIPS_mode()` instead of some command line option.",
+            "IOW, it would be nice if Node.js always relied solely on OpenSSL settings, no matter what build options or command line options are specified. The configuration options should only influence OpenSSL settings, not the Node.js code.",
+            "Pull request welcome, I think.",
+            "That seems reasonable to me and what you have in the branch which mentions this looks good so far.",
+            "Thx. I need to do some testing. I'll send PR once it is ready.",
+            "@voxik thanks for the update.",
+            "I did some testing around this on FIPS-enabled system. I built node with varying options and then ran `./node [--enable-fips] -p 'crypto.getFips()'`.\r\n\r\n1.  Node built with `--shared-openssl --openssl-is-fips` configure options, without this patch applied:\r\n\r\n    - `./node --enable-fips -p 'crypto.getFips()'` prints `1` \u21d2 FIPS mode enabled.\r\n    - `./node -p 'crypto.getFips()'` prints `0` \u21d2 FIPS mode is not enabled.\r\n\r\n2.  Node built with `--shared-openssl` and with this patch applied:\r\n\r\n    Same results as in point 1. Note that the configure option `--openssl-is-fips` seems to have no effect here, which is the whole point of this patch :smile:.\r\n\r\n3.  Node built with `--shared-openssl` without this patch:\r\n\r\n    - `./node --enable-fips -p 'crypto.getFips()'` reports `bad option: --enable-fips`.\r\n    - `./node -p 'crypto.getFips()'` prints `0` \u21d2 FIPS mode not enabled.\r\n\r\n    In this configuration, FIPS mode cannot be enabled at all.\r\n\r\n4.  Node built with `--openssl-is-fips` *or* this patch applied (same results), but without `--shared-openssl` (and thus with the bundled one):\r\n\r\n    - `./node --enable-fips -p 'crypto.getFips()'` throws an error:\r\n\r\n      ```\r\n      openssl fips failed: error:0F06D065:common libcrypto routines:FIPS_mode_set:fips mode not supported\r\n      ./node[1627]: ../src/node_crypto.cc:7028:void node::crypto::InitCryptoOnce(): Assertion `\"Unreachable code reached\"' failed.\r\n      1: 0xad7950 node::Abort() [./node]\r\n      2: 0xad79e2 node::Assert(node::AssertionInfo const&) [./node]\r\n      3: 0xc02347 node::crypto::InitCryptoOnce() [./node]\r\n      4: 0x7fe39fc9e20b  [/lib64/libpthread.so.0]\r\n      5: 0x1458469 uv_once [./node]\r\n      6: 0xc0b836 node::crypto::Initialize(v8::Local<v8::Object>, v8::Local<v8::Value>, v8::Local<v8::Context>, void*) [./node]\r\n      7: 0xaaa73b node::binding::GetInternalBinding(v8::FunctionCallbackInfo<v8::Value> const&) [./node]\r\n      8: 0xccd7a2 v8::internal::FunctionCallbackArguments::Call(v8::internal::CallHandlerInfo) [./node]\r\n      9: 0xccdbf3  [./node]\r\n      10: 0xcce496  [./node]\r\n      11: 0xcce726 v8::internal::Builtin_HandleApiCall(int, unsigned long*, v8::internal::Isolate*) [./node]\r\n      12: 0x14cf119  [./node]\r\n      ```\r\n\r\n    - `./node -p crypto.getFips()` prints `0` \u21d2 FIPS mode not enabled.\r\n\r\n    As expected, here the FIPS mode is reported as unsupported by the bundled OpenSSL version,\r\n    although it is quite aggresive about it \u2013 the assertion seems quite strict.\r\n\r\n5.  I did not really test the \"vanilla\" Node build, but from the above combinations\r\n    I assume that the `--enable-fips` option would not exist and without it,\r\n    the `crypto.getFips()` would still return `0`, making this case equivalent to point 3.\r\n\r\n---\r\n\r\n@voxik Hope this helps, let me know if you need any other combination :)\r\n",
+            "@khardix Thx for testing. So if I understand correctly, you have tested on the system where FIPS was supported, but disabled by default. Do you think you could provide also test results on the system with OpenSSL configured in FIPS mode by default? I think that specifying `fips=1` on kernel cmd line should be enough to enable the FIPS mode.\r\n\r\nAnd I am going to take a look into the 4th bullet.",
+            "> And I am going to take a look into the 4th bullet.\r\n\r\nSo I think the problem lies at this part of `InitCryptoOnce()`:\r\n\r\n~~~\r\n  /* Override FIPS settings in cnf file, if needed. */\r\n  unsigned long err = 0;  // NOLINT(runtime/int)\r\n  if (per_process::cli_options->enable_fips_crypto ||\r\n      per_process::cli_options->force_fips_crypto) {\r\n    if (0 == FIPS_mode() && !FIPS_mode_set(1)) {\r\n      err = ERR_get_error();\r\n    }\r\n  }\r\n  if (0 != err) {\r\n    fprintf(stderr,\r\n            \"openssl fips failed: %s\\n\",\r\n            ERR_error_string(err, nullptr));\r\n    UNREACHABLE();\r\n  }\r\n~~~\r\n\r\nwhere the `UNREACHABLE();` aborts the Node.js and actually the abortion is probably correct, because when OpenSSL does not support FIPS, it can't be enabled. But it should abort more gracefully. Not sure how to do that. May be something like `return ThrowCryptoError(env, err);`",
+            "I have opened PR #35019"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 51780,
+            "commit_id": "a4658c36f9e8f78a1963103e6b0c82e2d0bb7ac3",
+            "original_commit_id": "80098e605c1d535e495438210c661c3e69a24535",
+            "path": "test/parallel/test-process-env-allowed-flags-are-documented.js",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 64,
+            "original_line": 64,
+            "side": "LEFT",
+            "original_position": 12,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "We also need to test when node is configured `without-ssl`:\r\n```console\r\n./configure --without-ssl && make -j8\r\n```\r\nWith that configuration this test and `test/parallel/test-cli-node-print-help.js` are currently [failing](https://ci.nodejs.org/job/node-test-commit-linux-containered/nodes=ubuntu1804_sharedlibs_withoutssl_x64/25198/).\r\n\r\n`test-cli-node-print-help.js` can be run using the following command:\r\n```console\r\n$ ./node --expose-internals test/parallel/test-cli-node-print-help.j\r\n```",
+                "I have moved the FIPS flags behind the same checks as the rest of the SSL-related flags.\r\n\r\nThanks for pointing the `--without-ssl` compilation out!"
+            ]
+        },
+        {
+            "hunk_id": 51779,
+            "commit_id": "a4658c36f9e8f78a1963103e6b0c82e2d0bb7ac3",
+            "original_commit_id": "80098e605c1d535e495438210c661c3e69a24535",
+            "path": "test/parallel/test-crypto-fips.js",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "The `FIPS_ERROR_STRING` could be probably recycled here, since the linter reports it as unused?",
+                "On one hand, yes, it could be recycled. On the other hand, the naming convention of `FIPS_ERROR_STRING{n}` is not exactly self-documenting :wink: Overall, I would prefer to keep the new name."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,243 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 105299,
+    "lang": "java",
+    "pr_title": "[ML] Conditionally send the dimensions field as part of the openai requests",
+    "pr_body": "Closes https://github.com/elastic/elasticsearch/issues/105005\r\n\r\nThe motivation for this PR is to conditionally expose the `dimensions` field already stored in the openai service settings. The openai API will only accept the `dimensions` field if the `model` is one of the `text-embedding-3-*` models.\r\n\r\nFor documentation details: https://platform.openai.com/docs/api-reference/embeddings/create\r\nhttps://platform.openai.com/docs/models/embeddings\r\n\r\nThis was complicated for a couple reasons. Normally we could just add the new field in the openai service settings. Unfortunately a field called `dimensions` already exists to help with defining the `dense_vector` mapping. We set this field specifically for 3rd party services like openai during the creation process of the inference endpoint for text embeddings. We make a request and note the array size in the response to determine the dimensions. So for all 3rd party text embedding inference endpoint configurations, the `dimensions` field should be set automatically.\r\n\r\nThe problem is we only want to send this `dimensions` field if the _**user**_ has set the field while creating the inference endpoint.\r\n\r\nI can think of a couple solutions:\r\n\r\n1. Create a new field like `user_dimensions` which if set we'll send on with the request to openai\r\nWhen an inference endpoint is created and the model is returned we'd see something like this:\r\n\r\n```\r\n{\r\n    \"model_id\": \"openai\",\r\n    \"task_type\": \"text_embedding\",\r\n    \"service\": \"cohere\",\r\n    \"service_settings\": {\r\n        \"similarity\": \"dot_product\",\r\n        \"dimensions\": 123, <--- this would be set automatically by us (or maybe we could not set it if user_dimensions` is set)\r\n        \"user_dimensions\": 123,\r\n        \"model\": \"some model\"\r\n    },\r\n    \"task_settings\": {\r\n    }\r\n}\r\n```\r\n2. Create a hidden boolean field that gets set if the user did include the `dimensions` field in their original inference endpoint creation request\r\n\r\nWhen the an inference endpoint is created and the model is returned we wouldn't see this new hidden field and everything would look the same as before.\r\n\r\n```\r\n{\r\n    \"model_id\": \"openai\",\r\n    \"task_type\": \"text_embedding\",\r\n    \"service\": \"cohere\",\r\n    \"service_settings\": {\r\n        \"similarity\": \"dot_product\",\r\n        \"dimensions\": 123,\r\n        \"model\": \"some model\"\r\n    },\r\n    \"task_settings\": {\r\n    }\r\n}\r\n```\r\n\r\nI went with the second because I figured that'd be less confusing for users and I figured we'd likely have some internal fields that we'll likely need to hide in the future.\r\n\r\n\r\n_Hidden fields_ are still stored along side the other fields within the index in elasticsearch but they won't be included in any responses that would return a model.\r\n\r\nMost of the changes are to support hidden fields. All existing openai text embedding inference endpoints will have the new hidden field `dimensionsSetByUser` defaulted to `false`. If the user had set them for some reason and they are expecting the dimensions to be passed through (they weren't anyway previous to this PR) they'll just need to delete their inference endpoint and recreate it.\r\n\r\n## Testing\r\n\r\n### Setting dimensions with an incompatible model\r\n```\r\nPUT _inference/text_embedding/openai\r\n{\r\n    \"service\": \"openai\",\r\n    \"service_settings\": {\r\n        \"api_key\": \"${api_key}\",\r\n        \"organization_id\": \"${org}\",\r\n        \"max_input_tokens\": 512,\r\n        \"dimensions\": 5\r\n    },\r\n    \"task_settings\": {\r\n      \"model_id\": \"text-embedding-ada-002\"\r\n    }\r\n}\r\n```\r\n\r\nResponse\r\n```\r\n{\r\n  \"error\": {\r\n    \"root_cause\": [\r\n      {\r\n        \"type\": \"status_exception\",\r\n        \"reason\": \"Received an unsuccessful status code for request from inference entity id [openai] status [400]. Error message: [This model does not support specifying dimensions.]\"\r\n      }\r\n    ],\r\n    \"type\": \"status_exception\",\r\n    \"reason\": \"Received an unsuccessful status code for request from inference entity id [openai] status [400]. Error message: [This model does not support specifying dimensions.]\"\r\n  },\r\n  \"status\": 400\r\n}\r\n```\r\n\r\n### Setting dimensions with a compatible model\r\n\r\n```\r\nPUT _inference/text_embedding/openai\r\n{\r\n    \"service\": \"openai\",\r\n    \"service_settings\": {\r\n        \"api_key\": \"${api_key}\",\r\n        \"organization_id\": \"${org}\",\r\n        \"max_input_tokens\": 512,\r\n        \"dimensions\": 5\r\n    },\r\n    \"task_settings\": {\r\n      \"model_id\": \"text-embedding-3-small\"\r\n    }\r\n}\r\n```\r\n\r\nResponse\r\n```\r\n{\r\n  \"model_id\": \"openai\",\r\n  \"task_type\": \"text_embedding\",\r\n  \"service\": \"openai\",\r\n  \"service_settings\": {\r\n    \"organization_id\": \"org\",\r\n    \"similarity\": \"dot_product\",\r\n    \"dimensions\": 5,\r\n    \"max_input_tokens\": 512\r\n  },\r\n  \"task_settings\": {\r\n    \"model_id\": \"text-embedding-3-small\"\r\n  }\r\n}\r\n\r\n```\r\n\r\nInference request\r\n```\r\nPOST _inference/text_embedding/openai\r\n{\r\n  \"input\": [\"hello\"],\r\n  \"task_settings\": {\r\n  }\r\n}\r\n```\r\n\r\nResponse\r\n```\r\n{\r\n  \"text_embedding\": [\r\n    {\r\n      \"embedding\": [\r\n        0.18924388,\r\n        -0.6276148,\r\n        0.06360514,\r\n        0.74572676,\r\n        0.100659885\r\n      ]\r\n    }\r\n  ]\r\n}\r\n```\r\n\r\n## Example ingested document with dimensions set to 10\r\n\r\n```\r\n{\r\n  \"took\": 6,\r\n  \"timed_out\": false,\r\n  \"_shards\": {\r\n    \"total\": 1,\r\n    \"successful\": 1,\r\n    \"skipped\": 0,\r\n    \"failed\": 0\r\n  },\r\n  \"hits\": {\r\n    \"total\": {\r\n      \"value\": 100,\r\n      \"relation\": \"eq\"\r\n    },\r\n    \"max_score\": 0,\r\n    \"hits\": [\r\n      {\r\n        \"_index\": \"msmarco-passage-collection-openai\",\r\n        \"_id\": \"SjWuio0BR1SKXivyaw37\",\r\n        \"_score\": 0,\r\n        \"_source\": {\r\n          \"text_embedding\": [\r\n            0.26239877939224243,\r\n            0.5806183815002441,\r\n            -0.03832590579986572,\r\n            0.019353946670889854,\r\n            -0.12325408309698105,\r\n            -0.26056525111198425,\r\n            -0.033029038459062576,\r\n            -0.5093143582344055,\r\n            -0.35631635785102844,\r\n            0.34877848625183105\r\n          ],\r\n          \"column2\": \"This is the definition of RNA along with examples of types of RNA molecules. This is the definition of RNA along with examples of types of RNA molecules. RNA Definition\"\r\n        }\r\n      }\r\n    ]\r\n  }\r\n}\r\n```",
+    "pr_comments": [
+        "Hi @jonathan-buttner, I've created a changelog YAML for you.",
+        "Pinging @elastic/ml-core (Team:ML)"
+    ],
+    "merged": true,
+    "created_at": "2024-02-08T19:15:46Z",
+    "issue_context": {
+        "number": 105005,
+        "title": "[ML] Support the `dimensions` option for 3rd gen OpenAI text embedding models",
+        "body": "### Description\n\nThe new `text-embedding-3-small` and `text-embedding-3-large` model are available for use in the Inference API (v8.12) by configuring the `model` parameter to one of those models. The OpenAI text embedding API now has a `dimensions` option for those models to specify the number of dimensions in the response vectors. The same option should be available in the inference API.",
+        "comments": [
+            "Pinging @elastic/ml-core (Team:ML)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 36969,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "server/src/main/java/org/elasticsearch/inference/ServiceSettings.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Happy to rename this. I couldn't think of a good name. Maybe `getRedactedXContentObject`?",
+                "Filtered is good. The purpose is to hide implementation details and that shouldn't be confused with hiding secrets settings which is what redacted suggests to me."
+            ]
+        },
+        {
+            "hunk_id": 36972,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/qa/inference-service-tests/src/javaRestTest/java/org/elasticsearch/xpack/inference/MockInferenceServiceIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 96,
+            "original_line": 96,
+            "side": "RIGHT",
+            "original_position": 50,
+            "position": 50,
+            "subject_type": "line",
+            "review_comments": [
+                "Since this test passes `true` for `should_return_hidden_field` we should see it in the response"
+            ]
+        },
+        {
+            "hunk_id": 36975,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/src/test/java/org/elasticsearch/xpack/inference/services/openai/embeddings/OpenAiEmbeddingsServiceSettingsTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1,
+            "original_line": 1,
+            "side": "RIGHT",
+            "original_position": 1,
+            "position": 1,
+            "subject_type": "line",
+            "review_comments": [
+                "Sigh, these should have been moved. There mostly the same as before but I did add a few test cases around the dimensions behavior."
+            ]
+        },
+        {
+            "hunk_id": 36978,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/src/main/java/org/elasticsearch/xpack/inference/services/openai/embeddings/OpenAiEmbeddingsServiceSettings.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 231,
+            "original_line": 231,
+            "side": "RIGHT",
+            "original_position": 204,
+            "position": 205,
+            "subject_type": "line",
+            "review_comments": [
+                "neat"
+            ]
+        },
+        {
+            "hunk_id": 36970,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "server/src/main/java/org/elasticsearch/inference/ModelConfigurations.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 137,
+            "original_line": 137,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "Returns an `XContentObject` removing the fields that should not be exposed."
+            ]
+        },
+        {
+            "hunk_id": 36980,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "server/src/main/java/org/elasticsearch/inference/ToFilteredXContentObject.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 21,
+            "original_line": 21,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "Another pattern you will see in the codebase is to use `params` parameter of `toXContent(XContentBuilder builder, Params params)` to control when the internal fields should be written:\r\n\r\n```\r\nif params['include_internal_fields'] {\r\n  // write dimensions_set_by_user\r\n}\r\n```\r\n\r\nBoth are good, your approach is more explicit which is always good.",
+                "Ah thanks, good to know \ud83d\udc4d "
+            ]
+        },
+        {
+            "hunk_id": 36974,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/src/main/java/org/elasticsearch/xpack/inference/services/openai/embeddings/OpenAiEmbeddingsServiceSettings.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 59,
+            "original_line": 59,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "The `dimensions` field should always be set when ready from the persistent settings. But since we're allowing null we'll leave it that way just in case. We'll check for null in a few places to handle it."
+            ]
+        },
+        {
+            "hunk_id": 36976,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "server/src/main/java/org/elasticsearch/inference/ToFilteredXContentObject.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 21,
+            "original_line": 21,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "Not needed for this PR, but we should think about contributing/moving this interface to a package which is usable anywhere in elasticsearch as its very general and I imagine other people would like something like this"
+            ]
+        },
+        {
+            "hunk_id": 36979,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/src/test/java/org/elasticsearch/xpack/inference/services/openai/embeddings/OpenAiEmbeddingsTaskSettingsTests.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 72,
+            "original_line": 65,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "is there a reason all of these tests use PERSISTENT?",
+                "Yeah not really, I'll move the logic that relies on the context into a static function and test that."
+            ]
+        },
+        {
+            "hunk_id": 36977,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/src/main/java/org/elasticsearch/xpack/inference/services/openai/embeddings/OpenAiEmbeddingsServiceSettings.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 47,
+            "original_line": 47,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "why does this one have a different access modifier than the other ones? ",
+                "Good point, I'll switch `ORGANIZATION` to be package private. `NAME` needs to be public because it's used in a separate package when registering the named writeable registry."
+            ]
+        },
+        {
+            "hunk_id": 36971,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/qa/inference-service-tests/src/javaRestTest/java/org/elasticsearch/xpack/inference/MockInferenceServiceIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 31,
+            "position": 31,
+            "subject_type": "line",
+            "review_comments": [
+                "Ensures that `service_settings` does not have the `hidden_field`."
+            ]
+        },
+        {
+            "hunk_id": 36973,
+            "commit_id": "84f963fb1ab524e983c19cc826e7c13f8cb90e11",
+            "original_commit_id": "fbceb7fb93e58d07be8592530c1f6d9fc19ddb13",
+            "path": "x-pack/plugin/inference/src/main/java/org/elasticsearch/xpack/inference/InferenceNamedWriteablesProvider.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 31,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "I believe `dimensions` is really a embeddings thing so I moved moved the service settings to be embedding settings.\r\n\r\nWe're stuck with `OpenAiEmbeddingsServiceSettings.NAME` the way it was before though."
+            ]
+        }
+    ]
+}

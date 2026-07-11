@@ -1,0 +1,438 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 12929,
+    "lang": "rust",
+    "pr_title": "Remove redundent information and optimize dynamic allocations in `Table`",
+    "pr_body": "# Objective\r\n\r\n- fix #12853\r\n- Make `Table::allocate` faster\r\n\r\n## Solution\r\nThe PR consists of multiple steps:\r\n\r\n1) For the component data: create a new data-structure that's similar to `BlobVec` but doesn't store `len` & `capacity` inside of it: \"BlobArray\" (name suggestions welcome) \r\n2) For the `Tick` data: create a new data-structure that's similar to `ThinSlicePtr` but supports dynamic reallocation: \"ThinArrayPtr\" (name suggestions welcome)\r\n3) Create a new data-structure that's very similar to `Column` that doesn't store `len` & `capacity` inside of it: \"ThinColumn\"\r\n4) Adjust the `Table` implementation to use `ThinColumn` instead of `Column`\r\n\r\nThe result is that only one set of `len` & `capacity` is stored in `Table`, in `Table::entities`\r\n\r\n### Notes Regarding Performance\r\nApart from shaving off some excess memory in `Table`, the changes have also brought noteworthy performance improvements: \r\nThe previous implementation relied on `Vec::reserve` & `BlobVec::reserve`, but that redundantly repeated the same if statement (`capacity` == `len`). Now that check could be made at the `Table` level because the capacity and length of all the columns are synchronized; saving N branches per allocation. The result is a respectable performance improvement per every `Table::reserve` (and subsequently `Table::allocate`) call. \r\n\r\nI'm hesitant to give exact numbers because I don't have a lot of experience in profiling and benchmarking, but these are the results I got so far:\r\n\r\n*`add_remove_big/table` benchmark after the implementation:*\r\n\r\n![after_add_remove_big_table](https://github.com/bevyengine/bevy/assets/46227443/b667da29-1212-4020-8bb0-ec0f15bb5f8a)\r\n\r\n*`add_remove_big/table` benchmark in main branch (measured in comparison to the implementation):*\r\n\r\n![main_add_remove_big_table](https://github.com/bevyengine/bevy/assets/46227443/41abb92f-3112-4e01-b935-99696eb2fe58)\r\n\r\n*`add_remove_very_big/table` benchmark after the implementation:*\r\n\r\n![after_add_remove_very_big](https://github.com/bevyengine/bevy/assets/46227443/f268a155-295b-4f55-ab02-f8a9dcc64fc2)\r\n\r\n*`add_remove_very_big/table` benchmark in main branch (measured in comparison to the implementation):*\r\n\r\n![main_add_remove_very_big](https://github.com/bevyengine/bevy/assets/46227443/78b4e3a6-b255-47c9-baee-1a24c25b9aea)\r\n\r\ncc @james7132 to verify\r\n\r\n---\r\n\r\n## Changelog\r\n\r\n- New data-structure that's similar to `BlobVec` but doesn't store `len` & `capacity` inside of it: `BlobArray`\r\n- New data-structure that's similar to `ThinSlicePtr` but supports dynamic allocation:`ThinArrayPtr`\r\n- New data-structure that's very similar to `Column` that doesn't store `len` & `capacity` inside of it: `ThinColumn`\r\n- Adjust the `Table` implementation to use `ThinColumn` instead of `Column`\r\n- New benchmark: `add_remove_very_big` to benchmark the performance of spawning a lot of entities with a lot of components (15) each\r\n\r\n## Migration Guide\r\n\r\n`Table` now uses `ThinColumn` instead of `Column`. That means that methods that previously returned `Column`, will now return `ThinColumn` instead.\r\n\r\n`ThinColumn` has a much more limited and low-level API, but you can still achieve the same things in `ThinColumn` as you did in `Column`. For example, instead of calling `Column::get_added_tick`, you'd call `ThinColumn::get_added_ticks_slice` and index it to get the specific added tick.\r\n\r\n\r\n",
+    "pr_comments": [
+        "looks like a segfault in `run-examples-macos-metal` ci? needs investigation\r\ne: fixed",
+        "> For the component data: create a new data-structure that's similar to `BlobVec` but doesn't store `len` & `capacity` inside of it: \"BlobArray\" (name suggestions welcome) (This type makes a compile-time destinction between ZST types and non-ZST types)\r\n\r\nI like `UntrackedBlobVec` for this concept -- \"thin\" in Rust contexts typically refers to pointer sizes, but the data structures aren't pointers. And IMO, \"untracked\" is clearer about the intention. By the same logic, I like `UntrackedVec` and `UntrackedColumn` over `ThinArrayPtr` and `ThinColumn` (assuming `ThinArrayPtr` is implemented like a `Vec`).",
+        "> I'm not sure thee ZST separation is actually worth it. The cost of the branch is only needed up on `BlobVec::reserve_exact`, which is only called when the entities Vec is reallocated, which occurs at typical power-of-two capacity threshold. The extra SparseSet likely negates any memory savings from the redundant length and capacity cuts. It might be worth benchmaking.\r\n\r\nI did some benchmarking and the ZST separation indeed has negligible performance differences, it looks like the branch predictor is really pulling it's weight. So I merged the ZST and non-ZST columns.\r\nThanks for calling this out!",
+        "Due to the amount of unsafe in this PR, merging now is a potential risk for 0.14, moving this to merge early on in the 0.15 cycle.",
+        "Unblocked \ud83c\udf89 ",
+        "@Adamkob12 Do you have anytime to resolve conflicts to help this pr moving forword ? I don't want to miss out on such an excellent PR in 0.15 especially it has been approved by james7132 and james",
+        "@Adamkob12 sorry to leave you waiting. Once merge conflicts are resolved I'll get this in :)",
+        "No worries! I'll try to resolve the conflicts soon.",
+        "Fixed the conflicts, note for reviewers: pay extra attention to `#[cfg(feature = \"track_change_detection\")]` adjacent code, It's the first time I've seen this feature and integrating it into the PR was the majority of the work so it's very possible that I missed some small details in documentation or something like that.\r\n\r\nAlso we should probably bench this again to be safe",
+        "Your PR increases Bevy Minimum Supported Rust Version. Please update the `rust-version` field in the root Cargo.toml file."
+    ],
+    "merged": true,
+    "created_at": "2024-04-19T16:50:41Z",
+    "issue_context": {
+        "number": 12853,
+        "title": "Table redundantly stores 3 lengths and capacities for each column",
+        "body": "Tables store a length and capacity for a BlobVec and two tick Vecs for every column in it. All of them are updated in unison when spawning/moving/despawning entities. \r\n\r\nIn an ideal world, a table should only store one length and one capacity that applies to all allocations underneath it. This would make `Table::allocate` O(1) in the best case instead of O(columns).\r\n\r\nNote that addressing this likely will require a lot more unsafe, as this will require lifting a lot of the unsafe parts of BlobVec into Table.",
+        "comments": [
+            "As I see it, there are two options: (please correct me if I'm wrong, I'm writing this without much experience in the storage system)\r\n\r\n#### Option 1\r\n\r\n1) Split `BlobVec` into `RawBlobVec` and `BlobVec` (like `Vec`'s implementation)\r\n2) Use `RawBlobVec` and `RawVec` in `Column`\r\n3) Use a single length value for all columns in `Table`\r\nThis will reduce 3\\*columns - 1 `usize`s from each `Table` (8[4]\\*(3\\*columns-1) bytes), not too shabby.\r\n\r\n#### Option 2\r\n\r\nSimilar to option 1, but instead of `RawVec`s, `Column` will just store (small abstractions over) raw pointers.\r\nCapacity and length will be stored at the `Table` level.\r\nThis will reduce 6\\*columns - 2 `usize`s from each `Table` (8[4]\\*(6\\*columns-2) bytes), twice as much as option 1.\r\n",
+            "Option 2 would be strongly preferred, though some other paths might need to be retained to keep support ComponentSparseSet, intact.\r\n\r\nBikeshedding here, but a `RawBlobVec` is just a `Blob`.\r\n\r\nOne thing to note is that the capacity of `BlobVec` is set to `usize::MAX` for ZSTs, which may not play well with this setup.\r\n\r\n`bevy_ptr` has the concept of a `ThinSlicePtr<'a, T>` which is a `NonNull` that becomes a slice in debug builds. We may want to use a `ThinVec<T>` of the same nature to handle the component ticks in `Column`.",
+            "Now that I think about it, option 2 would save a lot branching - it's a must. \r\nThis does make me wonder if the ZSTs should be stored separately, maybe one `SparseSet` for ZSTs, and one for normal ones (eg):\r\n```rust\r\nstruct Table {\r\n    columns: ImmutableSparseSet<ComponentId, Column<false>>,\r\n    zst_columns: ImmutableSparseSet<ComponentId, Column<true>>,\r\n    cap: usize,\r\n    len: usize\r\n    entities: Vec<Entity>,\r\n}\r\n// ..\r\nstruct Column<const IS_ZST: bool> { .. }\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 273,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 292,
+            "original_line": 277,
+            "side": "RIGHT",
+            "original_position": 277,
+            "position": 292,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    pub unsafe fn as_slice(&self, slice_len: usize) -> &[T] {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 263,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7,
+            "original_line": 7,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n/// Similar to [`Vec<T>`], but with the capacity and length cut out for performance reasons.\r\n///\r\n/// This type can be treated as a `ManuallyDrop<Box<[T]>` without a built in length. To avoid,\r\n/// memory leaks, [`drop`]Self::drop) must be called when no longer in use.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 262,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 16,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's not split function signatures on debug or not, this is fairly likely to cause an issue in the future."
+            ]
+        },
+        {
+            "hunk_id": 272,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 252,
+            "original_line": 235,
+            "side": "RIGHT",
+            "original_position": 235,
+            "position": 252,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    unsafe fn last_element(&mut self, current_len: usize) -> Option<*mut T> {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 261,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 12,
+            "original_line": 9,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "Like ThinSlicePtr, this should, in debug mode,  track it's length and capacity and ensure that it's not being changed.",
+                "I added capacity in debug mode. but because the type doesn't support push / extend methods, tracking the length means changing api, so I decided against it. "
+            ]
+        },
+        {
+            "hunk_id": 281,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/blob_array.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 463,
+            "original_line": 481,
+            "side": "RIGHT",
+            "original_position": 481,
+            "position": 463,
+            "subject_type": "line",
+            "review_comments": [
+                "Should this also call `debug_assert_ne!(index_to_keep, index_to_remove);`?"
+            ]
+        },
+        {
+            "hunk_id": 278,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/blob_array.rs",
+            "start_line": 160,
+            "original_start_line": 148,
+            "start_side": "RIGHT",
+            "line": 162,
+            "original_line": 150,
+            "side": "RIGHT",
+            "original_position": 150,
+            "position": 162,
+            "subject_type": "line",
+            "review_comments": [
+                "AFAIK this is generally done by first setting the length to 0 and then drop the elements. This would need to be done by the caller of this function though",
+                "Yeah, setting the drop function to `None` would be the same as setting the length to 0 \u2014 they both guarantee that a double free doesn't occur.\r\nAre you sure that that would need to be done by the caller? in the `BlobVec` implementation it's done by the function itself as well.",
+                "> Are you sure that that would need to be done by the caller?\r\n\r\nI was referring to setting the length to 0, and since `BlobArray` doesn't hold the length it can't do it.\r\n\r\nI don't mean to say that letting the drop function to `None` is wrong, but it feels pretty hacky.",
+                "Is this still needed? Not a big deal either was as `drop` needs to `Option` to support `!Drop` types but figured it was worth revisiting."
+            ]
+        },
+        {
+            "hunk_id": 282,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/table/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 660,
+            "original_line": 659,
+            "side": "RIGHT",
+            "original_position": 659,
+            "position": 660,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't see anything here that results in the component being forgotten, this seems to just grab a mutable reference and return it\r\n\r\nOkay I found the use site and it says you need to remove the row afterwards, I wonder if Safety should mention that here too..."
+            ]
+        },
+        {
+            "hunk_id": 277,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/blob_vec.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 282,
+            "original_line": 282,
+            "side": "LEFT",
+            "original_position": 41,
+            "position": 41,
+            "subject_type": "line",
+            "review_comments": [
+                "Why remove the getters/setters? \r\nThe fields are private so it's not a big deal, but we lose the ability to annotate safety and so won't get clippy lints encouraging safety comments when people touch the fields.",
+                "The primary thing is that they're dead code. They're no longer used in any form as these types are entirely internal. We'd need to add some `allow(dead_code)` annotations."
+            ]
+        },
+        {
+            "hunk_id": 264,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 54,
+            "original_line": 50,
+            "side": "RIGHT",
+            "original_position": 50,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    /// Allocate memory for the array, this should only be used if no previous allocation has been made (capacity = 0)\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 270,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 159,
+            "original_line": 162,
+            "side": "RIGHT",
+            "original_position": 162,
+            "position": 159,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &'_ mut T {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 266,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 35,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline(always)]\r\n    fn set_capacity(&mut self, _capacity: usize) {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 268,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 128,
+            "side": "RIGHT",
+            "original_position": 128,
+            "position": 125,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    pub unsafe fn get_unchecked_raw(&mut self, index: usize) -> *mut T {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 269,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 137,
+            "original_line": 140,
+            "side": "RIGHT",
+            "original_position": 140,
+            "position": 137,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    pub unsafe fn get_unchecked(&self, index: usize) -> &'_ T {\r\n```",
+                "These inlines should probably be added to the other low level array-like types too."
+            ]
+        },
+        {
+            "hunk_id": 267,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 44,
+            "original_line": 49,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    pub fn with_capacity(capacity: usize) -> Self {\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 275,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/table/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 378,
+            "original_line": 415,
+            "side": "RIGHT",
+            "original_position": 649,
+            "position": 378,
+            "subject_type": "line",
+            "review_comments": [
+                "This could be a safe function."
+            ]
+        },
+        {
+            "hunk_id": 265,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 17,
+            "original_line": 14,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Rather than disallowing ZST types, it would probably be simpler to just skip (de)allocating in the case where `size_of::<T>() == 0`. As it currently stands, `impl<T> From<Box<[T]>> for ThinArrayPtr<T>` checks for ZSTs while `empty` and `with_capacity` do not."
+            ]
+        },
+        {
+            "hunk_id": 280,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/blob_array.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 257,
+            "original_line": 263,
+            "side": "RIGHT",
+            "original_position": 263,
+            "position": 257,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this in an `unsafe` block but not the call to `std::alloc::realloc`?"
+            ]
+        },
+        {
+            "hunk_id": 276,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/table/mod.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 388,
+            "original_line": 428,
+            "side": "RIGHT",
+            "original_position": 662,
+            "position": 388,
+            "subject_type": "line",
+            "review_comments": [
+                "This could be a safe function."
+            ]
+        },
+        {
+            "hunk_id": 279,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/table/column.rs",
+            "start_line": 340,
+            "original_start_line": 357,
+            "start_side": "RIGHT",
+            "line": 346,
+            "original_line": 363,
+            "side": "RIGHT",
+            "original_position": 363,
+            "position": 346,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason this isn't implemented as a `ThinColumn` along with a length and capacity `usize`s?",
+                "`Column` will be completely replaced by `ThinColumn` in a follow-up PR (see #14824)",
+                "Seems reasonable then"
+            ]
+        },
+        {
+            "hunk_id": 274,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 281,
+            "original_line": 267,
+            "side": "RIGHT",
+            "original_position": 267,
+            "position": 281,
+            "subject_type": "line",
+            "review_comments": [
+                "We're using debug_checked_unwrap in realloc, but panicking here. Shouldn't this be the same for both?",
+                "I felt that `realloc` is a much hotter method, so the tradeoff is worth it there."
+            ]
+        },
+        {
+            "hunk_id": 271,
+            "commit_id": "c510b9b405ee101398dadf237dfa143dbd9681b0",
+            "original_commit_id": "4de67b5cdb2aee4e6961c75db0f3a0d147585421",
+            "path": "crates/bevy_ecs/src/storage/thin_array_ptr.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 238,
+            "original_line": 222,
+            "side": "RIGHT",
+            "original_position": 222,
+            "position": 238,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    #[inline]\r\n    pub unsafe fn swap_remove_and_drop_unchecked(\r\n```"
+            ]
+        }
+    ]
+}

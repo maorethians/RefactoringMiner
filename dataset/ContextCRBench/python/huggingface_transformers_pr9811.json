@@ -1,0 +1,1091 @@
+{
+    "repo": "huggingface/transformers",
+    "pr_number": 9811,
+    "lang": "python",
+    "pr_title": "adapt mbart and generate for Mbart50",
+    "pr_body": "# What does this PR do?\r\nThis PR adapts `MBartForConditionalGeneration` and `generate` for mbart-50 models. \r\n\r\nThere are two main differences between mbart-50 and existing mbart-cc25 models \r\n1. for mbart-50 both source and target language text begin with the `<language token>`,  in mbart-cc25 `<language_token>` is used as suffix token.\r\n2. Also the `decoder_input_ids` begin with `[eos] [tgt_lang_token] ...`, so for generation we need to use `eos` as the `decoder_start_token_id` and force the `tgt_lang_token` as the first generated token.\r\n\r\nThis PR \r\n1. adds `MBart50Tokenizer` which encodes the text as described above, IMO adding a new tokenizer makes sense as it'll make it explicit that mbart-50 encodes the text differently.\r\n2.  introduces two new `generate` arguments  and `LogitsProcessor`\r\n    - `forced_bos_token_id` and `forced_eos_token_id`,  to force a specific start and end token. This is particularly useful for \r\n       many to many and one to many translation models, so we can pass different language tokens as `forced_bos_token_id` to \r\n       `generate`, \r\n    - `ForcedBosTokenLogitsProcessor` and `ForcedEosTokenLogitsProcessor`\r\n3. Remove `adjust_logits_during_generation` method from all models (except from `Marian`) and handle that use case using the newly introduced logits processors.\r\n4. remove the `force_bos_token_to_be_generated` argument from `BartConfig`\r\n\r\nFor `Marian` we still need to keep the `adjust_logits_during_generation` method to force the model to not generate pad token. Adding the pad token to `bad_words_ids` does not resolve this issue, the score of `pad_token_id` needs to be set to `-inf` before calling `log_softmax`.\r\n\r\nBelow is an example of mbart-50 model using `forced_bos_token_id`\r\n\r\n```python\r\nfrom transformers import MBartForConditionalGeneration, MBart50Tokenizer\r\n\r\narticle_hi = \"\u0938\u0902\u092f\u0941\u0915\u094d\u0924 \u0930\u093e\u0937\u094d\u091f\u094d\u0930 \u0915\u0947 \u092a\u094d\u0930\u092e\u0941\u0916 \u0915\u093e \u0915\u0939\u0928\u093e \u0939\u0948 \u0915\u093f \u0938\u0940\u0930\u093f\u092f\u093e \u092e\u0947\u0902 \u0915\u094b\u0908 \u0938\u0948\u0928\u094d\u092f \u0938\u092e\u093e\u0927\u093e\u0928 \u0928\u0939\u0940\u0902 \u0939\u0948\"\r\narticle_ar = \"\u0627\u0644\u0623\u0645\u064a\u0646 \u0627\u0644\u0639\u0627\u0645 \u0644\u0644\u0623\u0645\u0645 \u0627\u0644\u0645\u062a\u062d\u062f\u0629 \u064a\u0642\u0648\u0644 \u0625\u0646\u0647 \u0644\u0627 \u064a\u0648\u062c\u062f \u062d\u0644 \u0639\u0633\u0643\u0631\u064a \u0641\u064a \u0633\u0648\u0631\u064a\u0627.\"\r\n\r\nmodel = MBartForConditionalGeneration.from_pretrained(\"facebook/mbart-50-large-many-to-many\")\r\ntokenizer = MBart50Tokenizer.from_pretrained(\"facebook/mbart-50-large-many-to-many\")\r\n\r\n# translate Hindi to French\r\nencoded_hi = tokenizer.prepare_seq2seq_batch(src_texts=article_hi, src_lang=\"hi_IN\", return_tensors=\"pt\")\r\ngenerated_tokens = model.generate(**encoded_hi, forced_bos_token_id=tokenizer.lang_code_to_id[\"fr_XX\"])\r\ntokenizer.batch_decode(generated_tokens, skip_special_tokens=True)\r\n# => \"Le chef de l 'ONU affirme qu 'il n 'y a pas de solution militaire dans la Syrie.\"\r\n\r\n# translate Arabic to English\r\nencoded_ar = tokenizer.prepare_seq2seq_batch(src_texts=article_ar, src_lang=\"ar_AR\", return_tensors=\"pt\")\r\ngenerated_tokens = model.generate(**encoded_ar, forced_bos_token_id=tokenizer.lang_code_to_id[\"en_XX\"])\r\ntokenizer.batch_decode(generated_tokens, skip_special_tokens=True)\r\n# => \"The Secretary-General of the United Nations says there is no military solution in Syria.\"\r\n```\r\n\r\nTODOs:\r\n- [x] Make sure all generation related slow integration tests pass for affected models \r\n  - [x] BART\r\n  - [x] mBART (one test is failing, but it's failing on master as well, so not related to this PR)\r\n  - [x] Blender\r\n  - [x] FSMT\r\n  - [x] Marian\r\n  - [x] Pegasus\r\n  - [x] Generation integration test\r\n- [x] add tests for `ForcedBosTokenLogitsProcessor` and `ForcedEosTokenLogitsProcessor`\r\n- [x] document mBART-50\r\n- [x] Add model cards ([all mbart-50 models](https://huggingface.co/models?filter=mbart-50))\r\n- [x] add the forced params to `facebook/bart-large-cnn`'s config on the hub\r\n- [ ] notebook explaining  how to use the one-to-many and many-to-many translation models\r\n\r\nFixes #7060",
+    "pr_comments": [
+        "I like the idea of using `LogitsProcessor`, my only concern is now each time the user wants to use a different `max_length` they would need to pass the `forced_pos_id_pairs= {max_length: eos_token_id}`.\r\n\r\nAlso IMO `prefix_token` sounds more intuitive than `forced_pos_id_pairs`. So I think we could add `ForceTokenProcessor ` and keep both `prefix_token` and `forced_pos_id_pairs` arguments. \r\n\r\nAnd if `prefix_token` is passed or `config.force_bos_token_to_be_generated` is `True` we set\r\n```python\r\nforced_pos_id_pairs = {2: prefix_token or bos_token_id, max_length: eos_token_id}\r\n```\r\n\r\nthis would avoid breaking change.\r\n",
+        "Putting our discussion with @patil-suraj down here for everyone to see. @patil-suraj brought up a good point that `forced_pos_id_pairs` is not super user friendly and might be hard to read and people usually never force \"in the middle\" tokens to be generated. So I like the proposed approach making two LogitsProcessor better as well => we should therefore make \r\na `ForcedBosTokenLogitsProcessor` that takes a `token` as input and always forces the first token to be generated and a `ForcedEosTokenLogitsProcessor` that also takes a `token` as input and forces this token to be generated at `max_length`. \r\nAs discussed we should delete all `adjust_logits` functionality and also get rid of Bart's `config.force_eos_to_be_generated` parameter while keeping full backwards compatibility as discussed.",
+        "Thanks a lot for making this work @patil-suraj! \r\n\r\nWill review the PR now. I saw that you changed the config for `facebook/bart-large-cnn` online which is nice, but should not delete: `force_bos_token_to_be_generated` from the config or it won't be backwards compatible (previous transformer versions need to still use this param). Also it seems like you accidently uploaded a `.ipynb_checkpoints` folder: force_bos_token_to_be_generated",
+        "> We have to make sure that all slow tests for Bart, MBart, Pegasus, Marian, Blenderbot, BlenderbotSmall, FSMT, RAG pass for both PT and TF. I think some of the RAGTokenGeneration could have been broken here\r\n\r\nall slow tests are passing for PT, will run the RAG tests now. Also, there is no `force_bos_token_id_to_be_generated` parameter in `RagConfig`, it's in the `generator` config if the `generator` is BART, and `BartConfig` already handles this.\r\n\r\n> Not sure whether we want to do inheritance for the MBart50Tokenizer\r\n\r\nNo strong opinion here will remove the inheritance.\r\n\r\nRegarding the `prepare_seq2seq_batch` method:\r\nThese checkpoints are mostly intended for multilingual fine-tuning/translation,  in this case, it's actually nice to be able to pass lang_id directly for encoding rather than setting `src_lang` and `tgt_lang` on tokenizer each time we have a new language pair.\r\n\r\nIf we have fixed src and target language then in that case `prepare_seq2seq_batch` definitely doesn't make much sense."
+    ],
+    "merged": false,
+    "created_at": "2021-02-05T08:47:06Z",
+    "issue_context": {
+        "number": 7060,
+        "title": "mBART 50",
+        "body": "# mBART 50\r\n\r\n## Additional languages to the mBART 25 model\r\n\r\nThe model is described in [Multilingual Translation with Extensible Multilingual Pretraining and Finetuning](https://arxiv.org/pdf/2008.00401.pdf)\r\n\r\n## Open source status\r\n\r\n* [x] the model implementation is available: [mBART](https://github.com/pytorch/fairseq/tree/master/examples/mbart)\r\n* [ ] the model weights are available: They should be released with the benchmark dataset, but I can't find them.\r\n* [ ] who are the authors: @tangyuq @huihuifan @xianxl ...\r\n",
+        "comments": [
+            "Thank you for your interest. We are doing a few clean-up and will release them shortly. ",
+            "Waiting for the model too :)\r\n\r\nThanks",
+            "@tangyuq Is the benchmark included in [Beyond English-Centric Multilingual Machine Translation](https://github.com/pytorch/fairseq/tree/master/examples/m2m_100)?",
+            "We'll be adding a full evaluation on the ML50 benchmark in an updated version. The main reason why I haven't added it yet is that we want to update ML50's evaluation pairs done on WMT20 to the WMT20 test sets. When ML50 was originally released, the WMT20 test sets were not released yet. So we'll update both works together. \r\n\r\nA portion of ML50 evaluation, from the original mBART paper, is available in Beyond English Centric MMT work already. ",
+            "Hi, thanks for the great work and releasing the models to public.\r\nDo we have any update on mBART50 model release? ",
+            "The [mBART50 model](https://github.com/pytorch/fairseq/tree/master/examples/multilingual#mbart50-models) is now available on the fairseq repository.",
+            "@jaspock Has someone been able to load these mBART50 models with huggingface mBART version?\r\nI was able to convert it (and the weight appear to be right). However, when generating translations, it just repeats the same word over and over again.\r\n",
+            "Maybe @patil-suraj has some input?",
+            "Hi @jaspock \r\n\r\nI'm also facing the same issue, I've been able to convert the weights, but as you said the generation is not working, I'm investigating this currently.",
+            "mBART-50 is now available on master!\r\n\r\nhttps://huggingface.co/transformers/master/model_doc/mbart.html#overview-of-mbart-50\r\n\r\nhttps://huggingface.co/models?filter=mbart-50",
+            "Hi, I want to finetune the multilingual model for some languages.\r\nI cannot find the exact script , number of updates used to finetune mbart50.\r\nThe paper suggested 500k updates for training the model that was trained from scratch. Paper [Link](https://arxiv.org/pdf/2008.00401.pdf)\r\nThe multilingual fine-tuning script shows 40k updates in the training [script](https://github.com/pytorch/fairseq/tree/master/examples/multilingual#mbart50-models) (Which was also used for Bilingual model in mBart paper)\r\n\r\nBut I cannot find specifications for MT-FT (Multilingual Fine Tuning) for 50 languages.\r\nI suspect 40k won't be enough if combined data for all languages is high.\r\nCan anyone guide me if I am missing something\r\n",
+            "> Hi, I want to finetune the multilingual model for some languages.\r\n> I cannot find the exact script , number of updates used to finetune mbart50.\r\n> The paper suggested 500k updates for training the model that was trained from scratch. Paper [Link](https://arxiv.org/pdf/2008.00401.pdf)\r\n> The multilingual fine-tuning script shows 40k updates in the training [script](https://github.com/pytorch/fairseq/tree/master/examples/multilingual#mbart50-models) (Which was also used for Bilingual model in mBart paper)\r\n> \r\n> But I cannot find specifications for MT-FT (Multilingual Fine Tuning) for 50 languages.\r\n> I suspect 40k won't be enough if combined data for all languages is high.\r\n> Can anyone guide me if I am missing something\r\n\r\nHi @kaivu1999 Did you figure out how to fine-tune? I am also exploring for finetuning the multilingual model but haven't found a proper specification yet.",
+            "Hi @kaivu1999, @pdakwal \r\n\r\n> I cannot find the exact script \r\n\r\nThere is a `run_translation.py` script [here](https://github.com/huggingface/transformers/tree/master/examples/pytorch/translation), which can be used for fine-tuning mBART-50 but it does not support multi-lingual fine-tuning. But it should be easy to adapt to do that.\r\n\r\nFor multi-lingual fine-tuning, what we need to do here is, say we are fine-tuning on two language pairs, in that case, we need to concatenate the two datasets or in case the two language pairs don't have the same number of examples then add some sort of sampler which will sample the example from the datasets depending on the number of examples in each one. And when processing each language pair, set the appropriate `src_lang` and `tgt_lang` tokens. The processing part is explained in the [docs](https://huggingface.co/transformers/model_doc/mbart.html#overview-of-mbart-50).",
+            "Hi @kaivu1999, @pdakwal  were u able to finetune mbart50 on custom data? Please help."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 66525,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/blenderbot/modeling_tf_blenderbot.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1481,
+            "original_line": 1481,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "I think this was a merge conflict here. I deleted this function a while back and added the more generic `TFCausalLanguageModelingLoss` to all BART-like models. Can you check whith current master and delete all those newly added `compute_loss` functions? "
+            ]
+        },
+        {
+            "hunk_id": 66549,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/blenderbot/configuration_blenderbot.py",
+            "start_line": 88,
+            "original_start_line": 88,
+            "start_side": "RIGHT",
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66521,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/bart/configuration_bart.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 178,
+            "original_line": 178,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 49,
+            "subject_type": "line",
+            "review_comments": [
+                "nice!"
+            ]
+        },
+        {
+            "hunk_id": 66535,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/rag/modeling_rag.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1092,
+            "original_line": 1092,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "<3",
+                "We might have to update RAG's config to be sure that this works correctly - did you run all the RAG slow tests as well?"
+            ]
+        },
+        {
+            "hunk_id": 66538,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_tf_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 148,
+            "original_line": 148,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            forced_eos_token_id (:obj:`int`, `optional`):\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66553,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/configuration_mbart.py",
+            "start_line": 88,
+            "original_start_line": 88,
+            "start_side": "RIGHT",
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66532,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 202,
+            "original_line": 202,
+            "side": "RIGHT",
+            "original_position": 202,
+            "position": 202,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we use the new contextmanager `as_target_tokenizer` and `as_source_tokenizer` instead of this method. I think I'd actually prefer to not have this method...but let's see what @sgugger and @LysandreJik say",
+                "Agree with @patrickvonplaten ",
+                "The method needs to be there for backward compatibility with `finetune_trainer.py`. It can be coded like this (to adjust the `src_lang` and `tgt_lang` before using the default one).\r\n\r\nI don't thing src_lang and tgt_lang should have defaults however, they should be left at None (and we update the attribute if they are not None)."
+            ]
+        },
+        {
+            "hunk_id": 66556,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50.py",
+            "start_line": 110,
+            "original_start_line": 110,
+            "start_side": "RIGHT",
+            "line": 112,
+            "original_line": 112,
+            "side": "RIGHT",
+            "original_position": 112,
+            "position": 112,
+            "subject_type": "line",
+            "review_comments": [
+                "We should not add any new example using `prepare_seq2seq_batch`."
+            ]
+        },
+        {
+            "hunk_id": 66507,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_logits_process.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 541,
+            "original_line": 481,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 22,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you add a line `scores[:, self.bos_token_id] = 0` here?"
+            ]
+        },
+        {
+            "hunk_id": 66516,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/convert_slow_tokenizer.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 501,
+            "original_line": 501,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Great that you added this as well!"
+            ]
+        },
+        {
+            "hunk_id": 66509,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_tf_utils.py",
+            "start_line": 920,
+            "original_start_line": 920,
+            "start_side": "RIGHT",
+            "line": 922,
+            "original_line": 922,
+            "side": "RIGHT",
+            "original_position": 82,
+            "position": 82,
+            "subject_type": "line",
+            "review_comments": [
+                "Since there are no `LogitsProcessor`s in TF `generate`, keeping the forced bos and eos token logic here.",
+                "Cool! Very much agree here - until `generate()` is not refactored, this looks like a very good solution"
+            ]
+        },
+        {
+            "hunk_id": 66559,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50_fast.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 120,
+            "original_line": 120,
+            "side": "RIGHT",
+            "original_position": 120,
+            "position": 120,
+            "subject_type": "line",
+            "review_comments": [
+                "Same remark as before."
+            ]
+        },
+        {
+            "hunk_id": 66511,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/marian/modeling_marian.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1325,
+            "original_line": 1325,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "This will be handled by `ForcedEosTokenLogitsProcessor`"
+            ]
+        },
+        {
+            "hunk_id": 66520,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2180,
+            "original_line": 2180,
+            "side": "RIGHT",
+            "original_position": 94,
+            "position": 94,
+            "subject_type": "line",
+            "review_comments": [
+                "same comment as for the other one no? This is now only relevant for Marian"
+            ]
+        },
+        {
+            "hunk_id": 66531,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 97,
+            "original_line": 97,
+            "side": "RIGHT",
+            "original_position": 97,
+            "position": 97,
+            "subject_type": "line",
+            "review_comments": [
+                "why is that? Is this expected? ",
+                "This should also be removed."
+            ]
+        },
+        {
+            "hunk_id": 66504,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/convert_mbart_original_checkpoint_to_pytorch.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 18,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm fine with the changes here"
+            ]
+        },
+        {
+            "hunk_id": 66510,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/marian/modeling_tf_marian.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1461,
+            "original_line": 1461,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "hack for marian"
+            ]
+        },
+        {
+            "hunk_id": 66550,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/blenderbot_small/configuration_blenderbot_small.py",
+            "start_line": 88,
+            "original_start_line": 88,
+            "start_side": "RIGHT",
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66557,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50_fast.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 39,
+            "subject_type": "line",
+            "review_comments": [
+                "Same remark as before, we can ignore the styler for this list and have it all on one line."
+            ]
+        },
+        {
+            "hunk_id": 66555,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50.py",
+            "start_line": 89,
+            "original_start_line": 89,
+            "start_side": "RIGHT",
+            "line": 90,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 90,
+            "position": 90,
+            "subject_type": "line",
+            "review_comments": [
+                "This should be deleted, all tokenziers have `prepare_seq2seq_batch` now. Plus we don't want to advertise it as it's going to be deprecated once we remove `finetune_trainer.py`. The new `run_seq2seq` script does not use it."
+            ]
+        },
+        {
+            "hunk_id": 66536,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_logits_process.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 546,
+            "original_line": 546,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "(nit) could this be `ForcedEOSToken...` instead of `Eos`?"
+            ]
+        },
+        {
+            "hunk_id": 66546,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 746,
+            "original_line": 746,
+            "side": "RIGHT",
+            "original_position": 65,
+            "position": 65,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                The id of the token to force as the last generated token when :obj:`max_length` is reached.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66514,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/configuration_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 134,
+            "original_line": 134,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        - **forced_bos_token_id** (:obj:`int`, `optional`) -- The id of the token to force as the\r\n```",
+                "we don't have to add the default param if it defaults to None"
+            ]
+        },
+        {
+            "hunk_id": 66518,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_tf_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "(nit) not a big fan of those constants if there are only used twice below"
+            ]
+        },
+        {
+            "hunk_id": 66552,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/marian/configuration_marian.py",
+            "start_line": 88,
+            "original_start_line": 88,
+            "start_side": "RIGHT",
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66558,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50_fast.py",
+            "start_line": 106,
+            "original_start_line": 106,
+            "start_side": "RIGHT",
+            "line": 108,
+            "original_line": 108,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 108,
+            "subject_type": "line",
+            "review_comments": [
+                "Same remark as before on this method."
+            ]
+        },
+        {
+            "hunk_id": 66527,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/blenderbot_small/modeling_tf_blenderbot_small.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1456,
+            "original_line": 1456,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "same should be deleted"
+            ]
+        },
+        {
+            "hunk_id": 66560,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/pegasus/configuration_pegasus.py",
+            "start_line": 88,
+            "original_start_line": 88,
+            "start_side": "RIGHT",
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66526,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/blenderbot_small/modeling_blenderbot_small.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1313,
+            "original_line": 1313,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "<3"
+            ]
+        },
+        {
+            "hunk_id": 66544,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/configuration_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 139,
+            "original_line": 139,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n          last generated token when :obj:`max_length` is reached.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66523,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/bart/modeling_tf_bart.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1448,
+            "original_line": 1448,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "why is this added?"
+            ]
+        },
+        {
+            "hunk_id": 66539,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 741,
+            "original_line": 741,
+            "side": "RIGHT",
+            "original_position": 60,
+            "position": 60,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            forced_bos_token_id (:obj:`int`, `optional`):\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66534,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/pegasus/modeling_tf_pegasus.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1487,
+            "original_line": 1487,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "think we can delete this function"
+            ]
+        },
+        {
+            "hunk_id": 66529,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/modeling_tf_mbart.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1472,
+            "original_line": 1472,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "same no need for this I think"
+            ]
+        },
+        {
+            "hunk_id": 66547,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/bart/configuration_bart.py",
+            "start_line": 95,
+            "original_start_line": 95,
+            "start_side": "RIGHT",
+            "line": 96,
+            "original_line": 96,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66519,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1641,
+            "original_line": 1641,
+            "side": "RIGHT",
+            "original_position": 85,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            # hack: adjust tokens for Marian. For Marian we have to make sure that the `pad_token_id` cannot be generated both before and after the `F.log_softmax` operation.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66528,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/marian/modeling_tf_marian.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1488,
+            "original_line": 1488,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "should be deleted"
+            ]
+        },
+        {
+            "hunk_id": 66537,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_tf_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 144,
+            "original_line": 144,
+            "side": "RIGHT",
+            "original_position": 22,
+            "position": 22,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            forced_bos_token_id (:obj:`int`, `optional`):\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66545,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 742,
+            "original_line": 742,
+            "side": "RIGHT",
+            "original_position": 61,
+            "position": 61,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                The id of the token to force as the first generated token after the :obj:`decoder_start_token_id`. Useful\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66506,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1614,
+            "original_line": 1614,
+            "side": "LEFT",
+            "original_position": 76,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "nice!"
+            ]
+        },
+        {
+            "hunk_id": 66551,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/fsmt/configuration_fsmt.py",
+            "start_line": 115,
+            "original_start_line": 115,
+            "start_side": "RIGHT",
+            "line": 116,
+            "original_line": 116,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            The id of the token to force as the last generated token when :obj:`max_length` is reached. Usually set to\r\n            :obj:`eos_token_id`.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66513,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/configuration_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 134,
+            "original_line": 134,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Nice docstring!"
+            ]
+        },
+        {
+            "hunk_id": 66508,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_logits_process.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 542,
+            "original_line": 490,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "Thanks @patrickvonplaten "
+            ]
+        },
+        {
+            "hunk_id": 66554,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "Use a special command to make the style ignore this, there is no point having that list take 50 lines."
+            ]
+        },
+        {
+            "hunk_id": 66505,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 573,
+            "original_line": 565,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "he we should also add a \r\n```\r\nforced_bos_token_id = forced_bos_token_id if forced_bos_token_id is not None else self.config.forced_bos_token_id\r\n```\r\n\r\nSame goes for `forced_eos_token_id`"
+            ]
+        },
+        {
+            "hunk_id": 66522,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/bart/modeling_bart.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1344,
+            "original_line": 1344,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "yaaay!"
+            ]
+        },
+        {
+            "hunk_id": 66503,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/convert_mbart_original_checkpoint_to_pytorch.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 55,
+            "original_line": 55,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "great catch!"
+            ]
+        },
+        {
+            "hunk_id": 66541,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_tf_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 145,
+            "original_line": 145,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                The id of the token to force as the first generated token after the :obj:`decoder_start_token_id`. Useful\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66543,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/configuration_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 135,
+            "original_line": 135,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n          first generated token after the :obj:`decoder_start_token_id`. Useful for multilingual models like `mBART\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66542,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_tf_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 149,
+            "original_line": 149,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                The id of the token to force as the last generated token when :obj:`max_length` is reached.\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66530,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 85,
+            "original_line": 85,
+            "side": "RIGHT",
+            "original_position": 85,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "Not sure we want to continue our inheritance pattern for tokenizers - this tokenizer looks quite different to XLMRoberta to me so I think I'd be in favor of not using inheritance here (wdyt @LysandreJik @sgugger ?)",
+                "I agree, and MBart in itself isn't linked to XLM-R imo, so the inheritance makes it a bit hard to understand.",
+                "Agreed with both of you. It should also take `src_lang` and `tgt_lang` in the init so that the attributes are created and initialized. The user can then change these attributes to change the languages used by the tokenzier.\r\n\r\nThat behavior should be documented."
+            ]
+        },
+        {
+            "hunk_id": 66512,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "tests/test_pipelines_summarization.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 49,
+            "original_line": 49,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "The test uses `greedy_search` and eos was not forced in `greedy_search` before this PR"
+            ]
+        },
+        {
+            "hunk_id": 66533,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/mbart/tokenization_mbart50_fast.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1,
+            "original_line": 1,
+            "side": "RIGHT",
+            "original_position": 1,
+            "position": 1,
+            "subject_type": "line",
+            "review_comments": [
+                "same comments here as in file above"
+            ]
+        },
+        {
+            "hunk_id": 66540,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 745,
+            "original_line": 745,
+            "side": "RIGHT",
+            "original_position": 64,
+            "position": 64,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            forced_eos_token_id (:obj:`int`, `optional`):\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66517,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/generation_logits_process.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 525,
+            "original_line": 525,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "Nice!",
+                "(nit) could this be `ForcedBOSToken...` instead of `Bos`?"
+            ]
+        },
+        {
+            "hunk_id": 66548,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/bart/configuration_bart.py",
+            "start_line": 181,
+            "original_start_line": 181,
+            "start_side": "RIGHT",
+            "line": 183,
+            "original_line": 183,
+            "side": "RIGHT",
+            "original_position": 54,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "Use two lines here to respect the 119 char limit."
+            ]
+        },
+        {
+            "hunk_id": 66515,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/configuration_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 138,
+            "original_line": 138,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        - **forced_eos_token_id** (:obj:`int`, `optional`) -- The id of the token to force as the\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 66524,
+            "commit_id": "84ef6e3f5b6de228615b55435965f63b3134fa1e",
+            "original_commit_id": "3be965c5dbee794a7a3606df6a1ae36a0d65904d",
+            "path": "src/transformers/models/bart/modeling_tf_bart.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1448,
+            "original_line": 1448,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Great!"
+            ]
+        }
+    ]
+}

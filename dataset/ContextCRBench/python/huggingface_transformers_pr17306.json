@@ -1,0 +1,96 @@
+{
+    "repo": "huggingface/transformers",
+    "pr_number": 17306,
+    "lang": "python",
+    "pr_title": "Fix -1e4 as attn mask",
+    "pr_body": "# What does this PR do?\r\n\r\nFix the issues regarding `-1e4` as attention mask.\r\n\r\nFix #17215 #17121 #14859",
+    "pr_comments": [
+        "_The documentation is not available anymore as the PR was closed or merged._",
+        "Generally, this looks good to me. I'd prefer though to not factor out a one-liner into a function (even if we have to add the one-liner 100+ times). It's not good for readability to have to jump to `modeling_utils.py` and the code saved is not worth it for a one-liner.\r\n\r\nAlso, I'd advocate to make three separate PRs (one for PT, one for TF, one for Flax). Think it should be both easier to maintain the PRs as well as review them. \r\n\r\nA first test should then be that all slow tests pass. After that it would indeed be nice if we could run some fine-tuning for the most important models (BERT on GLUE, GPT2 on causal LM, T5 on translation maybe). Maybe also not even necessary to verify that everything is correct with a training run if the slow tests all pass ",
+        "Hi,\r\n\r\n@patrickvonplaten:\r\n  - I removed the new function.\r\n  - I have to modify `FlaxT5Attention` otherwise the PT/Flax T5 equivalence tests will fail.\r\n\r\n@sgugger:\r\n  - since there is no more new function `mask_value()`, so no more `device` issue. There is one place I need to use tensor and device though:\r\n\r\n https://github.com/huggingface/transformers/blob/195ef42e0be974e8c019e9d5f03070f65365c721/src/transformers/models/gpt2/modeling_gpt2.py#L202-L205\r\n\r\nWould this be a problem for model parallelism for big model inference? It is `attn_weights.device` instead of `self.dtype` though.",
+        "@ydshieh Using the weight device is perfectly fine, thanks for checking!",
+        "Cool, exciting!",
+        "Hi, @patrickvonplaten @patil-suraj @sgugger @LysandreJik \r\n\r\nThis PR is ready for review. \r\n\r\n- Only dealing with PyTorch models: but need to change `FlaxT5` too to make the test pass.\r\n- In general, change to `torch.finfo(correct-dtype).min` instead of `-10000`, `-1e9` etc.\r\n- In particular, changes in `modeling_utils.py`\r\n- Verified the change by training a T5 from scratch as well as finetuning the `t5-small` checkpoint",
+        "@sgugger @patrickvonplaten: sorry to call you after the approval, there is something more to discuss after I saw #17437 by @younesbelkada.\r\n\r\n- First I need to remove the use of `float(\"-inf\")` as done in [this commit](https://github.com/huggingface/transformers/pull/17306/commits/9fa9d9e8ac4aec9df3c42b3c6e6b178271230247)\r\n  - It's better not to use `inf`: it is hard to track if there is any arithmetic ops that will produce `NaN`.\r\n\r\n- Second, there are still some issues when using `torch.finfo(dtype).min`, especially when running in `fp16`, see the code snippet below.\r\n\r\n  Basically: \r\n  - `torch.finfo(torch.float16).min + (-16.0) = -inf`. (or anything < `-16.0`)\r\n  - In some cases, we get all 0s as attention mask:\r\n    - for example, `[pad_token, token_1]` will give an attention mask `[[0, 0], [0, 1]]` (due to causal mask + padding).\r\n    - this mask becomes `[[-65504, -65504], ...]` after using `torch.finfo(dtype).min` (for `fp16`)\r\n    - This might give `[[-inf, -inf], ...]` when combining an `atten_scores` with values < -16.0 \r\n    - Then, we get `NaN` after softmax. \r\n\r\n~~- `torch`'s `softmax` can't work with fp16 input on CPU~~\r\n  - ~~RuntimeError: \"softmax_lastdim_kernel_impl\" not implemented for 'Half'~~\r\n\r\n### Suggestions\r\n\r\n~~- Cast `fp16` to `fp32` just before `softmax`, so it can run on CPU~~\r\n- Perform some other processing before `softmax` to avoid `NaN` and non-sense output, especially avoid `[-inf, -inf]` or `[-inf, - large_value]` as input  to `softmax`\r\n- Change attn probability to `[0, 0, .. 0]` if the input is all large negative value `torch.finfo(dtype).min` \r\n\r\n### Code Snippet\r\n```\r\nimport torch\r\nfrom torch import nn\r\n\r\n# device = \"cpu\" --> not working with softmax on float16 (RuntimeError: \"softmax_lastdim_kernel_impl\" not implemented for 'Half')\r\ndevice = \"cuda\"\r\n\r\ndtype = torch.float16\r\n\r\nmask_value = torch.finfo(dtype).min\r\nattn_mask = torch.tensor([mask_value, mask_value], dtype=dtype)\r\n\r\nattn_scores_0 = torch.tensor([-0, -0], dtype=dtype)\r\nattn_scores_1 = torch.tensor([-4, -16], dtype=dtype)\r\nattn_scores_2 = torch.tensor([-18, -16], dtype=dtype)\r\n\r\nfinal_attn_scores_0 = attn_scores_0 + attn_mask  # --> [-65504,  -65504]\r\nfinal_attn_scores_1 = attn_scores_1 + attn_mask  # --> [-65504,  -inf]\r\nfinal_attn_scores_2 = attn_scores_2 + attn_mask  # --> [-inf,  -inf]\r\n\r\nattn_prob_0 = nn.functional.softmax(final_attn_scores_0.to(device), dim=-1)  # --> [0.5, 0.5], but non-sense!!\r\nattn_prob_1 = nn.functional.softmax(final_attn_scores_1.to(device), dim=-1)  # --> [1, 0], but non-sense!!\r\nattn_prob_2 = nn.functional.softmax(final_attn_scores_2.to(device), dim=-1)  # --> [nan, nan], very bad!\r\n\r\nprint(final_attn_scores_0)\r\nprint(final_attn_scores_1)\r\nprint(final_attn_scores_2)\r\nprint(attn_prob_0)\r\nprint(attn_prob_1)\r\nprint(attn_prob_2)\r\n```",
+        "Nothing should be done in FP16 on CPU, softmax is not the only operation that is not implemented in Half on CPU.",
+        "> Nothing should be done in FP16 on CPU, softmax is not the only operation that is not implemented in Half on CPU.\r\n\r\nOK, thank you! Still want to hear your opinion on other points when you have more time",
+        "I'm personally leaning toward implementing an util that preprocesses the attention mask before the softmax as you suggested @ydshieh, but curious to see others opinion.",
+        "I think we can leave the discussion regarding `softmax` and  `attention score processing` to another thread and PR.\r\n\r\nAfter removing `float(\"-inf\")` in this PR, it's less likely to get all `-inf` in a particular sequence.\r\n(It's sill likely to happen during training, so better to have a process done after this PR).\r\n\r\nSo I would prefer to merge the current version once @LysandreJik is happy with this PR.",
+        "@michaelbenayoun \r\n\r\nI have tried to keep your change \r\n```\r\nmask = torch.full((tgt_len, tgt_len), torch.tensor(float(\"-inf\")))\r\n```\r\nwith my own, so it becomes\r\n```\r\nmask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))\r\n```\r\n\r\nIf you encounter any problem after this PR is merged, don't hesitate to ping me.",
+        "@michaelbenayoun I need you help \ud83d\ude4f \r\n\r\n\r\nhttps://github.com/huggingface/transformers/blob/575a8c0a8e2bf6491d7ef0f932fb6caf8a7712b1/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L135\r\n\r\nI need to change `torch.tensor(float(\"-inf\")))` to `torch.tensor(torch.finfo(dtype of an input).min))`\r\n\r\nbut I can't understand what the input it is here. Is it `g` or is it `self`.\r\n\r\nFrom the line below\r\n```\r\nmasked_fill(g, output, r_mask, g.op(\"Constant\", value_t=torch.tensor(0, dtype=torch.uint8)))\r\n```\r\nI guess it might be the second argument, so I should use `self`, but it looks strange to me \ud83d\ude22 ",
+        "@ydshieh About the first change you mention, I don't think it will break anything, and I will try to apply the same changes when I add support for new model architectures.\r\n\r\nAbout the symbolic function, you are right I think. Basically `self` is `input` here, maybe we should change the name of the parameter to make things clearer?",
+        "> @ydshieh About the first change you mention, I don't think it will break anything, and I will try to apply the same changes when I add support for new model architectures.\r\n> \r\n> About the symbolic function, you are right I think. Basically `self` is `input` here, maybe we should change the name of the parameter to make things clearer?\r\n\r\nGreat, thanks for the answer! We can change the name, but not very urgent.\r\n",
+        "Ran GPU non-slow tests (single/multi GPU) - results are fine.",
+        "Will merge today (as been approved by 3 core maintainers), if there is no further comment on\r\n\r\nhttps://github.com/huggingface/transformers/pull/17306#pullrequestreview-994918858",
+        "As discussed on Slack, will wait the release of Bloom, and not merge now."
+    ],
+    "merged": true,
+    "created_at": "2022-06-03T13:33:21Z",
+    "issue_context": {
+        "number": 17215,
+        "title": "-1e9 constants in T5 implementation",
+        "body": "These -1e9 constants are too large for fp16 training\r\n\r\nhttps://github.com/huggingface/transformers/blob/df735d1317994e366ab0edff6c55930e18912b7c/src/transformers/models/t5/modeling_tf_t5.py#L728\r\nhttps://github.com/huggingface/transformers/blob/df735d1317994e366ab0edff6c55930e18912b7c/src/transformers/models/t5/modeling_tf_t5.py#L746\r\n\r\nMaybe they should be made configurable?",
+        "comments": [
+            "Probably of interest to @ydshieh "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 67586,
+            "commit_id": "25eac9123f1007ee4059dbdd4325962c022e9808",
+            "original_commit_id": "6589e510fa4e6c442059de2fab84752535de9b23",
+            "path": "src/transformers/models/layoutlmv3/modeling_layoutlmv3.py",
+            "start_line": 889,
+            "original_start_line": 889,
+            "start_side": "RIGHT",
+            "line": 891,
+            "original_line": 891,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Need to pass the `embedding_output.dtype` in order to make `LayoutLMv3ModelTest.test_multi_gpu_data_parallel_forward` works."
+            ]
+        },
+        {
+            "hunk_id": 67585,
+            "commit_id": "25eac9123f1007ee4059dbdd4325962c022e9808",
+            "original_commit_id": "6589e510fa4e6c442059de2fab84752535de9b23",
+            "path": "src/transformers/modeling_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 835,
+            "original_line": 835,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 43,
+            "subject_type": "line",
+            "review_comments": [
+                "Add a `dtype` argument, so we can use it in `LayoutLMv3Model`",
+                "The other 2 changes (not shown above)\r\n\r\nhttps://github.com/huggingface/transformers/blob/de8beb96c1d0d323d5d09a85438b47b47a52b0ac/src/transformers/modeling_utils.py#L729-L730\r\n\r\nhttps://github.com/huggingface/transformers/blob/de8beb96c1d0d323d5d09a85438b47b47a52b0ac/src/transformers/modeling_utils.py#L744-L745\r\n\r\n"
+            ]
+        },
+        {
+            "hunk_id": 67584,
+            "commit_id": "25eac9123f1007ee4059dbdd4325962c022e9808",
+            "original_commit_id": "6589e510fa4e6c442059de2fab84752535de9b23",
+            "path": "src/transformers/models/albert/modeling_albert.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 731,
+            "original_line": 731,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "imho, the incantation is obtuse enough to make a utility function:\r\n\r\n```python\r\ndef near_neg_inf(dtype):\r\n    return torch.finfo(self.dtype).min\r\n```",
+                "Haha, I think I suggested to do the exact opposite for readability - what do you think @sgugger @LysandreJik ?",
+                "I personally prefer to avoid those kinds of one-line functions as it makes it harder to read the code, with the reader having to navigate."
+            ]
+        }
+    ]
+}

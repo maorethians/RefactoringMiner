@@ -1,0 +1,177 @@
+{
+    "repo": "huggingface/transformers",
+    "pr_number": 11471,
+    "lang": "python",
+    "pr_title": "Pytorch - Lazy initialization of models",
+    "pr_body": "\ud83d\udea8\ud83d\udea8\ud83d\udea8 **Breaking seeded model initialization** \ud83d\udea8\ud83d\udea8\ud83d\udea8\r\n\r\nAs explained below this PR breaks seeded model initialization by default. To ensure the exact same model initialization as before, use:\r\n\r\n```python\r\ntorch.manual_seed(seed)\r\nmodel = BertForSequenceClassification.from_pretrained(\"bert-base-cased\", _fast_init=False)\r\n```\r\n\r\n# What does this PR do?\r\n\r\nThis PR implements fast initializing by only initializing weights that need to be initialized. For every model two aggressive tests are added to make sure that the new \"fast\" initialization initializes the weights according to the exact same distributions as the previous init scheme. \r\n\r\nIMO, it is not possible to ensure that:\r\n\r\n```python\r\nfrom transformers import BertForSequenceClassification\r\nimport torch\r\n\r\ntorch.manual_seed(0)\r\nmodel = BertForSequenceClassification.from_pretrained(\"bert-base-cased\", _fast_init=False)  # this randomely inits the lm_head layer\r\n```\r\n\r\nyields the same results as the new \"fast\" init\r\n\r\n```python\r\ntorch.manual_seed(0)\r\nmodel = BertForSequenceClassification.from_pretrained(\"bert-base-cased\")  # this randomely inits the lm_head layer\r\n```\r\n\r\nsince in the first case all layers are initialized so that the random number generator is called much more often, thus making it impossible to ensure identical weights initialization => compare to [this](https://discuss.pytorch.org/t/does-pytorch-change-its-internal-seed-during-training/46505/4) post to better understand why this is probably not possible.\r\n\r\nThis became obvious in this PR since I had to change the random_seed for running the `run_ner.py` examples test to make it pass.\r\n\r\nI guess it is therefore better to stick to \"initializing all weights\" for now and only when changing to version 5.0 making this breaking change. => Guess we should discuss this @sgugger @LysandreJik @stas00 \r\n\r\n\r\n## Who can review?\r\n\r\nAnyone in the community is free to review the PR once the tests have passed. Feel free to tag\r\nmembers/contributors who may be interested in your PR.\r\n\r\nFixes: #9205",
+    "pr_comments": [
+        "Not to impede this PR, just wanted to add that this comment might be of importance for future work in this area: https://github.com/pytorch/pytorch/issues/29523#issuecomment-831390099\r\n\r\nAnd the whole issue: https://github.com/pytorch/pytorch/issues/29523\r\n\r\nI wonder if our side needs/should support that `reset_parameters` feature in our models. Given the last comment https://github.com/pytorch/pytorch/issues/29523#issuecomment-831435863 it's unclear where it's standing. So perhaps this is something to revisit later when the dust settles on the pytorch side.",
+        "FYI, pytorch has just added `torch.nn.utils.skip_init()` to handle similar situations:\r\nhttps://pytorch.org/tutorials/prototype/skip_param_init.html\r\nit should appear probably around pt-1.9.1.\r\n\r\nNote that `torch.nn.utils.skip_init()` is even more efficient as it doesn't allocate any storage at all! So there is not even an overhead of creating any weights until they are loaded from state_dict. https://pytorch.org/tutorials/prototype/skip_param_init.html#implementation-details\r\n",
+        "Hey all - this introduced a pretty nasty bug for us, that took a while to figure out. Here's a case where this initialization of the `missing_keys`, which normally shouldn't matter, broke our model after version 4.6. We have a custom model that optionally initializes some of its weights from a separate module. Calling `from_pretrained` and passing this separate module used to \"work\", but now those weights are overwritten. See MWE:\r\n```\r\nfrom torch.nn import Linear\r\nfrom transformers import BertModel\r\n\r\n\r\nclass MyCustomModel(BertModel):\r\n    def __init__(self, config, custom_layer=None):\r\n        super().__init__(config)\r\n        if custom_layer is not None:\r\n            self.custom_layer = custom_layer\r\n        else:\r\n            self.custom_layer = Linear(1024, 1024)\r\n\r\n\r\nif __name__ == \"__main__\":\r\n    import transformers\r\n    print(transformers.__version__)\r\n    layer = Linear(1024, 1024)\r\n    print(layer.weight.sum())\r\n    custom_model = MyCustomModel.from_pretrained('bert-base-uncased', custom_layer=layer)\r\n    # used to be the same as the layer above, but it is \"re-initialized\" in the from_pretrained method\r\n    print(custom_model.custom_layer.weight.sum())\r\n```\r\nResult:\r\n```\r\n4.11.3\r\ntensor(5.9874, grad_fn=<SumBackward0>)\r\nSome weights of the model checkpoint at bert-base-uncased were not used when initializing MyCustomModel: ['cls.seq_relationship.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.transform.dense.weight', 'cls.predictions.bias', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.decoder.weight', 'cls.seq_relationship.bias']\r\n- This IS expected if you are initializing MyCustomModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).\r\n- This IS NOT expected if you are initializing MyCustomModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).\r\nSome weights of MyCustomModel were not initialized from the model checkpoint at bert-base-uncased and are newly initialized: ['bert.custom_layer.bias', 'bert.custom_layer.weight']\r\nYou should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.\r\ntensor(17.4651, grad_fn=<SumBackward0>)\r\n```\r\n\r\nThis used to \"just work\" in version < 4.6. Perhaps we were relying on an unintended \"feature\". Setting `_fast_init=False` *does* fix things, but it's a bit hacky as it only applies to the initialization of this custom module that is called upstream in our service. Additionally, we don't know what happens if we'll need to rely on this feature in the future, but it goes away.\r\n\r\nCan you comment on this? Thanks!",
+        "Hey @john-heyer,\r\n\r\nThanks for the feedback. We indeed didn't take account the effect this would have on custom models that inherit from `transformers` models like BERT. Just to understand better, the problem was that before 4.6, the `custom_layer` was not (re-)initialized when calling `MyCustomModel.from_pretrained(...)` - however after 4.6 it was initialized twice once before calling `from_pretrained(...)` and once after calling it? ",
+        "@john-heyer - I answered in-detail here: https://github.com/huggingface/transformers/issues/17370",
+        "thanks @patrickvonplaten - yes, that is correct - before 4.6 `custom_layer` was not re-initialized, and now it is! Thanks for opening the other thread. I'll follow there.",
+        "Can this be used to load pretrained params directly to the GPU models without keeping the full copy of params on CPU?\r\n\r\nE.g. https://github.com/huggingface/diffusers has `unet = UNetModel.from_pretrained(\"fusing/ddpm-lsun-church\").to(torch_device)` while theoretically one could have unet = UNetModel.from_pretrained(\"fusing/ddpm-lsun-church\"m device = torch_device)`",
+        "Hey @vadimkantorov, could you maybe open an issue under `diffusers` instead? :-)",
+        "Is transfomers following a different design? I assumed diffusers just copied the original design from transformers"
+    ],
+    "merged": true,
+    "created_at": "2021-05-03T15:48:16Z",
+    "issue_context": {
+        "number": 9205,
+        "title": "[model_utils] very slow model instantiation",
+        "body": "For some reason I'm noticing a very slow model instantiation time.\r\n\r\nFor example to load `shleifer/distill-mbart-en-ro-12-4` it takes \r\n* 21 secs to instantiate the model\r\n* 0.5sec to `torch.load` its weights.\r\n\r\nIf I'm not changing how the model is created and want to quickly fast forward to the area of debug how could these slow parts be cached and not rebuilt anew again and again?\r\n\r\nBut also it looks like we are doing a completely wasteful operation of init_weights, which immediately get overwritten with pretrained model weights (https://github.com/huggingface/transformers/issues/9205#issuecomment-748741195) (for the use case of pre-trained model).\r\n\r\n(I initially made a mistake and thought that it was `torch.load` that had an issue, but it's `cls(config, *model_args, **model_kwargs)`) - thank you, @sgugger - so this post has been edited to reflect reality. So if you're joining later you can skip the comments up to https://github.com/huggingface/transformers/issues/9205#issuecomment-748722644 and continue from there)\r\n\r\n@patrickvonplaten, @sgugger, @LysandreJik ",
+        "comments": [
+            "Doesn't that script also loads and preprocess the data? From what you're reporting, I don't interpret this as \"transformers takes a long time to load the model\" (since the line that does that takes the same time as a torch load) but as \"stuff that happens in that script before the model loading takes a lot of time\" (which is probably data preprocessing + the 3s to import transformers if TF is in your env). Or am I missing something?\r\n",
+            "Perhaps my first post is confusing, what I did is bracketing the `torch.load` call in modeling_utils.py:\r\n```\r\n        start_time = time.time()\r\n        state_dict = torch.load(resolved_archive_file, map_location=\"cpu\")\r\n        end_time = time.time() - start_time\r\n```\r\nSo all the other stuff isn't being measured, just the `torch.load` call. ",
+            "Ah, I understand better. I don't think your comparison is fair: `AutoModel.from_pretrained` does two things: creating a model and filling it with the weights. From a small experiment in timing on my side, I believe all the time is spent in the model creation. So you should compare the timing of creating the model and loading the weights inside to have something that's apple to apple.",
+            "I removed the 2nd part that was showing the same issue from a different angle, as it appears to just confuse and isn't contributing to understanding the issue at hand.\r\n\r\nThere is just `state_dict = torch.load(resolved_archive_file, map_location=\"cpu\")` call - and nothing else. On its own:\r\n`python -c \"import torch; torch.load('/hf/transformers-master/data/distill-mbart-en-ro-12-4/pytorch_model.bin')\"`\r\n it takes ~1s, the exact same call inside `modeling_utils` takes 22+ secs.",
+            "OK, somehow I made a mistake and was taking the snapshot of startime before `model = cls(config, *model_args, **model_kwargs)` and not `torch.load()` - my apologies :( and thank you for double checking my invalid report.\r\n\r\n```\r\n        import time\r\n        t0 = time.time()\r\n        model = cls(config, *model_args, **model_kwargs)\r\n        t1 = time.time()\r\n        state_dict = torch.load(resolved_archive_file, map_location=\"cpu\")\r\n        t2 = time.time()\r\n        print(f\"cls init { round(t1-t0, 4)}\")\r\n        print(f\"load     { round(t2-t1, 4)}\")\r\n        import sys\r\n        sys.exit(0)\r\n\r\n```\r\n\r\n```\r\ncls init 21.2055\r\nload     0.5074\r\n```\r\n\r\nSo it's setting up the model that takes so long, just as you said.\r\n\r\nCan this somehow be sped up? I was integrating deepspeed and re-running the same command repeatedly and 23 extra secs of waiting to just discover that something is off was very painful for debugging. All the failures happened at much later stages. I worked around it it by switching to a tiny model, but even that takes some secs.\r\n\r\nCan we think of a way to make an image and load it rather than rebuilding the model from scratch? So we torch.load the weights, but also cache the model image itself and load it too, rather then create it anew. It seems to be so wasteful and slow if I'm not debugging the model creation but say tuning up something in the trainer and I want the other parts to load blazingly fast and get me to the point of interest quickly. What would be the best way to approach such need?\r\n",
+            "So doing profiling on model instantiation code it can be seen that `_init_weights` is where some 75% of that slowdown happens\r\n\r\n```\r\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\r\n      354   18.942    0.054   18.942    0.054 {method 'normal_' of 'torch._C._TensorBase' objects}\r\n      225    2.286    0.010    2.286    0.010 {method 'uniform_' of 'torch._C._TensorBase' objects}\r\n````\r\n\r\nSo we are completely wasting time doing init weights, since we are immediately replacing them. (with the exception to `SinusoidalPositionalEmbedding` which do not get loaded from the pretrained model). \r\n\r\nIf you prefer the visual version:\r\n\r\n![snapshot_2](https://user-images.githubusercontent.com/10676103/102736813-a4daec00-42fa-11eb-8b8c-3a11ca275e6f.png)\r\n\r\nChances are that model init needs to be made context aware and not init weights which will be immediately replaced. Thoughts?\r\n\r\nThat would make `transformers` so much faster to start! (e.g. think the model pages website which takes forever to load a model).\r\n\r\nThe profiling was done with:\r\n```\r\n# prep\r\npip install graphviz gprof2dot\r\ncat <<EOT > prog\r\nfrom transformers import AutoModelForSeq2SeqLM\r\nAutoModelForSeq2SeqLM.from_pretrained(\"sshleifer/distill-mbart-en-ro-12-4\")\r\nEOT\r\n\r\n# text profile\r\nUSE_TF=0 PYTHONPATH=src python -m cProfile -s tottime prog > profile.txt\r\nhead -10 profile.txt\r\n\r\n# visual profile\r\nUSE_TF=0 PYTHONPATH=src python -m cProfile -o profile.pstats prog\r\ngprof2dot -f pstats profile.pstats |  dot -Tsvg -o callgraph.svg\r\ndisplay callgraph.svg\r\n```\r\n\r\n",
+            "If we see a significant gain in loading time, maybe it's worth to explore a way to only apply `init_weights` on missing layers. Not sure how easy it would be to implement it though...\r\n\r\nMaybe a `init_weights` function arg in `__init__` might make sense:\r\n```python\r\nmodel = cls(config, init_weights=False, *model_args, **model_kwargs)  # don't call init_weights, but initialize all weights to zero because it's much faster\r\n# load weights into model and get missing layers\r\n# init missing layers\r\n```",
+            "Yeah Patrick's suggestion is probably the best, though I'm not sure it can easily be achieved in the current API. Note that this is only one slowdown at the beginning of training, so I don't think this should be high priority.",
+            "I totally get it that it's not high priority, since most people don't care for a slow start when they run it non-stop for hours - it only affects people who need a quick start - which is the case when debugging something or as I suggested the demo function on the model pages which takes a really long time to load.\r\n\r\nIn the case of BART, its deterministic segments do the init internally, so it's enough to just monkeypatch as a proof of concept:\r\n\r\n```\r\n        # modeling_utils.py::from_pretrained\r\n        init_weights_orig = PreTrainedModel.init_weights\r\n        def init_weights_pretrained(self):\r\n            # self.apply(self._init_weights)\r\n            if self.config.pruned_heads: self.prune_heads(self.config.pruned_heads)\r\n            self.tie_weights()\r\n            \r\n        PreTrainedModel.init_weights = init_weights_pretrained\r\n        model = cls(config, *model_args, **model_kwargs)\r\n        PreTrainedModel.init_weights = init_weights_orig\r\n\r\n```\r\nand this command:\r\n```\r\nPYTHONPATH=../../src USE_TF=0 time python -c 'from transformers import AutoModelForSeq2SeqLM; AutoModelForSeq2SeqLM.from_pretrained(\"sshleifer/distill-mbart-en-ro-12-4\")'\r\n```\r\ngoes from 25sec to 8secs. The instantiation goes from 22 secs to 5 secs.\r\n\r\nThere are few `uniform_` calls left which account for 2.3 extra secs, which if shaves off we should be down to 2-3 secs (from 22!).\r\n\r\nI quickly checked that the core functions normally - same scores - well, I did just one finetune_trainer run.\r\n\r\nOne way is to solve this as @patrickvonplaten suggested, and I'm also thinking of changing the design a bit. So that each model has a normal `init_weights` and `init_weights_pretrained` - then it's very clear to the developer what goes where and then simply invoke one or the other depending on the context. And then it's just a matter of choosing how to signal the context.\r\n",
+            "I don't see how you could have an `init_weights_pretrained`: it depends on the checkpoint you pass: if you pass the checkpoint of a `BertModel` to  `BertForMaskedLM`, you just have one bias to initialize (if weights are tied). But if you pass a checkpoint of a `BertForMaskedLM` checkpoint then you have nothing to initialize. And the same holds for every variant (which would have different specific weights to initialize in case of a pretrained model) so I don't really see how you can do this API-wise.\r\n\r\nThe only way I see through it is to allow the `init_weights` to get the list of model parameters to randomly initialize, but since we use the `apply` method afterward (and rely on it to get modules inside each model specific `_init_weights` method) I don't see how to use it properly. It would probably require some clever recursive method.\r\n\r\nAgain, lots of headaches and possibilities for errors for an end result that doesn't strike me as high priority.\r\n\r\n> it only affects people who need a quick start - which is the case when debugging something or as I suggested the demo function on the model pages which takes a really long time to load.\r\n\r\nIt doesn't take 25 seconds on a tiny model, only a big one. So I'd suggest debugging on a tiny model :-)",
+            "Thank you both for entertaining possible approaches and suggesting that you are not quite seeing a smooth solution. I just don't know enough about all of it, so I'm surely missing on cases I haven't thought of, but somehow in my mind it looks simple. The devil is in the details.\r\n\r\n> It doesn't take 25 seconds on a tiny model, only a big one. So I'd suggest debugging on a tiny model :-)\r\n\r\nUnfortunately the tiny model approach doesn't work with debugging OOM in deepspeed, as its configuration correlates to the model size. I guess it's not special to deepspeed at all. So the tiny model trick works for checking mechanics (i.e. that the code compiles), but isn't helpful for OOM debug.",
+            "@patrickvonplaten, @sgugger, @LysandreJik - could we please revisit this - working on making t5-11b train was painful - it was taking really really really long time to init the model, just to drop it and replace with pre-trained weights. Transformers is mainly about pre-trained models, so perhaps this can be made somehow configurable? \r\n\r\nWe know when a pretrained model is loaded, so why not propagate that information and let the model know it's being loaded in pre-trained mode, so that it could skip any weight inits that are going to be replaced anyway?\r\n\r\nAnd while we are at it, I don't suppose there is a way to involve more than one CPU core in loading the model? I guess that would be a question for pytorch.\r\n\r\nThank you!",
+            "I'm happy to add such a featurue. It should be feasible to only initialize those layers that are not in the saved `.pt` file.",
+            "Indeed, this would be a welcome feature, big models aren't going away.",
+            "This issue has been automatically marked as stale and been closed because it has not had recent activity. Thank you for your contributions.\n\nIf you think this still needs to be addressed please comment on this thread.",
+            "@patrickvonplaten, I should probably work on it - since it doesn't seem like you will have time any time soon.",
+            "It's on my To-Do List, but still don't think, I'll be able to take a look within the next 2,3 weeks - sorry :-/ If you find some time for this, it would be great",
+            "Ihave finetuned a longformer encoder decoder model, and trying to convert it into an api but model takes too long to load that api throws a not responding error.\r\n![code](https://user-images.githubusercontent.com/51691311/146528750-d79a7ee6-d78c-4ca1-928c-8a5268f8b9d5.PNG)\r\nKindly if anyone can guide me on how can I reduce the time for the model to load.\r\nThank You in advance.",
+            "Hello @AyeshaSarwar,\r\n\r\ncould you please use the forum: https://discuss.huggingface.co/ instead for such questions? We don't support Flask compatibility in `transformers`. Please keep in mind that the issues are mainly used for issues related to just `transformers`.\r\n\r\nThanks",
+            "Im on the same boat as @stas00 . I understand that the code need to maintain a wider compatibility across the oceans of models, but people needs a working workaround before an elegant solution born into reality. I believe as huggingface slowly graduating from pure research field, more and more people are being hurt by the tremendous model initialization time. \r\nHoping for a change",
+            "@DeXtmL, this thread is 2 years old - the particular problem I raised in this Issue has been solved a long time ago. The model is no longer being init'ed twice.\r\n\r\nIf you feel something is still slow please start a new Issue.\r\n\r\nthank you."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 65820,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "tests/test_modeling_common.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 185,
+            "original_line": 179,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "Check that loading from base to extended model leads to same init results"
+            ]
+        },
+        {
+            "hunk_id": 65821,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "tests/test_modeling_common.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 231,
+            "original_line": 231,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 56,
+            "subject_type": "line",
+            "review_comments": [
+                "Check that loading from extended to base model leads to same init results",
+                "This 2nd test function is almost identical to the first one other than the name of the class variable and this:\r\n```\r\n-                model.save_pretrained(tmpdirname)\r\n+                model.config.save_pretrained(tmpdirname)\r\n```\r\n\r\nTotally not attached, just in case one test would be simpler to main into the future. Perhaps not. It just looked too similar so I had to diff it ;)"
+            ]
+        },
+        {
+            "hunk_id": 65819,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "tests/test_modeling_common.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 215,
+            "original_line": 215,
+            "side": "RIGHT",
+            "original_position": 40,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "this makes the test pretty aggressive since a random weights is deleted forcing each init to be the same"
+            ]
+        },
+        {
+            "hunk_id": 65816,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "examples/pytorch/test_examples.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 198,
+            "original_line": 198,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "This shows, how the new \"fast\" init leads to different initialization which in some sense breaks backwards compatibility for seed initialization"
+            ]
+        },
+        {
+            "hunk_id": 65818,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "src/transformers/modeling_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1351,
+            "original_line": 1336,
+            "side": "RIGHT",
+            "original_position": 347,
+            "position": 369,
+            "subject_type": "line",
+            "review_comments": [
+                "We need those special cases to prevent init errors when loading a \"base model\", *e.g.* `BertModel` into an \"extension model\" *e.g.* `BertForSequenceClassification` and vice-versa"
+            ]
+        },
+        {
+            "hunk_id": 65817,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "src/transformers/modeling_utils.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1205,
+            "original_line": 1190,
+            "side": "RIGHT",
+            "original_position": 210,
+            "position": 232,
+            "subject_type": "line",
+            "review_comments": [
+                "function is factored out into a new function since it became way too long to read"
+            ]
+        },
+        {
+            "hunk_id": 65822,
+            "commit_id": "9acb97a2b8ecf0662a2a5e9b5770f2d45eca0ee8",
+            "original_commit_id": "1c86157d9d8eeccb8c95fd399f860b3e751b2efe",
+            "path": "tests/test_modeling_common.py",
+            "start_line": 196,
+            "original_start_line": 196,
+            "start_side": "RIGHT",
+            "line": 199,
+            "original_line": 199,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "Clever trick!"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,60 @@
+{
+    "repo": "ethereum/go-ethereum",
+    "pr_number": 21839,
+    "lang": "go",
+    "pr_title": "les/utils: protect against WeightedRandomSelect overflow",
+    "pr_body": "This PR fixes a flow control vulnerability that can cause a WRS weight overflow. It came up with les/4 (already fixed on my branch) but can affect old clients too. It also adds overflow protection and a proper error log to WRS.\r\n\r\nFixes https://github.com/ethereum/go-ethereum/issues/21820\r\nSupersedes https://github.com/ethereum/go-ethereum/pull/21821",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2020-11-13T04:20:25Z",
+    "issue_context": {
+        "number": 21820,
+        "title": "panic: invalid argument to Int63n (light mainnet node)",
+        "body": "#### System information\r\n\r\nGeth version: geth-linux-amd64-1.9.23-8c2f2715 but also observed in 1.9.22\r\nOS & Version: Amazon Linux 4.14.193-149.317.amzn2.x86_64\r\nGo version: go1.13.14 linux/amd64\r\n\r\n#### Actual behaviour\r\n\r\nIt runs ok for a while, but then crashes with:\r\n\r\n```\r\npanic: invalid argument to Int63n\r\n\r\ngoroutine 47 [running]:\r\nmath/rand.(*Rand).Int63n(0xc000090150, 0x8000000000000001, 0x0)\r\n        math/rand/rand.go:111 +0x11d\r\nmath/rand.Int63n(...)\r\n        math/rand/rand.go:327\r\ngithub.com/ethereum/go-ethereum/les/utils.(*WeightedRandomSelect).Choose(0xc003344920, 0xc000e78da8, 0xc000e78d78)\r\n        github.com/ethereum/go-ethereum/les/utils/weighted_select.go:86 +0x4f\r\ngithub.com/ethereum/go-ethereum/les.(*requestDistributor).nextRequest(0xc000470bd0, 0x0, 0x0, 0x0, 0x0)\r\n        github.com/ethereum/go-ethereum/les/distributor.go:242 +0x7b2\r\ngithub.com/ethereum/go-ethereum/les.(*requestDistributor).loop(0xc000470bd0)\r\n        github.com/ethereum/go-ethereum/les/distributor.go:145 +0xc5\r\ncreated by github.com/ethereum/go-ethereum/les.newRequestDistributor\r\n        github.com/ethereum/go-ethereum/les/distributor.go:89 +0x14c\r\n```\r\n\r\n#### Steps to reproduce the behaviour\r\n\r\nI'm running a light geth node on mainnet with:\r\n\r\n```\r\n./geth --syncmode light \\\r\n  --datadir \"$HOME/.ethereum-mainnet\" \\\r\n  --port 20202 \\\r\n  --rpc --rpcaddr xx.xx.xx.xx --rpcport 28545 --rpcapi personal,web3,eth \\\r\n  --ws --wsaddr xx.xx.xx.xx --wsport 28546 --wsapi personal,web3,eth\r\n```\r\n\r\nPossibly relevant, I am also running a light testnet node on the same machine, and have not yet experienced the same problem. (Although that node struggles to find peers, so that could be the reason.)\r\n\r\n(Note to self: I have now wiped the config folder and restarted, to see if that helps.)",
+        "comments": [
+            "@zsfelfoldi repro: \r\n```diff\r\ndiff --git a/les/utils/weighted_select_test.go b/les/utils/weighted_select_test.go\r\nindex 3e1c0ad987..c5913ed9d7 100644\r\n--- a/les/utils/weighted_select_test.go\r\n+++ b/les/utils/weighted_select_test.go\r\n@@ -66,3 +66,12 @@ func TestWeightedRandomSelect(t *testing.T) {\r\n \ttestFn(100000)\r\n \ttestFn(1000000)\r\n }\r\n+\r\n+// TestOOB tests values which doesn't fit in int64\r\n+func TestOOB(t *testing.T) {\r\n+\tw := NewWeightedRandomSelect(func(i interface{}) uint64 {\r\n+\t\treturn 5\r\n+\t})\r\n+\tw.root.sumWeight = uint64(0xffffffffffffffee)\r\n+\tw.Choose()\r\n+}\r\n```\r\n\r\nIt's easy to just fix by just making it ceiling to `math.MaxInt64`, however, there's an additional `panic(nil)` in `func (n *wrsNode) choose(val uint64)` that get's hit instead. ",
+            "Thanks for reporting, @joeytwiddle ",
+            "@zsfelfoldi actually, the later `panic` is probably just because my testcase is bad. Potential fix: \r\n\r\n```diff\r\ndiff --git a/les/utils/weighted_select.go b/les/utils/weighted_select.go\r\nindex d6db3c0e65..15f6eae5e3 100644\r\n--- a/les/utils/weighted_select.go\r\n+++ b/les/utils/weighted_select.go\r\n@@ -17,6 +17,7 @@\r\n package utils\r\n \r\n import (\r\n+\t\"math\"\r\n \t\"math/rand\"\r\n )\r\n \r\n@@ -83,6 +84,9 @@ func (w *WeightedRandomSelect) Choose() WrsItem {\r\n \t\tif w.root.sumWeight == 0 {\r\n \t\t\treturn nil\r\n \t\t}\r\n+\t\tif int64(w.root.sumWeight) < 0{\r\n+\t\t\tw.root.sumWeight = math.MaxInt64\r\n+\t\t}\r\n \t\tval := uint64(rand.Int63n(int64(w.root.sumWeight)))\r\n \t\tchoice, lastWeight := w.root.choose(val)\r\n \t\tweight := w.wfn(choice)\r\n```",
+            "Or perhaps even better: \r\n```diff\r\n\r\ndiff --git a/les/utils/weighted_select.go b/les/utils/weighted_select.go\r\nindex d6db3c0e65..d5169dbbfd 100644\r\n--- a/les/utils/weighted_select.go\r\n+++ b/les/utils/weighted_select.go\r\n@@ -83,7 +83,7 @@ func (w *WeightedRandomSelect) Choose() WrsItem {\r\n \t\tif w.root.sumWeight == 0 {\r\n \t\t\treturn nil\r\n \t\t}\r\n-\t\tval := uint64(rand.Int63n(int64(w.root.sumWeight)))\r\n+\t\tval := rand.Uint64() % w.root.sumWeight\r\n \t\tchoice, lastWeight := w.root.choose(val)\r\n \t\tweight := w.wfn(choice)\r\n \t\tif weight != lastWeight {\r\n\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 31673,
+            "commit_id": "61350d0e835900a92677cb29b57e93744273d27f",
+            "original_commit_id": "920a28711746c8e44ef3e6270a41f038d767d92b",
+            "path": "les/utils/weighted_select.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 63,
+            "original_line": 63,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Why we check the `overflow` twice?",
+                "I see. For removing the old weight."
+            ]
+        },
+        {
+            "hunk_id": 31672,
+            "commit_id": "61350d0e835900a92677cb29b57e93744273d27f",
+            "original_commit_id": "920a28711746c8e44ef3e6270a41f038d767d92b",
+            "path": "les/flowcontrol/control.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 320,
+            "original_line": 320,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "So it's the root cause for overflowed stuff right? The bufferlimit is 0 but we don't have any protection."
+            ]
+        }
+    ]
+}

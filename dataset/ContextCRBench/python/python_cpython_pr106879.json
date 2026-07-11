@@ -1,0 +1,57 @@
+{
+    "repo": "python/cpython",
+    "pr_number": 106879,
+    "lang": "python",
+    "pr_title": "gh-106751: Optimize SelectSelector.select() for many iteration case",
+    "pr_body": "<!--\r\nThanks for your contribution!\r\nPlease read this comment in its entirety. It's quite important.\r\n\r\n# Pull Request title\r\n\r\nIt should be in the following format:\r\n\r\n```\r\ngh-NNNNN: Summary of the changes made\r\n```\r\n\r\nWhere: gh-NNNNN refers to the GitHub issue number.\r\n\r\nMost PRs will require an issue number. Trivial changes, like fixing a typo, do not need an issue.\r\n\r\n# Backport Pull Request title\r\n\r\nIf this is a backport PR (PR made against branches other than `main`),\r\nplease ensure that the PR title is in the following format:\r\n\r\n```\r\n[X.Y] <title from the original PR> (GH-NNNN)\r\n```\r\n\r\nWhere: [X.Y] is the branch name, e.g. [3.6].\r\n\r\nGH-NNNN refers to the PR number from `main`.\r\n\r\n-->\r\n\r\n\r\ncloses: gh-106751",
+    "pr_comments": [
+        "Similar technique can be adopted.\r\n\r\n## Benchmark\r\n```python\r\nimport timeit\r\nimport os\r\nfrom selectors import SelectSelector, EVENT_WRITE, EVENT_READ\r\n\r\nselect = SelectSelector()\r\nfor _ in range(100):\r\n    r, w = os.pipe()\r\n    os.write(w, b\"a\")\r\n    select.register(r, EVENT_READ)\r\n\r\nelapsed = timeit.timeit(\r\n    \"selector.select()\",\r\n    number=100000,\r\n    globals={\"selector\": select},\r\n)\r\n\r\nprint(f\"elapsed: {elapsed}\")\r\n\r\n\r\n```\r\n## Result\r\nAS-IS: elapsed -> 2.051669834000222\r\nTO-BE: elapsed -> 1.9723411249997298 (1.04x faster)\r\n\r\n",
+        "cc @eendebakpt"
+    ],
+    "merged": true,
+    "created_at": "2023-07-19T07:44:58Z",
+    "issue_context": {
+        "number": 106751,
+        "title": "Optimize XXXSelector for many iterations of the event loop",
+        "body": "split out from https://github.com/python/cpython/pull/106555#issuecomment-1632025959\r\n\r\nThe current `EpollSelector` can be sped up a bit. This makes quite a difference when there are 100000+ iterations of the event loop per minute (the use case being receiving bluetooth data from multiple sources) since selectors have to run every iteration.\r\n\r\noriginal: 11.831302762031555\r\nnew: 9.579423972172663\r\n\r\n```\r\nimport timeit\r\nimport math\r\nimport select\r\nimport os\r\nfrom selectors import EpollSelector, EVENT_WRITE, EVENT_READ\r\n\r\n\r\nclass OriginalEpollSelector(EpollSelector):\r\n    def select(self, timeout=None):\r\n        if timeout is None:\r\n            timeout = -1\r\n        elif timeout <= 0:\r\n            timeout = 0\r\n        else:\r\n            # epoll_wait() has a resolution of 1 millisecond, round away\r\n            # from zero to wait *at least* timeout seconds.\r\n            timeout = math.ceil(timeout * 1e3) * 1e-3\r\n        # epoll_wait() expects `maxevents` to be greater than zero;\r\n        # we want to make sure that `select()` can be called when no\r\n        # FD is registered.\r\n        max_ev = max(len(self._fd_to_key), 1)\r\n        ready = []\r\n        try:\r\n            fd_event_list = self._selector.poll(timeout, max_ev)\r\n        except InterruptedError:\r\n            return ready\r\n        for fd, event in fd_event_list:\r\n            events = 0\r\n            if event & ~select.EPOLLIN:\r\n                events |= EVENT_WRITE\r\n            if event & ~select.EPOLLOUT:\r\n                events |= EVENT_READ\r\n\r\n            key = self._key_from_fd(fd)\r\n            if key:\r\n                ready.append((key, events & key.events))\r\n        return ready\r\n\r\n\r\nNOT_EPOLLIN = ~select.EPOLLIN\r\nNOT_EPOLLOUT = ~select.EPOLLOUT\r\n\r\nclass NewEpollSelector(EpollSelector):\r\n    def select(self, timeout=None):\r\n        if timeout is None:\r\n            timeout = -1\r\n        elif timeout <= 0:\r\n            timeout = 0\r\n        else:\r\n            # epoll_wait() has a resolution of 1 millisecond, round away\r\n            # from zero to wait *at least* timeout seconds.\r\n            timeout = math.ceil(timeout * 1e3) * 1e-3\r\n        # epoll_wait() expects `maxevents` to be greater than zero;\r\n        # we want to make sure that `select()` can be called when no\r\n        # FD is registered.\r\n        max_ev = len(self._fd_to_key) or 1\r\n        ready = []\r\n        try:\r\n            fd_event_list = self._selector.poll(timeout, max_ev)\r\n        except InterruptedError:\r\n            return ready\r\n        \r\n        fd_to_key = self._fd_to_key\r\n        for fd, event in fd_event_list:\r\n            key = fd_to_key.get(fd)\r\n            if key:\r\n                ready.append(\r\n                    (\r\n                        key,\r\n                        (\r\n                            (event & NOT_EPOLLIN and EVENT_WRITE)\r\n                            | (event & NOT_EPOLLOUT and EVENT_READ)\r\n                        )\r\n                        & key.events,\r\n                    )\r\n                )\r\n        return ready\r\n\r\n\r\noriginal_epoll = OriginalEpollSelector()\r\nnew_epoll = NewEpollSelector()\r\n\r\n\r\nfor _ in range(512):\r\n    r, w = os.pipe()\r\n    os.write(w, b\"a\")\r\n    original_epoll.register(r, EVENT_READ)\r\n    new_epoll.register(r, EVENT_READ)\r\n\r\n\r\noriginal_time = timeit.timeit(\r\n    \"selector.select()\",\r\n    number=100000,\r\n    globals={\"selector\": original_epoll},\r\n)\r\nnew_time = timeit.timeit(\r\n    \"selector.select()\",\r\n    number=100000,\r\n    globals={\"selector\": new_epoll},\r\n)\r\n\r\nprint(\"original: %s\" % original_time)\r\nprint(\"new: %s\" % new_time)\r\n```\n\n<!-- gh-linked-prs -->\n### Linked PRs\n* gh-106754\n* gh-106864\n* gh-106879\n* gh-106884\n<!-- /gh-linked-prs -->\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 24851,
+            "commit_id": "fdab58bb5ea6f1bc0b6dce5d6054c3a632a60c36",
+            "original_commit_id": "7513e2e7e48f6c004ed9bce55f2dcc6b388e02cd",
+            "path": "Lib/selectors.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 317,
+            "original_line": 317,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Note: on my system `frozenset` is slightly slower than `set`, but the difference is very small"
+            ]
+        },
+        {
+            "hunk_id": 24852,
+            "commit_id": "fdab58bb5ea6f1bc0b6dce5d6054c3a632a60c36",
+            "original_commit_id": "7513e2e7e48f6c004ed9bce55f2dcc6b388e02cd",
+            "path": "Lib/selectors.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 319,
+            "original_line": 319,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "The `rw` is only used once. You assigned `r | w` to a variable for readability?"
+            ]
+        }
+    ]
+}

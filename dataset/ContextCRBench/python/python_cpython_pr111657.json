@@ -1,0 +1,45 @@
+{
+    "repo": "python/cpython",
+    "pr_number": 111657,
+    "lang": "python",
+    "pr_title": "GH-109369: Exit tier 2 if executor is invalid",
+    "pr_body": "Fixes GH-109369.\r\nAdds a `_CHECK_VALIDITY` uop which is inserted after any escaping operations.\r\nEnsures that uop traces will be exited promptly if the code is instrumented.",
+    "pr_comments": [
+        "So, on the JIT branch, we don't actually keep the executor handy when executing instructions (only when entering/exiting traces). I'm guessing we'll need it a lot more in the future once we start doing stitching and such, but I wonder: can we just stick it on the `tstate` or the `frame`? It feels a bit painful to dedicate a register to this thing, especially since it'll be hardly used in optimized traces (I think).\r\n\r\nNot a big deal though, and can be deferred to a later date. Just something to ponder, or to do if it's easy now.",
+        "Idea: put the executor's address in `_CHECK_VALIDITY`'s `operand`? Then the JIT would require no modifications to support this change.",
+        "Ah, never mind, the JIT can burn in the executor. I withdraw my comments. :)"
+    ],
+    "merged": true,
+    "created_at": "2023-11-08T12:14:28Z",
+    "issue_context": {
+        "number": 109369,
+        "title": "Executors might ignore instrumentation.",
+        "body": "# Bug report\n\nCode handed to the optimizer may not include instrumentation. If instrumentation is added later, the executor does not see it.\nWe remove all `ENTER_EXECUTORS` when instrumenting, but that doesn't fix the problem of executors that are still running.\n\n### Example\n\nA loop that calls `foo`:\n```Py\nwhile large_number > 0:\n    foo()\n    large_number -= 1\n```\nThe loop gets turned into an executor, and sometime before `large_number` reaches zero, a debugger gets attached and in some callee of `foo` turns on monitoring of calls. We would expect all subsequent calls to `foo()` to be monitored, but they will not be, as the executor knows nothing about the call to `foo()` being instrumented.\n\n### Let's not rely on the executor/optimizer to handle this.\n\nWe could add a complex de-optimization strategy, so that executors are invalidated when instrumentation occurs, but that is the sort of thing we want to be doing for maximum performance, not for correctness.\n\nIt is much safer, and ultimately no slower (once we implement fancy de-optimization) to add extra checks for instrumentation, so that unoptimized traces are correct.\n\n### The solution\n\nThe solution is quite simple, add a check for instrumentation after every call.\n\nWe can make this less slow (and less simple) by combining the eval-breaker check and instrumentation check into one. This makes the check slightly more complex, but should speed up `RESUME` by less than it slows down every call as every call already has an eval-breaker check.\n\nCombining the two checks reducing the number of bits for versions from 64 to 24 (we need the other bits for eval-breaker, gc, async exceptions, etc). A 64 bit number never overflows (computers don't last long enough), but 24 bit numbers do.\n\nThis will have three main effects, beyond the hopefully very small performance impact for all code:\n* It removes the need for a complete call stack scan of all threads when instrumenting. \n* Tools that set or change monitoring many times will see significant performance improvements as we no longer need to traverse all stacks to re-instrument the whole call stack whenever monitoring changes\n* Tools that set or change monitoring many millions of times will break, as we run out of versions. It is likely that these tools were already broken or had performance so bad as to be totally unusable.\n\n#### Making the check explicit in the bytecode.\n\nWe can simplify all the call instructions by removing the `CHECK_EVAL_BREAKER` check at the end and adding an explicit `RESUME` instruction after every `CALL`\n\nAlthough this has the disadvantage of making the bytecode larger and adding dispatch overhead, it does have the following advantages:\n* Allows tier 1 to optimize the `RESUME` to `RESUME_CHECK` which might be cancel out the additional dispatch overhead.\n* Makes the check explicit, making it feasible for tier 2 optimizations to remove it.\n\n\n<!-- gh-linked-prs -->\n### Linked PRs\n* gh-109846\n* gh-110358\n* gh-110384\n* gh-111642\n* gh-111657\n<!-- /gh-linked-prs -->\n",
+        "comments": [
+            "Because instrumentation can turned on in a finalizer and each `Py_DECREF()` could potentially turn on instrumentation, it actually makes sense to rely on de-optimization machinery, as it too easy to miss a check otherwise.\r\n\r\nWith that in mind, we need to do the following:\r\n\r\n- [ ] Implement `valid` flag to executors, and machinery to unset it if a dependency changes.\r\n- [ ] Add micro-op to check validity bit and insert it after every impure instruction\r\n- [ ] Optimize executor implementation, improving hash functions and store in a tree, not a list.",
+            "Do I read between the lines that we are not proceeding with the [plan](https://github.com/faster-cpython/ideas/issues/582) to reimplement `DECREF` by putting the objects to be deleted in some kind of queue that is processed e.g. when the eval breaker goes off?",
+            "That is still the plan, but we don't want to be relying on it for correctness.\r\n\r\nRegardless of whether `Py_DECREF` can have arbitrary side effects or not, there will be a set of micro-ops that can have arbitrary side effects, so we need to handle them.\r\n\r\nhttps://github.com/faster-cpython/ideas/issues/582 will make that set of micro-ops smaller, meaning fewer guards and better optimizations."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 24930,
+            "commit_id": "ce3670634b5ef0c666d5e4571f10153164d27021",
+            "original_commit_id": "97c4c06d0d235aad00e5b6b10af8b8d68c889b9b",
+            "path": "Tools/cases_generator/flags.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 106,
+            "original_line": 106,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 71,
+            "subject_type": "line",
+            "review_comments": [
+                "The InstructionFlags were intended to be for things that get emitted into the metadata and used by the interpreter.  There is a bitmask created for them below. I think if we want to have things here which are only used in the generator then we need to make sure we don't waste a bit in that bit mask for them.",
+                "It gets used by the optimizer, so it needs to go in a table somewhere. This seems to be the only place to put it.\r\nWe ought to have separate tables for the tier 1 instructions, and for uops. But that's for another PR."
+            ]
+        }
+    ]
+}

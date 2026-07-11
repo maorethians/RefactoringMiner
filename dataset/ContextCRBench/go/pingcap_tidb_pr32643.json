@@ -1,0 +1,42 @@
+{
+    "repo": "pingcap/tidb",
+    "pr_number": 32643,
+    "lang": "go",
+    "pr_title": "table/tables: fix a corner case of renew lease operation on cached table",
+    "pr_body": "<!--\r\n\r\nThank you for contributing to TiDB!\r\n\r\nPR Title Format:\r\n1. pkg [, pkg2, pkg3]: what's changed\r\n2. *: what's changed\r\n\r\n-->\r\n\r\n### What problem does this PR solve?\r\n<!--\r\n\r\nPlease create an issue first to describe the problem.\r\n\r\nThere MUST be one line starting with \"Issue Number:  \" and \r\nlinking the relevant issues via the \"close\" or \"ref\".\r\n\r\nFor more info, check https://pingcap.github.io/tidb-dev-guide/contribute-to-tidb/contribute-code.html#referring-to-an-issue.\r\n\r\n-->\r\n\r\nIssue Number: close #32642\r\n\r\nProblem Summary:\r\n\r\n### What is changed and how it works?\r\n\r\nHandle the bug that after Read Locked -> Write -> Read Locked state changes, the renew lease operation success mistakenly.\r\nNow I check `oldLocalLease != remoteLease` to see whether there is another intermediate state change, and prevent the ABA issue.\r\nThis change can also reduce the conflict when there are several tidb instances handling renew lease simultaneously.\r\n\r\n\r\n### Check List\r\n\r\nTests <!-- At least one of them must be included. -->\r\n\r\n- [X] Unit test\r\n- [ ] Integration test\r\n- [ ] Manual test (add detailed scripts or steps below)\r\n- [ ] No code\r\n\r\nSide effects\r\n\r\n- [ ] Performance regression: Consumes more CPU\r\n- [ ] Performance regression: Consumes more Memory\r\n- [ ] Breaking backward compatibility\r\n\r\nDocumentation\r\n\r\n- [ ] Affects user behaviors\r\n- [ ] Contains syntax changes\r\n- [ ] Contains variable changes\r\n- [ ] Contains experimental features\r\n- [ ] Changes MySQL compatibility\r\n\r\n### Release note\r\n\r\n<!-- bugfix or new feature needs a release note -->\r\n\r\n```release-note\r\nNone\r\n```\r\n",
+    "pr_comments": [
+        "[REVIEW NOTIFICATION]\n\nThis pull request has been approved by:\n\n- lcwangchao\n- tangenta\n\n\n\n\nTo complete the [pull request process](https://book.prow.tidb.io/#/en/workflows/pr), please ask the reviewers in the [list](https://prow.tidb.io/tichi/repos/pingcap/tidb/pulls/32643/owners) to review by filling `/cc @reviewer` in the comment.\nAfter your PR has acquired the required number of LGTMs, you can assign this pull request to the committer in the [list](https://prow.tidb.io/tichi/repos/pingcap/tidb/pulls/32643/owners) by filling  `/assign @committer` in the comment to help you merge this pull request.\n\nThe full list of commands accepted by this bot can be found [here](https://prow.tidb.io/command-help?repo=pingcap%2Ftidb).\n\n<details>\n\nReviewer can indicate their review by submitting an approval review.\nReviewer can cancel approval by submitting a request changes review.\n</details>\n\n<!--Review Notification Identifier-->",
+        "Code Coverage Details: https://codecov.io/github/pingcap/tidb/commit/c5dd83eb758529b5421d1356334b558d32ffeae7",
+        "/merge",
+        "This pull request has been accepted and is ready to merge. <details>Commit hash: 97171f89227e359b2f0a906ba488b03dadd79afb</details>",
+        "/run-unit-test"
+    ],
+    "merged": true,
+    "created_at": "2022-03-01T14:20:46Z",
+    "issue_context": {
+        "number": 32642,
+        "title": "A corner case of renew lease operation on cached table",
+        "body": "## Bug Report\r\n\r\nPlease answer these questions before submitting your issue. Thanks!\r\n\r\n### 1. Minimal reproduce step (Required)\r\n\r\n<!-- a step by step guide for reproducing the bug. -->\r\n\r\nIt's difficult to reproduce such kind of issue.\r\nBy reading the code logic...\r\n\r\nIf renew lease success, update the lease time of the cache, reuse it.\r\n\r\n```\r\nsucc, err := c.handle.RenewLease(context.Background(), tid, lease, op)\r\nif err != nil {\r\n\tlog.Warn(\"Renew read lease error\", zap.Error(err))\r\n}\r\nif succ {\r\n\tc.cacheData.Store(&cacheData{\r\n\t\tStart:     data.Start,\r\n\t\tLease:     lease,\r\n\t\tMemBuffer: data.MemBuffer,\r\n\t})\r\n}\r\n```\r\n\r\n\r\nThe renew lease logic is buggy:\r\n\r\n```\r\nfunc (h *stateRemoteHandle) renewReadLease(ctx context.Context, tid int64, newLease uint64) (bool, error) {\r\n\tvar succ bool\r\n\terr := h.runInTxn(ctx, func(ctx context.Context, now uint64) error {\r\n\t\tlockType, oldLease, _, err := h.loadRow(ctx, tid)\r\n\t\tif err != nil {\r\n\t\t\treturn errors.Trace(err)\r\n\t\t}\r\n\t\tif now >= oldLease {\r\n\t\t\t// read lock had already expired, fail to renew\r\n\t\t\treturn nil\r\n\t\t}\r\n\t\tif lockType != CachedTableLockRead {\r\n\t\t\t// Not read lock, fail to renew\r\n\t\t\treturn nil\r\n\t\t}\r\n\r\n\t\tif newLease > oldLease { // lease should never decrease!\r\n\t\t\terr = h.updateRow(ctx, tid, \"READ\", newLease)\r\n\t\t\tif err != nil {\r\n\t\t\t\treturn errors.Trace(err)\r\n\t\t\t}\r\n\t\t}\r\n\t\tsucc = true\r\n\t\treturn nil\r\n\t})\r\n\treturn succ, err\r\n}\r\n```\r\n\r\n**It may happen that the meta state change from: Read Locked -> Write -> Read Locked again,\r\nand then the renew lease operation success!**\r\n\r\nAn example of a pratical case:\r\n\r\n1. session1 read from cached data\r\n2. session1 find the read lock lease is about to expire, so it renew the lease\r\n3. the renew lease background gorouine hang for a long time\r\n\r\n4. session2 (maybe in another tidb) update the table\r\n5. session3 (maybe in another tidb) read the table, make the table cached\r\n\r\n6. session1 continue from step3, the renew lease operation execute, **it succeed**! now the cached data is a stale one.\r\n7. session1 read from cached date in a new query, get the wrong result.\r\n\r\n### 2. What did you expect to see? (Required)\r\n\r\n### 3. What did you see instead (Required)\r\n\r\n### 4. What is your TiDB version? (Required)\r\n\r\n<!-- Paste the output of SELECT tidb_version() -->\r\n\r\nmaster e389170624e227068213f523b7bed837ae3d95b1 \r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 38786,
+            "commit_id": "c5dd83eb758529b5421d1356334b558d32ffeae7",
+            "original_commit_id": "e0db77ecd1c5c1edad3d1affb5ace393c413527c",
+            "path": "table/tables/cache.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 55,
+            "original_line": 55,
+            "side": "LEFT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "Before removing this line, the `LockForRead` and `RenewLease` operation may happen at the same time ... but they share the same `StateRemote` handle instance for executing SQL.\r\nThat would cause DATA RACE"
+            ]
+        }
+    ]
+}

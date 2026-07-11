@@ -1,0 +1,44 @@
+{
+    "repo": "prometheus/prometheus",
+    "pr_number": 9856,
+    "lang": "go",
+    "pr_title": "Fix panic, out of order chunks, and race warning during WAL replay",
+    "pr_body": "Closes https://github.com/prometheus/prometheus/issues/9846\r\nCloses https://github.com/prometheus/prometheus/issues/9859\r\n\r\nPossible fix for the race warning in #9847 \r\n\r\nFirst we introduce `walSubsetProcessor`, which packages up the `processWALSamples()` function and its input and output channels, helping to clarify how these things relate.\r\n\r\nThen extract a few more methods.\r\n\r\nFinally we add a lock round each batch of samples, so the race detector can see that we never access series owned by the processor outside of a lock.\r\n\r\nAlthough we have waited for the processor to finish, we still get a warning from the race detector because it doesn't know how the different parts relate.\r\n\r\n\r\n",
+    "pr_comments": [
+        "> This PR as is LGTM. But I would like to also fix #9859 in this PR, it is a small change.\r\n\r\n@bboreham I've added a test to reproduce issue #9859 in https://github.com/prometheus/prometheus/pull/9863. Do you mind picking it in this PR so we change the WAL replay to fix that too?",
+        "Hi,\r\n\r\nWe update prometheus on Cortex and we noticed big difference on wall time replay (2x-4x) that seems related to this change:\r\n\r\n![Screen Shot 2022-05-09 at 8 27 13 PM](https://user-images.githubusercontent.com/4027760/167536793-75c8ed55-f345-4a58-94c5-b32337358388.png)\r\n\r\nif we revert this change we cannot see this anymore.\r\n\r\nis this expected?",
+        "No, I would not expect that. \r\nThis PR was mostly a refactoring, but we did add some locking. \r\nPlease can you do some analysis where the program is spending the extra time.  Is it burning CPU, waiting on locks, etc.?  \r\n\r\nAnother angle might be to determine which commit within this PR makes the difference. ",
+        "Thanks for the quick response @bboreham \r\nI will do commit by commit and see what can I find..",
+        "Seems that the first commit already causes the issue:\r\n\r\nI guess that before we were returning early when the series was created and now we have to flush the input/output?\r\n\r\n\r\nhttps://github.com/bboreham/prometheus/commit/1565c8803519ed87d002ae6c94466f3f62f7f114#diff-e55e448a1ce649167194e1ced19ab2009f422ad678011e333414b8de8e62d311L220\r\n\r\n![Screen Shot 2022-05-09 at 10 28 40 PM](https://user-images.githubusercontent.com/4027760/167549298-72d10ce1-ac33-43be-b39b-412f8baf3c69.png)\r\n already increase the time:\r\n\r\n",
+        "It's plausible. The \"output\" is a channel to re-use buffers; really it's waiting to make sure nothing is running in parallel.\r\n\r\nCould you grab some gouroutine dumps while it runs, so we can see which line(s) are more popular to wait on?\r\nE.g. 5x `/debug/pprof/goroutine?debug=1` should suggest something.",
+        "The main difference in time is btw this 2 lines:\r\n\r\nCurrent Version:\r\n\r\n```\r\nlevel=info ts=2022-05-10T17:05:55.020872066Z caller=head.go:542 org_id=user msg=\"Replaying WAL, this may take a while\"\r\nlevel=info ts=2022-05-10T17:07:05.268967653Z caller=head.go:578 org_id=user msg=\"WAL checkpoint loaded\"\r\n```\r\n\r\nReverted Version:\r\n```\r\nlevel=info ts=2022-05-10T17:12:04.844703353Z caller=head.go:542 org_id=user msg=\"Replaying WAL, this may take a while\"\r\nlevel=info ts=2022-05-10T17:12:09.31871618Z caller=head.go:578 org_id=user msg=\"WAL checkpoint loaded\"\r\n```\r\n\r\nThis is the goroutine dump while the process was hanging between those lines: https://gist.github.com/alanprot/217fff7d5ac2f3b53485bdebca4268fb\r\n\r\nI do see the `waitUntilIdle` there.\r\n\r\n```\r\n1 @ 0x43b6f6 0x469c0e 0xe1859e 0xe15edf 0xe07b3a 0xdf7a5e 0xdf6c5b 0x1d271d0 0x1d295db 0xdc0067 0x46cfc1\r\n#\t0x469c0d\ttime.Sleep+0x12d\t\t\t\t\t\t\t\t\t\t\t\t\t\tpath-redated/lib/src/runtime/time.go:193\r\n#\t0xe1859d\tpath-redated/vendor/github.com/prometheus/prometheus/tsdb.(*walSubsetProcessor).waitUntilIdle+0x5d\tpath-redatedvendor/github.com/prometheus/prometheus/tsdb/head_wal.go:441\r\n#\t0xe15ede\tpath-redated/vendor/github.com/prometheus/prometheus/tsdb.(*Head).loadWAL+0x133e\t\t\t\tpath-redatedvendor/github.com/prometheus/prometheus/tsdb/head_wal.go:213\r\n#\t0xe07b39\tpath-redated/vendor/github.com/prometheus/prometheus/tsdb.(*Head).Init+0xf19\t\t\t\tpath-redatedvendor/github.com/prometheus/prometheus/tsdb/head.go:573\r\n#\t0xdf7a5d\tpath-redated/vendor/github.com/prometheus/prometheus/tsdb.open+0xb9d\t\t\t\t\tpath-redatedvendor/github.com/prometheus/prometheus/tsdb/db.go:750\r\n#\t0xdf6c5a\tpath-redated/vendor/github.com/prometheus/prometheus/tsdb.Open+0x9a\t\t\t\t\tpath-redatedvendor/github.com/prometheus/prometheus/tsdb/db.go:576\r\n#\t0x1d271cf\tpath-redated/vendor/github.com/cortexproject/cortex/pkg/ingester.(*Ingester).createTSDB+0x7ef\t\tpath-redatedvendor/github.com/cortexproject/cortex/pkg/ingester/ingester_v2.go:1611\r\n#\t0x1d295da\tpath-redated/vendor/github.com/cortexproject/cortex/pkg/ingester.(*Ingester).openExistingTSDB.func1+0x15a\tpath-redatedvendor/github.com/cortexproject/cortex/pkg/ingester/ingester_v2.go:1740\r\n#\t0xdc0066\tpath-redated/vendor/golang.org/x/sync/errgroup.(*Group).Go.func1+0x66\r\n```"
+    ],
+    "merged": true,
+    "created_at": "2021-11-25T08:00:30Z",
+    "issue_context": {
+        "number": 9846,
+        "title": "Panic in WAL replay",
+        "body": "This is related to #9841. Let's say we encounter the situation described in #9841 because of some misconfiguration, we can face panic because of below scenario:\r\n\r\n1. The samples record is read first, and it goes ahead to add the sample to the series [here](https://github.com/prometheus/prometheus/blob/f08c89e569b2421bcc8ef7caf585fd8d3c2ccaba/tsdb/head_wal.go#L386).\r\n2. The series record is seen next, and the series get's created [here](https://github.com/prometheus/prometheus/blob/f08c89e569b2421bcc8ef7caf585fd8d3c2ccaba/tsdb/head_wal.go#L205-L221).\r\n3. Since both records are processed in parallel, it can happen that though samples record was seen first, series gets created first before the sample is appended [here](https://github.com/prometheus/prometheus/blob/f08c89e569b2421bcc8ef7caf585fd8d3c2ccaba/tsdb/head_wal.go#L407)\r\n\r\nNow comes the race that causes panic:\r\n\r\n1. When series is created, we set the m-map chunks [here](https://github.com/prometheus/prometheus/blob/f08c89e569b2421bcc8ef7caf585fd8d3c2ccaba/tsdb/head_wal.go#L219). This assumes that no sample append will be in parallel.\r\n2. At the same time, the sample append tries to access the mmapped chunks [here](https://github.com/prometheus/prometheus/blob/f08c89e569b2421bcc8ef7caf585fd8d3c2ccaba/tsdb/head_append.go#L485).\r\n\r\nDue to changing slice, the access of the slice can panic. (We faced this at Grafana Labs)\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 49734,
+            "commit_id": "3efa3cf02804f876b8673807bbe464e408e0d71b",
+            "original_commit_id": "5e746e4e88adfe44a69764e3ac99d2d01f2224db",
+            "path": "tsdb/head_wal.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 361,
+            "original_line": 361,
+            "side": "RIGHT",
+            "original_position": 157,
+            "position": 157,
+            "subject_type": "line",
+            "review_comments": [
+                "Note to reviewers: the key change to fix #9859 is that the head chunk is now reset after series creation while taking the new lock."
+            ]
+        }
+    ]
+}

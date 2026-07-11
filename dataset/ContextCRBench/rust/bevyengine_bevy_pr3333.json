@@ -1,0 +1,69 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 3333,
+    "lang": "rust",
+    "pr_title": "Query::get_multiple and get_multiple_mut",
+    "pr_body": "# Objective\r\n\r\n- The inability to have multiple active mutable borrows into a query is a common source of borrow-checker pain for users.\r\n- This is a pointless restriction if and only if we can guarantee that the entities they are accessing are unique.\r\n- This could already by bypassed with `get_unchecked`, but that is an extremely unsafe API.\r\n- Closes #2042.\r\n\r\n## Solution\r\n\r\n- Implement `Query::get_multiple` and `get_multiple_mut`, to provide access to the data of more than one entity at once.\r\n- `get_multiple_mut` enforces uniqueness (to ensure soundness), but `get_multiple` does not (to reduce overhead).\r\n- No equivalent methods were made on `World`, as multiple `EntityMut` cannot exist at once: the ability to add and remove components to entities with it make that design fundamentally unsound.\r\n- Even when working in an exclusive world context, users can still create a `Query` and then use these methods.\r\n- An iterator is returned, rather than a `Vec` or other collection in order to avoid allocations and ensure maximal flexibility.\r\n\r\n## Breaking\r\nTechnically, this is a breaking change, as I've added a `AliasedMutability` variant to the `QueryEntityError` enum.",
+    "pr_comments": [
+        "Also, probably just stating the obvious here, but adding an error to `QueryEntityError` would not be a breaking change if it would be marked as `#[non_exhaustive]`.",
+        "We have accepted that every release will be extremely breaking, at least for now ;) I'm reasonably happy with causing compiler errors to draw attention to new behavior in this case.",
+        "For the lack of variadics, what about using and returning `const` generics? So `[Entity; N] -> [&mut T; N]`?",
+        "> For the lack of variadics, what about using and returning const generics? So [Entity; N] -> [&mut T; N]?\r\n\r\nMy first impressions is that this is too restrictive, and will make this API more frustrating to use. Let me see what it would look like though.",
+        "Honestly I like the simpler more consistent API with const generics better. This is good, thanks @yilinwei!",
+        "@MinerSebas thanks for the review! I've fixed up your comments now.",
+        "@MinerSebas, the `Query::from_state` method is actually needed to make these methods useful when we're working with a raw `World`. As a result, removing this made the doc-tests fail. IMO this should be part of the same PR; I'll clean it up.",
+        "I don't really think that we should be adding `Query::from_state` in this PR, its an entirely unrelated API addition. It should be possible to get a `Query` from `World` already:\r\n```rust\r\nlet mut world = World::default();\r\nlet mut system_state = SystemState::<Query<&mut Foo>>::new(&mut world); \r\nlet mut query = system_state.get_mut(&mut world);\r\n```",
+        "Lol those errors are not super helpful... can be fixed by replacing `impl Iterator` with `GetMultipleMut` in `fn get_multiple_mut` and by doing `Query::<'q, 's, Q, F>::get_unchecked` in `GetMultipleMut::next`. changing `Query::get` from `fn get(&'s self` to `fn get(&self` seems to fix the error for `fn get_multiple`",
+        "Closing in favor of the less messy #4298."
+    ],
+    "merged": false,
+    "created_at": "2022-02-23T23:34:17Z",
+    "issue_context": {
+        "number": 2042,
+        "title": "Safe method for multiple mutable references to components from Query",
+        "body": "## What problem does this solve or what need does it fill?\r\n\r\nIt is sometimes useful/easier to have mutable access to the same component of many different entities at once.\r\n\r\n## What solution would you like?\r\n\r\nTwo new methods for Query, a default and one for a component. Example:\r\n\r\n```rust\r\nfn get_many_mut<'a, Q: WorldQuery, F: WorldQuery>(\r\n    entities: impl IntoIterator<Item = Entity>,\r\n    query: &'a mut Query<Q, F>,\r\n) -> Result<Vec<<Q::Fetch as Fetch<'a>>::Item>, MultiEntityQueryErr>\r\nwhere\r\n    F::Fetch: FilterFetch,\r\n{\r\n    let mut unique = HashSet::default();\r\n    let mut iter = entities.into_iter();\r\n    if iter.by_ref().all(|x| unique.insert(x)) {\r\n        let mut result = Vec::with_capacity(unique.len());\r\n\r\n        for entity in iter {\r\n            match unsafe { query.get_unchecked(entity) } {\r\n                Ok(item) => {\r\n                    result.push(item);\r\n                }\r\n                Err(err) => {\r\n                    return Err(MultiEntityQueryErr::QueryEntityError(err));\r\n                }\r\n            }\r\n        }\r\n\r\n        Ok(result)\r\n    } else {\r\n        Err(MultiEntityQueryErr::DuplicateEntities)\r\n    }\r\n}\r\n```\r\n\r\nJust a quick implementation I've already written, not necessarily the best. Originally I used const generic arrays to avoid heap allocation too - but depends on use case.\r\n\r\n## What alternative(s) have you considered?\r\n\r\nHave users implement it themselves using the existing unsafe Query methods, like above, and worry their use of unsafe will cause issues.\r\n",
+        "comments": [
+            "This functionality is definitely valuable; see #2010 for another version of how this might look, and check out the [Relations RFC](https://github.com/bevyengine/rfcs/pull/18) that inspired it.\r\n\r\nAs a stop-gap, #1763 provides a limited but very commonly useful version of this functionality.",
+            "See #2276 for more thoughts on the API design here. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 978,
+            "commit_id": "bee959e2a4eafaa7786576be7fa53dd49d2f6260",
+            "original_commit_id": "d3e526bfc09c58ff5996e3b1e70e3310ded4f578",
+            "path": "crates/bevy_ecs/src/system/query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 681,
+            "original_line": 758,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 67,
+            "subject_type": "line",
+            "review_comments": [
+                "Imo this shouldn't use an iterator or hash set. To avoid allocations and hashing, it should do a brute force in place entity collision check. For small numbers of entities (which the const generic basically enforces) this will be much much faster. I expect 99% of use cases to use 2 or 3 entities (one comparison and three comparisons, respectively). And it should return a fixed size array:\r\n\r\n```rust\r\nif let Ok([c1, c2, c3]) = query.get_multiple_mut([e1, e2, e3]) {\r\n}\r\n```",
+                "Quick and dirty impl that ignores error handling:\r\n\r\n```rust\r\n\r\n    #[inline]\r\n    pub fn get_multiple<const N: usize>(\r\n        &'s self,\r\n        entities: [Entity; N],\r\n    ) -> Result<[<Q::ReadOnlyFetch as Fetch<'w, 's>>::Item; N], QueryEntityError> {\r\n        for i in 0..entities.len() {\r\n            for j in (i + 1)..entities.len() {\r\n                if entities[i] == entities[j] {\r\n                    panic!(\"cannot call on matching entities\")\r\n                }\r\n            }\r\n        }\r\n        Ok(entities.map(|e| unsafe {\r\n            self.state\r\n                .get_unchecked_manual::<Q::ReadOnlyFetch>(\r\n                    self.world,\r\n                    e,\r\n                    self.last_change_tick,\r\n                    self.change_tick,\r\n                )\r\n                .unwrap()\r\n        }))\r\n    }\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 977,
+            "commit_id": "bee959e2a4eafaa7786576be7fa53dd49d2f6260",
+            "original_commit_id": "d3e526bfc09c58ff5996e3b1e70e3310ded4f578",
+            "path": "crates/bevy_ecs/src/system/query.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 711,
+            "original_line": 893,
+            "side": "RIGHT",
+            "original_position": 286,
+            "position": 94,
+            "subject_type": "line",
+            "review_comments": [
+                "This is kind of unrelated fix in this pull, so maybe add one line in the \"incidental\" part of the pull description about it."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,80 @@
+{
+    "repo": "tauri-apps/tauri",
+    "pr_number": 12745,
+    "lang": "rust",
+    "pr_title": "fix(tauri): fix `use-after-free` unsoundness for state manager",
+    "pr_body": "<!--\r\nBefore submitting a PR, please read https://github.com/tauri-apps/tauri/blob/dev/.github/CONTRIBUTING.md#pull-request-guidelines\r\n\r\n1. Give the PR a descriptive title.\r\n\r\n  Examples of good title:\r\n    - fix(windows): fix race condition in event loop\r\n    - docs: update example for `App::show`\r\n    - feat: add `Window::set_fullscreen`\r\n\r\n  Examples of bad title:\r\n    - fix #7123\r\n    - update docs\r\n    - fix bugs\r\n\r\n2. If there is a related issue, reference it in the PR text, e.g. closes #123.\r\n3. If this change requires a new version, then add a change file in `.changes` directory with the appropriate bump, see https://github.com/tauri-apps/tauri/blob/dev/.changes/README.md\r\n4. Ensure that all your commits are signed https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits\r\n5. Ensure `cargo test` and `cargo clippy` passes.\r\n6. Propose your changes as a draft PR if your work is still in progress.\r\n-->\r\n\r\nclose #12721\r\n\r\nanother impl to #12723\r\n",
+    "pr_comments": [
+        "ping @amrbashir "
+    ],
+    "merged": false,
+    "created_at": "2025-02-20T03:34:21Z",
+    "issue_context": {
+        "number": 12721,
+        "title": "[bug] `StateManager`  is unsound",
+        "body": "### Describe the bug\n\n```rust\nfn foo(app: tauri::App) {\n    use tauri::Manager;\n\n    #[derive(Debug)]\n    struct Foo(i32);\n\n    app.manage(Foo(0));\n    let state = app.state::<Foo>().inner();\n    let mut returned_state = app.unmanage::<Foo>().unwrap();\n    returned_state.0 = 42;\n\n    println!(\"{}\", state.0); // \ud83d\udc48 encountered a dangling reference (use-after-free)\n}\n```\n\nWhile retaining a reference to the state, removing the managed state from the manager will result in a dangling pointer.\n\n### Reproduction\n\nHere is an equivalent implementation, run it with [miri](https://github.com/rust-lang/miri) (miri cannot directly run tauri):\n\n```rust\nuse std::{\n    any::{Any, TypeId},\n    cell::UnsafeCell,\n    collections::HashMap,\n    hash::BuildHasherDefault,\n    sync::{Arc, Mutex},\n};\n\n/// A guard for a state value.\n///\n/// See [`Manager::manage`](`crate::Manager::manage`) for usage examples.\npub struct State<'r, T: Send + Sync + 'static>(&'r T);\n\nimpl<'r, T: Send + Sync + 'static> State<'r, T> {\n    /// Retrieve a borrow to the underlying value with a lifetime of `'r`.\n    /// Using this method is typically unnecessary as `State` implements\n    /// [`std::ops::Deref`] with a [`std::ops::Deref::Target`] of `T`.\n    #[inline(always)]\n    pub fn inner(&self) -> &'r T {\n        self.0\n    }\n}\n\nimpl<T: Send + Sync + 'static> std::ops::Deref for State<'_, T> {\n    type Target = T;\n\n    #[inline(always)]\n    fn deref(&self) -> &T {\n        self.0\n    }\n}\n\nimpl<T: Send + Sync + 'static> Clone for State<'_, T> {\n    fn clone(&self) -> Self {\n        State(self.0)\n    }\n}\n\nimpl<T: Send + Sync + 'static + PartialEq> PartialEq for State<'_, T> {\n    fn eq(&self, other: &Self) -> bool {\n        self.0 == other.0\n    }\n}\n\nimpl<T: Send + Sync + std::fmt::Debug> std::fmt::Debug for State<'_, T> {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        f.debug_tuple(\"State\").field(&self.0).finish()\n    }\n}\n\n#[derive(Default)]\nstruct IdentHash(u64);\n\nimpl std::hash::Hasher for IdentHash {\n    fn finish(&self) -> u64 {\n        self.0\n    }\n\n    fn write(&mut self, bytes: &[u8]) {\n        for byte in bytes {\n            self.write_u8(*byte);\n        }\n    }\n\n    fn write_u8(&mut self, i: u8) {\n        self.0 = (self.0 << 8) | (i as u64);\n    }\n\n    fn write_u64(&mut self, i: u64) {\n        self.0 = i;\n    }\n}\n\ntype TypeIdMap = HashMap<TypeId, Box<dyn Any>, BuildHasherDefault<IdentHash>>;\n\n/// The Tauri state manager.\n#[derive(Debug)]\npub struct StateManager {\n    map: Mutex<UnsafeCell<TypeIdMap>>,\n}\n\n// SAFETY: data is accessed behind a lock\nunsafe impl Sync for StateManager {}\nunsafe impl Send for StateManager {}\n\nimpl StateManager {\n    pub(crate) fn new() -> Self {\n        Self {\n            map: Default::default(),\n        }\n    }\n\n    fn with_map_ref<'a, F: FnOnce(&'a TypeIdMap) -> R, R>(&'a self, f: F) -> R {\n        let map = self.map.lock().unwrap();\n        let map = map.get();\n        // SAFETY: safe to access since we are holding a lock\n        f(unsafe { &*map })\n    }\n\n    fn with_map_mut<F: FnOnce(&mut TypeIdMap) -> R, R>(&self, f: F) -> R {\n        let mut map = self.map.lock().unwrap();\n        let map = map.get_mut();\n        f(map)\n    }\n\n    pub(crate) fn set<T: Send + Sync + 'static>(&self, state: T) -> bool {\n        self.with_map_mut(|map| {\n            let type_id = TypeId::of::<T>();\n            let already_set = map.contains_key(&type_id);\n            if !already_set {\n                map.insert(type_id, Box::new(state) as Box<dyn Any>);\n            }\n            !already_set\n        })\n    }\n\n    pub(crate) fn unmanage<T: Send + Sync + 'static>(&self) -> Option<T> {\n        self.with_map_mut(|map| {\n            let type_id = TypeId::of::<T>();\n            map.remove(&type_id)\n                .and_then(|ptr| ptr.downcast().ok().map(|b| *b))\n        })\n    }\n\n    /// Gets the state associated with the specified type.\n    pub fn get<T: Send + Sync + 'static>(&self) -> State<'_, T> {\n        self.try_get()\n            .expect(\"state: get() when given type is not managed\")\n    }\n\n    /// Gets the state associated with the specified type.\n    pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<State<'_, T>> {\n        self.with_map_ref(|map| {\n            map.get(&TypeId::of::<T>())\n                .and_then(|ptr| ptr.downcast_ref::<T>())\n                .map(State)\n        })\n    }\n}\n\nfn main() {\n    #[derive(Debug)]\n    struct Foo(i32);\n\n    let state_manager = Arc::new(StateManager::new());\n\n    state_manager.set(Foo(0)); // manage the state\n    let state = state_manager.try_get::<Foo>().unwrap().inner(); // then get the state\n    let mut returned_state = state_manager.unmanage::<Foo>().unwrap(); // unmanage the state\n    returned_state.0 = 42;\n\n    println!(\"{}\", state.0); // \ud83d\udc48 encountered a dangling reference (use-after-free)\n}\n```\n\n### Expected behavior\n\nThe unsoundness comes from this line: <https://github.com/tauri-apps/tauri/blob/3f680588cd5ada3a44245fd77b5b87d7ee4c478e/crates/tauri/src/state.rs#L123>.\n\nIt allows retaining a reference to the Hashmap value after the `MutexGuard` is dropped.\n\n### Full `tauri info` output\n\n```text\nrust 1.82 stable\ntauri 2.2.5\n```\n\n### Stack trace\n\n`cargo +nightly miri run`\n\n```text\nerror: Undefined Behavior: out-of-bounds pointer use: alloc1105 has been freed, so this pointer is dangling\n   --> src/main.rs:152:20\n    |\n152 |     println!(\"{}\", state.0); // \ud83d\udc48 encountered a dangling reference (use-after-free)\n    |                    ^^^^^^^ out-of-bounds pointer use: alloc1105 has been freed, so this pointer is dangling\n    |\n    = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior\n    = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information\nhelp: alloc1105 was allocated here:\n   --> src/main.rs:111:37\n    |\n    |                                     ^^^^^^^^^^^^^^^\nhelp: alloc1105 was deallocated here:\n   --> src/main.rs:121:62\n    |\n121 |                 .and_then(|ptr| ptr.downcast().ok().map(|b| *b))\n    |                                                              ^\n    = note: BACKTRACE (of the first span):\n    = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `println` (in Nightly builds, run with -Z macro-backtrace for more info)\n\nnote: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace\n\nerror: aborting due to 1 previous error\n```\n\n### Additional context\n\n_No response_",
+        "comments": [
+            "Due to semantic compatibility, it seems that it can't be fixed \ud83d\ude30, especially since users can still hold `&Foo` after `drop(state)` (via `State::inner`).\n\nIt seems we can only deprecate `Manager::unmanage` to let users know about its unsoundness."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14007,
+            "commit_id": "1ec2554c8e85563ca11fe98e5e1a5b8f529de3f3",
+            "original_commit_id": "95fc3cd424a1d05b818be435abf1510c06dd7a87",
+            "path": "crates/tauri/src/state.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 159,
+            "original_line": 159,
+            "side": "RIGHT",
+            "original_position": 131,
+            "position": 131,
+            "subject_type": "line",
+            "review_comments": [
+                "we could remove `Box` and use `Arc` directly, should avoid a level of indirection"
+            ]
+        },
+        {
+            "hunk_id": 14005,
+            "commit_id": "1ec2554c8e85563ca11fe98e5e1a5b8f529de3f3",
+            "original_commit_id": "95fc3cd424a1d05b818be435abf1510c06dd7a87",
+            "path": "crates/tauri/src/state.rs",
+            "start_line": 45,
+            "original_start_line": 45,
+            "start_side": "RIGHT",
+            "line": 54,
+            "original_line": 54,
+            "side": "RIGHT",
+            "original_position": 54,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "a simple fix for this would be \r\n```rs\r\n pub fn inner(&'r self) -> &'r T {\r\n   self.0.as_ref()\r\n }\r\n```\r\n\r\nIn normal cases, this should be a breaking change but since this fixes a memory leak, it should be fine",
+                "I personally believe that most people do not need the `unmanage` feature (it seems that tauri itself does not use it also); if users really need `unmanage`, they can implement it themselves using `Mutex` and `Option::take`. This way, users who do not need mutability (`unmanage`) do not have to pay the performance cost (use `Arc` instead of `Box`, and `Arc::clone` for every `get`).\r\n\r\nSo, does tauri really want to introduce a BREAKING CHANGE in `2.x` for this? Moreover, this BREAKING CHANGE would make `pub fn inner(&'r self) -> &'r T` quite useless (almost equivalent to removing it).",
+                "I assume you mean `app.state().inner()` use-case won't work? in that case I guess your solution is correct, and `deref` should be used instead.",
+                "Here is my use case for `fn inner`: <https://github.com/WSH032/pytauri/blob/47fe27d6f67c6d490ce753ac7976eb4b8a43cbdd/crates/tauri-plugin-pytauri/src/lib.rs#L103-L109>.\r\n\r\nWith `fn inner<'a>(&'a self) -> &'r T`, I can return a reference of another type without needing to continue holding `State`.\r\n\r\nIf we really want to proceed as mentioned above, we might need to provide a method similar to [`MutexGuard::map`](https://doc.rust-lang.org/std/sync/struct.MutexGuard.html#method.map) to help convert `State<'_, T>` to `State<'_, U>`.",
+                "at this point, I would go with https://github.com/tauri-apps/tauri/pull/12723 for now, but instead of completely removing, we just document its pitfall and maybe print a warning in debug builds.\r\n\r\nthen in v3, we rework the API and introduce `.map` and remove `inner` in favor of `deref`"
+            ]
+        },
+        {
+            "hunk_id": 14006,
+            "commit_id": "1ec2554c8e85563ca11fe98e5e1a5b8f529de3f3",
+            "original_commit_id": "95fc3cd424a1d05b818be435abf1510c06dd7a87",
+            "path": "crates/tauri/src/state.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "This just makes it confusing, let's remove and use `Arc` directly"
+            ]
+        }
+    ]
+}

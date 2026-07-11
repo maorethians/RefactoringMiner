@@ -1,0 +1,67 @@
+{
+    "repo": "astral-sh/uv",
+    "pr_number": 9365,
+    "lang": "rust",
+    "pr_title": "Surface extras and group conflicts in `uv export`",
+    "pr_body": "## Summary\r\n\r\nCloses https://github.com/astral-sh/uv/issues/9364.\r\n",
+    "pr_comments": [
+        "I'm actually not sure `uv export` can support conflicting groups at all. Or at least, not all cases and not to `requirements.txt`. Because with my ongoing work to fix #9289, some cases can generate ambiguous dependencies. And since PEP 508 markers aren't expressive enough to capture the conditional logic required to disambiguate them, exporting to a flat format like `requirements.txt` that only supports PEP 508 markers could result in a set of requirements where there are multiple versions of the same package.",
+        "Isn't this right, then? We only export a specific set of enabled groups and extras, and this PR ensures that they're all compatible.",
+        "(`uv export` doesn't attempt to export all groups and extras; it exports a specific set of groups and extras.)"
+    ],
+    "merged": true,
+    "created_at": "2024-11-22T20:06:41Z",
+    "issue_context": {
+        "number": 9289,
+        "title": "Multiple conflicting extras installed when using explicit index assignments",
+        "body": "When conflicting extra groups share a dependant, both extra groups seem to be installed.\r\n\r\nConsider the following example adapted from the [docs](https://docs.astral.sh/uv/guides/integration/pytorch/#configuring-accelerators-with-optional-dependencies):\r\n```pyproject.toml\r\n[project]\r\nname = \"project\"\r\nversion = \"0.1.0\"\r\nrequires-python = \">=3.11,<3.12\"\r\ndependencies = []\r\n\r\n[project.optional-dependencies]\r\ncpu = [\r\n  \"torch>=2.5.1\",\r\n  \"torchvision>=0.20.1\",\r\n]\r\ncu124 = [\r\n  \"torch>=2.5.1\",\r\n  \"torchvision>=0.20.1\",\r\n]\r\nmetrics = [\r\n  \"torchmetrics>=1.2.0\",\r\n]\r\n\r\n[tool.uv]\r\nconflicts = [\r\n  [\r\n    { extra = \"cpu\" },\r\n    { extra = \"cu124\" },\r\n  ],\r\n]\r\n\r\n[tool.uv.sources]\r\ntorch = [\r\n  { index = \"pytorch-cpu\", extra = \"cpu\", marker = \"platform_system != 'Darwin'\" },\r\n  { index = \"pytorch-cu124\", extra = \"cu124\" },\r\n]\r\ntorchvision = [\r\n  { index = \"pytorch-cpu\", extra = \"cpu\", marker = \"platform_system != 'Darwin'\" },\r\n  { index = \"pytorch-cu124\", extra = \"cu124\" },\r\n]\r\n\r\n[[tool.uv.index]]\r\nname = \"pytorch-cpu\"\r\nurl = \"https://download.pytorch.org/whl/cpu\"\r\nexplicit = true\r\n\r\n[[tool.uv.index]]\r\nname = \"pytorch-cu124\"\r\nurl = \"https://download.pytorch.org/whl/cu124\"\r\nexplicit = true\r\n```\r\n\r\nThe key difference is the additional extra `metrics` that includes the `torchmetrics` package that depends on `torch`.\r\n\r\nWhen I lock and sync both cpu and metrics extras, I get multiple versions of torch installed:\r\n```bash\r\n$ uv sync --extra cpu --extra metrics\r\nResolved 34 packages in 1ms\r\nUninstalled 3 packages in 199ms\r\nInstalled 3 packages in 1.10s\r\n ~ torch==2.5.1\r\n ~ torch==2.5.1+cpu\r\n ~ torch==2.5.1+cu124\r\n```",
+        "comments": [
+            "Interesting, thanks. I don't think the extra indexes are relevant, since you can reproduce with:\r\n\r\n```toml\r\n[project]\r\nname = \"project\"\r\nversion = \"0.1.0\"\r\nrequires-python = \">=3.11,<3.12\"\r\ndependencies = []\r\n\r\n[project.optional-dependencies]\r\nfoo = [\r\n  \"idna==3.10\",\r\n]\r\nbar = [\r\n  \"idna==3.9\",\r\n]\r\nbaz = [\r\n  \"anyio\",\r\n]\r\n\r\n[tool.uv]\r\nconflicts = [\r\n  [\r\n    { extra = \"foo\" },\r\n    { extra = \"bar\" },\r\n  ],\r\n]\r\n```\r\n\r\nFrom there, `uv tree` gives you:\r\n\r\n```\r\nproject v0.1.0\r\n\u251c\u2500\u2500 idna v3.9 (extra: bar)\r\n\u251c\u2500\u2500 anyio v4.6.2.post1 (extra: baz)\r\n\u2502   \u251c\u2500\u2500 idna v3.9\r\n\u2502   \u251c\u2500\u2500 idna v3.10\r\n\u2502   \u2514\u2500\u2500 sniffio v1.3.1\r\n\u2514\u2500\u2500 idna v3.10 (extra: foo)\r\n```",
+            "Thanks. It also happens if the two conflicting extra groups share the common dependant:\r\n```pyproject.toml\r\n[project]\r\nname = \"project\"\r\nversion = \"0.1.0\"\r\nrequires-python = \">=3.11,<3.12\"\r\ndependencies = []\r\n\r\n[project.optional-dependencies]\r\nfoo = [\r\n  \"idna==3.10\",\r\n  \"anyio\",\r\n]\r\nbar = [\r\n  \"idna==3.9\",\r\n  \"anyio\",\r\n]\r\n\r\n[tool.uv]\r\nconflicts = [\r\n  [\r\n    { extra = \"foo\" },\r\n    { extra = \"bar\" },\r\n  ],\r\n]\r\n```",
+            "I think i see a path to fixing this. I think it has two components:\r\n\r\n* In `ResolverOutput::from_state` (and possibly also `marker_reachability`), generate `extra = \"...\"` markers from each `Resolution`'s conflicting groups, if they have them. Then apply those markers via intersection to each of the edges in that `Resolution`. So in Charlie's example above, that means the `idna==3.9` dependency would have a `extra == \"bar\"` marker and the `idna==3.10` dependency would have a `extra == \"foo\" or extra == \"baz\"` marker. Or something similar.\r\n* Update `InstallTarget::to_resolution` in `uv-resolver/lock` to pass in extras when doing marker evaluation.\r\n\r\nOne hiccup here is that this doesn't take groups into account, so we might not be able to reuse markers for this. We'll instead need an additional field to encode this extra/group inclusion logic.",
+            "Working it out by hand, I think the conditional logic for each idna dependency in each of the three forks present in this example is:\r\n\r\n```\r\n idna==3.9: extra != \"foo\" and (extra == \"bar\" or extra == \"baz\")\r\nidna==3.10: extra != \"bar\" and (extra == \"foo\" or extra == \"baz\")\r\nidna==3.10: (extra != \"foo\" and extra != \"bar\") and extra == \"baz\"\r\n```\r\n\r\nWhich combines to:\r\n\r\n```\r\n idna==3.9: extra != \"foo\" and (extra == \"bar\" or extra == \"baz\")\r\nidna==3.10: (extra != \"bar\" and (extra == \"foo\" or extra == \"baz\"))\r\n            or ((extra != \"foo\" and extra != \"bar\") and extra == \"baz\")\r\n```\r\n\r\nAnd simplifies to:\r\n\r\n```\r\n idna==3.9: extra != \"foo\" and (extra == \"bar\" or extra == \"baz\")\r\nidna==3.10: (extra != \"bar\" and extra == \"baz\") or (extra != \"bar\" and extra == \"foo\")\r\n```\r\n\r\nNote that because of how extras work, the above notation is quite misleading. It's more clearly written like this:\r\n\r\n```\r\n idna==3.9: \"foo\" not in extras and (\"bar\" in extras or \"baz\" in extras)\r\nidna==3.10: (\"bar\" not in extras and \"baz\" in extras) or (\"bar\" not in extras and \"foo\" in extras)\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 49168,
+            "commit_id": "79e9f182ab03bbf57bf59c27f2e1075ff1775bc6",
+            "original_commit_id": "536d038f9b70915899286437a9918b70c7475831",
+            "path": "crates/uv/tests/it/lock.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2364,
+            "original_line": 2364,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "I know this isn't from this pull request, but can we call these extras something other than `project`, e.g., `extra1` and `extra2`, for clarity? I changed these in the documentation but didn't realize there were tests with the same cases.",
+                "Yeah sure.",
+                "Per other PR, I'll do this in a dedicated change, since a lot of other tests do this too."
+            ]
+        },
+        {
+            "hunk_id": 49381,
+            "commit_id": "79e9f182ab03bbf57bf59c27f2e1075ff1775bc6",
+            "original_commit_id": "536d038f9b70915899286437a9918b70c7475831",
+            "path": "crates/uv/tests/it/lock.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2364,
+            "original_line": 2364,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "I know this isn't from this pull request, but can we call these extras something other than `project`, e.g., `extra1` and `extra2`, for clarity? I changed these in the documentation but didn't realize there were tests with the same cases.",
+                "Yeah sure.",
+                "Per other PR, I'll do this in a dedicated change, since a lot of other tests do this too."
+            ]
+        }
+    ]
+}

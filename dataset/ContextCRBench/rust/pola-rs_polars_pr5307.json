@@ -1,0 +1,92 @@
+{
+    "repo": "pola-rs/polars",
+    "pr_number": 5307,
+    "lang": "rust",
+    "pr_title": "fix(rust,python): Add ability to read csv columns as `Int8`, `Int16`, `UInt8`, `UInt16`",
+    "pr_body": "Fixes #5214 \r\n\r\nFor some reason, I had to bump `clap` from `3.2.22` to `4.0.18` in order to build; not sure why this is the case but it's included with this PR only because I was forced down this route.",
+    "pr_comments": [
+        "Hm, I seem to have somehow mixed-and matched things while compiling locally and didn't see the errors. Apologies; I'll leave this PR open and fix the mistakes.",
+        "I don't want the extra code bloat for this. We need to parse with existing types and downcast later.",
+        "> I don't want the extra code bloat for this. We need to parse with existing types and downcast later.\r\n\r\nI get what you're saying, but how do you see that being implemented? Some sort of filter/option that is passed to/applied after the creation of the `Buffer`? Also, related to the existing solution, I'm struggling to understand how the trait bounds are not satisfied for `Buffer::Int8(v) => v.finish().into_series()` etc. Any insights as to why this error is being produced?\r\n\r\nEDIT\r\nReally silly handling of the extra types for `.into_series()` working, I cannot work out why simply doing:\r\n\r\n```rust\r\nimpl<'a> Buffer<'a> {\r\n    pub(crate) fn into_series(self) -> PolarsResult<Series> {\r\n        let s = match self {\r\n            Buffer::Int8(v) => v.finish().into_series(),\r\n<snip>\r\n```\r\n\r\nleads to:\r\n```\r\n  594:43  error   the method `into_series` exists for struct `ChunkedArray<polars_core::datatypes::Int8Type>`, but its trait bounds were not satisfied \u200brustc:\r\n                  the following trait bounds were not satisfied:\r\n                  `implementations::SeriesWrap<ChunkedArray<polars_core::datatypes::Int8Type>>: polars_core::prelude::SeriesTrait`\r\n                  which is required by `ChunkedArray<polars_core::datatypes::Int8Type>: polars_core::prelude::IntoSeries`\r\n```\r\n\r\nIn other words, I am struggling with the code to work out what the trait bounds are--I would really like to understand this problem better; any insights would be greatly appreciated!\r\n\r\nThat aside, I know you don't want to add these additional handlers into `Buffer` directly, but I couldn't see a \"good\" path do do this via casting in (I'm assuming) a reader like you have done here:\r\n\r\n```rust\r\n    /// Read the file and create the DataFrame.\r\n    fn finish(mut self) -> PolarsResult<DataFrame> {\r\n        let rechunk = self.rechunk;\r\n        let schema_overwrite = self.schema_overwrite;\r\n        let dtype_overwrite = self.dtype_overwrite;\r\n        let should_parse_dates = self.parse_dates;\r\n        let low_memory = self.low_memory;\r\n\r\n        #[cfg(feature = \"dtype-categorical\")]\r\n<snip>\r\n```\r\n\r\nIs this the kind of thing you had in mind? Perhaps a `feature = \"small-dtype\"` configuration?",
+        "As well, not sure if this is a separate issue or a side-effect of the (undesired) implementation so only putting this here as a comment for now. It would seem the dtypes are not maintained anyway, making this a potentially futile exercise. For example:\r\n\r\n```python\r\nimport io\r\nimport polars as pl\r\n\r\ndata = \"\"\"a,b,c\r\n1,2,127\r\n,,\r\n3,-9,127\"\"\"\r\n\r\nf = io.BytesIO()\r\nf.write(data.encode(\"utf-8\"))\r\nf.seek(0)\r\n(\r\n    pl.read_csv(\r\n        f,\r\n        has_header=True,\r\n        dtypes=[pl.UInt8, pl.Int16, pl.Int8],\r\n    )\r\n    .sum()\r\n)\r\n```\r\ngives\r\n```\r\nshape: (1, 3)\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502 a   \u2506 b   \u2506 c   \u2502\r\n\u2502 --- \u2506 --- \u2506 --- \u2502\r\n\u2502 i64 \u2506 i64 \u2506 i64 \u2502\r\n\u255e\u2550\u2550\u2550\u2550\u2550\u256a\u2550\u2550\u2550\u2550\u2550\u256a\u2550\u2550\u2550\u2550\u2550\u2561\r\n\u2502 4   \u2506 -7  \u2506 254 \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2518\r\n```\r\nwhich kind of defeats the purpose I would think.",
+        "> I don't want the extra code bloat for this. We need to parse with existing types and downcast later.\r\n\r\nContinuing on what I said earlier. We need to downcast later and use the parsers that are already in place. You can use the `to_cast` information for that.\r\n\r\nHere is the snippet that prepares `to_cast` https://github.com/pola-rs/polars/blob/33da4a85871216e39f708e7210fc8fea9c674e0f/polars/polars-io/src/csv/read.rs#L367.\r\n",
+        "@DeliciousHair, I think you are on the right path. I have left a few comments.",
+        "@ritchie46 Apologies for leaving this for so long, the 9-5 has been taking up a lot more than that the past few weeks. Trying to fix this up now though and I'm having some problems regarding the ownership of `reader_bytes` that has me just going in circles; hoping there is a more skilled person around that may be able to lend a hand.\r\n\r\nBasic version of attempted solution is:\r\n\r\n```rust\r\nlet reader_bytes = get_reader_bytes(&mut self.reader)?;\r\n...\r\nlet (schema, to_cast, _has_cat) = self.prepare_schema_overwrite(&schema);\r\n...\r\nlet mut csv_reader = self.core_reader(\r\n    Some(&schema),\r\n    to_cast,\r\n    Some(reader_bytes)\r\n)?;\r\n```\r\n\r\nthis doesn't work, as expected:\r\n```shell\r\nerror[E0502]: cannot borrow `self` as immutable because it is also borrowed as mutable\r\n   --> polars/polars-io/src/csv/read.rs:552:51\r\n    |\r\n528 |                 let reader_bytes = get_reader_bytes(&mut self.reader)?;\r\n    |                                                     ---------------- mutable borrow occurs here\r\n...\r\n552 |                 let (schema, to_cast, _has_cat) = self.prepare_schema_overwrite(&schema);\r\n    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ immutable borrow occurs here\r\n...\r\n568 |                     Some(reader_bytes)\r\n    |                          ------------ mutable borrow later used here\r\n\r\nerror[E0499]: cannot borrow `self` as mutable more than once at a time\r\n   --> polars/polars-io/src/csv/read.rs:565:38\r\n    |\r\n528 |                   let reader_bytes = get_reader_bytes(&mut self.reader)?;\r\n    |                                                       ---------------- first mutable borrow occurs here\r\n...\r\n565 |                   let mut csv_reader = self.core_reader(\r\n    |  ______________________________________^\r\n566 | |                     Some(&schema),\r\n567 | |                     to_cast,\r\n568 | |                     Some(reader_bytes)\r\n    | |                          ------------ first borrow later used here\r\n569 | |                 )?;\r\n    | |_________________^ second mutable borrow occurs here\r\n```\r\n\r\nThe \"obvious\" solution (to my amateur thinking anyway) is to deref `reader_bytes`, but that doesn't seem to work. This compiles:\r\n```rust\r\nlet reader_bytes = {\r\n    let rb = get_reader_bytes(&mut self.reader)?;\r\n    ReaderBytes::Owned(rb.deref().to_vec())\r\n};\r\n```\r\nbut then leads to other problems at run-time of the form:\r\n```shell\r\nError: InvalidOperation(Owned(\"Cannot create polars series from Int8 type\"))\r\n```\r\n\r\nAny pointers? I'm rather stuck.",
+        "I am closing this as the PR has not been updated in a while. Also, I believe we have this functionality now in the `dtypes` parameter for `read_csv`."
+    ],
+    "merged": false,
+    "created_at": "2022-11-02T08:05:06Z",
+    "issue_context": {
+        "number": 5214,
+        "title": "pl.read_csv() does not recognize U/Int8, U/Int16 dtypes",
+        "body": "### Polars version checks\r\n\r\n- [X] I have checked that this issue has not already been reported.\r\n\r\n- [X] I have confirmed this bug exists on the [latest version](https://pypi.org/project/polars/) of Polars.\r\n\r\n\r\n### Issue description\r\n\r\nWhen providing 1- and 2-byte integer dtypes to `pl.read_csv()`, a `ComputeError` is raised.\r\n\r\n### Reproducible example\r\n\r\n```python\r\nimport polars as pl\r\nfrom io import BytesIO\r\n\r\nfor dtype in [pl.UInt8, pl.Int8, pl.UInt16, pl.Int16, pl.UInt32, pl.Int32,  pl.UInt64, pl.Int64]:\r\n    buffer = BytesIO()\r\n    pl.DataFrame({'a': pl.Series([1, 2, 3, 4, 5], dtype=dtype)}).write_csv(buffer)\r\n\r\n    try:\r\n        pl.read_csv(buffer, dtypes=[dtype])\r\n    except Exception as e:\r\n        print(e)\r\n\r\n    output.close()\r\n```\r\n```\r\nUnsupported data type UInt8 when reading a csv\r\nUnsupported data type Int8 when reading a csv\r\nUnsupported data type UInt16 when reading a csv\r\nUnsupported data type Int16 when reading a csv\r\n```\r\n\r\n### Expected behavior\r\n\r\nNo output\r\n\r\n### Installed versions\r\n\r\n<details>\r\n\r\n```\r\n---Version info---\r\nPolars: 0.14.18\r\nIndex type: UInt32\r\nPlatform: Windows-10-10.0.19044-SP0\r\nPython: 3.9.5 (tags/v3.9.5:0a7dcbd, May  3 2021, 17:27:52) [MSC v.1928 64 bit (AMD64)]\r\n---Optional dependencies---\r\npyarrow: 8.0.0\r\npandas: 1.4.3\r\nnumpy: 1.23.1\r\nfsspec: <not installed>\r\nconnectorx: 0.3.0\r\nxlsx2csv: 0.8\r\nmatplotlib: 3.6.1\r\n```\r\n\r\n</details>\r\n",
+        "comments": [
+            "Was there an hack to fix the issue in the Python API? It's odd to me that the Python API `read_csv` does support U/Int8 and U/Int16 types now. However, the Rust API `CsvReader::with_dtypes` does NOT support U/Int8, U/Int16 types. ",
+            "Did you activate the dtype features?",
+            "@ritchie46,\r\n\r\nYou were right! Including the `dtype-full` feature made it work. ",
+            "While `read_csv` now supports reading 1 & 2-byte integers, both `read_csv_batched` and `scan_csv` report that it is not supported: `Unsupported data type Int8 when reading a csv`\r\nScanning as 4-byte integers and downcasting before a `collect()` uses significantly more memory (e.g. for large arrays of genoytpes). Workaround for now is to use `read_csv_batched` in smaller chunks.",
+            "> While `read_csv` now supports reading 1 & 2-byte integers, both `read_csv_batched` and `scan_csv` report that it is not supported: `Unsupported data type Int8 when reading a csv` Scanning as 4-byte integers and downcasting before a `collect()` uses significantly more memory (e.g. for large arrays of genoytpes). Workaround for now is to use `read_csv_batched` in smaller chunks.\r\n\r\nThe problem is that `LazyCsvReader::with_dtype_overwrite` does not support these datatypes, while `CsvReader::with_dtypes` does.",
+            "Closed via #7290."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 52874,
+            "commit_id": "ec68e4f0fd7e789bcbec91b8f8acc70d8e46ce2a",
+            "original_commit_id": "a4e87b9c0445d6bd26447c49fb4fc531884aa478",
+            "path": "polars/polars-io/src/csv/read.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 386,
+            "original_line": 386,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do these need to be cast? We have have native support for these.",
+                "I may have altered something via the match arms, but what seems to be happening is that if either of `self.schema_overwrite` or `self.dtype_overwrite` are set, then `self.prepare_schema_overwrite(schema)` is used which, in turn, uses the casting. Without this (superfluous) cast in here, I couldn't seem to get the buffer to read the dtype as specified. I'll look again though."
+            ]
+        },
+        {
+            "hunk_id": 52875,
+            "commit_id": "ec68e4f0fd7e789bcbec91b8f8acc70d8e46ce2a",
+            "original_commit_id": "a4e87b9c0445d6bd26447c49fb4fc531884aa478",
+            "path": "polars/polars-io/src/csv/read.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 519,
+            "original_line": 519,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 36,
+            "subject_type": "line",
+            "review_comments": [
+                "This means we call this one twice on a csv read. This can be a full disk read in the case of compressed csv's so if we call this we should keep the reader_bytes and initialize the core reader with it.",
+                "Yup, and I agree that this is far from a decent approach. I did not want to get too into the weeds with the whole header-parsing logic though as that seemed well beyond my current skill level in terms of code I would be touching for this small problem. I would very much welcome some suggestions regarding how to actually remove this (silly) two-step solution.",
+                "I think we should could add an `optional` reader_bytes argument to the core reader.\r\n\r\nThen you pass the reader_bytes you just created and then let the core reader continue doing its work."
+            ]
+        },
+        {
+            "hunk_id": 52873,
+            "commit_id": "ec68e4f0fd7e789bcbec91b8f8acc70d8e46ce2a",
+            "original_commit_id": "a4e87b9c0445d6bd26447c49fb4fc531884aa478",
+            "path": "polars/polars-io/src/csv/buffer.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 31,
+            "original_line": 31,
+            "side": "RIGHT",
+            "original_position": 3,
+            "position": 3,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you remove these changes from git? I would not expect any changes in `buffer.rs` for this fix.",
+                "Oops, my bad!"
+            ]
+        }
+    ]
+}

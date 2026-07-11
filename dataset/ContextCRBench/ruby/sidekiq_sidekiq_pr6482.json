@@ -1,0 +1,49 @@
+{
+    "repo": "sidekiq/sidekiq",
+    "pr_number": 6482,
+    "lang": "ruby",
+    "pr_title": "Rewrite retry_all and kill_all APIs to use ZPOPMIN ",
+    "pr_body": "Instead of a paginated cursor, fixes #6481.",
+    "pr_comments": [
+        "DeadSet#retry_all:\r\n\r\n|    |     Size      |  Time |\r\n|----------|:-------------:|------:|\r\n| Old |  100,000 | 10.75 |\r\n| New |    100,000  |  7.93 |\r\n\r\nNew implementation appears to be roughly 30% faster.",
+        "RetrySet#kill_all is even faster: Old 7.99, New 4.31.\r\n\r\nI suspect some of the speedup is because I default the new implementation to disable error notifications. If we're killing 50,000 jobs it's probably a bad idea to send 50,000 notifications to the error service."
+    ],
+    "merged": true,
+    "created_at": "2024-10-30T18:00:32Z",
+    "issue_context": {
+        "number": 6481,
+        "title": "Dead queue stuck in retry loop after hitting \"Retry All\"",
+        "body": "Ruby version: 3.2.5\r\nRails version: 7.1.4.1\r\nSidekiq / Pro / Enterprise version(s): sidekiq-pro 5.5.8\r\n\r\nDead queue sometimes gets stuck in a retry loop after hitting \"Retry All\" from the Dead page on Sidekiq UI. The dead jobs are enqueued & run, end up in the dead queue, then enqueued again on repeat.\r\n\r\nI believe this is because [retry_all](https://github.com/sidekiq/sidekiq/blob/main/lib/sidekiq/api.rb#L843-L847) loops while the [size of the dead queue](https://github.com/sidekiq/sidekiq/blob/main/lib/sidekiq/api.rb#L620-L623) is > 0. This means that the initial jobs running could fail and go back to the dead queue before the later jobs get run.\r\n\r\nReproducing on Rails console:\r\n```\r\n> dead_set = Sidekiq::DeadSet.new\r\n=> #<Sidekiq::DeadSet:0x00007fb0edb85330 @_size=51, @name=\"dead\">\r\n> while dead_set.size > 0\r\n     dead_set.each do |job|\r\n       job.retry\r\n     end\r\n     print \".\"\r\n   end\r\n...........=> nil\r\n```\r\n",
+        "comments": [
+            "Brainstorming here...\r\n\r\nSince the score of any new entries to the Dead set should be strictly larger than any existing score, we should be able to add logic like \"break after enqueuing N elements\" where N is the size at the start of the loop, instead of looping until size = 0.\r\n\r\nPRs welcome, I'm working on Faktory right now.",
+            "Aren\u2019t we already looping through each job and calling retry? Why can\u2019t we just get rid of the size > 0 check?\r\n\r\nI\u2019m assuming it\u2019s because we want to capture any incoming dead jobs as well, which I suppose begs the question of whether \u201cRetry All\u201d should retry what\u2019s on the page or what\u2019s in the Redis dead queue.",
+            "We're mutating a data structure while simultaneously iterating through it. Lots of room for data races and footguns here.\r\n\r\nSince this is a relatively straightforward thing to test, I think we should create an integration test which exercises this case so we can test and verify the current semantics. There should be something close to that already in `test/api_test.rb`.",
+            "The size check is because iterating while mutating is unpredictable. If we remove an element, all other elements shift their index so we can't effectively use a cursor.\r\n\r\nWe could iterate backwards from the \"tail\" of the structure and use indexes to remove the tail element. That will only fail if another entry is pushed into the middle of the structure: unlikely for the dead set but quite common for the scheduled set.\r\n\r\nI just tested and verified that using `each` breaks (retrying each job causes 500 out of 1000 jobs to be retried) but using `reverse_each` works exactly as expected. Unfortunately reverse_each loads the entire dataset into memory first. \ud83d\ude2d No easy solution yet.",
+            "I would suggest the easiest and best long-term choice is to rewrite these APIs to use ZPOPMIN[0], which we couldn't use until Sidekiq 7.0. Popping one entry at a time effectively rate limits the enqueue process and minimizes any data loss if the network happens to drop right at that instant.\r\n\r\n[0]: https://redis.io/docs/latest/commands/zpopmin/",
+            "Let me know if you have any feedback RE: this PR. ^^^^^^^^^^^",
+            "Thanks for looking at this, Mike. We're in the process right now of upgrading to Sidekiq 7. Until we're done with our migration, would you find monkey-patching the Sidekiq::JobSet#each method to be acceptable using the first method you described - breaking after enqueueing N elements?\r\n\r\n```\r\ndef each\r\n      initial_size = @_size\r\n      offset_size = 0\r\n      page = -1\r\n      page_size = 50\r\n      \r\n      processed = 0 # NEW\r\n\r\n      loop do\r\n        range_start = page * page_size + offset_size\r\n        range_end = range_start + page_size - 1\r\n        elements = Sidekiq.redis { |conn|\r\n          conn.zrange name, range_start, range_end, \"withscores\"\r\n        }\r\n        break if elements.empty? && processed >= initial_size # NEW\r\n        processed += elements.size # NEW\r\n        page -= 1\r\n        elements.reverse_each do |element, score|\r\n          yield SortedEntry.new(self, score, element)\r\n        end\r\n        offset_size = initial_size - @_size\r\n      end\r\n    end\r\n```\r\n\r\n",
+            "As long as @_size is current, I think that's reasonable."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 64916,
+            "commit_id": "4bf6255a694b9af3e4dcf1a0367e8d43ac286b99",
+            "original_commit_id": "626b4bfbdf9c68889697353cffd9b2d12f9912af",
+            "path": "lib/sidekiq/api.rb",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 686,
+            "original_line": 686,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm puzzled, is this not decrementing from the counter for a manual retry?",
+                "Any retry triggered from the API is considered a manual retry. It should not increment `retry_count`; we decrement to make the increment in JobRetry a no-op."
+            ]
+        }
+    ]
+}

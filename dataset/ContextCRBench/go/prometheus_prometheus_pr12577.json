@@ -1,0 +1,51 @@
+{
+    "repo": "prometheus/prometheus",
+    "pr_number": 12577,
+    "lang": "go",
+    "pr_title": "histograms: Fix parsing of float histograms without zero bucket",
+    "pr_body": "Fixes #12305",
+    "pr_comments": [
+        "@zenador & @krajorama , this should be an easy review (especially given that @krajorama has done a protobuf parser review recently). Could you have a look?\r\n\r\nSee the bug and the individual commit description for the full context."
+    ],
+    "merged": true,
+    "created_at": "2023-07-19T12:43:57Z",
+    "issue_context": {
+        "number": 12305,
+        "title": "Native histogram federation not working",
+        "body": "### What did you do?\n\nI've added native histograms to some code of mine. The code is running on 40 servers, each one is running a prometheus instance which is scraped by a master server. \"--enable-feature\" native-histograms is enabled on all instances.\r\n\r\nOn each instance, I can see the values of the native histogram being properly ingested by prometheus. However on the master instance I can only see the values ingested locally, the entire series are missing for all servers being scraped. All other series from these servers is present.\n\n### What did you expect to see?\n\nFull time series from all servers being scrapped.\n\n### What did you see instead? Under which circumstances?\n\nOnly locally ingested data present.\n\n### System information\n\nLinux 6.1.12-zen1+ #19 ZEN SMP PREEMPT Wed Mar 15 19:32:47 CET 2023 x86_64 x86_64 x86_64 GNU/Linux\n\n### Prometheus version\n\n```text\nprometheus, version 2.44.0-rc.0 (branch: HEAD, revision: d70688038e5d444ab8beac53722df15d244038e4)\r\n  build user:       root@c3e52c6dd464\r\n  build date:       20230426-09:46:54\r\n  go version:       go1.20.3\r\n  platform:         linux/amd64\r\n  tags:             netgo,builtinassets,stringlabels\n```\n\n\n### Prometheus configuration file\n\n```yaml\nThis is from the master server. As mentioned, each target node does have the data available, so I assume the problem is not on their side. \r\n\r\n  - job_name: 'federate'\r\n    scrape_interval: 15s\r\n\r\n    honor_labels: true\r\n    metrics_path: '/federate'\r\n\r\n    params:\r\n      'match[]':\r\n        - '{job=~\".*\"}'\r\n\r\n    static_configs:\r\n      - targets:\r\n        [...]\n```\n\n\n### Alertmanager version\n\n_No response_\n\n### Alertmanager configuration file\n\n_No response_\n\n### Logs\n\n_No response_",
+        "comments": [
+            "Two more observations:\r\n\r\n- I turned on debug logging, but it showed nothing of interest, barely anything at all.\r\n- I deleted the TSDB on all servers, including the master, and restarted prometheus as well as my own program. Did not change anything.",
+            "I tried to reproduce the bug with a minimal setup. But everything seems to work fine.\r\n\r\nCan you double-checked that your master server also runs with `--enable-feature=native-histograms`?\r\n\r\n~~I would also suspect that the query you use for the federate endpoint (`'{job=~\".*\"}'`) doesn't work. It violates the \"vector selector must contain at least one non-empty matcher\" thing.~~ (I tried it out, it (weirdly) works.)",
+            "Thanks for your response. Just double-checked:\r\n\r\n$ ps ax|grep prometheus\r\n2704193 ?        Ssl  284:04 /usr/bin/prometheus --storage.tsdb.retention.time 7d --config.file /etc/prometheus/prometheus.yml --storage.tsdb.path /var/lib/prometheus/metrics2/ --enable-feature native-histograms\r\n\r\nI can also see it being enabled in the prometheus Web UI.\r\n\r\nNot sure where to continue looking. All seems fine, the web UI on each server shows the time series being ingested, it just doesn't arrive on the master. The locally scraped one does however.\r\n\r\nRegarding the query, that is a relict of when I installed prometheus two years ago and didn't really understand too much of how it works. I never had a reason to change it afterwards as so far things have been running smoothly.",
+            "Can you minimize your setup until everything works and then gradually add more things to see when it precisely breaks?\r\n\r\nMy (working) setup is the following:\r\n\r\n- I run the example target from client_golang ( https://github.com/prometheus/client_golang/blob/main/examples/random/main.go ).\r\n\r\n- This is the scrape config on the directly scraping Prometheus:\r\n\r\n```\r\nscrape_configs:\r\n  - job_name: 'demo'\r\n    static_configs:\r\n      - targets:\r\n        - localhost:8080\r\n```\r\n\r\n- This is the scrape config on the federating Prometheus (note that it is not scraping anything else!):\r\n\r\n```\r\nscrape_configs:\r\n  - job_name: 'federation'\r\n    honor_labels: true\r\n    metrics_path: /federate\r\n    params:\r\n      'match[]':\r\n        - '{job=\"demo\"}'\r\n    static_configs:\r\n      - targets:\r\n        - localhost:9090\r\n```\r\n\r\nThe native histogram is called `rpc_durations_histogram_seconds`. It arrives at both Prometheus servers.",
+            "I will try, thanks.\r\n\r\nJust one more note in case it matters, all series are being relabeled, specifically they have the server name and the program instance (their are multiple running in parallel) added as labels. This happens on both the master and the worker nodes for the locally running instances while ingesting the data.",
+            "I'd definitely try to remove all those extra things to see if federation works in a vanilla configuration. Maybe your relabeling creates some duplicates or something?\r\n",
+            "@kaber2 has any now evidence come up? I'll close this for now as I still cannot reproduce the issue. Feel free to follow up with any updates.",
+            "My apology for the delay. It appears the reason is the use of NativeHistogramZeroThreshold: prometheus.NativeHistogramZeroThresholdZero in my histograms. Without it, they are federated properly.\r\n\r\nLet me dig down a bit more and verify.",
+            "Ok I've confirmed that this is the cause, simply removing it without any further changes makes it work properly",
+            "OK, that's a smoking gun then. So native histograms with a zero threshold of zero aren't federated properly. I'll need to look into that. Thank you very much.",
+            "OK, I found the issue. Federation uses results coming from the PromQL engine. Native Histograms are always treated as float histograms in PromQL. So federation will expose float histograms. The parser identifies a native histogram by the presence of a populated zero bucket or a non-zero zero threshold or by the existence of integer buckets, but it doesn't check float buckets.\r\n\r\nIn your case, the federation produces a native histogram with a zero threshold of zero, nothing in the zero bucket, and only float buckets. That case is very rare in the usual instrumentation, and that's the reason why we haven't run into it.\r\n\r\nhttps://github.com/prometheus/prometheus/pull/12577 adds tests and fixes the issue.\r\n\r\nThanks again for the precise report that helped hunting down a bug that would have affected many other use cases, too."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 49985,
+            "commit_id": "071f4bbea44c0cc37358573a181f616dbeeede2c",
+            "original_commit_id": "f44915e56bbd0b7e6d68d9512060f83f99c17565",
+            "path": "web/federate_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 372,
+            "original_line": 372,
+            "side": "RIGHT",
+            "original_position": 40,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "I noticed @codesome 's comment bellow, does PromQL return the header now? At least for Gauges? Could we add a test case?",
+                "Yes, we should address this TODO eventually. But out of scope for this PR. (Once we are out of the woods with the many histogram tasks, I'll definitely scan all the remaining TODOs for clean up.)"
+            ]
+        }
+    ]
+}

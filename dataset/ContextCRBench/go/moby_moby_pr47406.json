@@ -1,0 +1,305 @@
+{
+    "repo": "moby/moby",
+    "pr_number": 47406,
+    "lang": "go",
+    "pr_title": "Allocate IPv6 addresses after detecting IPv6 support",
+    "pr_body": "**- What I did**\r\n\r\nIf IPv6 is disabled for a container, do not allocate an IPv6 address when it's attached to an IPv6 network.\r\n\r\n- Fix https://github.com/moby/moby/issues/47055\r\n\r\n**- How I did it**\r\n\r\nThere are a few commits - it's probably easiest to review them separately ...\r\n\r\n_**Unconditionally update container.NetworkSettings**_\r\n\r\n In `daemon.allocateNetwork()`, flag `updateSettings` was set if `container.NetworkSettings.Networks` was empty. That flag was passed down through the call stack to avoid a call to `daemon.updateNetworkSettings()` in `daemon.updateNetworkConfig()`.\r\n\r\nOther calls to `daemon.updateNetworkSettings()`, which happen when connecting an existing container to another network, unconditionally made the NetworkSettings update.\r\n\r\nI don't think there's a circumstance where NetworkSettings is not empty during container creation. Even if there is, the update is harmless and cheap. Eliminating the `updateSettings` flag simplifies the code a little and, in the next commit where `allocateNetwork()` is split out of `initializeNetworking()`, it avoids the need to pass that flag between the two.\r\n\r\n_**Separate Sandbox/Endpoint construction**_\r\n\r\nPreviously, the `libnetwork.Sandbox` was created in `daemon.allocateNetwork()` if there was no network - otherwise it happened while connecting an Endpoint in `daemon.connectToNetwork()`. If there was an endpoint in the default bridge, it had to be connected first, because extra configuration is needed in the Sandbox for legacy links and that could only happen during Sandbox construction.\r\n\r\nNow, config for legacy links is added to the Sandbox when constructing the Endpoint that needs it - removing the constraint on ordering of Endpoint construction, and the dependency between Endpoint and Sandbox construction.\r\n\r\nSo, now a Sandbox can be constructed in one place, before the first Endpoint.\r\n\r\nAlso, replaces some legacy-link specific Sandbox option-setters with Sandbox methods for updating `/etc/hosts`, and updates a legacy-link parent's IPv6 address as well as its IPv4 address when a child container restarts.\r\n\r\n_**Configure network endpoints after creating a container**_\r\n\r\nThis commit splits the bulk of `daemon.allocateNetwork()` out of `daemon.initializeNetworking()`.\r\n\r\n`daemon.initializeNetworking()` hasn't moved, but it now only prepares configuration and doesn't do any Endpoint construction or configuration. Sandbox construction still happens here.\r\n\r\nEndpoint construction is in `daemon.allocateNetwork()` which, on non-Windows, is called after the container task has been created (before it's started).\r\n\r\nOn Windows, Endpoint construction still happens before the container task is created. If it's created afterwards, some DNS lookups for the container don't seem to end up in our resolver - see the TODO comment in the code. (But, Windows can't benefit from the delayed assignment of IPv6 addresses anyway.)\r\n\r\nDoing the Endpoint construction after the `osSbox` has been set up makes it possible to probe the container's network for IPv6 support first - enabling the next commit ...\r\n\r\n_**Only assign IPv6 addresses if required**_\r\n\r\nIf a Sandbox is provided to `CreateEndpointForSandbox`, check whether it has IPv6 before allocating IPv6 addresses.\r\n\r\nBecause no IPv6 address is added to the DNS when the Sandbox doesn't support it, a lookup for a container on an IPv6 network can now have no IPv6 address. The resolver is updated to treat a missing IPv6 address on an IPv4 hit as `ipv6miss` even if the network has IPv6 enabled. (So, an empty DNS response is returned, avoiding the upstream DNS request and NXDOMAIN.)\r\n\r\nThe `macvlan` driver expected an endpoint on a network with IPv6 subnets to have an IPv6 address - it searched the subnets for the address assigned to the endpoint, to work out which gateway address to use (crashing if there was no address). Now, it only makes that search if there is an IPv6 address.\r\n\r\n**- How to verify it**\r\n\r\nExisting regression tests for the refactoring.\r\n\r\nNew integration test checks that a container with IPv6 disabled via `sysctl` on an IPv6 network has no IPv6 address.\r\n\r\n**- Description for the changelog**\r\n\r\nIf IPv6 is disabled for a container, do not allocate an IPv6 address when it's attached to an IPv6 network.",
+    "pr_comments": [
+        "I've un-merged CreateEndpoint/Endpoint.Join, so that the Sandbox can be configured for legacy links between the two.\r\n\r\nCreateEndpoint still needs to know whether to set up IPv6 addresses, so I've added CreateEndpointForSandbox that takes the Sandbox as a param. Once we get rid of legacy links perhaps we'll make it do the Join as well, but there's no need to do that as part of this change.\r\n\r\nMoving address assignment to Join would mean CreateEndpoint doesn't need to see the Sandbox, but it wouldn't help with legacy links ... Join would need a callback after allocating addresses, before doing the Join.\r\n\r\nThe final commit isn't intended to be merged in its current state, if we want to do it or something like it, the changes will need to be pushed down into the other commits - it's just an experiment/proposal for removing references to legacy-links from the libnetwork code, while making the Sandbox update for legacy links type safe.\r\n\r\n> I do not want libnetwork to have any specific knowledge of containers or the daemon. The default bridge network is a daemon concept. Legacy links are a containers concept: containers have legacy links; sandboxes do not. The legacy links daemon feature happens to be implemented in terms of a combination of Sandbox options, but libnetwork does not need to know that.\r\n\r\nThat sounds good. But, the Sandbox options to implement legacy links are very legacy-linky, not generic things that we'll want to leave behind for other purposes when we drop support for legacy links. For example ...\r\n\r\n```\r\n// OptionParentUpdate function returns an option setter for parent container\r\n// which needs to update the IP address for the linked container.\r\nfunc OptionParentUpdate(cid string, name, ip string) SandboxOption {\r\n```\r\n\r\nEven `libnetwork.OptionGeneric` is only used for legacy links, but because it's disguised it's harder to reason about and the structure of the options is more complicated than it needs to be.\r\n\r\nSo, I don't think removing references to legacy links gives us anything but obfuscation. But, I know there are strong feelings on the subject - so, can do something like the change in the final commit? Or, is there a better approach?",
+        "> CreateEndpoint still needs to know whether to set up IPv6 addresses, so I've added CreateEndpointForSandbox that takes the Sandbox as a param.\r\n\r\nPlease, please, **please** just make it the daemon's responsibility to pass `libnetwork.CreateOptionDisableIPv6()` to `CreateEndpoint`, same as the way you had it before I said anything. `func buildCreateEndpointOptions` already derives other endpoint-create options from the sandbox and everything. Keep in mind that I wanted the Endpoint's IPv6-ness to be determined _at Join time_ so that the Endpoint config could not get out of sync with the Sandbox. `CreateEndpointForSandbox` does not address that concern, _but superficially appears to do so_ because it takes a `*Sandbox` parameter.\r\n\r\n--------\r\n\r\n> But, the Sandbox options to implement legacy links are very legacy-linky, not generic things that we'll want to leave behind for other purposes when we drop support for legacy links.\r\n\r\nMost of the Sandbox options to implement legacy links are very `/etc/hosts`-y. `OptionExtraHost` adds an entry to the sandbox's `/etc/hosts` file. It could just as easily be implemented as a `(*Sandbox)` method. `OptionParentUpdate` adds/updates an entry in another sandbox's `/etc/hosts` file. The meat of the implementation, `func (*Sandbox) updateParentHosts`, only uses its receiver parameter for two things: to get the list of updates to apply, and to get the controller handle so it can look up the other sandboxes to apply the updates to. If provided with a `(*Sandbox)` method to update a host entry, the daemon could just as easily implement that behaviour itself! It's already enumerating all the sandbox IDs which need updating and the entries to update anyway.\r\n\r\n`OptionGeneric` is the only exception. The option data gets added to the data returned by `(*Sandbox).Labels()`, which in turn are passed into `(driverapi.Driver).Join` and `(driverapi.Driver).ProgramExternalConnectivity` because sandbox labels are endpoint driver options, obviously. (Sigh.) Oddly enough, the bridge driver respects the port binding and exposed ports options passed into `ProgramExternalConnectivity` but not `\"ParentEndpoints\"` or `\"ChildEndpoints\"`, despite the method reconfiguring parent/child link iptables rules.\r\n\r\n`func (*Sandbox) AddLegacyLinks` therefore does three different things. It updates the /etc/hosts files of the receiver sandbox, it updates the /etc/hosts files of other sandboxes as specified by the `OptionParentUpdate` args, and it also updates the sandbox labels. The method call doesn't actually _do_ anything with the updated sandbox labels, however. Three distinct things should be three distinct functions.\r\n\r\n```go\r\n// strawman:\r\n\r\nfunc (*Sandbox) AddHostsEntry(name, ip string) // instead of OptionExtraHost\r\nfunc (*Sandbox) UpdateHostsEntry(name, ip string) // instead of OptionParentUpdate\r\nfunc (*Sandbox) UpdateLabels(map[string]interface{}) // instead of OptionGeneric\r\n```\r\n\r\nThere you go: type-safe and not obfuscated, just like you wanted. I'd even argue that it would _clarify_ legacy link behaviour since it makes explicit (on the daemon side) that a parent update is just an update to an entry in /etc/hosts of another sandbox. And it does not add any new references to legacy links to libnetwork, just like I wanted.\r\n\r\nNote that with my strawman, the equivalent daemon code to\r\n```go\r\nlibnetwork.OptionParentUpdate(parent.ID, alias, bridgeSettings.IPAddress)\r\n```\r\nwould be (approximately)\r\n```go\r\npsb, _ := daemon.netController.GetSandbox(parent.ID)\r\npsb.UpdateHostsEntry(alias, bridgeSettings.IPAddress)\r\n```\r\n\r\n`UpdateLabels` is still hard to reason about, but I don't see any better way that does not involve worse hacks or fundamentally rearchitecting core parts of libnetwork. There's no getting around the fact that the daemon has to do something else after updating the sandbox labels before the updated parent and child link lists take effect. Mentioning legacy links anywhere in the vicinity of such a method definition would imply behaviour it does not implement.\r\n\r\nAs for making `UpdateLabels` more type-safe, how about something like this?\r\n```go\r\npackage bridge // import \"github.com/docker/docker/libnetwork/drivers/bridge\"\r\n\r\nfunc LegacyContainerLinkOptions(parentEndpoints, childEndpoints []string) map[string]interface{}\r\n```\r\n```go\r\nsb.UpdateLabels(bridge.LegacyContainerLinkOptions(parents, children))\r\n```\r\n\r\nI'm not picky about the name, but I feel pretty strongly about it living in the bridge driver package as the bridge driver is the only driver which consumes the parent/child endpoint lists.",
+        "Ok - I think that's done.\r\n",
+        "Thank you for humouring me! I skimmed the diff and it's looking much, much better. I am especially happy with how `func (*Daemon) addLegacyLinks` turned out! I will do a full review pass this week.",
+        "Moved back to draft for now ... the change will need to be rebased once the SetKey prestart hook is re-removed.",
+        "Rebased, and added a commit to re-remove the SetKey hook.\r\n\r\nIt'll need to be rebased again once https://github.com/moby/moby/pull/47621 is merged (and that'll make `TestSetInterfaceSysctl` pass).",
+        "Rebased to resolve merge conflicts and run up-to-date tests.",
+        "Rebased again (new conflict in `integration/networking/bridge_test_linux.go`)."
+    ],
+    "merged": true,
+    "created_at": "2024-10-14T22:47:44Z",
+    "issue_context": {
+        "number": 47055,
+        "title": "IPv4 only container are resolved with an IPv6 address on an IPv6 enabled network",
+        "body": "### Description\n\nHi there, there's something I don't fully understand about docker networking and ipv6.\r\n\r\nI have a dual-stack network where some containers are v4+v6 and some are v4 only.\r\nI can see that when a dual-stack container revolves an ipv4-only, it gets ans ipv4 AND an ipv6 address from the resolver.\r\nLooking at the interface in the ipv4-only container, I don't see any ipv6 address, so I don't understand how the resolver can get an ipv6 address for it, especially if specified as ipv6-disabled.\r\n\r\nPlease find below the reproduction steps.\r\n\r\nI'm probably missing something...\r\n\r\nThanks.\n\n### Reproduce\n\n```\r\n# create dual stack network\r\ndocker network create \\\r\n    --subnet 192.168.123.0/24 --gateway 192.168.123.1 --ip-range 192.168.123.128/26 \\\r\n    --subnet=\"fde0:725c:19d8:9704::/64\" --gateway=\"fde0:725c:19d8:9704::1\" --ipv6 \\\r\n    test-dual-stack-network\r\n\r\n# start and ipv4-only and a dual-stack container\r\ndocker run -d --network test-dual-stack-network --name dual-stack node:19-alpine tail -f /dev/null \r\ndocker run -d --network test-dual-stack-network --name ipv4-only --sysctl net.ipv6.conf.all.disable_ipv6=1 node:19-alpine tail -f /dev/null \r\n\r\n# check that dual-stack container has ipv4 + ipv6\r\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN qlen 1000\r\n    inet6 ::1/128 scope host\r\n       valid_lft forever preferred_lft forever\r\n136: eth0@if137: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1500 state UP\r\n    inet6 fde0:725c:19d8:9704::2/64 scope global flags 02\r\n       valid_lft forever preferred_lft forever\r\n    inet6 fe80::42:c0ff:fea8:7b80/64 scope link\r\n       valid_lft forever preferred_lft forever\r\n\r\n# check that ipv4-only container has no ipv6\r\n$ docker exec -ti ipv4-only ip -6 addr\r\n(no output)\r\n\r\n# resolve ipv4-only from dual-stack\r\n$ docker exec -ti dual-stack nslookup ipv4-only\r\nServer:\t\t127.0.0.11\r\nAddress:\t127.0.0.11:53\r\n\r\nNon-authoritative answer:\r\nName:\tipv4-only\r\nAddress: 192.168.123.129\r\n\r\nNon-authoritative answer:\r\nName:\tipv4-only\r\nAddress: fde0:725c:19d8:9704::3\r\n```\n\n### Expected behavior\n\n`docker exec -ti dual-stack nslookup ipv4-only` to return only ipv4.\r\n\n\n### docker version\n\n```bash\nClient:\r\n Cloud integration: v1.0.35-desktop+001\r\n Version:           24.0.5\r\n API version:       1.43\r\n Go version:        go1.20.6\r\n Git commit:        ced0996\r\n Built:             Fri Jul 21 20:32:30 2023\r\n OS/Arch:           darwin/arm64\r\n Context:           desktop-linux\r\n\r\nServer: Docker Desktop 4.22.0 (117440)\r\n Engine:\r\n  Version:          24.0.5\r\n  API version:      1.43 (minimum version 1.12)\r\n  Go version:       go1.20.6\r\n  Git commit:       a61e2b4\r\n  Built:            Fri Jul 21 20:35:38 2023\r\n  OS/Arch:          linux/arm64\r\n  Experimental:     false\r\n containerd:\r\n  Version:          1.6.21\r\n  GitCommit:        3dce8eb055cbb6872793272b4f20ed16117344f8\r\n runc:\r\n  Version:          1.1.7\r\n  GitCommit:        v1.1.7-0-g860f061\r\n docker-init:\r\n  Version:          0.19.0\r\n  GitCommit:        de40ad0\n```\n\n\n### docker info\n\n```bash\nClient:\r\n Version:    24.0.5\r\n Context:    desktop-linux\r\n Debug Mode: false\r\n Plugins:\r\n  buildx: Docker Buildx (Docker Inc.)\r\n    Version:  v0.11.2-desktop.1\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-buildx\r\n  compose: Docker Compose (Docker Inc.)\r\n    Version:  v2.20.2-desktop.1\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-compose\r\n  dev: Docker Dev Environments (Docker Inc.)\r\n    Version:  v0.1.0\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-dev\r\n  extension: Manages Docker extensions (Docker Inc.)\r\n    Version:  v0.2.20\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-extension\r\n  init: Creates Docker-related starter files for your project (Docker Inc.)\r\n    Version:  v0.1.0-beta.6\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-init\r\n  sbom: View the packaged-based Software Bill Of Materials (SBOM) for an image (Anchore Inc.)\r\n    Version:  0.6.0\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-sbom\r\n  scan: Docker Scan (Docker Inc.)\r\n    Version:  v0.26.0\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-scan\r\n  scout: Command line tool for Docker Scout (Docker Inc.)\r\n    Version:  0.20.0\r\n    Path:     /Users/tomav/.docker/cli-plugins/docker-scout\r\n\r\nServer:\r\n Containers: 67\r\n  Running: 4\r\n  Paused: 0\r\n  Stopped: 63\r\n Images: 28\r\n Server Version: 24.0.5\r\n Storage Driver: overlay2\r\n  Backing Filesystem: extfs\r\n  Supports d_type: true\r\n  Using metacopy: false\r\n  Native Overlay Diff: true\r\n  userxattr: false\r\n Logging Driver: json-file\r\n Cgroup Driver: cgroupfs\r\n Cgroup Version: 2\r\n Plugins:\r\n  Volume: local\r\n  Network: bridge host ipvlan macvlan null overlay\r\n  Log: awslogs fluentd gcplogs gelf journald json-file local logentries splunk syslog\r\n Swarm: inactive\r\n Runtimes: io.containerd.runc.v2 runc\r\n Default Runtime: runc\r\n Init Binary: docker-init\r\n containerd version: 3dce8eb055cbb6872793272b4f20ed16117344f8\r\n runc version: v1.1.7-0-g860f061\r\n init version: de40ad0\r\n Security Options:\r\n  seccomp\r\n   Profile: unconfined\r\n  cgroupns\r\n Kernel Version: 5.15.49-linuxkit-pr\r\n Operating System: Docker Desktop\r\n OSType: linux\r\n Architecture: aarch64\r\n CPUs: 4\r\n Total Memory: 7.668GiB\r\n Name: docker-desktop\r\n ID: 7fbae3e1-bac7-4317-85cb-9e58ca837f7f\r\n Docker Root Dir: /var/lib/docker\r\n Debug Mode: false\r\n HTTP Proxy: http.docker.internal:3128\r\n HTTPS Proxy: http.docker.internal:3128\r\n No Proxy: hubproxy.docker.internal\r\n Experimental: false\r\n Insecure Registries:\r\n  hubproxy.docker.internal:5555\r\n  127.0.0.0/8\r\n Live Restore Enabled: false\r\n\r\nWARNING: daemon is not using the default seccomp profile\n```\n\n\n### Additional Info\n\n```\r\n$ docker inspect ipv4-only\r\n[\r\n    {\r\n        \"Id\": \"24ce3d7b171d825dc3d01cb8eee5370a3bedef539249cf476b98154fd052abb5\",\r\n        \"Created\": \"2024-01-10T15:06:21.784037625Z\",\r\n        \"Path\": \"docker-entrypoint.sh\",\r\n        \"Args\": [\r\n            \"tail\",\r\n            \"-f\",\r\n            \"/dev/null\"\r\n        ],\r\n        \"State\": {\r\n            \"Status\": \"running\",\r\n            \"Running\": true,\r\n            \"Paused\": false,\r\n            \"Restarting\": false,\r\n            \"OOMKilled\": false,\r\n            \"Dead\": false,\r\n            \"Pid\": 34415,\r\n            \"ExitCode\": 0,\r\n            \"Error\": \"\",\r\n            \"StartedAt\": \"2024-01-10T15:06:21.972918417Z\",\r\n            \"FinishedAt\": \"0001-01-01T00:00:00Z\"\r\n        },\r\n        \"Image\": \"sha256:309fc9aaf0d7d138831483c33eae396be3e1b5bd83ac1e57e1b124f9300df1fc\",\r\n        \"ResolvConfPath\": \"/var/lib/docker/containers/24ce3d7b171d825dc3d01cb8eee5370a3bedef539249cf476b98154fd052abb5/resolv.conf\",\r\n        \"HostnamePath\": \"/var/lib/docker/containers/24ce3d7b171d825dc3d01cb8eee5370a3bedef539249cf476b98154fd052abb5/hostname\",\r\n        \"HostsPath\": \"/var/lib/docker/containers/24ce3d7b171d825dc3d01cb8eee5370a3bedef539249cf476b98154fd052abb5/hosts\",\r\n        \"LogPath\": \"/var/lib/docker/containers/24ce3d7b171d825dc3d01cb8eee5370a3bedef539249cf476b98154fd052abb5/24ce3d7b171d825dc3d01cb8eee5370a3bedef539249cf476b98154fd052abb5-json.log\",\r\n        \"Name\": \"/ipv4-only\",\r\n        \"RestartCount\": 0,\r\n        \"Driver\": \"overlay2\",\r\n        \"Platform\": \"linux\",\r\n        \"MountLabel\": \"\",\r\n        \"ProcessLabel\": \"\",\r\n        \"AppArmorProfile\": \"\",\r\n        \"ExecIDs\": null,\r\n        \"HostConfig\": {\r\n            \"Binds\": null,\r\n            \"ContainerIDFile\": \"\",\r\n            \"LogConfig\": {\r\n                \"Type\": \"json-file\",\r\n                \"Config\": {}\r\n            },\r\n            \"NetworkMode\": \"test-dual-stack-network\",\r\n            \"PortBindings\": {},\r\n            \"RestartPolicy\": {\r\n                \"Name\": \"no\",\r\n                \"MaximumRetryCount\": 0\r\n            },\r\n            \"AutoRemove\": false,\r\n            \"VolumeDriver\": \"\",\r\n            \"VolumesFrom\": null,\r\n            \"ConsoleSize\": [\r\n                46,\r\n                187\r\n            ],\r\n            \"CapAdd\": null,\r\n            \"CapDrop\": null,\r\n            \"CgroupnsMode\": \"private\",\r\n            \"Dns\": [],\r\n            \"DnsOptions\": [],\r\n            \"DnsSearch\": [],\r\n            \"ExtraHosts\": null,\r\n            \"GroupAdd\": null,\r\n            \"IpcMode\": \"private\",\r\n            \"Cgroup\": \"\",\r\n            \"Links\": null,\r\n            \"OomScoreAdj\": 0,\r\n            \"PidMode\": \"\",\r\n            \"Privileged\": false,\r\n            \"PublishAllPorts\": false,\r\n            \"ReadonlyRootfs\": false,\r\n            \"SecurityOpt\": null,\r\n            \"UTSMode\": \"\",\r\n            \"UsernsMode\": \"\",\r\n            \"ShmSize\": 67108864,\r\n            \"Sysctls\": {\r\n                \"net.ipv6.conf.all.disable_ipv6\": \"1\"\r\n            },\r\n            \"Runtime\": \"runc\",\r\n            \"Isolation\": \"\",\r\n            \"CpuShares\": 0,\r\n            \"Memory\": 0,\r\n            \"NanoCpus\": 0,\r\n            \"CgroupParent\": \"\",\r\n            \"BlkioWeight\": 0,\r\n            \"BlkioWeightDevice\": [],\r\n            \"BlkioDeviceReadBps\": [],\r\n            \"BlkioDeviceWriteBps\": [],\r\n            \"BlkioDeviceReadIOps\": [],\r\n            \"BlkioDeviceWriteIOps\": [],\r\n            \"CpuPeriod\": 0,\r\n            \"CpuQuota\": 0,\r\n            \"CpuRealtimePeriod\": 0,\r\n            \"CpuRealtimeRuntime\": 0,\r\n            \"CpusetCpus\": \"\",\r\n            \"CpusetMems\": \"\",\r\n            \"Devices\": [],\r\n            \"DeviceCgroupRules\": null,\r\n            \"DeviceRequests\": null,\r\n            \"MemoryReservation\": 0,\r\n            \"MemorySwap\": 0,\r\n            \"MemorySwappiness\": null,\r\n            \"OomKillDisable\": null,\r\n            \"PidsLimit\": null,\r\n            \"Ulimits\": null,\r\n            \"CpuCount\": 0,\r\n            \"CpuPercent\": 0,\r\n            \"IOMaximumIOps\": 0,\r\n            \"IOMaximumBandwidth\": 0,\r\n            \"MaskedPaths\": [\r\n                \"/proc/asound\",\r\n                \"/proc/acpi\",\r\n                \"/proc/kcore\",\r\n                \"/proc/keys\",\r\n                \"/proc/latency_stats\",\r\n                \"/proc/timer_list\",\r\n                \"/proc/timer_stats\",\r\n                \"/proc/sched_debug\",\r\n                \"/proc/scsi\",\r\n                \"/sys/firmware\"\r\n            ],\r\n            \"ReadonlyPaths\": [\r\n                \"/proc/bus\",\r\n                \"/proc/fs\",\r\n                \"/proc/irq\",\r\n                \"/proc/sys\",\r\n                \"/proc/sysrq-trigger\"\r\n            ]\r\n        },\r\n        \"GraphDriver\": {\r\n            \"Data\": {\r\n                \"LowerDir\": \"/var/lib/docker/overlay2/3cb2228c038a0ce0f19f1bd7a25c207fbac3e4e210a8feb4c6c1b97e14c2fc69-init/diff:/var/lib/docker/overlay2/551179578b1a8cc7cb5ef2d33912fbea4835946b83b14ef41d2bda84142ef175/diff:/var/lib/docker/overlay2/10a77529225f16c055942f8f3b7ad886e78d609f863db0adb7c0f2401d53b060/diff:/var/lib/docker/overlay2/3576624d09a3c441806ddb645291a31f9369d89815ffecde48d08dc1ba74d0ec/diff:/var/lib/docker/overlay2/382768c536559fb944f7131debd4748554762e32ac25fb6eebde1ae775dade8e/diff\",\r\n                \"MergedDir\": \"/var/lib/docker/overlay2/3cb2228c038a0ce0f19f1bd7a25c207fbac3e4e210a8feb4c6c1b97e14c2fc69/merged\",\r\n                \"UpperDir\": \"/var/lib/docker/overlay2/3cb2228c038a0ce0f19f1bd7a25c207fbac3e4e210a8feb4c6c1b97e14c2fc69/diff\",\r\n                \"WorkDir\": \"/var/lib/docker/overlay2/3cb2228c038a0ce0f19f1bd7a25c207fbac3e4e210a8feb4c6c1b97e14c2fc69/work\"\r\n            },\r\n            \"Name\": \"overlay2\"\r\n        },\r\n        \"Mounts\": [],\r\n        \"Config\": {\r\n            \"Hostname\": \"24ce3d7b171d\",\r\n            \"Domainname\": \"\",\r\n            \"User\": \"\",\r\n            \"AttachStdin\": false,\r\n            \"AttachStdout\": false,\r\n            \"AttachStderr\": false,\r\n            \"Tty\": false,\r\n            \"OpenStdin\": false,\r\n            \"StdinOnce\": false,\r\n            \"Env\": [\r\n                \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\",\r\n                \"NODE_VERSION=19.7.0\",\r\n                \"YARN_VERSION=1.22.19\"\r\n            ],\r\n            \"Cmd\": [\r\n                \"tail\",\r\n                \"-f\",\r\n                \"/dev/null\"\r\n            ],\r\n            \"Image\": \"node:19-alpine\",\r\n            \"Volumes\": null,\r\n            \"WorkingDir\": \"\",\r\n            \"Entrypoint\": [\r\n                \"docker-entrypoint.sh\"\r\n            ],\r\n            \"OnBuild\": null,\r\n            \"Labels\": {}\r\n        },\r\n        \"NetworkSettings\": {\r\n            \"Bridge\": \"\",\r\n            \"SandboxID\": \"bbd1bed273e5a723dbd70bfc00de376bb5d2a5c1ed32993b2a8376eb89f38cec\",\r\n            \"HairpinMode\": false,\r\n            \"LinkLocalIPv6Address\": \"\",\r\n            \"LinkLocalIPv6PrefixLen\": 0,\r\n            \"Ports\": {},\r\n            \"SandboxKey\": \"/var/run/docker/netns/bbd1bed273e5\",\r\n            \"SecondaryIPAddresses\": null,\r\n            \"SecondaryIPv6Addresses\": null,\r\n            \"EndpointID\": \"\",\r\n            \"Gateway\": \"\",\r\n            \"GlobalIPv6Address\": \"\",\r\n            \"GlobalIPv6PrefixLen\": 0,\r\n            \"IPAddress\": \"\",\r\n            \"IPPrefixLen\": 0,\r\n            \"IPv6Gateway\": \"\",\r\n            \"MacAddress\": \"\",\r\n            \"Networks\": {\r\n                \"test-dual-stack-network\": {\r\n                    \"IPAMConfig\": null,\r\n                    \"Links\": null,\r\n                    \"Aliases\": [\r\n                        \"24ce3d7b171d\"\r\n                    ],\r\n                    \"NetworkID\": \"3529611cf1da65a490712c4866cee7ec16058e39362d2a1fcfe0320d7e7f10fc\",\r\n                    \"EndpointID\": \"8865c25be193ce7e06e27284fa1f145afc798152add0f6817bf19d13259ccd3d\",\r\n                    \"Gateway\": \"192.168.123.1\",\r\n                    \"IPAddress\": \"192.168.123.129\",\r\n                    \"IPPrefixLen\": 24,\r\n                    \"IPv6Gateway\": \"fde0:725c:19d8:9704::1\",\r\n                    \"GlobalIPv6Address\": \"fde0:725c:19d8:9704::3\",\r\n                    \"GlobalIPv6PrefixLen\": 64,\r\n                    \"MacAddress\": \"02:42:c0:a8:7b:81\",\r\n                    \"DriverOpts\": null\r\n                }\r\n            }\r\n        }\r\n    }\r\n]\r\n```",
+        "comments": [
+            "/cc @akerouanton @robmry ",
+            "Hi @tomav - thank you for reporting this, you're not missing anything.\r\n\r\nI'm about to make some changes to the way the IPv6-ness of a container gets decided, currently it's based on whether it's connected to a network with IPv6 enabled. The `--sysctl` option is applied in the container's namespace, but it's not taken into account in its configuration. \r\n\r\nSo, we'll change that, and use it to fix this problem.",
+            "Thanks @robmry! This will solve numerous issues. \ud83c\udf89\r\nIn my case, a nginx dual-stack container which acts as a reverse proxy to ipv4-only containers. It always tries first the ipv6   received from the resolver with default configuration before fallback on ipv4, which drastically increases time to first byte.",
+            "Hi @robmry \ud83d\udc4b\r\nWas wondering if there was any progress on ipv6 issues reported by me or others, or if you have any ETA to share.\r\nThank you!",
+            "Hi @tomav ... we'd hoped to get https://github.com/moby/moby/pull/47406 merged in the 27.0 release, it was delayed primarily because delaying setup of the addresses breaks an assumption in Kata containers, which currently expects interfaces to be configured before container task initialisation completes (during an OCI \"prestart\" hook that we need to remove). We should be able to get it into 28.0, but I'm not sure of the date for that yet."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 31301,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations_unix.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 116,
+            "original_line": 116,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "It's existing code, but this is confusing; i.e., we overwrite `cEndpointID` in each iteration, and `cEndpointID` is used elsewhere.",
+                "Oh! I see Cory commented about that as well; https://github.com/moby/moby/pull/47406/commits/68a4761a27f554c9f1864b079fb8e693554c99c9#r1526578113",
+                "That link doesn't work - but I think it's https://github.com/moby/moby/pull/47406#discussion_r1526578113\r\n\r\nIn any case, I think it's something for follow-up as it's not changed by this PR - which is already big enough!"
+            ]
+        },
+        {
+            "hunk_id": 31307,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "libnetwork/network.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2002,
+            "original_line": 2002,
+            "side": "RIGHT",
+            "original_position": 59,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "Not relevant for this PR, but this could uses a `map[string]struct{}` to avoid allocations."
+            ]
+        },
+        {
+            "hunk_id": 31294,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 498,
+            "original_line": 498,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 155,
+            "subject_type": "line",
+            "review_comments": [
+                "Looks like [the `updateSettings` flag was originally added to make some error handling conditional](https://github.com/moby/moby/commit/2ab94e11a2a8499088a72ab27fd09e897d8c810a#diff-16773f0dae8247ebf9b538e267af2430ef50c5f38d9f28d0b0ec4b34c910b9dbR881-R888) for some reason that has long been refactored into irrelevance."
+            ]
+        },
+        {
+            "hunk_id": 31298,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 516,
+            "original_line": 516,
+            "side": "LEFT",
+            "original_position": 103,
+            "position": 181,
+            "subject_type": "line",
+            "review_comments": [
+                "I think it's worth keeping this comment."
+            ]
+        },
+        {
+            "hunk_id": 31304,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 23,
+            "original_line": 23,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Curious (no need to change); did this panic somewhere? (in that case; are we missing a check somewhere to prevent that)?",
+                "Yes ...\r\n\r\n```\r\npanic: runtime error: invalid memory address or nil pointer dereference [recovered]\r\n\tpanic: runtime error: invalid memory address or nil pointer dereference\r\n[signal SIGSEGV: segmentation violation code=0x1 addr=0x48 pc=0x17aaf44]\r\n\r\ngoroutine 27 [running]:\r\ntesting.tRunner.func1.2({0x1aa5ce0, 0x3171920})\r\n\t/usr/local/go/src/testing/testing.go:1631 +0x1c4\r\ntesting.tRunner.func1()\r\n\t/usr/local/go/src/testing/testing.go:1634 +0x33c\r\npanic({0x1aa5ce0?, 0x3171920?})\r\n\t/usr/local/go/src/runtime/panic.go:770 +0x124\r\ngithub.com/docker/docker/daemon.(*Daemon).updateNetworkSettings(0x400051dd00, 0x400051dab8, 0x40000504e0, 0x40001a5b20)\r\n\t/go/src/github.com/docker/docker/daemon/container_operations.go:170 +0x224\r\ngithub.com/docker/docker/daemon.(*Daemon).updateNetworkConfig(0x400051dd00, 0x400051dab8, 0x40000504e0, 0x40001a5b20)\r\n\t/go/src/github.com/docker/docker/daemon/container_operations.go:631 +0x2ac\r\ngithub.com/docker/docker/daemon.TestDNSNamesOrder(0x4000563d40)\r\n\t/go/src/github.com/docker/docker/daemon/container_operations_test.go:35 +0x264\r\ntesting.tRunner(0x4000563d40, 0x1ee8270)\r\n\t/usr/local/go/src/testing/testing.go:1689 +0xec\r\ncreated by testing.(*T).Run in goroutine 1\r\n\t/usr/local/go/src/testing/testing.go:1742 +0x318\r\n```\r\n\r\nWhich comes from:\r\nhttps://github.com/moby/moby/blob/0cba41041441d1d44ed3915c64e14f3a8ba7d798/daemon/container_operations.go#L170\r\n\r\nLooks like it's normally initialised in `daemon.newContainer` - and there's lots of code that assumes it exists:\r\nhttps://github.com/moby/moby/blob/afdfe4ff86fa625ee38bbdadbfebe811efede3a9/daemon/container.go#L151"
+            ]
+        },
+        {
+            "hunk_id": 31303,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 949,
+            "original_line": 949,
+            "side": "LEFT",
+            "original_position": 108,
+            "position": 336,
+            "subject_type": "line",
+            "review_comments": [
+                "Looks like this patch swapped the order of `initializeNetworking` and  `allocateNetwork`, which makes the diff harder to read; would you mind changing the order back to reduce the diff?",
+                "The functions weren't exactly swapped, code moved between them. I'd tried to minimise the diff in terms of lines-changed.\r\n\r\nMaybe it's easier to understand a bigger diff, but without moving function declarations - just moving more lines between functions?\r\n\r\nSo I've made the change (can put it back if needed). The diff has gone from:\r\n`1 file changed, 58 insertions(+), 42 deletions(-)` to\r\n`1 file changed, 68 insertions(+), 52 deletions(-)`."
+            ]
+        },
+        {
+            "hunk_id": 31297,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 509,
+            "original_line": 509,
+            "side": "LEFT",
+            "original_position": 89,
+            "position": 169,
+            "subject_type": "line",
+            "review_comments": [
+                "While the CLI prevents you from attaching to the default network and custom networks at the same time, there's no such check in the daemon. That means, this condition was previously defining a specific order of operations:\r\n\r\n1. The default `bridge` network, if it's specified;\r\n2. Then, any custom networks.\r\n\r\nBut since the order of network attachment defines the default gateway, removing that code means the default bridge might not be the default gateway now. Although the legacy --link justification doesn't hold anymore, we need to keep that old code / behavior for the time being (until we add a way to specify which attachment should be the default gateway).",
+                "After chatting more about this, I think you're right: the default gateway is changed whenever an endpoint that sorts first (in lexicographic order) is attached to the sandbox. We should be good to go with that change.",
+                "Marking as \"unresolved\" to keep these comments visible (making it easier to discover in future)",
+                "Just to note then ... the endpoints are sorted by gateway-ness, then by name. (So, the \"best\" choices of gateway endpoints are preferred, but equally good endpoints are just ordered lexicographically.)\r\n\r\nhttps://github.com/moby/moby/blob/59eba0ae1360171ba3b4fe36d0d35d9e8720ce90/libnetwork/sandbox.go#L677-L683"
+            ]
+        },
+        {
+            "hunk_id": 31295,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/network.go",
+            "start_line": 919,
+            "original_start_line": 896,
+            "start_side": "RIGHT",
+            "line": 924,
+            "original_line": 924,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "The endpoint could determine for itself whether IPv6 is enabled in the sandbox when the Endpoint is Joined to the Sandbox. It'd make sense to have an endpoint option persisted in the store for _the user_ to disable IPv6 allocation for an attachment, but it feels weird to use an endpoint option to convey a fact about the sandbox it will be joined to. The endpoint option might get out of sync with ground truth.\r\n\r\nHow feasible would it be to defer IPAM allocation until the join operation?",
+                "I think it's feasible - and I agree it'd be better, but it would be a behavioural change for libnetwork. At the moment, our daemon code expects to be able to stash address info in NetworkSettings after creating the endpoint, before the join. That can be changed but, do we need to worry about other users of libnetwork doing something similar?\r\n\r\nAlternatively, we could pass the `libnetwork.Sandbox` to the `CreateEndpoint` as an `EndpointOption` - not to be stored in the `Endpoint`, just so it can see what it'll be joined to? (If it gets no sandbox option, or the sandbox doesn't have an osSbox that can be checked for the `::1`, the Endpoint would just follow its current rules for allocating IPv6 addresses - and libnetwork's behaviour wouldn't change.)",
+                "> Alternatively, we could pass the libnetwork.Sandbox to the CreateEndpoint as an EndpointOption ...\r\n\r\nExpanding on that idea, I added `CreateOptionJoinSandbox` ... nothing creates an Endpoint without adding it to a Sandbox. Optionally combining the two steps means the CreateEndpoint has access to the Sandbox, so it can inspect it.",
+                "> At the moment, our daemon code expects to be able to stash address info in NetworkSettings after creating the endpoint, before the join. That can be changed\r\n\r\nStash info for _which_ addresses? IPAM-allocated addresses are allocated without the daemon in the loop, IIUC. And I'm not sure why changing when IPAM addresses are allocated _inside libnetwork_ has any impact on daemon code.\r\n\r\n> but, do we need to worry about other users of libnetwork doing something similar?\r\n\r\nBuildkit is already a royal pain to update in Moby, so it's only fair to subject them to the same thing when updating Moby for buildkitd. If given the choice between fixing architectural mistakes in libnetwork and maintaining compatibility with importers of libnetwork that are not moby, I'd pick the former every time.\r\n\r\n> Optionally combining the two steps means the CreateEndpoint has access to the Sandbox, so it can inspect it.\r\n\r\nCreateEndpoint would have access to _that instance_ of the Sandbox to inspect _the OS state at that point in time._ I'm worried about the restore story, where a container running when the daemon is stopped is restarted when the daemon is next started. Consider the case where the system is rebooted in between and `disable_ipv6=true` is added to or removed from the kernel command line. When the daemon is started, the existing Endpoint and Sandbox are rehydrated from libnetwork's datastore. If IPv6 support in the sandbox is only checked when the endpoint is created, the container would not get an IPv6 address if IPv6 support was enabled in the kernel between reboots, or an IPv6 address would be allocated that does not get used if IPv6 support was disabled. Actually, deferring IPAM allocation to join would not be sufficient to solve this restore case as sandbox restore follows a different code-path from endpoint join. IPAM allocation would also have to be redone on restore. (Redoing allocation on restore would also be required to e.g. properly implement a DHCP-client IPAM allocator.)",
+                "> > At the moment, our daemon code expects to be able to stash address info in NetworkSettings after creating the endpoint, before the join. That can be changed\r\n> \r\n> Stash info for _which_ addresses? IPAM-allocated addresses are allocated without the daemon in the loop, IIUC. And I'm not sure why changing when IPAM addresses are allocated _inside libnetwork_ has any impact on daemon code.\r\n\r\nThe existing daemon code does ...\r\n  - CreateEndpoint()\r\n    - _libnetwork allocates addresses_\r\n  - Copy the addresses libnetwork just allocated into NetworkSettings.\r\n  - Join()\r\n\r\nIf libnetwork delayed addresses allocation until the Join(), NetworkSettings would have to be updated after the Join(). That's ok, but it is a change needed in the daemon because of an hidden change in the behaviour of libnetwork's API.\r\n\r\n> > Optionally combining the two steps means the CreateEndpoint has access to the Sandbox, so it can inspect it.\r\n> \r\n> CreateEndpoint would have access to _that instance_ of the Sandbox to inspect _the OS state at that point in time._ I'm worried about the restore story, where a container running when the daemon is stopped is restarted when the daemon is next started. Consider the case where the system is rebooted in between and `disable_ipv6=true` is added to or removed from the kernel command line. When the daemon is started, the existing Endpoint and Sandbox are rehydrated from libnetwork's datastore. If IPv6 support in the sandbox is only checked when the endpoint is created, the container would not get an IPv6 address if IPv6 support was enabled in the kernel between reboots, or an IPv6 address would be allocated that does not get used if IPv6 support was disabled. Actually, deferring IPAM allocation to join would not be sufficient to solve this restore case as sandbox restore follows a different code-path from endpoint join. IPAM allocation would also have to be redone on restore. (Redoing allocation on restore would also be required to e.g. properly implement a DHCP-client IPAM allocator.)\r\n\r\nYes, 'restore' restores a container with the config it had before. Re-creating a container and disconnect/connect are the ways to change its networking config.\r\n\r\nAllocating addresses during Join(), and then not actually just Join() because that wouldn't help with the restore case anyway, would be a further complicated and delicate change - a lot of code paths are involved. So, while dealing with a requirement to change the host's networking stack without re-creating containers might be worthwhile - I think it implies significantly more risk and work, and doesn't need to be part of this change.\r\n\r\nThis PR cleans up construction of Sandbox and Endpoints by separating them cleanly, it doesn't move any responsibility for configuration of legacy links between the daemon and libnetwork, and it makes it possible to attach an IPv4 container to an IPv6 network without it getting IPv6 addresses.",
+                "This also paves the way for not-allocating IPv4 addresses for an IPv6 only network, which is possibly more important.  There's quite a bit more to sort out for that, but this is a first step.",
+                "I think it's safe to say there are no other users of libnetwork for container networking. Buildkit only uses the resolvconf package and any third-party users are doing so at their own risk, IMO."
+            ]
+        },
+        {
+            "hunk_id": 31300,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations_unix.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 50,
+            "position": 50,
+            "subject_type": "line",
+            "review_comments": [
+                "For a follow-up; now that this code is in a platform-specific file, we should inline this function (makes it clearer what it does); https://github.com/moby/moby/blob/9eeec5fbb42bd58b0f69026096cf8a0477eedd01/daemon/container_operations_unix.go#L403-L407\r\n\r\n\r\nAnd remove the windows stub; https://github.com/moby/moby/blob/9eeec5fbb42bd58b0f69026096cf8a0477eedd01/daemon/container_operations_windows.go#L153-L155 ",
+                "That's now https://github.com/moby/moby/pull/48821."
+            ]
+        },
+        {
+            "hunk_id": 31299,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 536,
+            "original_line": 536,
+            "side": "LEFT",
+            "original_position": 131,
+            "position": 208,
+            "subject_type": "line",
+            "review_comments": [
+                "Probably fine for a follow-up; `func (daemon *Daemon) buildSandboxOptions` is currently a pseudo-method on `Daemon`, but now that this code is removed, it no longer references the `Daemon`, so it  can be a regular function.\r\n",
+                "Ok, done as a separate commit."
+            ]
+        },
+        {
+            "hunk_id": 31302,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 505,
+            "original_line": 505,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 235,
+            "subject_type": "line",
+            "review_comments": [
+                "Not new code, and can't comment on the actual line above, but wondering if we should log if we fail to delete the sandbox.",
+                "Ok, done."
+            ]
+        },
+        {
+            "hunk_id": 31305,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "libnetwork/sandbox_dns_unix.go",
+            "start_line": 33,
+            "original_start_line": 33,
+            "start_side": "RIGHT",
+            "line": 34,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "Not entirely new (I think), but it caught my eye now;\r\n\r\nThis logic;\r\n\r\n- Appends extrahosts\r\n- Calls \"rebuild\" for the hosts file\r\n\r\nBut looking at the \"rebuild\";\r\n\r\n1. It generates a new host-file (to replace the existing one?) with the new config (which includes the new \"extra hosts\")\r\n2. After that, it updates the file for each endpoint\r\n\r\nThat last part is done in a loop, and for each iteration it adds an endpoint, and (from a quick look), locks the hosts-file and writes it to disk\r\n\r\nI'm wondering;\r\n\r\n- Could we could we skip the \"updating\" part if we would update the config before we call `sb.buildHostsFile()`?\r\n- (or have `sb.buildHostsFile()` accept the list of \"additional hosts\" to add)\r\n- :point_up: so that it has all the data it needs, and just has to construct (and write) once\r\n\r\n```go\r\nfunc (sb *Sandbox) rebuildHostsFile(ctx context.Context) error {\r\n\tif err := sb.buildHostsFile(); err != nil {\r\n\t\treturn errdefs.System(err)\r\n\t}\r\n\tfor _, ep := range sb.Endpoints() {\r\n\t\tif err := sb.updateHostsFile(ctx, ep.getEtcHostsAddrs()); err != nil {\r\n\t\t\treturn errdefs.System(err)\r\n\t\t}\r\n\t}\r\n\treturn nil\r\n}\r\n```\r\n\r\nIf that's not an option, I noticed that  `sb.updateHostsFile()` accepts a _slice_ of addresses; so instead of updating it one at a time, would that mean we could just collect the endpoints, and pass it? Something like;\r\n\r\n```go\r\neps := sb.Endpoints()\r\naddrs :=  make([]string, 0, len(eps))\r\nfor _, ep := range eps {\r\n    addrs = append(addrs, ep.getEtcHostsAddrs()...)\r\n    if err := sb.updateHostsFile(ctx, ep.getEtcHostsAddrs()); err != nil {\r\n        return errdefs.System(err)\r\n    }\r\n}\r\nif err := sb.updateHostsFile(ctx, addrs...); err != nil {\r\n\t// NOTE: should sb.updateHostsFile already return a proper errdefs type (errdefs.System)?\r\n    return errdefs.System(err)\r\n}\r\nreturn nil\r\n```\r\n\r\n",
+                "`Sandbox.AddHostsEntry` is only used for legacy `--link` options for containers on the default bridge network, before they're started - and those containers are only likely to be connected to the default bridge (only one Endpoint) ... so I don't think there's much to gain by optimising it.\r\n\r\n`Sandbox.rebuildHostsFile` is called from `SetKey` for a newly created container once the its support for IPv6 is known. That container could be connected to multiple endpoints - so maybe there are some msecs to be gained by accumulating addresses from all of the endpoints. But, optimising the whole `etchosts` thing so that it doesn't keep writing/reading/merging the contents (before a container starts and the user's had a chance to modify it), is probably the way to go if that's an issue.\r\n\r\nThese `/etc/hosts` entries are pretty questionable anyway for user-defined networks that have an internal DNS resolver. If we figure out a [fix for buildkit](https://github.com/moby/moby/pull/48020), so that we can use the internal resolver for the default network too, even more so.\r\n\r\nI don't really want to muck about with it in this PR, maybe as a follow-up if needed?",
+                "This is now https://github.com/moby/moby/pull/48823"
+            ]
+        },
+        {
+            "hunk_id": 31306,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "libnetwork/network.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2001,
+            "original_line": 2001,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "Mostly curious; is there any order in the results? In this case, should \"last\" or \"first\" take precedence? (currently the first one is used, and the last one is discarded; wondering if we should loop in reverse).",
+                "This PR only changes whitespace here ... but no, I don't think the order can matter - the results come from a map in the first place, and DNS resolvers are free to rotate addresses in responses anyway to balance load."
+            ]
+        },
+        {
+            "hunk_id": 31296,
+            "commit_id": "caf2d5dc7c3573f1c02c1487ceb6a27e57ddeb20",
+            "original_commit_id": "6ac445c42badc98b416baa32cca5d6f8b712b359",
+            "path": "daemon/container_operations_unix.go",
+            "start_line": 139,
+            "original_start_line": 136,
+            "start_side": "RIGHT",
+            "line": 141,
+            "original_line": 141,
+            "side": "RIGHT",
+            "original_position": 96,
+            "position": 103,
+            "subject_type": "line",
+            "review_comments": [
+                "The ostensible list of parent endpoints is actually `children[len(children)-1].NetworkSettings.Networks[defaultNetName].EndpointID` repeated `len(parents)` times?! That's how the pre-refactor code behaved, so good on retaining bug-compatibility. I'm just amused such an egregious bug went unnoticed for so long.",
+                "Yes, that's silly ... but it's unrelated to this PR, which hasn't changed it at all."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,42 @@
+{
+    "repo": "apache/airflow",
+    "pr_number": 26103,
+    "lang": "python",
+    "pr_title": "Don't error when multiple tasks produce the same dataset",
+    "pr_body": "Previously this was \"racey\", so running multiple dags all updating the\r\nsame outlet dataset (or how I ran in to this: mapped tasks) would cause\r\nsome of them to fail with a unique constraing violation.\r\n\r\nThe fix has two paths, one generic and an optimized version for\r\nPostgres.\r\n\r\nThe generic one is likely slightly slower, and uses the pattern that the\r\nSQLA docs have for exactly this case. To quote\r\n\r\n> This pattern is ideal for situations such as using PostgreSQL and\r\n> catching IntegrityError to detect duplicate rows; PostgreSQL normally\r\n> aborts the entire tranasction when such an error is raised, however when\r\n> using SAVEPOINT, the outer transaction is maintained. In the example\r\n> below a list of data is persisted into the database, with the occasional\r\n> \"duplicate primary key\" record skipped, without rolling back the entire\r\n> operation:\r\n\r\nHowever for PostgreSQL specifically, there is a better approach we can\r\ndo: use it's `ON CONFLICT DO NOTHING` approach. This also allows us to\r\ndo the whole process in a single SQL statement for all outlet datasets (vs\r\n1 select + 1 insert per dataset for the slow path)\r\n\r\nFixes #25210",
+    "pr_comments": [
+        "Nice \ud83d\udc4d"
+    ],
+    "merged": true,
+    "created_at": "2022-09-01T13:36:42Z",
+    "issue_context": {
+        "number": 25210,
+        "title": "Many tasks updating dataset at once causes some of them to fail",
+        "body": "### Apache Airflow version\n\nmain (development)\n\n### What happened\n\nI have 16 dags which all update the same dataset.  They're set to finish at the same time (when the seconds on the clock are 00). About three quarters of them behave as expected, but the other quarter fails with errors like:\r\n\r\n```\r\n[2022-07-21, 06:06:00 UTC] {standard_task_runner.py:97} ERROR - Failed to execute job 8 for task increment_source ((psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint \"dataset_dag_run_queue_pkey\"\r\nDETAIL:  Key (dataset_id, target_dag_id)=(1, simple_dataset_sink) already exists.\r\n\r\n[SQL: INSERT INTO dataset_dag_run_queue (dataset_id, target_dag_id, created_at) VALUES (%(dataset_id)s, %(target_dag_id)s, %(created_at)s)]\r\n[parameters: {'dataset_id': 1, 'target_dag_id': 'simple_dataset_sink', 'created_at': datetime.datetime(2022, 7, 21, 6, 6, 0, 131730, tzinfo=Timezone('UTC'))}]\r\n(Background on this error at: https://sqlalche.me/e/14/gkpj); 375)\r\n```\r\n\r\nI've prepaired a gist with the details: https://gist.github.com/MatrixManAtYrService/b5e58be0949eab9180608d0760288d4d\n\n### What you think should happen instead\n\nAll dags should succeed\n\n### How to reproduce\n\nSee this gist:  https://gist.github.com/MatrixManAtYrService/b5e58be0949eab9180608d0760288d4d\r\n\r\nSummary:  Unpause all of the dags which we expect to collide, wait two minutes.  Some will have collided.\n\n### Operating System\n\ndocker/debian\n\n### Versions of Apache Airflow Providers\n\nn/a\n\n### Deployment\n\nAstronomer\n\n### Deployment details\n\n`astro dev start` targeting commit: cff7d9194f549d801947f47dfce4b5d6870bfaaa\r\n\r\nbe sure to have `pause` in requirements.txt\n\n### Anything else\n\n_No response_\n\n### Are you willing to submit PR?\n\n- [ ] Yes I am willing to submit a PR!\n\n### Code of Conduct\n\n- [X] I agree to follow this project's [Code of Conduct](https://github.com/apache/airflow/blob/main/CODE_OF_CONDUCT.md)\n",
+        "comments": [
+            "This is described here:  https://github.com/apache/airflow/issues/24974\r\n\r\nMaybe it's ok that the update failed--given that the downstream dag ran as desired--but I don't think it should cause the task to fail.",
+            "nice work!",
+            "Ran across this again (at least I think it's the same thing) with this dag:\r\n\r\n```python3\r\nfrom airflow import Dataset, DAG\r\nfrom airflow.operators.python import PythonOperator\r\nfrom datetime import datetime\r\n\r\n\r\nfan_out = Dataset(\"fan_out\")\r\nfan_in = Dataset(\"fan_in\")\r\n\r\n# the leader\r\nwith DAG(\r\n    dag_id=\"momma_duck\", start_date=datetime(1970, 1, 1), schedule_interval=None\r\n) as leader:\r\n\r\n    PythonOperator(\r\n        task_id=\"has_outlet\", python_callable=lambda: None, outlets=[fan_out]\r\n    )\r\n\r\n# the many\r\nfor i in range(1, 1000):\r\n    with DAG(\r\n        dag_id=f\"duckling_{i}\", start_date=datetime(1970, 1, 1), schedule_on=[fan_out]\r\n    ) as duck:\r\n\r\n        PythonOperator(\r\n            task_id=\"has_outlet\", python_callable=lambda: None, outlets=[fan_in]\r\n        )\r\n    globals()[f\"duck_{i}\"] = duck\r\n\r\n\r\n# the straggler\r\nwith DAG(\r\n    dag_id=\"straggler_duck\", start_date=datetime(1970, 1, 1), schedule_on=[fan_in]\r\n) as straggler:\r\n\r\n    PythonOperator(task_id=\"has_outlet\", python_callable=lambda: None)\r\n\r\n```\r\n\r\nThis time I noticed that, with the LocalExecutor at least, there are messages regarding zombines in the scheduler log:\r\n\r\n```{dag.py:3178} INFO - Setting next_dagrun for duckling_897 to None, run_after=None\r\n{dagrun.py:567} INFO - Marking run <DagRun duckling_855 @ 2022-08-08 21:01:33.571168+00:00: dataset_triggered__2022-08-08T21:01:33.568548+00:00, state:running, queued_at: 2022-08-08 21:01:33.569170+00:00. externally triggered: False> successful\r\n{dagrun.py:612} INFO - DagRun Finished: dag_id=duckling_855, execution_date=2022-08-08 21:01:33.571168+00:00, run_id=dataset_triggered__2022-08-08T21:01:33.568548+00:00, run_start_date=2022-08-08 21:03:40.332173+00:00, run_end_date=2022-08-08 21:07:27.579980+00:00, run_duration=227.247807, state=success, external_trigger=False, run_type=dataset_triggered, data_interval_start=None, data_interval_end=None, dag_hash=ff772192a0a9c22e28dbebf2b14f1ebc\r\n{dag.py:3178} INFO - Setting next_dagrun for duckling_855 to None, run_after=None\r\n{scheduler_job.py:1364} WARNING - Failing (58) jobs without heartbeat after 2022-08-08 21:02:27.737896+00:00\r\n{scheduler_job.py:1372} ERROR - Detected zombie job: {'full_filepath': '/home/matt/2022/08/07/dags/many_to_one.py', 'msg': 'Detected <TaskInstance: duckling_289.has_outlet dataset_triggered__2022-08-08T21:01:31.846596+00:00 [running]> as zombie', 'simple_task_instance': <airflow.models.taskinstance.SimpleTaskInstance object at 0x7f98ebffc850>, 'is_failure_callback': True}\r\n{scheduler_job.py:1372} ERROR - Detected zombie job: {'full_filepath': '/home/matt/2022/08/07/dags/many_to_one.py', 'msg': 'Detected <TaskInstance: duckling_127.has_outlet dataset_triggered__2022-08-08T21:01:31.823203+00:00 [running]> as zombie', 'simple_task_instance': <airflow.models.taskinstance.SimpleTaskInstance object at 0x7f98ec93f7f0>, 'is_failure_callback': True}\r\n\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 54486,
+            "commit_id": "639bea9c1915a37fcae78be1420d93179cda0657",
+            "original_commit_id": "5697e9fdfa9d5af2d48f7037c31972c2db1f4397",
+            "path": "tests/models/test_taskinstance.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1720,
+            "original_line": 1720,
+            "side": "LEFT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "This change is because SQLA was warning us about a (likely) unintended cross-product effect!"
+            ]
+        }
+    ]
+}

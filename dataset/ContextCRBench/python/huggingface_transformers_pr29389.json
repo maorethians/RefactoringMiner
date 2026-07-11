@@ -1,0 +1,153 @@
+{
+    "repo": "huggingface/transformers",
+    "pr_number": 29389,
+    "lang": "python",
+    "pr_title": "Correct llava mask & fix missing setter for `vocab_size`",
+    "pr_body": "This PR fixes llava mask in the generation case.\r\n\r\n`torch.cat((attention_mask, extended_mask), dim=-1)` was very wrong and it is a miracle we were getting meaningful generation for batch generation. The issue is that this disregards the attention_mask used during the first forward pass, that is custom. Wrong past key values are used.\r\n\r\nIt is also not clear to me why this custom masking is handled in the forward and not in GenerationMixin cc @gante (we are doing unnecessary operations at each forward to retrieve the correct attention_mask, it could just be an output of the model & updated in GenerationMixin)\r\n\r\nFixes https://github.com/huggingface/transformers/issues/28184",
+    "pr_comments": [
+        "The docs for this PR live [here](https://moon-ci-docs.huggingface.co/docs/transformers/pr_29389). All of your documentation changes will be reflected on that endpoint. The docs are available until 30 days after the last update.",
+        "> It is also not clear to me why this custom masking is handled in the forward and not in GenerationMixin cc @gante (we are doing unnecessary operations at each forward to retrieve the correct attention_mask, it could just be an output of the model & updated in GenerationMixin)\r\n\r\n@fxmarty We do that by default (in [this function](https://github.com/huggingface/transformers/blob/9c5e560924c4868033cc9ac650bee80dc4049158/src/transformers/generation/utils.py#L647)) \ud83e\udd14 \r\n\r\n@zucchini-nlp since you're interested in multimodal models: after this PR gets merged, can you inspect why llava (and related models) need this custom attention mask handling at generation time?",
+        "@gante , I've been affected by this also while trying to make speculative decoding work with VLMs. I'll briefly outline what I found.\r\n\r\nThe custom mask is needed in Llava because it concatenated image embeds and text, which is further used as `inputs_embeds` for the LLM part. Thus after pre-fill they require attention mask of much larger length than what we got initially. When we update `model_kwargs` in `generate`, we assume one token is added to prev attention mask. This is not the case for Llava, since the attention mask holds values for textual part only, so the `forward` adds masks for the image part every call.\r\n\r\nComparing to other models, I have counted only 3 soft prompt VLMs in `transformers` (Kosmos-2, Blip, Llava). The other two models do not have this issue, because they have custom `generate` where embeds are concatenated, new attention masks are prepared manually and only then `text_model.generate()` is called for further handling. But Llava calls `composite_model.generate()` directly.\r\n\r\nWe can either fix Llava to call `text_model.generate()` for consistency with others or update `model_kwargs` depending on `past_key_values` length in `generate`. I was also thinking that if the second case, we can get rid of using `_prepare_token_type_ids` and `_prepare_attention_mask` in speculative decoding. \r\n\r\nIt's up to you to decide if we need any changes, I have no idea how this can affect library-wide \ud83d\ude04 ",
+        "> We can either fix Llava to call text_model.generate() for consistency with others or update model_kwargs depending on past_key_values length in generate. I was also thinking that if the second case, we can get rid of using _prepare_token_type_ids and _prepare_attention_mask in speculative decoding.\r\n\r\n@zucchini-nlp I'd say to go with \"call text_model.generate() for consistency\", if that is feasible and results in a clean interface. `generate` is still quite rigid at the moment, so handling more cases will slow down ongoing projects. After we refactor `generate` to make it more flexible, we can revisit this decision :)",
+        "Llava slow tests all pass (apart from `tests/models/llava/test_modeling_llava.py::LlavaForConditionalGenerationModelTest::test_cpu_offload` which does not pass on main either).",
+        "I added a setter to fix the regression in https://github.com/huggingface/transformers/pull/29586#discussion_r1535058927 (`RUN_SLOW=1 CUDA_VISIBLE_DEVICES=1 pytest tests/models/llava -s -vvvvv -k \"test_small_model_integration_test\"` failing on main)\r\n\r\nI wonder if llava is working on the release version? maybe not",
+        "@amyeroberts We need to set `final_embedding` to zero for https://github.com/huggingface/transformers/blob/aa17cf986f0761382f3d6e591e985a42671c3fb7/src/transformers/models/llava/modeling_llava.py#L449\r\n\r\nto do its job! Up to now it did not do what was expected.\r\n\r\nWhat I meant in\r\n\r\n> It is also not clear to me why this custom masking is handled in the forward and not in GenerationMixin cc @gante (we are doing unnecessary operations at each forward to retrieve the correct attention_mask, it could just be an output of the model & updated in GenerationMixin)\r\n\r\nis that this (i.e. the attention_mask reconstruction in the decode) could be avoided altogether if the mask was rather handled in generate, which is currently not the case in the implementation\r\n\r\nedit: slow tests for llava pass"
+    ],
+    "merged": true,
+    "created_at": "2024-03-18T10:26:17Z",
+    "issue_context": {
+        "number": 28184,
+        "title": "LLaVa Left Padding Got Weird Results",
+        "body": "### System Info\n\nReproduce : \r\n\r\n```python\r\nfrom PIL import Image\r\nimport requests\r\nfrom transformers import AutoProcessor, LlavaForConditionalGeneration\r\n\r\nmodel = LlavaForConditionalGeneration.from_pretrained(\"llava-hf/llava-1.5-7b-hf\").to(\r\n    \"cuda\"\r\n)\r\nprocessor = AutoProcessor.from_pretrained(\"llava-hf/llava-1.5-7b-hf\")\r\n\r\nprompt1 = \"<image>\\n<image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"\r\nprompt2 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nprompt3 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nurl1 = \"https://images.unsplash.com/photo-1552053831-71594a27632d?q=80&w=3062&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nurl2 = \"https://images.unsplash.com/photo-1617258683320-61900b281ced?q=80&w=3087&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nimage1 = Image.open(requests.get(url1, stream=True).raw)\r\nimage2 = Image.open(requests.get(url2, stream=True).raw)\r\n\r\ninputs = processor(\r\n    text=[prompt1, prompt2, prompt3],\r\n    images=[image1, image2, image1, image2],\r\n    return_tensors=\"pt\",\r\n    padding=True,\r\n)\r\nfor key in inputs:\r\n    inputs[key] = inputs[key].to(\"cuda\")\r\n    print(key, inputs[key].shape)\r\n\r\n# Generate\r\ngenerate_ids = model.generate(**inputs, max_length=512)\r\noutputs = processor.batch_decode(\r\n    generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False\r\n)\r\n\r\nprint(outputs)\r\n```\r\n\r\nThis will outputs : \r\n```Result\r\n[\"\\n \\nUSER: What's the the difference of two images?\\nASSISTANT: In the two images, the primary difference is the presence of a flower in the dog's mouth. In the first image, the dog is holding a flower in its mouth, while in the second image, the dog is not holding a flower. This subtle change in the scene highlights the dog's interaction with the flower, and it may evoke different emotions or interpretations depending on the viewer's perspective.\", '\\nUSER: Describe the image.\\nASSISTANT: The dog is a \\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n', '\\nUSER: Describe the image.\\nASSISTANT: The \\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\u042a schlie\u00df']\r\n```\r\n\r\nI checked images are rightly placed. but for batch2 and 3 \r\nIt's consist of lots of padding (False x 583)\r\n[False x 583, False, True x 576  , False, False, False, False, False, False, False, False, False, False, False, False, False, False]\r\n\r\nI guess llava doesn't see this kind of prefix on training phase would result in weird behavior.\n\n### Who can help?\n\n_No response_\n\n### Information\n\n- [ ] The official example scripts\n- [ ] My own modified scripts\n\n### Tasks\n\n- [ ] An officially supported task in the `examples` folder (such as GLUE/SQuAD, ...)\n- [ ] My own task or dataset (give details below)\n\n### Reproduction\n\nstated at above\n\n### Expected behavior\n\nskip",
+        "comments": [
+            "cc @younesbelkada @ArthurZucker ",
+            "hi @SeungyounShin \r\nWhat transformers version are you using?\r\nin the first input `prompt1 = \"<image>\\n<image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"` you passed two images; note multi-image query is not well supported for Llava-like models as they have not excplicitly trained for that according to the authors.",
+            "btw you can also to `inputs = inputs.to(\"cuda\")`",
+            "I am currently using `4.37.0.dev0`\r\n\r\n\r\n```python\r\nprompt1 = \"<image>\\n<image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"\r\nprompt2 = \"<image>\\n<image>\\nUSER: Describe the two images.\\nASSISTANT:\"\r\n# prompt3 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nurl1 = \"https://images.unsplash.com/photo-1552053831-71594a27632d?q=80&w=3062&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nurl2 = \"https://images.unsplash.com/photo-1617258683320-61900b281ced?q=80&w=3087&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nimage1 = Image.open(requests.get(url1, stream=True).raw)\r\nimage2 = Image.open(requests.get(url2, stream=True).raw)\r\n\r\ninputs = processor(\r\n    text=[prompt1, prompt2],\r\n    images=[image1, image2, image1, image2],\r\n    return_tensors=\"pt\",\r\n    padding=True,\r\n)\r\n```\r\nThis will output :\r\n```text\r\n [1]\r\nUSER: What's the the difference of two images?\r\nASSISTANT: In the two images, the primary difference is the presence of a flower in the dog's mouth. In the first image, the dog is holding a flower in its mouth, while in the second image, the dog is not holding a flower. This subtle change in the scene highlights the dog's interaction with the flower, and it may evoke different emotions or interpretations depending on the viewer's perspective.\r\n\r\n [2]\r\nUSER: Describe the two images.\r\nASSISTANT: The two images show a cute brown and white dog standing on a grassy hill. In one image, the dog is holding a green leaf in its mouth, while in the other, it is holding a yellow flower. Both images capture the dog's playful and curious nature as it interacts with its surroundings.\r\n```\r\n\r\n\r\nThe implementation appears to be functioning correctly. Upon reviewing, I noticed that the [final embeddingl](https://github.com/huggingface/transformers/blob/260b9d2179ea9592b24ff102ab9ea672f6a4f3ef/src/transformers/models/llava/modeling_llava.py#L304) effectively supports multiple images.",
+            "[modeling_llava.py#L304](https://github.com/huggingface/transformers/blob/260b9d2179ea9592b24ff102ab9ea672f6a4f3ef/src/transformers/models/llava/modeling_llava.py#L304) is this expected behavior?\r\n\r\nConsidering the relationship between image patches. Specifically, if image patch 100 references image patch 84, it appears there shouldn't be any issue. I haven't come across any mention of masking related to image patches in the LLaVa paper. Is this approach used in the official implementation of `LLaVa`?\r\n\r\n\r\n**It would be beneficial to have an example of fine-tuning for multi-images. Would you be open to accepting a Pull Request (PR) that includes an example of fine-tuning on multi-images?\r\n\r\n",
+            "Hi @SeungyounShin \r\nIndeed it seems you are correct, despite the model not being explicitly trained for this, it seems to perform well on some examples as you shared, which is very nice! cc @haotian-liu for visibility! \r\nI suspect something is off with SDPA (`torch.scaled_dot_product_attention` not being able to deal with arbitraty attention masks. I need some time to properly investigate how to fix this. Meanwhile you can do two things\r\n1- Use the `eager` attention implementation:\r\n\r\n```diff\r\nfrom PIL import Image\r\nimport requests\r\nfrom transformers import AutoProcessor, LlavaForConditionalGeneration\r\n\r\nmodel = LlavaForConditionalGeneration.from_pretrained(\"llava-hf/llava-1.5-7b-hf\").to(\r\n+ model = LlavaForConditionalGeneration.from_pretrained(\"llava-hf/llava-1.5-7b-hf\", attn_implementation=\"eager\").to(\r\n    \"cuda\"\r\n)\r\nprocessor = AutoProcessor.from_pretrained(\"llava-hf/llava-1.5-7b-hf\")\r\n\r\nprompt1 = \"<image>\\n<image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"\r\nprompt2 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nprompt3 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nurl1 = \"https://images.unsplash.com/photo-1552053831-71594a27632d?q=80&w=3062&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nurl2 = \"https://images.unsplash.com/photo-1617258683320-61900b281ced?q=80&w=3087&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nimage1 = Image.open(requests.get(url1, stream=True).raw)\r\nimage2 = Image.open(requests.get(url2, stream=True).raw)\r\n\r\ninputs = processor(\r\n    text=[prompt1, prompt2, prompt3],\r\n    images=[image1, image2, image1, image2],\r\n    return_tensors=\"pt\",\r\n    padding=True,\r\n)\r\nfor key in inputs:\r\n    inputs[key] = inputs[key].to(\"cuda\")\r\n    print(key, inputs[key].shape)\r\n\r\n# Generate\r\ngenerate_ids = model.generate(**inputs, max_length=512)\r\noutputs = processor.batch_decode(\r\n    generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False\r\n)\r\n\r\nprint(outputs)\r\n```\r\n2- Process the prompts one-by-one instead of performing batched generation\r\n\r\ncc @fxmarty as well as this is about SDPA",
+            "@younesbelkada is this in the end not related to sdpa?",
+            "@fxmarty I think it is related to SDPA as Llava model creates non-standard attention mask and the script fails for SDPA ",
+            "@younesbelkada i also found similar issue when i tried to implement batch inference. do you know why it creates non-standard attention mask? it should theoretically use the standard autoregressive mask?",
+            "@haotian-liu I think this happens in the case you try to have different numbers of images per prompt + multi-turn chat. If let's say you have 2 images in the first prompt and one image on the second prompt, your attention mask will look like\r\n\r\n```bash\r\n[image 1] [prompt 1] [image 2] [prompt 2]\r\n0 0 0.. 0  1 1 1 1 1 .. 1 0 0 0 ... 0 1 1 1 1 1 ... 1\r\n[image 3] [prompt 3]\r\n0 0 0.. 0  1 1 1 1 1 .. 1\r\n```\r\n\r\nI think the reason that for the prompt\r\n```python\r\nprompt1 = \"<image>\\n<image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"\r\nprompt2 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nprompt3 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nurl1 = \"https://images.unsplash.com/photo-1552053831-71594a27632d?q=80&w=3062&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nurl2 = \"https://images.unsplash.com/photo-1617258683320-61900b281ced?q=80&w=3087&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nimage1 = Image.open(requests.get(url1, stream=True).raw)\r\nimage2 = Image.open(requests.get(url2, stream=True).raw)\r\n\r\ninputs = processor(\r\n    text=[prompt1, prompt2, prompt3],\r\n    images=[image1, image2, image1, image2],\r\n    return_tensors=\"pt\",\r\n    padding=True,\r\n)\r\n```\r\nWe are getting a non-standard attention mask is the presence of `\\n` between the two `<image>` tokens for `prompt1`. Can you try out the following:\r\n```diff\r\n- prompt1 = \"<image>\\n<image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"\r\n+ prompt1 = \"<image><image>\\nUSER: What's the the difference of two images?\\nASSISTANT:\"\r\nprompt2 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nprompt3 = \"<image>\\nUSER: Describe the image.\\nASSISTANT:\"\r\nurl1 = \"https://images.unsplash.com/photo-1552053831-71594a27632d?q=80&w=3062&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nurl2 = \"https://images.unsplash.com/photo-1617258683320-61900b281ced?q=80&w=3087&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D\"\r\nimage1 = Image.open(requests.get(url1, stream=True).raw)\r\nimage2 = Image.open(requests.get(url2, stream=True).raw)\r\n\r\ninputs = processor(\r\n    text=[prompt1, prompt2, prompt3],\r\n    images=[image1, image2, image1, image2],\r\n    return_tensors=\"pt\",\r\n    padding=True,\r\n)\r\n```\r\nThat way the attention mask will become standard I believe cc @haotian-liu what do you think?",
+            "@younesbelkada Thank you! i thought it may be due to a different reason, as the strange behavior occured when I previously tried to do batch inference with one image for each sample. I'll try to find another example later to see if it still exists.",
+            "Hi, this should be fixed by https://github.com/huggingface/transformers/pull/29389. Could you give a second try? Thank you for the report!"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 65774,
+            "commit_id": "38b292900d904dd40cee7550288fa1e683a56769",
+            "original_commit_id": "fadb053379b3ef24c4ec8e6d7d58555af21f58db",
+            "path": "tests/models/llava/test_modeling_llava.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 480,
+            "original_line": 310,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "This test itself was wrong. The input_ids is `tensor([[32001, 32001, 32001,     1,  3148,  1001, 29901, 29871, 32000, 29871,\r\n            13,  5618,   526,   278,  2712,   306,   881,   367,   274,  1300,\r\n          2738,  1048,   746,   306,  6493,   445,  2058, 29973,  1724,   881,\r\n           306,  6963,   411,   592, 29973,    13, 22933,  9047, 13566, 29901],\r\n        [    1,  3148,  1001, 29901, 29871, 32000, 29871,    13,  5618,   338,\r\n           445, 29973,    13, 22933,  9047, 13566, 29901,  7803,   274,  1446,\r\n         19214,   373,   263,  6592, 29991,    13, 11889, 29901, 29871, 32000,\r\n         29871,    13,  2855,   445, 29973,    13, 22933,  9047, 13566, 29901]],\r\n       device='cuda:0')`, with `32000` being the image tokens. The first sequences visibly see only the first image, so the output should not be different compared to https://github.com/huggingface/transformers/blob/00c1d87a7d5c8dfb4554370983b5a3f7c069edd7/tests/models/llava/test_modeling_llava.py#L245-L265, should it @younesbelkada?\r\n\r\nhttps://huggingface.co/llava-hf/llava-1.5-7b-hf/blob/main/config.json#L6"
+            ]
+        },
+        {
+            "hunk_id": 65779,
+            "commit_id": "38b292900d904dd40cee7550288fa1e683a56769",
+            "original_commit_id": "fadb053379b3ef24c4ec8e6d7d58555af21f58db",
+            "path": "src/transformers/models/llava/modeling_llava.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 347,
+            "original_line": 347,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "I quite don't understand this comment, why do we need to mask out here because of using the past_key_values? ",
+                "A bit later in the code (specifically here: https://github.com/huggingface/transformers/blob/aa17cf986f0761382f3d6e591e985a42671c3fb7/src/transformers/models/llava/modeling_llava.py#L449), we check `past_key_values` value to find unattended tokens. This was not correct before because this added step `6.` was missing.\r\n\r\nOverall, this would be worth a larger refactor that would avoid regenerating full masks at every forward step in the generate. This PR is just a hotfix."
+            ]
+        },
+        {
+            "hunk_id": 65775,
+            "commit_id": "38b292900d904dd40cee7550288fa1e683a56769",
+            "original_commit_id": "fadb053379b3ef24c4ec8e6d7d58555af21f58db",
+            "path": "tests/models/llava/test_modeling_llava.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 487,
+            "original_line": 315,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "This test does not pass on main (trash is generated instead)"
+            ]
+        },
+        {
+            "hunk_id": 65777,
+            "commit_id": "38b292900d904dd40cee7550288fa1e683a56769",
+            "original_commit_id": "fadb053379b3ef24c4ec8e6d7d58555af21f58db",
+            "path": "src/transformers/models/llava/modeling_llava.py",
+            "start_line": 348,
+            "original_start_line": 344,
+            "start_side": "RIGHT",
+            "line": 351,
+            "original_line": 347,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        new_token_positions = new_token_positions * (input_ids != self.pad_token_id)\r\n```\r\nshould this not work as well? given that we create the `new_token_positions` with a cumsum we could also do it before (right after the cumsum)\r\n",
+                "not sure which one will end up being faster",
+                "maybe"
+            ]
+        },
+        {
+            "hunk_id": 65776,
+            "commit_id": "38b292900d904dd40cee7550288fa1e683a56769",
+            "original_commit_id": "fadb053379b3ef24c4ec8e6d7d58555af21f58db",
+            "path": "src/transformers/models/llava/modeling_llava.py",
+            "start_line": 347,
+            "original_start_line": 343,
+            "start_side": "RIGHT",
+            "line": 352,
+            "original_line": 348,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "As later `batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)` is used, this is necessary",
+                "I don't see why - could you explain a little bit more? The previous code didn't modify `first_layer_past_key_value`"
+            ]
+        },
+        {
+            "hunk_id": 65778,
+            "commit_id": "38b292900d904dd40cee7550288fa1e683a56769",
+            "original_commit_id": "fadb053379b3ef24c4ec8e6d7d58555af21f58db",
+            "path": "src/transformers/models/llava/configuration_llava.py",
+            "start_line": 150,
+            "original_start_line": 150,
+            "start_side": "RIGHT",
+            "line": 153,
+            "original_line": 153,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this good @NielsRogge @amyeroberts ?",
+                "Shouldn't we remove the `@property` annotator above? That fixed https://github.com/huggingface/transformers/issues/29789 for me. Isn't property for immutable things (whereas the vocabulary size can change? cc @amyeroberts ",
+                "Properties aren't for immutable things (this is the value of a setter). The property enables us to emit a deprecation warning if the property is accessed as an attribute.\r\n\r\nRemoving the property annotation would mean that previous usage of `config.vocab_size` would break, and people would have to use `config.vocab_size()`"
+            ]
+        }
+    ]
+}

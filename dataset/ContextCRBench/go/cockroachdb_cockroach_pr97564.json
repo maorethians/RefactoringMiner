@@ -1,0 +1,253 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 97564,
+    "lang": "go",
+    "pr_title": "kvserver: narrow down 'finishing a proposal with outstanding reproposal'",
+    "pr_body": "In #94633, I introduced[^1] an assertion that attempted to catch cases\r\nin which we might otherwise accidentally end up applying a proposal\r\ntwice.\r\n\r\nThis assertion had a false positive.\r\n\r\nI was able to reproduce the failure within ~minutes via\r\n`./experiment.sh` in #97173 as of 33dcdef.\r\n\r\nBetter testing of these cases would be desirable. Unfortunately, while\r\nthere is an abstraction over command application (`apply.Task`), most\r\nof the logic worth testing lives in `(*replicaAppBatch)` which is\r\nessentially a `*Replica` with more moving parts attached. This does\r\nnot lend itself well to unit testing.\r\n\r\nI had a run[^2][^3][^4] earlier this year to make log application\r\nstandalone, but then didn't have enough time to follow through.\r\nIt would be desirable to do so at a later date, perhaps with\r\nthe explicit goals of having interactions like the one discussion\r\nin this PR unit become testable.\r\n\r\n[^4]: #93309\r\n[^3]: #93266\r\n[^2]: #93239\r\n\r\n[^1]: https://github.com/cockroachdb/cockroach/pull/94633/files#diff-50e458584d176deae52b20a7c04461b3e4110795c8c9a307cf7ee6696ba6bc60R238\r\n\r\nThis assertion was previously trying to assert too much at a distance\r\nand was not only incorrect, but additionally inscrutable.\r\n\r\nIt was mixing up two assertions, the first one of which is sensible:\r\nIf an entry is accepted, it must not be superseded by inflight proposal.\r\nIf this were violated, this superseded proposal could also apply,\r\nresulting in a failure of replay protection. This assertion is now\r\nstill around as a stand-alone assertion.\r\n\r\nThe other half of the assertion was more confused: if an entry is\r\nrejected, it was claiming that it couldn't also be superseded. The\r\nthinking was that if a superseding log entry exists, maybe it could\r\napply, and that would be bad since we just told the waiting client\r\nthat their proposal got rejected.\r\n\r\nThis reasoning is incorrect, as the following example shows. Consider\r\nthe following initial situation:\r\n\r\n    [lease seq is 1]\r\n    log idx 99:  unrelated cmd at LAI 10000, lease seq = 1\r\n    log idx 100: cmd X at LAI 10000, lease seq = 1\r\n\r\nAnd next:\r\n\r\n- a new lease enters the log at idx 101 (lease seq = 2)\r\n- an identical copy of idx 100 enters the log at idx 102\r\n- we apply idx 100, leading to superseding reproposal at idx 103\r\n\r\nresulting in the log:\r\n\r\n    [lease seq is 1]\r\n    log idx 99: unrelated cmd at LAI 10000, lease seq = 1\r\n    log idx 100: cmd X at LAI 10000, lease seq = 1\r\n    log idx 101: lease seq = 2\r\n    log idx 102: (same as idx 100)\r\n    log idx 103: cmd X at LAI = 20000, lease seq = 1\r\n\r\nDuring application of idx 102, we get a *permanent* rejection and yet\r\nthe entry is superseded (by the proposal at idx 103). This would\r\nerroneously trigger the assertion, even though this is a legal sequence\r\nof events with no detrimental outcomes: the superseding proposal will\r\nalways have the same lease sequence as its superseded copies, so it\r\nwill also fail.\r\n\r\nI initially tried only soften the assertion a *little bit*. Observing\r\nthat the example above led to a *permanent* rejection, should we only\r\nrequire that a proposal (which in this assertion is always local) is not\r\nsuperseded if it got rejected due to its lease index (which implies that\r\nit passed the lease check)? It turns out that this is primarily an\r\nassertion on when superseded proposals are counted as \"local\" at this\r\npoint in the code: if there were multiple copies of this rejected\r\nproposal in the current `appTask` (i.e. the current `CommittedEntries`\r\nslice handed to us for application by raft), then all copies are\r\ninitially local; and a copy that successfully spawns a superseding\r\nproposal would be made non-local from that point on. On the face\r\nof it, All other copies in the same `appTask` would now hit the\r\nassertion (erroneously): they are local, they are rejected, so\r\nwhy don't they enter the branch? The magic ingredient is that\r\nif an entry is superseded when we handle the lease index rejection,\r\nwe also unlink the proposal from it. So these never enter this\r\npath since it's not local at this point.\r\n\r\nFor example, if these are the log entries to apply (all at valid lease\r\nseq):\r\n\r\n    log idx 99: unrelated cmd at LAI 10000\r\n    log idx 100: cmd X at LAI 10000\r\n    log idx 101: (identical copy of idx 100)\r\n\r\nand idxs 99-101 are applied in one batch, then idx 100 would spawn\r\na reproposal at a new lease applied index:\r\n\r\n    log idx 99: unrelated cmd at LAI 10000\r\n    log idx 100: cmd X at LAI 10000             <- applied\r\n    log idx 101: (identical copy of idx 100)\r\n    log idx 100: cmd X at LAI 20000             <- not in current batch\r\n\r\nWhen we apply 101, we observe an illegal lease index, but the proposal\r\nsupersedes the entry, so we mark it as non-local and don't enter the\r\nbranch that contains the assertion.\r\n\r\nThe above reasoning is very difficult to understand, and it happens\r\ntoo far removed from where the interesting state changes happen.\r\n\r\nAlso, for testing purposes it is interesting to introduce \"errors\"\r\nin the lease applied index assignment to artificially exercise these\r\nreproposal mechanisms. In doing so, these assertions can trip because\r\nthe lease applied index assigned to a reproposal might accidentally\r\n(or intentionally!) match the existing lease applied index, in which\r\ncase copies of the command in the same batch now *don't* consider\r\nthemselves superseded.\r\n\r\nThe value of this testing outweighs the very limited benefit of\r\nthis branch of the assertion. An argument could even be made that\r\nthis assertion alone as negative benefit due to its complexity.\r\n\r\nWe are removing it in this commit and will instead work towards\r\nsimplifying the mechanisms that played a role in explaining the\r\nasssertion.\r\n\r\nCloses https://github.com/cockroachdb/cockroach/issues/97102.\r\nCloses https://github.com/cockroachdb/cockroach/pull/97347.\r\nCloses #97447.\r\nCloses #97612.\r\n\r\nNo release note because unreleased (except perhaps in an alpha).\r\n\r\nEpic: none\r\nRelease note: None\r\n\r\n",
+    "pr_comments": [
+        "It looks like your PR touches production code but doesn't add or edit any test code. Did you consider adding tests to your PR?\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>",
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/97564)\n<!-- Reviewable:end -->\n",
+        "TFTR!\r\n\r\n> Is this basically a rollback\r\n\r\nI checked and yes, almost. There is this part that hasn't been brought back: https://github.com/cockroachdb/cockroach/pull/97564#discussion_r1116704958",
+        "bors r=pavelkalinnikov",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=8849926&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2023-02-23T15:27:27Z",
+    "issue_context": {
+        "number": 97612,
+        "title": "roachtest: clearrange/checks=false/rangeTs=false failed",
+        "body": "roachtest.clearrange/checks=false/rangeTs=false [failed](https://teamcity.cockroachdb.com/buildConfiguration/Cockroach_Nightlies_RoachtestNightlyGceBazel/8820223?buildTab=log) with [artifacts](https://teamcity.cockroachdb.com/buildConfiguration/Cockroach_Nightlies_RoachtestNightlyGceBazel/8820223?buildTab=artifacts#/clearrange/checks=false/rangeTs=false) on master @ [0d3393b0623a5c258b25725f64f3689e2f54667b](https://github.com/cockroachdb/cockroach/commits/0d3393b0623a5c258b25725f64f3689e2f54667b):\n\n\n```\ntest artifacts and logs in: /artifacts/clearrange/checks=false/rangeTs=false/run_1\n(cluster.go:1956).Run: output in run_105101.069200958_n1-10_cockroach-workload-r: ./cockroach workload run kv --concurrency=32 --duration=1h returned: context canceled\n(monitor.go:127).Wait: monitor failure: monitor command failure: unexpected node event: 10: dead (exit status 7)\n```\n<p>Parameters: <code>ROACHTEST_cloud=gce</code>\n, <code>ROACHTEST_cpu=16</code>\n, <code>ROACHTEST_encrypted=false</code>\n, <code>ROACHTEST_fs=ext4</code>\n, <code>ROACHTEST_localSSD=true</code>\n, <code>ROACHTEST_ssd=0</code>\n</p>\n<details><summary>Help</summary>\n<p>\n\n\nSee: [roachtest README](https://github.com/cockroachdb/cockroach/blob/master/pkg/cmd/roachtest/README.md)\n\n\n\nSee: [How To Investigate \\(internal\\)](https://cockroachlabs.atlassian.net/l/c/SSSBr8c7)\n\n</p>\n</details>\n/cc @cockroachdb/storage\n<sub>\n\n[This test on roachdash](https://roachdash.crdb.dev/?filter=status:open%20t:.*clearrange/checks=false/rangeTs=false.*&sort=title+created&display=lastcommented+project) | [Improve this report!](https://github.com/cockroachdb/cockroach/tree/master/pkg/cmd/internal/issues)\n</sub>\n\n\nJira issue: CRDB-24786",
+        "comments": [
+            "n10 died with a fatal error in `(*replicaStateMachine).ApplySideEffects`\r\n```\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165  finishing proposal with outstanding reproposal at a higher max lease index: \u2039Term:8 Index:185037 Type:EntryNormal Data:\"\\000eT\\376\\356\\277\\036\\024\\0340uj$B\\n\\010\\366\\361\\243\\367\\354\\251\\257\\243\\027\\222\\001\\025\\t\\366\\370\\350\\316N\\275F\\027 D(\\002048\\002@\\020H\\002r0\\n.\\000\\000\\000\\000\\000\\000\\000\\000\\001\\000\\000\\000\\001\\027\\366p\\211\\200\\236\\2617\\226\\333\\316/\\303\\210\\000\\027F\\275N\\316\\350\\370\\366\\t\\010Z\\233\\345\\251\\n&\\001\\355 \\246\\245\\013\\212\\001\\n\\010\\203\\304\\361\\342\\341\\251\\257\\243\\027\"\u203a\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !goroutine 456 [running]:\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/util/log.getStacks(0x1)\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/get_stacks.go:25 +0x89\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/util/log.(*loggerT).outputLogEntry(0xc000dedc00, {{{0xc001cd6060, 0x24}, {0x0, 0x0}, {0x590b7d2, 0x1}, {0x5a8ce17, 0x2}}, 0x1746bd4ecfd4b4e7, ...})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/clog.go:262 +0x97\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/util/log.logfDepthInternal({0x6d3c548, 0xc00cabe540}, 0x2, 0x4, 0x0, 0x0?, {0x5a37b3a, 0x4f}, {0xc010c74000, 0x1, ...})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/channels.go:106 +0x645\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/util/log.logfDepth(...)\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/channels.go:39\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/util/log.Fatalf(...)\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/bazel-out/k8-opt/bin/pkg/util/log/log_channels_generated.go:848\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*replicaStateMachine).ApplySideEffects(0xc00a626680, {0x6d3c548, 0xc00cabe540}, {0x6d7d6d8?, 0xc002c7d408})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/replica_application_state_machine.go:241 +0x925\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply.mapCheckedCmdIter({0x7f49c8652548?, 0xc00a626a50}, 0xc010c747d0)\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/apply/cmd.go:210 +0x158\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply.(*Task).applyOneBatch(0xc010c74cc8, {0x6d3c548, 0xc018f5e600}, {0x6d6d200, 0xc00a6269f0})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/apply/task.go:310 +0x1f8\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply.(*Task).ApplyCommittedEntries(0xc010c74cc8, {0x6d3c548, 0xc018f5e600})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/apply/task.go:251 +0x9a\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Replica).handleRaftReadyRaftMuLocked(_, {_, _}, {{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, ...}, ...})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/replica_raft.go:1004 +0x13b9\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Replica).handleRaftReady(_, {_, _}, {{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, ...}, ...})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/replica_raft.go:699 +0x17b\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Store).processReady(0xc0016f8a80, 0x6d3c548?)\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/store_raft.go:644 +0x145\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*raftScheduler).worker(0xc000953800, {0x6d3c548, 0xc007e12570})\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/scheduler.go:333 +0x235\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx.func2()\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/util/stop/stopper.go:470 +0x146\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !created by github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx\r\nF230224 10:54:17.434010 456 kv/kvserver/replica_application_state_machine.go:241 \u22ee [T1,n10,s10,r2479/2:\u2039/Table/112/1/-{74874\u2026-68474\u2026}\u203a,raft] 165 !\tgithub.com/cockroachdb/cockroach/pkg/util/stop/stopper.go:461 +0x43b\r\n```",
+            "Same issue as #97102. Should be fixed by #97564.",
+            "cc @cockroachdb/replication"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15202,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 283,
+            "original_line": 283,
+            "side": "RIGHT",
+            "original_position": 110,
+            "position": 117,
+            "subject_type": "line",
+            "review_comments": [
+                "Is the func comment still correct? The `return nil` case got less nuanced.",
+                "Good point, fixed."
+            ]
+        },
+        {
+            "hunk_id": 15970,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_state_machine.go",
+            "start_line": 247,
+            "original_start_line": 247,
+            "start_side": "RIGHT",
+            "line": 261,
+            "original_line": 261,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 77,
+            "subject_type": "line",
+            "review_comments": [
+                "This block is now equivalent to pre-#94633, right?",
+                "Correct.\r\n\r\nThe one thing that is gone is this part here:\r\n\r\nhttps://github.com/cockroachdb/cockroach/pull/94633/files#diff-50e458584d176deae52b20a7c04461b3e4110795c8c9a307cf7ee6696ba6bc60L243-L247\r\n\r\nGiven my track record of getting all assertions wrong, I'm slightly worried about that. I'm pretty sure that if a higher reproposal exists and the current proposal did not apply, then the current one got rejected permanently and then so will the higher one. I was considering bringing this back just for FUD reasons, but that could also be incorrect for all I know, I don't think these edges of the system have gotten much airplay until https://github.com/cockroachdb/cockroach/pull/97173. The code path was definitely never hit in tests."
+            ]
+        },
+        {
+            "hunk_id": 15200,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 241,
+            "original_line": 241,
+            "side": "LEFT",
+            "original_position": 84,
+            "position": 141,
+            "subject_type": "line",
+            "review_comments": [
+                "This is the `return nil` that would then set the caller's `pErr` to `nil`.",
+                "There is another `return nil` below btw. Good that there its meaning is less overloaded now."
+            ]
+        },
+        {
+            "hunk_id": 15967,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 241,
+            "original_line": 241,
+            "side": "LEFT",
+            "original_position": 84,
+            "position": 141,
+            "subject_type": "line",
+            "review_comments": [
+                "This is the `return nil` that would then set the caller's `pErr` to `nil`.",
+                "There is another `return nil` below btw. Good that there its meaning is less overloaded now."
+            ]
+        },
+        {
+            "hunk_id": 15968,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 165,
+            "original_line": 165,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "This inverts the condition in the (now removed) early return in `tryReproposeWithNewLeaseIndex`."
+            ]
+        },
+        {
+            "hunk_id": 14455,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 283,
+            "original_line": 283,
+            "side": "RIGHT",
+            "original_position": 110,
+            "position": 117,
+            "subject_type": "line",
+            "review_comments": [
+                "Is the func comment still correct? The `return nil` case got less nuanced.",
+                "Good point, fixed."
+            ]
+        },
+        {
+            "hunk_id": 15203,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_state_machine.go",
+            "start_line": 247,
+            "original_start_line": 247,
+            "start_side": "RIGHT",
+            "line": 261,
+            "original_line": 261,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 77,
+            "subject_type": "line",
+            "review_comments": [
+                "This block is now equivalent to pre-#94633, right?",
+                "Correct.\r\n\r\nThe one thing that is gone is this part here:\r\n\r\nhttps://github.com/cockroachdb/cockroach/pull/94633/files#diff-50e458584d176deae52b20a7c04461b3e4110795c8c9a307cf7ee6696ba6bc60L243-L247\r\n\r\nGiven my track record of getting all assertions wrong, I'm slightly worried about that. I'm pretty sure that if a higher reproposal exists and the current proposal did not apply, then the current one got rejected permanently and then so will the higher one. I was considering bringing this back just for FUD reasons, but that could also be incorrect for all I know, I don't think these edges of the system have gotten much airplay until https://github.com/cockroachdb/cockroach/pull/97173. The code path was definitely never hit in tests."
+            ]
+        },
+        {
+            "hunk_id": 14454,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 165,
+            "original_line": 165,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "This inverts the condition in the (now removed) early return in `tryReproposeWithNewLeaseIndex`."
+            ]
+        },
+        {
+            "hunk_id": 15969,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 283,
+            "original_line": 283,
+            "side": "RIGHT",
+            "original_position": 110,
+            "position": 117,
+            "subject_type": "line",
+            "review_comments": [
+                "Is the func comment still correct? The `return nil` case got less nuanced.",
+                "Good point, fixed."
+            ]
+        },
+        {
+            "hunk_id": 14453,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 241,
+            "original_line": 241,
+            "side": "LEFT",
+            "original_position": 84,
+            "position": 141,
+            "subject_type": "line",
+            "review_comments": [
+                "This is the `return nil` that would then set the caller's `pErr` to `nil`.",
+                "There is another `return nil` below btw. Good that there its meaning is less overloaded now."
+            ]
+        },
+        {
+            "hunk_id": 15201,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_result.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 165,
+            "original_line": 165,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "This inverts the condition in the (now removed) early return in `tryReproposeWithNewLeaseIndex`."
+            ]
+        },
+        {
+            "hunk_id": 14456,
+            "commit_id": "554a5d5e28b205d78242d23bc827e60f8033453c",
+            "original_commit_id": "0a60831afbdcd71f1ed31699bb37270852bf4865",
+            "path": "pkg/kv/kvserver/replica_application_state_machine.go",
+            "start_line": 247,
+            "original_start_line": 247,
+            "start_side": "RIGHT",
+            "line": 261,
+            "original_line": 261,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 77,
+            "subject_type": "line",
+            "review_comments": [
+                "This block is now equivalent to pre-#94633, right?",
+                "Correct.\r\n\r\nThe one thing that is gone is this part here:\r\n\r\nhttps://github.com/cockroachdb/cockroach/pull/94633/files#diff-50e458584d176deae52b20a7c04461b3e4110795c8c9a307cf7ee6696ba6bc60L243-L247\r\n\r\nGiven my track record of getting all assertions wrong, I'm slightly worried about that. I'm pretty sure that if a higher reproposal exists and the current proposal did not apply, then the current one got rejected permanently and then so will the higher one. I was considering bringing this back just for FUD reasons, but that could also be incorrect for all I know, I don't think these edges of the system have gotten much airplay until https://github.com/cockroachdb/cockroach/pull/97173. The code path was definitely never hit in tests."
+            ]
+        }
+    ]
+}

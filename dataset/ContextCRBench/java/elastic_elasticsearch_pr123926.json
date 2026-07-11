@@ -1,0 +1,235 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 123926,
+    "lang": "java",
+    "pr_title": "System data streams are not being upgraded in the feature migration API",
+    "pr_body": "This commit adds support for system data streams reindexing. The system data stream migration extends the existing system indices migration task and uses the [data stream reindex API](https://www.elastic.co/guide/en/elasticsearch/reference/8.x/data-stream-reindex-api.html).\r\nThe system index migration task starts a reindex data stream task and tracks its status every second. Only one system index or system data stream is migrated at a time. If a data stream migration fails, the entire system index migration task will also fail.\r\n \r\nCloses: ES-10934\r\nCloses: https://github.com/elastic/elasticsearch/issues/122949",
+    "pr_comments": [
+        "Hi @alexey-ivanov-es, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+        "OK, I think I see two bugs here, one minor and one less so. First, the minor one:\r\nI see this in my logs about half the time I do an upgrade:\r\n```\r\n[2025-03-07T14:00:12,920][ERROR][o.e.c.m.SystemIndexMetadataUpgradeService] [v7.17.28-1] System index metadata upgrade failed java.lang.NullPointerException: Cannot invoke \"org.elasticsearch.cluster.metadata.IndexMetadata.getIndex()\" because \"indexMetadata\" is null\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.metadata.SystemIndexMetadataUpgradeService.shouldBeSystem(SystemIndexMetadataUpgradeService.java:171)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.metadata.SystemIndexMetadataUpgradeService$SystemIndexMetadataUpgradeExecutor.updateIndices(SystemIndexMetadataUpgradeService.java:242)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.metadata.SystemIndexMetadataUpgradeService$SystemIndexMetadataUpgradeExecutor.execute(SystemIndexMetadataUpgradeService.java:209)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService.innerExecuteTasks(MasterService.java:1075)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService.executeTasks(MasterService.java:1038)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService.executeAndPublishBatch(MasterService.java:245)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService$BatchingTaskQueue$Processor.lambda$run$2(MasterService.java:1691)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.action.ActionListener.run(ActionListener.java:452)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService$BatchingTaskQueue$Processor.run(MasterService.java:1688)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService$5.lambda$doRun$0(MasterService.java:1283)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.action.ActionListener.run(ActionListener.java:452)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.cluster.service.MasterService$5.doRun(MasterService.java:1262)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.common.util.concurrent.ThreadContext$ContextPreservingAbstractRunnable.doRun(ThreadContext.java:1044)\r\n        at org.elasticsearch.server@8.19.0-SNAPSHOT/org.elasticsearch.common.util.concurrent.AbstractRunnable.run(AbstractRunnable.java:27)\r\n        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1095)\r\n        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:619)\r\n        at java.base/java.lang.Thread.run(Thread.java:1447)\r\n```\r\nHere's why I think it happens:\r\n\r\n- I have a system data stream, `.fleet-actions-results` that was created in v7. I run /_migration/system_features in 8.19.\r\n- The system migration sees that it needs to upgrade the fleet data stream `.fleet-actions-results`.\r\n- The system migration calls the reindex data stream API.\r\n- When the reindex data stream API finishes, it swaps the new index into the `.fleet-actions-results data stream`, and the old one out. This creates a cluster state change\r\n- The system migration sees the cluster state change since SystemIndexMetadataUpgradeService is a ClusterStateListener. It sees that there is a v7 system index named `.ds-.fleet-actions-results-2025.03.07-000001` that is not in a data stream. This is a system index that we need to update!\r\n- The reindex data stream API deletes `.ds-.fleet-actions-results-2025.03.07-000001` now that we no longer need it\r\n- The system migration API is attempting to reindex `.ds-.fleet-actions-results-2025.03.07-000001`. But it has been deleted. So we get the exception above.\r\n\r\nThis exception is harmless. It's just happening because the index has been deleted in between when we decided we needed to handle it and when we went to handle it. I think we ought to just have [SystemIndexMetadataUpgradeExecutor::updateIndices to continue in the for loop if indexMetadata is null](https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/metadata/SystemIndexMetadataUpgradeService.java#L243).",
+        "The other bug I think I'm seeing is that system indices become unreadable after upgrade. If I try to read `.fleet-actions-results` before the upgrade (with a header saying that I am the fleet product), it works fine. After doing an upgrade, making requests to the same index in the same way returns:\r\n```\r\n{\"error\":{\"root_cause\":[{\"type\":\"illegal_argument_exception\",\"reason\":\"Data stream(s) [.fleet-actions-results] may not be accessed by product [fleet]\"}],\"type\":\"illegal_argument_exception\",\"reason\":\"Data stream(s) [.fleet-actions-results] may not be accessed by product [fleet]\"},\"status\":400}\r\n```\r\nI think the problem is that [system data streams can only have indices starting with `.ds-<data_stream_name>-`](https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/indices/SystemDataStreamDescriptor.java#L134.), but the upgrade replaces the original index with one named `.migrated-ds-.fleet-actions-results-2025.03.07-000001`.",
+        "> My only remaining question with respect to design is whether we do/should add a block to the datastream to prevent write loss during a migration?\r\n\r\nAs I understand - no. The first step in data stream migration is to do a rollover, which creates a new write index for the data stream and all write requests will be send to it. And this new index was created with the current version, so doesn't need migration. @masseyke correct me if I'm wrong\r\n\r\n>Maybe we can have the help of fleet/datastore to manually test an upgrade before the release is cut?\r\n\r\nYes, I've already asked them to retest their system indices migration when this PR is merged: https://github.com/elastic/ingest-dev/issues/4826",
+        "@alexey-ivanov-es \r\n>As I understand - no. The first step in data stream migration is to do a rollover, which creates a new write index for the data stream and all write requests will be send to it. And this new index was created with the current version, so doesn't need migration. \r\n\r\nThat is correct: if the write index needs to be upgraded, we first do a rollover, so that the new write index has version 8.x .  Most writes should then go to the new write index, but it is still possible that writes go to the other backing indices if the backing indices are written too directly (rather than through the data stream name). Because of this, we actually do set a read-only block on the source backing indices while doing the reindex. ",
+        "@masseyke \r\n>System index metadata upgrade failed java.lang.NullPointerException\r\n\r\nI've added protection from that NPE. And I'll also create a separate ticket to review how we handle hidden/system status for data stream backing indices during their lifecycle.\r\n\r\n>The other bug I think I'm seeing is that system indices become unreadable after upgrade. If I try to read .fleet-actions-results before the upgrade (with a header saying that I am the fleet product), it works fine. After doing an upgrade, making requests to the same index in the same way returns:\r\n\r\nI've added a workaround for this. To properly fix the issue, we have a ticket: ES-10870\r\n\r\n",
+        "This looks pretty good to me. A couple of questions:\r\n\r\nThis ought to go into `main` and `9.0`, right? We don't need it right now, but this would probably be useful to build on when we deal with the 9->10 migration. If nothing else, we'll want the changes from [this commit](https://github.com/elastic/elasticsearch/pull/123926/commits/41b51923208cdf77f4d9d1891af4a224e516b48b) because the system data streams will blow up in 9.x without them.\r\n\r\n> Maybe we can have the help of fleet/datastore to manually test an upgrade before the release is cut?\r\n\r\nWe can just add migration of the fleet data stream to DataStreamsUpgradeIT (or any other upgrade IT), right?\r\n",
+        "@masseyke \r\n>This ought to go into main and 9.0, right? We don't need it right now, but this would probably be useful to build on when we deal with the 9->10 migration. If nothing else, we'll want the changes from [this commit](https://github.com/elastic/elasticsearch/pull/123926/commits/41b51923208cdf77f4d9d1891af4a224e516b48b) because the system data streams will blow up in 9.x without them.\r\n\r\nYes, this will be in 9.x/main branches with small modifications.\r\n\r\n>We can just add migration of the fleet data stream to DataStreamsUpgradeIT (or any other upgrade IT), right?\r\n\r\nI've already created [SystemIndicesUpgradeIT](https://github.com/elastic/elasticsearch/blob/1aba6780e1012ddf7f717bce9ec4089b5431477a/x-pack/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/SystemIndicesUpgradeIT.java), but I think it would be useful to retest it manually as well",
+        "> I've already created [SystemIndicesUpgradeIT](https://github.com/elastic/elasticsearch/blob/1aba6780e1012ddf7f717bce9ec4089b5431477a/x-pack/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/SystemIndicesUpgradeIT.java), but I think it would be useful to retest it manually as well\r\n\r\nAh, sorry, I had missed the addition of that test!",
+        "> LGTM, provided that there's been a bit of regression testing with security enabled to ensure we aren't breaking regular system index migration.\r\n\r\nIt looks like the new SystemIndicesUpgradeIT covers both a system index and a system data stream, and it runs with security enabled.",
+        "@masseyke \r\n>SystemIndicesUpgradeIT just failed for me\r\n\r\nDo you have an exception it failed with? It might be failing with ~ \"status is IN_PROGRESS, but expected NO_MIGRATION_NEEDED\" because migration sometimes takes more than 10 seconds, so I am going to increase timeout in `assertBusy`",
+        "> @masseyke\r\n> \r\n> > SystemIndicesUpgradeIT just failed for me\r\n> \r\n> Do you have an exception it failed with? It might be failing with ~ \"status is IN_PROGRESS, but expected NO_MIGRATION_NEEDED\" because migration sometimes takes more than 10 seconds, so I am going to increase timeout in `assertBusy`\r\n\r\nI thought I deleted my comment quickly enough, but apparently I didn't. :) It was failing for me because I didn't have your most recent commits. Once I pulled those, the problem went away.",
+        "## \ud83d\udc9a Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| \u2705 |  [8.18](https://github.com/elastic/elasticsearch/pull/124750)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/124750\">](https://github.com/elastic/elasticsearch/pull/124750) |"
+    ],
+    "merged": true,
+    "created_at": "2025-03-06T22:29:13Z",
+    "issue_context": {
+        "number": 122949,
+        "title": "System data streams are not being upgraded in the feature migration API",
+        "body": "See https://github.com/elastic/kibana/issues/211614 for an example of what this looks like to the end user. We have a system data stream, `.fleet-action-results` that has one or more old backing indices. The user calls the feature migration API (`POST /_migration/system_features`), which is supposed to upgrade all system indices and data streams. That does not return any errors. Then the deprecation info API (`GET /_migration/deprecations`) tells them that they need to reindex the `.fleet-action-results` data stream (`POST _data_stream/_modify`). Since it is a system data stream though, the user is not allowed to reindex it. They get stuck in a position where they cannot upgrade.",
+        "comments": [
+            "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+            "Hey team, wanted to check if there's any timeline for it already by any chance. Unfortunately the issue is stopping us from upgrading to 9.0. Thanks in advance for putting some priority on it :) cc: @dasansol92 @ferullo ",
+            "@tomsonpl I'm investigating the issue right now, but I can't provide an ETA yet. As soon as I have more information, I'll update you here",
+            "Thanks \ud83d\udc4d ",
+            "@tomsonpl We've identified the problem - `/_migration/system_features` doesn't take system data streams into account. I'm working on a fix, but it may be a big one and may take a few days to get merged",
+            "Hey @alexey-ivanov-es \ud83d\udc4b \nThanks for the work you've done!\nWanted to check up and see if the issue is resolved, or just partly resolved, since the PR mentions another PR to add system data streams migration. \n\nWondering if I could run my tests again, and not face the `.fleet-actions-results` issue? :) \n",
+            "Hi @tomsonpl,\n\nIt ended up requiring more work than I initially anticipated, but we're pretty close to resolving it ([PR](https://github.com/elastic/elasticsearch/pull/123926)). I expect it to be done by the end of this week. The PR that was merged didn't actually change the system's behavior but was required for the final changes.",
+            "Awesome, thank you \ud83d\udc4d ",
+            "Hey team, the issue seem partially resolved in my case - because initially the issue appeared when I tried to use the Upgrade Assistant, and `.fleet-actions-results` system index showed up as ES Critical issue, blocking the upgrade. \n\nTested today with 8.18 - the blocker on Upgrade assistant does not exist \ud83d\udc4d \nBut when trying to upgrade to 9.0 - ES doesn't stand up and the deployment crashes. \n\n<img width=\"1464\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/3549597c-95c7-412d-bfd7-79f5d1891b36\" />\n<img width=\"1476\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/be51103e-863b-4044-bf73-3a983e6b77f6\" />\n\nLooking at the logs there seem to be an issue with the same index: \nhttps://platform-logging.kb.us-west2.gcp.elastic-cloud.com/app/r/s/QaW23 \n\nTo me it seems connected to the previous issue, but please share your thoughts.\nThanks in advance!\n\ncc: @alexey-ivanov-es @masseyke @dasansol92 \n",
+            "The exception is: \n`The index [.ds-.fleet-actions-results-2025.03.17-000001/yh1rfZLtQz2utrMw5lAYzw] created in version [7.17.25-8.0.0] with current compatibility version [7.17.25-8.0.0] must be marked as read-only using the setting [index.blocks.write] set to [true] before upgrading to 9.0.0`\nAnd the data stream wasn't reindexed during migration.\n\n7.17.25-8.0.0 version looks suspicious to me, I'm investigating what it means and whether it might be a root cause of the problem",
+            "Update:\n\nWe debugged this with @alexey-ivanov-es , and apparently the fixes haven't gotten to 8.18 GA build yet.\nI double tested and the issue does not occur on snapshot build...\nSorry for the confusion :bows:\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 36914,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/action/TransportGetFeatureUpgradeStatusAction.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 166,
+            "original_line": 166,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "Ugly solution, if you see more elegant one please don't hesitate to suggest "
+            ]
+        },
+        {
+            "hunk_id": 36910,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/shards/ShardsAvailabilityHealthIndicatorService.java",
+            "start_line": 1214,
+            "original_start_line": 1214,
+            "start_side": "LEFT",
+            "line": 1236,
+            "original_line": 1236,
+            "side": "LEFT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this no longer needed?",
+                "At 1198 of this file `feature.getIndexDescriptors()` has changed to `feature.getSystemResourceDescriptors()` which includes both indices and data streams. The rest of the removed code was essentially the same as there, so now remaining code covers both indices and data streams."
+            ]
+        },
+        {
+            "hunk_id": 36912,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/task/SystemIndexMigrator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 751,
+            "original_line": 748,
+            "side": "RIGHT",
+            "original_position": 477,
+            "position": 499,
+            "subject_type": "line",
+            "review_comments": [
+                "Should this be at the warn level?",
+                "I don't think so. This code should only execute in one scenario: the migration of a data stream starts -> the [child task](https://github.com/elastic/elasticsearch/blob/8.x/x-pack/plugin/migrate/src/main/java/org/elasticsearch/xpack/migrate/task/ReindexDataStreamPersistentTaskExecutor.java#L52) migrating the data stream fails for some reason -> the user restarts the system indices migration task.\r\n\r\nSince the data stream migration task [retains](https://github.com/elastic/elasticsearch/blob/8.x/x-pack/plugin/migrate/src/main/java/org/elasticsearch/xpack/migrate/task/ReindexDataStreamPersistentTaskExecutor.java#L295) its status for 1 day, we need to \"cancel\" the existing task and start a new one to avoid getting the same failure result again. In this case, the failure has already been logged.\r\n\"Canceling\" the task here is part of normal operation, so I don't think it should be logged as error or warning.  I don't even want to make it info as it might be confusing to see"
+            ]
+        },
+        {
+            "hunk_id": 36911,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/task/SystemIndexMigrator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 306,
+            "original_line": 306,
+            "side": "RIGHT",
+            "original_position": 266,
+            "position": 267,
+            "subject_type": "line",
+            "review_comments": [
+                "Thanks for renaming this to something sensible"
+            ]
+        },
+        {
+            "hunk_id": 36919,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/task/SystemIndexMigrator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 622,
+            "original_line": 622,
+            "side": "RIGHT",
+            "original_position": 370,
+            "position": 370,
+            "subject_type": "line",
+            "review_comments": [
+                "IIUC, this doesn't block the datastream from receiving writes while the migration is in progress.  Should it?\r\n",
+                "https://github.com/elastic/elasticsearch/pull/123926#issuecomment-2715421657"
+            ]
+        },
+        {
+            "hunk_id": 36913,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/task/SystemIndexMigrator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 759,
+            "original_line": 756,
+            "side": "RIGHT",
+            "original_position": 485,
+            "position": 507,
+            "subject_type": "line",
+            "review_comments": [
+                "Could this go into an infinite recursive loop if another part of the system is causing persistent errors? e.g. `migrateDataStream()` -> `checkDataStreamMigrationStatus()` -> `cancelExistingDataStreamMigrationAndRetry()` ->  `cancelDataStreamMigration()` -> `migrateDataStream()` -> ...\r\n(I may be missunderstanding the flow control here)\r\n\r\nIn the original system index migration logic, an error would just stop the whole migration from continuing, such that a user would need to retry.  I spoke with @gwbrown, who mentioned that this was intentional in case there was a failure elsewhere in the system.  WDYT?",
+                "It shouldn't. The chain `migrateDataStream()` -> ... -> `cancelExistingDataStreamMigrationAndRetry()` is possible if a task for migrating that data stream already exists and is in a failed state. In that case, we cancel it and start a new one.\r\nA new task is only started if the cancellation is successful. This means we shouldn't receive a `ResourceAlreadyExistsException` (line 649), which means that `checkDataStreamMigrationStatus` is called with `restartMigrationOnError=false` (line 647).\r\n\r\nThere is still slight possibility that we end up at the line 714 not because of exception from `dataStreamMigrationFailed` (lines 701 and 703), but because of another error, I will try to improve handling there.",
+                ">an error would just stop the whole migration from continuing\r\n\r\nLogic here is similar to deleting existing index created during failed migration attempt",
+                "> Logic here is similar to deleting existing index created during failed migration attempt\r\n\r\nYeah that makes sense and it's a good idea to retry.  \r\n\r\n>There is still slight possibility that we end up at the line 714 not because of exception from dataStreamMigrationFailed (lines 701 and 703), but because of another error, I will try to improve handling there.\r\n\r\nExactly.  I'm worried that an issue in some other part of ES might cause this to just loop forever.",
+                ">Exactly. I'm worried that an issue in some other part of ES might cause this to just loop forever.\r\n\r\nShould be fixed now"
+            ]
+        },
+        {
+            "hunk_id": 36915,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/task/SystemIndexMigrator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 629,
+            "original_line": 629,
+            "side": "RIGHT",
+            "original_position": 377,
+            "position": 377,
+            "subject_type": "line",
+            "review_comments": [
+                "This request is cancellable if you give it the parent task id. I don't think that system index migration is cancellable though, right? I assume that's by design since most system indices and data streams are small, so no need to be able to cancel this?",
+                "> I don't think that system index migration is cancellable though, right? I assume that's by design since most system indices and data streams are small, so no need to be able to cancel this?\r\n\r\nYes\r\n\r\n>This request is cancellable if you give it the parent task id\r\n\r\nSystemIndexMigrator uses `ParentTaskAssigningClient`, I believe it should set the parent task id to the requests"
+            ]
+        },
+        {
+            "hunk_id": 36916,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/security/user/InternalUsers.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 231,
+            "original_line": 231,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't know enough about how/where this user is used.  Can this be abused? Are there other mechanisms which prevent a regular user from reindexing restricted indices?  This is probably a question for security.\r\n\r\n",
+                "My understanding is that if someone tries to reindex a system data stream directly using the reindexing API without the necessary permissions, it will be blocked before any transport action is triggered. However, I haven't verified this - I'll check this tomorrow "
+            ]
+        },
+        {
+            "hunk_id": 36918,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/main/java/org/elasticsearch/system_indices/task/SingleFeatureMigrationResult.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 85,
+            "original_line": 85,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "For this class, should mentions of index be renamed to resource?  Hmm, or maybe  in a follow-up PR to do a bunch of renaming...",
+                ">maybe in a follow-up PR to do a bunch of renaming\r\n\r\nYes, I don't want to add another 50 files to this PR due to renaming"
+            ]
+        },
+        {
+            "hunk_id": 36917,
+            "commit_id": "b99c8d4580442e2b8b4692e9836e42a94f0473bc",
+            "original_commit_id": "bb32c7aaf2431acc760fd959600dfb088fadf63e",
+            "path": "x-pack/plugin/migrate/src/internalClusterTest/java/org/elasticsearch/system_indices/action/FeatureMigrationIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 279,
+            "original_line": 279,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "Yeah that's much better, thanks!"
+            ]
+        }
+    ]
+}

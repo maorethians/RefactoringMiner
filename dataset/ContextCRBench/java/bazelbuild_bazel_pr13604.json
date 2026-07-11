@@ -1,0 +1,372 @@
+{
+    "repo": "bazelbuild/bazel",
+    "pr_number": 13604,
+    "lang": "java",
+    "pr_title": "Save remote output metadata to ActionCache and load them before checking action cache",
+    "pr_body": "This PR extends `ActionCache.Entry` to store output metadata by having a map of <Path, Metadata>. This map is updated after action execution when we update action cache so that metadata of all outputs of the action are saved. Before checking the action cache (when executing actions), we will load the output metadata into output store if it is remote and the correspondingly local one is missing.\r\n\r\nWith this change, remote output metadata is saved to disk so build without bytes can use them among server restarts. \r\n We can also download outputs after action execution since remote output metadata can be accessed outside.\r\n\r\nPart of https://github.com/bazelbuild/bazel/issues/12665.\r\n\r\nFixes https://github.com/bazelbuild/bazel/issues/8248.",
+    "pr_comments": [
+        "@philwo @janakdr @alexjski PTAL",
+        "Another thought: we can probably move \"load metadata cache\" and \"update metadata cache\" into `OutputService` and separate `MetadataCache` from `ActionCache` so that this change only affects Bazel's remote execution/cache.",
+        "General idea seems reasonable, will defer to @alexjski ",
+        "Can you explain why we need separate files for the metadata as opposed to storing that with the existing structure? That could technically open possibilities of entries present in the metadata, but not in the cache and the other way round. Is the worry that we could read the metadata in case of a cache miss?",
+        "They are technically different type of maps: the action cache is a map of `<Path of action's first output, Digest of action data>` while the metadata cache is a map of `<Path of a output file, Metadata>`. Storing them into different files seems to be reasonable.\r\n\r\n> That could technically open possibilities of entries present in the metadata, but not in the cache and the other way round.\r\n\r\nI think this is a valid case. If entries present in the metadata but not in the cache, Bazel will just ignore them. If the other way round, it is just the case before this change.\r\n\r\n> Is the worry that we could read the metadata in case of a cache miss?\r\n\r\nEven if we store metadata into action cache files, a cache miss shouldn't remove the metadata.\r\n\r\nHowever, we can change to store the metadata to the existing action cache file (by suffix the path of output file with `:metadata` for example) if you prefer this way. ",
+        "Updated to merge two maps into one. For metadata of an output, the key is its `execPath` plus a suffix `:metadata`.",
+        "> Updated to merge two maps into one. For metadata of an output, the key is its `execPath` plus a suffix `:metadata`.\r\n\r\nThat's good. I think I initially had more negative reaction to separate maps than it calls for (sorry) because I didn't realize the output fingerprint check is still present, which negates all of the risks. Anyway with merged map, we know they both are always in sink which is nice thing in itself.",
+        "Regarding https://github.com/bazelbuild/bazel/pull/13604#issuecomment-868172207, I am thinking separating these metadata methods from `ActionCache` and let `OutputService` do the job (that's why it initially has a `MetadataCache` interface).\r\n\r\nThe goal of this PR is allowing Bazel to download remote outputs after action execution. To do that, we need:\r\n1. Download metadata of remote outputs and save them during action execution.\r\n2. When the remote output is downloaded, the remote metadata should be removed from cache (so we can re-construct metadata from local file system).\r\n\r\n1 is implemented - during the step when we update action cache, we also check for metadata injected during action execution, and save those which is \"remote\".\r\n\r\n2 is only implemented for downloads happened within action execution - if the metadata injected is not \"remote\", we remove the key from cache during updating the action cache.\r\n\r\nConsidering the case that the local action cache of a remote action is valid (hence action execution is skipped) but we need to download its outputs. With current implementation, it won't work.\r\n\r\nWe need a post action execution download procedure. Whichever module implements this feature, it needs to access ActionCache to remove metadata for downloaded outputs. Accessing ActionCache somewhere else is risky IMO.\r\n\r\nIf we move these metadata methods to the `OutputService` i.e. it is responsible for maintaining the metadata, then we will have following steps when executing an action:\r\n1. Load metadata from OutputService (if it is not null) into `OutputStore` (this is essentially constructing an action-local metadata cache from a global one).\r\n2. Check the ActionCache with `OutputStore`.\r\n3. If cache is invalidated, execute the action and update metadata with method provided by `OutputService` (merge the action-local metadata cache into a global one).\r\n4. Call the post action download method provided by the `OutputService` during which the metadata is updated by itself for downloaded outputs.\r\n\r\nWDYT?",
+        "> Regarding [#13604 (comment)](https://github.com/bazelbuild/bazel/pull/13604#issuecomment-868172207), I am thinking separating these metadata methods from `ActionCache` and let `OutputService` do the job (that's why it initially has a `MetadataCache` interface).\r\n> \r\n> The goal of this PR is allowing Bazel to download remote outputs after action execution. To do that, we need:\r\n> \r\n> 1. Download metadata of remote outputs and save them during action execution.\r\n> 2. When the remote output is downloaded, the remote metadata should be removed from cache (so we can re-construct metadata from local file system).\r\n> \r\n> 1 is implemented - during the step when we update action cache, we also check for metadata injected during action execution, and save those which is \"remote\".\r\n> \r\n> 2 is only implemented for downloads happened within action execution - if the metadata injected is not \"remote\", we remove the key from cache during updating the action cache.\r\n\r\nThat may be a reason for 2 maps, so you can still have cache hits for local actions.\r\n\r\n> \r\n> Considering the case that the local action cache of a remote action is valid (hence action execution is skipped) but we need to download its outputs. With current implementation, it won't work.\r\n> \r\n> We need a post action execution download procedure. Whichever module implements this feature, it needs to access ActionCache to remove metadata for downloaded outputs. Accessing ActionCache somewhere else is risky IMO.\r\n> \r\n> If we move these metadata methods to the `OutputService` i.e. it is responsible for maintaining the metadata, then we will have following steps when executing an action:\r\n> \r\n> 1. Load metadata from OutputService (if it is not null) into `OutputStore` (this is essentially constructing an action-local metadata cache from a global one).\r\n> 2. Check the ActionCache with `OutputStore`.\r\n> 3. If cache is invalidated, execute the action and update metadata with method provided by `OutputService` (merge the action-local metadata cache into a global one).\r\n> 4. Call the post action download method provided by the `OutputService` during which the metadata is updated by itself for downloaded outputs.\r\n> \r\n> WDYT?\r\n\r\nMy very first reaction is that I think we discussed that before and that was not agreed upon. I see 2 reasons to need to download the outputs:\r\n\r\n1. Follow-up local actions.\r\n2. Allow users to inspect the outptus.\r\n\r\nSeems like that if you need those, your best bet may be a FUSE-based solution which tracks all outputs which would deem all of these changes unnecessary (see https://github.com/bazelbuild/bazel/pull/12823).\r\n\r\nAnother thing to consider about downloading results, if you wanted to do that eagerly (I think if we can have FUSE, that would be strictly better) is a subscribing to events and looking at outputs. We already issue those for top-level actions (BEP), there also is CachedActionEvent (you might need to add the metadata to it though). I am not pressing too hard, but that is something to think about -- it looks like we may already have the desired interface there. For reference, we already look at the outputs right there: https://github.com/bazelbuild/bazel/blob/4ccb2cced62e4fc070349e1b8ea6c941074bccbb/src/main/java/com/google/devtools/build/lib/skyframe/SkyframeActionExecutor.java#L657-L664.\r\n\r\nThis PR as which only tracks the metadata in action cache, to me can serve an interesting case for remote-only builds, which is something that we discussed before and it is indeed a nice thing to have.",
+        "> My very first reaction is that I think we discussed that before and that was not agreed upon. I see 2 reasons to need to download the outputs:\r\n> \r\n> 1. Follow-up local actions.\r\n> 2. Allow users to inspect the outptus.\r\n> \r\n\r\nAnother case is we can just inject metadata for the outputs of an action and start executing dependent actions while keeping output downloads in the background (today, we have to wait for the download).\r\n\r\n> Seems like that if you need those, your best bet may be a FUSE-based solution which tracks all outputs which would deem all of these changes unnecessary (see #12823).\r\n> \r\n\r\nIIUC, we are experimenting with non-FUSE-based solution. The solution in my head is we can build artifacts as normal and use \"outputs\" flags to tell Bazel which outputs we want to download, e.g. no flags means we want all the outputs, `--remote_download_minimal` means we want a minimal set of outputs (we can also introduce additional \"outputs\" flags to tell Bazel in a more fine grained level).\r\n\r\nIf we need outputs that weren't downloaded during previous build, we can then \"rebuild\" with different \"outputs\" flags which will hit the local action cache but start downloading missing outputs.\r\n\r\nThe entire progress for executing an action remotely should be:\r\n\r\n1. Check for local action cache. If hit, go to step 6.\r\n2. Remove injected metadata and local outputs if any.\r\n3. Check for remote cache. If hit, go to step 5.\r\n4. Upload inputs and execute.\r\n5. Download and inject metadata.\r\n6. Only download outputs which is requested by the \"outputs\" flags in the background (remove injected metadata after download).\r\n7. If there are more actions, go to step 1.\r\n8. Wait for all downloads.\r\n\r\nThis works without FUSE but provides similar experience.\r\n\r\n> Another thing to consider about downloading results, if you wanted to do that eagerly (I think if we can have FUSE, that would be strictly better) is a subscribing to events and looking at outputs. We already issue those for top-level actions (BEP), there also is CachedActionEvent (you might need to add the metadata to it though). I am not pressing too hard, but that is something to think about -- it looks like we may already have the desired interface there. For reference, we already look at the outputs right there:\r\n> \r\n> https://github.com/bazelbuild/bazel/blob/4ccb2cced62e4fc070349e1b8ea6c941074bccbb/src/main/java/com/google/devtools/build/lib/skyframe/SkyframeActionExecutor.java#L657-L664\r\n> \r\n> .\r\n\r\nThis is also a good place to consider for post execution downloading. One thing I mentioned above is that we need to remove remote metadata from cache after download. So we need to decide whether should we expose ActionCache to other modules or we keep ActionCache as it is and introduce a separate interface for metadata only.\r\n\r\n> This PR as which only tracks the metadata in action cache, to me can serve an interesting case for remote-only builds, which is something that we discussed before and it is indeed a nice thing to have.\r\n",
+        "Perhaps the word \"FUSE\" is a bit of a red herring. Let's say, any\nfilesystem-based output service. An NFS volume would also work. Chi, what\nis the reason to avoid such a setup and centralize logic inside Bazel?\n",
+        "Just chiming in, but macFUSE performance isn't the best, so any solution that requires FUSE might not be performant on macOS.",
+        "To be clear, I wasn't meant to replace FUSE-based (or any filesystem-based output service) solution but just wanted to improve \"build withouts bytes\".\r\n\r\n> Chi, what is the reason to avoid such a setup and centralize logic inside Bazel?\r\n\r\nIIUC, we don't offer the setup for Bazel today. For users who care about network bandwidth, the only choice is \"build without bytes\". The ways moving forward are probably:\r\n1. Improve \"build without bytes\".\r\n2. Add support for FUSE like #12823.\r\n\r\nI don't think these two ways are incompatible with each other.",
+        "I would like to go ahead with Chi's idea of having this logic in Bazel.\r\n\r\nI think filesystem-based layers are probably the most user-friendly interface when they work, but they come with lots of challenges, too: They are platform-specific, they are often slower than non-filesystem-based APIs (e.g. see sandboxfs performance vs symlink-based sandbox performance), they require additional setup (e.g. install FUSE), they require having special privileges on the system (admin rights, ability to load a kernel extension, ability to mount a filesystem, ...) and they might not be available on all systems due to security policies. As we know from Google they can perform very well in a carefully managed IT environment, but I don't believe we will be able to provide a good out of the box experience for these solutions on typical user systems.\r\n\r\nThe two approaches should nicely complement each other though!",
+        "> I would like to go ahead with Chi's idea of having this logic in Bazel.\r\n> \r\n> I think filesystem-based layers are probably the most user-friendly interface when they work, but they come with lots of challenges, too: They are platform-specific, they are often slower than non-filesystem-based APIs (e.g. see sandboxfs performance vs symlink-based sandbox performance), they require additional setup (e.g. install FUSE), they require having special privileges on the system (admin rights, ability to load a kernel extension, ability to mount a filesystem, ...) and they might not be available on all systems due to security policies. As we know from Google they can perform very well in a carefully managed IT environment, but I don't believe we will be able to provide a good out of the box experience for these solutions on typical user systems.\r\n> \r\n> The two approaches should nicely complement each other though!\r\n\r\nThere already was a discussion about that before and I also believe there was some effort put towards testing how NFS-based solutions perform. I think that in order to have most informed discussion, we should merge those and look at the results from the tests and them make design decisions. I believe that this code review may not be the best place for that.\r\n\r\nThe main thinking so far was that if we have a FUSE/NFS-based solution available, then the incentive of this may be low. What I was missing from the proposal before was the justification for why the added complexity is needed if we have FUSE/NFS solution. If there is none, I would strongly prefer to i\r\n\r\n> > My very first reaction is that I think we discussed that before and that was not agreed upon. I see 2 reasons to need to download the outputs:\r\n> > \r\n> > 1. Follow-up local actions.\r\n> > 2. Allow users to inspect the outptus.\r\n> \r\n> Another case is we can just inject metadata for the outputs of an action and start executing dependent actions while keeping output downloads in the background (today, we have to wait for the download).\r\n> \r\n> > Seems like that if you need those, your best bet may be a FUSE-based solution which tracks all outputs which would deem all of these changes unnecessary (see #12823).\r\n> \r\n> IIUC, we are experimenting with non-FUSE-based solution. The solution in my head is we can build artifacts as normal and use \"outputs\" flags to tell Bazel which outputs we want to download, e.g. no flags means we want all the outputs, `--remote_download_minimal` means we want a minimal set of outputs (we can also introduce additional \"outputs\" flags to tell Bazel in a more fine grained level).\r\n> \r\n> If we need outputs that weren't downloaded during previous build, we can then \"rebuild\" with different \"outputs\" flags which will hit the local action cache but start downloading missing outputs.\r\n> \r\n> The entire progress for executing an action remotely should be:\r\n> \r\n> 1. Check for local action cache. If hit, go to step 6.\r\n> 2. Remove injected metadata and local outputs if any.\r\n> 3. Check for remote cache. If hit, go to step 5.\r\n> 4. Upload inputs and execute.\r\n> 5. Download and inject metadata.\r\n> 6. Only download outputs which is requested by the \"outputs\" flags in the background (remove injected metadata after download).\r\n> 7. If there are more actions, go to step 1.\r\n> 8. Wait for all downloads.\r\n> \r\n> This works without FUSE but provides similar experience.\r\n> \r\n> > Another thing to consider about downloading results, if you wanted to do that eagerly (I think if we can have FUSE, that would be strictly better) is a subscribing to events and looking at outputs. We already issue those for top-level actions (BEP), there also is CachedActionEvent (you might need to add the metadata to it though). I am not pressing too hard, but that is something to think about -- it looks like we may already have the desired interface there. For reference, we already look at the outputs right there:\r\n> > https://github.com/bazelbuild/bazel/blob/4ccb2cced62e4fc070349e1b8ea6c941074bccbb/src/main/java/com/google/devtools/build/lib/skyframe/SkyframeActionExecutor.java#L657-L664\r\n> > \r\n> > .\r\n> \r\n> This is also a good place to consider for post execution downloading. One thing I mentioned above is that we need to remove remote metadata from cache after download. So we need to decide whether should we expose ActionCache to other modules or we keep ActionCache as it is and introduce a separate interface for metadata only.\r\n\r\nWhy do we need to remove the metadata? Also, it may be useful what metadata you mean in this context -- the newly added metadata in action cache or the metadata stored in ActionExecutionValue (skyframe).\r\n\r\n> \r\n> > This PR as which only tracks the metadata in action cache, to me can serve an interesting case for remote-only builds, which is something that we discussed before and it is indeed a nice thing to have.\r\n\r\n",
+        "> Why do we need to remove the metadata? Also, it may be useful what metadata you mean in this context -- the newly added metadata in action cache or the metadata stored in ActionExecutionValue (skyframe).\r\n\r\nI was referring to the newly added metadata in action cache. This PR __only__ save remote metadata and load them into OutputStore before checking the action cache. If we don't remove the remote metadata of one output from action cache after downloaded it, we will still use the remote metadata from action cache instead of re-calculating it from local file system next time when we check action cache (even if the local file content is changed).\r\n\r\nNow I think it again, maybe we can change to storing __all__ metadata of outputs into action cache (which helps https://github.com/bazelbuild/bazel/issues/13566). Re-calculating all metadata of outputs for the action from local file system (we do it today as well) and compare them with those stored in the action cache. Then we don't need to remove metadata after downloads.\r\n\r\nIt looks like saving metadata directly in action cache is a preferred way. Then I would like to make it stored within one map by extending `ActionCache.Entry`.",
+        "> > Why do we need to remove the metadata? Also, it may be useful what metadata you mean in this context -- the newly added metadata in action cache or the metadata stored in ActionExecutionValue (skyframe).\r\n> \r\n> I was referring to the newly added metadata in action cache. This PR **only** save remote metadata and load them into OutputStore before checking the action cache. If we don't remove the remote metadata of one output from action cache after downloaded it, we will still use the remote metadata from action cache instead of re-calculating it from local file system next time when we check action cache (even if the local file content is changed).\r\n> \r\n\r\nI agree, we need to take care of that. My thinking was that it may be a better API to just request a desired end state rather than have fine-grain manipulations. My preference would be to have an API like this:\r\n\r\n```\r\nMap<PathFragment, FileArtifactMetadata> newOutputs = ...;\r\ncache.updateMetadata(key, newOutputs);\r\n```\r\n\r\nIn fact, that could be a single call as part of updating the cache, which we already do.\r\n\r\nover:\r\n```\r\nMap<PathFragment, FileArtifactMetadata> oldOutputs = ...;\r\nMap<PathFragment, FileArtifactMetadata> newOutputs = ...;\r\noldOutputs.keySet().stream().filter(k -> !newOutputs.containsKey(k)).forEach(cache::removeMetadata);\r\nnewOutputs.forEach((k, m) -> cache.putMetadata(k, m);\r\n```\r\n\r\nIn fact, then you can choose in the cache implementation to only track the remote ones and you don't have to worry about removing old entries since the operation resembles `map = newMap` vs `manipulate(map)`.\r\n\r\n> Now I think it again, maybe we can change to storing **all** metadata of outputs into action cache (which helps #13566). Re-calculating all metadata of outputs for the action from local file system (we do it today as well) and compare them with those stored in the action cache. Then we don't need to remove metadata after downloads.\r\n> \r\n\r\nNot sure if we need that. My point was merely about the API seeming too fine grained. Logically it makes perfect sense.\r\n\r\n> It looks like saving metadata directly in action cache is a preferred way. Then I would like to make it stored within one map by extending `ActionCache.Entry`.\r\n\r\nI agree, if we are doing that, the `update(Map<...>)` seems like the simplest choice.\r\n\r\n",
+        "@alexjski  The code is updated. PTAL.\r\n\r\nIt works fine to encode/decode `FileArtifactValue` with `ObjectCodecs`. However, when serializing `TreeArtifactValue`, since it has reference to `SpecialArtifact` -> `ArtifactRoot` -> `Path` -> `FileSystem` -> `FileSystem`, there is an infinite loop. Not sure whether the `ObjectCodecs` is used correctly or not, I have to use create `SerializableTreeArtifactValue`.",
+        "> @alexjski The code is updated. PTAL.\r\n> \r\n> It works fine to encode/decode `FileArtifactValue` with `ObjectCodecs`. However, when serializing `TreeArtifactValue`, since it has reference to `SpecialArtifact` -> `ArtifactRoot` -> `Path` -> `FileSystem` -> `FileSystem`, there is an infinite loop. Not sure whether the `ObjectCodecs` is used correctly or not, I have to use create `SerializableTreeArtifactValue`.\r\n\r\nI don't think you need that -- in fact, we already do serialize `TreeArtifactValue`. The trick for it is to register the `FileSystem` object as a serialization constant, using [addReferenceConstant](https://github.com/bazelbuild/bazel/blob/97c5019b0f9825170177f6a1da794145db12a507/src/main/java/com/google/devtools/build/lib/skyframe/serialization/ObjectCodecRegistry.java#L341-L344).",
+        "Addressed most comments and added flag `--experimental_action_cache_store_output_metadata` to switch the feature. May need more time to add (and fix existing) tests.",
+        "Added a few tests. More are coming tomorrow.",
+        "Tests added. I think we can have another review round."
+    ],
+    "merged": false,
+    "created_at": "2021-07-28T21:07:14Z",
+    "issue_context": {
+        "number": 8248,
+        "title": "Store remote metadata in the on disk action cache",
+        "body": "This is part of #6862.\r\n\r\nThe persistent action cache stores the state of Bazel's output base. It does not know about remotely stored files. We need to extend it to do so.\r\n\r\n```\r\n$ bazel build :foo --experimental_remote_download_outputs=minimal\r\n$ bazel shutdown\r\n# This will be clean build, because the metadata from the previous build are\r\n# not yet properly persisted to disk\r\n$ bazel build :foo --experimental_remote_download_outputs=minimal\r\n```\r\n\r\n",
+        "comments": [
+            "This problem makes up to several minutes for me. Any updates on priority?",
+            "No updates.",
+            "I saw the related #10233 which talks about refactoring `findMissingBlobs`. Is there more difficulties relating to `--experimental_inmemory_jdeps_files` and `--experimental_inmemory_dotd_files` that needs to be considered? Would the right way to solve this issue be to implement `--disk_cache` support in combination with remote execution or should there be another flag involved?\r\n\r\nI do see this phenomenon also when the analysis cache is discarded due to changing configuration flags, even if the server is still alive.",
+            "This can be enabled by setting `--experimental_action_cache_store_output_metadata`."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 20233,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 618,
+            "original_line": 589,
+            "side": "RIGHT",
+            "original_position": 413,
+            "position": 451,
+            "subject_type": "line",
+            "review_comments": [
+                "ditto."
+            ]
+        },
+        {
+            "hunk_id": 20225,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 438,
+            "original_line": 420,
+            "side": "RIGHT",
+            "original_position": 181,
+            "position": 265,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do we need WriteEmptyOutputAction here?",
+                "Previously, outputs are [created](https://github.com/bazelbuild/bazel/blob/2c059126de8e128d9dc1cc8b7eb3d7fe99bde6e6/src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java#L123) with empty content within `runAction`. Since we need to test against the case that outputs are not created but instead metadata are  injected, we move the creation to the action itself."
+            ]
+        },
+        {
+            "hunk_id": 20232,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 588,
+            "original_line": 563,
+            "side": "RIGHT",
+            "original_position": 387,
+            "position": 421,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: would getToken make sense here too?",
+                "Another option is to check the stats are empty before the second run. To me, the first run is a part of arrange here."
+            ]
+        },
+        {
+            "hunk_id": 20218,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/ActionCacheChecker.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 366,
+            "original_line": 357,
+            "side": "RIGHT",
+            "original_position": 80,
+            "position": 238,
+            "subject_type": "line",
+            "review_comments": [
+                "nitnit: indent"
+            ]
+        },
+        {
+            "hunk_id": 20226,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 495,
+            "original_line": 465,
+            "side": "RIGHT",
+            "original_position": 219,
+            "position": 328,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we also test an action which injects remote metadata and creates the file locally. Think running remote runner with the option to materialize all outputs.",
+                "Added test for the case where the local metadata is same as injected remote one.",
+                "I was also thinking about the case when an action both injects the remote metadata and stores a file locally. Wouldn't remote execution with download all do that?",
+                "Remote execution with download all won't inject remote metadata. but I will probably change it to inject remote metadata to support async download. Test case added.",
+                "FYI, that is what we do internally."
+            ]
+        },
+        {
+            "hunk_id": 20234,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 679,
+            "original_line": 652,
+            "side": "RIGHT",
+            "original_position": 476,
+            "position": 512,
+            "subject_type": "line",
+            "review_comments": [
+                "This is hardly an important case, but does this mean that empty trees will not get action cache hits? I would think that actions generating those should also be eligible.",
+                "The tree metadata of that empty tree won't be saved but it will get action cache hits. Updated the checks.",
+                "Thanks!"
+            ]
+        },
+        {
+            "hunk_id": 20229,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 857,
+            "original_line": 556,
+            "side": "RIGHT",
+            "original_position": 310,
+            "position": 690,
+            "subject_type": "line",
+            "review_comments": [
+                "assert the entry has no remote files now?",
+                "The entry has remote files since we still inject remote metadata during the second execution. That said, I updated the test to assert the metadata in the entry is equals to the metadata injected from the second run.",
+                "Thank you!"
+            ]
+        },
+        {
+            "hunk_id": 20223,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/cache/CompactPersistentActionCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 539,
+            "original_line": 513,
+            "side": "RIGHT",
+            "original_position": 196,
+            "position": 196,
+            "subject_type": "line",
+            "review_comments": [
+                "I like that we always store the empty maps. You don't need to make a distinction on the cache format thanks to that. Is there a noticeable difference in the size of the cache with the flag disable due to the extra 2 ints?",
+                "Nope. For building Bazel itself, the size of action cache increased from 896K to 904K (0.9%) if not output metadata stored. The size increased to 1.8M if all the output metadata are remote and are stored.\r\n",
+                "Thank you for checking that -- Bazel for sure is large enough target to give us some confidence here."
+            ]
+        },
+        {
+            "hunk_id": 20231,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/util/ActionsTestUtil.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 985,
+            "original_line": 985,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "You can revert that.",
+                "I added override in the subclass (FakeMetadataHandler) which will throw IOException.",
+                "Then you certainly can't revert that -- sorry!"
+            ]
+        },
+        {
+            "hunk_id": 20227,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 618,
+            "original_line": 528,
+            "side": "RIGHT",
+            "original_position": 282,
+            "position": 451,
+            "subject_type": "line",
+            "review_comments": [
+                "Ideally, we would clean the statistics before this one. Maybe consider making runAction return the token or a boolean whether it was a cache hit -- that would be easy to check.",
+                "I wonder if that would not be simpler if you didn't use `runAction` for this, but just call `getTokenIfNeedToExecute`."
+            ]
+        },
+        {
+            "hunk_id": 20230,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/cache/CompactPersistentActionCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 516,
+            "original_line": 492,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 173,
+            "subject_type": "line",
+            "review_comments": [
+                "Is that still truly max size?",
+                "Fixed."
+            ]
+        },
+        {
+            "hunk_id": 20220,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/cache/ActionCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 338,
+            "original_line": 339,
+            "side": "RIGHT",
+            "original_position": 187,
+            "position": 218,
+            "subject_type": "line",
+            "review_comments": [
+                "optional-and-silly-nit: you could maybe include the children count here or something. I honestly have no clue where we use that, so that is entirely up to you."
+            ]
+        },
+        {
+            "hunk_id": 20221,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/skyframe/ActionMetadataHandler.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 409,
+            "original_line": 409,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "As much as removing checks is scary -- I think that's the right call -- it looks like this boolean literally protects against the metadata cache only (am I missing something?). We set it right after the metadata cache check and start with false otherwise.\r\n\r\nIf the metadata handler was to hand around after, we could consider a tri-state here maybe (checking cache -> cache hit/execution), but I don't see the point."
+            ]
+        },
+        {
+            "hunk_id": 20228,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 699,
+            "original_line": 531,
+            "side": "RIGHT",
+            "original_position": 285,
+            "position": 532,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we assert the output metadata in the entry? Also, how about checking whether the outputs were injected to the metadata handler?"
+            ]
+        },
+        {
+            "hunk_id": 20224,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/cache/ActionCache.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 154,
+            "original_line": 155,
+            "side": "RIGHT",
+            "original_position": 96,
+            "position": 95,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we should rename that now? I would think that in input map only now.",
+                "`mdMap` still contains inputs and outputs.",
+                "That's right, sorry about that!"
+            ]
+        },
+        {
+            "hunk_id": 20222,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/ActionCacheChecker.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 586,
+            "original_line": 577,
+            "side": "RIGHT",
+            "original_position": 126,
+            "position": 356,
+            "subject_type": "line",
+            "review_comments": [
+                "We used to just remove the entry from cache on a miss -- why not keep it the same way?",
+                "I didn't change this logic. Not sure How the line you commented on are related to this.",
+                "That's true, sorry about that."
+            ]
+        },
+        {
+            "hunk_id": 20219,
+            "commit_id": "fe7c0f7071d1b8ac1299b1e928e161bb2c0354c5",
+            "original_commit_id": "f79b61f84b6f1d37b0463a3e6f6971deb44f167c",
+            "path": "src/main/java/com/google/devtools/build/lib/actions/ActionCacheChecker.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 611,
+            "original_line": 602,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 377,
+            "subject_type": "line",
+            "review_comments": [
+                "nice rename!"
+            ]
+        }
+    ]
+}

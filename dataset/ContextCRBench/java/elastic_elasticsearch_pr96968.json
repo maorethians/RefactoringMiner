@@ -1,0 +1,74 @@
+{
+    "repo": "elastic/elasticsearch",
+    "pr_number": 96968,
+    "lang": "java",
+    "pr_title": "Add support for reindex over CCS",
+    "pr_body": "Reindexing requires `ignore_unavailable` search option to be set on request to execute reindex from remote - to be able to reference remote index in a format **cluster_name:index_name**\r\nhttps://github.com/elastic/elasticsearch/blob/2e6834ad1103f7eab2e5a9cf2dcb5816ec4d2d17/server/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java#L1612-L1622\r\n\r\nUnfortunately [Reindex API](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-reindex.html#docs-reindex-api-query-params) does not have `ignore_unavailable` among supported query parameters. In the same time there is cluster level settings `cluster.remote.<cluster_name>.skip_unavailable` which allows check if remote cluster is configured to skip unavailable indices.\r\n\r\nThis PR checks if CCS/CCR is enabled and modifies request object if there is `skip_unavailable` flag is present.\r\nBoth re-index request formats are supported now\r\n\r\nRequest 1:\r\n```\r\ncurl -X POST \"localhost:19200/_reindex?pretty\" -H 'Content-Type: application/json' -d'\r\n{\r\n  \"source\": {\r\n        \"remote\": {\r\n                \"host\": \"http://172.18.0.2:9200\"\r\n        },\r\n    \"index\": \"my-index-000001\"\r\n  },\r\n  \"dest\": {\r\n    \"index\": \"my-index-000001\"\r\n  }\r\n}\r\n'\r\n```\r\n\r\nRequest 2:\r\n```\r\ncurl -X POST \"localhost:19200/_reindex?pretty\" -H 'Content-Type: application/json' -d'\r\n{\r\n  \"source\": {\r\n    \"index\": \"cluster0:my-index-000001\"\r\n  },\r\n  \"dest\": {\r\n    \"index\": \"my-index-000001\"\r\n  }\r\n}\r\n'\r\n```\r\n\r\nCloses #89120",
+    "pr_comments": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Hi @volodk85, I've created a changelog YAML for you.",
+        "Thank you @DaveCTurner for having a look.\r\n\r\nI added `ignore_unavailable` to Reindex API query parameters. Now in order to use reindex from remote, users have to specify it explicitly. `ignore_unavailable` index option does not depend on `skip_unavailable` remote cluster setting.\r\n```\r\ncurl -X POST \"localhost:19200/_reindex?ignore_unavailable=true\" -H 'Content-Type: application/json' -d'\r\n{\r\n  \"source\": {\r\n    \"index\": \"cluster0:my-index-000001\"\r\n  },\r\n  \"dest\": {\r\n    \"index\": \"my-index-000001\"\r\n  }\r\n}\r\n```\r\n\r\nWith this change Reindex API behaves as follow (assuming remote index does not exists):\r\n`ignore_unavailable`: **true**\r\nLocal -> Local: Call successful \r\nRemote -> Local: Call sucessful\r\nboth report zeros in total/create/update/delete metrics\r\n```\r\n{\"took\":24,\"timed_out\":false,\"total\":0,\"updated\":0,\"created\":0,\"deleted\":0,\"batches\":0,\"version_conflicts\":0,\"noops\":0,\"retries\":{\"bulk\":0,\"search\":0},\"throttled_millis\":0,\"requests_per_second\":-1.0,\"throttled_until_millis\":0,\"failures\":[]}\r\n```\r\n`ignore_unavailable`: **false**\r\nLocal -> Local: Operation fails (index not found)\r\nRemote -> Local: Operation fails due to gating in [IndexNameExpressionResolver.java](https://github.com/elastic/elasticsearch/blob/2e6834ad1103f7eab2e5a9cf2dcb5816ec4d2d17/server/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java#L1612-L1622) **Call to remote does not happen at all!**\r\n\r\n>Often folks will want the reindex to fail if the source index is unavailable, but with this option I think it'll report success without having copied everything over\r\n\r\nI agree that API should behave in the same way regardless we query local or remote index - if it does not exist, there should be clear error statement.\r\n\r\nNow I wonder why the condition which mandates presence of `ignore_unavailable` flag for querying remote index in [IndexNameExpressionResolver.java](https://github.com/elastic/elasticsearch/blob/2e6834ad1103f7eab2e5a9cf2dcb5816ec4d2d17/server/src/main/java/org/elasticsearch/cluster/metadata/IndexNameExpressionResolver.java#L1612-L1622) was ever introduced?\r\nIf it only for fixing datemath expression as commit message suggest (Fix indices resolver for datemath with colon  (#92973) Albert Zaharovits* 2023-01-18, 9:41 a.m.) IMHO it sounds like using wrong tool to solve the problem. Currently reindex API requires to slap `ignore_unavailable` flag for ability to \"touch\" remote index regardless its availability/existence of other side of wire. This contradicts with CCS api which allows to query remote index without having those query param. Taking into account that CCR and CCS are closely related, I expect they behave in the same way when it comes to query remotes.\r\n\r\n@albertzaharovits could you please comment?",
+        "The core change here is to stop evaluating remote expressions on local node. If the expression is remote, it will be evaluated on remote node when request reaches target node. By doing this, it is possible to lift current restriction of having `ignore_unvailable` flag whenever we try to _reindex from remote. ",
+        "Could we try the approach [mentioned in my comment on the issue](https://github.com/elastic/elasticsearch/issues/89120#issuecomment-1205256149) and just skip remote indices when validating the reindex request? In other words, adjust `org.elasticsearch.reindex.ReindexValidator#validateAgainstAliases` rather than the `IndexNameExpressionResolver` itself? We're only trying to avoid reindexing with the same source and target, but remote indices cannot be a target in any case so there's no need to resolve them here.",
+        "Recap of changes in this PR\r\n1. `IndexNameExpressionResolver ` is not touched\r\n2. reindex api now respects `ignore_unavailable` request option which is propagated in underlying search request\r\n3. Fix for datemath expression: remote name with complex datemath expressions containing `:` symbol was treated as a \"remote-of-remote\" names.\r\n\r\nNoteworthy that in current `main` it is not possible to `_search/_count` from index which name is represented by a valid but rather complex datemath expression e.g. <datemath-{2001-01-01-13||+1h/h{yyyy-MM-dd-HH|-07:00}}> \r\n\r\nBefore fix\r\n```\r\ncurl -X GET \"localhost:9200/%3Cdatemath-%7B2001-01-01-13%7C%7C%2B1h%2Fh%7Byyyy-MM-dd-HH%7C-07%3A00%7D%7D%3E/_count\"\r\n{\"error\":{\"root_cause\":[{\"type\":\"no_such_remote_cluster_exception\",\"reason\":\"no such remote cluster: [<datemath-{2001-01-01-13||+1h/h{yyyy-MM-dd-HH|-07]\"}],\"type\":\"no_such_remote_cluster_exception\",\"reason\":\"no such remote cluster: [<datemath-{2001-01-01-13||+1h/h{yyyy-MM-dd-HH|-07]\"},\"status\":404}\r\n```\r\nAfter fix\r\n```\r\ncurl -X GET \"localhost:9200/%3Cdatemath-%7B2001-01-01-13%7C%7C%2B1h%2Fh%7Byyyy-MM-dd-HH%7C-07%3A00%7D%7D%3E/_count\"\r\n{\"count\":100,\"_shards\":{\"total\":1,\"successful\":1,\"skipped\":0,\"failed\":0}}% \r\n```",
+        "Jenkins run elasticsearch-ci/bwc"
+    ],
+    "merged": true,
+    "created_at": "2023-10-11T08:21:33Z",
+    "issue_context": {
+        "number": 89120,
+        "title": "Support reindex over CCS",
+        "body": "### Description\n\nGiven we have registered remotes and are able to cross cluster search/replicate I would like to be able to reindex a remote index on the local cluster.\r\n\r\nThe normal index from remote requires a host to be set. The proxy endpoint used for the remote doesn't work as that's over transport and index from remote uses the http/REST interface. Using the ES rest requires a user to be created with the correct permission, effectively not using the registered remote.\r\n\r\nDoing a local index results in index not found:\r\n\r\n```\r\n# normal search works\r\nPOST remote1:example-index/_search\r\n\r\n# results in index not found\r\nPOST _reindex\r\n{\r\n  \"source\": {\r\n    \"index\": \"remote1:example-index\"\r\n  },\r\n  \"dest\": {\r\n    \"index\": \"my-new-example-index\"\r\n  }\r\n}\r\n```\r\n\r\n```\r\n{\r\n  \"error\" : {\r\n    \"root_cause\" : [\r\n      {\r\n        \"type\" : \"index_not_found_exception\",\r\n        \"reason\" : \"no such index [remote1:example-index]\",\r\n        \"resource.type\" : \"index_or_alias\",\r\n        \"resource.id\" : \"remote1:example-index\",\r\n        \"index_uuid\" : \"_na_\",\r\n        \"index\" : \"remote1:example-index\"\r\n      }\r\n    ],\r\n    \"type\" : \"index_not_found_exception\",\r\n    \"reason\" : \"no such index [remote1:example-index]\",\r\n    \"resource.type\" : \"index_or_alias\",\r\n    \"resource.id\" : \"remote1:example-index\",\r\n    \"index_uuid\" : \"_na_\",\r\n    \"index\" : \"remote1:example-index\"\r\n  },\r\n  \"status\" : 404\r\n}\r\n```\r\n",
+        "comments": [
+            "As supplied by @DaveCTurner :\r\n```\r\n$ curl --silent --compressed 'http://localhost:9200/_reindex?error_trace' -H 'Content-type: application/json' --data-binary $'{\"dest\":{\"index\":\"destindex\"},\"source\":{\"index\":\"cluster_one:testindex\"}}' | jq '.error.stack_trace' -cMr\r\njava.lang.IllegalArgumentException: Cross-cluster calls are not supported in this context but remote indices were requested: [cluster_one:testindex]\r\n\tat org.elasticsearch.server@8.3.2/org.elasticsearch.cluster.metadata.IndexNameExpressionResolver.concreteIndices(IndexNameExpressionResolver.java:330)\r\n\tat org.elasticsearch.server@8.3.2/org.elasticsearch.cluster.metadata.IndexNameExpressionResolver.concreteIndexNames(IndexNameExpressionResolver.java:314)\r\n\tat org.elasticsearch.server@8.3.2/org.elasticsearch.cluster.metadata.IndexNameExpressionResolver.concreteIndexNames(IndexNameExpressionResolver.java:85)\r\n\tat org.elasticsearch.reindex.ReindexValidator.validateAgainstAliases(ReindexValidator.java:141)\r\n\tat org.elasticsearch.reindex.ReindexValidator.initialValidation(ReindexValidator.java:61)\r\n\tat org.elasticsearch.reindex.TransportReindexAction.validate(TransportReindexAction.java:121)\r\n\tat org.elasticsearch.reindex.TransportReindexAction.doExecute(TransportReindexAction.java:98)\r\n\tat org.elasticsearch.reindex.TransportReindexAction.doExecute(TransportReindexAction.java:36)\r\n\t```",
+            "Pinging @elastic/es-distributed (Team:Distributed)",
+            "AFAICT the only obstacle is this validation step that is trying to verify there's no overlap between source and destination indices, and remote source indices cannot also be destination indices so they can just be skipped here. I did a quick experiment which skips this validation and encountered no other problems:\r\n\r\n```\r\n$ curl --silent --compressed 'http://localhost:9200/_reindex?pretty' -H 'Content-type: application/json' --data-binary $'{\"dest\":{\"index\":\"destindex\"},\"source\":{\"index\":\"cluster_one:testindex\"}}'\r\n{\r\n  \"took\" : 1053,\r\n  \"timed_out\" : false,\r\n  \"total\" : 1,\r\n  \"updated\" : 0,\r\n  \"created\" : 1,\r\n  \"deleted\" : 0,\r\n  \"batches\" : 1,\r\n  \"version_conflicts\" : 0,\r\n  \"noops\" : 0,\r\n  \"retries\" : {\r\n    \"bulk\" : 0,\r\n    \"search\" : 0\r\n  },\r\n  \"throttled_millis\" : 0,\r\n  \"requests_per_second\" : -1.0,\r\n  \"throttled_until_millis\" : 0,\r\n  \"failures\" : [ ]\r\n}\r\n```",
+            "I was running into the same restriction.\r\n+1 for getting this in as it feels like the expected behavior for users.",
+            "+1 on fixing this issue. \r\n\r\nI also run into it. AFAICS, the only way to overcome it is reindexing specifying \"remote\" hostname and authentication data. Having CCS support would be much better.",
+            "Thank you @volodk85 !"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 35872,
+            "commit_id": "c9710eebd816cb035b8761a7d0879c7644f7f131",
+            "original_commit_id": "3465a2bf183d157397aaea2772c59d2e28dbbe45",
+            "path": "modules/reindex/src/main/java/org/elasticsearch/reindex/ReindexValidator.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 163,
+            "original_line": 163,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "small nit: you could have used the existing RemoteClusterAware.REMOTE_CLUSTER_INDEX_SEPARATOR constant here.",
+                "TIL; @volodk85 would you make that change?",
+                "If you don't mind I'll address this in follow up [PR](https://github.com/elastic/elasticsearch/pull/100646) (complex datemath things) which I opened yesterday for Search team.",
+                "Sounds good :+1:"
+            ]
+        },
+        {
+            "hunk_id": 35871,
+            "commit_id": "c9710eebd816cb035b8761a7d0879c7644f7f131",
+            "original_commit_id": "3465a2bf183d157397aaea2772c59d2e28dbbe45",
+            "path": "modules/reindex/src/internalClusterTest/java/org/elasticsearch/index/reindex/CrossClusterReindexIT.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 27,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 29,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "Are there equivalent tests for within-cluster reindex actions? Including the date-math ones? I couldn't see any, but it'd be good to have some.",
+                "There are no high-level (IT) tests for this, but there are bunch of them on index name resolvers level",
+                "I extended test suite for within-cluster reindexing with test cases focused on date math index names "
+            ]
+        }
+    ]
+}

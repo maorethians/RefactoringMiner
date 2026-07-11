@@ -1,0 +1,88 @@
+{
+    "repo": "netty/netty",
+    "pr_number": 9388,
+    "lang": "java",
+    "pr_title": "Only close eventFD in EpollEventLoop when it cannot be written to.",
+    "pr_body": "Motivation:\r\nWriting to the eventFD is racy with close.   If the event loop is shutdown\r\nand the fd closed, the fd number could be reused.   An in progress call to wakeup()\r\nmay write to the newly allocated fd, causing corruption.\r\n\r\nModification:\r\nMake wakeup() indicate if a write is in progress or has completed.  The normal\r\nloop will clear this indicator.  A shutdown now waits for the pending fd write to\r\nfinish.\r\n\r\nResult:\r\nNo TSAN races reported.\r\n\r\nFixes #9362",
+    "pr_comments": [
+        "Can one of the admins verify this patch?",
+        "@netty-bot test this please ",
+        "@carl-mastrangelo I'm actually not sure this is watertight yet, the below is  maybe unlikely but I think possible... WDYT?\r\n\r\n- EL is awake, `wakenUp == WA`\r\n- T1 submits task and CAS succeeds, now `wakenUp == WIP`, proceeds to call eventfd write\r\n- EL completes task processing, sets `wakenUp = WA` prior to going to sleep\r\n- T2 submits task and CAS succeeds, now `wakenUp == WIP`\r\n- T1 finishes eventfd write, successfully CASes `wakenUp` from `WIP` to `WNA`\r\n- Channel was closed at some point, EL proceeds to close eventfd, not blocked because state is `WNA`\r\n- fd is reassigned, T2 calls eventfd write",
+        "Here is a possible alternative that avoids the race described above and does not use additional CAS for wakeup: ~b397f45cd4d39ee05e26eeba1d0f411ac015ac77~ 36ff672b808fd5e17fb908fd22a2ce4f9cae97eb\r\n\r\nI don't think it's quite what @ejona86 was suggesting in #9362, but might be similar. And it's not clear to me how polling for EAGAIN or a non-EAGAIN would avoid the race - I don't think either tells you for sure that there is or isn't some outstanding write in progress?\r\n\r\nIt does mean typically reading from the fd during close, but I'm not sure that's a big deal. Closing shouldn't be high frequency or on critical path (unlike wakeup operation for example), and it already involves some syscalls to close all the fds.",
+        "@ejona86 please check https://github.com/netty/netty/commit/36ff672b808fd5e17fb908fd22a2ce4f9cae97eb.",
+        "This was fixed by https://github.com/netty/netty/pull/9535"
+    ],
+    "merged": false,
+    "created_at": "2019-07-20T06:22:42Z",
+    "issue_context": {
+        "number": 9362,
+        "title": "Shutdown race in EpollEventLoop",
+        "body": "In 4.1.38, there is an fd race in EpollEventLoop.  The loop thread, while trying to shutdown, closes the eventFd.    The outside thread that calls shutdownGracefully, tries to wake up the loop to notice that it wants it to shutdown.   There is a race where the wakeup() call can write to an eventfd that has been closed already, resulting in the possibility of writing to the wrong fd.\r\n\r\nThe sequence of events loops like:\r\n\r\n1.  T1:  eventLoop.shutdownGracefully()\r\n2.  T1:  state = ST_SHUTDOWN\r\n2.  T2:  reads state == ST_SHUTDOWN\r\n2.  T1:  Enters  EpollEventLoop.wakeup()\r\n2.  T2:  Exits loop, enters EpollEventLoop.cleanup() \r\n2.  T2:  Closes eventFd.\r\n2.  T1: Wins race to by setting wakenUp to 1\r\n2.  T1: Calls Native.eventFdWrite(eventFd.intValue(), 1L);\r\n\r\n\r\n\r\n\r\nThe easiest way I can see to fix this race is to use a synchronized block in wakeup(), after the thread has won the wakenUp = 1 race:\r\n\r\n```java\r\n    @Override\r\n    protected void wakeup(boolean inEventLoop) {\r\n        if (!inEventLoop && WAKEN_UP_UPDATER.getAndIncrement(this) == 0) {\r\n            // write to the evfd which will then wake-up epoll_wait(...)\r\n            synchronized (eventFd) {\r\n                if (!isShutdown()) {\r\n                    Native.eventFdWrite(eventFd.intValue(), 1L);\r\n                }\r\n            }\r\n        }\r\n    }\r\n```\r\n\r\n Additionally, in EpollEventLoop.cleanup, acquire a lock before closing the eventFd, synchronize the close:\r\n\r\n```java\r\n            synchronized (eventFd) {\r\n                try {\r\n                    eventFd.close();\r\n                } catch (IOException e) {\r\n                    logger.warn(\"Failed to close the event fd.\", e);\r\n                }\r\n            }\r\n```\r\n\r\n\r\n\r\nThis is kind of unfortunate, but the race makes it possible that another FD is opened after closing the eventFd, and the wakeUp call writes to the wrong FD.  The main downside of my proposed patch is probably the risk of deadlocks (because I dont know what locks I hold), as well as some performance penalty.   \r\n\r\n\r\nIdeas on how to not pay this cost are welcome, but I think the danger is enough to merit fixing this.\r\n\r\ncc @ejona86 @normanmaurer ",
+        "comments": [
+            "Hmm is this only in the last release ? Using a synchronized sounds like not a good idea ",
+            "Not just in last release, but I noticed it while cleaning up races in gRPC.\r\n\r\nAre you open to busy polling in shutdown?",
+            "Yes this sounds like a better idea",
+            "Can we continue polling until the event loop successfully sets wakenUp to 1, after which point it closes the fds? If the event loop sets wakenUp to 1, then wakeup()'s getAndSet will become a \"noop.\"",
+            "@ejona86 We can't because wakeup may have already won the race, but not yet written to the fd.   \r\n\r\nI thought about this more over the weekend, and I can't see a way to do with without both an \"enter\" and \"exit\" atomic op.  The loop doesn't know if there is an in-progress or upcoming write to the fd.  ",
+            "> We can't because wakeup may have already won the race, but not yet written to the fd.\r\n\r\nWe know when we lose the race as wakeup will be 1. In that case we wait on the eventfd for the event we know is coming and then we \"try again.\" Except we could choose not to set wakeup to 0, so I guess we just leave wakeup as-is and are now safe to close the eventfd.\r\n\r\nNote that means that wakeup then becomes \"load bearing.\" Before it was an optimization. Now it is critical and must not use eventfd when wakeup is 1.",
+            "losing the race means that wakenUp will be 1, but since the eventfd is in non-blocking mode, we would have to poll it until it returns eagain.  I dislike the idea of making close *required* to read from the fd, so I changed the logic to be a tri-state.   \r\n\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 50355,
+            "commit_id": "e7c75453156648c5d5835061a5f0a945bfe5b90b",
+            "original_commit_id": "dd1785ba66dca72a82ec5e5d2e63498f1f591db0",
+            "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 468,
+            "original_line": 468,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 58,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe not a big deal but should we add a sleep(50) or so to reduce CPU costs ?"
+            ]
+        },
+        {
+            "hunk_id": 50353,
+            "commit_id": "e7c75453156648c5d5835061a5f0a945bfe5b90b",
+            "original_commit_id": "dd1785ba66dca72a82ec5e5d2e63498f1f591db0",
+            "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 188,
+            "original_line": 190,
+            "side": "RIGHT",
+            "original_position": 32,
+            "position": 32,
+            "subject_type": "line",
+            "review_comments": [
+                "its a bit sad that we now need another CAS :/",
+                "The alternative is:  on shutdown, busy-read from the event FD until we *don't* get EAGAIN, which would indicate that the `wakeup()` call is complete.   That avoids the second CAS.  thoughts?"
+            ]
+        },
+        {
+            "hunk_id": 50354,
+            "commit_id": "e7c75453156648c5d5835061a5f0a945bfe5b90b",
+            "original_commit_id": "dd1785ba66dca72a82ec5e5d2e63498f1f591db0",
+            "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 468,
+            "original_line": 468,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 58,
+            "subject_type": "line",
+            "review_comments": [
+                "Thread yield?"
+            ]
+        }
+    ]
+}

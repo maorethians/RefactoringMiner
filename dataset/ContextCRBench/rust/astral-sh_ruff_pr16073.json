@@ -1,0 +1,94 @@
+{
+    "repo": "astral-sh/ruff",
+    "pr_number": 16073,
+    "lang": "rust",
+    "pr_title": "[red-knot] Support re-export conventions for stub files",
+    "pr_body": "This is an alternative implementation to #15848.\r\n\r\n## Summary\r\n\r\nThis PR adds support for re-export conventions for imports for stub files.\r\n\r\n**How does this work?**\r\n* Add a new flag on the `Import` and `ImportFrom` definitions to indicate whether they're being exported or not\r\n* Add a new enum to indicate whether the symbol lookup is happening within the same file or is being queried from another file (e.g., an import statement)\r\n* When a `Symbol` is being queried, we'll skip the definitions that are (a) coming from a stub file (b) external lookup and (c) check the re-export flag on the definition\r\n\r\nThis implementation does not yet support `__all__` and `*` imports as both are features that needs to be implemented independently.\r\n\r\ncloses: #14099\r\ncloses: #15476 \r\n\r\n## Test Plan\r\n\r\nAdd test cases, update existing ones if required.\r\n",
+    "pr_comments": [
+        "<!-- __CODSPEED_PERFORMANCE_REPORT_COMMENT__ -->\n<!-- __CODSPEED_INSTRUMENTATION_PERFORMANCE_REPORT_COMMENT__ -->\n\n## [CodSpeed Performance Report](https://codspeed.io/astral-sh/ruff/branches/dhruv%2Fre-export-2)\n\n### Merging #16073 will **degrade performances by 4.21%**\n\n<sub>Comparing <code>dhruv/re-export-2</code> (929cf75) with <code>main</code> (3d0a58e)</sub>\n\n\n\n### Summary\n\n`\u274c 1 (\ud83d\udc41 1)` regressions  \n`\u2705 31` untouched benchmarks  \n\n\n\n### Benchmarks breakdown\n\n|     | Benchmark | `BASE` | `HEAD` | Change |\n| --- | --------- | ----------------------- | ------------------- | ------ |\n| \ud83d\udc41 | `` red_knot_check_file[incremental] `` | 4.5 ms | 4.7 ms | -4.21% |\n",
+        "## Performance notes (on-going)\r\n\r\nTried removing the `lookup: SymbolLookup` field and instead have two salsa query but that doesn\u2019t improve the performance (at least locally) (https://github.com/astral-sh/ruff/pull/16073/commits/e8ca8831d28b0bd126fa2be8edac859eac2b3db9 - going to check if Codspeed yields the same results).\r\n\r\n<details><summary>Patch:</summary>\r\n<p>\r\n\r\n```diff\r\ndiff --git a/crates/red_knot_python_semantic/src/types.rs b/crates/red_knot_python_semantic/src/types.rs\r\nindex 390675f32..a4c68ea63 100644\r\n--- a/crates/red_knot_python_semantic/src/types.rs\r\n+++ b/crates/red_knot_python_semantic/src/types.rs\r\n@@ -126,6 +126,37 @@ fn symbol<'db>(\r\n     name: &str,\r\n ) -> Symbol<'db> {\r\n     #[salsa::tracked]\r\n+    fn internal_symbol_by_id<'db>(\r\n+        db: &'db dyn Db,\r\n+        scope: ScopeId<'db>,\r\n+        is_dunder_slots: bool,\r\n+        symbol_id: ScopedSymbolId,\r\n+    ) -> Symbol<'db> {\r\n+        symbol_by_id(\r\n+            db,\r\n+            SymbolLookup::Internal,\r\n+            scope,\r\n+            is_dunder_slots,\r\n+            symbol_id,\r\n+        )\r\n+    }\r\n+\r\n+    #[salsa::tracked]\r\n+    fn external_symbol_by_id<'db>(\r\n+        db: &'db dyn Db,\r\n+        scope: ScopeId<'db>,\r\n+        is_dunder_slots: bool,\r\n+        symbol_id: ScopedSymbolId,\r\n+    ) -> Symbol<'db> {\r\n+        symbol_by_id(\r\n+            db,\r\n+            SymbolLookup::External,\r\n+            scope,\r\n+            is_dunder_slots,\r\n+            symbol_id,\r\n+        )\r\n+    }\r\n+\r\n     fn symbol_by_id<'db>(\r\n         db: &'db dyn Db,\r\n         lookup: SymbolLookup,\r\n@@ -233,7 +264,10 @@ fn symbol<'db>(\r\n     let is_dunder_slots = name == \"__slots__\";\r\n     table\r\n         .symbol_id_by_name(name)\r\n-        .map(|symbol| symbol_by_id(db, lookup, scope, is_dunder_slots, symbol))\r\n+        .map(|symbol| match lookup {\r\n+            SymbolLookup::Internal => internal_symbol_by_id(db, scope, is_dunder_slots, symbol),\r\n+            SymbolLookup::External => external_symbol_by_id(db, scope, is_dunder_slots, symbol),\r\n+        })\r\n         .unwrap_or(Symbol::Unbound)\r\n }\r\n \r\n```\r\n\r\n</p>\r\n</details> \r\n\r\n---\r\n\r\nI compared the trace logs between `main` and `re-export-2` using the debug build on `tomllib` with the following command (includes the now merged coarse-grained commit):\r\n\r\n```sh\r\nRED_KNOT_PROFILE_LOG=1 RAYON_NUM_THREADS=1 red_knot check -vvv\r\n```\r\n\r\nCold: https://www.diffchecker.com/JqHRR99N/\r\n\r\n- There are more calls to `symbol(\"object\")` compared to before\r\n- The number of ingredients are the same (as expected)\r\n- Reduced number of `symbol(\"__getitem__\")` calls\r\n- Increased number of `symbol_by_id` salsa query\r\n\r\nIncremental: https://www.diffchecker.com/KqLUCdie/ \r\n\r\n- Similar observations as in the cold benchmark\r\n- For the incremental part, I\u2019m seeing a lot of `DidValidateMemoizedValue` salsa events. As per the docs (mentioned below), is it that now the incremental benchmark is going through more number of queries as compared to on `main` and that a lot of time is spent on validating whether salsa can re-use the cached value or not.\r\n\r\n```rs\r\n    /// Occurs when we found that all inputs to a memoized value are\r\n    /// up-to-date and hence the value can be re-used without\r\n    /// executing the closure.\r\n    ///\r\n    /// Executes before the \"re-used\" value is returned.\r\n```\r\n\r\n---\r\n\r\nNOTE: There's still a 4% regression on the incremental benchmark which I want to look into.",
+        "Thanks for the analysis. Calling more salsa queries is probably the culprit because we pay an overhead for every salsa that requires \"checking\" if it's still green during the incremental benchmark.",
+        "There's still a 4% regression which I want to look into but I'd find it useful to get some initial feedback on the implementation itself which is why I'm marking this as ready for review.",
+        "> There's still a 4% regression\r\n\r\nBummer, I thought there was a reasonable chance this approach would eliminate the regression. I guess it is coming from somewhere that both approaches have in common...",
+        "\ud83e\udd73 Great to see this get over the line \u2014 thanks @dhruvmanila! \ud83d\ude03"
+    ],
+    "merged": true,
+    "created_at": "2025-02-12T08:36:00Z",
+    "issue_context": {
+        "number": 15476,
+        "title": "[red-knot] No error when using some `types` symbols without importing them",
+        "body": "Red Knot does not raise any errors when using some symbols from `types` without importing them. I haven't done an exhaustive investigation, but all of these should raise errors:\n```py\na: Literal[2] =   # no error here\nb: Any = 2  # no error here\nc: Never = 3\nd: Annotated[int, \"\u2026\"] = 2\ne: Union[int, str] = 2\n```",
+        "comments": [
+            "I think this is a duplicate of https://github.com/astral-sh/ruff/issues/14099 -- these symbols are imported in typeshed's `builtins.pyi` file, and we haven't yet implemented an understanding the re-export conventions for stub files. (No import in a stub file should be understood as a public re-export unless it uses the explicit `import foo as foo` or `from foo import bar as bar` syntax)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 68157,
+            "commit_id": "929cf7555925e9cec11c8e9fa5a3f3fdd2eacf32",
+            "original_commit_id": "0a75a1d56bf0f4d0955cdaf1bf5a82e9de0c0fe9",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4983,
+            "original_line": 4983,
+            "side": "RIGHT",
+            "original_position": 237,
+            "position": 237,
+            "subject_type": "line",
+            "review_comments": [
+                "Looking through the usages of `global_symbol` and `symbol` it does seem to me that the majority of call sites use `Internal`. Requiring the parameter for all call sites makes the API significantly more verbose. I think it could be useful to expose two methods instead of making this a parameter. I'm not familiar enough with the subject to propose good names. \r\n\r\nI'd probably use `symbol` and `global_symbol` for the `SymbolLookup` variant that's most commonly used (which is the right default in most cases) and have a method with a more explicit name for the other variant.",
+                "I agree with this, for clarity/ergonomic reasons. I think we can just add a new `imported_symbol` function (same as `global_symbol` but with external lookup).",
+                "There's one subtle difference which I noticed when trying out this appraoch - `known_module_symbol` uses `global_symbol` which is a more limited version of the logic that's present on `ModuleLiteralType::member` in that the former skips `__init__` and `__dict__` while the later does not.\r\n\r\n**`ModuleLiteralType::member`:**\r\n\r\nhttps://github.com/astral-sh/ruff/blob/f8093b65ea88eb11a0d0f4ffdbf7c6f007043238/crates/red_knot_python_semantic/src/types.rs#L3798-L3819\r\n\r\n**`global_symbol`:**\r\n\r\nhttps://github.com/astral-sh/ruff/blob/f8093b65ea88eb11a0d0f4ffdbf7c6f007043238/crates/red_knot_python_semantic/src/types.rs#L255-L269\r\n\r\nNow, this PR also resolves https://github.com/astral-sh/ruff/issues/15476 by way of using the re-export conventions when looking up for a symbol in the builtins scope (via the fallback logic in `infer_name_load`). But, this should still use the logic from `global_symbol` when falling back to `ModuleType` such that the following throws an error:\r\n```py\r\nreveal_type(__init__)\r\n```\r\n\r\nThis means that there's only one place where _both_ `SymbolLookup::External` and only ignoring `__getattr__` from `ModuleType` logic needs to happen which is in `ModuleTypeLiteral::member` but there are multiple places where _only_ SymbolLookup::External` needs to happen (`global_symbol`, `known_module_symbol`).\t",
+                "**tl;dr** of the above comment:\r\n\r\n| Function / Method | `SymbolLookup` | Ignore from `ModuleType` |\r\n|--------|--------|--------|\r\n| `ModuleTypeLiteral::member` | `Imported` | `__getattr__` |\r\n| `known_module_symbol` | `Imported` | `__init__`, `__dict__`, `__getattr__` |\r\n| `global_symbol` | `SameFile` | `__init__`, `__dict__`, `__getattr__` |\r\n\r\nwhich doesn't allow us to create a function that defaults to `External` without repeating the logic for `ModuleType` fallback logic in multiple places.",
+                "The special case is only the builtins here, maybe we could add a variant `SymbolLookup::Builtin` to explicitly clarify here.\r\n\r\nI'll put a follow-up PR to make the review process easier and keep this PR limited to only performance related changes.",
+                "(Related to https://github.com/astral-sh/ruff/pull/16073#discussion_r1953849717, ignore this for now.)",
+                "Great catch! This doesn't seem like an issue? The handling of these extra `ModuleType` names is always a `.or_fall_back_to(...)` call on the result of calling `symbol`, so it seems like we can easily wrap up any version of that logic that we want to avoid repeating into an orthogonal function that takes a `Symbol` and returns a `Symbol` with the fallback to a `ModuleType` name, and then we can call these orthogonal functions wherever we need to without repeating any actual logic. I think it's fine if we have a separate `builtin_symbol` function as well as `imported_symbol`."
+            ]
+        },
+        {
+            "hunk_id": 68158,
+            "commit_id": "929cf7555925e9cec11c8e9fa5a3f3fdd2eacf32",
+            "original_commit_id": "0a75a1d56bf0f4d0955cdaf1bf5a82e9de0c0fe9",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": 110,
+            "original_start_line": 110,
+            "start_side": "RIGHT",
+            "line": 115,
+            "original_line": 115,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "Another idea:\r\n\r\n```rs\r\npub(crate) enum SymbolResolution {\r\n\t/// Resolve the symbol as seen from within the current module\r\n    Local,\r\n\t/// Resolve the symbol as it would be seen when imported from another module\r\n    Imported,\r\n}\r\n```",
+                "This could lead to the following functions:\r\n1. `global_symbol`\r\n2. `imported_global_symbol`\r\n3. `symbol`\r\n4. `imported_symbol`\r\n\r\nwhere, (1) and (3) defaults to `Local` and (2) and (4) defaults to `Imported`",
+                "It's not possible to import a non-global symbol, so I think item 4 in that table is unnecessary? It should just be the first three possibilities.\r\n\r\nAs far as the naming of this enum, I think I weakly prefer \"Lookup\" over \"Resolution\". I think for the enum values my main concern is that it's easy to confuse \"internal to a scope\" and \"external to a scope\" vs \"internal to a file\" and \"external to a file\". Scope internal/external is our existing distinction of local vs \"public\" symbol types; all of these functions are for \"public\" types, since for local types we just `symbol_from_bindings` with the bindings for that particular use. So for that reason I think I would prefer being extra explicit about that part in the variant names, not just in the docstrings, e.g. `SameFile` and `OtherFile`? Or `SameFile` and `Imported`? Or `FileInternal` and `Imported`?",
+                "Yeah, that makes sense. I'm in favor of using `SameFile` and `Imported`."
+            ]
+        },
+        {
+            "hunk_id": 68159,
+            "commit_id": "929cf7555925e9cec11c8e9fa5a3f3fdd2eacf32",
+            "original_commit_id": "0a75a1d56bf0f4d0955cdaf1bf5a82e9de0c0fe9",
+            "path": "crates/red_knot_python_semantic/src/types.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 350,
+            "original_line": 350,
+            "side": "RIGHT",
+            "original_position": 109,
+            "position": 109,
+            "subject_type": "line",
+            "review_comments": [
+                "May not matter much, but `in_stub()` is something we could check just once for the entire lookup (based on the file) and update the `lookup` value we pass in here based on that, instead of re-checking `in_stub` for every binding (and below for every declaration), when it will be the same for all of them. (This is related to another comment above about reducing the number of cached memos to re-validate in the incremental benchmark.)\r\n\r\nSimilarly, I don't know how smart the Rust compiler is here or whether it would make any difference, but it seems like we could define the closure function conditionally based on `lookup.is_external()`, so that if it's not external the closure is a no-op, instead of re-checking `lookup.is_external()` for every binding/declaration.",
+                "> May not matter much, but `in_stub()` is something we could check just once for the entire lookup (based on the file) and update the `lookup` value we pass in here based on that, instead of re-checking `in_stub` for every binding (and below for every declaration), when it will be the same for all of them. (This is related to another comment above about reducing the number of cached memos to re-validate in the incremental benchmark.)\r\n\r\nI don't think the `in_stub` check is tied with the `lookup` value but we can include the source type of the imported file such that the enum becomes:\r\n```rs\r\nenum SymbolLookup {\r\n\tSameFile,\r\n\tImported(PySourceType),\r\n}\r\n\r\nimpl SymbolLookup {\r\n\tfn is_imported_from_stub(self) -> bool\r\n}\r\n```",
+                "> I don't think the `in_stub` check is tied with the `lookup` value\r\n\r\nI wasn't suggesting it's tied to the `lookup` value, but it is tied to the _lookup_, as in a single call to `symbol` is always in a single scope which is in a single file which is either a stub or not. We don't have to check it individually for each binding/declaration.\r\n\r\nWe could add a `PySourceType` to the `Imported` variant, but this seems more complex than necessary, since the behavior for `SameFile` and `Imported(not-stub)` would always be identical? If we are able to use multiple functions to make the enum an internal implementation detail, it could just be `RequireExplicitReExports {Yes/No}` and the `imported_symbol` function would set it to `Yes` conditionally based on whether the symbol is being looked up in a stub or not.",
+                "I see, thanks for clarifying. The `RequireExplicitReExports` suggestion is interesting.",
+                "The `in_stub` check was pulled out of the query and is only checked once along with using `RequireExplicitReExport` in https://github.com/astral-sh/ruff/pull/16133."
+            ]
+        }
+    ]
+}

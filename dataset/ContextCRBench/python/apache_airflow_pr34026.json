@@ -1,0 +1,63 @@
+{
+    "repo": "apache/airflow",
+    "pr_number": 34026,
+    "lang": "python",
+    "pr_title": "AIP-44 Migrate Job to Internal API",
+    "pr_body": "This PR migrates Job's methods to Internal API. \r\nIt also adds some methods for JobPydantic to make it usable interchangebly with Job.\r\nHowever not all method are migrated - *JobRunner still operates on ORM Job object - and it is required, as  Job contains some \"callback\" methods, which can't be easily serialized and executed in Internal API. Instead they may simply do additional Internal API call.\r\nJobPydantic is mostly used as a transport object.\r\n\r\ncloses: #29315\r\nrelated: #30298\r\n\r\n\r\n\r\n<!-- Please keep an empty line above the dashes. -->\r\n---\r\n**^ Add meaningful description above**\r\nRead the **[Pull Request Guidelines](https://github.com/apache/airflow/blob/main/CONTRIBUTING.rst#pull-request-guidelines)** for more information.\r\nIn case of fundamental code changes, an Airflow Improvement Proposal ([AIP](https://cwiki.apache.org/confluence/display/AIRFLOW/Airflow+Improvement+Proposals)) is needed.\r\nIn case of a new dependency, check compliance with the [ASF 3rd Party License Policy](https://www.apache.org/legal/resolved.html#category-x).\r\nIn case of backwards incompatible changes please leave a note in a newsfragment file, named `{pr_number}.significant.rst` or `{issue_number}.significant.rst`, in [newsfragments](https://github.com/apache/airflow/tree/main/newsfragments).\r\n",
+    "pr_comments": [
+        "LGTM after deeper review.",
+        "@mhenc -> one thing to remember that we have to do as a follow-up for AIP-44 as well - we need to implement the heartbeat callback in AIP-44 compliant way.\r\n\r\nIn the current implementaiton of AIP-44 the callback is still called on the client side (i.e. in the local task job) and it performs some DB methods / refreshing task instance and dag run from the DB so it is . But it also uses some \"local\" process manageement (terminating running task if the state changed, but also handle the \"impersonation\" case where we have additional parent process created in the process of switching to the impersonated user - so this method should be likely split into \"retrieving state from DB\" (with internal API call) and reacting to state change. \r\n\r\nOr maybe we could refactor the heartbeat_callback approach and make a \"dedicated\" local task job heartbeat that will do it in a single Internal API call to both update heartbeat status AND retrieve the state and return it to be able to kill processes as reaction to external DB state change.\r\n\r\ncc: @bjankie1 - I think it would be great if you two think about it and propose some approach that would be good regarding potential optimisation of heartbeat in the future).\r\n\r\nCurrently the callback is as follows.\r\n\r\n```python\r\n    @provide_session\r\n    def heartbeat_callback(self, session: Session = NEW_SESSION) -> None:\r\n        \"\"\"Self destruct task if state has been moved away from running externally.\"\"\"\r\n        if self.terminating:\r\n            # ensure termination if processes are created later\r\n            self.task_runner.terminate()\r\n            return\r\n\r\n        self.task_instance.refresh_from_db()\r\n        ti = self.task_instance\r\n\r\n        if ti.state == TaskInstanceState.RUNNING:\r\n            fqdn = get_hostname()\r\n            same_hostname = fqdn == ti.hostname\r\n            if not same_hostname:\r\n                self.log.error(\r\n                    \"The recorded hostname %s does not match this instance's hostname %s\",\r\n                    ti.hostname,\r\n                    fqdn,\r\n                )\r\n                raise AirflowException(\"Hostname of job runner does not match\")\r\n            current_pid = self.task_runner.get_process_pid()\r\n            recorded_pid = ti.pid\r\n            same_process = recorded_pid == current_pid\r\n\r\n            if recorded_pid is not None and (ti.run_as_user or self.task_runner.run_as_user):\r\n                # when running as another user, compare the task runner pid to the parent of\r\n                # the recorded pid because user delegation becomes an extra process level.\r\n                # However, if recorded_pid is None, pass that through as it signals the task\r\n                # runner process has already completed and been cleared out. `psutil.Process`\r\n                # uses the current process if the parameter is None, which is not what is intended\r\n                # for comparison.\r\n                recorded_pid = psutil.Process(ti.pid).ppid()\r\n                same_process = recorded_pid == current_pid\r\n\r\n            if recorded_pid is not None and not same_process and not IS_WINDOWS:\r\n                self.log.warning(\r\n                    \"Recorded pid %s does not match the current pid %s\", recorded_pid, current_pid\r\n                )\r\n                raise AirflowException(\"PID of job runner does not match\")\r\n        elif self.task_runner.return_code() is None and hasattr(self.task_runner, \"process\"):\r\n            if ti.state == TaskInstanceState.SKIPPED:\r\n                # A DagRun timeout will cause tasks to be externally marked as skipped.\r\n                dagrun = ti.get_dagrun(session=session)\r\n                execution_time = (dagrun.end_date or timezone.utcnow()) - dagrun.start_date\r\n                if ti.task.dag is not None:\r\n                    dagrun_timeout = ti.task.dag.dagrun_timeout\r\n                else:\r\n                    dagrun_timeout = None\r\n                if dagrun_timeout and execution_time > dagrun_timeout:\r\n                    self.log.warning(\"DagRun timed out after %s.\", execution_time)\r\n\r\n            # potential race condition, the _run_raw_task commits `success` or other state\r\n            # but task_runner does not exit right away due to slow process shutdown or any other reasons\r\n            # let's do a throttle here, if the above case is true, the handle_task_exit will handle it\r\n            if self._state_change_checks >= 1:  # defer to next round of heartbeat\r\n                self.log.warning(\r\n                    \"State of this instance has been externally set to %s. Terminating instance.\", ti.state\r\n                )\r\n                self.terminating = True\r\n            self._state_change_checks += 1\r\n```"
+    ],
+    "merged": true,
+    "created_at": "2023-09-04T22:37:59Z",
+    "issue_context": {
+        "number": 29315,
+        "title": "AIP-44 Migrate BaseJob.heartbeat to InternalAPI",
+        "body": "https://github.com/apache/airflow/blob/main/airflow/jobs/base_job.py#L182\n\n",
+        "comments": [
+            "I would like to work on this issue, please.",
+            "Assigned you",
+            "Thank you! \ud83d\ude4f "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 55479,
+            "commit_id": "ea475ad71710232a21004cfce39c868396bbf68e",
+            "original_commit_id": "e1fd8d83d1a2f48d61f92d1bfc42f7b0603f4193",
+            "path": "airflow/jobs/job.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 155,
+            "original_line": 155,
+            "side": "RIGHT",
+            "original_position": 77,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "This is slight change in the semantics - job end_date is updated after the on_kill, but looking at implementations, that does not matter.",
+                "Right, but please notice that end_date was not set on `self` but on newly fetched object - so `self.on_kill()`  didn't have access to the `job.end_date`\r\nThat's why I believe it's safe to move the updating for `end_date` after."
+            ]
+        },
+        {
+            "hunk_id": 55480,
+            "commit_id": "ea475ad71710232a21004cfce39c868396bbf68e",
+            "original_commit_id": "e1fd8d83d1a2f48d61f92d1bfc42f7b0603f4193",
+            "path": "airflow/jobs/job.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 187,
+            "original_line": 187,
+            "side": "RIGHT",
+            "original_position": 86,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "I tihnk we need to meet for an interactive brainstorming session and discuss what's going on here. I believe there were some non-obvious behaviours of heartbeat that we should replicate (especially around edge cases).\r\n\r\nI tried recently to understand what's going on in this method and explain it here:  https://github.com/apache/airflow/discussions/33689#discussioncomment-6820251\r\n\r\nAnd I think it's not entirely obvious if we have the same now.\r\n\r\nLet's discuss on slack @mhenc.",
+                "@potiuk any update on this? "
+            ]
+        }
+    ]
+}

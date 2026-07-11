@@ -1,0 +1,102 @@
+{
+    "repo": "apache/airflow",
+    "pr_number": 33570,
+    "lang": "python",
+    "pr_title": "Fix waiting setup tasks when they are not a direct upstream",
+    "pr_body": "<!--\r\n Licensed to the Apache Software Foundation (ASF) under one\r\n or more contributor license agreements.  See the NOTICE file\r\n distributed with this work for additional information\r\n regarding copyright ownership.  The ASF licenses this file\r\n to you under the Apache License, Version 2.0 (the\r\n \"License\"); you may not use this file except in compliance\r\n with the License.  You may obtain a copy of the License at\r\n\r\n   http://www.apache.org/licenses/LICENSE-2.0\r\n\r\n Unless required by applicable law or agreed to in writing,\r\n software distributed under the License is distributed on an\r\n \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\r\n KIND, either express or implied.  See the License for the\r\n specific language governing permissions and limitations\r\n under the License.\r\n -->\r\n\r\n<!--\r\nThank you for contributing! Please make sure that your code changes\r\nare covered with tests. And in case of new features or big changes\r\nremember to adjust the documentation.\r\n\r\nFeel free to ping committers for the review!\r\n\r\nIn case of an existing issue, reference it using one of the following:\r\n\r\ncloses: #ISSUE\r\nrelated: #ISSUE\r\n\r\nHow to write a good git commit message:\r\nhttp://chris.beams.io/posts/git-commit/\r\n-->\r\ncloses: #33561\r\n\r\nThis PR force the TI to wait all the upstream setup tasks event if they are not a direct upstream. Please check #33561 for more details.\r\n\r\n\r\n<!-- Please keep an empty line above the dashes. -->\r\n---\r\n**^ Add meaningful description above**\r\nRead the **[Pull Request Guidelines](https://github.com/apache/airflow/blob/main/CONTRIBUTING.rst#pull-request-guidelines)** for more information.\r\nIn case of fundamental code changes, an Airflow Improvement Proposal ([AIP](https://cwiki.apache.org/confluence/display/AIRFLOW/Airflow+Improvement+Proposals)) is needed.\r\nIn case of a new dependency, check compliance with the [ASF 3rd Party License Policy](https://www.apache.org/legal/resolved.html#category-x).\r\nIn case of backwards incompatible changes please leave a note in a newsfragment file, named `{pr_number}.significant.rst` or `{issue_number}.significant.rst`, in [newsfragments](https://github.com/apache/airflow/tree/main/newsfragments).\r\n",
+    "pr_comments": [
+        "good catch. bummer we missed this one.  will take a look here.",
+        "@hussein-awala i noticed there are some failing tests.  is this ready for review or are you still working through some edge cases?",
+        "> @hussein-awala i noticed there are some failing tests. is this ready for review or are you still working through some edge cases?\r\n\r\nIt was supposed to be ready (I tested it and it worked perfectly as expected), but there seems to be a problem with the mapped operators (which I didn't test), and I didn't have time to check it. I'll resume working on it this weekend, and I'll draft it in the meantime.",
+        "Cool, so one thing @hussein-awala ... I think in order to ensure consistent behavior, we must also add something like this to function `validate_setup_teardown` \r\n\r\n```\r\n            if task.is_setup:\r\n                for down_task in task.downstream_list:\r\n                    if not down_task.is_teardown and down_task.trigger_rule not in one_success_rules:\r\n                        # this is required to ensure consistent clearing behavior when upstream\r\n                        raise ValueError(\r\n                            \"Setup tasks must be followed with trigger rule ALL_SUCCESS or ONE_SUCCESS.\"\r\n                        )\r\n```\r\n\r\nor perhaps better, do the check when setting upstream / downstream.  The reason is that, what you are doing (and needfully so) is essentially to check that upstream setups are done and successful before the downstream (which is not directly connected) may run.  BUT, if a user uses a trigger rule such as `one_failed` following a setup task, then this can create odd results where, the scenario where the task runs is when the setup fails, but we're clearing it and running it, and the setup succeeds, so it shouldn't run.  It's very odd and nonsensical, but we should guard against it and for consistency.  If it's not clear I can try and create an example.  We could perhaps relax this a bit to allow other trigger rules for work tasks not inside the scope of the setup.\r\n\r\nOther point... on the topic of scope of the setup....  I think your logic for `get_setups_only` may be incorrect because it gets, i think, all upstream setups, but note that the scope of the setup can be constrained by adding a teardown, which means that anything that is not between the setup and its teardown is not assumed to require that setup.  i think the easiest way for you to obtain just the \"relevant\" setups is to just use `get_upstreams_only_setups_and_teardowns` and filter out the teardowns.  This method restricts to just setups and teardowns for which the object task is \"in scope\".\r\n",
+        "i'm gonna collaborate on this with you if that's alright since time is short.\r\ni will rebase and add a couple changes which of course you can revert if you have concerns. i'l try to make it obvious what each commit does.\r\n",
+        "oh darn cannot rebase let's see if i can just add",
+        "ok yeah that worked... ok so yeah, pushed a few changes, mainly the only changes i made were with respect to making the diff easier to follow.  added a few comments. will continue to review.",
+        "Fixed by an alternative solution by #33903"
+    ],
+    "merged": false,
+    "created_at": "2023-08-30T09:08:57Z",
+    "issue_context": {
+        "number": 33561,
+        "title": "The TI doesn't wait setup tasks when they are not a direct upstream",
+        "body": "### Apache Airflow version\n\n2.7.0\n\n### What happened\n\nWhen we add a setup task (let's call it S) before a sequence of tasks, and we clear the state of a not direct downstream task for the setup task (let's call it T), the state of S is correctly cleared, but the task T doesn't wait for S, they are running in parallel.\n\n### What you think should happen instead\n\nThe setup task should be treated as an upstream for all the downstream tasks\n\n### How to reproduce\n\n```python\r\nfrom datetime import datetime\r\n\r\nfrom airflow.models import DAG\r\nfrom airflow.operators.python import PythonOperator\r\n\r\ndef sleep_and_log(msg):\r\n    import time\r\n    \r\n    time.sleep(5)\r\n    print(msg)\r\n\r\n\r\n\r\nwith DAG(\r\n    dag_id=\"test_setup_teardown\",\r\n    schedule_interval=None,\r\n    start_date=datetime(2023, 8, 20),\r\n    catchup=False,\r\n):\r\n    setup_task = PythonOperator(\r\n        task_id=\"setup_task\",\r\n        python_callable=lambda: sleep_and_log(\"setup_task\"),\r\n    ).as_setup()\r\n\r\n    teardown_task = PythonOperator(\r\n        task_id=\"teardown_task\",\r\n        python_callable=lambda: sleep_and_log(\"teardown_task\"),\r\n    ).as_teardown(setups=[setup_task])\r\n\r\n    t1 = PythonOperator(\r\n        task_id=\"t1\",\r\n        python_callable=lambda: sleep_and_log(\"t1\"),\r\n    )\r\n\r\n    t2 = PythonOperator(\r\n        task_id=\"t2\",\r\n        python_callable=lambda: sleep_and_log(\"t2\"),\r\n    )\r\n\r\n    setup_task >> t1 >> t2 >> teardown_task\r\n```\r\n\r\nCreate a run and wait all the tasks to finish, then clear the state of t2, the setup task and t2 states will be cleared, and both tasks will run in parallel.\n\n### Operating System\n\nDebian GNU/Linux\n\n### Versions of Apache Airflow Providers\n\n_No response_\n\n### Deployment\n\nDocker-Compose\n\n### Deployment details\n\n_No response_\n\n### Anything else\n\n_No response_\n\n### Are you willing to submit PR?\n\n- [X] Yes I am willing to submit a PR!\n\n### Code of Conduct\n\n- [X] I agree to follow this project's [Code of Conduct](https://github.com/apache/airflow/blob/main/CODE_OF_CONDUCT.md)\n",
+        "comments": [
+            "This issue has been automatically marked as stale because it has been open for 365 days without any activity. There has been several Airflow releases since last activity on this issue. Kindly asking to recheck the report against latest Airflow version and let us know if the issue is reproducible. The issue will be closed in next 30 days if no further activity occurs from the issue author.",
+            "This issue has been closed because it has not received response from the issue author."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 54363,
+            "commit_id": "831933f7a03cfcccd1da08f32063952a297e7f81",
+            "original_commit_id": "9ce76e321f9792690a8d93d5ecb4df9bdaf8fac9",
+            "path": "airflow/ti_deps/deps/trigger_rule_dep.py",
+            "start_line": 135,
+            "original_start_line": 135,
+            "start_side": "RIGHT",
+            "line": 138,
+            "original_line": 138,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 71,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        if ti.task.is_teardown:\r\n            setup_upstream_tasks = (task for task in ti.task.upstream_list if task.is_setup)\r\n        else:\r\n            setup_upstream_tasks = ti.task.get_upstreams_only_setups()\r\n```\r\n\r\nNo need to build a list here as far as I can tell"
+            ]
+        },
+        {
+            "hunk_id": 54364,
+            "commit_id": "831933f7a03cfcccd1da08f32063952a297e7f81",
+            "original_commit_id": "9ce76e321f9792690a8d93d5ecb4df9bdaf8fac9",
+            "path": "airflow/ti_deps/deps/trigger_rule_dep.py",
+            "start_line": 315,
+            "original_start_line": 315,
+            "start_side": "RIGHT",
+            "line": 317,
+            "original_line": 317,
+            "side": "RIGHT",
+            "original_position": 230,
+            "position": 230,
+            "subject_type": "line",
+            "review_comments": [
+                "I\u2019d do\r\n\r\n```python\r\nelif upstream_setup and not setup_down:\r\n    pass\r\n```\r\n\r\nand dedent the entire block below. (Not sure if I got the boolean negation right)"
+            ]
+        },
+        {
+            "hunk_id": 54361,
+            "commit_id": "831933f7a03cfcccd1da08f32063952a297e7f81",
+            "original_commit_id": "9ce76e321f9792690a8d93d5ecb4df9bdaf8fac9",
+            "path": "airflow/models/dag.py",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 725,
+            "original_line": 725,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "Since we\u2019ve drilled this deep, can this show what the offending task is for clarity?"
+            ]
+        },
+        {
+            "hunk_id": 54362,
+            "commit_id": "831933f7a03cfcccd1da08f32063952a297e7f81",
+            "original_commit_id": "9ce76e321f9792690a8d93d5ecb4df9bdaf8fac9",
+            "path": "airflow/ti_deps/deps/trigger_rule_dep.py",
+            "start_line": 44,
+            "original_start_line": 44,
+            "start_side": "RIGHT",
+            "line": 45,
+            "original_line": 45,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this just to have the default? Dataclass is pretty significantly slower and not really worthwhile here since the class is unpacked pretty much immediately. Better to stick to a named tuple."
+            ]
+        }
+    ]
+}

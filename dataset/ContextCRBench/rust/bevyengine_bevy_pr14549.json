@@ -1,0 +1,56 @@
+{
+    "repo": "bevyengine/bevy",
+    "pr_number": 14549,
+    "lang": "rust",
+    "pr_title": "Change ReflectMapEntities to operate on components before insertion",
+    "pr_body": "# Objective\r\n\r\nFixes #14465\r\n\r\n## Solution\r\n\r\nAlters `ReflectMapEntities` to operate more like `MapEntities` by making it operate on the component itself rather than the `World` post-insertion. As a result, `Observers` never see the in-between state where the scene component has been added, but hasn't yet had its entities mapped.\r\n\r\nAlso brings it more in-line with `MapEntities` by accepting a generic `DynEntityMapper` rather than relying on the `EntityHashMap` and `SceneEntityMapper` implementation.\r\n\r\n## Testing\r\n\r\n* New unit test for `Observer`s + `DynamicScene`s\r\n* New unit test for `Observer`s + `Scene`s\r\n* Open to suggestions for other tests!\r\n\r\n---\r\n\r\n## Migration Guide\r\n\r\n- The existing `map_entities` and `map_all_entities` methods have been renamed to `map_world_entities` and `map_all_world_entities` respectively and marked as deprecated.\r\n  - Figured I'd leave these in some form since the new method isn't exactly a drop-in replacement.\r\n  - ~This is in a separate commit so that they'll be easy to fully remove later.~ Edit: Oops, I forgot I did this and squashed it away. Oh well, should still be easy to remove them if/when desired.\r\n\r\n",
+    "pr_comments": [
+        "**Welcome**, new contributor!\n\n  Please make sure you've read our [contributing guide](https://github.com/bevyengine/bevy/blob/main/CONTRIBUTING.md) and we look forward to reviewing your pull request shortly \u2728",
+        "Let me know when this is ready for review :) I'm going to want a regression test or two: the logic here is *tricky* but important to get right.",
+        "Hmm, I added a test which correctly fails before/succeeds after my change, but in the process I noticed that I'm now causing `'dynamic_scene::tests::components_not_defined_in_scene_should_not_be_affected_by_scene_entity_map' has overflowed its stack` :upside_down_face: ",
+        "Ope, I'm just an idiot :sweat_smile: Forgot to use the wrapped `EntityMapper` rather than the outer `UnDynEntityMapper`.",
+        "@alice-i-cecile Ready for review!\r\n\r\nI'm satisfied that this change fixes the original scenes/observers/mapped entities issue, but I wonder if there isn't a more fundamental problem with observers and their immediacy. This fixes the issue of individual components being in an inconsistent state, but I think the overall scene will still be inconsistent when the observers fire, e.g. a `Trigger<OnAdd, Parent>` observer may still see an empty parent entity if the child is written before its parent.",
+        "Agreed, there's something deeper here that's bothering me but I haven't figured out exactly what yet.\r\n\r\n@cart's idea from https://github.com/bevyengine/bevy/pull/14520#discussion_r1699159208 to use a topologically sorted order of resolution might help this problem as well.",
+        "Yeah, that sounds like it would definitely help, but it also feels like another band-aid.\r\n\r\nIn my mind, the _real_ issue is that observers very much look like systems, which have always run on either side of sync points and thus could never observe intermediate state. But in reality, observers _can_ see this intermediate state since they run immediately. Things like `cmd.entity(e).insert(Foo).insert(Bar)` vs `cmd.entity(e).insert(Bar).insert(Foo)` didn't previously have much semantic difference, since all systems (and commands later in the queue) only ever saw the final state where they both existed. Queueing component hooks and triggers as extra Commands rather than immediate calls could be a possible solution with the added benefit of avoiding stack overflows resulting from too many nested triggers.\r\n\r\nEdit: Delved a little more deeply, and I think I'm conflating a couple of issues. The stack overflow is due to how command application recurses on `world.flush()` rather than anything trigger-related, and the only observers that are immediately invoked are the `On(Add|Remove|Insert|etc.)` ones as far as I can tell. So _in general_, observers behave like systems and fire post-sync, or at least obey the expected queueing semantics, but the component lifecycle ones insert themselves mid-command-queue.",
+        "Can we plz schedule this PR for an upcoming milestone? \r\nAFIK this is what allows us to deserialize scenes that involve MapEntities and Obsevers, which I guess will be increasingly common.\r\nI believe it closes:\r\n- #14300 \r\n  - my one, currently scheduled for 0.14.3 milestone\r\n- #14465 \r\n- #14467 \r\n  - to be confirmed whether its the same bug\r\n",
+        "Happy to get this rebased and mergeable, but I still think it's just a band-aid. Systems with exclusive `World` access and `Commands` shouldn't have to worry about how they order operations just to appease some observer, and observers shouldn't have to care about how things are ordered within a command/exclusive system. I expect exclusive `World` access to be, well, exclusive, and observers/hooks getting to run in the middle of them feels an awful lot like concurrent shared access. I get that it's all technically kosher according to the borrow checker's rules, but it still breaks the expected mental model. I wrote up [a similar issue](https://github.com/bevyengine/bevy/issues/14621) about mid-exclusive command application, but I think even mid-exclusive read-only observer/hook access is wrong.",
+        "Yeah, I'd like to get this merged :) I disagree with you on \"should hooks and observers operate during exclusive world access\", but that's a conversation for another thread.",
+        "@mrchantey can I please have your review here?",
+        "Went through the referenced issues to see how relevant they are:\r\n\r\n* #14465 is directly addressed, but we already knew that\r\n* #14467 is unrelated, but I put in a fix for it\r\n* #14300 is fixed by this change, but only incidentally. Its real problem is nearly the same as #14467 - observers are allowed to create pending entities which must be flushed before certain operations. This change makes it so that the panic isn't triggered by dynamic scenes, but the bug still remains.",
+        "Merging #15405 instead, which resolves the same issue.",
+        "@alice-i-cecile  I think some wires got crossed - This PR and https://github.com/bevyengine/bevy/pull/15405 both resolve https://github.com/bevyengine/bevy/issues/14300, but only this one resolves https://github.com/bevyengine/bevy/issues/14465. The test it adds still fails before the fix.\r\n\r\nSo this is still relevant and should be reopened.",
+        "Sorry, I can't reopen this PR. Can you remake it?\r\n"
+    ],
+    "merged": false,
+    "created_at": "2024-09-17T12:29:39Z",
+    "issue_context": {
+        "number": 14465,
+        "title": "Observers and hooks doesn't pair well with mapped entities",
+        "body": "## Bevy version\r\n\r\nv0.14.0\r\n\r\n## What you did\r\n\r\nI have a component that stores an entity. The component implements and reflects `MapEntities`, so on scene deserialization it automatically maps entities inside it.\r\n\r\n## What went wrong\r\n\r\nWhen I implement `on_add` hook or `OnAdd` observer for such component, it triggers before `MapEntities` which results in invalid entity access.\r\nIt happens because we insert components here:\r\nhttps://github.com/bevyengine/bevy/blob/eabb58aa0466dadc5d485483efad9a90b4feb285/crates/bevy_scene/src/scene.rs#L117-L123\r\nBut entities mapped later:\r\nhttps://github.com/bevyengine/bevy/blob/eabb58aa0466dadc5d485483efad9a90b4feb285/crates/bevy_scene/src/scene.rs#L128-L131\r\n\r\nI think we should map entities before the insertion.",
+        "comments": [
+            "I would like to add a comment by @mockersf from Discord:\r\n\r\n> that's going to be not fun to fix, we need to add the entities before we can map them... so I guess the fix would be to spawn empty entities, do the mapping, then inserting the components...\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 1230,
+            "commit_id": "97d4d15af6ed8cf960e19f44e48eacfa5d75cb03",
+            "original_commit_id": "efda7f3f9c96164f6e5be04d2be9c267919c6a0a",
+            "path": "crates/bevy_scene/src/dynamic_scene.rs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 87,
+            "original_line": 87,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm not 100% on Bevy docs style, are we meant to declare these panics in the function docs?",
+                "Yes, it would be nice to add a `#Panics` section to the docs.",
+                "My understanding is that panics only need to be documented if they can be triggered by the caller due to invariants not being upheld. That isn't the case for this panic as it signals a bug in the method internals."
+            ]
+        }
+    ]
+}
