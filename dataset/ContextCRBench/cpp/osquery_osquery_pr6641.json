@@ -1,0 +1,108 @@
+{
+    "repo": "osquery/osquery",
+    "pr_number": 6641,
+    "lang": "cpp",
+    "pr_title": "curl_certificate: Implement configurable timeout through WHERE clause",
+    "pr_body": "to Fix #6615 i've updated curl_certificates to have a timeout so it doesn't hang forever. It works by setting up the socket, setting a recv timeout, connecting, and then passing the socket into BIO to complete the TLS handshake.\r\n\r\nI've tested this on Mac, Windows, and Linux and should provide feature parity with the old BIO-based implementation (supports ipv6 and ipv4).  I've added an optional timeout parameter to the table that allows the user to set a timeout in seconds for their query.  It defaults to 3s.\r\n\r\n@theopolis this is ready for review now.",
+    "pr_comments": [
+        "sorry for all the back and forth, this is now ready for review @theopolis .  I set the default to not change the current behavior (of no timeout).  If you specify a timeout it will be honored but otherwise will wait forever.  ",
+        "> Also, instead of setting up the socket yourself, could you use BIO_get_fd to get the underlying socket and called setsockopt on that?\r\n\r\nhahaha, i know.  That's what I tried first.  But, as you know, the openssl API is a strange and mysterious thing.  Sadly, this call does not work.  It always returns -1 =(",
+        "This looks correct but I would like to test it locally under some exceptional conditions. ",
+        "wow, good catch @theopolis .  Took me a long time to figure out what was going on (and I'm still not even 100% sure).  Two different problems here.  The reason the table wasn't working for osquery.io was because I forgot to call `SSL_set_tlsext_host_name` which is required on some platforms (e.g., it works without on Linux but won't on mac).  Once I fixed that, I found that SSL memory allocation is a strange and terrible thing (big surprise with openssl I know).  I suspected it was because i failed to free the `ssl` object.  I tried adding a scope guard to free it, but got double free memory errors. \r\n So, it appears that `BIO_free_all` actually does this freeing of the `ssl` for you once you've associated the `ssl` object with the `BIO`.  But because of the placement of the `ssl` initialization, there were some conditions (like the one above with osquery.io) that caused it to leak that `ssl`.  I've moved the `ssl` initialization closer to where the BIO gets created.  This of course means that if the `ssl` initialization fails, then I have to close down the connected socket manually.  This is all rather terrible and a good case for why openssl is such a pain to use.  All those neat scope_guard tricks get very complicated and can't always be used.  So, i think that this won't leak any more memory.  But I don't actually have an environment to test this out.  Is there a valgrind or clang option to do the leak analysis that I can confirm before you have to look again?  Or can you confirm that the leak analysis is clean now on your tests?",
+        "Do we want this to be configurable vs https://github.com/osquery/osquery/pull/6616 ?",
+        "> Do we want this to be configurable vs #6616 ?\r\n\r\ni think have a config option is a good thing (it's easy to offer this configuration to the user).  But keeping the default set at infinite timeout (preserving the original behavior) may not be the right choice.  It's pretty easy to change to another default like 3 or 5 seconds?  ",
+        "Heads up this is still leaking sockets, check that they remain in `CLOSE_WAIT` or `ESTABLISHED` via `select * from process_open_sockets where pid = (select pid from osquery_info);` and there is still a memory leak (the original one I pasted from LeakSanitizer).\r\n\r\nTo test with LeakSanitizer use: `cmake -DOSQUERY_ENABLE_ADDRESS_SANITIZER=ON ..` and you will see the leak when exiting from the `osqueryi` shell.",
+        "> i think have a config option is a good thing (it's easy to offer this configuration to the user). But keeping the default set at infinite timeout (preserving the original behavior) may not be the right choice. It's pretty easy to change to another default like 3 or 5 seconds?\r\n\r\nI think a default anywhere between 3 and 10s is reasonable. Could support 0 as a forever if you wanted, or not.",
+        "I set a 4s default and fixed the socket leak.  Apparently BIO_CLOSE doesn't actually close the socket =(. Last time I trust openssl to do something for me.  \r\n\r\n@theopolis I'm still trying to track down the memory leak.  I need to build on a Linux system I think.",
+        "Awesome, let me know how it goes. If you need some help next week I can find some time to look for the leak too.",
+        "ok, i feel like i'm at my wits end @theopolis .  i can't get address sanitizer or valgrind to tell me anything sensible about what's leaking.  I get huge lists of symbol-less events claiming that things are leaking.  I also had to set ASAN_OPTIONS=detect_container_overflow=0 for it to get over some problems in code I didn't change in curl_certificate.\r\n\r\nI can't seem to correctly build osquery with debug symbols.  I've tried the following on a relatively stock ubuntu 18.04 machine which is straight from https://osquery.readthedocs.io/en/stable/development/building/\r\n\r\n```\r\n# Install the prerequisites\r\nsudo apt install -y --no-install-recommends git python3 bison flex make\r\n\r\n# Optional: install python tests prerequisites\r\nsudo apt install -y --no-install-recommends python3-pip python3-setuptools python3-psutil python3-six python3-wheel\r\npip3 install timeout_decorator thrift==0.11.0 osquery pexpect==3.3\r\n\r\n# Optional: install RPM packaging prerequisites\r\nsudo apt install -y --no-install-recommends rpm binutils\r\n\r\n# Download and install the osquery toolchain\r\nwget https://github.com/osquery/osquery-toolchain/releases/download/1.1.0/osquery-toolchain-1.1.0-x86_64.tar.xz\r\nsudo tar xvf osquery-toolchain-1.1.0-x86_64.tar.xz -C /usr/local\r\n\r\n# Download and install a newer CMake\r\nwget https://github.com/Kitware/CMake/releases/download/v3.14.6/cmake-3.14.6-Linux-x86_64.tar.gz\r\nsudo tar xvf cmake-3.14.6-Linux-x86_64.tar.gz -C /usr/local --strip 1\r\n# Verify that `/usr/local/bin` is in the `PATH` and comes before `/usr/bin`\r\n\r\n# Download source\r\ngit clone https://github.com/nabilschear/osquery\r\ncd osquery\r\n\r\n# Build osquery\r\nmkdir -p build; cd build\r\n\r\n# one or more of these is required to clone some related repos...\r\ngit config --global http.postBuffer 500M\r\ngit config --global http.maxRequestBuffer 100M\r\ngit config --global core.compression 0\r\n\r\ncmake -DOSQUERY_TOOLCHAIN_SYSROOT=/usr/local/osquery-toolchain -DCMAKE_BUILD_TYPE=Debug -DOSQUERY_ENABLE_ADDRESS_SANITIZER=ON ..\r\ncmake --build . -j10 \r\n```\r\n\r\nI could def use some help tracking down the leak or getting me an environment where I can track it myself. ",
+        "hahaha, funny how asking for help results in you immediately finding the problem yourself.  To get debug symbols in valgrind, I had to build a newer version of valgrind from source (3.16).  Then through some manual flailing around, I discovered that calling both BIO_free and SSL_free resulted in a double free.  Only calling BIO_free leaks memory.  So, SSL_free must also free the BIO.  Anyways I re-arranged the scope guards and removed the BIO_free_all call entirely.  No longer leaking memory for me. So, I think this is all working now.",
+        "Will take a look now, thanks for all the work!"
+    ],
+    "merged": true,
+    "created_at": "2020-09-11T02:18:31Z",
+    "issue_context": {
+        "number": 6615,
+        "title": "curl_certificates doesn't time out when connected to a server that doesn't respond",
+        "body": "<!-- Thank you for contributing to osquery! -->\r\n\r\n# Bug report\r\n\r\n<!--\r\nPlease follow this template.\r\nBefore submitting an issue search for duplicates.\r\n-->\r\n\r\n### What operating system and version are you using?\r\n\r\n version = 18.04.5 LTS (Bionic Beaver)\r\n   build =\r\nplatform = ubuntu\r\n\r\n### What version of osquery are you using?\r\n\r\nversion = 4.4.0\r\n\r\n### What steps did you take to reproduce the issue?\r\n\r\nThe curl_certificate table will hang indefinitely if there's something listening that doesn't respond.\r\n\r\nin one terminal run\r\n\r\n`nc -l 5000`\r\n\r\nThen issue the query:\r\n\r\n`osqueryi \"select * from curl_certificate where hostname=\\\"localhost:5000\\\";\"`\r\n\r\nosquery will hang waiting on more data from the TLS handshake that will never come.\r\n\r\n### What did you expect to see?\r\n\r\nI expected it to return no rows.\r\n\r\n### What did you see instead?\r\n\r\nhangs indefinitely",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 68829,
+            "commit_id": "be2efabdc60e2395eccc9738b73368e14b12145b",
+            "original_commit_id": "689a57178580039d64561362d0593c13d92647fe",
+            "path": "osquery/tables/networking/curl_certificate.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 411,
+            "original_line": 411,
+            "side": "RIGHT",
+            "original_position": 134,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there any cleanup for closing this socket after you confirm `>= 0`?",
+                "very good question.  We can't close the socket until it's connected.  I then moved an unrelated SSL initialization out of the way.  That leaves us with this: We then hand off the socket to BIO and tell it to close it down when it is done (that's what BIO_CLOSE is suppose to do): https://github.com/osquery/osquery/pull/6641/files#diff-850a3567d411d5f1b144c0ac1e59f1c1R447\r\n\r\nThe only place where this could potentially go wrong is here: https://github.com/osquery/osquery/pull/6641/files#diff-850a3567d411d5f1b144c0ac1e59f1c1R447 and here I'm not totally sure what the behavior of openssl would be in this circumstance if it's unable to create the BIO.  So, I'm thinking that we shouldn't re-close the socket if the BIO_new_socket fails."
+            ]
+        },
+        {
+            "hunk_id": 68827,
+            "commit_id": "be2efabdc60e2395eccc9738b73368e14b12145b",
+            "original_commit_id": "689a57178580039d64561362d0593c13d92647fe",
+            "path": "osquery/tables/networking/curl_certificate.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 372,
+            "original_line": 372,
+            "side": "RIGHT",
+            "original_position": 80,
+            "position": 89,
+            "subject_type": "line",
+            "review_comments": [
+                "I see you calling `WSACleanup()` before returning below, checkout our `./osquery/utils/scope_guard.h` utilities\r\n```cpp\r\nauto const wsa_guard = scope_guard::create([]() { WSACleanup(); });\r\n```",
+                "Then you can remove all of the `#ifdef WIN32` + `WSAClean()` + `#endif` calls below.",
+                "i think i did this right, but i'd appreciate a look"
+            ]
+        },
+        {
+            "hunk_id": 68826,
+            "commit_id": "be2efabdc60e2395eccc9738b73368e14b12145b",
+            "original_commit_id": "689a57178580039d64561362d0593c13d92647fe",
+            "path": "osquery/tables/networking/curl_certificate.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "This should be moved inside cmake/flags.cmake under `windows_common_link_options`",
+                "done, two were already present, I added the third"
+            ]
+        },
+        {
+            "hunk_id": 68828,
+            "commit_id": "be2efabdc60e2395eccc9738b73368e14b12145b",
+            "original_commit_id": "689a57178580039d64561362d0593c13d92647fe",
+            "path": "osquery/tables/networking/curl_certificate.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 388,
+            "original_line": 388,
+            "side": "RIGHT",
+            "original_position": 102,
+            "position": 113,
+            "subject_type": "line",
+            "review_comments": [
+                "Also consider a scope guard that contains the logic \r\n```cpp\r\n    if (addrinfo != nullptr) {\r\n      freeaddrinfo(addrinfo);\r\n    }\r\n```\r\nyou will have to include `[&addrinfo]` in the capture group."
+            ]
+        }
+    ]
+}

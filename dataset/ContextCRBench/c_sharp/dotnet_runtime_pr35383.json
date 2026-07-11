@@ -1,0 +1,188 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 35383,
+    "lang": "c_sharp",
+    "pr_title": "Add app-local support for ICU",
+    "pr_body": "Fixes: https://github.com/dotnet/runtime/issues/826\r\nThis adds supports for apps to carry their own copy of ICU. \r\n\r\n## How this works\r\n\r\nApps need to set a runtime config property:\r\n```json\r\n\"System.Globalization.AppLocalIcu\": \"<suffix>:<version> or <version>\"\r\n```\r\nIt can also be via an env var in the form of `DOTNET_SYSTEM_GLOBALIZATION_APPLOCALICU`.\r\n\r\n`<suffix>`: this is optional in the config property, but this follows the public ICU packaging conventions as when building a custom ICU you can customize it to produce the lib names and exported symbol names to contain a suffix. i.e: `libicuucmyapp` where `myapp` is the suffix. This can't be greater than 20 chars in length for the config switch.\r\n`<version>`: this has to be a valid ICU version, i.e: 67.1. This version will be used to load the binaries and to get the exported symbols.\r\n\r\n### How do we load ICU\r\n\r\nTo load ICU we use `NativeLibrary.TryLoad` api which does probing in different paths, first it tries to find the library in `NATIVE_DLL_SEARCH_DIRECTORIES` property which is created by the dotnet host based on the deps.json file for the app. More explained [here](https://docs.microsoft.com/en-us/dotnet/core/dependency-loading/default-probing)\r\n\r\nFor self contained apps, the user doesn't really need to do anything special but to make sure the app has ICU side by side in the APP directory, as for self contained apps, the app directory is by default in `NATIVE_DLL_SEARCH_DIRECTORIES`. \r\n\r\nIf you're consuming ICU via a NuGet package, this will work in framework-dependent apps as NuGet will resolve the native assets and include them in the deps.json file and in the output directory for the app under the `runtimes` dir, then we will load it from there.\r\n\r\nHowever, the tricky part comes whenever it is a framework-dependent app (no self contained) and ICU is part of the project. The SDK doesn't yet have a feature for \"loose\" native binaries to land into `deps.json`: https://github.com/dotnet/sdk/issues/11373. However, there is a workaround by adding something like this to the csproj:\r\n```xml\r\n  <ItemGroup>\r\n    <IcuAssemblies Include=\"icu\\*.so*\" />\r\n    <RuntimeTargetsCopyLocalItems Include=\"@(IcuAssemblies)\" AssetType=\"native\" CopyLocal=\"true\" DestinationSubDirectory=\"runtimes/linux-x64/native/\" DestinationSubPath=\"%(FileName)%(Extension)\" RuntimeIdentifier=\"linux-x64\" NuGetPackageId=\"System.Private.Runtime.UnicodeData\" />\r\n  </ItemGroup>\r\n```\r\n\r\nNote that this will have to be done for all the ICU binaries for the supported runtimes. Also, the `NuGetPackageId` metadata in the `RuntimeTargetsCopyLocalItems` item group, needs to match a NuGet package that the project actually references, it can't just be a dummy NuGet package.\r\n\r\n### macOS behavior\r\n\r\nMacOS has a different behavior for resolving dependent dynamic libraries from the load commands specified in the `match-o` file than the Linux loader. In the Linux loader, we could just load `libicudata` first, then `libicuuc` and last `libicui18n` in that order to satisfy dependent libraries. \r\n\r\nHowever, in MacOS this doesn't work. When building ICU in MacOS, you by default get a dynamic library with these load commands in libicuuc for example:\r\n```sh\r\nsantifdezm@santiagos-mbp dlopen-test % otool -L /Users/santifdezm/repos/icu-build/icu/install/lib/libicuuc.67.1.dylib\r\n/Users/santifdezm/repos/icu-build/icu/install/lib/libicuuc.67.1.dylib:\r\n libicuuc.67.dylib (compatibility version 67.0.0, current version 67.1.0)\r\n libicudata.67.dylib (compatibility version 67.0.0, current version 67.1.0)\r\n /usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1281.100.1)\r\n /usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 902.1.0)\r\n```\r\n\r\nThese commands are just referencing the name of the dependent libraries for the other components of ICU, so the loader will do the search following the `dlopen` conventions. Which involve having these libraries in the system directories or setting the `LD_LIBRARY_PATH` env vars, or having ICU at the app level directory.\r\n\r\nHowever, there are some directives for the loader, like `@loader_path` which tells the loader to search for that dependency in the same directory as the binary with that load command. So there's 2 ways to achieve this.\r\n\r\n#### instal_name_tool -change\r\nRunning:\r\n```\r\ninstall_name_tool -change \"libicudata.67.dylib\" \"@loader_path/libicudata.67.dylib\" /path/to/libicuuc.67.1.dylib\r\ninstall_name_tool -change \"libicudata.67.dylib\" \"@loader_path/libicudata.67.dylib\" /path/to/libicui18n.67.1.dylib\r\ninstall_name_tool -change \"libicuuc.67.dylib\" \"@loader_path/libicuuc.67.dylib\" /path/to/libicui18n.67.1.dylib\r\n```\r\n\r\n#### patching ICU to produce the install names with @loader_path\r\nChanging: https://github.com/unicode-org/icu/blob/ef91cc3673d69a5e00407cda94f39fcda3131451/icu4c/source/config/mh-darwin#L32-L37 to: \r\n```\r\nLD_SONAME = -Wl,-compatibility_version -Wl,$(SO_TARGET_VERSION_MAJOR) -Wl,-current_version -Wl,$(SO_TARGET_VERSION) -install_name @loader_path/$(notdir $(MIDDLE_SO_TARGET))\r\n```\r\n\r\nbefore running autoconf (./runConfigureICU).\r\n\r\nHomebrew does this for all the installed packages: https://github.com/Homebrew/brew/blob/d5ffb96d241e6a19d6ac4563f93210821db23245/Library/Homebrew/extend/os/mac/keg_relocate.rb#L110\r\nhttps://github.com/Homebrew/brew/blob/ef471e97675b97a87827bda2542e39fc07bfe7b3/Library/Homebrew/os/mac/keg.rb#L24\r\n\r\nAlso, Firefox patches ICU similar, using the @executable_path directive for the loader:\r\nhttps://hg.mozilla.org/mozilla-central/file/tip/intl/icu-patches/bug-915735#l20\r\n\r\ncc: @ericstj @danmosemsft @tarekgh @jkotas @janvorli @stephentoub \r\n\r\nFYI: @jefgen @mjsabby ",
+    "pr_comments": [
+        "Tagging subscribers to this area: @tarekgh, @safern, @krwq\nNotify danmosemsft if you want to be subscribed.",
+        "Forgot to mention. I need to add tests for this, but I'm working on building a test package in runtime-assets repo with ICU in it.",
+        "cc: @GrabYourPitchforks ",
+        "cc @timmydo @gregdunham",
+        "I've addressed all PR feedback except for: https://github.com/dotnet/runtime/pull/35383#pullrequestreview-400192870 which I plan to address today. Could I please get more reviews in the meantime? ",
+        "All feedback is addressed \ud83d\ude04 ",
+        "@tarekgh @jkotas @stephentoub does this look good now? ",
+        "Thanks all for the reviews \ud83d\ude04 ",
+        "yay!!!! \ud83d\udd25"
+    ],
+    "merged": true,
+    "created_at": "2020-04-24T14:07:11Z",
+    "issue_context": {
+        "number": 826,
+        "title": "Support using ICU when running on Windows ",
+        "body": "Windows 10 now carrying a version of ICU. It will be good to allow .NET Core take advantage of that.\r\n\r\n**Goals** \r\n\r\nThere are 2 goals which if we do will get us in the much better position regarding the globalization support. \r\n\r\n- Allow using the installed Windows version of ICU when running on Windows 10 19H1 and up. \r\n- Allow using the app ICU version which the app carry with. \r\n\r\nDoing these 2 goals will give the flexibility to the apps to decide if want to use whatever ICU version shipping with Windows or decide to carry its own version of ICU.  \r\n\r\n**How we can support ICU on Windows** \r\n\r\n- We'll merge System.Globalization.Native code to coreclr and include this code for Windows build too. System.Globalization.Native has the ICU interop.\r\n- Adding a shim to load the ICU libraries like what we are doing on Linux, but we\u2019ll try to load it from different places (From System32 folder or app folder for Windows). \r\n- Having the inteop cs code which is compiled for Linux to be included for Windows too. Of course, we must refactor the current code more and instead of having Windows and Linux cs files, we\u2019ll have NLS and ICU code paths instead. \r\n\r\n**Loading Default installed ICU on Windows** \r\n\r\nWindows RS2 started carrying ICU. The ICU DLLs are installed on %WINDIR%\\System32 folder.  \r\nOn RS2, there are 2 DLLs installed there named icuuc.dll and icuin.dll. On 19H1, Windows combined these 2 DLLs into a single DLL named icu.dll. \r\nWe'll support the loading ICU on Windows starting from 19H1 version and up. The reason is the previous versions require COM initialization which can cause some issues.\r\n\r\n**NLS or ICU as a default?** \r\n\r\nWe'll use ICU by default as this is the future direction and we want to get users switch to that. Of course this will be kind of breaking change especially for sorting  behavior and locale data. We are going to provide a config switch to allow using NLS if any app wanted to switch back to the old behavior.\r\n\r\n**Loading non-ICU default libraries** \r\n\r\nAs the second goal is to allow using a specific version of ICU which not necessary the same version shipped with Windows. We are working with Windows team to have them produce ICU NuGet package which apps can get and install with their app (under the app folder). The apps will install it under the app folder for the reasons:  \r\n\r\n- Not try to access any files outside the app folder. That will be more secure. \r\n- The app can be self-contained and possibly can get the ICU package work seamlessly with the .NET Core csproj which will place the ICU DLLs under the app published folder. \r\n\r\nThe app can opt-in to the app version using the config switch. We\u2019ll try to find the libraries under the app folder according to the layout decided by NuGet package. \r\nThe ICU NuGet package will support running on down level Windows versions (e.g. Windows 7). That can give advantage of using ICU there too. \r\n\r\n**Config Switch**  \r\n\r\nWe need the config switch for 2 reasons:  \r\n\r\nTo opt-in/out to or from using ICU/NLS. \r\nTo opt-in use the local app ICU version instead of the global version. \r\n\r\nNote, we can have this switch work on Linux/macOS too. so, we\u2019ll allow apps to carry their own ICU version if they need to.  The issue here is, so far no one producing NuGet packages for ICU on Linux and macOS. The apps on Linux/macOS will need manually to carry the ICU libs to allow local ICU support.\r\n\r\nThe suggesting is to have a config switch named System.Globalization.ICU and will have the possible values:  \r\n\r\n- None \t\tmeans use the ICU (default value). \r\n- NLS\t        means use NLS APIs and not ICU. this value will be supported on Windows only. \r\n- Local\t\tuse app local version (maybe we need to specify the version in the value but need some more investigation about that). \r\n\r\nWe\u2019ll support the switch through environment variable too called DOTNET_SYSTEM_GLOBALIZATION_ICU. \r\n\r\n**Falling back**  \r\n\r\n- If the app didn't opt-in to use NLS and we fail to load the ICU libraries, we\u2019ll fallback to NLS APIs\r\n- If the app opt-in to use local app version of ICU and failed to load it, we'll fail the app and fail fast. \r\n\r\n**Invariant Mode**  \r\n\r\n If the globalization invariant mode is enabled, we honor it and will not try to load ICU at all. \r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 6636,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 97,
+            "original_line": 122,
+            "side": "RIGHT",
+            "original_position": 120,
+            "position": 95,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we throw a DllNotFoundException instead of fail fasting?  Again, just want to make sure we've thought through the scenario and what the desired behavior is.  If we've agreed on fail fast here, ok.",
+                "if the app introduced wrong config switch, I would say fail fast is better here. because will give early clue what can be fixed. I am not sure what will happen if we throw DllNotFoundException in that early execution and at that time we should introduce a fallback path.\r\n\r\n---\r\nIn reply to: [414603770](https://github.com/dotnet/runtime/pull/35383#discussion_r414603770) [](ancestors = 414603770)",
+                "Same comment as: https://github.com/dotnet/runtime/pull/35383#discussion_r414746131\r\n\r\ncc: @tarekgh ?"
+            ]
+        },
+        {
+            "hunk_id": 6637,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 100,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 123,
+            "position": 98,
+            "subject_type": "line",
+            "review_comments": [
+                ">lib [](start = 19, length = 3)\r\n\r\ndoes NativeLibrary.TryLoad initialize lib IntPtr.Zero when it fail? just checking.",
+                "Yeah, actually its return bool is the result of `lib != IntPtr.Zero`.\r\n\r\nhttps://github.com/dotnet/runtime/blob/89d08de5d2e29c45a904513dcc554aa31f3a5d2e/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/NativeLibrary.cs#L122-L136"
+            ]
+        },
+        {
+            "hunk_id": 6642,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 63,
+            "original_line": 63,
+            "side": "RIGHT",
+            "original_position": 61,
+            "position": 61,
+            "subject_type": "line",
+            "review_comments": [
+                "These length checks protect buffer overruns in the unmanaged code. It may be better to do them in the unmanaged code so that the magic constants are not duplicated between the two places, and so that what check and the code that depends on this check are closed together.",
+                "Makes sense to avoid having duplication. The reason why I added validation here was to not even bother trying to load ICU if the input was outside of the sizes we expected... I guess it wouldn\u2019t hurt to try and load icu and if for some reason we where able to load icu and get to native code then validate that there.",
+                "Fixed, thanks. "
+            ]
+        },
+        {
+            "hunk_id": 6640,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 90,
+            "original_line": 96,
+            "side": "RIGHT",
+            "original_position": 116,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: could $\"{baseName}{suffix}{extension}{version}\" be better?",
+                "Spans do not work with interpolated strings today."
+            ]
+        },
+        {
+            "hunk_id": 6635,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 46,
+            "original_line": 56,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "This sounds very odd, but there are soo many odd things about the ICU packaging and loading that I can believe it.",
+                "I think this complication is coming from wanting to be able to place the ICU libraries in an arbitrary location that the OS loader doesn't know anything about (and the path isn't set in any env variable) -- but I think your point still stands regardless. :)",
+                "Right, this is because we're trying to load from an arbitrary location that the OS loader might not know about if the environment variables to tell the OS loader, consider this path are not set."
+            ]
+        },
+        {
+            "hunk_id": 6641,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 61,
+            "original_line": 61,
+            "side": "RIGHT",
+            "original_position": 74,
+            "position": 59,
+            "subject_type": "line",
+            "review_comments": [
+                "I think this is fine but just want to confirm when ':' exist at the beginning of the string, this slicing will produce empty span (with length zero). right?",
+                "Right, I tested it and it will be that way, so it is the equivalent of not passing a suffix. "
+            ]
+        },
+        {
+            "hunk_id": 6639,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/coreclr/src/System.Private.CoreLib/src/System/Globalization/GlobalizationMode.Windows.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 37,
+            "original_line": 37,
+            "side": "RIGHT",
+            "original_position": 40,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: >=",
+                "The reason why I did `> 0` is because if `.` is in position 0, it means we got `.` or `.65` or something like that, so it is not worth trying to load icu with `.` first and then with `.65` as it is not a valid version, right?  It doesn't matter either way works. ",
+                "Isn't equivalent to no major version is provided?",
+                "Right, but is there even a way to have ICU with no major version? ",
+                "The builder can decide that. no? if you think we shouldn't consider it, then that is ok. we want to ensure documenting the behavior if we run into such a case.",
+                "I can\u2019t even think how the name would be there for the binaries. In that case I would think the user should pass down 0.54. In windows unless the user changes how ICU is built it encodes the major version in the binary only at the moment.",
+                "I think we should just document it as I don\u2019t even think it is going to be that common of a scenario."
+            ]
+        },
+        {
+            "hunk_id": 6638,
+            "commit_id": "62463836ed6549c25729e065c2d05bcac608b686",
+            "original_commit_id": "96268f3ef58674d66908ff90da0f32fc04c1f68f",
+            "path": "src/libraries/Common/src/Interop/Interop.ICU.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 24,
+            "original_line": 15,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                ">GlobalizationNative_InitICUFunctions [](start = 64, length = 36)\r\n\r\nwhy we are using different name InitICUFunctions than InitICU is the method header?",
+                "I think just because I suck at naming. Will update them to match. "
+            ]
+        }
+    ]
+}

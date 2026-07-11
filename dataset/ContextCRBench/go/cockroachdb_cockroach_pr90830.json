@@ -1,0 +1,185 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 90830,
+    "lang": "go",
+    "pr_title": "gc: use clear range operations to remove multiple garbage keys across keys and versions",
+    "pr_body": "Summary:\r\n\r\nGC Will track consecutive keys and issue GCClearRange requests to remove multiple keys at once if it can find more than configured number of keys. This covers multiple versions of the same key as well as multiple consecutive keys.\r\n\r\nOn the GC side it will count consecutive keys while building \"points batches\" e.g. batches containing MVCC keys to delete. Those batches are capped to fit into resulting raft entries once deletion is executed. GC could accumulate more than a single batch in memory in that case. Once necessary number of consecutive keys is found, GCClearRange is issued and pending batches are discarded. If non gc-able data is found, pending batches are GC'd and clear range tracking is restarted.\r\nTo protect GC from consuming too much memory for example if it collects a range with very large keys, it uses a configrable memory limit on how many key bytes could be held in pending batches. If this limit is reached before GC reaches minimum desired number of keys, oldest batch is GC'd and starting point for clear range is adjusted.\r\n\r\nOn the evaluation side, GC requests for ranges will obtain write latches removed range to prevent other requests writing in the middle of the range. However, if only a single key is touched i.e. multiple versions are deleted, then no latches are obtained as it is done when deleting individual versions as all the removed data is below the GC threshold.\r\n\r\nGC exposes a metric `queue.gc.info.numclearconsecutivekeys` that shows how many times GCClearRange was used.\r\nGC adds new system setting `kv.gc.clear_range_min_keys` that sets minimum number of keys eligible for GCClearRange.\r\n\r\n\r\n----\r\n\r\nbatcheval: handle ClearSubRange request fields in GC requests\r\n\r\nHandle ClearSubRange GC request fields to use GCClearRange storage\r\nfunctions for ranges of keys that contain no visible data instead\r\nof removing each key individually.\r\nThis PR only enables processing of request field, while actual GC\r\nand storage functionality is added in previous PRs.\r\n\r\nRelease note: None\r\n\r\n----\r\n\r\ngc: add version gate to GC clear range requests\r\n\r\nClearRange fields of GCRequests are ignored by earlier versions,\r\nthis feature needs to be version gated to let GC work when talking\r\nto a previous version if GC is run from a different node.\r\n\r\nRelease note: None\r\n\r\n----\r\n\r\ngc: add metrics for clear range requests in GC\r\n\r\nThis commit adds two metrics for clear range functionality in GC:\r\n\r\nqueue.gc.info.numclearconsecutivekeys is incremented every time GC sends\r\na ClearRange request for a bunch of consecutive keys to a replica\r\n\r\nRelease note (ops change): Metric queue.gc.info.numclearconsecutivekeys\r\nadded. It exposes number of clear range requests to remove consecutive\r\nkeys issued by mvcc garbage collection.\r\n\r\n----\r\n\r\ngc: GC use delete_range_keys for consecutive ranges of keys\r\n\r\nWhen deleting large chunks of keys usually produced by range tombstones\r\nGC will use point deletion for all versions found within replica key\r\nrange.\r\nThat kind of operations would generate unnecessary load on the storage\r\nbecause each individual version must be deleted independently.\r\nThis patch adds an ability for GC to find ranges of consecutive keys\r\nwhich are not interleaved with any newer data and create\r\ndelete_range_key GC requests to remove them.\r\n\r\nRelease note: None\r\n\r\n----\r\n\r\nrditer: helper to visit multiple replica key spans\r\n\r\nIterateMVCCReplicaKeySpans helper to complement IterateplicaKeySpans\r\nExisting tests moved from ReplicaMVCCDataIterator to\r\nIterateMVCCReplicaKeySpans as former is being sunsetted and only a\r\nsingle call site exists.\r\n\r\nRelease note: None\r\n\r\n----\r\n\r\nstorage: add gc operation that uses clear range\r\n\r\nDeleting multiple versions of same key or continuous ranges of\r\npoint keys with pebble tombstones could be inefficient when range\r\nhas lots of garbage.\r\nThis pr adds a storage gc operation that uses pebble range tombstones\r\nto remove data.\r\n\r\nRelease note: None\r\n\r\n----\r\n\r\ngc: add delete range parameters to gc request\r\n\r\nThis commit adds clear_sub_range_key parameters to GC request.\r\nclear_sub_range_keys is used by GC queue to remove chunks of\r\nconsecutive keys where no new data was written above the GC\r\nthreshold and storage can optimize deletions with range\r\ntombstones.\r\nTo support new types of keys, GCer interface is also updated\r\nto pass provided keys down to request.\r\n\r\nRelease note: None\r\n\r\nFixes: #84560, #61455",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/90830)\n<!-- Reviewable:end -->\n",
+        "PS: this can close out #61455 too.",
+        "bors r=erikgrinaker",
+        "Build failed (retrying...):\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=8025102&buildTypeId=Cockroach_BazelEssentialCi)",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=8026299&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2022-11-21T13:58:37Z",
+    "issue_context": {
+        "number": 84560,
+        "title": "storage: use ClearMVCCRange when GC-ing multiple versions under range tombstones",
+        "body": "When the whole range content is removed during GC we would issue point deletes for every value found. This is wasteful as we may use `ClearMVCCRange` and related operations when doing so.\r\n\r\nTo do this, we should change GC to issue new types RangeDeletion requests that would put pebble range tombstones instead of individual deletes.\r\n\r\nNote that new request field or request type is needed to ensure we could put proper latches as it would be possible to remove newer data. And this wouldn't not be compatible with latchless GC, but that is fine as ranges subject to complete deletion are unused and are not supposed to get recent writes.\r\n\r\nJira issue: CRDB-17736\n\nEpic CRDB-20465",
+        "comments": [
+            "cc @cockroachdb/replication",
+            ">Note that new request field or request type is needed to ensure we could put proper latches as it would be possible to remove newer data.\r\n\r\nDon't we already take out a write latch when GCing MVCC range tombstones? Do we need anything more than that?",
+            "cc @cockroachdb/replication"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15337,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/kv/kvserver/gc/gc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 651,
+            "original_line": 651,
+            "side": "RIGHT",
+            "original_position": 380,
+            "position": 397,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm having a hard time understanding the invariants here. Can you please spell out when various fields are set/unset, how they relate to each other, and which conditions depend on them?",
+                "Added comments on the type."
+            ]
+        },
+        {
+            "hunk_id": 15340,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/storage/mvcc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5467,
+            "original_line": 5467,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 109,
+            "subject_type": "line",
+            "review_comments": [
+                "It would be good to explain how this works, I had to read the logic a few times to understand it. In particular, when encountering a new key this no longer points to the previous key, but the current key."
+            ]
+        },
+        {
+            "hunk_id": 15339,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/storage/mvcc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5523,
+            "original_line": 5523,
+            "side": "RIGHT",
+            "original_position": 94,
+            "position": 165,
+            "subject_type": "line",
+            "review_comments": [
+                "`FirstAtOrAbove()` can have a non-negligible cost when empty, so it's usually faster to check `len(rangeTombstones) > 0` first in hot paths.",
+                "Actually nevermind, I forgot that we handled this internally."
+            ]
+        },
+        {
+            "hunk_id": 15333,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/kv/kvserver/gc/gc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 138,
+            "original_line": 138,
+            "side": "RIGHT",
+            "original_position": 37,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm not sure we really need a setting for this, but I suppose it's nice to have an off switch in case of problems. But shouldn't we have a similar setting for the byte limit?",
+                "I was thinking that it should be like a way to turn if off if it affects storage performance of a bug is discovered. For memory usage, we don't have direct visibility so having memory setting questionable. Maybe we need a budget with metric in that case. Having a setting is also tempting because I don't know what to expect.",
+                "Ok, makes sense."
+            ]
+        },
+        {
+            "hunk_id": 15334,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/kv/kvserver/gc/gc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 297,
+            "original_line": 297,
+            "side": "RIGHT",
+            "original_position": 81,
+            "position": 91,
+            "subject_type": "line",
+            "review_comments": [
+                "We use both `ClearConsecutiveKeys` and `ClearRange` to refer to this concept. We should pick one and stick with it -- probably `ClearRange`, because it's so ingrained already, but it might be a bit confusing when it doesn't clear range keys, only point keys.",
+                "I renamed that to ClearRange/ClearRangeSpan to remove confusion. Except for original request where it is called ClearRangeKey unfortunately and it is too late to rename."
+            ]
+        },
+        {
+            "hunk_id": 15338,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/kv/kvserver/gc/gc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 818,
+            "original_line": 818,
+            "side": "RIGHT",
+            "original_position": 608,
+            "position": 652,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason why we track the start key and other info when we haven't yet crossed the clear range threshold?",
+                "We update the key every time we advance for simplicity. We ensure key part is always set and we bump timestamp as we go. We don't clone it and just share cloned value from batch allocator so it should be cheap. When we stop collecting points batches we will start cloning into dedicated reusable slice. Alternatively we need to track a state and copy value over when we hit clear range threshold."
+            ]
+        },
+        {
+            "hunk_id": 15336,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/kv/kvserver/gc/gc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 889,
+            "original_line": 889,
+            "side": "RIGHT",
+            "original_position": 685,
+            "position": 727,
+            "subject_type": "line",
+            "review_comments": [
+                "is this true if we then go on to GC range keys? Doesn't the range key GC assume that all point keys have been GCed first? How do we protect against this?",
+                "We will fail to delete range key in turn, it won't expose any old data.",
+                "But only because we check it during request evaluation, right? I think we discussed removing the server-side check if it turned out to be too expensive, did we ever benchmark that?",
+                "I don't think we benchmarked how expensive search vs deletion is. When running GC threshold evaluations, local time to scan and to delete is in the same ballpark so eliminating one for point keys might be beneficial.\r\n\r\nI think the solution could be not to remove range tombstones if some key deletions failed, or tracking oldest non deleted version and only remove range tombstones below that.",
+                "Yeah, I think we discussed not GCing range keys if point key GC failed.",
+                "To be clear, we can leave this for later and write up an issue or TODO for it. But it would be good to verify that the scan isn't too expensive as it currently is, since we're holding a write latch while running it."
+            ]
+        },
+        {
+            "hunk_id": 15335,
+            "commit_id": "9efbf4f2e5d27e11b6a9b95e7b429091e694207b",
+            "original_commit_id": "58739fe8ecdb9f458c0527bdd9930d74a4a9e98e",
+            "path": "pkg/kv/kvserver/gc/gc.go",
+            "start_line": 724,
+            "original_start_line": 704,
+            "start_side": "RIGHT",
+            "line": 725,
+            "original_line": 725,
+            "side": "RIGHT",
+            "original_position": 452,
+            "position": 494,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we need to clear this out if `isNewestPoint == false`? It seems like it'd be safer if the batch flush cleared it out, so callers don't have to remember doing it, but it doesn't seem like it does?",
+                "It shouldn't affect correctness, but we could nil it out when flushing batch if we are going to clear counters there. I thought that it was easier to understand if clearing of state would be done outside of flush because it is already pretty overloaded with sending data out and accounting for it. But if it is easier to understand like that let it be.",
+                "Thanks. Seems better for the flush to update any associated state, so that callers don't have to remember doing it (potentially getting it wrong)."
+            ]
+        }
+    ]
+}

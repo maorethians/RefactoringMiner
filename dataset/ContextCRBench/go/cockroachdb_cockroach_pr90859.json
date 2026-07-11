@@ -1,0 +1,43 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 90859,
+    "lang": "go",
+    "pr_title": "storage/pebbleiter: guard against double-closed Iterators",
+    "pr_body": "Replace direct uses of the `*pebble.Iterator` type with a `pebbleiter.Iterator`\r\ntype definition. In production builds, this type is a simple type definition for\r\n`*pebble.Iterator` which suffers no overhead. In `crdb_test` builds, the\r\n`pebbleiter.Iterator` is defined as a `*pebbleiter.AssertionIter` type that can\r\nassert proper use of the `*pebble.Iterator` type and its contract.\r\n\r\nInitially, use this new assertion iterator to ensure that a `*pebble.Iterator`\r\nis never double-closed, which may cause the Iterator to be added to a sync pool\r\ntwice leading to races. This type of assertion cannot be done by\r\n`*pebble.Iterator`, because the iterator may already be reused by the time the\r\nsecond Close is run.\r\n\r\nIn the future, I'd like to also introduce assertions that pkg/storage always\r\nchecks validity before calling HasPointAndRange and RangeKeyChanged (see\r\ncockroachdb/pebble#2205).\r\n\r\nRelease note: None\r\nEpic: None\r\n\r\nClose #90643.",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/90859)\n<!-- Reviewable:end -->\n"
+    ],
+    "merged": true,
+    "created_at": "2023-01-09T19:10:07Z",
+    "issue_context": {
+        "number": 90643,
+        "title": "storage: guard against double Iterator `Close`",
+        "body": "If a `*pebble.Iterator` is closed twice, its underlying `iterAlloc` structure can be added into a sync pool twice. This can cause very difficult to diagnose bugs.\r\n\r\nWe could guard against this in `crdb_test` builds with a type that wraps a `*pebble.Iterator` and watches for double Closes. Eg,:\r\n\r\n```\r\ntype doubleCloseIterator struct {\r\n        *pebble.Iterator\r\n        closed bool\r\n}\r\n\r\nfunc (i *doubleCloseIterator) Close() error {\r\n        if i.closed {\r\n                panic(fmt.Sprintf(\"iterator %p already closed once before\", i.Iterator))\r\n        }\r\n        i.closed = true\r\n        return i.Iterator.Close()\r\n}\r\n```\r\nInspired by #90120, which could conceivably be a symptom of a double-Close, although the cause of that panic is still unknown.\n\nJira issue: CRDB-20868",
+        "comments": [
+            "Hi @jbowens, I've guessed the C-ategory of your issue and suitably labeled it. Please re-label if inaccurate.\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [otan](https://github.com/otan).</sub>"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 16131,
+            "commit_id": "96c8a75cefcc9923170705038acede18e34efe7d",
+            "original_commit_id": "ba960706e50b37a0f0256d07b474ef22be1ec918",
+            "path": "pkg/storage/pebbleiter/crdb_test_off.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 11,
+            "original_line": 11,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "I think it's worth considering whether eschewing the conditional compilation and just sticking with a straightforward  wrapping design might be fine. For example, something like:\r\n\r\n```\r\nimport \"github.com/cockroachdb/cockroach/pkg/util/buildutil\"\r\n\r\ntype Iterator struct {\r\n    iter *pebble.Iterator\r\n    closed bool\r\n}\r\n\r\nfunc Wrap(iter *pebble.Iterator) Iterator {\r\n    return Iterator { iter: iter }\r\n}\r\n\r\nfunc (i *Iterator) Clone(cloneOpts pebble.CloneOptions) (*Iterator, error) { ... }\r\n\r\nfunc (i *Iterator) Close() error {\r\n    if buildutil.CrdbTestBuild {\r\n        if i.closed { \r\n            panic(\"pebble.Iterator already closed\")\r\n        }\r\n        err := i.iter.Close()\r\n        i.closed = true\r\n        return err\r\n    } else {\r\n        return i.iter.Close()\r\n    }\r\n}\r\n```\r\n\r\nI imagine your thinking is that allocating the extra struct is not a cost we should pay if we're not running a test build, and maybe you're right. However I wonder if the extra cost (another little struct and maybe one additional indirection for Clone() and Close()) is not minimal enough that we can just eat it. I don't know enough about the implementation to say so -- maybe these iterators are opened and closed in a really hot loop and we can't afford taking any extra time.\r\n\r\nAnother thing to consider: if we just decide to keep the wrapping in non-test builds, then we could have an extra guardrail, right?\r\n\r\n```\r\nfunc (i *Iterator) Close() error {\r\n    if i.closed {\r\n         if buildutil.CrdbTestBuild {\r\n            panic(...)\r\n        } else {\r\n            return fmt.Errorf(\"iterator has already been closed\") // can attach extra data to the error here too\r\n        }\r\n    }\r\n    err := i.iter.Close()\r\n    i.closed = true\r\n    return err\r\n}\r\n```\r\n\r\nWe can avoid panicking immediately in this case but presumably throwing an error if we're doing something that's definitely illegal is better than just continuing on to likely corrupt data? ",
+                "Re: the last bit -- if we're going to keep track of whether each individual iterator is closed to warn about double-closes, I also wonder whether that logic makes more sense as a part of the `pebble.Iterator` itself. That struct could carry around the `closed bool` and give a sensible error if the method is called more than once.",
+                "> However I wonder if the extra cost (another little struct and maybe one additional indirection for Clone() and Close()) is not minimal enough that we can just eat it. I don't know enough about the implementation to say so -- maybe these iterators are opened and closed in a really hot loop and we can't afford taking any extra time.\r\n\r\nThis layer is particularly performance sensitive and any additional allocations would be prohibitive.\r\n\r\n> Re: the last bit -- if we're going to keep track of whether each individual iterator is closed to warn about double-closes, I also wonder whether that logic makes more sense as a part of the pebble.Iterator itself. That struct could carry around the closed bool and give a sensible error if the method is called more than once.\r\n\r\nSince both `storage.pebbleIterator` and `pebble.Iterator` are pooled to reduce allocations, the iterators structs may already be in use again by the time `Close` is called a second time. We can't distinguish between a `Close` issued by the new user, versus a double-`Close` by the old user.\r\n\r\nIt does seem like it'd be feasible to maintain monotonically increasing  counts of `opens` and `closes` and assert that `closes` never exceeds `opens`, but the ability to make `crdb_test`-gated assertions of `pkg/storage`'s use of `pebble.Iterator` is generally useful. We could move some of those assertions into `pebble.Iterator`, but they still need to be gated on `crdb_test`.\r\n\r\n@rickystewart would it be feasible to add the Pebble `invariants` build tag when the Cockroach `crdb_test` build tag is set? That could allow us to take advantage of the existing Pebble invariant assertions.",
+                "(As mentioned, don't let this comment block you, this is fine to be checked-in as is.)\r\n\r\n> @rickystewart would it be feasible to add the Pebble invariants build tag when the Cockroach crdb_test build tag is set? That could allow us to take advantage of the existing Pebble invariant assertions.\r\n\r\nIt is possible, but it might result in a lot of stuff being re-compiled for developers when swapping between builds and tests if they happen to be using `pebble`. You can file a follow-up issue to discuss this if you like."
+            ]
+        }
+    ]
+}

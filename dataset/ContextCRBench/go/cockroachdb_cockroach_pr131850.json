@@ -1,0 +1,358 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 131850,
+    "lang": "go",
+    "pr_title": "raft: add tracing to raft",
+    "pr_body": "This commit adds tracing to the various places within raft where state transitions happen. When a message is first proposed, it matches the context of the original message to the raft entry and registers it for tracing. Then it adds to the trace at the key points during the transitions and finally stops tracing once a `MsgStorageApplyResp` is received past the entry.\r\n\r\nFixes: #104035\r\n\r\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/131850)\n<!-- Reviewable:end -->\n",
+        "A sample trace for a RF3 request:\r\n```\r\n     4.035ms      0.031ms                                    event:kv/kvserver/replica_proposal.go:1003 [n2,s2,r70/2:/{Table/104-Max}] need consensus on write batch with op count=1\r\n     4.071ms      0.036ms                                    event:kv/kvserver/replica_raft.go:126 [n2,s2,r70/2:/{Table/104-Max}] evaluated request\r\n     4.096ms      0.025ms                                    event:kv/kvserver/replica_raft.go:171 [n2,s2,r70/2:/{Table/104-Max}] proposing command to write 1 new keys, 1 new values, 0 new intents, write batch size=46 bytes\r\n     4.123ms      0.027ms                                    event:kv/kvserver/replica_raft.go:282 [n2,s2,r70/2:/{Table/104-Max}] acquiring proposal quota (182 bytes)\r\n     4.159ms      0.036ms                                    event:kv/kvserver/replica_raft.go:459 [n2,s2,r70/2:/{Table/104-Max}] submitting proposal to proposal buffer\r\n     4.202ms      0.043ms                                    event:kv/kvserver/replica_proposal_buf.go:574 [n2,s2,r70/2:/{Table/104-Max}] flushing proposal to Raft\r\n     4.307ms      0.105ms                                    event:raft/raft.go:1336 [n2,s2,r70/2:/{Table/104-Max}] 2->None MsgProp Term:0 Log:0/0\r\n     4.360ms      0.053ms                                    event:raft/rawnode.go:445 [n2,s2,r70/2:/{Table/104-Max}] 2->1 MsgApp Term:8 Log:8/21\r\n     4.374ms      0.014ms                                    event:raft/rawnode.go:445 [n2,s2,r70/2:/{Table/104-Max}] 2->3 MsgApp Term:8 Log:8/21\r\n     4.396ms      0.022ms                                    event:raft/rawnode.go:445 [n2,s2,r70/2:/{Table/104-Max}] 2->AppendThread MsgStorageAppend Term:0 Log:8/22\r\n    14.481ms     10.085ms                                    event:raft/rawnode.go:445 [n2,s2,r70/2:/{Table/104-Max}] 2->ApplyThread MsgStorageApply Term:0 Log:0/0\r\n    14.520ms      0.039ms                                        === operation:local proposal _unfinished:1 _verbose:1 node:2 store:2 range:70/2:/{Table/104-Max} raft:\r\n    14.555ms      0.035ms                                        event:kv/kvserver/replica_application_cmd.go:143 [n2,s2,r70/2:/{Table/104-Max},raft] ack-ing replication success to the client; application will continue async w.r.t. the client\r\n    14.589ms      0.034ms                                        event:kv/kvserver/app_batch.go:116 [n2,s2,r70/2:/{Table/104-Max},raft] applying command\r\n    14.668ms     11.268ms                                event:server/node.go:1690 [n2] node sending response\r\n```",
+        "@pav-kv I attempted to incorporate all your changes, but hit a snag... After https://github.com/cockroachdb/cockroach/pull/70370/commits/2ad2bee257e78970ce2c457ddd6996099ed6727a, we now create tracing spans for all tasks launched from `RunAsyncTask`. I think this is the wrong thing to do, but it is unclear how to work around this. \r\n\r\nWe are currently logging all the \"right\" things, and the tracing spans mostly look good on both the client and the server, but there is way too much logging because of this. \r\n\r\nI'm going to take a break now but will think again on Monday how to better work around this. ",
+        "Outstanding tasks:\r\n\r\n- [x] Handle the upgrade case due to the encoding change\r\n- [x] Don't persist the encoded bit\r\n- [x] Split the PRs into more digestible pieces\r\n- [x] Bench tests",
+        "I cleaned up the PR and removed all the raft encoding changes. I left the tracing in place because it seems to be useful in a number of cases. I'm not 100% sure, but I think there is still a problem with the way I'm using tracing that is leaking. ",
+        "@andrewbaptist Thanks, appreciate the commits separation. I'll review tomorrow.",
+        "@pav-kv This should be ready for review now. It might be worth adding a flag to diable this if we decide it is too expensive, and the tests need a bit more work, but other than that, it is good. I've added some guards to prevent too many outstanding traces, and they make a decent compromise between losing too much information and impacting performance. \r\n\r\nThe new PR for changing the ProposalBuffer context is surprising that it didn't show up before, but it happened in one extended test under stress. I think it is a good change regardless. \r\n\r\nI'm hoping to at a minimum get the protocol changes in before the branch cut, so if you want I can split that out into a separate PR. ",
+        "@pav-kv Thanks for all the feedback! I implemented most of the changes and have a couple of TODO's in place. I also updated the test to actually validate the trace has the expected values (and removed the redundant test). \r\n\r\nThere are a couple of minor outstanding points, but I'm not sure if they should be changed:\r\n1) How to handle a proposal with multiple entries. I left it only tracing one, but its an option to change that (either now or in the future)\r\n2) Different messages for different message types (with less fields). I've found it useful to have all the fields printed even if they aren't always relevant, but that could definitely be cleaned up later as well.\r\n\r\nOne very unfortunate thing I found with testing this morning is that there are a lot of \"extra\" traced messages such as from the queues such as this: \r\nhttps://github.com/cockroachdb/cockroach/blob/master/pkg/kv/kvserver/replicate_queue.go#L748\r\n\r\nWhich means that we get a lot more traces in the log than we'd like during things like rebalancing and background jobs.\r\n\r\nI'm tempted to move this to a different log file to avoid cluttering the main file, but I can also do that as a follow-on PR.\r\n",
+        "@andrewbaptist\r\n\r\n> I'm tempted to move this to a different log file to avoid cluttering the main file, but I can also do that as a follow-on PR.\r\n\r\nLike to a separate `raft` logging channel? Sounds good if this isn't much work.",
+        "> @andrewbaptist\r\n> \r\n> > I'm tempted to move this to a different log file to avoid cluttering the main file, but I can also do that as a follow-on PR.\r\n> \r\n> Like to a separate `raft` logging channel? Sounds good if this isn't much work.\r\n\r\nUnfortunately this was a bigger effort than I originally expected. Let me look at a few alternative options...",
+        "@pav-kv  - Some thoughts about the PR - I made a few updates last night based on your review.\r\n* It would be good to at least get the protobuf changes in place before the branch cut. I debated adding a Term parameter to the protobuf, even if we don't use it for tracing. It might help if we later decide to use it. Thoughts? \r\n* I plan to add unit tests to RaftTracing directly rather than a system level test. Especially since the registration logic is a little more complex than before.\r\n* The current approach disables the tracing by default. I'm going to run all the perturbation tests this morning with it enabled (plus https://github.com/cockroachdb/cockroach/pull/132713) and add some traces and real data to this issue. \r\n\r\nAny other thoughts on it?",
+        "A trace with this enabled looks like this:\r\n<img width=\"1283\" alt=\"image\" src=\"https://github.com/user-attachments/assets/b71073c0-a693-4e76-a712-37076a8f15de\">\r\n[trace.txt](https://github.com/user-attachments/files/17401554/trace.txt)\r\n\r\nSearching for the id can be done with a command like this:\r\n```\r\nbaptist_cockroachlabs_com@gceworker-abaptist:~/go/src/github.com/cockroachdb/cockroach$ roachprod ssh $CLUSTER \"grep i27814158/e928.f674 logs/cockroach.log\"\r\nbaptist-test:[1 2 3 4]: grep i27814158/e928.f674 lo... 4/4\r\n   1: \t<err> COMMAND_PROBLEM: exit status 1\r\n\r\n   2: \t<ok>\r\n\tI241016 19:04:23.721573 308 kv/kvserver/replica_proposal_buf.go:1185 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138708  registering local trace i27814158/e928.f674\r\n\tI241016 19:04:23.721682 308 kv/kvserver/replica_raft.go:1998 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138709  4->1 MsgApp Term:13 Log:13/27814157 Range:27814158-27814158\r\n\tI241016 19:04:23.721741 308 kv/kvserver/replica_raft.go:1998 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138710  4->2 MsgApp Term:13 Log:13/27814157 Range:27814158-27814158\r\n\tI241016 19:04:23.721784 308 kv/kvserver/replica_raft.go:1192 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138711  4->AppendThread MsgStorageAppend Term:0 Log:13/27814158 Range:27814158-27814158\r\n\tI241016 19:04:23.722126 319 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138712  4->4 MsgAppResp Term:13 Index:27814158\r\n\tI241016 19:04:23.722182 319 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138713  AppendThread->4 MsgStorageAppendResp Log:13/27814158\r\n\tI241016 19:04:23.724276 313 kv/kvserver/replica_raft.go:619 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138714  1->4 MsgAppResp Term:13 Index:27814158\r\n\tI241016 19:04:23.724415 313 kv/kvserver/replica_raft.go:1224 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138715  4->ApplyThread MsgStorageApply Term:0 Log:0/0 Range:27814158-27814158\r\n\tI241016 19:04:23.724554 313 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138716  ApplyThread->4 MsgStorageApplyResp Term:13 Index:27814158\r\n\tI241016 19:04:23.724573 313 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n2,s2,r150/4:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 138717  unregistered log index 27814158 from tracing\r\n\r\n   3: \t<ok>\r\n\tI241016 19:04:23.723070 310 kv/kvserver/replica_raft.go:617 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144689  registering remote trace i27814158/e928.f674\r\n\tI241016 19:04:23.723101 310 kv/kvserver/replica_raft.go:619 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144690  4->2 MsgApp Term:13 Log:13/27814157 Range:27814158-27814158\r\n\tI241016 19:04:23.723128 310 kv/kvserver/replica_raft.go:1192 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144691  2->AppendThread MsgStorageAppend Term:0 Log:13/27814158 Range:27814158-27814158\r\n\tI241016 19:04:23.723329 346 kv/kvserver/replica_raft.go:1998 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144692  2->4 MsgAppResp Term:13 Index:27814158\r\n\tI241016 19:04:23.723388 296 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144693  AppendThread->2 MsgStorageAppendResp Log:13/27814158\r\n\tI241016 19:04:23.725028 307 kv/kvserver/replica_raft.go:1224 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144694  2->ApplyThread MsgStorageApply Term:0 Log:0/0 Range:27814158-27814158\r\n\tI241016 19:04:23.725125 307 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144695  ApplyThread->2 MsgStorageApplyResp Term:13 Index:27814158\r\n\tI241016 19:04:23.725142 307 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n3,s3,r150/2:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 144696  unregistered log index 27814158 from tracing\r\n\r\n   4: \t<ok>\r\n\tI241016 19:04:23.722918 306 kv/kvserver/replica_raft.go:617 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111200  registering remote trace i27814158/e928.f674\r\n\tI241016 19:04:23.722955 306 kv/kvserver/replica_raft.go:619 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111201  4->1 MsgApp Term:13 Log:13/27814157 Range:27814158-27814158\r\n\tI241016 19:04:23.722981 306 kv/kvserver/replica_raft.go:1192 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111202  1->AppendThread MsgStorageAppend Term:0 Log:13/27814158 Range:27814158-27814158\r\n\tI241016 19:04:23.723258 331 kv/kvserver/replica_raft.go:1998 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111203  1->4 MsgAppResp Term:13 Index:27814158\r\n\tI241016 19:04:23.723304 311 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111204  AppendThread->1 MsgStorageAppendResp Log:13/27814158\r\n\tI241016 19:04:23.724763 309 kv/kvserver/replica_raft.go:1224 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111205  1->ApplyThread MsgStorageApply Term:0 Log:0/0 Range:27814158-27814158\r\n\tI241016 19:04:23.724854 309 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111206  ApplyThread->1 MsgStorageApplyResp Term:13 Index:27814158\r\n\tI241016 19:04:23.724864 309 kv/kvserver/replica_raft.go:1974 \u22ee [T1,Vsystem,n4,s4,r150/1:\u2039/Table/106/1/{-91320\u2026-1}\u203a,id=i27814158/e928.f674] 111207  unregistered log index 27814158 from tracing\r\n```",
+        "@andrewbaptist Do we want to say \"Fixes: #104035\", or just make it \"Part of\"? This is a first approximation of tracing, but we have some follow-up work after it:\r\n\r\n- harden it so that it's safe to enable by default\r\n- work out the trace collection story\r\n- make it resilient to leader/lease splits and leader movements\r\n\r\nOr consider filing another issue with the follow-ups after this PR is merged.",
+        "Your pull request contains more than 1000 changes. It is strongly encouraged to split big PRs into smaller chunks.\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>",
+        "@pav-kv Thanks again for the numerous reviews.\r\n\r\nI think everything should be addressed. I added basic functionality tests also.  ",
+        "Pre-LGTM modulo a few fixes and drive-by nits.",
+        "Thanks. I'm going to go through and review the whole thing myself one more time in the morning, but I went through all your comments and addressed them. I'm pretty happy with how this turned out. ",
+        "Good catch on the dupe registration. I added handling for this case and a test as well.",
+        "TFTR! I'm glad we are finally ready to merge!\r\n\r\nI'm running the full restart test now with tracing (and I have it set to fail the test at the end) and will post some of the traces and actually try and use it to debug a real problem. I'll merge it later this afternoon assuming it all looks good.",
+        "Looking at a cluster running a workload that has relatively good performance but some slowdowns, the relevant section of the trace now look like this:\r\n```\r\n     1.381ms      0.062ms                            event:kv/kvclient/kvcoord/range_iter.go:220 [n1,client=10.142.0.105:40404,hostssl,user=roachprod,txn=99326cbe] key: /Table/106/1/7939083717752317238/0, desc: r6735:/Table/106/1/793{7762535867303456-9607025825678572} [(n4,s8):1, (n7,s14):5, (n12,s24):4, next=6, gen=102, sticky=9223372036.854775807,2147483647]\r\n...\r\n     2.559ms      0.026ms                                    event:kv/kvserver/replica_proposal_buf.go:825 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] attaching closed timestamp 1729277975.522853185,0 to proposal 44d9cb9e8cefe448\r\n     2.571ms      0.012ms                                    event:kv/kvserver/replica_proposal_buf.go:576 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] flushing proposal to Raft\r\n     2.578ms      0.007ms                                        === operation:raft trace _unfinished:1 _verbose:1 node:4 store:8 range:6735/1:/Table/106/1/793{7762\u2026-9607\u2026}\r\n     2.621ms      0.043ms                                        event:kv/kvserver/replica_proposal_buf.go:1189 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] registering local trace i6071/218b.18ba\r\n     2.667ms      0.046ms                                        event:kv/kvserver/replica_raft.go:2026 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] 1->5 MsgApp Term:8 Log:8/6070 Entries:[6071-6071]\r\n     2.706ms      0.039ms                                        event:kv/kvserver/replica_raft.go:1220 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] 1->AppendThread MsgStorageAppend Term:0 Log:8/6071 Entries:[6071-6071]\r\n     2.981ms      0.274ms                                        event:kv/kvserver/replica_raft.go:2002 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] 1->1 MsgAppResp Term:8 Index:6071\r\n     3.015ms      0.034ms                                        event:kv/kvserver/replica_raft.go:2002 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] AppendThread->1 MsgStorageAppendResp Log:8/6071\r\n   137.067ms    134.053ms                                        event:kv/kvserver/replica_raft.go:645 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] 5->1 MsgAppResp Term:8 Index:6071\r\n   137.181ms      0.114ms                                        event:kv/kvserver/replica_raft.go:1252 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026}] 1->ApplyThread MsgStorageApply Term:0 Log:0/0 Entries:[6071-6071]\r\n   137.100ms     -0.081ms                                        === operation:local proposal _unfinished:1 _verbose:1 node:4 store:8 range:6735/1:/Table/106/1/793{7762\u2026-9607\u2026} raft:\r\n   137.126ms      0.026ms                                        event:kv/kvserver/replica_application_cmd.go:143 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026},raft] ack-ing replication success to the client; application will continue async w.r.t. the client\r\n   137.197ms      0.071ms                                        event:kv/kvserver/app_batch.go:116 [n4,s8,r6735/1:/Table/106/1/793{7762\u2026-9607\u2026},raft] applying command\r\n   137.302ms    135.489ms                                event:server/node.go:1696 [n4] node sending response\r\n```\r\n\r\nLooking into the cockroach logs you see:\r\n```\r\n$ grep -h \"i6071/218b.18ba\" *.cockroach.log | cut -b 56- | sort\r\nI241018 18:59:38.522903 606 kv/kvserver/replica_proposal_buf.go:1189 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94194 registering local trace i6071/218b.18ba\r\nI241018 18:59:38.522946 606 kv/kvserver/replica_raft.go:2026 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94195 1->5 MsgApp Term:8 Log:8/6070 Entries:[6071-6071]\r\nI241018 18:59:38.522986 606 kv/kvserver/replica_raft.go:1220 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94196 1->AppendThread MsgStorageAppend Term:0 Log:8/6071 Entries:[6071-6071]\r\nI241018 18:59:38.523234 614 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94197 1->1 MsgAppResp Term:8 Index:6071\r\nI241018 18:59:38.523297 614 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94198 AppendThread->1 MsgStorageAppendResp Log:8/6071\r\nI241018 18:59:38.655679 627 kv/kvserver/replica_raft.go:643 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92986 registering remote trace i6071/218b.18ba\r\nI241018 18:59:38.655718 627 kv/kvserver/replica_raft.go:645 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92987 1->5 MsgApp Term:8 Log:8/6070 Entries:[6071-6071]\r\nI241018 18:59:38.655747 627 kv/kvserver/replica_raft.go:1220 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92988 5->AppendThread MsgStorageAppend Term:0 Log:8/6071 Entries:[6071-6071]\r\nI241018 18:59:38.656992 640 kv/kvserver/replica_raft.go:2026 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92989 5->1 MsgAppResp Term:8 Index:6071\r\nI241018 18:59:38.657325 604 kv/kvserver/replica_raft.go:645 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94207 5->1 MsgAppResp Term:8 Index:6071\r\nI241018 18:59:38.657454 604 kv/kvserver/replica_raft.go:1252 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94208 1->ApplyThread MsgStorageApply Term:0 Log:0/0 Entries:[6071-6071]\r\nI241018 18:59:38.657602 604 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94209 ApplyThread->1 MsgStorageApplyResp LastEntry:8/6071\r\nI241018 18:59:38.657632 604 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94210 unregistered log index 6071 from tracing\r\nI241018 18:59:38.661373 627 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92990 AppendThread->5 MsgStorageAppendResp Log:8/6071\r\nI241018 18:59:38.661452 627 kv/kvserver/replica_raft.go:1252 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92991 5->ApplyThread MsgStorageApply Term:0 Log:0/0 Entries:[6071-6071]\r\nI241018 18:59:38.661555 627 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92992 ApplyThread->5 MsgStorageApplyResp LastEntry:8/6071\r\nI241018 18:59:38.661570 627 kv/kvserver/replica_raft.go:2002 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92993 unregistered log index 6071 from tracing\r\n```\r\n\r\nDigging in this indicates that the cause of the delay was between the sending of the `MsgApp` to n7 and it receiving it.\r\n\r\n```\r\nI241018 18:59:38.522946 606 kv/kvserver/replica_raft.go:2026 \u22ee [T1,Vsystem,n4,s8,r6735/1:\u2039\u00d7\u203a,id=i6071/218b.18ba] 94195 1->5 MsgApp Term:8 Log:8/6070 Entries:[6071-6071]\r\nI241018 18:59:38.655679 627 kv/kvserver/replica_raft.go:643 \u22ee [T1,Vsystem,n7,s14,r6735/5:\u2039\u00d7\u203a,id=i6071/218b.18ba] 92986 registering remote trace i6071/218b.18ba\r\n```\r\nNote that n12 was out of the picture during this time. ",
+        "TFTR!\r\n\r\nI'm going to merge this now so that we have it for runs this weekend and can iterate more on any datastructure changes going forward\r\n\r\nbors r=pav-kv",
+        "Build succeeded:\n  * [docker_image_amd64](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755661698)\n  * [linux_arm64_build](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755663306)\n  * [check_generated_code](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662058)\n  * [macos_arm64_build](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755663729)\n  * [linux_amd64_fips_build](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662674)\n  * [linux_amd64_build](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662502)\n  * [unit_tests](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755663603)\n  * [lint](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662217)\n  * [macos_amd64_build](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755663450)\n  * [acceptance](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755661923)\n  * [local_roachtest_fips](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662975)\n  * [examples_orms](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662358)\n  * [local_roachtest](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755662811)\n  * [windows_build](https://github.com/cockroachdb/cockroach/actions/runs/11411437792/job/31755663871)",
+        "Based on the specified backports for this PR, I applied new labels to the following linked issue(s). Please adjust the labels as needed to match the branches actually affected by the issue(s), including adding any known older branches.\n\n----\n\nIssue #104035: branch-release-24.3.\n\n----\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>",
+        "> > _[Reviewable](https://reviewable.io/reviews/cockroachdb/cockroach/131850)_ status: :shipit: complete! 0 of 0 LGTMs obtained\r\n> \r\n> _[`pkg/kv/kvserver/rafttrace/rafttrace.go` line 82 at r78](https://reviewable.io/reviews/cockroachdb/cockroach/131850#-O9WgIs76VTLpcvWcsMa:-O9WgIs76VTLpcvWcsMb:b-npck6g) ([raw file](https://github.com/cockroachdb/cockroach/blob/fe746c700443d68433b4ebf464a8b27ebcebf396/pkg/kv/kvserver/rafttrace/rafttrace.go#L82)):_\r\n> \r\n> > ```go\r\n> > \tt.mu.Unlock()\r\n> > \tif propCtx != nil {\r\n> > \t\tlog.VEventfDepth(propCtx, depth+1, 3, format, args...)\r\n> > ```\r\n> \r\n> Won't this log twice, in that we've already logged using `log.InfofDepth`?\r\n\r\nOne log goes to the event trace, and the other to the `cockroach.log`. We could consider making it optional through config which log it goes to, but it mostly seems better to have both logs in place. "
+    ],
+    "merged": true,
+    "created_at": "2024-10-16T12:37:18Z",
+    "issue_context": {
+        "number": 104035,
+        "title": "kvserver: add tracing through Raft",
+        "body": "Currently, our tracing stops when we submit the proposal to Raft:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/da5be736ddb6579055b237b33c61024a3e4a0d70/pkg/kv/kvserver/replica_proposal_buf.go#L906-L909\r\n\r\nAnd only resumes once the proposal is applied locally:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/939f9552e8c5787506f589094888f52fca667175/pkg/kv/kvserver/replica_application_decoder.go#L60-L61\r\n\r\nIt would be very useful to have trace events for the intermediate steps as well. In particular:\r\n\r\n* Log append (on any replica).\r\n* Submitted to send queue.\r\n* Sent across the network.\r\n* Received across the network.\r\n* Submitted to the local Raft replica.\r\n* Log read and/or entry cache read.\r\n\r\nBecause we control both the storage and network code, most of this can be done in CRDB code rather than etcd/raft, but we'll also need a couple of changes in upstream Raft. A rough sketch:\r\n\r\n* A field on `raftpb.Entry` with arbitrary user metadata (in our case, the proposal ID from `ProposalData.idKey`).\r\n* A mechanism to fetch the tracing context for a given proposal ID.\r\n* A channel to propagate tracing information from and back to the caller, probably via `MsgApp` and `MsgAppResp`.\r\n\r\nJira issue: CRDB-28326\r\nEpic: CRDB-37516",
+        "comments": [
+            "cc @cockroachdb/replication",
+            "In a past conversation with @tbg, he pointed out that there is already some infrastructure in place for propagating this and tracing through Raft, but I'm not familiar with the details. There will likely be some amount of research/archaeology to determine what infrastructure already exists.",
+            "Adding O-support, since missing Raft tracing regularly hampers diagnosis of latency escalations.",
+            "> there is already some infrastructure in place for propagating this and tracing through Raft, but I'm not familiar with the details\r\n\r\nThere are a [couple of fields](https://github.com/cockroachdb/cockroach/blob/911f1ce389342459592d89fe7b78bcba3a2d265a/pkg/raft/raftpb/raft.proto#L104-L108) in raft messages:\r\n\r\n- an arbitrary context, which some [flows](https://github.com/cockroachdb/cockroach/blob/911f1ce389342459592d89fe7b78bcba3a2d265a/pkg/raft/raft.go#L999) use. Although we would have to be careful not to accidentally override it.\r\n- a more recent addition is that requests can have an attached response, although these don't work across nodes.\r\n\r\nNow that we've imported raft, we can modify the protocol more flexibly.\r\n\r\n> A field on `raftpb.Entry` with arbitrary user metadata (in our case, the proposal ID from `ProposalData.idKey`).\r\n\r\nAn ideal ID would be `(term, index)` of the submitted entry. If it were that leaseholder==leader, we would get this ID at flushing to raft time, and use it to: a) watch the committed entries, b) tracing etc. Unfortunately, we don't have this information exposed to the proposer, so extending `raftpb.Entry` with a proposal ID might be the way in the short term.",
+            "_<WIP, I'm updating this comment with more details later>_\r\n\r\nHere are some key points in the raft entry lifetime, between evaluation on the leaseholder and confirming the entry is applied to the state machine. We want most of these events traced.\r\n\r\n[\"propose\" phase on the leaseholder]\r\n1. From the [proposals](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/kv/kvserver/replica.go#L739) map, they get [inserted](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/kv/kvserver/replica_raft.go#L444) to the proposals [buffer](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/kv/kvserver/replica.go#L571-L584).\r\n2. Later, the proposals buffer's `FlushLockedWithRaftGroup` builds the `raftpb.Entry` slices, and [steps](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/kv/kvserver/replica_proposal_buf.go#L1038-L1042) them into `raft.RawNode` as a `MsgProp` message.\r\n\t- If the raft instance is not the leader, it may (if this feature is enabled) [forward](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/raft/raft.go#L1607-L1616) the proposal message to the leader over network.\r\n\r\n[\"propose\" phase on the leader]\r\n\r\n3. The leader may drop proposals on the floor, but most of the time it [appends](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/raft/raft.go#L1268) them to its log.\r\n4. Eventually, the leader [broadcasts](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/raft/raft.go#L658-L667) the `raftpb.Entry`-s to followers with a `MsgApp` message.\r\n5. In parallel, it also sends the entry to the local log storage via `Ready` call (the protocol is the same as on the follower below).\r\n\r\n[\"accept\" phase on a follower]\r\n\r\n6. The `MsgApp` message is stepped, and the follower [appends](https://github.com/cockroachdb/cockroach/blob/021c72ae4a131bf511bff654fd3e4162947d3b15/pkg/raft/raft.go#L1661) the entry to the in-memory log.\r\n    - It's possible that the follower's log is not up-to-date, in which case the below does not happen. Instead, there is a bit of back and forth with the leader until the log is caught up.\r\n7. The entry is sent to local log storage via `Ready` call.\r\n8. Once the storage confirmed storing the entry, the follower sends `MsgAppResp` to the leader.\r\n\r\n[\"commit/apply\" phase on the leader]\r\n\r\n9. Once the leader collected a quorum of `MsgAppResp` covering an entry, the entry is committed.\r\n10. The entry pops up via `Ready` call, in the `CommittedEntries` slice. Below the entry is applied to the state machine.\r\n11. In parallel, the leader notifies the followers that the entry got committed.\r\n\r\n[\"commit/apply\" phase on the follower]\r\n\r\n12. When the follower sees a commit index advancement, it returns newly committed entries via `Ready.CommittedEntries`.\r\n13. The entries get applied to the state machine.\r\n\r\n[on the leaseholder]\r\n\r\n14. Once the leaseholder applied an entry that sits in the `proposals` map, it notifies the client.\r\n\r\n----\r\n\r\nNuances:\r\n\r\n- reproposals: there can be multiple `raftpb.Entry` submitted for a single proposal\r\n- snapshots",
+            "A simple insert trace currently looks like:\r\n\r\n![image](https://github.com/cockroachdb/cockroach/assets/39606633/1b5a82a9-69da-4e24-87d1-e66ba23cf226)\r\n\r\n\r\nOr, with `vmodule=raft=1` to hit \r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/ceb19c5b75cf4aa02c68a669122349a3e9aca33d/pkg/kv/kvserver/raft.go#L258-L258\r\n\r\n![image](https://github.com/cockroachdb/cockroach/assets/39606633/da1bc943-a082-4311-983f-2bdf3df94ab0)\r\n\r\n\r\n",
+            "Un-assigning myself as I'm not actively working on this issue.",
+            "Based on the specified backports for linked PR #131850, I applied the following new label(s) to this issue: branch-release-24.3. Please adjust the labels as needed to match the branches actually affected by this issue, including adding any known older branches.\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14481,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 401,
+            "original_line": 401,
+            "side": "RIGHT",
+            "original_position": 225,
+            "position": 401,
+            "subject_type": "line",
+            "review_comments": [
+                "Consider also printing the range of `m.Entries` indices.",
+                "Added"
+            ]
+        },
+        {
+            "hunk_id": 14487,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": 223,
+            "original_start_line": 203,
+            "start_side": "RIGHT",
+            "line": 227,
+            "original_line": 227,
+            "side": "RIGHT",
+            "original_position": 207,
+            "position": 227,
+            "subject_type": "line",
+            "review_comments": [
+                "How about a CAS loop which breaks when either we succeed in incrementing the value, or the value is >= `numRegisteredStore`? It would seem unfortunate to drop the trace on the floor only because someone raced with us.\r\n\r\nAs an alternative to this CAS (better, I think), consider:\r\n\r\n```golang\r\nif num := r.numRegisteredStore.Add(1); num > numAllowed {\r\n\t// This branch is super rare, considering all the checks above.\r\n\t// Only happens when multiple trace registers are racing when we\r\n\t// are about to exceed the limit.\r\n\tr.numRegisteredStore.Add(-1)\r\n\treturn false\r\n}\r\nr.numRegisteredReplica.Add(1)\r\nreturn true\r\n```",
+                "Isn't this just a poor man's implementationf of CAS (well it would be if you changed the if to a for). I don't think the normal uncontented CAS case is any more expensive than this. The race is so rare that I'm not sure its worth optimizing for."
+            ]
+        },
+        {
+            "hunk_id": 14477,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/replica_proposal_buf.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 873,
+            "original_line": 873,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "Is `Context` never nil? Could you place a comment somewhere to this extent? Maybe in the `ProposalData.ctx` comment.",
+                "I added a comment to indicate that it is never nil and clean up the verbiage a little. "
+            ]
+        },
+        {
+            "hunk_id": 14489,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 351,
+            "original_line": 351,
+            "side": "RIGHT",
+            "original_position": 330,
+            "position": 351,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we also nil the `propSpan` here?",
+                "I don't think it was strictly necessary, but changed anyway to make it clear. "
+            ]
+        },
+        {
+            "hunk_id": 14492,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 223,
+            "original_line": 223,
+            "side": "RIGHT",
+            "original_position": 213,
+            "position": 223,
+            "subject_type": "line",
+            "review_comments": [
+                "Could you also note that we can drop the trace here if someone outpaced us and incremented numRegisteredStore? And say that it's fine because it's a rare case.",
+                "Added"
+            ]
+        },
+        {
+            "hunk_id": 14490,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace_test.go",
+            "start_line": 262,
+            "original_start_line": 281,
+            "start_side": "RIGHT",
+            "line": 263,
+            "original_line": 263,
+            "side": "RIGHT",
+            "original_position": 282,
+            "position": 263,
+            "subject_type": "line",
+            "review_comments": [
+                "`Term`, `Index`, and `LogTerm` for this type of message are unused. Remove?\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/b2e1d9a00915b6e835893120ff029592755c48ae/pkg/raft/rawnode.go#L459-L465",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 14484,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 434,
+            "original_line": 434,
+            "side": "RIGHT",
+            "original_position": 303,
+            "position": 434,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we want to hold the `t.mu` mutex while logging? Could do the data structure updates with `t.mu` locked, remember whether we want to log the message, and log it at the end after having released the mutex.",
+                "Updated. I'm not sure if it would have been a problem in practice, but I like the idea of minimizing the mutexes under lock."
+            ]
+        },
+        {
+            "hunk_id": 14478,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/replica_proposal.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 289,
+            "original_line": 289,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "So this is the one place where the context can change?\r\n\r\nThe thing is: we also modify `doneCh` above, for instance. I think the assumption is that all these fields are \"owned\" by the `raftMu`-protected critical section after some point (I'd have to page things in to figure it out, but [this](https://github.com/cockroachdb/cockroach/blob/5531ba107658b49e922fe264ad23034a1317855a/pkg/kv/kvserver/replica_proposal.go#L93-L102) comment seems relevant). So I wonder if we can assume the same thing for the `ctx` field. Is hiding it under an atomic needed?",
+                "There are also 2 places in `makeReproposal` and one in `evalAndPropose` that change the `ctx` of the original proposal. While the writes to this field are typically protected by the `raftMu` I don't think the reads were protected before and definitely are not after the changes I added. I only made this change after unit test failures that occurred without this. \r\n\r\nThe `doneCh` is also modified, but in practice today all uses (read and writes) are already protected. I wonder if there is a different approach for some of these fields where they should be protected by a `proposalBuf.mu` or something to make this more clear.\r\n\r\nI also added a TODO to track this down in the future. There is likely a lot more cleanup we should do in Raft logging once this is in place to wrap all the raft logging into the write context, but that is somewhat out of scope for this. ",
+                "This is all resolved now that I'm able to use the propCtx directly after using `WithFollowsFrom`. So this isn't a problem anymore."
+            ]
+        },
+        {
+            "hunk_id": 14485,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 191,
+            "original_line": 191,
+            "side": "RIGHT",
+            "original_position": 164,
+            "position": 191,
+            "subject_type": "line",
+            "review_comments": [
+                "As an extra optimization. Could you check what mutexes are held in all stacks that update `r.numRegisteredReplica`? I have a suspicition that all of them might be holding `Replica.raftMu` or `Replica.mu`. If so, we could change the `Load()` to just read the local variable (but still update it atomically, for other readers).\r\n\r\nIf so, might add some `RaftMuLocked` / `ReplicaLocked` suffixes to methods that always hold a mutex, and optimize some atomics out.",
+                "I'd rather do this as a follow-up. I added a TODO to look at this. I wanted to look at some of this if we do a Raft retrospective as it was very difficult to know which locks are held whe. "
+            ]
+        },
+        {
+            "hunk_id": 14488,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 285,
+            "original_line": 285,
+            "side": "RIGHT",
+            "original_position": 258,
+            "position": 285,
+            "subject_type": "line",
+            "review_comments": [
+                "Consider placing this check first. It is cheaper than fetching the context/span.",
+                "Swapped. ",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 14482,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": 148,
+            "original_start_line": 86,
+            "start_side": "RIGHT",
+            "line": 149,
+            "original_line": 149,
+            "side": "RIGHT",
+            "original_position": 87,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "Same thing: we flush lazily, so it's not always the fact that the limit is not exceeded.",
+                "Ack"
+            ]
+        },
+        {
+            "hunk_id": 14480,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 454,
+            "original_line": 454,
+            "side": "RIGHT",
+            "original_position": 220,
+            "position": 454,
+            "subject_type": "line",
+            "review_comments": [
+                "One thing that's concerning here: it's possible that `MsgStorageApplyResp` never covers a registered index, or covers it much later in time.\r\n\r\nFor example:\r\n1. The leader replicates a traced entry 100 to us, we register it.\r\n2. Another leader is elected, and regresses the log to index 90. Effectively, it wipes this entry 100 from our log (as well as entries 91-99).\r\n3. Only when the new leader proposes and commits all the way up to index 100 again, will we be able to unregister here. It's possible that it never happens, or happens much later, if there are no writes.\r\n\r\nThe approach with `LogMark`s would be more resilient to this kind of issue, because from the `LogMark` we can tell when such wipes happen. Before we fix the entry lifetime issues like this, I'm not sure it's safe to enable this tracing by default.\r\n\r\nOr maybe it's fine if this index stays tracked longer time if it doesn't cause extra logging. A more concerning case would be if we're logging too much.",
+                "That is a valid risk. There are a few options to deal with it, but none of them are minor. \r\n\r\n1) Reintroduce the term and logmark. That's not great as I'm still not sure we conclusively know when to clear this entry. \r\n2) Reintroduce the term and close out all traces if the term on the replica ever changes. I'm not sure if we will miss some important traces\r\n3) Allow the tracing to stay active. While it continues to use the concurrent limit, it doesn't cause too much logging.\r\n\r\nWith the change to set the default to 0 and the protection on duplicate MsgAppResp and MsgStorageAppendResp I think this should be safe enough. The worse case is that we will lose logging ability rather than having too many traces or log messages active. I could also consider adding a \"max trace time\" in the future to expire traces that have not moved in too long, but I'm not sure how important that is to do."
+            ]
+        },
+        {
+            "hunk_id": 14483,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 206,
+            "original_line": 206,
+            "side": "RIGHT",
+            "original_position": 135,
+            "position": 206,
+            "subject_type": "line",
+            "review_comments": [
+                "Slightly worried about the overhead here. We would be essentially calling `FlushAll` on every message. I realize this `== 0` check is what I previously suggested, sorry.\r\n\r\nIf we roll back to `if numRegistered > numAllowed { flush() }`, this would also be not ideal: if one or two ranges are not clearing themselves (e.g. it's quiesced or something, and observes no messages), then this check will also incur a flush on every message on all ranges.\r\n\r\nCan we find a way to make the 0 case nearly free (not more than one or two atomic loads)? I'm pretty sure we need a variable local to this `RaftTracer` to achieve something like this.",
+                "I cleaned this up again. Now we have the two variables and check the \"local\" one first. We will only load the global one if we are likely to register. Also I think the overhead of reading a shared atomic should be ~ the cost of reading the setting. I ran some tests and I don't see it in perf traces."
+            ]
+        },
+        {
+            "hunk_id": 14479,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 369,
+            "original_line": 369,
+            "side": "RIGHT",
+            "original_position": 164,
+            "position": 369,
+            "subject_type": "line",
+            "review_comments": [
+                "Can there be inserts racing with this removal, and `RaftTracer` staying in a non-zero state afterwards?\r\n\r\nI don't know if it's useful to log this case. If a replica is destroyed, maybe just silently zero it out. Or not clear/close at all, to avoid having to reason about this case. We're going to stop processing these messages anyway, and won't try to trace things.",
+                "Unfortunately with moving the numRegistered to a store level variable, it is important to clear these out. The case of adding during close is unfortunate. Maybe I'll add a "
+            ]
+        },
+        {
+            "hunk_id": 14486,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 190,
+            "original_line": 190,
+            "side": "RIGHT",
+            "original_position": 163,
+            "position": 190,
+            "subject_type": "line",
+            "review_comments": [
+                "Could you please add a comment stating that this is optimized for the `numAllowed == 0` fast path? E.g. note that the `numAllowed == 0` case only costs us a couple of atomic loads per message.",
+                "Added"
+            ]
+        },
+        {
+            "hunk_id": 14491,
+            "commit_id": "fe746c700443d68433b4ebf464a8b27ebcebf396",
+            "original_commit_id": "7296e84b9b94f33bfc51a10a8940dd69402434e6",
+            "path": "pkg/kv/kvserver/rafttrace/rafttrace.go",
+            "start_line": 127,
+            "original_start_line": 110,
+            "start_side": "RIGHT",
+            "line": 128,
+            "original_line": 128,
+            "side": "RIGHT",
+            "original_position": 111,
+            "position": 128,
+            "subject_type": "line",
+            "review_comments": [
+                "Alternatively, double-down on distributed trace collection if/when it's supported. So that the trace does not need to be plumbed back to the leaseholder / txn coordinator.",
+                "Added to TODO."
+            ]
+        }
+    ]
+}

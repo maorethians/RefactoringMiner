@@ -1,0 +1,45 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 8856,
+    "lang": "cpp",
+    "pr_title": "[Python Arrow] Fix issue related to TIMESTAMP_TZ and filter pushdown into PyArrow",
+    "pr_body": "This PR fixes #8522 \r\n\r\nArrow supports TIMESTAMP_TZ with any time unit (s, ms, ns, us)\r\nWe only support the time unit us for them, so we convert to us.\r\n\r\nWhen a filter is applied that does a comparison against a constant, the constant is cast to the type of the column.\r\nSo the constant gets cast to TIMESTAMP_TZ (us)\r\n\r\nWhen this filter gets pushed down into arrow, that results in attempting to compare TIMESTAMP_TZ(ms) against TIMESTAMP_TZ(us), which is not supported.",
+    "pr_comments": [
+        "Looks like the exception type is wrong in the test, could you have another look?",
+        "On Mac with `Python 3.9.17` I can't reproduce it\r\n\r\n-------\r\n\r\nOn a Linux docker container:\r\n(all packages in `requirements-dev.txt` have been reinstalled prior to running this)\r\n```\r\nroot@f6dc42ebe522:/app/duckdb# python3 -m pytest tools/pythonpkg/tests/fast/test_import_without_pyarrow_dataset.py \r\n============================= test session starts ==============================\r\nplatform linux -- Python 3.9.12, pytest-7.4.2, pluggy-1.3.0\r\nrootdir: /app/duckdb/tools/pythonpkg/tests\r\nconfigfile: pytest.ini\r\ncollected 1 item                                                               \r\n\r\ntools/pythonpkg/tests/fast/test_import_without_pyarrow_dataset.py .      [100%]\r\n\r\n============================== 1 passed in 0.73s ===============================\r\nroot@f6dc42ebe522:/app/duckdb# uname -a \r\nLinux f6dc42ebe522 5.15.49-linuxkit #1 SMP PREEMPT Tue Sep 13 07:51:32 UTC 2022 aarch64 aarch64 aarch64 GNU/Linux\r\n```",
+        "Think I found the culprit, the test that's failing is actually underspecified, which I now fixed.\r\nIt uses `arrow_dataset().IsLoaded()` which will return true if it was loaded correctly by us before.\r\n\r\nThe test however monkeypatches the pyarrow dataset to not be present, so in the sys modules it's no longer present.\r\nWe don't check for this so the VerifyDatasetLoaded method succeeds, while later on where the attributes are imported this will fail.\r\n\r\nI don't see why that's a huge deal though, in both cases it throws an exception, the one we throw is just a little more descriptive, none the less I changed and hopefully fixed it now :)\r\n\r\n----------------------\r\n\r\nThis doesn't fix it either, unless we actually make an environment where `pyarrow.dataset` is not available we can't really test this, because monkeypatching just makes it as if it wasn't imported\r\n\r\nIf we `import pyarrow.dataset` from within duckdb, I believe that just undoes all of the monkeypatching\r\nIf I add a test above this one which doesn't monkeypatch, then the second test will fail because it was already imported and probably cached.",
+        "I am tempted to remove the failing test\r\nIt's testing a scenario that we can not reliably, deterministically replicate\r\n\r\nIf the test is run standalone it passes, when I run it together with other tests, it doesn't raise an exception (because pyarrow is loaded before it was monkeypatched out)\r\nAnd I'm guessing the order tests are run is platform dependent, which makes the exception we get on Linux different because of the sequence of tests that are run before the offending test.",
+        "Thanks!"
+    ],
+    "merged": true,
+    "created_at": "2023-09-15T20:09:25Z",
+    "issue_context": {
+        "number": 8522,
+        "title": "[python] InvalidInputException filtering pyarrow table timestamp column with timezone and unit is not 'us'",
+        "body": "### What happens?\r\n\r\nWhen filtering a timestamp column with a timezone and the unit is not 'us' of a pyarrow table the following error appears:\r\n\r\n\r\n```\r\nInvalidInputException: Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result\r\n\r\nError: Invalid Error: ArrowNotImplementedError: Function 'greater_equal' has no kernel matching input types (timestamp[ms, tz=UTC], timestamp[s])\r\n\r\nAt:\r\n  pyarrow/error.pxi(121): pyarrow.lib.check_status\r\n```\r\npyarrow version is 12.0.1\r\n\r\n\r\n### To Reproduce\r\n\r\n```python\r\nimport pyarrow as pa\r\nimport datetime as dt\r\nimport duckdb\r\n\r\nt_us = pa.Table.from_arrays(\r\n    arrays=[pa.array([dt.datetime(2022,1,1)])], \r\n    schema=pa.schema([pa.field(\"time\", pa.timestamp(\"us\", tz=\"UTC\"))])\r\n)\r\n\r\nt_ms = pa.Table.from_arrays(\r\n    arrays=[pa.array([dt.datetime(2022,1,1)])], \r\n    schema=pa.schema([pa.field(\"time\", pa.timestamp(\"ms\", tz=\"UTC\"))])\r\n)\r\n```\r\n```sql\r\nduckdb.sql(\"FROM t_us\").filter(\"time>='2022-01-01'\") \r\n\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502           time           \u2502\r\n\u2502 timestamp with time zone \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 2022-01-01 00:00:00+00   \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\n```\r\n```sql\r\nduckdb.sql(\"FROM t_ms\").filter(\"time>='2022-01-01'\") \r\n\r\nInvalidInputException: Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result\r\nError: Invalid Error: ArrowNotImplementedError: Function 'greater_equal' has no kernel matching input types (timestamp[ms, tz=UTC], timestamp[s])\r\n\r\nAt:\r\n  pyarrow/error.pxi(121): pyarrow.lib.check_status\r\n```\r\n\r\n### OS:\r\n\r\nUbuntu 22.04 x86_64\r\n\r\n### DuckDB Version:\r\n\r\n0.8.2-dev1435\r\n\r\n### DuckDB Client:\r\n\r\npython\r\n\r\n### Full Name:\r\n\r\nVolker Lorrmann\r\n\r\n### Affiliation:\r\n\r\nSiemens\r\n\r\n### Have you tried this on the latest `master` branch?\r\n\r\nI have tested with a master build\r\n\r\n### Have you tried the steps to reproduce? Do they include all relevant data and configuration? Does the issue you report still appear there?\r\n\r\n- [X] Yes, I have",
+        "comments": [
+            "@legout thanks for reporting this. I made some slight adjustments to your code and managed to reproduce it."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23667,
+            "commit_id": "edfe130a1cc53d8b2646ae1f6b9cdd320601f9f4",
+            "original_commit_id": "ba71015ee711d95fe13886f372824143cae7493c",
+            "path": "tools/pythonpkg/src/python_import_cache.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 20,
+            "original_line": 20,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Not sure what the point of this change is?",
+                "None really, I had initially meant to check ModuleIsLoaded if the `ptr` was none-null, to double verify\r\nBut even with monkeypatching this looked like it didn't make IsLoaded return false\r\n\r\nSo this is left over code that I might want to undo"
+            ]
+        }
+    ]
+}

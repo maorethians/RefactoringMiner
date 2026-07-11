@@ -1,0 +1,51 @@
+{
+    "repo": "openssl/openssl",
+    "pr_number": 18948,
+    "lang": "c",
+    "pr_title": "bn_nist: fix strict aliasing problem (1.1.1 backport)",
+    "pr_body": "As of clang-14 the strict aliasing is causing code to magically disappear.\r\nBy explicitly inlining the code, the aliasing problem evaporates.\r\n\r\nFixes #18225\r\n\r\nBackport of #18258 to 1.1.1.\r\n\r\n",
+    "pr_comments": [
+        "This pull request is ready to merge",
+        "Merged to 1.1.1. Thank you."
+    ],
+    "merged": false,
+    "created_at": "2022-08-04T10:08:39Z",
+    "issue_context": {
+        "number": 18225,
+        "title": "Elliptic Curve code without ASM is broken with Clang 14",
+        "body": "Hello,\r\n\r\nIt looks like on Linux (x86_64), starting with Clang 14, the code for Elliptic Curves (when assembler is not enabled) is broken when compiled with optimizations (O2/O3). It is totally fine when using assembler, but when using regular C code, some curves will fail in OpenSSL internals. It doesn't seem to be new (I tested a few older versions) and it seems to be also affecting the 3.0.x branch although I have personally experienced it on the 1.1.1 branch.\r\n\r\nFrom running the tests, it seems to be only affecting a few curves (like `secp384r1`, `prime192v1`, `prime256v1`) and it seems to be that some validation does not pass, potentially due to bad codegen. I don't know if OpenSSL has some undefined behaviors in that section of the code as I haven't investigated yet. But, it was working well up to Clang 13, and GCC 11 is good too.\r\n\r\nI've tested and generated logs for the following configs:\r\n- 1.1.1n | Clang 14 | No ASM (**broken**)\r\n- 1.1.1n | Clang 14 | ASM (working)\r\n- 1.1.1n | GCC 11 | No ASM (working)\r\n\r\nAll these tests were done in a Docker container based on Ubuntu 22.04. I've also tested `1.1.1k | Clang 14 | No ASM` and `3.0.2 | Clang 14 | No ASM` which reproduce the exact same issue, so didn't generated logs for them.\r\n\r\n[config_1_1_1n_noasm_clang14.txt](https://github.com/openssl/openssl/files/8606273/config_1_1_1n_noasm_clang14.txt)\r\n[tests_1_1_1n_noasm_clang14.txt](https://github.com/openssl/openssl/files/8606276/tests_1_1_1n_noasm_clang14.txt)\r\n[tests_verbose_1_1_1n_noasm_clang14.txt](https://github.com/openssl/openssl/files/8606278/tests_verbose_1_1_1n_noasm_clang14.txt)\r\n\r\n[config_1_1_1n_asm_clang14.txt](https://github.com/openssl/openssl/files/8606272/config_1_1_1n_asm_clang14.txt)\r\n[tests_1_1_1n_asm_clang14.txt](https://github.com/openssl/openssl/files/8606275/tests_1_1_1n_asm_clang14.txt)\r\n\r\n[config_1_1_1n_noasm_gcc.txt](https://github.com/openssl/openssl/files/8606274/config_1_1_1n_noasm_gcc.txt)\r\n[tests_1_1_1n_noasm_gcc.txt](https://github.com/openssl/openssl/files/8606277/tests_1_1_1n_noasm_gcc.txt)\r\n\r\n",
+        "comments": [
+            "This looks to be a problem with Clang optimising better in version 14.  Compiling with `-fno-strict-aliasing` seems to address the issue.  Without deeper investigation, it isn't clear if this is our bug or Clang's.",
+            "Thanks @paulidale for pointing out that it was not an issue when disabling strict aliasing. I've identified `crypto/bn/bn_nist.c` as being the file causing the issues. I'll see if I can identity the actual problematic code and update this ticket with my findings.",
+            "The issue seems to be around the function `nist_cp_bn_0`, which is called by all `BN_nist_mod_XYZ` functions except for `BN_nist_mod_224` (likely why the 224 curve isn't affected). I don't see anything wrong with the `nist_cp_bn_0` function, which is basically a manually written loop to `memcpy` + `memset`. It doesn't seem to violate strict aliasing rules from what I've seen as both the source and destination are `BN_ULONG` arrays. \r\n\r\nI'm more a C++ programmer than a C programmer, so I might have missed something that is specific to C, but it can points you toward which section of the code is problematic. The rest of the `BN_nist_mod_XYZ` functions seem fine and the codegen doesn't seem to change that much except around the `nist_cp_bn_0` call.\r\n\r\n\r\nI've compared the generated code against when strict aliasing is disabled and it seems that the whole copy is discarded (and additional operations from the same `else` block?). So it might be a compiler bug. I've been able to make it generate seemingly proper assembly by rewriting the copy operation with an explicit call to `memcpy` and `memset` instead of the loop.\r\n\r\n[bn_nist_strict_aliasing.txt](https://github.com/openssl/openssl/files/8614294/bn_nist_strict_aliasing.txt)\r\n[bn_nist_no_strict_aliasing.txt](https://github.com/openssl/openssl/files/8614293/bn_nist_no_strict_aliasing.txt)\r\n[bn_nist_strict_aliasing_with_workaround.txt](https://github.com/openssl/openssl/files/8614312/bn_nist_strict_aliasing_with_workaround.txt)\r\n\r\n\r\nI've dumped the preprocessed source file for easier debugging if it can help you:\r\n[bn_nist_preprocessed.txt](https://github.com/openssl/openssl/files/8614315/bn_nist_preprocessed.txt)\r\n\r\nJust need to pass these additional arguments to the compiler to match the OpenSSL buildsystem: `-fPIC -m64 -O3`\r\n",
+            "Great work.  I agree that function should have no aliasing problems.\r\n\r\nI've raised an issue with the LLVM folks.",
+            "I'm not sure that's right. I think there is a strict aliasing violation, though you should check with language experts. C's strict aliasing and union rules, as I understand them, are quite harsh. While there is a carve-out in C (but not C++, which is even stricter) for using unions to do type-punning, that only applies when you read or write directly to a union. Writing through a pointer to an inactive arm is UB.\r\n\r\nSee example 3 of 6.5.2.3 in [n1256](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1256.pdf). (Whether these are the right rules is another matter. I doubt there is much C code out there that uses unions which is well-defined w.r.t. all this.)\r\n\r\nLikewise, the strict aliasing rules (6.5, clause 7) doesn't include an allowance for unions in the effective type of the object, only the type of the lvalue expression (which doesn't involve a union).",
+            "Agreed, example 3 is damning.\r\nIt's also different....\r\n\r\n",
+            "This looks like the fundamental issue is if the array in the union is converted to a pointer or accessed directly as an array.  If it is converted, the behaviour is undefined.  The patch accesses the union as an array which solves this.\r\n\r\nInteresting is that using memcpy/memset which both convert the array to a pointer, doesn't break the code.\r\n\r\nAt this point I'm satisfied that the problem is in the OpenSSL code.  I'm a little miffed that there were no warnings about undefined behaviour ever.",
+            "Are there plans to fix this for the 1.1.1 release?",
+            "> Are there plans to fix this for the 1.1.1 release?\r\n\r\nI created a backport or the fix in #18948"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 43407,
+            "commit_id": "318ab8e3967f3f01dfd07aa76d236740df55c284",
+            "original_commit_id": "26cfeb76cfda55ba5248219f40252af7c2b22be1",
+            "path": "crypto/bn/bn_nist.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 270,
+            "original_line": 270,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "I suppose if dst is in parens src_in, top and max should be as well.",
+                "Hmm....yes. But this is a backport of code that is already merged to master/3.0. I'm not sure we should have a different version of the code in 1.1.1.",
+                "Up to you I guess. It's safe in all the places it's currently used, so..."
+            ]
+        }
+    ]
+}

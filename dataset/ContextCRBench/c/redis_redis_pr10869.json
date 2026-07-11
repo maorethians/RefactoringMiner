@@ -1,0 +1,145 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 10869,
+    "lang": "c",
+    "pr_title": "Gossip forgotten nodes on `CLUSTER FORGET`",
+    "pr_body": "Gossip the cluster node blacklist in ping and pong messages. This means that CLUSTER FORGET doesn't need to be sent to all nodes in a cluster. It can be sent to one or more nodes and then be propagated to the rest of them.\r\n\r\nFor each blacklisted node, its node id and its remaining blacklist TTL is gossiped in a cluster bus ping extension (introduced in #9530).\r\n\r\n```\r\nRelease notes:\r\nAutomatically propagate node deletion to other nodes in a cluster when `CLUSTER FORGET` is called, allowing nodes to be deleted with a single call in most cases.\r\n```\r\n\r\nFixes #10861.",
+    "pr_comments": [
+        "@redis/core-team The major change here is that `CLUSTER FORGET` will now attempt to gossip the deletion to all nodes in the cluster. You can still use the old style of calling `CLUSTER FORGET` on all nodes without errors.",
+        "LGTM on high level.\r\ni understand that the implication on older versions (mixed cluster) is that older nodes will print a log warning, and will require an explicit FORGET.\r\nso the feature can be relied on, only if all nodes supports this, but will not cause harm in mixed clusters.\r\n\r\nI understand redis-cli still sends that command to all nodes (and we can probably never change that), so is this change just to resolve a race condition (mentioned in the related issue?).\r\nlet's copy the relevant justification text to the top comment here (for the purpose of release notes).\r\n\r\nwhile on that topic, considering that it's gonna take a long time before we actually release it, i wanna propose a new guideline:\r\nwhenever we tag an issue to be mentioned in the release notes, we also add a line in the top comment of the PR with a short text to be copied to the release notes.\r\nsomething like:\r\n```\r\nRelease notes: \r\n<some short text that's enough to draw the reader attention if this might affect them, or cause them to skip otherwise>\r\n```\r\nWDYT?",
+        "@oranagra Since you are the one that is generating the release notes most of the time, I'm happy to follow/enforce that. ",
+        "@zuiderkwast do you want to rebase? ",
+        "tests sporadically failed on ARM + TLS\r\nhttps://github.com/redis/redis-extra-ci/runs/7935419226?check_suite_focus=true\r\n```\r\n*** [err]: Set cluster hostnames and verify they are propagated in tests/unit/cluster/hostnames.tcl\r\ncluster config did not reach a consistent state\r\n*** [err]: Update hostnames and make sure they are all eventually propagated in tests/unit/cluster/hostnames.tcl\r\ncluster config did not reach a consistent state\r\n*** [err]: Remove hostnames and make sure they are all eventually propagated in tests/unit/cluster/hostnames.tcl\r\ncluster config did not reach a consistent state\r\n*** [err]: Verify cluster-preferred-endpoint-type behavior for redirects and info in tests/unit/cluster/hostnames.tcl\r\ncluster config did not reach a consistent state\r\n```",
+        "> tests sporadically failed on ARM + TLS https://github.com/redis/redis-extra-ci/runs/7935419226?check_suite_focus=true\r\n> \r\n> ```\r\n> cluster config did not reach a consistent state\r\n> ```\r\n\r\nAny idea why and what we can do about it? Shall we increase the time to wait to reach a consistent cluster state?",
+        "Increasing the timing seems like one such option, we can see if it helps. An immediate change is we should probably print out the delta.",
+        "i see it's usually fast, so i suppose increase the time won't help much\r\n```\r\n[ok]: Set cluster hostnames and verify they are propagated (311 ms)\r\n[ok]: Update hostnames and make sure they are all eventually propagated (309 ms)\r\n[ok]: Remove hostnames and make sure they are all eventually propagated (312 ms)\r\n[ok]: Verify cluster-preferred-endpoint-type behavior for redirects and info (307 ms)\r\n```",
+        "It might be a failover causing some havoc? I have seen that happening on some of the other ARM tests. We should also probably clean up the logging a bit, it's hard to follow."
+    ],
+    "merged": true,
+    "created_at": "2022-06-17T09:18:18Z",
+    "issue_context": {
+        "number": 10861,
+        "title": "Gossiped node deletion",
+        "body": "Typically you need to send a cluster forget to each node in a cluster to delete a node. If you don't do this fast enough, the node will be re-added through gossip. Ideally you just need to forget a node and it will eventually be forgotten throughout the cluster.\r\n\r\nThis is part of #8948.\r\n\r\nPossible ways to implement this:\r\n\r\n1. Append the contents of the clusterBlacklistNodes (node id and timestamp) to all cluster ping and pong messages. A ping extension (mechanism introduced for hostnames) can be used for this. (The blacklist expire timestamp needs to be gossiped too, so that we don't end up with the node being re-forgotten and re-added to the blacklist by gossip after the blacklist TTL is passed.) This increases the size of the cluster bus messages while any node is blacklisted (1 minute), but if the blacklist is short and the ping extension is small, this might be acceptable.\r\n2. Append the contents of the clusterBlacklistNodes (node id and timestamp) to every pong message which is a response to a ping, but only when we detect that the ping's gossip section contains a forgotten node, i.e. a node in our blacklist. This minimizes the extra data sent over the cluster bus, but it is enough to make sure a node is forgotten throughout the cluster?\r\n3. When a CLUSTER FORGET command is received, broadcast this to the cluster, for example in a pong with the forgotten node in a ping extension. This is done only once and by the node which receives the command. If a client sends CLUSTER FORGET to all nodes in a cluster, there will be NxN pongs sent in a short period of time.\r\n\r\n@madolson et.al. any preference among the above or other ideas?",
+        "comments": [
+            "First, some context. Some folks from RL and the core group have been iterating on a design for completing replacing the clusterbus with a new consistent storage. With that in place, it becomes trivial to \"remove\" a node from a cluster, since all operations are driven through consensus. @ushachar ping since he is supposed to be preparing that for general discussion.\r\n\r\nSince the idea of Cluster V2 is it will replace the cluster in the fullness of time, we can still make incremental progress until then on other parts of the cluster system, since it'll be at least 1+ years. We decided to continue iterating on slot migration, for instance.\r\n\r\nSo, to your points. I generally like the option 1, it can also be \"enhanced\" like option 3 by immediately broadcasting out the ping to all nodes. I don't have much issue with \"extra\" metadata on the cluster protocol since it's already so verbose (it's ~2kb today, already larger than a single TCP packet!). Option 2 seems to try to be more of an optimization, but I'm not convinced it buys us all that much. One thing worth highlighting is that the current system does not broadcasting any time information, to allow nodes to have different clocks, so we should consider broadcasting out relative TTL which can only decrement.",
+            ">Some folks from RL and the core group have been iterating on a design for completing replacing the clusterbus with a new consistent storage. \r\n\r\n@madolson is this the doc that you were referring to [here](https://github.com/redis/redis/issues/2807#issuecomment-1152794422)?\r\n\r\n>We decided to continue iterating on slot migration, for instance.\r\n\r\nDo you mind circling back to thread #2807? I don't intend to hijack this thread but now with this new information, I think it would be great to align with the community on how to best evolve the existing slot migration protocol. \r\n\r\n>Typically you need to send a cluster forget to each node in a cluster to delete a node. If you don't do this fast enough, the node will be re-added through gossip. Ideally you just need to forget a node and it will eventually be forgotten throughout the cluster.\r\n\r\nI agree we need a one-shot `CLUSTER FORGET`. The timeout can  indeed become an issue in a large cluster. However, I am not sure if gossip is the right solution. It is not entirely clear to me how we could ensure consistency in the face of failures. What'd happen if a few nodes in the cluster didn't receive the gossip for various reasons, either temporarily network issues or simply some races between `CLUSTER MEET` and `CLUSTER FORGET` such that the `FORGET` initiator wasn't aware of the presence of these nodes. A consensus-based solution would be ideal IMO though I don't have the details, yet.\r\n",
+            "I'll go for option 1 with relative TTL then!\r\n\r\n@PingXie I don't think we'll get any guarantees here, just better chances. redis-cli can still try to send cluster forget to all nodes. Guarantees will come in the new future cluster bus, hopefully.\r\n\r\n@madolson Any chance that I (and @PingXie I suppose) can be involved in the Cluster V2 project? I have some time to spend and it seems wiser to spend it on the long-term solution. Or do you prefer that we continue to improve Cluster V1 meanwhile?",
+            "Option 1 seems  good, and we need to avoid broadcast operations as much as possible, broadcasting in a large cluster (1000 nodes) may cause fluctuations in latency",
+            "> Option 1 seems good, and we need to avoid broadcast operations as much as possible, broadcasting in a large cluster (1000 nodes) may cause fluctuations in latency\r\n\r\n@judeng We already broadcast to the entire cluster in various situations, taking ownership of a slot for instance. Given that this is only at the initial forget, I think that's justifiable.\r\n\r\n> @madolson Any chance that I (and @PingXie I suppose) can be involved in the Cluster V2 project? I have some time to spend and it seems wiser to spend it on the long-term solution. Or do you prefer that we continue to improve Cluster V1 meanwhile?\r\n\r\nYes, more so I *want* you two to help! I was under the impression that the main design would be posted and we can start iterating already, I'm not really sure why it's not. EDIT: It is now! https://github.com/redis/redis/pull/10875\r\n\r\n> Do you mind circling back to thread https://github.com/redis/redis/issues/2807?\r\n\r\nAt least for the time being I'm very time constrained, I will try.",
+            ">@PingXie I don't think we'll get any guarantees here, just better chances. redis-cli can still try to send cluster forget to all nodes. Guarantees will come in the new future cluster bus, hopefully.\r\n\r\nMake sense @zuiderkwast. I am in agreement with option 1 too.\r\n\r\nIf we can make sure `CLUSTER_BLACKLIST_TTL` is greater than `cluster_node_timeout` (with some safe margin), I think we could avoid broadcasting the TTL. It should be OK that not all nodes stop the `forget node` broadcasting at the same time.  Nodes that have forgotten the node can ignore the new broadcasting such that we don't have to worry about a never-ending feedback loop. It is also easier to have every node work with a fixed timeout.\r\n\r\nAnother thought regarding the node to be forgotten. Today, the node to be forgotten no-ops the `CLUSTER FORGET` command. It continues to participate in cluster activities such as sending out gossip and answering cluster topology queries, despite being asked to leave. Neither is desired for a node that is or will soon be a stranger to the rest of the cluster. However it still makes sense for this node to serve read requests while waiting to be removed. Maybe we could consider tackling this issue as part of the solution as well?",
+            "> If we can make sure `CLUSTER_BLACKLIST_TTL` is greater than `cluster_node_timeout` (with some safe margin), I think we could avoid broadcasting the TTL.\r\n\r\n@PingXie We can't, can we? CLUSTER_BLACKLIST_TTL is 1 minute but node timeout is configurable...\r\n\r\n> Nodes that have forgotten the node can ignore the new broadcasting such that we don't have to worry about a never-ending feedback loop.\r\n\r\nGood point!\r\n\r\n> It is also easier to have every node work with a fixed timeout.\r\n\r\nYes, I guess the code gets simpler, but if there is a lot of latency and the gossip takes some time to reach all nodes, the blacklist can survive longer than expected. Given a node id is 40 bytes and a TTL is 8 bytes, I don't think it matters much for the message size at least. Please have a look at the PR to evaluate the complexity of this.",
+            ">We can't, can we? CLUSTER_BLACKLIST_TTL is 1 minute but node timeout is configurable...\r\n\r\nWe could set TTL to `CLUSTER_BLACKLIST_TTL + cluster_node_timeout` on each node. Traffic is one thing but I do think the simplicity (of not having to deal with an extra field) is appealing. \r\n\r\n>Please have a look at the PR to evaluate the complexity of this.\r\n\r\nDo you want to wait for #10536 to merge? I refactored the extension building logic to simplify the addition of new extensions. I think it is very close to the finish line. I am really hoping @madolson could find some time soon :-)",
+            "> We could set TTL to `CLUSTER_BLACKLIST_TTL + cluster_node_timeout` on each node. Traffic is one thing but I do think the simplicity (of not having to deal with an extra field) is appealing.\r\n\r\nSure, it would be simpler. That means that we set it to `CLUSTER_BLACKLIST_TTL + cluster_node_timeout` also on the CLUSTER FORGET command, right? What about the concern that gossip can take a long time to reach all nodes in a large cluster, is that a valid concern?\r\n\r\n> Do you want to wait for #10536 to merge? I refactored the extension building logic to simplify the addition of new extensions.\r\n\r\nGood to know. Sure, I can rebase my PR after yours is merged. But I can also keep my PR in a working state meanwhile.",
+            ">That means that we set it to CLUSTER_BLACKLIST_TTL + cluster_node_timeout also on the CLUSTER FORGET command, right?\r\n\r\nRight and every node sets the same TTL (`CLUSTER_BLACKLIST_TTL+cluster_node_timeout`) upon receiving a new `forget node` for the first time.\r\n\r\n>What about the concern that gossip can take a long time to reach all nodes in a large cluster, is that a valid concern?\r\n\r\nThis is a valid concern but orthogonal to how the TTL is set, either statically via a hard-coded formula like what we discussed here or runtime calculation as your PR demonstrates. In theory, both can run into this issue where the sender has already expired the delete before the gossip arrives at the receiver. In fact, if there is asymmetry in terms of latency between the two links: from sender to receiver and from receiver to sender, I could imagine a never-ending loop. Imagine that the latency from sender `S` to receiver `R` is greater than the TTL and the TTL is greater than the latency from `R` to `S`. `S` would've expired the deletion before `R` receives the deletion; `R` then forwards the deletion back to `S`, which would re-process the deletion resulting in a new gossip to `R`. And because the latency from `S` to `R` is greater than the TTL, `R` would already expire its deletion before it sees the new gossip. We are now in a perpetual loop. That said, I don't think this would be an issue in reality because 1) the expected latency (ms) in any deployment will be way lower than either the typical node timeout (sec) and the TTL (min). 2) latency spikes should be short lived and as soon as latency goes back to normal, any potential loop would be broken; 3)  the worst case scenario is that the delete is reverted, which we already agree is acceptable as long as there is a way to detect and a retry would be all is needed.",
+            "> We already broadcast to the entire cluster in various situations, taking ownership of a slot for instance. Given that this is only at the initial forget, I think that's justifiable.\r\n\r\n@madolson in 7.0, the broadcast messages for pubsub and module have been minimized, and other broadcast messages, such as  slot whonership messages, still need to be broadcast to recover routing information asap.  As a user's point of view, they are more willing to put up with the delay caused by broadcast messages than the delay caused by redirection. But the removal of nodes, usually in the cluster in doing a sale-in operation, users may not be willing to affect their traffic",
+            "@judeng the idea here is to piggyback on the periodic PING message, which now has the ability to carry additional payload via a construct called `extension` thanks to @madolson's work (#9530). The PING message without any extension is already quite substantial, ~~`~2KB * (N+1)`~~ `~2KB+100B*N` where `N` is the number of nodes picked for gossip. The additional cost incurred by this new payload would be `40B * M` where `M` is the number of nodes to be removed from the cluster. In a large cluster, `N >> M` and we will probably be looking at ~~\\~1% (or less)~~  a small size increase at the per-message level. Of course, given the fully-meshed topology, the total size increase in a cluster would be linear to the square of total node number. Another thing to note is that the overhead would be short-lived (bounded by the TTL). Therefore, based on these two observations (small and time-bound size increase), I would assume the overall impact is negligible. The impact from scaling out the cluster would be a lot bigger and long-lasting. I am curious to know if this is inline with your experience. ",
+            "> What about the concern that gossip can take a long time to reach all nodes in a large cluster, is that a valid concern?\r\n\r\nWe aren't \"gossiping\" this, or at least we aren't from the implementation. The only piece of information we gossip is the health information. The Ping/Pong messages are guaranteed (as much as cluster can guarantee) within the `cluster_node_timeout` by sending a new message if we haven't heard from the node by `cluster_node_timeout`/2. We should hit every single node within the max(CLUSTER_BLACKLIST_TTL,cluster_node_timeout). I think doing an addition between the two seems like a fine approximation.\r\n\r\nThe other observation made by PingXie about the potential failure modes seem mostly correct. It doesn't seem all that hard to just \"decrement\" the TTL each time you forward it on by some amount. So even in some eternal loop, it eventually decays away.\r\n\r\n> @madolson in 7.0, the broadcast messages for pubsub and module have been minimized, and other broadcast messages, such as slot whonership messages, still need to be broadcast to recover routing information asap. As a user's point of view, they are more willing to put up with the delay caused by broadcast messages than the delay caused by redirection. But the removal of nodes, usually in the cluster in doing a sale-in operation, users may not be willing to affect their traffic\r\n\r\nMy POV is that I split these operations into \"datapath\" (pubsub + module) and \"control path\" (add/remove/update topology). Control path I have really no objection to a full fanout, since they are very infrequent. Topology is generally pretty fixed, and only get's updated on occasion. So spending 10ms to broadcast 1k messages is OK. I'm far less OK with datapath operations fanning out.\r\n\r\n> Do you want to wait for https://github.com/redis/redis/pull/10536 to merge? I refactored the extension building logic to simplify the addition of new extensions. I think it is very close to the finish line. I am really hoping @madolson could find some time soon :-)\r\n\r\nYes I'm going to look at your PR first. So we can rebase after that.",
+            "> Control path I have really no objection to a full fanout, since they are very infrequent\r\n\r\n@madolson  Agree! your point is very clear, I think I get it, thank you\uff01 In my usage scenario, the data of my cluster has doubled almost every year, and now it has close to 1200 nodes. Most of the overhead of the cluster bus is spent on ping/pong messages, indeed the full fanout are very very infrequent."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48699,
+            "commit_id": "5f028009efaa85540ba9c88d768023d2438ba12e",
+            "original_commit_id": "95b88f672a54fc66d719c1385008ad8f8cc7d642",
+            "path": "src/cluster.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3039,
+            "original_line": 3044,
+            "side": "RIGHT",
+            "original_position": 65,
+            "position": 57,
+            "subject_type": "line",
+            "review_comments": [
+                "the dictIterator  should be freed in the end?",
+                "Thanks! I forgot."
+            ]
+        },
+        {
+            "hunk_id": 48700,
+            "commit_id": "5f028009efaa85540ba9c88d768023d2438ba12e",
+            "original_commit_id": "95b88f672a54fc66d719c1385008ad8f8cc7d642",
+            "path": "src/cluster.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2026,
+            "original_line": 2020,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "is clusterMsgPingExtForgottenNode should be aligned with 8 bytes?",
+                "The size of clusterMsgPingExtForgottenNode is a multiple of 8, so it is already aligned. But perhaps I should add an assert?",
+                "I added `static_assert(sizeof(clusterMsgPingExtForgottenNode) % 8 == 0);`"
+            ]
+        },
+        {
+            "hunk_id": 48702,
+            "commit_id": "5f028009efaa85540ba9c88d768023d2438ba12e",
+            "original_commit_id": "95b88f672a54fc66d719c1385008ad8f8cc7d642",
+            "path": "src/cluster.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2026,
+            "original_line": 2026,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Seems like there is a `UndefinedBehaviorSanitizer`, i ran a daily and it report this\r\n```\r\ncluster.c:2053:48: runtime error: index 48 out of bounds for type 'char [40]'\r\nSUMMARY: UndefinedBehaviorSanitizer: undefined-behavior cluster.c:2053:48 in \r\n```\r\n\r\nis a false positive, i guess doing a `REDIS_NO_SANITIZE(\"bounds\")` can do the work, i am tesing it",
+                "Thanks. I'm on vacation. Do you mind looking into this? Or anyone else...?",
+                "i guess it is a false positive, i added a `REDIS_NO_SANITIZE(\"bounds\")` like others, #11053"
+            ]
+        },
+        {
+            "hunk_id": 48698,
+            "commit_id": "5f028009efaa85540ba9c88d768023d2438ba12e",
+            "original_commit_id": "95b88f672a54fc66d719c1385008ad8f8cc7d642",
+            "path": "src/cluster.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3047,
+            "original_line": 3050,
+            "side": "RIGHT",
+            "original_position": 64,
+            "position": 65,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't see the gossip message size getting increased to accommodate the extra extensions?",
+                "`hdr->totlen` is set a few lines below.",
+                "I was referring to the working buffer allocated on line 2964 (this PR), whose size only includes the hostname extension on line 2959. So I think we will be overflowing the buffer on line 3050.",
+                "You're right. Thx!",
+                "I've updated estlen."
+            ]
+        },
+        {
+            "hunk_id": 48701,
+            "commit_id": "5f028009efaa85540ba9c88d768023d2438ba12e",
+            "original_commit_id": "95b88f672a54fc66d719c1385008ad8f8cc7d642",
+            "path": "src/cluster.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5668,
+            "original_line": 5673,
+            "side": "RIGHT",
+            "original_position": 94,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "@zuiderkwast what do you think about the idea of allowing the node to be deleted to initiate the gossip message as well? This would save another explicit operation on the admin side. ",
+                "Would this be a new command? Like `CLUSTER LEAVE` or something?\r\n\r\nSeems like a good idea. A node could broadcast this message repeatedly until everyone responds with a message that it has been blacklisted.",
+                "Sure, especially if it makes sense with cluster V2 as well. But let's do that in another PR...",
+                "> Would this be a new command? Like CLUSTER LEAVE or something?\r\n\r\nI haven't thought about the exact command much but the ultimate experience that I am looking for should allow an admin to send such a command to an arbitrary node in the cluster to remove a node from the cluster permanently, subject to errors. The node  to be removed could be dead or live, primary or replica. The node who receives the command could be the node to be removed itself or a random node. \r\n\r\n> Sure, especially if it makes sense with cluster V2 as well. But let's do that in another PR...\r\n\r\nYeah I think it is aligned with v2 as well with the difference that here any node can handle the remove request while with v2 only metadata nodes (TD/FC) can handle the request. The bulk of the logic however is completely abstracted away from the admin in both cases. Separate PR(s) is/are probably the better route.\r\n"
+            ]
+        }
+    ]
+}

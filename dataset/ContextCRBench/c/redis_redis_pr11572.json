@@ -1,0 +1,114 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 11572,
+    "lang": "c",
+    "pr_title": "Cleanup: Get rid of server.core_propagates",
+    "pr_body": "1. Get rid of server.core_propagates - we can just rely on module/call nesting levels\r\n2. Rename in_nested_call  to execution_nesting and update the comment\r\n3. Remove module_ctx_nesting (redundant, we can use execution_nesting)\r\n4. Modify postExecutionUnitOperations according to the comment (The main purpose of this PR)\r\n5. trackingHandlePendingKeyInvalidations: Check the nesting level inside this function\r\n\r\nfixes #11536",
+    "pr_comments": [
+        "@MeirShpilraien FYI (sorry if you already started working on that, i was bored)",
+        "@guybe7 I did not start yet but was about to :)\r\nQuestion, why do we need 2 nesting variables, `call_nesting` and `module_ctx_nesting`? Wouldn't one nesting variable will be enough?",
+        "@MeirShpilraien good question, let me delete one of them and run the tests while i'm reading the code",
+        "@MeirShpilraien please have another look (also please go over a couple of \"TODO\" comments that i left in the code)",
+        "@oranagra please have a look"
+    ],
+    "merged": true,
+    "created_at": "2022-12-13T12:09:26Z",
+    "issue_context": {
+        "number": 11536,
+        "title": "Refactor the use of `server.core_propagation`, `server.module_ctx_nesting`, and `server.in_nested_call`",
+        "body": "Following the work that was done on https://github.com/redis/redis/pull/11199, we believe we can refactor the code that decide when we need to perform command propagation and reduce the amount of conditions and variable that currently involve in the processes.\r\n\r\nWe believe that a single `nesting_level` variable can be good enough. Each time an execution unit starts, we increase the `nesting_level` (and decrease it when the execution unit end). When `nesting_level` gets to zero, we can perform post notifications jobs and command propagation.",
+        "comments": [
+            "Agreed.\r\n`server.core_propagation` sort-of means - we are processing a command and in a transaction.\r\n`server.in_nested_call` means the `call()` function has invoked a command processor.  If `>=1` this means that a command is in progress.  When `>1`, we know that `call()` is has been invoked recursively.\r\n\r\nWhile addressing this, I would also suggest an additional assertion be added to `processEventsWhileBlocked()`.  Currently, this code expects that we are not within the context of a command - unless it's a LUA script or a module yield, in which case only `CMD_ALLOW_BUSY` commands are permitted.  I'd suggest making that explicit with this assertion:\r\n```\r\nvoid processEventsWhileBlocked(void) {\r\n    serverAssert(server.core_propagates == 0 || isInsideYieldingLongCommand());\r\n    ...\r\n```\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+            "BTW - I tried that assertion above.  It trips the test cases for DEBUG loading of AOF.  I think this means that you can currently cause an engine crash by performing a DEBUG LOADAOF while at maxmemory.  A recursive event loop is created.  The entire recursive event loop will be transactionized.  Eviction will assert when the 2nd (write) command is executed in the recursive call."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48867,
+            "commit_id": "ba083e6b704e25a9040632f6c13e676d8777180d",
+            "original_commit_id": "155acef51ac7826ed294a4b61d891f1c7a9a40ac",
+            "path": "src/server.c",
+            "start_line": 3288,
+            "original_start_line": 3288,
+            "start_side": "RIGHT",
+            "line": 3289,
+            "original_line": 3289,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 41,
+            "subject_type": "line",
+            "review_comments": [
+                "i'd rather move this call to be explicit in the two places where module.c calls postExecutionUnitOperations.\r\ni think that's more related to terminating the the module context, not the execution job (in that case we should maybe rename it to `moduleRootContextDestroy()`?\r\n\r\nmaybe i forgot something we discussed where you explained why that's problematic?\r\nis it because we'll have to compare server.execution_nesting to 0? (we're also the ones who decrement it there, so it's not out of context).",
+                "the problem is that if code from module.c runs from within call() execution_nesting will always be >0 because call() increments it.\r\n\r\nso basically if we are in call(), the postExecutionUnitOperations that is in afterCommand actually does something (the two calls in modue.c only do something if we are outside of call)",
+                "or we can check that the context is REDISMODULE_CTX_COMMAND and that module_ctx_nesting is **1**.\r\nthat's a bit ugly too.\r\n\r\ni guess that's the compromise of unifying the two counters into one.\r\nconsidering the two alternatives, i think the current one is better.",
+                "we should also consider the case that cmd->proc is called directly, not through `call` (in aof.c).\r\nin that case the dispatcher will mark the context with REDISMODULE_CTX_COMMAND and module_ctx_nesting can be either 0 (in case of startup loading) or 1 in case of DEBUG LOADAOF.\r\n\r\nin the first case modulePostExecutionUnitOperations will not be called, and in the second case it will.\r\ndo you see any issues there?",
+                "@oranagra for the record, this was the behavior even before this PR (CMIIW), so even if we do see an issue with that it should be handled in a separate PR\r\n\r\nIMHO re DEBUG LOADAOF we're fine: it is a debug command, so hardly used. regardless I consider it some form of MULTI/EXEC, in which case we are aligned (PEJ will only be called after all commands were executed)\r\nnot so sure about startup AOF tho...\r\n\r\n@MeirShpilraien did you intend for postExecutionUnitOperations to run during AOF load (both startup and DEBUG LOADAOF)",
+                "at the very least, let's improve the tests to cover these cases, i'm paranoid about not having coverage for that and getting an assertion after releasing this change.\r\n\r\nmaybe add AOF propagation (and loading) to tests/unit/moduleapi/postnotifications.tcl\r\nand / or maybe add restart from AOF to tests/unit/moduleapi/propagate.tcl (currently only uses DEBUG LOADAOF)",
+                "in order to add tests, i need to know how we want and what's the expected behavior\r\n\r\nbtw, in the case of startup-AOF, won't all the PEJ accumulate and then be triggered just after the first non-AOF command?\r\n\r\ni feel like the way to go is to prevent adding PEJs if `server.loading`",
+                "for example, let's say a module adds some PEJ that calls `RM_Call(\"INCR c!\", \"notify-counter\")` \r\nif we do nothing, after an AOF this counter will be 2X what it should be\r\non the other hand, maybe it's the module's responsibility to make things right inside the PEJ CB, based on the state.\r\na similar argument can be said about master-replica: the replica should not run the above RM_Call, but rather receive it from master",
+                "i agree the modules should not do these things, and i'm not sure what these will be useful for.\r\ni think we should call them after each command in AOF (same as we call them on a replica), maybe the module will just need to update some internal state, it should certainly not start write commands in this state.\r\n\r\ni was paranoid about reaching some panic (even in a well behaved module), i think that our coverage for tests that do AOF loading with modules are lacking (even if they won't use the API to register PEJ, or use them to register callbacks that do nothing).",
+                "just thought of something: if we have MULTI/EXEC inside an AOF, PEJ will be executed after each command in the transaction (AOF calls `proc` but execCommand calls `call`, incrementing execution_nesting from 0 to 1 and then from 1 to 0 in `afterCommand`)\r\n\r\ni suggest opening an issue about the correct handling of PEJ with AOF, comprised mostly of defining what we want and adding more tests. i'll mark this issue as a must for 7.2\r\n\r\nsounds good? or do you think things should be handled in this PR?",
+                "ok, we can leave this issue with the module PEJ to another PR, likely that RM_AddPostNotificationJob should return an error in this state.\r\n\r\nbut still, maybe in this PR we wanna improve tests/unit/moduleapi/propagate.tcl to also restart from AOF? (currently only uses DEBUG LOADAOF)",
+                "https://github.com/redis/redis/issues/11643"
+            ]
+        },
+        {
+            "hunk_id": 48869,
+            "commit_id": "ba083e6b704e25a9040632f6c13e676d8777180d",
+            "original_commit_id": "155acef51ac7826ed294a4b61d891f1c7a9a40ac",
+            "path": "src/module.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 819,
+            "original_line": 811,
+            "side": "RIGHT",
+            "original_position": 55,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "i think we need a bigger comment here to explain why we don't want to increment on any module context being created / destroyed.",
+                "ok"
+            ]
+        },
+        {
+            "hunk_id": 48870,
+            "commit_id": "ba083e6b704e25a9040632f6c13e676d8777180d",
+            "original_commit_id": "155acef51ac7826ed294a4b61d891f1c7a9a40ac",
+            "path": "src/module.c",
+            "start_line": 8116,
+            "original_start_line": 8116,
+            "start_side": "RIGHT",
+            "line": 8118,
+            "original_line": 8118,
+            "side": "RIGHT",
+            "original_position": 37,
+            "position": 143,
+            "subject_type": "line",
+            "review_comments": [
+                "maybe we should explicitly mention \"evict\" and \"expire\" to make it clearer."
+            ]
+        },
+        {
+            "hunk_id": 48868,
+            "commit_id": "ba083e6b704e25a9040632f6c13e676d8777180d",
+            "original_commit_id": "155acef51ac7826ed294a4b61d891f1c7a9a40ac",
+            "path": "src/server.c",
+            "start_line": 3608,
+            "original_start_line": 3608,
+            "start_side": "LEFT",
+            "line": 3610,
+            "original_line": 3610,
+            "side": "LEFT",
+            "original_position": 102,
+            "position": 102,
+            "subject_type": "line",
+            "review_comments": [
+                "it looks as if it's no longer relevant to avoid doing that invalidations in when nested (you moved the `if` inside).\r\nmaybe it's wrong (to check server.execution_nesting in postExecutionUnitOperations, trackingHandlePendingKeyInvalidations, etc)?\r\n\r\nmaybe it's better that all callers explicitly check it and understand when it takes action and when not (keep that function only doing actions without restrictions).\r\nrather than making it look as if you call it and it does something when in fact it's just a \"maybe\".",
+                "but on the other hand, postExecutionUnitOperations should never be called if execution_nesting is >0, so i can move the `if` outside, but then i'll add an assertion\r\n\r\nsame for trackingHandlePendingKeyInvalidations",
+                "well, the code will look a bit better at the caller IMHO (more explicit), but never mind, one more hop for the reader.\r\n\r\np.s. so maybe move these comments that you deleted into their designated functions?",
+                "i didn't delete any comments, i moved them (one is in postExecutionUnitOperations and the other is in trackingHandlePendingKeyInvalidations)"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,750 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 89477,
+    "lang": "go",
+    "pr_title": "kvnemesis: uniquely identify all versions",
+    "pr_body": "This is essentially a v2 of kvnemesis. While a lot of code has changed, it's not a rewrite, rather we are actually bringing kvnemesis closer to the idea which ultimately led to it being built. That idea is that if values can uniquely identify the operation which wrote them, serializability checking becomes easier as any observation of a value totally orders the reader and the writer with respect to each other. \"Easier\" meant both simpler code, as well as actually being able to computationally do the verification on complex histories.\r\n\r\nPrior to this PR, kvnemesis was writing unique values where it could, but it couldn't do it for deletions - after all, a deletion is like writing a \"nothing\" to MVCC, and there wasn't any way to make two \"nothings\" distinguishable. Having broken with the basic premise of unique values, there was a lot of bending over backwards going on to avoid, for the most part, devolving into a \"normal\" serializability checker. However, for contrived edge cases this would not be avoidable, and so there would be histories that kvnemesis just couldn't handle.\r\n\r\n\"v2\" (this PR) gets this right. The main contribution is that we now thread kvnemesis' sequence numbers all the way down into MVCC and back up with the RangeFeed. Values are now truly unique: a deletion tombstone is identifiable via its `MVCCValueHeader`, which carries the `kvnemesisutil.Seq` of the `Operation` that originally wrote it. On top of this, everything \"just works\" as you expect.\r\n\r\nPlumbing testing-only fields through the KV API protobufs isn't something that was taken lightly and that required a good amount of deliberation. However, we figured out a clever (maybe too clever?) way to have these fields be zero-sized in production, meaning they cannot possibly affect production logic and they also do not influence struct sizes or the wire encoding. As a drawback, kvnemesis requires the `crdb_test` build tag (it will `t.Skip()` otherwise).\r\n\r\nThe remainder of this PR is mostly improvements in code quality. `echodriven` testing was introduced for many of the tests that could benefit from it. The core components of kvnemesis were reworked for clarity (the author spent the first week very confused and wishes for that experience to remain unrepeated by anyone). kvnemesis also tracks the execution timestamps as reported by the KV layer, which a future change could [use](https://github.com/cockroachdb/cockroach/issues/92898) for additional validation.\r\n\r\nOf note is the updated doc comment, which is reproduced below in entirety.\r\n\r\n\r\nFixes #90955.\r\nFixes #88988.\r\nFixes #76435.\r\nFixes #69642.\r\n\r\n----\r\n\r\nPackage kvnemesis exercises the KV API with random concurrent traffic (as\r\nwell as splits, merges, etc) and then validates that the observed behaviors\r\nare serializable.\r\n\r\nIt does so in polynomial time based on the techniques used by [Elle] (see in\r\nparticular section 4.2.3), using the after-the-fact MVCC history as a record\r\nof truth. It ensures that all write operations embed a unique identifier that\r\nis stored in MVCC history, and can thus identify which of its operations'\r\nmutations are reflected in the database (\"recoverability\" in Elle parlance).\r\n\r\nA run of kvnemesis proceeds as follows.\r\n\r\nFirst, a Generator is instantiated. It can create, upon request, a sequence\r\nin which each element is a random Operation. Operations that are mutations\r\n(i.e. not pure reads) are assigned a unique kvnemesisutil.Seq which will be\r\nstored alongside the MVCC data written by the Operation.\r\n\r\nA pool of worker threads concurrently generates Operations and executes them\r\nagainst a CockroachDB cluster. Some of these Operations may\r\nsucceed, some may fail, and for some of them an ambiguous result may be\r\nencountered.\r\nAlongside this random traffic, kvnemesis maintains a RangeFeed that ingests\r\nthe MVCC history. This creates a \"carbon copy\" of the MVCC history.\r\n\r\nAll of these workers wind down once they have in aggregate completed a\r\nconfigured number of steps.\r\n\r\nNext, kvnemesis validates that the Operations that were executed and the\r\nresults they saw match the MVCC history, i.e. checks for Serializability. In\r\ngeneral, this is an NP-hard problem[^1], but the use of unique sequence\r\nnumbers (kvnemesisutil.Seq) makes it tractable, as each mutation in the MVCC\r\nkeyspace uniquely identifies the Operation that must have written the value.\r\n\r\nWe make use of this property as follows. First, the Validate method iterates\r\nthrough all Operations performed and, for each, inspects\r\n\r\n- the type of the Operation (i.e. Put, Delete, Get, ...),\r\n- the (point or range) key of the operation, and\r\n- its results (i.e. whether there was an error or which key-value pairs were returned).\r\n\r\nEach atomic unit (i.e. individual non-transactional operation, or batch of\r\nnon-transactional operations, or transaction) results in a slice (in order\r\nin which the Operations within executed[^2]) of observations, where each\r\nelement is either an observed read or an observed write.\r\n\r\nFor example, a Batch that first writes `v1` to `k1`, then scans `[k1-k3)`\r\n(reading its own write as well as some other key k2 with value v2) and then\r\ndeletes `k3` would generate the following slice:\r\n\r\n       [\r\n         observedWrite(k1->v1),\r\n         observedScan(k1->v1, k2->v2),\r\n         observedWrite(k3->v3),\r\n       ]\r\n\r\nEach such slice (i.e. atomic unit) will then be compared to the MVCC history.\r\nFor all units that succeeded, their writes must match up with versions in\r\nthe MVCC history, and this matching is trivial thanks to unique values\r\n(including for deletions, since we embed the kvnemesisutil.Seq in the value),\r\nand in particular a single write will entirely fix the MVCC timestamp at\r\nwhich the atomic unit must have executed.\r\n\r\nFor each read (i.e. get or scan), we compute at which time intervals each\r\nread would have been valid. For example, if the MVCC history for a key `k1`\r\nis as follows:\r\n\r\n                  k1\r\n\r\n       \t -----------------\r\n       \t t5      v2\r\n       \t t4\r\n       \t t3\r\n       \t t2     <del>\r\n       \t t1      v1\r\n\r\nthen\r\n\r\n  - observedGet(k1->v1)  is valid for [t1,t2),\r\n  - observedGet(k1->nil) is valid for [0,t1) and [t2,t5), and\r\n  - observedGet(k1->v2)  is valid for [t5,inf).\r\n\r\nBy intersecting the time intervals for each Operation in an atomic unit, we\r\nthen get the MVCC timestamps at which this Operation would have observed what\r\nit ended up observing. If this intersection is empty, serializability must have\r\nbeen violated.\r\n\r\nIn the error case, kvnemesis verifies that no part of the Operation became visible.\r\nFor ambiguous results, kvnemesis requires that either no Operation become visible,\r\nor otherwise treats the atomic unit as committed.\r\n\r\nThe KV API also has the capability to return the actual execution timestamp directly\r\nwith responses. At the time of writing, kvnemesis does verify that it does do this\r\nreliably, but it does not verify that the execution timestamp is contained in the\r\nintersection of time intervals obtained from inspecting MVCC history[^3].\r\n\r\n[Elle]: https://arxiv.org/pdf/2003.10554.pdf\r\n[^1]: https://dl.acm.org/doi/10.1145/322154.322158\r\n[^2]: there is currently concurrency within the atomic unit in kvnemesis. It\r\ncould in theory carry out multiple reads concurrently while not also writing,\r\nsuch as DistSQL does, but this is not implemented today. See:\r\nhttps://github.com/cockroachdb/cockroach/issues/64825\r\n[^3]: tracked in https://github.com/cockroachdb/cockroach/issues/92898.\r\n\r\nEpic: none",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/89477)\n<!-- Reviewable:end -->\n",
+        "No rush on reviewing this Erik, it's not ready for merging anyway, need to come up with a version of the plumbing that could at least in theory get consensus.\r\n\r\nBut this seems to work and I'll base DeleteRangeUsingTombstone on it so that we can start getting some test coverage.\t ",
+        "I haven't done the plumbing and there are some test failures to fix up (because I changed some proto sizes under `crdb_test`), but this is worth a look now.",
+        "@erikgrinaker maybe we should kick this off with a 30 minute live walkthrough? I haven't written enough high-level description yet, though I suspect you're in the loop already.",
+        "Sure, we can do that. After standup? I'm pretty familiar already, but the diff is large enough that there are probably bits that I've missed.",
+        "Haven't squashed yet, but it's rebased and has a nice PR message. PTALL @erikgrinaker \r\nThere are also two comments (maybe easiest to find on reviewable, I resolved everything else) that I'd like your take on.\r\n\r\nHope to get this in on Monday \ud83e\udd1e\ud83c\udffd\ud83e\udd1e\ud83c\udffd\ud83e\udd1e\ud83c\udffd\ud83e\udd1e\ud83c\udffd\ud83e\udd1e\ud83c\udffd ",
+        "> so I haven't reviewed everything again in detail, but looked over the comments and the code outside of the kvnemesis package.\r\n\r\nThe fixup commits are all there, so if you really wanted to, you could find the one that looks familiar from last time and review from there. But there is limited utility there too, just pointing it out as an option.\r\n\r\nTFTR, will address later.",
+        "bors r=erikgrinaker",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=7873195&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2022-11-12T10:34:21Z",
+    "issue_context": {
+        "number": 88988,
+        "title": "kvnemesis: make deletions unique",
+        "body": "**Is your feature request related to a problem? Please describe.**\r\n\r\n`kvnemesis` will be much simpler and powerful if it has a way to uniquely map deletions observed via the rangefeed, i.e. `(key,timestamp)` pairs, to its operations.\r\n\r\nIt relies on such a unique mapping for all operations (by writing unique values) but deletions don't offer it, leading to more complexity and situations in which kvnemesis can't verify histories.\r\n\r\n**Describe the solution you'd like**\r\n\r\nAllow kvnemesis to embed a payload in `MVCCValueHeader`.\r\n\r\n**Describe alternatives you've considered**\r\n\r\nWe could also make deletions \"choose their value\", i.e. not force them to be represented by empty `roachpb.Value` at the MVCC layer. That way, kvnemesis could use its unique values \"verbatim\" by putting them into the deletes.\r\n\r\n**Additional context**\r\n\r\nThis also needs to work for `MVCCDeleteRangeUsingTombstone`.\r\n\r\n----\r\n\r\nhttps://github.com/cockroachdb/cockroach/issues/69642\r\n\r\n\r\n\n\nJira issue: CRDB-20067",
+        "comments": [
+            "cc @cockroachdb/replication"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14954,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvserver/testing_knobs.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 410,
+            "original_line": 410,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Assuming this is still the plan? Ignoring the rangefeed stuff for now then."
+            ]
+        },
+        {
+            "hunk_id": 15299,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 152,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 97,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "We should copy `rk.Value` too, like with point keys."
+            ]
+        },
+        {
+            "hunk_id": 14378,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/applier.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 354,
+            "original_line": 354,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we could add a testing hook for `Batch` which can automatically assign seq nums to appended requests?"
+            ]
+        },
+        {
+            "hunk_id": 15296,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 250,
+            "original_line": 250,
+            "side": "RIGHT",
+            "original_position": 82,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "Won't think be fixed now?"
+            ]
+        },
+        {
+            "hunk_id": 15295,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/operations_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 60,
+            "original_line": 60,
+            "side": "RIGHT",
+            "original_position": 73,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: let's give these proper, stable names, to avoid a lot of `testdata` churn if we add or reorder test cases."
+            ]
+        },
+        {
+            "hunk_id": 14380,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 182,
+            "original_line": 182,
+            "side": "RIGHT",
+            "original_position": 129,
+            "position": 131,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: consider printing a `roachpb.Span` instead, which has a more compact presentation."
+            ]
+        },
+        {
+            "hunk_id": 15302,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/seq_tracker.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we optimistically do a map lookup, and only fall back to a linear scan if `endKey` is non-nil?"
+            ]
+        },
+        {
+            "hunk_id": 14644,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 250,
+            "original_line": 250,
+            "side": "RIGHT",
+            "original_position": 82,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "Won't think be fixed now?"
+            ]
+        },
+        {
+            "hunk_id": 14645,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 267,
+            "original_line": 267,
+            "side": "RIGHT",
+            "original_position": 98,
+            "position": 101,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's do it."
+            ]
+        },
+        {
+            "hunk_id": 14377,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 267,
+            "original_line": 267,
+            "side": "RIGHT",
+            "original_position": 98,
+            "position": 101,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's do it."
+            ]
+        },
+        {
+            "hunk_id": 15294,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/doc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 15,
+            "original_line": 15,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Didn't know this, neat!\n\nThanks for expanding this document, it's very helpful."
+            ]
+        },
+        {
+            "hunk_id": 14963,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/seq_tracker.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we optimistically do a map lookup, and only fall back to a linear scan if `endKey` is non-nil?"
+            ]
+        },
+        {
+            "hunk_id": 14642,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/doc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 15,
+            "original_line": 15,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Didn't know this, neat!\n\nThanks for expanding this document, it's very helpful."
+            ]
+        },
+        {
+            "hunk_id": 15297,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 267,
+            "original_line": 267,
+            "side": "RIGHT",
+            "original_position": 98,
+            "position": 101,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's do it."
+            ]
+        },
+        {
+            "hunk_id": 14649,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/validator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 268,
+            "original_line": 268,
+            "side": "LEFT",
+            "original_position": 120,
+            "position": 120,
+            "subject_type": "line",
+            "review_comments": [
+                "Love it."
+            ]
+        },
+        {
+            "hunk_id": 14379,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 152,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 97,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "We should copy `rk.Value` too, like with point keys."
+            ]
+        },
+        {
+            "hunk_id": 15300,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 182,
+            "original_line": 182,
+            "side": "RIGHT",
+            "original_position": 129,
+            "position": 131,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: consider printing a `roachpb.Span` instead, which has a more compact presentation."
+            ]
+        },
+        {
+            "hunk_id": 14382,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/seq_tracker.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we optimistically do a map lookup, and only fall back to a linear scan if `endKey` is non-nil?"
+            ]
+        },
+        {
+            "hunk_id": 14646,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/applier.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 354,
+            "original_line": 354,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we could add a testing hook for `Batch` which can automatically assign seq nums to appended requests?"
+            ]
+        },
+        {
+            "hunk_id": 15301,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/validator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 268,
+            "original_line": 268,
+            "side": "LEFT",
+            "original_position": 120,
+            "position": 120,
+            "subject_type": "line",
+            "review_comments": [
+                "Love it."
+            ]
+        },
+        {
+            "hunk_id": 14381,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/validator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 268,
+            "original_line": 268,
+            "side": "LEFT",
+            "original_position": 120,
+            "position": 120,
+            "subject_type": "line",
+            "review_comments": [
+                "Love it."
+            ]
+        },
+        {
+            "hunk_id": 14375,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/operations_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 60,
+            "original_line": 60,
+            "side": "RIGHT",
+            "original_position": 73,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: let's give these proper, stable names, to avoid a lot of `testdata` churn if we add or reorder test cases."
+            ]
+        },
+        {
+            "hunk_id": 14957,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 250,
+            "original_line": 250,
+            "side": "RIGHT",
+            "original_position": 82,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "Won't think be fixed now?"
+            ]
+        },
+        {
+            "hunk_id": 14960,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 152,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 97,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "We should copy `rk.Value` too, like with point keys."
+            ]
+        },
+        {
+            "hunk_id": 14648,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 182,
+            "original_line": 182,
+            "side": "RIGHT",
+            "original_position": 129,
+            "position": 131,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: consider printing a `roachpb.Span` instead, which has a more compact presentation."
+            ]
+        },
+        {
+            "hunk_id": 15298,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/applier.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 354,
+            "original_line": 354,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we could add a testing hook for `Batch` which can automatically assign seq nums to appended requests?"
+            ]
+        },
+        {
+            "hunk_id": 14374,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/doc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 15,
+            "original_line": 15,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Didn't know this, neat!\n\nThanks for expanding this document, it's very helpful."
+            ]
+        },
+        {
+            "hunk_id": 14958,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 267,
+            "original_line": 267,
+            "side": "RIGHT",
+            "original_position": 98,
+            "position": 101,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's do it."
+            ]
+        },
+        {
+            "hunk_id": 14955,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/doc.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 15,
+            "original_line": 15,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Didn't know this, neat!\n\nThanks for expanding this document, it's very helpful."
+            ]
+        },
+        {
+            "hunk_id": 14376,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/generator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 250,
+            "original_line": 250,
+            "side": "RIGHT",
+            "original_position": 82,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "Won't think be fixed now?"
+            ]
+        },
+        {
+            "hunk_id": 14641,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvserver/testing_knobs.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 410,
+            "original_line": 410,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Assuming this is still the plan? Ignoring the rangefeed stuff for now then."
+            ]
+        },
+        {
+            "hunk_id": 15293,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvserver/testing_knobs.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 410,
+            "original_line": 410,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Assuming this is still the plan? Ignoring the rangefeed stuff for now then."
+            ]
+        },
+        {
+            "hunk_id": 14959,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/applier.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 354,
+            "original_line": 354,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe we could add a testing hook for `Batch` which can automatically assign seq nums to appended requests?"
+            ]
+        },
+        {
+            "hunk_id": 14961,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 182,
+            "original_line": 182,
+            "side": "RIGHT",
+            "original_position": 129,
+            "position": 131,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: consider printing a `roachpb.Span` instead, which has a more compact presentation."
+            ]
+        },
+        {
+            "hunk_id": 14647,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/engine.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 152,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 97,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "We should copy `rk.Value` too, like with point keys."
+            ]
+        },
+        {
+            "hunk_id": 14956,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/operations_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 60,
+            "original_line": 60,
+            "side": "RIGHT",
+            "original_position": 73,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: let's give these proper, stable names, to avoid a lot of `testdata` churn if we add or reorder test cases."
+            ]
+        },
+        {
+            "hunk_id": 14962,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/validator.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 268,
+            "original_line": 268,
+            "side": "LEFT",
+            "original_position": 120,
+            "position": 120,
+            "subject_type": "line",
+            "review_comments": [
+                "Love it."
+            ]
+        },
+        {
+            "hunk_id": 14650,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/seq_tracker.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we optimistically do a map lookup, and only fall back to a linear scan if `endKey` is non-nil?"
+            ]
+        },
+        {
+            "hunk_id": 14373,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvserver/testing_knobs.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 410,
+            "original_line": 410,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Assuming this is still the plan? Ignoring the rangefeed stuff for now then."
+            ]
+        },
+        {
+            "hunk_id": 14643,
+            "commit_id": "b3550aa80efaa843f822939b6c024738d271c38d",
+            "original_commit_id": "8165e3974c10e88b6ae11c6255872ea16f3a67e3",
+            "path": "pkg/kv/kvnemesis/operations_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 60,
+            "original_line": 60,
+            "side": "RIGHT",
+            "original_position": 73,
+            "position": 86,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: let's give these proper, stable names, to avoid a lot of `testdata` churn if we add or reorder test cases."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,109 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 79519,
+    "lang": "c_sharp",
+    "pr_title": "[NativeAOT] Thin locks",
+    "pr_body": "This change implements \"thin\" locks - lightweight spinlocks that use object header bits for mutual exclusion on NativeAOT. \r\nIn more complex scenarios such as blocking waits, a thin lock transparently transitions into a \"fat\" lock (implemented by `System.Threading.Lock`) that supports more scenarios.\r\n\r\nFixes: https://github.com/dotnet/runtime/issues/75108\r\nFixes: https://github.com/dotnet/runtime/issues/68891\r\n\r\nAfter this change the performance of C# `lock` statement is significantly better in both scenarios - Thin (76% faster) and Fat (30% faster). For NativeAOT this is a considerable improvement. Thin lock is also allocation-free.\r\n\r\nCoreClr is still a bit faster. About 20% faster in the thin lock scenario and 50% faster in fat lock scenario, \r\nManaged implementation may eventually match or be faster than native, but we need to address a few codegen inefficiencies. Fixing that should happen separately from this PR. See referenced issues.  \r\nThe main difference is accessing `CurrentManagedThreadId`. Accessing a thread static requires a method call, while c++ implementation of locks in CoreClr just inlines the access to a native TLS variable. The cost of this call really stands out and we need to call on both acquire and release parts. \r\n\r\nThese locks are fast. An uncontended lock/unlock cycle takes ~500-700 nsec. (~1 billion in 5sec), so little suboptimal things have effect.\r\n\r\nI had to make some changes in the fat Lock as well.\r\n- a few tweaks to make no-contention code path faster.\r\n- excessive hardcoded spinning replaced with adaptive spinning\r\n- exponential backoff on contentions for the state of the lock\r\n- fairness issues, especially once excessive spinning was addressed. (the lock is unfair by design, but we should not allow cases when one thread forever starves everyone else)\r\n\r\nRelated issues:\r\n- https://github.com/dotnet/runtime/issues/79521   <== **this is the most impactful.**\r\n-  https://github.com/dotnet/runtime/issues/79436\r\n- https://github.com/dotnet/runtime/issues/79485\r\n- https://github.com/dotnet/runtime/issues/63397\r\n\r\n",
+    "pr_comments": [
+        "Tagging subscribers to this area: @agocke, @MichalStrehovsky, @jkotas\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nThis change implements \"thin\" locks - lightweight spinlocks that use object header bits for mutual exclusion on NativeAOT. \r\nIn scenarios that require blocking wait and a few others, a thin lock transparently transition into a \"fat\" lock (implemented by `System.Threading.Lock`) that supports more scenarios.\r\n\r\nFixes: https://github.com/dotnet/runtime/issues/75108\r\nFixes: https://github.com/dotnet/runtime/issues/68891\r\n\r\nAfter this change the performance of C# `lock` statement is significantly better in both scenarios - Thin (76% faster) and Fat (30% faster). For NativeAOT this is a considerable improvement.\r\n\r\nCoreClr is still a bit faster. About 20% faster in the thin lock scenario and 50% faster in fat lock scenario, \r\nManaged implementation may eventually match or be faster than native, but we need to address a few codegen inefficiencies. Fixing that should happen separately from this PR. I will log issues to follow up.  \r\nThe main difference is accessing `CurrentManagedThreadId`. I have made the native side a bit faster, but it is still a method call to the native runtime for NativeAOT, while c++ implementation of locks just inlines the access. The cost of this call really stands out and we need to call on both acquire and release parts. \r\n\r\nThese locks are fast. An uncontended lock/unlock cycle takes ~500-700 nsec. (~1 billion in 5sec), so little suboptimal things have effect.\r\n\r\nI had to make some changes in the fat Lock as well.\r\n- a few tweaks to make no-contention code path faster.\r\n- excessive hardcoded spinning replaced with adaptive spinning\r\n- exponential backoff on contentions for the state of the lock\r\n- fairness issues, especially once excessive spinning was addressed. (the lock is unfair by design, but we should not allow cases when one thread completely starves everyone else)\r\n\r\nRelated issues:\r\n-  https://github.com/dotnet/runtime/issues/79436\r\n- https://github.com/dotnet/runtime/issues/79485\r\n- < TBD intrincify access to ManagedThreadId>   <- **this is the most impactful.**\r\n\r\n\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>VSadov</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-NativeAOT-coreclr`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "results from the same benchmark as in https://github.com/dotnet/runtime/issues/68891    \r\ncc: @adamsitnik \r\n\r\n`ConcurrentDictionary CreateAddAndClear<Int32> `\r\n\r\n```\r\nBefore the change:\r\n\r\n[2022/12/09 18:26:29][INFO] |               Method |       Runtime | Size |      Mean |    Error |   StdDev |    Median |       Min |       Max | Ratio | RatioSD |    Gen0 |    Gen1 |   Gen2 | Allocated | Alloc Ratio |\r\n[2022/12/09 18:26:29][INFO] |--------------------- |-------------- |----- |----------:|---------:|---------:|----------:|----------:|----------:|------:|--------:|--------:|--------:|-------:|----------:|------------:|\r\n[2022/12/09 18:26:29][INFO] | ConcurrentDictionary |      .NET 8.0 |  512 |  32.76 us | 0.339 us | 0.301 us |  32.76 us |  32.24 us |  33.27 us |  1.00 |    0.00 |  6.3073 |  1.4335 |      - | 107.08 KB |        1.00 |\r\n[2022/12/09 18:26:29][INFO] | ConcurrentDictionary | NativeAOT 8.0 |  512 | 339.93 us | 5.609 us | 4.972 us | 339.32 us | 334.65 us | 349.35 us | 10.38 |    0.12 | 11.7546 | 11.4679 | 1.7202 | 171.08 KB |        1.60 |\r\n\r\nAfter:\r\n[2022/12/09 19:14:37][INFO] |               Method |       Runtime | Size |     Mean |    Error |   StdDev |   Median |      Min |      Max | Ratio | RatioSD |   Gen0 |   Gen1 | Allocated | Alloc Ratio |\r\n[2022/12/09 19:14:37][INFO] |--------------------- |-------------- |----- |---------:|---------:|---------:|---------:|---------:|---------:|------:|--------:|-------:|-------:|----------:|------------:|\r\n[2022/12/09 19:14:37][INFO] | ConcurrentDictionary |      .NET 8.0 |  512 | 33.99 us | 0.336 us | 0.298 us | 33.98 us | 33.49 us | 34.54 us |  1.00 |    0.00 | 6.3073 | 1.4335 | 107.08 KB |        1.00 |\r\n[2022/12/09 19:14:37][INFO] | ConcurrentDictionary | NativeAOT 8.0 |  512 | 36.77 us | 0.449 us | 0.398 us | 36.88 us | 36.23 us | 37.58 us |  1.08 |    0.02 | 6.3073 | 1.4335 | 107.08 KB |        1.00 |\r\n```\r\n\r\nWe see a lot of improvements in throughput and allocations too (since thin lock is a no-allocation path).\r\nWe are closer, but still not on par with CoreClr. As I mentioned, some codegen issues stand in the way and should be addressed separately.\r\n\r\n\r\n`Perf_Monitor`  benchmarks\r\n\r\n```\r\nBefore the change:\r\n[2022/12/09 19:27:17][INFO] |       Method |       Runtime |     Mean |     Error |    StdDev |   Median |      Min |      Max | Ratio | RatioSD | Allocated | Alloc Ratio |\r\n[2022/12/09 19:27:17][INFO] |------------- |-------------- |---------:|----------:|----------:|---------:|---------:|---------:|------:|--------:|----------:|------------:|\r\n[2022/12/09 19:27:17][INFO] |    EnterExit |      .NET 8.0 | 4.458 ns | 0.0293 ns | 0.0229 ns | 4.458 ns | 4.415 ns | 4.501 ns |  1.00 |    0.00 |         - |          NA |\r\n[2022/12/09 19:27:17][INFO] |    EnterExit | NativeAOT 8.0 | 8.048 ns | 0.0152 ns | 0.0134 ns | 8.056 ns | 8.028 ns | 8.056 ns |  1.80 |    0.01 |         - |          NA |\r\n[2022/12/09 19:27:17][INFO] |              |               |          |           |           |          |          |          |       |         |           |             |\r\n[2022/12/09 19:27:17][INFO] | TryEnterExit |      .NET 8.0 | 5.861 ns | 0.3099 ns | 0.3445 ns | 5.677 ns | 5.591 ns | 6.508 ns |  1.00 |    0.00 |         - |          NA |\r\n[2022/12/09 19:27:17][INFO] | TryEnterExit | NativeAOT 8.0 | 8.028 ns | 0.0000 ns | 0.0000 ns | 8.028 ns | 8.028 ns | 8.028 ns |  1.35 |    0.08 |         - |          NA |\r\n\r\nAfter:\r\n[2022/12/09 19:23:33][INFO] |       Method |       Runtime |     Mean |     Error |    StdDev |   Median |      Min |      Max | Ratio | RatioSD | Allocated | Alloc Ratio |\r\n[2022/12/09 19:23:33][INFO] |------------- |-------------- |---------:|----------:|----------:|---------:|---------:|---------:|------:|--------:|----------:|------------:|\r\n[2022/12/09 19:23:33][INFO] |    EnterExit |      .NET 8.0 | 4.439 ns | 0.0236 ns | 0.0197 ns | 4.444 ns | 4.415 ns | 4.472 ns |  1.00 |    0.00 |         - |          NA |\r\n[2022/12/09 19:23:33][INFO] |    EnterExit | NativeAOT 8.0 | 5.019 ns | 0.0392 ns | 0.0367 ns | 5.017 ns | 4.989 ns | 5.103 ns |  1.13 |    0.01 |         - |          NA |\r\n[2022/12/09 19:23:33][INFO] |              |               |          |           |           |          |          |          |       |         |           |             |\r\n[2022/12/09 19:23:33][INFO] | TryEnterExit |      .NET 8.0 | 6.083 ns | 0.3853 ns | 0.4283 ns | 5.849 ns | 5.619 ns | 6.651 ns |  1.00 |    0.00 |         - |          NA |\r\n[2022/12/09 19:23:33][INFO] | TryEnterExit | NativeAOT 8.0 | 5.164 ns | 0.0382 ns | 0.0357 ns | 5.161 ns | 5.103 ns | 5.218 ns |  0.85 |    0.06 |         - |          NA |\r\n```\r\n",
+        "Results from my microbenchmark. Just doing 1billion lock/unlock iterations and reporting time in milliseconds (smaller is better):\r\n\r\n```\r\n=== New:\r\nFat:\r\n7596\r\nThin:\r\n5581\r\nFat:\r\n7586\r\nThin:\r\n5588\r\nFat:\r\n7601\r\n\r\n== Old  (there was really no thin/fat difference, all locks were fat):\r\nFat:\r\n9861\r\nThin:\r\n9844\r\nFat:\r\n9857\r\nThin:\r\n9826\r\nFat:\r\n9848\r\n\r\n=== CoreClr:\r\nFat:\r\n5287\r\nThin:\r\n4772\r\nFat:\r\n5332\r\nThin:\r\n4794\r\nFat:\r\n5279\r\n```\r\n\r\ncode for reference:\r\n```c#\r\nusing System.Diagnostics;\r\n\r\n\r\nnamespace ConsoleApp12\r\n{\r\n    internal class Program\r\n    {\r\n        static Program l1 = new Program();\r\n        static readonly Program l2 = new Program();\r\n\r\n        private const int iters = 1000000000;\r\n\r\n        static void Main(string[] args)\r\n        {\r\n            l1 = new Program();\r\n            l1.GetHashCode();\r\n            for (; ; )\r\n            {\r\n\r\n                System.Console.WriteLine(\"Fat:\");\r\n                FatLock();\r\n\r\n                System.Console.WriteLine(\"Thin:\");\r\n                ThinLock();\r\n            }\r\n\r\n            //Fairness();\r\n        }\r\n\r\n        static void FatLock()\r\n        {\r\n            Stopwatch sw = Stopwatch.StartNew();\r\n            for (int i = 0; i < iters; i++)\r\n            {\r\n                lock (l1)\r\n                {\r\n\r\n                }\r\n            }\r\n            System.Console.WriteLine(sw.ElapsedMilliseconds);\r\n        }\r\n\r\n        static void ThinLock()\r\n        {\r\n            Stopwatch sw = Stopwatch.StartNew();\r\n            for (int i = 0; i < iters; i++)\r\n            {\r\n                lock (l2)\r\n                {\r\n\r\n                }\r\n            }\r\n            System.Console.WriteLine(sw.ElapsedMilliseconds);\r\n        }\r\n\r\n        static void Fairness()\r\n        {\r\n            object l = new object();\r\n\r\n            const int n = 32;\r\n            Task[] workers = new Task[n];\r\n\r\n            for (int i = 0; i < n; i++)\r\n            {\r\n                workers[i] = Task.Run(() =>\r\n                {\r\n                    for (; ; )\r\n                    {\r\n                        lock (l)\r\n                        {\r\n                            Console.Write(\"{00} \", Environment.CurrentManagedThreadId);\r\n\r\n                            int ticks = Environment.TickCount;\r\n                            while (Environment.TickCount - ticks < 50)\r\n                                Thread.SpinWait(1);\r\n                        }\r\n                    }\r\n                });\r\n            }\r\n\r\n            Task.WaitAll(workers);\r\n        }\r\n\r\n    }\r\n}\r\n```",
+        "> Related issues:\r\n\r\nOne more codegen issue that can help this a bit: https://github.com/dotnet/runtime/issues/63397",
+        "> One more codegen issue that can help this a bit: https://github.com/dotnet/runtime/issues/63397\r\n\r\nRight, there is no reason for a pinned local be on stack, it is just a matter of root reporting. \r\n\r\nI experimented with using unpinned refs -  that is obviously incorrect, but failures are rare enough to measure how much we would gain. It was not much - within noise.\r\nIt may matter more once we deal with other issues, so I figured - lets push for other issues first.\r\nSince this came up and we already have an issue, I will add it to the list.",
+        "/azp run runtime-extra-platforms",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-extra-platforms",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "Thanks!!!"
+    ],
+    "merged": true,
+    "created_at": "2022-12-12T07:36:49Z",
+    "issue_context": {
+        "number": 75108,
+        "title": "[NativeAOT] Implement thin locks",
+        "body": "CoreClr is able to use object header bits for locking in trivial cases. That makes typical use of `lock` fairly cheap. NativeAOT does not have that and `lock(obj)` is always a \"fat lock\".\r\n\r\nThis is likely the reason for regressions in ConcurrentDictionary benchmarks.\r\n(re: https://github.com/dotnet/runtime/issues/68891)\r\n",
+        "comments": [
+            "Where would be a starting point for this? I\u2019d be interested in attempting an implementation to improve concurrency performance on our console ports.",
+            "@tomcashman this is already in progress, sorry. \r\nThere is already an implementation at a stage where I know it is correct (as in \"passing all tests\"), but I do not know yet if the perf is acceptable.\r\n\r\n",
+            "No worries I\u2019ll keep an eye out for the PR and we can test performance on consoles \ud83d\ude04 "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3669,
+            "commit_id": "a7256ec0ef33ea44785548ab29bf4764afd82f74",
+            "original_commit_id": "caa0bd5b30705a2d3f9b67031458c4e468fff4c1",
+            "path": "src/coreclr/nativeaot/System.Private.CoreLib/src/System/Threading/ObjectHeader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 61,
+            "original_line": 61,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "Pinning the object using `GetMethodTableRef` is not generally ok, but it is ok here since it is very low-level ObjectHeader code.",
+                "Pinning method table ptr saves computing the offset to data. We are not interested in object's data here. Yes, this is a very unusual scenario. As long as byref is within the range of the object, it is all the same to GC as it will \"align\" to the containing object and pin that object.\r\n\r\nI wish the object header belonged to the object though. We would not need pinning at all."
+            ]
+        },
+        {
+            "hunk_id": 3670,
+            "commit_id": "a7256ec0ef33ea44785548ab29bf4764afd82f74",
+            "original_commit_id": "caa0bd5b30705a2d3f9b67031458c4e468fff4c1",
+            "path": "src/coreclr/nativeaot/System.Private.CoreLib/src/System/Threading/SyncTable.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "I think it would be fine to use `UnsafeEntryRef` for `GetHashCode` too.",
+                "Reverted one too many."
+            ]
+        },
+        {
+            "hunk_id": 4362,
+            "commit_id": "a7256ec0ef33ea44785548ab29bf4764afd82f74",
+            "original_commit_id": "caa0bd5b30705a2d3f9b67031458c4e468fff4c1",
+            "path": "src/coreclr/nativeaot/System.Private.CoreLib/src/System/Threading/ObjectHeader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 61,
+            "original_line": 61,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "Pinning the object using `GetMethodTableRef` is not generally ok, but it is ok here since it is very low-level ObjectHeader code.",
+                "Pinning method table ptr saves computing the offset to data. We are not interested in object's data here. Yes, this is a very unusual scenario. As long as byref is within the range of the object, it is all the same to GC as it will \"align\" to the containing object and pin that object.\r\n\r\nI wish the object header belonged to the object though. We would not need pinning at all."
+            ]
+        },
+        {
+            "hunk_id": 4363,
+            "commit_id": "a7256ec0ef33ea44785548ab29bf4764afd82f74",
+            "original_commit_id": "caa0bd5b30705a2d3f9b67031458c4e468fff4c1",
+            "path": "src/coreclr/nativeaot/System.Private.CoreLib/src/System/Threading/SyncTable.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "I think it would be fine to use `UnsafeEntryRef` for `GetHashCode` too.",
+                "Reverted one too many."
+            ]
+        }
+    ]
+}

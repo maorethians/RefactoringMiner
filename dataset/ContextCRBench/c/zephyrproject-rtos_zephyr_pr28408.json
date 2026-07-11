@@ -1,0 +1,65 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 28408,
+    "lang": "c",
+    "pr_title": "usb: add support for dedicated work queue",
+    "pr_body": "Add an optional work queue to mitigate deadlocks when the USB infrastructure (servicing CDC-ACM UART) is blocked by non-USB tasks on the system work queue that invoke UART operations assuming these can progress without putting the task to sleep.\r\n\r\nNote per https://github.com/zephyrproject-rtos/zephyr/issues/27599#issuecomment-692214683 that fixes isolated to the CDC-ACM driver are not sufficient, as usb-transfer must also be able to make progress.\r\n\r\nFixes #27599",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2020-09-16T11:04:16Z",
+    "issue_context": {
+        "number": 27599,
+        "title": "bluetooth shell deadlock on USB shell UART",
+        "body": "`tests/bluetooth/shell` on `nrf52840dk_nrf52840` builds, and when I type `bt init` the subsystem initializes.\r\n\r\nIf I use 58f1e393bb16cf0872af8191f642989e8e560037 in https://github.com/pabigot/zephyr/commits/issue/27599 to switch to using a USB console that's also the shell device, the command line `bt init` never returns.\r\n\r\nDebugging shows that `bluetooth/shell/bt.c` successfully invokes `bt_enable(bt_ready)` and returns, but `bt_ready()` hangs in the `shell_print` marking the completion of initialization.  Additional diagnosis shows that `shell_pend_on_txdone()` is never receiving the signal to proceed.\r\n\r\nThis behavior is reproduced both without and with #27025.\r\n",
+        "comments": [
+            "Im suspecting the deadlock happens because of the contex the Bluetooth is initialized.\r\n`cmd_init` calls `bt_enable(bt_ready);` and `bt_enable` schedules the work to system work queue to call `bt_ready` callback. This is the place where `shell_print()` deadlocks. It seems that scheduling the work in order to call `bt_ready` makes the problem. I made quick test and called `bt_ready` directly instead of scheduling it to workqueue - it worked. Not sure if this is proper direction to dig in.",
+            "@pabigot can you test it over UART as well? I suspect that this might be related to #25672",
+            "IIRC I did test it that way since it's the default configuration, and it worked fine.  It possibly is related; the CDC ACM UART appears to use the system work queue to complete transmission, while a real UART would do it though interrupts.  If `bt_enable()` is also using it, and trying to print from it, that could be a problem.",
+            "It is a problem but I couldn't figure out how to overcome that. Similar situation happens with mcumgr #27727.",
+            "Results of some investigation: `bt_enable()` invokes `bt_init()` from the system work queue, which blocks until the initialization completes.  While it's blocked work items have been queued for `cdc_acm_irq_callback_work_handler` that would have to be processed to unblock it.\r\n\r\nThis can be resolved by adding a dedicated work queue in `subsys/usb/class/cdc_acm.c`, but that doesn't help because `usb_transfer_work()` is also using the system work queue and can't make progress until `bt_init()` gets out of the way.\r\n\r\nThis can be resolved by adding a dedicated work queue in `subsys/usb/usb_transfer.c`.\r\n\r\nSolutions are in the updated https://github.com/pabigot/zephyr/commits/issue/27599 (which also includes #28369 as an alternative to #28339).  However putting a clone of the system work queue in every module that wants to use a work queue is not sustainable.\r\n\r\nI think the use of the system work queue in USB and Bluetooth both need to be reviewed.\r\n\r\nIt may also be that the shell needs to document that `shell_fprintf()` should not be used from anything that might be invoked by a work queue.\r\n\r\nFYI @jfischer-phytec-iot @joerchan ",
+            "It's actually sufficient to give the USB infrastructure its own work queue, and let `usb_transfer` and `cdc_acm` share it.  That might be a viable solution.",
+            "> I think the use of the system work queue in USB and Bluetooth both need to be reviewed.\r\n\r\nUsing a bluetooth work-queue instead of the system workqueue has been suggested other places, for example to free up the availability of the system-workqueue.\r\n\r\nHowever this issue seems to be that the API of shell over CDC ACM cannot be called from the system-workqueue without the risking a deadlock. So solving this problem in the USB CDC ACM driver seems like the correct fix here.\r\n\r\nAdding another workqueue could be expensive it terms of RAM though, as the work done in the callbacks could mean you need a large system workqueue stack.\r\nIs it a possibility that the callback work is still done in the system workqueue, but the tx_work is done in another workqueue or possibly a TX thread?",
+            "> However this issue seems to be that the API of shell over CDC ACM cannot be called from the system-workqueue without the \r\n risking a deadlock. So solving this problem in the USB CDC ACM driver seems like the correct fix here.\r\n\r\nIt's not isolated to shell; any blocking UART transmission over CDC ACM will suspend whatever thread is animating the UART flow.  The impact is not localized to tasks within the CDC ACM driver since it depends on other parts of USB to get and put data, so the fix can't be done within CDC-ACM itself.\r\n\r\nDunno who wants to take this on, but if I were to do it I'd have an Kconfig-controlled selection of the work queue used by the USB subsystem, either system or its own, and have the USB-specific one default selected when CDC-ACM is enabled. Too much functionality depends on UART being able to make progress regardless of which thread is waiting for it.  I can submit that as a fix if nobody else has a different approach in progress.\r\n\r\nAt this time I don't recommend changes to Bluetooth, just taking into account that other system work queue users can block it and considering future changes."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 27770,
+            "commit_id": "23652a7d858f696ac980b9b828b1dc761b57842d",
+            "original_commit_id": "45c8c51a627567f864c8803d2b414521cbe1e3bb",
+            "path": "subsys/usb/usb_work_q.c",
+            "start_line": 3,
+            "original_start_line": 3,
+            "start_side": "RIGHT",
+            "line": 4,
+            "original_line": 4,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Should those be there if this is a new file? Just asking.",
+                "It's basically a copy of `kernel/system_work_q.c` with a few identifiers changed, so I preserved those copyrights."
+            ]
+        },
+        {
+            "hunk_id": 27769,
+            "commit_id": "23652a7d858f696ac980b9b828b1dc761b57842d",
+            "original_commit_id": "45c8c51a627567f864c8803d2b414521cbe1e3bb",
+            "path": "tests/bluetooth/shell/src/main.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 126,
+            "original_line": 126,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Couldn't USB auto enable when console is used? That should enable logging the init sequence as well.",
+                "No.  The user may want to register a custom handler.  (I do in real apps.)"
+            ]
+        }
+    ]
+}

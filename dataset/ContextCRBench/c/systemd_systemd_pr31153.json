@@ -1,0 +1,94 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 31153,
+    "lang": "c",
+    "pr_title": "Homed update policy: user changing own settings",
+    "pr_body": "Rework of #30109 to deal with changes in #30840 and discussed changes to behavior\r\n\r\nDepends on and includes #30840 \r\n\r\nFixes https://github.com/systemd/systemd/issues/34268",
+    "pr_comments": [
+        "I mapped out all the ways `user_record_authenticate` gets called:\r\n\r\n- `Activate` -> `home_activate` -> (check host record)\r\n- `Activate` -> `home_activate` -> `home_activate_luks` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Activate` -> `home_activate` -> `home_activate_luks` -> `home_auto_grow_luks` -> `home_resize_luks` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Activate` -> `home_activate` -> ... -> `home_refresh` -> `home_load_embedded_identity` -> (check ~/.identity)\r\n- `Update` -> `home_update` -> (check host record)\r\n- `Update` -> `home_update` -> `home_setup` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Update` -> `home_update` -> `home_load_embedded_identity`\r\n- `ChangePassword` -> `home_passwd` -> `home_load_embedded_identity`\r\n- `ChangePassword` -> `home_passwd` -> `home_setup` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Resize` -> `home_resize` -> (check host record)\r\n- `Resize` -> `home_resize` -> `home_resize_luks` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Fixate` -> `home_insepct` -> (check host record)\r\n- `Fixate` -> `home_inspect` -> `home_setup` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Fixate` -> `home_inspect` -> `home_load_embedded_identity`\r\n- `Authenticate` -> `home_inspect` -> (check host record)\r\n- `Authenticate` -> `home_inspect` -> `home_setup` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Authenticate` -> `home_inspect` -> `home_load_embedded_identity`\r\n- `Unlock` -> `home_unlock` -> (check host record)\r\n- `Deactivate` -> `home_deactivate` -> `home_auto_shrink_luks` -> `home_resize_luks` -> `home_setup_luks` -> `luks_validate_home_record` -> (check LUKS embedded record)\r\n- `Acquire` can also trigger `Activate`, `Fixate`, `Authenticate` or `Unlock` depending on what state the home is in",
+        "Part of what we discussed with @poettering is changing `user_record_authenticate` to always look into the kernel keyring and just use that key if it's available. Ultimately this would mean that `user_record_authenticate` will pass whenever the user is active and unlocked. So given all the code paths above, I want to break down why this is OK. Here we try to keep in mind the motivation for doing all these authentication checks: We never want to be in a situation where the user can unlock a home directory with an out-of-date password, even as we travel between hosts.\r\n- All code paths in response to `Activate`: the user must be inactive, and thus we don't have their key in the keyring and thus `user_record_authenticate` actually performs authentication\r\n- `Update`\r\n\t- If the key is available in the keyring, then the user must be active. But Activating the user already verified their password against the embedded records. So this should be safe. In this case, we skip all 3 checks.\r\n\t- If the key isn't available in the keyring, then the user must be inactive or locked:\r\n\t\t- If the user is locked, we don't permit updates at all and error before even starting homework. Thus the user must be inactive.\r\n\t\t- If we're performing an offline update, we skip the user_record_authenticate and don't even look at the embedded records. So we skip all 3 checks. But then the user will inevitably need to be Activated, which will perform all 3 checks as mentioned above.\r\n\t\t- If we're performing an online update, then we call `user_record_authenticate` which will actually perform the authentication (since the key isn't in the keyring!). So we do all 3 checks in this case.\r\n- `ChangePassword`\r\n\t- I think for this one we shouldn't ever load the key from the keyring just to be paranoid\r\n\t- Thus `user_record_authenticate` always performs the full authentication check\r\n- `Resize`: Very similar reasoning to `Update`, except we don't have an offline mode. Thus either the user is active and already verified via `Activate`, or they're inactive and we perform all three checks.\r\n- `Fixate`: An unfixated user can never be active, and thus we can never have their key in the keyring. So, we perform all 3 checks.\r\n- `Authenticate`: This is like `ChangePassword`. We shouldn't ever load the key from the keyring. The whole point of this method is to enforce authentication\r\n- `Unlock`: the user's key won't be in keyring, thus `user_record_authenticate` actually performs authentication\r\n- `Deactivate`: The keyring things are only used to auto-shrink the home area, so the logic from `Resize` applies. Loading the keys from the keyring to facilitate resize is also just status-quo...\r\n- `Acquire`: this just triggers the other methods depending on the state of the home, so anything we say about those should apply to `Acquire`\r\n\r\nSo all this said, what is the practical conclusion?\r\n\r\n- `home_activate` shouldn't bother trying to load from the keyring, because it will never find anything\r\n- `home_update` should load from the keyring every time\r\n- `home_passwd` shouldn't load from the keyring, to force password re-entry\r\n- `home_resize` should load from the keyring every time\r\n- `home_inspect` shouldn't load from the keyring. In `Fixate`'s case, it'll never find anything so it shouldn't bother, an in `Authenticate`'s case we don't want it to load from the keyring\r\n- `home_unlock` shouldn't bother\r\n- `home_deactivate` should always load from the keyring so that the eventual resize can work",
+        "btw, i'd split PRs up a lot more aggressively. If they can stand on their own reasonably I think single-commit PRs are great, too, even. Everything you already got in will make the remainder smaller, and the rebase mess will be reduced.",
+        "please rebase",
+        "Hmm interesting behavior I'm running into now\r\n\r\nLet's say you create two users, then `homectl update --offline` one of them, and then log the system into the other user (once). What will happen is the user you logged in as will eat up all the disk space, and the second user will never be able to authenticate again (it can't grow itself to reconcile changes to the user record and then authenticate).\r\n\r\nAlso, the user you logged in as will have their rebalanceWeight set to 0, opting them out of rebalancing. This is done by the rebalance operation itself. This seems like an outright bug to me...\r\n\r\nThoughts, @poettering?",
+        "> Thoughts, @poettering?\r\n\r\ni think we discussed this, in an earlier meeting, no? (or was that with someone else, don't remember?)\r\n\r\nsimplest approach might be to just show a clear error message, with a suggestion what to do, i.e. \"no disk space is available, you cannot log in until this is resolved. currently users x, y, z use the most disk space, please ask them to reduce their home dir size\", and maybe even a button you can click on that allows resizing their home dir after auth without them even logging in",
+        "I'd suggest to split up the PR: the first three commits are pretty much good to go, i'd put the good-to-merge/with-minor-suggestions label on it given there are only trivial issues with it. But the allowlist thing probably needs another round, hence maybe split that out and do separately?",
+        ">  think we discussed this, in an earlier meeting, no\r\n\r\nWe've discussed the spacing issue, yes. But that UX is more for situations where we're manually sizing home areas.\r\n\r\nI was under the impression that when auto-resizing is on (which it should be by default w/ LUKS+btrfs) it shouldn't be an issue...\r\n\r\nThere's also the behavior that seems outright buggy to me... Does auto-resize work in homed? I see no reason how it can: the first time it tries to rebalance it turns off rebalancing\r\n\r\n> no disk space is available, you cannot log in until this is resolved. currently users x, y, z use the most disk space, please ask them to reduce their home dir size\"\r\n\r\nA bit of a wrinkle to this too. If the user who logs in first happens to be a non-admin, then they'll need to authenticate as the admin on the Polkit prompt to resize themselves. But then that will fail because there's not enough space to authenticate the user.",
+        "Split out the mostly-OK commits to #31552, and leaving this MR to iterate on the allowlist",
+        "conceptually still looks good to me, added some more review points, but the most impotant thing is that the list of editable fields should be itsefl a field on the recrod, as discussed.",
+        "> [!IMPORTANT]\n> An -rc1 tag has been created and a release is being prepared, so please note that PRs introducing new features and APIs will be held back until the new version has been released.\n",
+        "looks good, just some minor things",
+        "so close! would love to get this merged.",
+        "lgtm, but it seems a rebase squashing mistake happened there.\r\n\r\n(my recommendation: run `git rebase origin/main -x \"ninja -C build\"` before force pushing, that builds every single commit of your patch set. That would have revealed the issue here.\r\n\r\nany chance you can fix this quickly, then we can merge this into v257 still",
+        "I marked this as rc-blocker, since it would be good to have in v257, and it's *so* close to be ready.",
+        "I'll fix the squashing mistake tomorrow, and assuming CI passes I'll hit the button",
+        "I have the change ready, will push it and merge once the last CI has passed here",
+        "Thanks!"
+    ],
+    "merged": true,
+    "created_at": "2024-10-08T13:31:53Z",
+    "issue_context": {
+        "number": 34268,
+        "title": "systemd-homed allow user to update his own config without admin",
+        "body": "### Component\n\nhomectl\n\n### Is your feature request related to a problem? Please describe\n\nCurrent homectl allows user to do limited thing. If one wants to change his own default shell, he must ask the admin for help.\r\n\r\nLooking at `chsh`, it can just update the default shell as it had been `setuid`.\n\n### Describe the solution you'd like\n\nUsers should be free to update their home area.\n\n### Describe alternatives you've considered\n\n_No response_\n\n### The systemd version you checked that didn't have the feature you are asking for\n\n256.5-1-arch",
+        "comments": [
+            "A fix for this is already pending in https://github.com/systemd/systemd/pull/31153"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32348,
+            "commit_id": "6a2d4a233dd10cbcfe931e5c63193641f2dab4f3",
+            "original_commit_id": "57b908caefc9fde6e85d95724346473525228590",
+            "path": "src/shared/user-record.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2203,
+            "original_line": 2203,
+            "side": "RIGHT",
+            "original_position": 68,
+            "position": 87,
+            "subject_type": "line",
+            "review_comments": [
+                "maybe emphasize that we check for non-NULL here, not strv_isempty(), in a comment",
+                "(because usually we treat those two cases as equivalent)"
+            ]
+        },
+        {
+            "hunk_id": 32349,
+            "commit_id": "6a2d4a233dd10cbcfe931e5c63193641f2dab4f3",
+            "original_commit_id": "57b908caefc9fde6e85d95724346473525228590",
+            "path": "src/shared/user-record.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1309,
+            "original_line": 1309,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "thi should have been squashed into the first commit, not the 2nd"
+            ]
+        },
+        {
+            "hunk_id": 32347,
+            "commit_id": "6a2d4a233dd10cbcfe931e5c63193641f2dab4f3",
+            "original_commit_id": "57b908caefc9fde6e85d95724346473525228590",
+            "path": "src/shared/user-record.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 440,
+            "original_line": 440,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "please output them in the calls in user-record-show.c"
+            ]
+        }
+    ]
+}

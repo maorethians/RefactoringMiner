@@ -1,0 +1,64 @@
+{
+    "repo": "grpc/grpc",
+    "pr_number": 29050,
+    "lang": "cpp",
+    "pr_title": "HTTP2: Add graceful goaway",
+    "pr_body": "Fixes #24237\r\nImplements graceful goaway at the HTTP2 layer.\r\n\r\nBefore this PR, the behavior of the HTTP2 server on shutdown was - \r\n* Send a GOAWAY frame with last stream ID filled with the last stream ID that was accepted.\r\n* Keep the connection alive till the number of streams goes down to 0.\r\n* Additionally, it would keep accepting new streams even after sending this GOAWAY frame. This is broken behavior as per the HTTP2 spec.\r\n\r\nAfter this PR, the HTTP2 server would perform a graceful shutdown as recommended by the spec -\r\n* Send a GOAWAY with last stream ID as 2^31-1 indicating to the client that no new streams should be started.\r\n* Waits for an RTT period by sending a ping (and waiting for an ACK). A hard limit of 20 seconds is considered as the limit beyond which we don't wait for the ACK anymore. While this is in progress, we continue to accept new streams to handle streams that were started before the client saw the GOAWAY.\r\n* After the RTT, we send a GOAWAY with last stream ID as the last stream that was accepted till this point. No more new streams are accepted after this.\r\n* The connection then remains alive till the existing streams are finished.",
+    "pr_comments": [
+        "Thanks for reviewing!\r\n\r\nIgnoring the C# infra flake - \r\n```\r\nunzip:  cannot find or open ../../../../input_artifacts/csharp_nugets_windows_dotnetcli.zip, ../../../../input_artifacts/csharp_nugets_windows_dotnetcli.zip.zip or ../../../../input_artifacts/csharp_nugets_windows_dotnetcli.zip.ZIP.\r\n```"
+    ],
+    "merged": true,
+    "created_at": "2022-03-18T03:50:52Z",
+    "issue_context": {
+        "number": 24237,
+        "title": "Server does not use graceful GOAWAY on graceful shutdown",
+        "body": "The server seems to have a concept for graceful shutdown, where it sends a GOAWAY and lets RPCs complete. However, it doesn't do the double-GOAWAY suggested by [MAX_CONNECTION_AGE gRFC](https://github.com/grpc/proposal/blob/master/A9-server-side-conn-mgt.md#proposal) and the [HTTP/2 spec](https://httpwg.org/specs/rfc7540.html#GOAWAY):\r\n\r\n> A server that is attempting to gracefully shut down a connection SHOULD send an initial GOAWAY frame with the last stream identifier set to 2<sup>31</sup>-1 and a NO_ERROR code. This signals to the client that a shutdown is imminent and that initiating further requests is prohibited. After allowing time for any in-flight stream creation (at least one round-trip time), the server can send another GOAWAY frame with an updated last stream identifier. This ensures that a connection can be cleanly shut down without losing requests.\r\n\r\nI'd suggest an implementation that sends a PING immediately after the first GOAWAY and sends the second GOAWAY when the ACK arrives. A timer can be set to 10 seconds and the second GOAWAY can be sent when the timer expires if the ACK has failed to arrive. This allows rapid, zero-configuration, race-less shutdowns.\r\n\r\nThe current server behavior is causing unnecessary RPC failures as it fails RPCs already sent by the client. This has been seen internally when a client swapped the server from GFE to C core, but also in https://github.com/grpc/grpc-java/issues/7409 . I believe we haven't noticed this before because many clients are automatically retrying these failed RPCs, but a bug in grpc-java (https://github.com/grpc/grpc-java/issues/7357) prevented them from showing up as UNAVAILABLE. gRPC clients have also have local races relating to GOAWAY and so it can been hard to determine whether seen instances are client-side races. The internal case was also easier to pin-point because we could do A/B comparison between GFE and C core.\r\n\r\nMAX_CONNECTION_AGE is probably more important than normal server shutdown, as it occurs more frequently. But normal server shutdown should also avoid this race. [Go](https://github.com/grpc/grpc-go/blob/8630cac324bf02ea0edfba758c2b2f3344af7bf7/internal/transport/http2_server.go#L1191), [Java](https://github.com/grpc/grpc-java/blob/c29ad76daea0d17637fefcab4dbfd9ef8cb84ebc/netty/src/main/java/io/grpc/netty/NettyServerHandler.java#L939), and GFE have had this behavior for years.\r\n\r\nCC @veblush ",
+        "comments": [
+            "For reference, C's handling of MAX_CONNECTION_AGE:\r\nhttps://github.com/grpc/grpc/blob/25518e5b084f375b4f834546dd10a23905c90323/src/core/ext/filters/max_age/max_age_filter.cc#L361-L363\r\n\r\nAnd the non-MAX_INT GOAWAY it triggers:\r\nhttps://github.com/grpc/grpc/blob/e834d0b34b43745b0839b6205e04cfb1a5924c3a/src/core/ext/transport/chttp2/transport/chttp2_transport.cc#L1735-L1737",
+            "Yes, we already have an internal bug for this b/135458602. It just hasn't reached the top of my priority queue yet. I'll see if I can get it done next quarter.",
+            "@yashykt, that looks like a client-side thing whereas this is a server-side thing. If they are the same, then go ahead and cross-link the internal one to reference this one. I would have done so, but a glance made it seem they were different.",
+            "You are right. It started off as a client-only thing, but as the discussion progressed, it mentions all the things we want to do including the server-side double GOAWAY shutdown as a wanted feature. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 51394,
+            "commit_id": "b91c9ef53e1523b73437faf7dd1310f019eed9e3",
+            "original_commit_id": "d589f4e6ca88168c306ebc7a883a615dc46d3f2b",
+            "path": "src/core/ext/transport/chttp2/transport/chttp2_transport.cc",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1764,
+            "original_line": 1764,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "My understanding of this type is that it keeps the transport alive an extra 20 seconds unconditionally - I think this is problematic -- if we signal GOAWAY and wait one RTT, then once the number of requests on a transport drops to zero we are able to complete this dance deterministically and release the (significant) memory used by the transport much earlier.",
+                "No, it's not an unconditional 20 second wait. It only waits 20 seconds if the peer does not respond to the ping. If there are no streams and the RTT completes with a ping ack, then we would immediately send the final goaway and close the transport. (Some of our tests fail on an unconditional wait.)",
+                "I missed the grpc_timer_cancel last night! That makes sense... let me take another pass on this."
+            ]
+        },
+        {
+            "hunk_id": 51393,
+            "commit_id": "b91c9ef53e1523b73437faf7dd1310f019eed9e3",
+            "original_commit_id": "d589f4e6ca88168c306ebc7a883a615dc46d3f2b",
+            "path": "src/core/ext/transport/chttp2/transport/chttp2_transport.cc",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1795,
+            "original_line": 1798,
+            "side": "RIGHT",
+            "original_position": 51,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "Should this be an assert?",
+                "No, this handles a race condition between the timer and the ping ack. Consider a scenario where the timer fires but we also receive the ping ack around the same time."
+            ]
+        }
+    ]
+}

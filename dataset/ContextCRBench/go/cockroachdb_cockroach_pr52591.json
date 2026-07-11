@@ -1,0 +1,54 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 52591,
+    "lang": "go",
+    "pr_title": "sql: validate the number of entries in a partial index after a backfill",
+    "pr_body": "This commit extends backfilling validation to ensure that the number of\r\nentries in a partial index after backfilling is equal to the number of\r\nrows in the table in which the partial index's predicate evaluates to\r\ntrue. This provides addition safety to ensure that backfilling occurred\r\ncorrectly, matching validation that is already performed for non-partial\r\nindexes.\r\n\r\nFixes #50223\r\n\r\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/52591)\n<!-- Reviewable:end -->\n",
+        "Ooof. The test below is failing because these validation changes require querying the table and filtering by the column added earlier in the transaction, but in the context of the `SELECT count(1) ...` transaction, the column does not yet exist.\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/9395dc13fe46fa8ffe412175ce9c6f8d2f60fb1c/pkg/sql/logictest/testdata/logic_test/partial_index#L506-L524",
+        "I'm not sure why the call to `MakeFirstMutationPublic` that `validateForwardIndexes` is doing isn't adding that column to the descriptor",
+        "@rohany ran this example through the debugger and it looks like `MakeFirstMutationPublic` and `AddUncommittedDescriptor` are _working_ as expected.\r\n\r\nBut it doesn't appear that columns added within a transaction are visible for reads or writes within the transaction.\r\n\r\n```\r\nroot@127.0.0.1:58520/defaultdb> create table t ();\r\nCREATE TABLE\r\n\r\nTime: 4.463ms\r\n\r\nroot@127.0.0.1:58520/defaultdb> begin;\r\nBEGIN\r\n\r\nTime: 104\u00b5s\r\n\r\nroot@127.0.0.1:58520/defaultdb  OPEN> alter table t add column a string;\r\nALTER TABLE\r\n\r\nTime: 4.557ms\r\n\r\nroot@127.0.0.1:58520/defaultdb  OPEN> select * from t where a = 'foo';\r\nERROR: column \"a\" does not exist\r\nSQLSTATE: 42703\r\n```\r\n\r\nSomehow check constraints get around this, just not sure exactly how...\r\n\r\n```\r\nroot@127.0.0.1:58520/defaultdb> create table t ();\r\nCREATE TABLE\r\n\r\nTime: 3.469ms\r\n\r\nroot@127.0.0.1:58520/defaultdb> begin;\r\nBEGIN\r\n\r\nTime: 174\u00b5s\r\n\r\nroot@127.0.0.1:58520/defaultdb  OPEN> alter table t add column a string;\r\nALTER TABLE\r\n\r\nTime: 3.446ms\r\n\r\nroot@127.0.0.1:58520/defaultdb  OPEN> alter table t add constraint c check (a is not null);\r\nALTER TABLE\r\n\r\nTime: 7.295ms\r\n\r\nroot@127.0.0.1:58520/defaultdb  OPEN> show create table t;\r\n  table_name |                 create_statement\r\n-------------+---------------------------------------------------\r\n  t          | CREATE TABLE public.t (FAMILY \"primary\" (rowid),\r\n             |     CONSTRAINT c CHECK (a IS NOT NULL)\r\n             | )\r\n(1 row)\r\n\r\nTime: 6.35ms\r\n\r\nroot@127.0.0.1:58520/defaultdb  OPEN> commit;\r\nCOMMIT\r\n```",
+        "> But it doesn't appear that columns added within a transaction are visible for reads or writes within the transaction.\r\n\r\nI agree, but that is because the column is in the `DELETE_AND_WRITE_ONLY` state. `MakeFirstMutationPublic` should move those columns out of `DELETE_AND_WRITE_ONLY` and into the set of columns on the actual descriptor. Is that happening?",
+        "Seems to be happening. `desc.Mutations` is empty and `tc.GetUncommittedTables()[0].GetPublicColumns()` includes the new column.",
+        "Turns out I needed to perform the same `MakeFirstMutationPublic` and `AddUncommittedDescriptor` dance for the other query that gets the expected number of entries in the index... I was looking in the wrong place the whole time.",
+        "Tests are failing because of an bug in an edge case: https://github.com/cockroachdb/cockroach/issues/52702. I'll fix in a separate PR ASAP.\r\n\r\nHow serendipitous for @rohany to have written a test in `drop_type` that caught this!",
+        ":bigo1:",
+        "The fix has been merged, so this _should_ pass now. \ud83e\udd1e ",
+        "\ud83e\udd2c Now that I've added a `tcModifier` to the second internal executor, tests like the one below fail because for some reason the query issued from within the backfiller, `SELECT count(1) FROM [53 AS t]`, returns `1`, not `3` and the `ALTER TABLE` succeeds when really it should error. I don't see how `1` is a possible result at all. Running the same select after the insert returns `3`, as you can see.\r\n\r\nI can reproduce fairly easily with stressing `fakedist-spec-planning`:\r\n\r\n```\r\nstatement ok\r\nCREATE TABLE add_default (a int primary key, b int not null)\r\n\r\nstatement ok\r\nINSERT INTO add_default VALUES (1, 1), (2, 2), (3, 3)\r\n\r\nquery I\r\nSELECT count(1) FROM [53 AS t]\r\n----\r\n3\r\n\r\nstatement error pgcode 23505 violates unique constraint \\\"add_default_g_key\\\"\r\nALTER TABLE add_default ADD g INT UNIQUE DEFAULT 1\r\n```",
+        "Ha... By consiering the new unique index descriptor as fully added, the optimize was using it to satisfy the query `SELECT count(1) FROM [53 AS t]`. I fixed it by forcing the primary index with `SELECT count(1) FROM [53 AS t]@[1]`.",
+        "> Ha... By consiering the new unique index descriptor as fully added, the optimize was using it to satisfy the query SELECT count(1) FROM [53 AS t]. I fixed it by forcing the primary index with SELECT count(1) FROM [53 AS t]@[1].\r\n\r\nThis isn't quite right -- the primary index isn't guaranteed to have ID 1! You have to see what the primary index's ID is from looking at the table descriptor.",
+        "@rohany yup, some tests caught that. Updated to be `desc.PrimaryKey.ID` which should be the primary key ID of the faked table descriptor version.\r\n",
+        "bors r=rohany",
+        "Build succeeded:\n  * [Compile Build (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=2180048&buildTypeId=Cockroach_CompileBuild)"
+    ],
+    "merged": true,
+    "created_at": "2020-08-10T19:28:09Z",
+    "issue_context": {
+        "number": 50223,
+        "title": "sql: validate the number of partial index entries after backfill",
+        "body": "https://github.com/cockroachdb/cockroach/blob/c1d0b4ac64711ab4fed3f13878e1ff3c523c8d74/pkg/sql/backfill.go#L1161-L1165",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 14796,
+            "commit_id": "b7cc8b4bf1250e43a61db128f22ec51a62badc29",
+            "original_commit_id": "53d5c7f9ce4ad0cc9f62b8a6bb08bab20d73f54e",
+            "path": "pkg/sql/backfill.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1080,
+            "original_line": 1080,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "can you have a partial inverted index?",
+                "At the moment they aren't fully supported. They likely won't make it into 20.2, and so I'll probably end up disallowing their creation for the release."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,327 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 45132,
+    "lang": "c_sharp",
+    "pr_title": "Task- and Span-based Socket.SendFile",
+    "pr_body": "Fixes https://github.com/dotnet/runtime/issues/42591\r\nFixes https://github.com/dotnet/runtime/issues/43846\r\n\r\nFor the windows-implementation added a new internal type `FileSendSocketAsyncEventargs`.\r\nAs on unix `SendFileAsync` consists of three \"send-calls\" (one for prebuffer, one for the file, one for the postbuffer) at the moment I see no way to unify the use of FileSendSocketAsyncEventargs for both flavors.",
+    "pr_comments": [
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\nThis serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, to please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "@stephentoub PTAL -- I've never been so far down in the internals of networking IO, so I'm not sure if this approach is OK. This PR is created to get some initial feedback (and hopefully hints for the correct route).",
+        "Tagging subscribers to this area: @dotnet/ncl\nSee info in area-owners.md if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nFixes https://github.com/dotnet/runtime/issues/42591\r\nFixes https://github.com/dotnet/runtime/issues/43846\r\n\r\nFor the windows-implementation added a new internal type `FileSendSocketAsyncEventargs`.\r\nAs on unix `SendFileAsync` consists of three \"send-calls\" (one for prebuffer, one for the file, one for the postbuffer) at the moment I see no way to unify the use of FileSendSocketAsyncEventargs for both flavors.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>gfoidl</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Net.Sockets`, `new-api-needs-documentation`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "> As on unix `SendFileAsync` consists of three \"send-calls\" (one for prebuffer, one for the file, one for the postbuffer) at the moment I see no way to unify the use of FileSendSocketAsyncEventargs for both flavors.\r\n\r\nDoesn't need to be in this PR, but consider setting the TCP_CORK option before sending, and removing it afterward (assuming it wasn't already set). This will make sending pre-/post- buffers more efficient.",
+        "> to unify the use of FileSendSocketAsyncEventargs for both flavors\r\n\r\nWindows has the (nice) API [TransmitFile](https://docs.microsoft.com/en-us/windows/win32/api/mswsock/nf-mswsock-transmitfile), which linux doesn't have. As idea the linux-pal could provide a similar api (that in turn does the three \"send-calls\"), so the managed side can be unified with the use of FileSendSocketAsyncEventargs.\r\n(This should be done in a separate PR if it should be done anyway).\r\n\r\n> TCP_CORK\r\n\r\nGood point. I'll have a look into this (later today).",
+        ">  consider setting the TCP_CORK option before sending, and removing it afterward (assuming it wasn't already set)\r\n\r\n@scalablecory how should this work if there are multiple overlapping `SendFile`-s? Don't we need some sort of semaphore logic to count the number of outstanding sends? What if `TCP_CORK` gets enabled in the middle of a send burst?",
+        "> > consider setting the TCP_CORK option before sending, and removing it afterward (assuming it wasn't already set)\r\n> \r\n> @scalablecory how should this work if there are multiple overlapping `SendFile`-s? Don't we need some sort of semaphore logic to count the number of outstanding sends? What if `TCP_CORK` gets enabled in the middle of a send burst?\r\n\r\nAre overlapping SendFile valid? Do you mean queued?\r\n\r\nI think sending pre- and post- buffer as separate I/Os has the same issue, right? You'd just have 5 ops to do as one serialized package rather than 3.",
+        "If I'm understanding this correctly, you've taken two different approaches here for Windows and Unix. For Unix, you updated the existing async SendFile path to support Tasks directly. For Windows, you added a new SendFile operation to SocketAsyncEventArgs.\r\n\r\nBoth approaches have their merits, but we should use the same approach for all platforms.\r\n\r\nThis is all complicated by the fact that SocketAsyncEventArgs doesn't actually support a SendFile operation today. It does. however, support SendPackets, which can do everything SendFile does. On Windows this ends up calling TransmitPackets instead of TransmitFile, but I don't think we care about that distinction.\r\n\r\nSo I would suggestion taking one of the following approaches on both Windows and Linux:\r\n(1) Just update the existing APM-based async paths to be Task-based (as you've done currently on Unix).\r\n(2) Implement on top of SocketAsyncEventArgs (like you've done on Windows), but use SendPackets in the implementation.\r\n\r\nI think (2) is better long-term, as it would leverage SAEA caching and remove some existing code; but (1) is simpler and addresses the immediate issue. ",
+        "BTW, it might make sense to separate out the new sync overloads into a separate PR, just to keep each change more manageable; up to you.",
+        "> I think sending pre- and post- buffer as separate I/Os has the same issue, right? You'd just have 5 ops to do as one serialized package rather than 3.\r\n\r\nThis is a good point -- I think we have an issue with the Unix impl of SendFile today, since there's no serialization here. If you do a concurrent Send, then that send could slip in between one of the parts of the SendFile and you won't get the expected results.\r\n\r\nDoes that sound right?\r\n\r\nThat said, we don't need to fix this as part of this PR.",
+        "> we have an issue with the Unix impl of SendFile today, since there's no serialization here. If you do a concurrent Send, then that send could slip in between one of the parts of the SendFile and you won't get the expected results.\r\n>\r\n> Does that sound right?\r\n\r\nYep, that's right. The [current implementation](https://github.com/dotnet/runtime/blob/0262b49a470bff6353fc91e87aec18b2c13c9e69/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Unix.cs#L198-L277) doesn't have any serialization, nor does this PR.\r\nAs you said, this should be addressed separately. I didn't find any (related) issue for this. Create one?\r\n\r\n> This is all complicated by the fact that SocketAsyncEventArgs doesn't actually support a SendFile operation today. It does. however, support SendPackets, which can do everything SendFile does\r\n\r\nWith SendPackets I don't get the point on how to handle _preBuffer_ and _postBuffer_.\r\nOn Windows _TransmitFile_ is a handy API which supports that in a direct way.\r\n\r\nIf the unix-pal would provide a similar API than TransmitFile on Windows, we could unifiy the implementation quite easily.\r\nI'll give it a try to move the differences down to the pal, so the \"entry\" can be unified with SAEA...hopefully that won't make things even more complicated.\r\n\r\n> (1) Just update the existing APM-based async paths to be Task-based (as you've done currently on Unix).\r\n\r\nFor Unix there was already [SendFileInternalAsync](https://github.com/dotnet/runtime/blob/0262b49a470bff6353fc91e87aec18b2c13c9e69/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Unix.cs#L239), which got updated for the new APIs.\r\nOn Windows there was no matching counterpart, therefore FileSendSocketAsyncEventargs got introduced (as it's special to Windows). BeginSendFile, etc. doesn't have support for cancellation either (or I don't know how to plumb it in).\r\n\r\n> the new sync overloads into a separate PR, just to keep each change more manageable; up to you.\r\n\r\nThis is basicallay just adding span and forwarding the array-based ones to them. That's why it is in the same PR (it's the easy part). So I'd like to keep them here.",
+        "> With SendPackets I don't get the point on how to handle preBuffer and postBuffer.\r\n\r\nPossible is using multiple `SendPacketsElement` (one for the preBuffer, one for the file, and one for the postBuffer). But that's three allocations + the one for the array `_sendPacketsElements` (and another one for the internal clone and for pinning) that can be avoided by using TransmitFile and memories.\r\n\r\nBTW: on Unix there's the same serialization issue.",
+        "> This is a good point -- I think we have an issue with the Unix impl of SendFile today, since there's no serialization here. If you do a concurrent Send, then that send could slip in between one of the parts of the SendFile and you won't get the expected results.\r\n> \r\n> Does that sound right?\r\n\r\nI don't think sync needs to be serialized, but async at least should be.",
+        "> I don't think sync needs to be serialized, but async at least should be.\r\n\r\nWhy not sync?",
+        "> As you said, this should be addressed separately. I didn't find any (related) issue for this. Create one?\r\n\r\nYeah, that would be great, thanks.",
+        "> Possible is using multiple SendPacketsElement (one for the preBuffer, one for the file, and one for the postBuffer). But that's three allocations + the one for the array _sendPacketsElements (and another one for the internal clone and for pinning) that can be avoided by using TransmitFile and memories.\r\n\r\nYes, that's what I was suggesting. I'm not sure the allocations matter much, but if we had concerns about this, we could cache them. I'd rather see us using the existing SendPackets code than creating a new SendFile operation.\r\n\r\n",
+        "We need to add Memory support on SendPackets as well: https://github.com/dotnet/runtime/issues/45267",
+        "Raised issue for the serialization problem --> https://github.com/dotnet/runtime/issues/45274\r\n\r\n(will comment on other points later...)",
+        "Re: SendPackets\r\n\r\nIf we decide to go this route, https://github.com/dotnet/runtime/issues/45267 should be done first in order to use the memory-support.\r\n\r\nJust had a quick look into the possibility on how to implement SendFileAsync via SendPackets. It's relatively straightforward for Windows and *nix.\r\nBut I don't like the (allocation) overhead that the SendPackets-method has (and can't be avoided in a easy way), whereas the specific sendfile-operation doesn't introduce these allocations.\r\nSo it could be the other way around: if SendPackets \"pattern matches\" to preBuffer, file, and postBuffer, so use SendFileAsync.\r\n\r\nI don't have any feeling how much these APIs will be used and how much concern we should put into avoiding allocations. So maybe it's best to just go with the simplest approach, and improve if there's (real) demand for it?",
+        "update: based on [recent discussion](https://github.com/dotnet/runtime/pull/45132#issuecomment-734491671) this PR should be finished on top of https://github.com/dotnet/runtime/pull/46975",
+        "> I'm not sure the allocations matter much, but if we had concerns about this, we could cache them. I'd rather see us using the existing SendPackets code than creating a new SendFile operation.\r\n\r\n@geoffkizer I think we should be careful here. Many sources and discussions refer to `sendfile` / `TransmitFile` as a go-to operation for high-performance scenarios. Since it's more general, winsock `TransmitPackets` *might* introduce some perf penalty, if used instead of `TransmitFile`. This, together with extra allocations might be unacceptable in high-perf use-cases.\r\n\r\nThe question is if we want to be fast by default, or deliver a functionally complete solution first, and investigate/improve performance later. Is there any value in a Task-based `SendFileAsync` if it's not the zero-overhead API users expect it to be?",
+        "> Since it's more general, winsock TransmitPackets might introduce some perf penalty, if used instead of TransmitFile.\r\n\r\nI think this is quite unlikely -- unless we have some additional info, I think we should assume TransmitPackets is as efficient as TransmitFile.\r\n\r\nThe extra allocations for using the SendPackets operation could be a concern; I don't have a strong opinion here. If it's easy to avoid this extra allocation, that would be good. If it's a real pain, I think we could probably live with it as is.",
+        "To move forward my plan looks like:\r\n\r\n1. separate the fix for https://github.com/dotnet/runtime/issues/43846 (span overloads) into it's own PR -- change is more unrelated than I first thought\r\n2. close this PR\r\n3. create PR for SendFileAsync based on `TransmitPackets` -- so the functionality is delivered\r\n4. try a PR for SendFileAsync based on `TrasmitFile` -- to avoid the allocations needed for TransmitPackets\r\n\r\nDoes this seem reasonable?",
+        "@gfoidl this plan sounds perfect to me, it seems to deal with all the concerns raised here, please go ahead!",
+        "- [x] Span-overloads --> https://github.com/dotnet/runtime/pull/47230\r\n- [ ] TransmitPackets-PR\r\n- [ ] TransmitFile-PR",
+        "Just started working on the `TransmitPackets` based version, and realized that there's no support for cancellation.\r\nSo plumbing cancellation in + the more allocations + on Unix there's already SendFileAsyncInternal that can be used makes the TransmitPackets version less attractive.\r\n\r\nI need a bit more thought on this, but ATM it seems that TransmitFile looks better for windows.",
+        "As I said above,\r\n\r\n> So I would suggestion taking one of the following approaches on both Windows and Linux:\r\n(1) Just update the existing APM-based async paths to be Task-based (as you've done currently on Unix).\r\n(2) Implement on top of SocketAsyncEventArgs (like you've done on Windows), but use SendPackets in the implementation.\r\n\r\nI'm fine to do (1) for now.\r\n\r\nLonger-term, we want to achieve the following goals:\r\n(A) Ensure we have a complete set of Socket APIs across the board (i.e., everything supports Task, Memory, Span, cancellation where appropriate)\r\n(B) Ensure we have first-class implementations of all the Task-based APIs (i.e. not wrapped around old IAsyncResult implementations, as these add unnecessary overhead)\r\n(C) Reimplement the old IAsyncResult APIs by wrapping the Task-based APIs. This allows us to get rid of a ton of code and some ugly dependencies we currently have on the old IAsyncResult infrastructure. Socket is one of the few remaining places in .NET Core that we haven't completed this.\r\n(D) Implement the Task-based APIs using SAEA under the covers. This allows us to cache SAEA instances to avoid unnecessary allocations, and also reduces redundant code paths.\r\n\r\nIf we want to punt on (D) for now because it's easier to just implement SendFileAsync directly, that's fine; but eventually we will want to meet all the goals above for SendFileAsync, so let's ensure whatever we do is working towards them, or at least not working away from them."
+    ],
+    "merged": false,
+    "created_at": "2020-11-23T21:53:49Z",
+    "issue_context": {
+        "number": 42591,
+        "title": "Add Task-based async API for Socket.SendFile",
+        "body": "## Background and Motivation\r\n\r\nWe have an APM version of this and a SocketAsyncEventArgs version, but no Task-based version.\r\n\r\nCurrent APM:\r\n\r\n```csharp\r\n    public IAsyncResult BeginSendFile(string fileName, AsyncCallback? callback, object? state);\r\n    public IAsyncResult BeginSendFile(string? fileName, byte[]? preBuffer, byte[]? postBuffer, TransmitFileOptions flags, AsyncCallback? callback, object? state); \r\n```\r\n## Proposed API\r\n\r\n```csharp\r\n    public ValueTask SendFileAsync(string fileName);\r\n    public ValueTask SendFileAsync(string? fileName, byte[]? preBuffer, byte[]? postBuffer, TransmitFileOptions flags);\r\n```\r\n",
+        "comments": [
+            "Tagging subscribers to this area: @dotnet/ncl\nSee info in area-owners.md if you want to be subscribed.",
+            "[Video](https://www.youtube.com/watch?v=Kk9Fv8m0Ksw&t=0h32m11s)\n\n* Makes sense, but we should take a cancellation tokena and memories\r\n\r\n```C#\r\nnamespace System.Net.Sockets\r\n{\r\n    public partial class Socket\r\n    {\r\n        // Existing APM APIs\r\n        // public IAsyncResult BeginSendFile(string fileName, AsyncCallback? callback, object? state);\r\n        // public IAsyncResult BeginSendFile(string? fileName, byte[]? preBuffer, byte[]? postBuffer, TransmitFileOptions flags, AsyncCallback? callback, object? state);\r\n        public ValueTask SendFileAsync(string? fileName, CancellationToken cancellationToken = default);\r\n        public ValueTask SendFileAsync(string? fileName, ReadOnlyMemory<byte> preBuffer, ReadOnlyMemory<byte> postBuffer, TransmitFileOptions flags, CancellationToken cancellationToken = default);\r\n    }\r\n}\r\n```\r\n",
+            "@stephentoub can you assign this to me?\r\n(Will do a PR in the next couple of days)",
+            "Sure :-) Thanks. Cancellation will be the trickiest part; the rest should be very straightforward.",
+            "Note to myself: don't forget to update the ref-assemblies.",
+            "Can the windows-version actually be cancelled (in a nice way)?\r\n\r\nThe code goes down to https://github.com/dotnet/runtime/blob/f025f53481b492725cf889616315c73102b6ee58/src/libraries/System.Net.Sockets/src/System/Net/Sockets/SocketPal.Windows.cs#L1150-L1152 which is [TransmitFile function (mswsock.h)](https://docs.microsoft.com/en-us/windows/win32/api/mswsock/nf-mswsock-transmitfile) and I don't see any functionality for cancellation.\r\n\r\nFor the unix-version existing code can be reused (after tweaking a little bit).\r\n\r\n",
+            "Has cancelling on windows be done via https://github.com/dotnet/runtime/blob/f025f53481b492725cf889616315c73102b6ee58/src/libraries/System.Net.Sockets/src/System/Net/Sockets/SocketAsyncEventArgs.Windows.cs#L102 (resp. `Interop.Kernel32.CancelIoEx`)?\r\n\r\n(Now I understand why you wrote tricky).",
+            "> Interop.Kernel32.CancelIoEx\r\n\r\nYup\r\n\r\n> Now I understand why you wrote tricky\r\n\r\n:wink:",
+            "@gfoidl Are you still looking at this?\r\n\r\nThis is the last issue blocking https://github.com/dotnet/runtime/issues/43845, which I'd really like to get done for .NET 6.",
+            "I got lost a bit in all the issue around sockets and especially for SendPacketsAsync...need to revive the branches.\r\n\r\nFor Unix it's quite straight-forward including cancellation.\r\n\r\nFor Windows we talked about basing it on SendPacketsAsync which can't be canceled (at least last time I checked). There's https://github.com/dotnet/runtime/issues/48477 but I don't know the state of that issue. Also SendPacketsAsync has quite some allocations that `TransmitFile` could avoid, but that's more effort and larger SAEA which we want to avoid.\r\n\r\nI'll prepare a PR based on SendPackets, as it's easier to move forward. We can optimize that later on.\r\n\r\nCan this issue / PR wait for Mon / Tue next week? (need to find a fix a \ud83d\udc1e in my code, so can look into this over the weekend)",
+            "> Can this issue / PR wait for Mon / Tue next week? (need to find a fix a \ud83d\udc1e in my code, so can look into this over the weekend)\r\n\r\nYeah, it's not urgent, I just want to make sure we can get this in for 6.0.\r\n\r\n> For Unix it's quite straight-forward including cancellation.\r\n> \r\n> For Windows we talked about basing it on SendPacketsAsync which can't be canceled (at least last time I checked).\r\n\r\nIf we base it on SendPacketsAsync, this would work for both Windows and Unix, which is preferred -- we don't want to have more platform-specific code here if we can avoid it.\r\n\r\nSendPacketsAsync can't be cancelled, but the way we have done cancellation for other Task-based APIs is to have an internal version that does support cancellation. You should see this pattern for other APIs like Send, Receive, etc.\r\n\r\nThat said, cancellation support here is a bit ugly currently. I would be fine with punting cancellation support for a first PR -- we need to address cancellation for a couple different operations anyway, including Accept (see https://github.com/dotnet/runtime/issues/33418) and Disconnect (see https://github.com/dotnet/runtime/issues/51452). It probably makes sense to tackle all of these at once. @antonfirsov thoughts?\r\n\r\n",
+            "I'm fine getting this in with `SendPacketsAsync` to get the refactoring story done. First I was afraid of regressing Windows perf with those allocations, but today's APM solution is allocating anyways.\r\n\r\nI'm wondering if we should also publish `SendFileAsync(SocketAsyncEventArgs)` for API symmetry?",
+            "> I'm wondering if we should also publish SendFileAsync(SocketAsyncEventArgs) for API symmetry?\r\n\r\nWe could consider it, but I don't think it's a priority. It doesn't add anything that SendPacketsAsync can't do.",
+            "Triage: Cancellation implementation is missing. Fine to move to Future.\r\nWe should create new issue to track that and close this one."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3110,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/ref/System.Net.Sockets.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 449,
+            "original_line": 449,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this needed or shall `Send` be used for _SendFileAsync_?",
+                "Since we are not exposing the `SocketAsyncEventArgs`-based overload publicly there is no point extending the public API with this option, so let's remove it I guess. (Adding a comment about the workaround when `SocketAsyncOperation.Send` is being assigned.) @geoffkizer agreed?",
+                "SocketAsyncEventArgs already has SendPackets, which is effectively a more general version of SendFile. So we shouldn't be adding SendFile to this enum.\r\n\r\nI suppose it does raise the question of whether we should have a Task-based SendPacketsAsync method, though..."
+            ]
+        },
+        {
+            "hunk_id": 4739,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/SocketAsyncContext.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2027,
+            "original_line": 2027,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "On Unix we don't cache this operation.\r\n[Other operations](https://github.com/dotnet/runtime/blob/664b96289bbcbb6abda6d2137e701c733f1a1094/src/libraries/System.Net.Sockets/src/System/Net/Sockets/SocketAsyncContext.Unix.cs#L41-L45) are cached, the Windows-counterpart is cached too.\r\n\r\nShall it be cached here too or is (re-) creating just fine?"
+            ]
+        },
+        {
+            "hunk_id": 3115,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/tests/FunctionalTests/SendFile.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 172,
+            "original_line": 172,
+            "side": "RIGHT",
+            "original_position": 31,
+            "position": 31,
+            "subject_type": "line",
+            "review_comments": [
+                "A lot of other socket tests (e.g. SendReceive, connect, etc) are generalized for different \"modes\" (sync, various async, span vs no span, etc) by deriving from SocketTestHelperBase and then instantiating appropriate versions of the class. We don't do this currently with SendFile, but since we are adding all these overloads, it probably makes sense to. That means adding SendFile to SocketHelperBase and providing relevant implementations on the derived classes, e.g. SocketHelperApm etc.\r\n",
+                "I think rebasing tests on `SocketTestHelperBase` is a must-have with this change.\r\n\r\nLooks like most of the tests can be refactored to the base class (`SendFile<T> : SocketTestHelperBase<T> where T : SocketHelperBase`), the ones that are specific to an (APM/Sync/Task) implementation can be moved to the subclass.",
+                "Makes sense, but can we do this in a different PR? There is quite some rebasing needed as\r\nhttps://github.com/dotnet/runtime/blob/f066972c7aa9f9147347623617e789e70aff3d3f/src/libraries/System.Net.Sockets/tests/FunctionalTests/SendFile.cs#L15 already inherits from `FileCleanupTestBase` (I guess this may be a reason why it wasn't done so far.)"
+            ]
+        },
+        {
+            "hunk_id": 3113,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 362,
+            "original_line": 362,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Doc comments are in https://github.com/gfoidl/dotnet-runtime/commit/feade37fbe1c780e50a6b845e1d581d1db14bae7\r\n\r\nWill merge them once the rest of the PR is OK to avoid unnecessary CI builds."
+            ]
+        },
+        {
+            "hunk_id": 4740,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 362,
+            "original_line": 362,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Doc comments are in https://github.com/gfoidl/dotnet-runtime/commit/feade37fbe1c780e50a6b845e1d581d1db14bae7\r\n\r\nWill merge them once the rest of the PR is OK to avoid unnecessary CI builds."
+            ]
+        },
+        {
+            "hunk_id": 3111,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 259,
+            "original_line": 260,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "Instead of the TaskCompletionSource this one is used and the callback (below) updated to take a state, so no closures need to be allocated."
+            ]
+        },
+        {
+            "hunk_id": 3114,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 32,
+            "original_line": 32,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we just use one of the existing send instances (above) here?",
+                "In the current state of the PR no, as FileSendSocketAsyncEventargs is special to windows and potential parent classes are sealed. Unsealing them might change perf-characteristics or would this be OK?\r\n\r\nBut I'll try something to unifiy this. Adding the fields to `SocketAsyncEventArgs` and use `AwaitableSocketAsyncEventArgs`, then one field could be re-used."
+            ]
+        },
+        {
+            "hunk_id": 4741,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 32,
+            "original_line": 32,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we just use one of the existing send instances (above) here?",
+                "In the current state of the PR no, as FileSendSocketAsyncEventargs is special to windows and potential parent classes are sealed. Unsealing them might change perf-characteristics or would this be OK?\r\n\r\nBut I'll try something to unifiy this. Adding the fields to `SocketAsyncEventArgs` and use `AwaitableSocketAsyncEventArgs`, then one field could be re-used."
+            ]
+        },
+        {
+            "hunk_id": 4737,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/ref/System.Net.Sockets.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 449,
+            "original_line": 449,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this needed or shall `Send` be used for _SendFileAsync_?",
+                "Since we are not exposing the `SocketAsyncEventArgs`-based overload publicly there is no point extending the public API with this option, so let's remove it I guess. (Adding a comment about the workaround when `SocketAsyncOperation.Send` is being assigned.) @geoffkizer agreed?",
+                "SocketAsyncEventArgs already has SendPackets, which is effectively a more general version of SendFile. So we shouldn't be adding SendFile to this enum.\r\n\r\nI suppose it does raise the question of whether we should have a Task-based SendPacketsAsync method, though..."
+            ]
+        },
+        {
+            "hunk_id": 4742,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/tests/FunctionalTests/SendFile.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 172,
+            "original_line": 172,
+            "side": "RIGHT",
+            "original_position": 31,
+            "position": 31,
+            "subject_type": "line",
+            "review_comments": [
+                "A lot of other socket tests (e.g. SendReceive, connect, etc) are generalized for different \"modes\" (sync, various async, span vs no span, etc) by deriving from SocketTestHelperBase and then instantiating appropriate versions of the class. We don't do this currently with SendFile, but since we are adding all these overloads, it probably makes sense to. That means adding SendFile to SocketHelperBase and providing relevant implementations on the derived classes, e.g. SocketHelperApm etc.\r\n",
+                "I think rebasing tests on `SocketTestHelperBase` is a must-have with this change.\r\n\r\nLooks like most of the tests can be refactored to the base class (`SendFile<T> : SocketTestHelperBase<T> where T : SocketHelperBase`), the ones that are specific to an (APM/Sync/Task) implementation can be moved to the subclass.",
+                "Makes sense, but can we do this in a different PR? There is quite some rebasing needed as\r\nhttps://github.com/dotnet/runtime/blob/f066972c7aa9f9147347623617e789e70aff3d3f/src/libraries/System.Net.Sockets/tests/FunctionalTests/SendFile.cs#L15 already inherits from `FileCleanupTestBase` (I guess this may be a reason why it wasn't done so far.)"
+            ]
+        },
+        {
+            "hunk_id": 3116,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 273,
+            "original_line": 273,
+            "side": "RIGHT",
+            "original_position": 84,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "Instead of checking for OperationAborted, I think we should just check if the cancellationToken is cancelled and throw if it is (i.e. call cancellationToken.ThrowIfCancellationRequested)",
+                "Though we may want to call UpdateStatusAfterSocketError too, not sure.\r\n\r\n",
+                "> we may want to call UpdateStatusAfterSocketError too, not sure.\r\n\r\nI'm not sure either, but I think we won't. https://github.com/dotnet/runtime/blob/0262b49a470bff6353fc91e87aec18b2c13c9e69/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.cs#L4022-L4036 would disconnect the socket, and cancellation is no reason to disconnect, or?"
+            ]
+        },
+        {
+            "hunk_id": 3112,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/SocketAsyncContext.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2027,
+            "original_line": 2027,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "On Unix we don't cache this operation.\r\n[Other operations](https://github.com/dotnet/runtime/blob/664b96289bbcbb6abda6d2137e701c733f1a1094/src/libraries/System.Net.Sockets/src/System/Net/Sockets/SocketAsyncContext.Unix.cs#L41-L45) are cached, the Windows-counterpart is cached too.\r\n\r\nShall it be cached here too or is (re-) creating just fine?"
+            ]
+        },
+        {
+            "hunk_id": 4738,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 259,
+            "original_line": 260,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "Instead of the TaskCompletionSource this one is used and the callback (below) updated to take a state, so no closures need to be allocated."
+            ]
+        },
+        {
+            "hunk_id": 4743,
+            "commit_id": "98e3ace65154acaacdd83062f2a3ab2c6fabb6b5",
+            "original_commit_id": "e2099f62f1ee28241f857edaf0ef7420018d11d8",
+            "path": "src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 273,
+            "original_line": 273,
+            "side": "RIGHT",
+            "original_position": 84,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "Instead of checking for OperationAborted, I think we should just check if the cancellationToken is cancelled and throw if it is (i.e. call cancellationToken.ThrowIfCancellationRequested)",
+                "Though we may want to call UpdateStatusAfterSocketError too, not sure.\r\n\r\n",
+                "> we may want to call UpdateStatusAfterSocketError too, not sure.\r\n\r\nI'm not sure either, but I think we won't. https://github.com/dotnet/runtime/blob/0262b49a470bff6353fc91e87aec18b2c13c9e69/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.cs#L4022-L4036 would disconnect the socket, and cancellation is no reason to disconnect, or?"
+            ]
+        }
+    ]
+}

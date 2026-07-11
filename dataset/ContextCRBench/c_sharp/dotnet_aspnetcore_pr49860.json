@@ -1,0 +1,71 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 49860,
+    "lang": "c_sharp",
+    "pr_title": "Support view buffer-based rendering in Blazor",
+    "pr_body": "Closes https://github.com/dotnet/aspnetcore/issues/49172.\r\n\r\nSupport larger HTML payloads by buffering and writing to the underlying `HttpResponseStreamWriter`, following a strategy similar to ViewBuffers in MVC. To avoid having to introduce new public API in the endpoints library and to avoid circular dependency chains between `M.A.Mvc.Razor` and `M.A.Components.Endpoints`, I opt-ed to copysource the relevant files from `M.A.ViewFeatures.Buffers` and make a few targeted modifications (relying on internal concrete implementations instead of public interfaces in method/constructor signatures), to make the code sharing a bit more sensible. In the future, we may consider moving the buffering logic to `M.A.Html.Abstractions` so that it can be used in both APIs, although the fact that `M.A.Mvc.Razor` has a transitive dependency on `M.A.Componnents.Endpoints` here.",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2023-08-09T17:18:28Z",
+    "issue_context": {
+        "number": 49172,
+        "title": "StaticHtmlRenderer uses synchronous writes which eventually fails",
+        "body": "All the prerendering logic inside `StaticHtmlRenderer` (and wrapper logic in `EndpointHtmlRenderer`'s `WriteComponentHtml`) performs synchronous writes against a `TextWriter` that wraps the output stream. \r\n\r\nThis works up to a point, but once you write too much content (presumably exceeding the writer's internal buffer), the system will throw *InvalidOperationException: Synchronous operations are disallowed. Call WriteAsync or set AllowSynchronousIO to true instead.*. This can happen with or without streaming SSR.\r\n\r\nLikely solutions:\r\n\r\n * We may be able to change the prerendering logic to use asynchronous writes throughout\r\n * Or we may need to write the prerendering output to a buffer and then asynchronously flush that to the response writer at the end of each batch\r\n",
+        "comments": [
+            "Repro: just make a page that renders hundreds of KB of HTML, either during the initial render or during a streaming SSR batch.\r\n\r\nProof-of-concept workaround:\r\n\r\n```diff\r\ndiff --git a/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.cs b/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.cs\r\nindex bbc46316d9..c29b64c733 100644\r\n--- a/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.cs\r\n+++ b/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.cs\r\n@@ -214,8 +214,18 @@ internal partial class EndpointHtmlRenderer : StaticHtmlRenderer, IComponentPrer\r\n     {\r\n         if (_streamingUpdatesWriter is { } writer)\r\n         {\r\n-            SendBatchAsStreamingUpdate(renderBatch, writer);\r\n-            return FlushThenComplete(writer, base.UpdateDisplayAsync(renderBatch));\r\n+            using var contentWriter = new StringWriter();\r\n+            SendBatchAsStreamingUpdate(renderBatch, contentWriter);\r\n+            return FlushThenComplete(contentWriter, writer, base.UpdateDisplayAsync(renderBatch));\r\n         }\r\n         else\r\n         {\r\n@@ -224,8 +234,9 @@ internal partial class EndpointHtmlRenderer : StaticHtmlRenderer, IComponentPrer\r\n \r\n         // Workaround for methods with \"in\" parameters not being allowed to be async\r\n         // We resolve the \"result\" first and then combine it with the FlushAsync task here\r\n-        static async Task FlushThenComplete(TextWriter writerToFlush, Task completion)\r\n+        static async Task FlushThenComplete(TextWriter contentToWrite, TextWriter writerToFlush, Task completion)\r\n         {\r\n+            await writerToFlush.WriteAsync(contentToWrite.ToString());\r\n             await writerToFlush.FlushAsync();\r\n             await completion;\r\n         }\r\n```\r\n\r\nThat workaround only handles the case where the problem occurs during a streaming SSR batch. A similar buffering workaround should work around the initial HTML output.",
+            "@SteveSandersonMS I think we might need to buffer, similar to how MVC does it.\r\n\r\nWhat's your gut feeling since you've been working in this area. Do you favor changing the logic to be async, or buffer the entire response like MVC does.",
+            "I'd at least look at changing the logic to be async, but my gut feeling is we would likely end up siding with the buffers.\r\n\r\nThe part about async that bothers me the most is that these are big methods with *so many* fine-grained write calls, I worry that the async state machines would be immense and perhaps there would be a lot of overhead from that.\r\n\r\nUltimately the ideal would be to try both and benchmark, but at this stage I would be fine with us just building on the experience we have from MVC and take a similar approach.",
+            "@SteveSandersonMS we might be able to minimize the async state machine overhead. We are not going to be doing concurrent writes, so it is very likely we can implement `IValueTaskSource` within the `EndpointHtmlRenderer` and avoid the allocations even when we go async.",
+            "> We may be able to change the prerendering logic to use asynchronous writes throughout\r\n\r\nJust looking at the code here again, there's an important reason why it's currently synchronous. We need the render buffers not to be mutated during this process. Doing this asynchronously (at least, to do it properly) would require adding some new primitive to our sync context to make it go into a locked state where it queues up incoming work even if no thread is currently holding it. Otherwise, each time we yield, other renders could occur and we'd end up in a corrupted state.\r\n\r\nThere may also be other aspects of the HTML rendering process that are built around an assumption of synchrony, so that would also require careful analysis if we were going to change it.\r\n\r\nThe alternative of using MVC-like viewbuffers is a more well-trodden path so may be the safer option for .NET 8 given that this change has to go in a very late preview (RC1 I think).",
+            "I am still getting this error on preview 7",
+            "@MarioGK Yes, this change was merged into the upcoming RC1 release so you'll still encounter the issue. I'd recommend trying it again once RC1 is released to see if that resolves your problem.",
+            "Hi @captainsafia \r\nFor which date is RC1 will be released?\r\n(I'm praying) \r\n\r\n@SteveSandersonMS thanks for the disclosure of the problem  \r\nThere's any workaround in the meantime to increase the buffer manually?\r\nI lost three days trying to understand how a HTML page broke the project :-( \r\nForcing AllowSynchronousIO doesn't work 100%\r\n\r\nThanks for the great project - keep the _momentum_ and please sponsor great documentation - too many versions creates noise on best practices and examples - May the blazor be with you :-)    ",
+            "@ricardok1 You can get a nightly build containing this fix right now if you want from https://github.com/dotnet/installer/blob/main/README.md#installers-and-binaries. That's my recommendation on how to avoid the problem until RC1 is out.",
+            "Does this resolve the similar issue with ViewComponents?\r\n\r\nhttps://github.com/dotnet/aspnetcore/issues/40928",
+            "@psylenced Nope, the issue was resolved only for components rendered using Blazor's StaticHtmlRenderer.",
+            "I get this error in Blazor preview 7. I have a page made up by several components, each representing a formrow.\r\n```asp.net\r\n@attribute [RenderModeServer]\r\n<FormGroup Title=Title>\r\n        <GroupDescription>\r\n            Description\r\n        </GroupDescription>\r\n        <GroupContent>\r\n            <Component1 />\r\n            <Component2 />\r\n            <Component3 />\r\n            <Component4 />\r\n            <Component5 />\r\n            <Component6 />\r\n            <Component7 />\r\n            <Component8 />\r\n            <Component9 />\r\n        </GroupContent>\r\n    </FormGroup>\r\n\r\nAnd the components\r\n\r\n\r\n@attribute [RenderModeServer]\r\n\r\n@if (editContext == null)\r\n{\r\n    <FormFieldLoading />\r\n}\r\nelse\r\n{\r\n    <EditForm EditContext=\"editContext\">\r\n        <FormRow>\r\n            <LeftColumn>\r\n                Name\r\n            </LeftColumn>\r\n\r\n            <MiddleColumn>\r\n                <div class=\"input-group\">\r\n                    <InputText @bind-Value=\"editModel.Field\" class=\"form-control\" />\r\n                    <InputUpdating Show=\"updating\" />\r\n                    <InputError Show=\"error\" />\r\n                    <InputSuccess Show=\"success\" />\r\n                    <InputReset Show=\"modified\" OnClick=\"Reset\" />\r\n                </div>\r\n                <SaveException Show=\"showException\" Message=\"@exception\" OnRetryClick=\"(async () => await Retry())\" OnCancelClick=\"Cancel\" />\r\n            </MiddleColumn>\r\n\r\n            <RightColumn>\r\n                <div>\r\n                    <ValidationMessage For=\"@(() => editModel.Field)\" class=\"text-danger\" />\r\n                    Description\r\n                </div>\r\n            </RightColumn>\r\n        </FormRow>\r\n\r\n        <DataAnnotationsValidator />\r\n    </EditForm>\r\n}\r\n``` \r\n\r\nThe components also have code for loading and saving data using JsonAsync API calls.\r\nThe other components referenced in the middle column are simple bootstrap formatted status symbols for the inputs, but in initial load they don't provide any markup at all.\r\n\r\nIf I have 11 of these components, it works fine, 12 or more fails. Configuring for syncIO just makes the whole page hang and nothing more happens.\r\nIf I add components to the page after loding it with less than 12 and do a hot reload, the page refreshes and all components are loaded fine. If I manually reload the page it fails.\r\n\r\n\r\nI don't fully understand all the above discussions, but will this be fixed in the upcoming RC?\r\n\r\n\r\n",
+            "@SimenArntsen Yes, it's partially fixed in RC1 (works if not streaming rendering) and will be fully fixed in RC2.",
+            "While waiting for the permanent fix, I have \"solved\" the problem by loading part of the page OnAfterRender and it works fine for my current project.",
+            "In our case we had to allow synchronous IO and use IIS Express instead of Kestrel (with Kestrel wouldn't work with AllowSynchronousIO  set to true.\r\n\r\nStill looking up for a final solution.\r\n\r\n```\r\nbuilder.Services.Configure<IISServerOptions>(options =>\r\n{\r\n    options.AllowSynchronousIO = true;\r\n});\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 13938,
+            "commit_id": "5a9b3571e2dc05a342f474321802bcd1c4bd69b1",
+            "original_commit_id": "cf12d968eeaba87c9ebbd53e9420f3b016b0ff21",
+            "path": "src/Components/Endpoints/src/RazorComponentEndpointInvoker.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "We should have fixed #47477 while doing this change. It should be as simple as grabbing `HtmlEncoder` from DI and using that instead of `HtmlEncoder.Default` (and ensuring `IServiceCollection.AddWebEncoders()` is called by `IServiceCollection.AddRazorComponents()`)"
+            ]
+        },
+        {
+            "hunk_id": 13937,
+            "commit_id": "5a9b3571e2dc05a342f474321802bcd1c4bd69b1",
+            "original_commit_id": "cf12d968eeaba87c9ebbd53e9420f3b016b0ff21",
+            "path": "src/Components/Endpoints/src/Rendering/ViewBufferTextWriter/ViewBufferTextWriter.cs",
+            "start_line": 4,
+            "original_start_line": 4,
+            "start_side": "RIGHT",
+            "line": 9,
+            "original_line": 9,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "Do you think we could file an issue tracking eventually merging these two implementations into one?",
+                "See https://github.com/dotnet/aspnetcore/issues/49932"
+            ]
+        }
+    ]
+}

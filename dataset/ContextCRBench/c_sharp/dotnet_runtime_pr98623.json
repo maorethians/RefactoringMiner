@@ -1,0 +1,169 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 98623,
+    "lang": "c_sharp",
+    "pr_title": "Move memset/memcpy helpers to managed impl",
+    "pr_body": "Closes https://github.com/dotnet/runtime/issues/98620\r\nCloses https://github.com/dotnet/runtime/issues/95517",
+    "pr_comments": [
+        "We have two places in CoreLib that call `Unsafe.InitBlockUnaligned`. These places are effectively going to call `SpanHelpers.Fill` now - we can fix them up to do that directly.\r\n\r\nhttps://github.com/dotnet/runtime/blob/2f43856e78faebe7347fdd76acc26de7ffaec539/src/libraries/System.Private.CoreLib/src/System/Span.cs#L309\r\n\r\nhttps://github.com/dotnet/runtime/blob/2f43856e78faebe7347fdd76acc26de7ffaec539/src/libraries/System.Private.CoreLib/src/System/SpanHelpers.cs#L25",
+        "> We have two places in CoreLib that call `Unsafe.InitBlockUnaligned`. These places are effectively going to call `SpanHelpers.Fill` now - we can fix them up to do that directly.\r\n\r\nThe problem that `SpanHelpers.Fill` is not optimized by jit for constant length. It was never needed, because e.g. `Span.Clear` invoked `Unsafe.InitBlockUnaligned`\r\n\r\n![image](https://github.com/dotnet/runtime/assets/523221/25545942-0f07-47d4-9b6b-0a2f98aa15d9)\r\n\r\nNo longer happens if we change it to call `SpanHelpers.Fill` directly. I'll look in a separate PR to unroll Fill as well (should be a simple fix).",
+        "@jkotas we don't use memset/memcpy helpers in JIT for x86 and always use `rep stosb/movb` - wonder if we should switch those to helpers or not? I presume `rep` might also lead to gc starvation.",
+        "> I presume rep might also lead to gc starvation.\r\n\r\n`rep ...` should be emitted as fully interruptible code to avoid gc starvation. It is same as a loop without a call. ",
+        "This needs a bit of work in JIT first. JIT currently has a bit ugly way to transform `GT_STORE_[DYN]_BLK` into a helper call - it does that too late in the emitter. With this PR it's now tricky because the helper call is non-deterministically either direct call or indirect (depends on whether the managed helper reached the final tier or not). I have a separate PR in works to simplify block handling in lower.\r\n\r\nUPD: https://github.com/dotnet/runtime/pull/98682",
+        "`SpanHelpers.ClearWithoutReferences` shoul be using `Unsafe.WriteUnaligned`?\r\n\r\nSee #26654.",
+        "> `SpanHelpers.ClearWithoutReferences` shoul be using `Unsafe.WriteUnaligned`?\r\n\r\nMakes sense, replaced with `WriteUnaligned`. Although, I guess a platform with super expensive unaligned writes should better go the `memset` pinvoke right away",
+        "Ugh, https://github.com/dotnet/runtime/pull/98682 has fixed most JIT issues I hit here, but there is one more place on ARM/ARM64 where we emit a call to memset (in `genPoisonFrame`) in the emitter phase and that one struggles from indirect helpers too (on nonAOT). Fixing now...",
+        "Ok, looks like we can't use managed call (memset) for frame poisoning \ud83e\udd14 Once I fixed the reloc issue I hit `pMD->HasUnmanagedCallersOnlyAttribute()` assert in reverse-pinvoke test",
+        "> Ok, looks like we can't use managed call (memset) for frame poisoning \r\n\r\nWe may need to add a special helper that is guaranteed to not trigger the GC for that. This helper is not going to friendly to GC suspension, but it should be ok given that it is only going to be used for sizes limited to stack frame size and only for debug code.",
+        "> We may need to add a special helper that is guaranteed\r\n\r\nI presume it could be a simple native memset call without ASM wrappers for nullchecks? (since pointer is guaranteed to be non-null in this case + it's debug like you mentioned)\r\n\r\nAn alternative is to emit a loop there, but that will have to be done for 4 targets (arm,arm64,la64,risc-v) - on x64 it's already using `rep stosb`",
+        "> I presume it could be a simple native memset call without ASM wrappers for nullchecks?\r\n\r\nyep",
+        "@jkotas regarding the managed impl - I wonder if we can just take the existing Memmove (block-based) impl for it and convert it to memzero? I made a benchmark playground https://gist.github.com/EgorBo/53a71a33a45a379adcd2abffb89ebe73\r\n\r\nI know microbenchmarks like these aren't very representative, but the block-based impl is more likely to be optimizeable with DC_ZVA, also, it supports data alignment.",
+        "> I wonder if we can just take the existing Memmove (block-based) impl for it and convert it to memzero?\r\n\r\nSounds good to me.",
+        "@jkotas anything else here? I think it's ready for review",
+        "What is the perf of memory clearing compared to what we have today? (e.g. what is the perf of https://github.com/dotnet/runtime/pull/98681#issuecomment-1953631152 ?)",
+        "Looks great otherwise!",
+        "> What is the perf of memory clearing compared to what we have today? (e.g. what is the perf of [#98681 (comment)](https://github.com/dotnet/runtime/pull/98681#issuecomment-1953631152) ?)\r\n\r\nFor me perf difference is 350ms (this PR) vs 320ms (Main).\r\nFrom my understanding, the issue here is that in Main we end up calling MEMSET helper as a direct call, while with this PR we call ClearWithoutReferences directly so it's always indirect. I think we should revert the to previous changes to still call InitBlock (and inline Fill/Clear into the helpers). Let me push the changes I have in mind to show",
+        "Another issue is that NativeAOT is compiled against generic CPU, so no AVX2 path \ud83d\ude1e ",
+        "Alright, I don't see a better alternative than this \ud83d\ude10 ",
+        "> > `SpanHelpers.ClearWithoutReferences` shoul be using `Unsafe.WriteUnaligned`?\r\n> \r\n> Makes sense, replaced with `WriteUnaligned`. Although, I guess a platform with super expensive unaligned writes should better go the `memset` pinvoke right away\r\n\r\n@EgorBo At some point the change to `WriteUnaligned` disappeared from this PR. I can clean this up later as part of #98812.\r\n",
+        "After sleeping on this, here are the principles that I think would be worth following for this PR:\r\n- Move all memcpy/memmove/memset/memclear etc. worker methods to SpanHelpers, so that all similar algorithms are in a single place\r\n- Stop using `Unsafe.InitBlock/CopyBlock` as implementation detail of SpanHelpers. It is hard to reason about circular interplay between these methods, SpanHelpers and the JIT\r\n- It is ok to change the UB behavior of `Unsafe.InitBlock/CopyBlock` if it is beneficial for better code sharing",
+        "@jkotas did you mean something like what I've just pushed? Or should the JIT helpers point directly to SpanHelpers (that might be tricky)?\r\n\r\nI actually have an idea how to fix the tail call problem, but would like to do it in a separate PR because it's already a bit overloaded\r\n\r\nAlso, the Fill impl can definitely be improved.",
+        "> did you mean something like what I've just pushed? Or should the JIT helpers point directly to SpanHelpers (that might be tricky)?\r\n\r\nI think we can point JIT helpers directly to SpanHelpers. The overall shape what you have pushed LGTM!",
+        "Btw, I found & fixed an existing bug - Memmove used to not throw an NRE if both src and dest are null + length is not zero e.g.:\r\n\r\n```cs\r\nBuffer.MemoryCopy(null, null, 10, 10);\r\n```\r\nthis doesn't fail (likely can be reproduced in other APIs which use Memmove under the hood)",
+        "> Memmove used to not throw an NRE if both src and dest are null + length is not zero e.g.\r\n\r\nThis is not a bug that needs fixing. Passing invalid buffer to Memmove is UB.",
+        "> > Memmove used to not throw an NRE if both src and dest are null + length is not zero e.g.\r\n> \r\n> This is not a bug that needs fixing. Passing invalid buffer to Memmove is UB.\r\n\r\nif I don't fix it, then:\r\n```cs\r\nvoid Test(MyStruct* a, MyStruct* b) => *a = *b; // or its ref version\r\n```\r\nwon't fail on both being null (or will depend on opts level)",
+        "Ok, I agree that it makes sense to fix this for internal JIT use of memory copy.",
+        "Done. I wrote some [benchmarks](https://gist.github.com/EgorBo/95054d0e1988c7ccfad856c62d823286)\r\nwhere `Core_Root_PR_tailcall` is this PR + a conservative [fix](https://github.com/EgorBo/runtime-1/commit/b1f80d6aaa5c7b655655c1e3f74dd1f7377d0cc7) for taillcalls (don't see big improvements from this). The fix is conservative because it disables unrollings for constant sizes.\r\n\r\nNOTE: PGO doesn't unroll these unknown-size memops because the opt I landed for this currently require R2R=0 and I didn't disable it.\r\n\r\nOverall looks good to me, IMO. It's possible that in some cases helper calls are always indirect because they're promoted to Tier1 together with the benchmarks, for cast helpers we did [this trick](https://github.com/dotnet/runtime/blob/79dd9bae9bb881eb716b608577c4cedc6c9cba72/src/coreclr/vm/callcounting.cpp#L665-L668), but I am not sure we want to add the whole SpanHelpers here as well.\r\n\r\nCopyBlock4000/InitBlock4000 likely struggle from going to native memset/memmove anyway from the managed helpers \r\nIt is also possible that these numbers vary a bit from run to run due to GC alignment (although, I tried to use `[MemoryRandomization]` I am not sure it helps).",
+        "> a conservative [fix](https://github.com/EgorBo/runtime-1/commit/b1f80d6aaa5c7b655655c1e3f74dd1f7377d0cc7) for taillcalls\r\n\r\nWhere would you expect it to help with the current state of the PR? The wrappers for JIT helpers are not there anymore, so the JIT helpers are not affected by this. \r\n\r\n> for cast helpers we did [this trick](https://github.com/dotnet/runtime/blob/79dd9bae9bb881eb716b608577c4cedc6c9cba72/src/coreclr/vm/callcounting.cpp#L665-L668),\r\n\r\nThis sounds like a general problem with ordering of tiered compilation. For direct calls, it would be preferable to compile the bottom layer methods faster than upper layer methods. I do not think we have anything in place to help with that (correct me if I am wrong). If there are a few more bottom layer types that we care about in particular, I do not see a problem with adding them to this workaround. ",
+        "> > Is the SpanHelpers byte overload more efficient for sizeof(T) == 1 or there is no difference?\r\n\r\n> No difference for now, but I wanted to improve the byte version so there will be\r\n\r\nIs this left for a follow up?",
+        "> Where would you expect it to help with the current state of the PR?\r\n\r\nFor ordinary managed calls for Clear/Memmove inside void methods, example:\r\n```cs\r\nvoid Test(Span<byte> span) => span.Clear();\r\n```\r\n^ the codegen is expected to perform a tail call to `SpanHelpers.ClearWithoutReferences` (it doesn't happen with this PR yet) \r\n\r\n> If there are a few more bottom layer types that we care about in particular, I do not see a problem with adding them to this workaround.\r\n\r\nOverall I agree, it's just that I'd rather want `SpanHelpers` to be promoted with a delay to avoid setting in stone weights too early (one day we'll implement the context-sensitive PGO to solve this problem differently). Also, all R2R'd methods can stay in R2R form longer. This timing issue can only manifest in simple microbenchmarks I presume (I still not sure the perf difference between indirect and direct calls are noticeable)\r\n\r\n> Is this left for a follow up?\r\n\r\nYep. We probably can ask our ARM64/Intel contributors for help here, although, I am not sure non-zero Memset is a popular operation (very few hits accross SPMI)."
+    ],
+    "merged": true,
+    "created_at": "2024-02-18T18:22:03Z",
+    "issue_context": {
+        "number": 98620,
+        "title": "memcpy/memset helpers on CoreCLR may not be suspension-friendly",
+        "body": "\r\nThis came in discussions for another fix:\r\nhttps://github.com/dotnet/runtime/pull/98547#issuecomment-1950243847\r\n\r\nWe generally try avoiding unbounded operations that may happen in coop mode while running native code as they may result in arbitrary long pauses when nothing runs except the said operation. \r\n(the operation starves GC and GC starves the rest of the app threads) \r\n\r\nThis scenario should be looked at and if needed either move to managed code, or make it happen piece-wise interleaved with suspension opportunities.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 5296,
+            "commit_id": "f5e066288f0455b840ae28c829857cbe474d5183",
+            "original_commit_id": "79dd9bae9bb881eb716b608577c4cedc6c9cba72",
+            "path": "src/libraries/System.Private.CoreLib/src/System/SpanHelpers.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "LEFT",
+            "original_position": 24,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "The PInvoke path may be still worth it - to do things like non-temporal stores for very large sizes, etc. "
+            ]
+        },
+        {
+            "hunk_id": 5298,
+            "commit_id": "f5e066288f0455b840ae28c829857cbe474d5183",
+            "original_commit_id": "79dd9bae9bb881eb716b608577c4cedc6c9cba72",
+            "path": "src/libraries/System.Private.CoreLib/src/System/SpanHelpers.ByteMemOps.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n```\r\nAnything TODO here?",
+                "um.. do you mean it needs a link? I didn't spend enough time testing this treshold on different cpus/platforms yet. I presume it also can't be too big to avoid regressing NAOT compiled for generic cpu.",
+                "If you believe that somebody should spend time on this, it should have a link.\r\n\r\nIt is complicated to pick one universal threshold, so I am not sure whether it would be time well spent. You end up picking your winners and losers. Anything in the 1kB-10kB range sounds about right to me. The point of threshold is to amortize the cost of the PInvoke transition.\r\n\r\nIf there is something to look at here, I think it would be the infinite threshold for Arm64 memcpy. I would expect that the unmanaged memcpy is going to have more tricks that we have here. The threshold for Arm64 was set years ago when the Arm64 optimizations in the overall ecosystem were just starting to show up.",
+                "I wasn't able to find any regressions from that infinite threshold on modern hw in microbenchmarks, but it's very possible the picture is different in real world due to those non-temporal stores etc. \r\nI agree it won't hurt to change that treshold to some big value like 32kb etc",
+                "I'll remove this comment as part of the `GT_STORE_DYN_BLK` clean up PR to avoid spinning CI for comment change if you don't mind"
+            ]
+        },
+        {
+            "hunk_id": 6953,
+            "commit_id": "f5e066288f0455b840ae28c829857cbe474d5183",
+            "original_commit_id": "79dd9bae9bb881eb716b608577c4cedc6c9cba72",
+            "path": "src/libraries/System.Private.CoreLib/src/System/SpanHelpers.ByteMemOps.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n```\r\nAnything TODO here?",
+                "um.. do you mean it needs a link? I didn't spend enough time testing this treshold on different cpus/platforms yet. I presume it also can't be too big to avoid regressing NAOT compiled for generic cpu.",
+                "If you believe that somebody should spend time on this, it should have a link.\r\n\r\nIt is complicated to pick one universal threshold, so I am not sure whether it would be time well spent. You end up picking your winners and losers. Anything in the 1kB-10kB range sounds about right to me. The point of threshold is to amortize the cost of the PInvoke transition.\r\n\r\nIf there is something to look at here, I think it would be the infinite threshold for Arm64 memcpy. I would expect that the unmanaged memcpy is going to have more tricks that we have here. The threshold for Arm64 was set years ago when the Arm64 optimizations in the overall ecosystem were just starting to show up.",
+                "I wasn't able to find any regressions from that infinite threshold on modern hw in microbenchmarks, but it's very possible the picture is different in real world due to those non-temporal stores etc. \r\nI agree it won't hurt to change that treshold to some big value like 32kb etc",
+                "I'll remove this comment as part of the `GT_STORE_DYN_BLK` clean up PR to avoid spinning CI for comment change if you don't mind"
+            ]
+        },
+        {
+            "hunk_id": 5297,
+            "commit_id": "f5e066288f0455b840ae28c829857cbe474d5183",
+            "original_commit_id": "79dd9bae9bb881eb716b608577c4cedc6c9cba72",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Span.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 303,
+            "original_line": 303,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Is the SpanHelpers byte overload more efficient for sizeof(T) == 1 or there is no difference? If the byte overload is more efficient, we may want to keep this check and call the byte overload for sizeof(T) == 1.",
+                "> Is the SpanHelpers byte overload more efficient for sizeof(T) == 1 or there is no difference?\r\n\r\nNo difference for now, but I wanted to improve the byte version so there will be"
+            ]
+        },
+        {
+            "hunk_id": 6951,
+            "commit_id": "f5e066288f0455b840ae28c829857cbe474d5183",
+            "original_commit_id": "79dd9bae9bb881eb716b608577c4cedc6c9cba72",
+            "path": "src/libraries/System.Private.CoreLib/src/System/SpanHelpers.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "LEFT",
+            "original_position": 24,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "The PInvoke path may be still worth it - to do things like non-temporal stores for very large sizes, etc. "
+            ]
+        },
+        {
+            "hunk_id": 6952,
+            "commit_id": "f5e066288f0455b840ae28c829857cbe474d5183",
+            "original_commit_id": "79dd9bae9bb881eb716b608577c4cedc6c9cba72",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Span.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 303,
+            "original_line": 303,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Is the SpanHelpers byte overload more efficient for sizeof(T) == 1 or there is no difference? If the byte overload is more efficient, we may want to keep this check and call the byte overload for sizeof(T) == 1.",
+                "> Is the SpanHelpers byte overload more efficient for sizeof(T) == 1 or there is no difference?\r\n\r\nNo difference for now, but I wanted to improve the byte version so there will be"
+            ]
+        }
+    ]
+}

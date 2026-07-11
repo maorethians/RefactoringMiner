@@ -1,0 +1,63 @@
+{
+    "repo": "osquery/osquery",
+    "pr_number": 5268,
+    "lang": "cpp",
+    "pr_title": "distributed query reliability",
+    "pr_body": "These changes are to make distributed queries more flexible and more reliable.\r\n - If watcher kills distributed worker, it will be detected and results reported to distributed_write with status 9.\r\n - Fixes #5260 where discovery queries have no effect.\r\n - Add **distributed_write_individually** boolean flag, false by default.  If true, results are reported to distributed_write endpoint after each query, rather than accumulating all results in memory and waiting for them all to finish.\r\n - Add **distributed_intra_sleep** uint64 flag, 0 by default.  If greater than zero, it's the number of seconds to sleep between distributed queries in the same work set.  This help spread out CPU load when running several queries in the same distributed request. Maximum is 30 seconds.\r\n - Removed a bunch of needless serialization/deserialization and related gtests.\r\n - Added several tests, as well as a mock distributed plugin to help test.\r\n- Validate _accelerate_ value, should be greater than zero, less than 1 hour.\r\n- Add logging of discovery queries and when results are dropped due to distributed_write endpoint down.\r\n ",
+    "pr_comments": [],
+    "merged": false,
+    "created_at": "2018-11-13T22:32:02Z",
+    "issue_context": {
+        "number": 5260,
+        "title": "Distributed queries execute regardless of discovery",
+        "body": "# Bug report\r\n\r\nAccording to the documentation, \"If all of the discovery queries return more than zero rows, then the queries are added to the query schedule\".  However, the code in distributed.cpp acceptWork() will add queries regardless of the discovery scan results.\r\n\r\n### What operating system and version are you using?\r\n\r\nThe bug is cross platform. I'm on MacOS X 10.13.6\r\n\r\n### What version of osquery are you using?\r\n\r\nversion = 3.3.1-32-g28ffde72\r\n\r\n### What steps did you take to reproduce the issue?\r\n\r\nUse a distributed setup with a discovery query.  For example, the following 1_1 query should never run, since the discovery 'past' query will not return any rows\r\n\r\n`{\"discovery\":{\"past\":\"SELECT * from time where year=1902;\"}, \"queries\":{\"1_1\":\"SELECT * FROM osquery_info;\"}}`\r\n\r\n### What did you expect to see?\r\n\r\nThe response from the above request should be:\r\n\r\n`{\"queries\":{\"1_1\":[]},\"statuses\":{\"1_1\":0}}`\r\n\r\n### What did you see instead?\r\n\r\nThe result for queries '1_1' will be populated.\r\n",
+        "comments": [
+            "Hrm. I can't find docs about how discovery queries and distributed queries are supposed to interact. But I did stare at the code a bunch... I don't know what correct is here, but it looks like the behavior as written expects the discovery query to be named the same as the query. Eg: there's a 1:1 map between them. So you'd want \r\n```\r\n{\"discovery\":{\"1_1\":\"SELECT * from time where year=1902;\"}, \"queries\":{\"1_1\":\"SELECT * FROM osquery_info;\"}}\r\n```\r\n_But_ I think the logic is wrong anyhow. If _all_ the discovery queries have no results, then `queries_to_run` remains empty, and all the distributed queries succeed.\r\n\r\nSo, if I read this correctly, you can get the desired behavior via:\r\n```json\r\n{\"discovery\":{\r\n   \"bogus\":\"SELECT 1;\",\r\n   \"1_1\":\"SELECT * from time where year=1902;\"\r\n}, \r\n\"queries\":{\"1_1\":\"SELECT * FROM osquery_info;\"}}\r\n```\r\n\r\nOf course, this is terrible. The underlying logic shouldn't be that hard to fix. Only I don't know what it _should_ be. I tend to think the syntax should match that of packs -- discovery queries is an array, not a map. But that is potentially an API change. ",
+            "> Of course, this is terrible.\r\n\r\nAgreed, we should revisit the documentation, expectation, and implementation here.",
+            "+1\r\n\r\nAlso: [examples](https://github.com/osquery/osquery/blob/1699adc38741c05bd9cf02fe6995a9aca9de9504/tools/tests/test_http_server.py#L87-L98) in the test http servers show the functionality being used to restrict the queries to some platforms. Maybe the packs scoping via discovery (as list of queries)/platform/version could be used for the distributed queries too.",
+            "Hi folks.\r\n\r\nFleet currently makes use of \"distributed discovery queries\" for avoiding the \"no such table\" errors with some extension tables, see [here](https://github.com/fleetdm/fleet/blob/15de4f3e65883abbb08ead57102e40f2fcac809c/server/service/osquery_utils/queries.go#L360-L363).\r\nAt the time, we decided to use the undocumented feature because it is useful to Fleet and the code/logic hasn't change in ~5 years.\r\n\r\nWe attempted to explain the undocumented \"distributed discovery\" implementation [here](https://github.com/fleetdm/fleet/blob/9d01ba33c6e5f85bc5fb8c3dc61c5b875193a5de/server/service/osquery.go#L575-L587), and is also documented by `osquery-go` [here](https://github.com/osquery/osquery-go/blob/df1df42c82067c127a136c13406a32eeb9e3e7da/plugin/distributed/distributed.go#L21-L26). In order to use the feature Fleet has to set a `SELECT 1;` query for the queries that do not need a discovery query.\r\n\r\nPutting the odd logic/behavior aside, the bug as mentioned in this issue is that all queries are executed if:\r\n- `discovery` queries are present, and,\r\n- all discovery queries return no rows.\r\n\r\nIn #7655, I propose a simple fix for this bug without changing the odd behavior/logic (+ it adds some tests to `acceptWork`).\r\n\r\nI'm open to discuss changing the behavior on another issue (maybe not requiring all queries to have a discovery query would make more sense). This would avoid having to send `SELECT 1;` on the queries that should run no matter what.",
+            "Hi @lucasmrod, thank you so much for taking a pass here.\r\n\r\nI am not sure that this is the correct solution, but I'm willing to hear more.\r\n\r\nI think there are maybe two points to discuss. The first is whether or not we should keep distributed discovery queries so dramatically different than scheduled queries. And the second is whether to require the `SELECT 1`.\r\n\r\nAs for the first, I feel very unsure. One of the things I find hardest about osquery, is that it feels like we have very little consistency. Discovery queries here, are completely different than on schedules. Etc. That sort of skew is a huge mental toll. So, somewhat, I favor making this more consistent -- discovery queries should be an array. Counterpoint -- I really wish discovery queries could be query-level, and not just pack level. And this may be the only way to get query level discovery queries on distributed queries. So maybe it's fine to double down on this, and maybe we can fix it in some hypothetical future API.\r\n\r\nAs for the second, I think if we embrace the discovery-queries-as-a-hash, I think we should not require `SELECT 1`. That feels like an API bug. If the query is not present in the hash, then we **should** execute it.\r\n\r\nThere's maybe some side question as well -- scheduled discovery queries allow one to have multiple discover queries. In a hash, I'm not sure how we can easily support that. (we could introspect the json response, but that's hard in go)",
+            "> I think there are maybe two points to discuss. The first is whether or not we should keep distributed discovery queries so dramatically different than scheduled queries. And the second is whether to require the SELECT 1.\r\nAs for the first, I feel very unsure. One of the things I find hardest about osquery, is that it feels like we have very little consistency. Discovery queries here, are completely different than on schedules. Etc. That sort of skew is a huge mental toll. So, somewhat, I favor making this more consistent -- discovery queries should be an array. Counterpoint -- I really wish discovery queries could be query-level, and not just pack level. And this may be the only way to get query level discovery queries on distributed queries. So maybe it's fine to double down on this, and maybe we can fix it in some hypothetical future API.\r\n\r\nI agree with your points here. Some consistency between features would be cool, but at the same time query-level discoveries is a useful feature in distributed queries.\r\n\r\n> As for the second, I think if we embrace the discovery-queries-as-a-hash, I think we should not require SELECT 1. That feels like an API bug. If the query is not present in the hash, then we should execute it.\r\n\r\nAgree on this one too, Fleet sets `SELECT 1;` on the queries that don't require a discovery query.\r\nThe logic should instead be that if there's no discovery query for a query then it should just run.\r\n(The PR linked to this issue just fixes a corner-case bug, IMO this logic should be changed on a separate issue/PR.)\r\n\r\n> There's maybe some side question as well -- scheduled discovery queries allow one to have multiple discover queries. In a hash, I'm not sure how we can easily support that. (we could introspect the json response, but that's hard in go)\r\n\r\nThis could be supported by defining the values of the discovery hash as an array of queries instead of a single query string.\r\nBut that would require either a breaking change in the API or a new `discovery2` field. Not sure how requested such feature is."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 68720,
+            "commit_id": "bc4d56a4ff8de69a622408ff576f3d1c3b3fdb27",
+            "original_commit_id": "0314871908273b2770129da9f5a7c3206f224f68",
+            "path": "osquery/distributed/distributed.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 463,
+            "original_line": 464,
+            "side": "RIGHT",
+            "original_position": 592,
+            "position": 591,
+            "subject_type": "line",
+            "review_comments": [
+                "You should log what that value is",
+                "I would be afraid of an exception.  accelerate is a JSON abstracted type that is expected int, but could be any type. is there a to_s() equivalent?"
+            ]
+        },
+        {
+            "hunk_id": 68719,
+            "commit_id": "bc4d56a4ff8de69a622408ff576f3d1c3b3fdb27",
+            "original_commit_id": "0314871908273b2770129da9f5a7c3206f224f68",
+            "path": "osquery/distributed/distributed.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 168,
+            "original_line": 171,
+            "side": "RIGHT",
+            "original_position": 143,
+            "position": 141,
+            "subject_type": "line",
+            "review_comments": [
+                "Should you notify the user you're overriding their flag settings here?",
+                "Added LOG line"
+            ]
+        }
+    ]
+}

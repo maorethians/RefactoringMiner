@@ -1,0 +1,149 @@
+{
+    "repo": "OpenRA/OpenRA",
+    "pr_number": 19335,
+    "lang": "c_sharp",
+    "pr_title": "Overhaul player color logic",
+    "pr_body": "The current player color logic has served us well, but has a few problems:\r\n\r\n1. The colors in the palette's remap range are completely ignored, and replaced with a linear range (with a special case for D2k's reverse linear range). This works well enough for RA / TD / D2k, but fails badly on any project that doesn't have uniformly spaced brightness steps between colors. Many community mods (including the planned content update for the SDK example mod) resorted to custom code (@IceReaper's `OverlayPlayerColorPalette`) to bypass this... but this should really be solved upstream.\r\n\r\n2. The color validator has always been flakey, allowing some players to successfully set colors that make them hard to see on the minimap, and other times rejecting colors that are clearly distinct (including some of the preset colors on the palette tab!)\r\n\r\n3. The brightness adjustments don't work with the chroma-key remapping for RGBA sprites (remaster assets + mod support). While i'm sure it would be possible to come with some ad-hoc rules to make this usable in some form, I don't think its worth the trouble. On the technical side, having only two variables define the player color allows us to pack all the required information (including the min and max hue for the chroma keying) into a single vec4, simplifying the implementation. \r\n\r\nThis PR aims to solve the above three points. The first three commits move code and definitions around without changing much behaviour. The idea was to centralize all the color picker logic in one place to make it easier for modders to restore the previous behaviour or introduce their own if the new approach does not suit them.\r\n\r\nThe fourth commit replaces the remap logic with a new implementation that roughly matches the behaviour of the upcoming RGBA chroma-key remapping (but not exactly: we're still overriding the hue and saturation instead of applying a delta - the delta approach looks bad with the RA palette).\r\n\r\nThe final commit reworks the color validation logic and UI:\r\n\r\n<img width=\"417\" alt=\"hspicker\" src=\"https://user-images.githubusercontent.com/167819/114286871-7ffdb680-9a5a-11eb-914d-d850e5e280db.png\">\r\n\r\nCloses #10906.\r\nCloses #17582.\r\nCloses #17941.\r\nFixes #19133.\r\n\r\nDuring my research on this I found https://www.compuphase.com/cmetric.htm, which appears to be the original source for our current validator logic. It turns out that #6239 missed a subtle but important point: the normal `Color` objects that we are used to are in the SRGB (i.e. gamma-corrected) color space, but the algorithm requires linear (non-gamma-corrected) colors! This goes a long way towards explaining (2).\r\n\r\nReducing the selectable colors to a fixed brightness also helps with (2), as the v=0.95 plane is brighter than most of the default terrain colors, making it impossible to select a color that conflicts with most of the terrain. There is overlap with the resource colors, but the fixed validator logic seems to handle this well enough.\r\n\r\nThis change also requires a new set of preset colors to be defined for each mod, and rather than repeating the long process from the first time I wrote a script that could visualise the color space and the validation thresholds. I started by placing a ring of 8 saturated and 8 desaturated colors, then tweaked the positions to reduce overlap between eachother and with the resource colors.\r\n\r\n<details>\r\n <summary>Expand to see python code</summary>\r\n\r\nPaste this into a Jupyter notebook cell (or your preferred alternative):\r\n\r\n```python\r\nimport matplotlib.pyplot as plt\r\nfrom matplotlib.patches import Polygon\r\nimport numpy as np\r\nfrom PIL import ImageColor\r\nfrom scipy.spatial import ConvexHull\r\n\r\n\r\ndef lerp(a, b, t):\r\n    return a + t * (b - a)\r\n\r\ndef srgb_to_linear(srgb):\r\n    return np.where(srgb <= 0.04045, srgb / 12.92, np.power((srgb + 0.055) / 1.055, 2.4))\r\n\r\ndef color_distance(srgb1, srgb2):\r\n    c1 = srgb_to_linear(np.atleast_2d(srgb1))\r\n    c2 = srgb_to_linear(np.atleast_2d(srgb2))\r\n    \r\n    rmean = (c1[:, 0] + c2[:, 0]) / 2\r\n    w = np.array([2 + rmean, 4 * np.ones_like(rmean), 3 - rmean]).T\r\n    return np.linalg.norm(np.sqrt(w) * (c1 - c2), axis=1)\r\n\r\ndef hsv_to_rgb(h, s, v):\r\n    px = np.abs(h % 1 * 6. - 3)\r\n    py = np.abs((h + 2. / 3) % 1 * 6. - 3)\r\n    pz = np.abs((h + 1. / 3) % 1 * 6. - 3)\r\n    return v * np.dstack((\r\n        lerp(1., np.clip(px - 1, 0, 1), s),\r\n        lerp(1., np.clip(py - 1, 0, 1), s),\r\n        lerp(1., np.clip(pz - 1, 0, 1), s)))\r\n\r\ndef cartesian_to_srgb(x, y, v):\r\n    sat = np.linalg.norm([x, y], axis=0)\r\n    hue = np.arctan2(y, x) / (2 * np.pi)\r\n    return hsv_to_rgb(hue, sat, v)\r\n\r\ndef generate_samples(density, min_sat=0, max_sat=1, v=0.95):\r\n    y = np.arange(-1, 1, density)\r\n    x = np.arange(-1, 1, density)\r\n    xx, yy = np.meshgrid(x, y)\r\n    srgb = cartesian_to_srgb(xx, yy, v)\r\n\r\n    sat = np.linalg.norm([xx, yy], axis=0)\r\n    valid = np.logical_and(sat > min_sat, sat < max_sat)\r\n\r\n    return xx[valid], yy[valid], srgb[valid]\r\n\r\ndef plot_threshold_hull(c, x, y, srgb, threshold=0.314):\r\n    distance = color_distance(c, srgb)\r\n    blocked = np.vstack([x[distance < threshold], y[distance < threshold]]).T\r\n    if len(blocked) == 0:\r\n        return\r\n    \r\n    hull = ConvexHull(blocked)\r\n    for simplex in hull.simplices:\r\n        plt.plot(blocked[simplex, 0], blocked[simplex, 1], '-', color=c[0])\r\n\r\ndef plot_preset_colors(hue, saturation, terrain, v=0.95):\r\n    plt.figure(figsize=(10, 10))\r\n    ax = plt.gca()\r\n\r\n    # Coarse grid for background\r\n    x, y, srgb = generate_samples(0.03, 0.3, 0.95, v=v)\r\n    plt.scatter(x, y, c=srgb, s=2)\r\n\r\n    # Fine grid for polygons\r\n    x, y, srgb = generate_samples(0.005, 0.3, 0.95, v=v)\r\n\r\n    for tc in terrain:\r\n        c = np.atleast_2d(ImageColor.getcolor(tc, \"RGB\")) / 255.\r\n        plot_threshold_hull(c, x, y, srgb)\r\n\r\n    for j in range(2):\r\n        for i in range(0, 8):\r\n            k = j * 8 + i\r\n            if k >= len(hue):\r\n                break\r\n\r\n            # Blocking threshold\r\n            ix = saturation[k] * np.cos(hue[k] * 2 * np.pi)\r\n            iy = saturation[k] * np.sin(hue[k] * 2 * np.pi)\r\n            ic = cartesian_to_srgb(ix, iy, v)[0]\r\n\r\n            plot_threshold_hull(ic, x, y, srgb)\r\n\r\n            # Color indicator\r\n            plt.plot(ix, iy, 's', color=ic[0])\r\n\r\n            # Preset color bar\r\n            plt.plot(i / 4 - 7/8., -j / 4 - 1.25, 's', color=hsv_to_rgb(hue[k], saturation[k], 0.95)[0][0], ms=51)\r\n\r\n    plt.xlim(-1, 1)\r\n    plt.ylim(-1.63, 1)\r\n    plt.xticks([])\r\n    plt.gca().set_aspect(1)\r\n    plt.yticks([])\r\n```\r\n\r\nand then generate the plot for e.g. ra:\r\n\r\n```python\r\nra_hue = [0, 0.125, 0.22, 0.375, 0.5, 0.56, 0.8, 0.88, 0, 0.15, 0.235, 0.4, 0.47, 0.55, 0.75, 0.85]\r\nra_sat = [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.4, 0.5, 0.4, 0.5, 0.4, 0.5, 0.4, 0.5]\r\nra_terrain = [\r\n    '#000000',\r\n    '#1C2024',\r\n    '#284428',\r\n    '#44443C',\r\n    '#587474',\r\n    '#5C74A4',\r\n    '#5C8CB4',\r\n    '#5DA5CE',\r\n    '#5E430D',\r\n    '#606060',\r\n    '#6F848B',\r\n    '#745A3F',\r\n    '#8470FF',\r\n    '#865F45',\r\n    '#948060',\r\n    '#A87B53',\r\n    '#B09C78',\r\n    '#C4C4C4',\r\n    '#D0C0A0',\r\n]\r\n\r\nplot_preset_colors(ra_hue, ra_sat, ra_terrain)\r\n```\r\n</details>\r\n\r\nHere are the colors for TD:\r\n\r\n![preset_cnc](https://user-images.githubusercontent.com/167819/114288168-e7b8ff00-9a64-11eb-8048-ee515e7d5223.png)\r\n\r\nThe small coloured dots in the background define the hue-saturation plane, which is the same as what we show ingame, but in its natural shape instead of cutting and stretching it into a rectangle. The coloured outlines show the validator limits for each of the preset colors marked with a square, and for the green and blue tiberium (top and left of the circle without squares).\r\n\r\nThe filled squares along the bottom show the presets as they appear in the color chooser.\r\n\r\nThis shows that the 16 colors are separated about as well as we can hope, covering most of the color space and not blocking eachother (none of the colored squares are inside the shape from another color).\r\n\r\n<details>\r\n <summary>Colors for RA</summary>\r\n<img src=\"https://user-images.githubusercontent.com/167819/114288320-97db3780-9a66-11eb-845f-7e799c66af51.png\" />\r\n</details>\r\n\r\n<details>\r\n <summary>Colors for D2k</summary>\r\n<img src=\"https://user-images.githubusercontent.com/167819/114288324-ab869e00-9a66-11eb-9972-358356c2c9f5.png\" />\r\n</details>\r\n\r\n<details>\r\n <summary>Colors for TS (uses the same as TD for simplicity)</summary>\r\n<img src=\"https://user-images.githubusercontent.com/167819/114288334-c1945e80-9a66-11eb-8392-fabc18cade39.png\" />\r\n</details>\r\n\r\nI expect this to be the last must-have remaster support PR needed to release a public preview that supports cross-play with the next release. The rest of the changes (including the chroma-key remapping itself) don't impact multiplayer compatibility, so there is less rush to merge them upstream.\r\n\r\nThis is a relatively small PR all things considered, but the underlying logic with the different color spaces and transformations is inherantly messy and confusing. It has taken me several sessions over the last few months to properly understand all these details, so I don't expect anybody else to off the top of their head either. If anything doesn't make sense just ask and i'll either try to explain here or if appropriate improve commenting in the code.",
+    "pr_comments": [
+        "Now needs a rebase/update for #19239.",
+        "Updated:\r\n* Rebased\r\n* Fixed penev's comments above\r\n* Fixed some more inconsistencies i noticed myself\r\n* Fixed the titan turret facing in the TS color picker\r\n\r\nStill need to update my own comment above.",
+        "Could we update `Color.ToAhsv()` to use the tuple syntax?\r\n\r\n```cs\r\n\r\n\t\tpublic (int A, float H, float S, float V) ToAhsv()\r\n\t\t{\r\n\t\t\tvar (h, s, v) = RgbToHsv(R, G, B);\r\n\r\n\t\t\treturn (A, h, s, v);\r\n\t\t}\r\n```",
+        "Updated.",
+        "Fixed.",
+        "Rebased.",
+        "Added an extra commit to move all the palette traits to a single location.",
+        "Looks good to me, needs a rebase, though.",
+        "Rebased.",
+        "Updated.",
+        "Updated to avoid multiple enumeration.",
+        "Rebased.",
+        "https://github.com/OpenRA/OpenRA/wiki/Changelog-(bleed)/_compare/e6f2a451e699b6272af69837af2cd9cd3403b3ed...dec025b6fe126fc2d1490b58c41cb7484c37010e",
+        "Hi, I just wanted to say that word is spreading amongst the Red Alert players that the color picker will be highly gimped next release. This is not going over well with some. Despite it's shortcomings, I've never heard anyone complain about it. Besides a solution for this already exists in the player color stance option. A lot of people are attached to or identify with certain colors that aren't in the selected 16. Please reconsider. Thanks.",
+        "The 16 colours in the plots above are the presets on the second tab of the colour chooser. Players are not limited to just those.",
+        "> \r\n> \r\n> The 16 colours in the plots above are the presets on the second tab of the colour chooser. Players are not limited to just those.\r\n\r\nmy bad... I guess I was misinformed."
+    ],
+    "merged": true,
+    "created_at": "2021-05-09T09:11:17Z",
+    "issue_context": {
+        "number": 19133,
+        "title": "TS Titan turret facing north in colorpicker preview",
+        "body": "It should face the same direction as its feet.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 1937,
+            "commit_id": "c13f0fd1b9550a6064d2dcd2c631b9814ba6be8d",
+            "original_commit_id": "52577c1de9f210018e3be44938b87944f3a19639",
+            "path": "OpenRA.Mods.Common/Widgets/Logic/Lobby/LobbyUtils.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 238,
+            "original_line": 238,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "cant we just use orderManager.World here?",
+                "`orderManager.World` refers to the world that hasn't yet been created for the game (null at this point), `worldRenderer.World` refers to the shellmap. This is all a mess that would be nice to clean up one day, but for now we can't use `orderManager.World`."
+            ]
+        },
+        {
+            "hunk_id": 2091,
+            "commit_id": "c13f0fd1b9550a6064d2dcd2c631b9814ba6be8d",
+            "original_commit_id": "52577c1de9f210018e3be44938b87944f3a19639",
+            "path": "OpenRA.Mods.Common/Widgets/Logic/ColorPickerLogic.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 37,
+            "original_line": 37,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "Need to remove the event handler?",
+                "`mixer` has the same lifetime (both belong to the color picker panel dialog) as this logic class, so shouldn't be needed."
+            ]
+        },
+        {
+            "hunk_id": 1935,
+            "commit_id": "c13f0fd1b9550a6064d2dcd2c631b9814ba6be8d",
+            "original_commit_id": "52577c1de9f210018e3be44938b87944f3a19639",
+            "path": "OpenRA.Mods.Common/Widgets/Logic/ColorPickerLogic.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 37,
+            "original_line": 37,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "Need to remove the event handler?",
+                "`mixer` has the same lifetime (both belong to the color picker panel dialog) as this logic class, so shouldn't be needed."
+            ]
+        },
+        {
+            "hunk_id": 2093,
+            "commit_id": "c13f0fd1b9550a6064d2dcd2c631b9814ba6be8d",
+            "original_commit_id": "52577c1de9f210018e3be44938b87944f3a19639",
+            "path": "OpenRA.Mods.Common/Widgets/Logic/Lobby/LobbyUtils.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 238,
+            "original_line": 238,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "cant we just use orderManager.World here?",
+                "`orderManager.World` refers to the world that hasn't yet been created for the game (null at this point), `worldRenderer.World` refers to the shellmap. This is all a mess that would be nice to clean up one day, but for now we can't use `orderManager.World`."
+            ]
+        },
+        {
+            "hunk_id": 1936,
+            "commit_id": "c13f0fd1b9550a6064d2dcd2c631b9814ba6be8d",
+            "original_commit_id": "52577c1de9f210018e3be44938b87944f3a19639",
+            "path": "OpenRA.Mods.Common/Traits/World/ColorPickerManager.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 90,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 91,
+            "position": 90,
+            "subject_type": "line",
+            "review_comments": [
+                "We enumerate terrainColor and playerColors several times and if you look at where these values comes from, i dont think that is intended?",
+                "Not sure what type of fix you were thinking here so will wait for clarification before I change anything."
+            ]
+        },
+        {
+            "hunk_id": 2092,
+            "commit_id": "c13f0fd1b9550a6064d2dcd2c631b9814ba6be8d",
+            "original_commit_id": "52577c1de9f210018e3be44938b87944f3a19639",
+            "path": "OpenRA.Mods.Common/Traits/World/ColorPickerManager.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 90,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 91,
+            "position": 90,
+            "subject_type": "line",
+            "review_comments": [
+                "We enumerate terrainColor and playerColors several times and if you look at where these values comes from, i dont think that is intended?",
+                "Not sure what type of fix you were thinking here so will wait for clarification before I change anything."
+            ]
+        }
+    ]
+}

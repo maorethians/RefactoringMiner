@@ -1,0 +1,97 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 10410,
+    "lang": "cpp",
+    "pr_title": "Rework Exception Internals",
+    "pr_body": "Fixes #6521\r\nFixes #10127\r\n\r\nThis PR reworks the way that exceptions work internally. Previously we had an inheritance hierarchy (`std::exception <- Exception <- StandardException <- BinderException`) and had information stored at different points along that hierarchy.\r\n\r\nIn addition, we used RTTI when catching exceptions to differentiate between different behaviors (e.g. at some locations in the code we would treat a `StandardException` differently from an `Exception`).\r\n\r\nThis caused some problems - particularly around extension loading. As we use static linking for easier distribution of extensions, symbols are duplicated (once in the extension and once in the base system) - causing this RTTI to fail one some platforms and generally causing odd issues.\r\n\r\n#### std::runtime_exception\r\n\r\nThis PR reworks exceptions so that `Exception` inherits from `std::runtime_error`, and **does not store any additional data** other than the error message that is passed onto `std::runtime_error`. As a result, all exception types can be treated the same - as `ex.what()` always returns the **full** contents of the error regardless of exception type.\r\n\r\n`Exception` stores all exception data in JSON format. For example, a `BinderException(\"Table not found\")` is stored as:\r\n\r\n```json\r\n{\r\n\t\"exception_type\": \"Binder\",\r\n\t\"exception_message\": \"Table not found\"\r\n}\r\n```\r\n\r\n`ex.what()` returns this JSON. As such, it should no longer be used to inspect the contents of the error. Instead, the `ErrorData` object (previously `PreservedError`) should be used. This class will de-compose the JSON and provide access to the underlying exception properties:\r\n\r\n```cpp\r\ncatch(std::exception &ex) {\r\n\tErrorData error(ex);\r\n\terror.Type(); // ExceptionType::BINDER\r\n\terror.RawMessage(); // Table not found\r\n\terror.Message(); // Binder Exception: Table not found\r\n}\r\n```\r\n\r\nThis greatly simplifies error handling and makes it less error prone, as we now only need to handle `std::exception`, instead of having multiple catches for different exception types. \r\n\r\nNote that from the perspective of the thrower, nothing changes. `throw BinderException(\"...\")` still works just like it did before.\r\n\r\n#### extra_info\r\n\r\nExceptions are also extended with support for extra exception information in the form of string key-value pairs. The extra key-value pairs can be inspected using `ErrorData::ExtraInfo`.\r\n\r\n#### Query Error Location\r\n\r\nMany errors contain information pointing to where in the query the error occurred, e.g.:\r\n\r\n```sql\r\nD select * from tbl;\r\n-- Error: Catalog Error: Table with name tbl does not exist!\r\n-- Did you mean \"system.information_schema.tables\"?\r\n-- LINE 1: select * from tbl\r\n--                       ^\r\n```\r\n\r\nPreviously, this information was added during construction of the error, using either `Binder::FormatError` or `QueryErrorContext::FormatError`. This then looked at the position in the query combined with the query string to construct the error marker.\r\n\r\nThe challenge here is that, in order to do this at the location where the error is thrown, we need to have access to both the query text and the position. As we do not have easy access to the full query text at all locations in the code this is not always easy - and in practice this limited this type of error reporting to parser and binding errors.\r\n\r\nIn this PR we rework the way that query error location reporting works by instead utilizing the `extra_info`. When constructing an exception we can provide a query error location, e.g.:\r\n\r\n```cpp\r\nthrow BinderException(expr.query_location, \"Error in expression!\");\r\n```\r\n\r\nOr short-hand:\r\n\r\n```cpp\r\nthrow BinderException(expr, \"Error in expression!\");\r\n```\r\n\r\nThe query location will be propagated upwards, and the full error message will only be constructed in `ClientContext::ProcessError` where we have full access to the query text.\r\n\r\nThis way, reporting query error locations is simpler and can be done in many more locations. This PR also adds query error positions to bound expressions (`Expression`) - allowing this information to be included in error messages more frequently in the future. \r\n\r\n#### string -> ErrorData\r\n\r\nAnother change made by this PR is that we used `std::string` to represent errors in many instances. While this works - it is rather error-prone. In addition, only returning the raw string message means we cannot return `extra_info`, or an exception type.\r\n\r\nIn this PR we replace many of these instances with `ErrorData` instead (e.g. in the `BindResult`, as return value of various functions, etc).\r\n\r\nThis changes a lot of code from this:\r\n\r\n```cpp\r\nauto error = Function();\r\nif (!error.empty()) {\r\n\tthrow BinderException(error);\r\n}\r\n```\r\n\r\nTo this:\r\n\r\n```cpp\r\nauto error = Function();\r\nif (error.HasError()) {\r\n\terror.Throw();\r\n}\r\n```\r\n\r\n\r\n#### HTTPException\r\n\r\nThe `HTTPException` was previously added as a special class that held extra information surrounding HTTP errors (see #6533). We later ran into issues with this type being thrown from extensions due to the aforementioned RTTI issues (#9351). In this PR, the `HTTPException` has been restored (and #9351 has been reverted). The HTTPException is no longer a special case, however, it merely fills up the `extra_info` with the HTTP exception information.\r\n\r\n#### errors_as_json\r\n\r\nThe `errors_as_json` can be set to obtain error information in raw JSON format. For certain errors, extra information or decomposed information is provided for easier machine processing. For example:\r\n\r\n```sql\r\nSET errors_as_json=true;\r\nSELECT * FROM nonexistent_tbl;\r\n```\r\n\r\n```json\r\n{\r\n   \"exception_type\":\"Catalog\",\r\n   \"exception_message\":\"Table with name nonexistent_tbl does not exist!\\nDid you mean \\\"temp.information_schema.tables\\\"?\",\r\n   \"name\":\"nonexistent_tbl\",\r\n   \"candidates\":\"temp.information_schema.tables\",\r\n   \"position\":\"14\",\r\n   \"type\":\"Table\",\r\n   \"error_subtype\":\"MISSING_ENTRY\"\r\n}\r\n```\r\n\r\n#### Breaking Changes\r\n\r\nThis PR contains a number of breaking changes:\r\n\r\n* The `Exception(string)` constructor has been removed - instead you must create an exception with a type (e.g. `Exception(ExceptionType::BINDER, string)`, but preferably `BinderException(string)`)\r\n* Several exceptions are moved to their own header (`CatalogException`, `BinderException`, etc).\r\n* `ValueOutOfRangeException` and `OutOfRangeException` are merged into one -> `OutOfRangeException`\r\n* `CastException` and `ConversionException` are merged into one -> `ConversionException`\r\n\r\n\r\n#### Python & Java\r\n\r\nCC @Mause\r\n \r\nBoth Python & Java clients have been modified to support the new exception handling - Python had the heaviest surgery. Perhaps have a look?\r\n\r\n#### Others\r\n\r\nThe `visualizer` extension is removed.",
+    "pr_comments": [
+        "As I was reading I remembered a recent issue/discussion about wanting to know what column was responsible for the error and how this would enable that, but you beat me to it haha\r\n\r\n> This PR also adds query error positions to bound expressions (Expression) - allowing this information to be included in error messages more frequently in the future.",
+        "Thanks for the comments - I'll merge this as-is to avoid piling on too many merge conflicts and address the Python client issues in a separate PR"
+    ],
+    "merged": true,
+    "created_at": "2024-02-01T08:21:47Z",
+    "issue_context": {
+        "number": 10127,
+        "title": "Process Exits on Invalid PRAGMA with DuckDB Golang Binding",
+        "body": "### What happens?\n\nI'm experiencing an issue with the DuckDB Golang binding (go-duckdb v1.5.6) where executing a PRAGMA statement with a non-existent function causes the process to exit unexpectedly. \n\n### To Reproduce\n\n```go\r\npackage main\r\n\r\nimport (\r\n\t\"database/sql\"\r\n\t_ \"github.com/marcboeker/go-duckdb\"\r\n)\r\n\r\nfunc main() {\r\n\tdb, _ := sql.Open(\"duckdb\", \"\")\r\n\t_, _ = db.Query(`PRAGMA something`)\r\n}\r\n\r\n```\r\n\r\nOutputs:\r\n```\r\nlibc++abi.dylib: terminating with uncaught exception of type duckdb::CatalogException: Catalog Error: Pragma Function with name something does not exist!\r\nDid you mean \"show\"?\r\nSIGABRT: abort\r\nPC=0x7fff20423462 m=0 sigcode=0\r\nsignal arrived during cgo execution\r\n\r\n```\n\n### OS:\n\nMacOS 11.2.3\n\n### DuckDB Version:\n\nv0.9.2(source_id: 3c695d7)\n\n### DuckDB Client:\n\ngo-duckdb v1.5.6\n\n### Full Name:\n\nYang Ou\n\n### Affiliation:\n\nDuozhuayu\n\n### Have you tried this on the latest `main` branch?\n\nI have tested with a release build (and could not test with a main build)\n\n### Have you tried the steps to reproduce? Do they include all relevant data and configuration? Does the issue you report still appear there?\n\n- [X] Yes, I have",
+        "comments": [
+            "Thanks, I could reproduce the issue. The problem seems to occur within the Go binding, so I opened an issue there (with the content of this issue): https://github.com/marcboeker/go-duckdb/issues/142",
+            "@szarnyasg I think the problem is located in the `duckdb_extract_statements` function of the C-API. I was able to reproduce the SIGABRT with the following C program:\r\n\r\n```\r\n#include \"duckdb.h\"\r\n\r\nduckdb_database db;\r\nduckdb_connection con;\r\n\r\nint main() {\r\n\tif (duckdb_open(NULL, &db) == DuckDBError) {\r\n\t\t// handle error\r\n\t}\r\n\tif (duckdb_connect(db, &con) == DuckDBError) {\r\n\t\t// handle error\r\n\t}\r\n\r\n\tduckdb_extracted_statements stmts;\r\n\tidx_t foo = duckdb_extract_statements(con, \"PRAGMA something\", &stmts);\r\n\r\n\t// cleanup\r\n\tduckdb_disconnect(&con);\r\n\tduckdb_close(&db);\r\n}\r\n```\r\n\r\nReplacing `PRAGMA something` with `PRAGMA show_tables` works, as this command exists.",
+            "Thanks @marcboeker for clarifying this. We'll look into it."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23699,
+            "commit_id": "100a23a45022c8a518426fe1d902e66eeda0eeb3",
+            "original_commit_id": "01d1dedf587a1e620a28c801fa18b47090e40192",
+            "path": "tools/pythonpkg/src/common/exceptions.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 222,
+            "original_line": 222,
+            "side": "RIGHT",
+            "original_position": 217,
+            "position": 217,
+            "subject_type": "line",
+            "review_comments": [
+                "I can't comment on the actual line, but it looks like we've deviated from the spec in the above comment, which isn't good"
+            ]
+        },
+        {
+            "hunk_id": 23673,
+            "commit_id": "100a23a45022c8a518426fe1d902e66eeda0eeb3",
+            "original_commit_id": "01d1dedf587a1e620a28c801fa18b47090e40192",
+            "path": "tools/pythonpkg/src/common/exceptions.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 222,
+            "original_line": 222,
+            "side": "RIGHT",
+            "original_position": 217,
+            "position": 217,
+            "subject_type": "line",
+            "review_comments": [
+                "I can't comment on the actual line, but it looks like we've deviated from the spec in the above comment, which isn't good"
+            ]
+        },
+        {
+            "hunk_id": 23672,
+            "commit_id": "100a23a45022c8a518426fe1d902e66eeda0eeb3",
+            "original_commit_id": "01d1dedf587a1e620a28c801fa18b47090e40192",
+            "path": "tools/pythonpkg/src/common/exceptions.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 252,
+            "original_line": 252,
+            "side": "RIGHT",
+            "original_position": 265,
+            "position": 265,
+            "subject_type": "line",
+            "review_comments": [
+                "Why change the hierarchy here?"
+            ]
+        },
+        {
+            "hunk_id": 23698,
+            "commit_id": "100a23a45022c8a518426fe1d902e66eeda0eeb3",
+            "original_commit_id": "01d1dedf587a1e620a28c801fa18b47090e40192",
+            "path": "tools/pythonpkg/src/common/exceptions.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 252,
+            "original_line": 252,
+            "side": "RIGHT",
+            "original_position": 265,
+            "position": 265,
+            "subject_type": "line",
+            "review_comments": [
+                "Why change the hierarchy here?"
+            ]
+        }
+    ]
+}

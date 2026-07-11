@@ -1,0 +1,155 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 102407,
+    "lang": "go",
+    "pr_title": "kvserver: check PROSCRIBED lease status over UNUSABLE",
+    "pr_body": "The PROSCRIBED lease status, just like EXPIRED, puts a lease to a definitely invalid state. The UNUSABLE state (when request timestamp is in stasis period) is less of a clear cut: we still own the lease but callers may use or not use it depending on context.\r\n\r\nFor example, the closed timestamp side-transport ignores the UNUSABLE state (because we still own the lease), and takes it as usable for its purposes. Because of the order in which the checks were made, this has lead to a bug: a PROSCRIBED lease is reported as UNUSABLE during stasis periods, the closed timestamp side-transport then considers it usable, and updates closed timestamps when it shouldn't.\r\n\r\nThis commit fixes the bug by swapping the order of checks in the leaseStatus method. The order now goes from \"hard\" checks like EXPIRED and PROSCRIBED, to \"softer\" UNUSABLE, and (when the softness is put to the limit) VALID.\r\n\r\nFixes #98698\r\nFixes #99931\r\nFixes #100101\r\nEpic: none\r\n\r\nRelease note (bug fix): a bug is fixed in closed timestamp updates within its side-transport. Previously, during asymmetric partitions, a node that transfers a lease away, and misses a liveness heartbeat, could then erroneously update the closed timestamp during the stasis period of its liveness. This could lead to closed timestamp invariant violation, and node crashes; in extreme cases this could lead to inconsistencies in read-only queries.",
+    "pr_comments": [
+        "It looks like your PR touches production code but doesn't add or edit any test code. Did you consider adding tests to your PR?\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>",
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/102407)\n<!-- Reviewable:end -->\n",
+        ">some callers may treat it as invalid, and some may thinks it's still valid.\r\n\r\nIt isn't really considered valid as such, I think the crucial point is that it's treated as _ours_. A `PROSCRIBED` lease isn't still ours because we may have transferred it away, but an `UNUSABLE` lease is still ours for the interval even though we can't use it (noone else can have an overlapping lease).\r\n\r\nThis probably also deserves a test case for the precedence.",
+        "Yeah, adding test in the meantime. Wanted to put the fix for review ASAP.",
+        "How does this interact with clock skew, btw? The stasis period exists because it's possible for someone else to believe their lease has already started while we also believe that ours hasn't ended because of clock skew. Can this also cause violations, such that we should exclude the `UNUSABLE` state from the side transport entirely, or is this handled by the closed timestamp protocol and/or the HLC?",
+        "@erikgrinaker Is your question basically: why [this](https://github.com/cockroachdb/cockroach/blob/793b4c8bfc6e9dbf7a05289f3e61035796476cc5/pkg/kv/kvserver/replica_closedts.go#L61-L62) comment? I don't know, it would be nice to explain in this comment why it's safe to close timestamps in the stasis.\r\n\r\nI think the reason it's ok is that the closed timestamps are \"logical\". They fall between the lease start and expiration timestamp. They aren't concerned with clock skew? Stasis is there to make sure there aren't **requests** served around the lease transfer times, i.e. it makes sure the **physical** time ranges when two leases are used are non-intersecting too?\r\n\r\nUpd: there might be a problem though. How about the following scenario?\r\n- Lease 1 ends at time T, lease 2 starts at time T.\r\n- Lease 1 enters stasis, and closes timestamp between T-skew and T.\r\n- In the meantime, lease is already active on another node which behind in time by \"skew\".\r\n- Lease 2 closes timestamp in the past compared to the already closed timestamp by lease 1.\r\n\r\nOTOH, I think it's always true that:\r\n- For two consecutive leases, LAI1 <= LAI2.\r\n- For two consecutive leases, CT1 <= lease 1 end time <= lease 2 start time <= CT2.\r\n\r\nSo, two closed timestamps coming from 2 leaseholders never form a CT regression? Even if one of them is in stasis.\r\n\r\nLease timestamps, and closed timestamps are \"logical\". They don't have any conflicts etc. Clock skew and stasis period come into play when we need to map physical onto this logical time, i.e. when this layer interacts with the \"requests\" layer above.",
+        "Yeah, I think it's the LAI that saves us, because presumably an unusable lease can't increment the LAI.",
+        "> Yeah, I think it's the LAI that saves us, because presumably an unusable lease can't increment the LAI.\r\n\r\nDoes it though? In the scenario we've seen, the old leaseholder must have been able to increment its LAI, despite the lease being in `PROSCRIBED` and then `UNUSABLE`, otherwise we wouldn't have seen the regression.\r\n\r\nI think the coordination here happens either by a lease transfer revoking the current lease (which will/should immediately halt the closed ts transport from sending future updates), or by the next lease necessarily having a greater start time than our expiration time, where the LAI is communicated via Raft, and the side transport is prevented from sending further updates beyond the expiration time. So the problem is simply that we keep sending updates after we transferred the lease, which we fix here. So I don't think `UNUSABLE` is a problem here.\r\n\r\nThere's also this:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/bfc5603a3cfb98e4172a201d3ff9d44a213adb2f/pkg/kv/kvserver/kvserverpb/lease_status.go#L51-L53",
+        "> Does it though? In the scenario we've seen, the old leaseholder must have been able to increment its LAI, despite the lease being in `PROSCRIBED` and then `UNUSABLE`, otherwise we wouldn't have seen the regression.\r\n\r\nThe old leaseholder was sending the old LAI. But the timestamp was high, getting into the territory of the next lease.\r\nThe new leaseholder was sending new LAIs, and later timestamps (which is a correct behaviour).",
+        "> I think the reason it's ok is that the closed timestamps are \"logical\". They fall between the lease start and expiration timestamp. \r\n\r\nAre you sure that's true? I don't think closed timestamps are constrained to the by the lease start, as the lease plays no role here:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L331-L338\r\n\r\nWe do make sure that the resulting timestamp isn't past the lease expiration,\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/793b4c8bfc6e9dbf7a05289f3e61035796476cc5/pkg/kv/kvserver/replica_closedts.go#L68-L71\r\n\r\nbut I don't see a corresponding check for the start time.\r\n\r\nAssuming a fixed closed timestamp lag time L, I agree that continuing to close during stasis doesn't seem to be an issue. The largest timestamp that can be closed by the old leaseholder is `endStasis-L` and the new leaseholder can only close `>= nextLeaseStart-L` (with the same or larger LAI). So these can't invert, I think this is morally what you're saying with the start time, but `nextLeaseStart-L` is clearly \"in some old lease\".\r\n\r\nBut also, closed timestamp lag time is a cluster setting and propagates async, so can't the old leaseholder be closing out `endStasis - L` but the new leaseholder closes out `nextLeaseStart - 10L` (cluster setting set to 10x the original)? These can obviously invert...",
+        "I'm probably missing something in that last bit because shouldn't changing the cluster setting trigger the assertion even if no lease changes hands then? Since the leaseholder's closed timestamp will regress against itself.",
+        "@erikgrinaker Added a unit-test, and updated the PR desc.",
+        "TFTRs!\r\n\r\nbors r=erikgrinaker,tbg",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=9859749&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2023-04-28T13:48:26Z",
+    "issue_context": {
+        "number": 98698,
+        "title": "kvserver: `side-transport update saw closed timestamp regression` during roachtest",
+        "body": "Test Eng has in-progress work to randomly enable runtime assertions (`crdb_test` build tag)  in roachtests [1], and in the process of testing that, there was a failure in the `failover/non-system/blackhole-recv` roachtest where a node crashed with the following error:\r\n\r\n```\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003  side-transport update saw closed timestamp regression on r1049: (lai=429, ts=1678502687.228717404,0) -> (lai=428, ts=1678502687.708863313,0)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !goroutine 1045566 [running]:\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/log.getStacks(0x1)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/get_stacks.go:25 +0x89\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/log.(*loggerT).outputLogEntry(0xc000b73c00, {{{0x0, 0x0}, {0x0, 0x0}, {0x0, 0x0}, {0x0, 0x0}}, 0x174b3d4de64f480d, ...})\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/clog.go:262 +0x97\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/log.logfDepthInternal({0x6e7a3d0, 0xc006245d10}, 0x2, 0x4, 0x0, 0x0?, {0x5b4cbd0, 0x60}, {0xc00228b9e8, 0x5, ...})\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/channels.go:106 +0x645\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/log.logfDepth(...)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/log/channels.go:39\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/log.Fatalf(...)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/bazel-out/k8-opt/bin/pkg/util/log/log_channels_generated.go:848\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*sidetransportAccess).assertNoRegression(0x50f5620?, {0x6e7a3d0, 0xc006245d10}, {{0x174b3d4d0ace695c, 0x0, 0x0}, 0x1ad}, {{0x174b3d4d276cdb51, 0x0, 0x0}, ...})\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/replica_closedts.go:263 +0x1eb\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*sidetransportAccess).forward(0xc0058a0598, {0x6e7a3d0, 0xc006245d10}, {0x20000c002539100?, 0xffffffff?, 0xff?}, 0x1ac, 0x0)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/replica_closedts.go:237 +0x15d\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Replica).ForwardSideTransportClosedTimestamp(...)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/replica_closedts.go:138\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Stores).ForwardSideTransportClosedTimestampForRange.func1(0xc009d26bb8?)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/stores.go:132 +0x8a\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Stores).VisitStores.func1(0xc009d26bb8?, 0xa60a968?)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/stores.go:149 +0x29\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/syncutil.(*IntMap).Range(0xc00571f7d0?, 0xc00228bc48)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/syncutil/int_map.go:352 +0x1fa\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Stores).VisitStores(0x67e?, 0xc002539100?)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/stores.go:148 +0x54\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver.(*Stores).ForwardSideTransportClosedTimestampForRange(0x5099580?, {0x6e7a3d0, 0xc006245d10}, 0x6e7a3d0?, {0xc006245d10?, 0x203000?, 0x0?}, 0x1?)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/pkg/kv/kvserver/stores.go:129 +0x96\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport.(*incomingStream).processUpdate(0xc004fff6b0, {0x6e7a3d0, 0xc006245d10}, 0xc003735a40)\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport/receiver.go:252 +0x675\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport.(*incomingStream).Run.func1({0x6e7a3d0, 0xc006245d10})\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport/receiver.go:328 +0x1b8\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx.func2()\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/stop/stopper.go:470 +0x146\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !created by github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx\r\nkv/kvserver/replica_closedts.go:263 \u00e2\u2039\u00ae [T1,n6] 2003 !\tgithub.com/cockroachdb/cockroach/pkg/util/stop/stopper.go:461 +0x43b\r\n```\r\n\r\nI don't think the failure is related to the fact that we were using a `crdb_test` build per se, so I wanted to bring this to kv-repl's attention so that you can take a closer look.\r\n\r\nI ran the test a couple more times and did not see the same issue happen again, but I can help with reproduction efforts if needed.\r\n\r\nArtifacts (n6 is the one that crashes):\r\n<https://teamcity.cockroachdb.com/viewLog.html?buildId=9006960&buildTypeId=Cockroach_Nightlies_RoachtestNightlyGceBazel&tab=artifacts#%2Ffailover%2Fnon-system%2Fblackhole-recv>\r\n\r\n[1] #98351\r\n\r\nJira issue: CRDB-25452\r",
+        "comments": [
+            "cc @cockroachdb/replication",
+            "Hi @erikgrinaker, please add branch-* labels to identify which branch(es) this release-blocker affects.\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>",
+            "@tbg This seems related to the reproposal closed timestamp regressions we've seen. Would you agree with lumping this into the reproposals epic and deal with it after the branch cut?",
+            "Yes, sounds good, added",
+            "Ok, removing GA-blocker and punting it until after the cut.",
+            "We've seen this same assertion fire in multiple sentry reports (see above). We also saw it fire again in https://github.com/cockroachdb/cockroach/issues/99931, which was another variant of `failover/.../blackhole-recv`. Is the side-transport susceptible to network reorderings that could make this easier to hit in this kind of test?\r\n\r\nI'm not adding the `GA-blocker` label back on because this is not new, but we should take a look at this, especially now that we have a test that can reproduce.",
+            "See my notes on #99931 - One possibility is that n6 received side channel updates from two nodes (n4 and n5) simultaneously. This unfortunately may stop failing on this test after #99840 merges, however, it would be easy enough to re-enable the old behavior by disabling `rpc.dialback.enabled` to allow the asymmetric partition to extend longer.",
+            "Discussed this briefly with @nvanbenschoten and @andrewbaptist. While I think this seems likely to be the issue we've \"always\" had with closed timestamp regressions seen in the wild (e.g. Sentry), and which Tobi found and fixed during reproposals, we feel like it's worth confirming that. Especially given that this issue is in the side transport, not during proposals. So we've added the GA-blocker to make sure we confirm this.",
+            "@tbg said that this was unlikely to be related to the issues we saw with reproposals and closed timestamp regressions. More likely network reordering or some such, like @nvanbenschoten said above.",
+            "In this stack trace the receiver processes a range that is being `Removed` from closed timestamp tracker. The sender, correspondingly, added this range to removals for one of the 2 reasons:\r\n\r\n1. It stopped being a leaseholder, so it doesn't anticipate sending any more updates soon: https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L361-L368\r\n2. The sender could not close the timestamp that it attached to the update, so it \"temporarily\" excludes it from the set of updates: https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L391-L396",
+            "A couple of facts about the closed timestamp updates in the side transport.\r\n\r\nThe timestamp may regress because the sender [doesn't ensure](https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L330-L343) it's monotonic. For example, when I changed `closedts.TargetDuration` cluster setting from the default 3s to 10s, I expected up to 7s of regression, which was confirmed in the receiver's log:\r\n\r\n```\r\nI230419 13:30:20.849723 705 kv/kvserver/closedts/sidetransport/receiver.go:224 \u22ee [T1,n2] 1728  received side-transport update: \u2039Seq num: 882, sending node: n1, snapshot: false, size: 37 bytes, closed timestamps: LAG_BY_CLUSTER_SETTING:1681911017.849317000,0 (3s ago), LEAD_FOR_GLOBAL_READS:1681911021.649317000,0? (799ms in the future)\u203a\r\n...\r\nI230419 13:30:21.050194 705 kv/kvserver/closedts/sidetransport/receiver.go:224 \u22ee [T1,n2] 1730  received side-transport update: \u2039Seq num: 883, sending node: n1, snapshot: false, size: 63 bytes, closed timestamps: LAG_BY_CLUSTER_SETTING:1681911011.049559000,0 (10s ago), LEAD_FOR_GLOBAL_READS:1681911021.849559000,0? (799ms in the future)\u203a\r\n```\r\n\r\nThis update is speculative, in a couple of aspects:\r\n- The receiver may have not applied this LAI yet: https://github.com/cockroachdb/cockroach/blob/793b4c8bfc6e9dbf7a05289f3e61035796476cc5/pkg/kv/kvserver/replica_closedts.go#L135-L138\r\n- The timestamp is local to the sender, and may be ahead of the timestamp recorded in the log. When the range is \"inactive\", this timestamp just gets bumped and sent.\r\n\r\nSo, when there are two nodes believing to be the leaseholder, and the range being \"inactive\", they both can be bumping the closed timestamp speculatively, and sending conflicting updates.\r\n\r\nA hypothetical situation that might be happening here:\r\n- There are two leaseholders, one at LAI 22 and another at LAI 23. The 22 one still doesn't know it should give up.\r\n- The range is \"inactive\" on both leaseholders (no in-flight requests / proposals). So, both leaseholders update the timestamp speculatively and send it through the side-transport.\r\n- Clearly, the timestamps may be out of order.\r\n- Both updates arrive in some order, get compared, and trigger the failure.\r\n- NB: the updates will be arriving through different [streams](https://github.com/cockroachdb/cockroach/blob/f92966c6888a467568441e6f85553d6ee876d701/pkg/kv/kvserver/closedts/sidetransport/receiver.go#L163-L180).",
+            "Not only the closed timestamp sent through the side-transport can regress [same code snippet [here](https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L330-L343)], the sender doesn't seem to be checking that this is a valid timestamp w.r.t. to the lease time interval. For example, shouldn't it verify that `now` that it [sends](https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L324) is below the lease expiration time for each range that it updates? I don't know if the `leaseholders` list copied [here](https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L352) is guaranteed to have only replicas whose lease expires after `now`.\r\n\r\nUPD: No, the timestamp is actually [checked](https://github.com/cockroachdb/cockroach/blob/fad7ac8303582228b010375c60820d4a6a798570/pkg/kv/kvserver/closedts/sidetransport/sender.go#L377) for each range before being sent. In particular, it must be below the lease expiration timestamp.\r\n\r\nBut I wonder if the timestamp can be below the lease **start** time, and overlap with the previous lease interval. It's 3s in the past, so does it mean that during the first 3s of holding the lease, the side-transport is sending closed timestamps from the previous lease interval? This is another way the closed timestamps from consecutive LAIs can regress.\r\n\r\nUPD: Probably no too, because becoming a leaseholder is an implicit bump of closed timestamp to the lease start time.",
+            "```\r\n02:36:23 failover.go:285: test status: failing n4 (blackhole-recv) \r\n02:37:21 failover.go:294: test status: recovering n4 (blackhole-recv)\r\n02:38:23 failover.go:285: test status: failing n5 (blackhole-recv)\r\n02:39:21 failover.go:294: test status: recovering n5 (blackhole-recv)\r\n02:40:23 failover.go:285: test status: failing n6 (blackhole-recv)\r\n02:41:21 failover.go:294: test status: recovering n6 (blackhole-recv)\r\n02:42:23 failover.go:285: test status: failing n4 (blackhole-recv)\r\n02:43:21 failover.go:294: test status: recovering n4 (blackhole-recv)\r\n02:44:22 failover.go:285: test status: failing n5 (blackhole-recv)\r\n\r\n02:44:36.526648 unable to transfer lease to s4: [n5,r1049]: unable to transfer lease to s4: refusing to transfer lease to (n4,s4):2 because target may need a Raft snapshot: \u2039replica in StateProbe\u203a\r\n\r\n02:44:38.422220 [n5,r358] have been waiting 15s to acquire \u2039write\u203a latch \u2039/{Local-Meta1/}@0,0\u203a, held by \u2039write\u203a latch \u2039/Local/RangeID/358/u{/RaftLog-\"rftm\"}@0,0\u203a\r\n\r\n02:44:47.228 the timestamp of CT update with LAI=429\r\n02:44:47.708 the timestamp of CT update with LAI=428\r\n\r\n02:44:47.843018 [n6] closed timestamps side-transport connection dropped from node: 5\r\n02:44:48.028188 [n5,rnode=6] connection is now ready\r\n\r\n02:44:48.783069 [n5] health alerts detected: {Alerts:[{StoreID:5 Category:\u2039METRICS\u203a Description:\u2039requests.slow.latch\u203a Value:1}]}\r\n# https://github.com/cockroachdb/cockroach/blob/ed0dda0b9a9675077cf70a796bbaece7686b2ac3/pkg/kv/kvserver/metrics.go#L1504-L1516\r\n\r\n02:44:50.228 [+3s] the first update was generated/sent at\r\n02:44:50.708 [+3s] the second update was generated/sent at\r\n\r\n02:44:50.729036 [n5,liveness-hb] slow heartbeat took 3.001639822s; err=result is ambiguous: context done during DistSender.Send: dial: context deadline exceeded\r\n02:44:50.732606 [n4,r431] incremented n5 liveness epoch to 3\r\n\r\n02:44:50.911346 [n6] the server is terminating due to a fatal error (see the DEV channel for details)\r\n02:44:50.930170 [n6] closed timestamps side-transport connection dropped from node: 4\r\n02:44:50.931129 [n4] closed timestamps side-transport connection dropped from node: 6\r\n\r\n02:44:50.931213 [n6] side-transport update saw closed timestamp regression on r1049: (lai=429, ts=1678502687.228717404,0) -> (lai=428, ts=1678502687.708863313,0)\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14605,
+            "commit_id": "add56b4ab7e8e0361374bfa5a86eaeeab145bd55",
+            "original_commit_id": "3b1bc872bb4bf8e5eb2ad8790ba8ec781167dd1f",
+            "path": "pkg/kv/kvserver/replica_range_lease_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 125,
+            "position": 125,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Instead of comments above the test cases, consider adding a `desc` field and use that as the test name too. It's annoying to debug failures when you have to count to find the correct case."
+            ]
+        },
+        {
+            "hunk_id": 14731,
+            "commit_id": "add56b4ab7e8e0361374bfa5a86eaeeab145bd55",
+            "original_commit_id": "3b1bc872bb4bf8e5eb2ad8790ba8ec781167dd1f",
+            "path": "pkg/kv/kvserver/replica_range_lease_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 125,
+            "position": 125,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Instead of comments above the test cases, consider adding a `desc` field and use that as the test name too. It's annoying to debug failures when you have to count to find the correct case."
+            ]
+        },
+        {
+            "hunk_id": 15136,
+            "commit_id": "add56b4ab7e8e0361374bfa5a86eaeeab145bd55",
+            "original_commit_id": "3b1bc872bb4bf8e5eb2ad8790ba8ec781167dd1f",
+            "path": "pkg/kv/kvserver/replica_range_lease_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 125,
+            "position": 125,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Instead of comments above the test cases, consider adding a `desc` field and use that as the test name too. It's annoying to debug failures when you have to count to find the correct case."
+            ]
+        },
+        {
+            "hunk_id": 15135,
+            "commit_id": "add56b4ab7e8e0361374bfa5a86eaeeab145bd55",
+            "original_commit_id": "3b1bc872bb4bf8e5eb2ad8790ba8ec781167dd1f",
+            "path": "pkg/kv/kvserver/replica_range_lease_test.go",
+            "start_line": 47,
+            "original_start_line": 47,
+            "start_side": "RIGHT",
+            "line": 55,
+            "original_line": 55,
+            "side": "RIGHT",
+            "original_position": 55,
+            "position": 55,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Would be good to name these. It's hard to read the integer indexes below."
+            ]
+        },
+        {
+            "hunk_id": 14730,
+            "commit_id": "add56b4ab7e8e0361374bfa5a86eaeeab145bd55",
+            "original_commit_id": "3b1bc872bb4bf8e5eb2ad8790ba8ec781167dd1f",
+            "path": "pkg/kv/kvserver/replica_range_lease_test.go",
+            "start_line": 47,
+            "original_start_line": 47,
+            "start_side": "RIGHT",
+            "line": 55,
+            "original_line": 55,
+            "side": "RIGHT",
+            "original_position": 55,
+            "position": 55,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Would be good to name these. It's hard to read the integer indexes below."
+            ]
+        },
+        {
+            "hunk_id": 14604,
+            "commit_id": "add56b4ab7e8e0361374bfa5a86eaeeab145bd55",
+            "original_commit_id": "3b1bc872bb4bf8e5eb2ad8790ba8ec781167dd1f",
+            "path": "pkg/kv/kvserver/replica_range_lease_test.go",
+            "start_line": 47,
+            "original_start_line": 47,
+            "start_side": "RIGHT",
+            "line": 55,
+            "original_line": 55,
+            "side": "RIGHT",
+            "original_position": 55,
+            "position": 55,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: Would be good to name these. It's hard to read the integer indexes below."
+            ]
+        }
+    ]
+}

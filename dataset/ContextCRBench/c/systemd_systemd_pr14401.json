@@ -1,0 +1,65 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 14401,
+    "lang": "c",
+    "pr_title": "nspawn: move virtual interfaces added with --network-interface back to the host",
+    "pr_body": "Should fix #13530. I've only tested with a physical ethernet interface and veth interfaces created with iproute2 directly. @LaKing can you test this PR as well if you get the chance?\r\n\r\n`--network-interface` explicitly documents that interfaces added with it are moved back to the host when the container shuts down. Currently, this is only the case for physical interfaces. This PR makes sure nspawn moves back all interfaces (virtual and physical).\r\n\r\nThe implementation consists of keeping the child's network namespace alive by opening the corresponding file in proc (/proc/\\<pid\\>/ns/net), entering it after the container shuts down, moving back the interfaces to the parent network namespace and leaving the child network namespace.\r\n\r\nBecause the `sd_device` checks in `parse_interface` failed when moving back the interfaces to the parent with `move_network_interfaces` (probably because we still have the host's view of /sys/ which doesn't have the interfaces in the container network namespace), I moved the `sd_device` checks out of `parse_interface` into a function `check_interface` which is called when parsing the command line arguments.",
+    "pr_comments": [
+        "Hmm. CIs dislike this or the test needs to be updated.",
+        "Cleaned this up a lot, should be good for a review now.\r\n\r\nOne problem we can't really solve is that if nspawn is SIGKILLED, we don't have the opportunity to move back network interfaces so they will still be removed. Maybe it's a good idea to document this?",
+        "CI failures seem unrelated to this PR.",
+        "Thanks for the detailed review. I pushed a simpler implementation based on your feedback. The one thing that's missing now is that the interfaces aren't moved back if an error occurs after moving the network interfaces to the child network namespace. I don't really see a way to implement that outside of putting the usual `goto finish` everywhere in `run_container` which I'd prefer to avoid. Any ideas for that?\r\n\r\nEDIT: I additionally verified this also works with internal reboots.\r\n\r\nEDIT: Another option would be to add a wrapper around `log_error_errno` that moves the network interfaces back to the parent network namespace as well. I'm not sure if this would be prefered over the goto approach in this case.",
+        "I've been using this PR and https://github.com/systemd/systemd/pull/14420 extensively for some integration tests with rebooting containers (the `--keep-unit` kind) and so far I haven't noticed any issues.",
+        "thanks! lgtm!"
+    ],
+    "merged": true,
+    "created_at": "2019-12-23T17:14:07Z",
+    "issue_context": {
+        "number": 13530,
+        "title": "Stopping nspawn container destroys the veth interface defined additionally with networkd.",
+        "body": "systemd 241 (v241-10.git511646b.fc30)\r\nFedora 30\r\n\r\nWhen usinng a custom veth-pair added with ```--network-interface``` in an .nspawn file, attaching it to the nspawn container, then stopping the container, both veth interfaces disappear. This is a bug according to the documentation, as it states \"When the container terminates, it is moved back to the host namespace.\"\r\n\r\n**Expected behaviour you didn't see**\r\nPutting back the veth interface to the host.\r\n\r\n**Unexpected behaviour you saw**\r\nThe veth interfaces disappearing.\r\n\r\n**Steps to reproduce the problem**\r\n\r\nIn order to attach a second interface manually to the container, I create a veth interface pair.\r\n\r\nWe have a virtual device: veth.netdev \r\n```\r\n[NetDev]\r\nName=veth1-interface\r\nKind=veth\r\n\r\n[Peer]\r\nName=veth2-interface\r\n```\r\n\r\nOne side is connected to a bridge: veth1-interface.network \r\n```\r\n[Match]\r\nName=veth1-interface\r\n\r\n[Network]\r\nBridge=br-interface\r\n```\r\n\r\nThe other side is the endpoint we need.\r\nveth2-interface.network\r\n``` \r\n[Match]\r\nName=veth2-interface\r\n\r\n[Network]\r\nDHCP=yes\r\n```\r\n\r\nWe have a corresponding file in the container, and only in the container: veth2.network \r\n```\r\n[Match]\r\nVirtualization=container\r\nName=veth2-interface\r\n\r\n[Network]\r\nDHCP=yes\r\n```\r\n\r\nWe have an .nspawn file that tells our container to use that interface: test.nspawn \r\n```\r\n[Network]\r\n## the primary interface\r\nBridge=10.250.0.x\r\n## the additional interface in question\r\nInterface=veth2-interface\r\n\r\n[ ... ]\r\n```\r\n\r\nAfter restarting systemd-networkd both interfaces are up:\r\n```\r\nveth1-interface: Gained carrier\r\nveth1-interface: Configured\r\nveth2-interface: Gained carrier\r\nveth2-interface: DHCPv4 address 10.10.0.14/24 via 10.10.0.1\r\n```\r\n\r\n```\r\nbr-interface\t\t8000.e6ec11b978c8\tno\t\tvlan-interface\r\n\t\t\t\t\t\t\tveth1-interface\r\n\r\n```\r\n\r\nip addr show\r\n```\r\n65: veth2-interface@veth1-interface: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000\r\n    link/ether 4e:f7:29:ad:c2:4a brd ff:ff:ff:ff:ff:ff\r\n    inet 10.10.0.14/24 brd 10.10.0.255 scope global dynamic veth2-ellatohaz\r\n       valid_lft 341sec preferred_lft 341sec\r\n    inet6 fe80::4cf7:29ff:fead:c24a/64 scope link \r\n       valid_lft forever preferred_lft forever\r\n66: veth1-interface@veth2-interface: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br-interface state UP group default qlen 1000\r\n    link/ether ea:d1:ee:f0:76:0d brd ff:ff:ff:ff:ff:ff\r\n    inet6 fe80::e8d1:eeff:fef0:760d/64 scope link \r\n       valid_lft forever preferred_lft forever\r\n\r\n```\r\n\r\nSo far all good. Container starts. veth2 appears as the second interface in the container, has the right ip all good.\r\n\r\nThen, the Container is stopped.\r\n\r\nWhen tryin to start the container again:\r\n```\r\nsystemd-nspawn[..]: Failed to resolve interface veth2-interface: No such device\r\n```\r\n\r\nAnd indeed. ip addr show displays none of the two veth interfaces, not attached to the bridge, nix nada, it disappeared.\r\n\r\nRestarting systemd-networkd brings the interface up again, but this behavior is not documented, in fact to documentation says the interface should appear on the host namespace, hence reporting as a bug.\r\n\r\n\r\n\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 32869,
+            "commit_id": "5b4855ab73c162e3bc34e11f7080074c59a77841",
+            "original_commit_id": "cb68406c6aaec3e5d38e72146a2f08bf1f8ee9da",
+            "path": "src/nspawn/nspawn.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 854,
+            "original_line": 854,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "so we check all those interfaces twice now? Why?",
+                "I'm not sure what you mean here? The `ARG_NETWORK_INTERFACE` and `ARG_NETWORK_MACVLAN` cases don't seem to fall through. Doesn't that mean we have to repeat the check for all the different types of interfaces? As far as I can see we're checking each network interface once in the switch now and don't check them again after.",
+                "we check in move_network_interfaces() again, no?",
+                "`move_network_interfaces` just calls `parse_interface` which doesn't do the check anymore (unless I'm missing something really obvious somewhere). The idea was to move the checking out of `parse_interface` so it could be used from inside a different network namespace without udev complaining."
+            ]
+        },
+        {
+            "hunk_id": 32870,
+            "commit_id": "5b4855ab73c162e3bc34e11f7080074c59a77841",
+            "original_commit_id": "cb68406c6aaec3e5d38e72146a2f08bf1f8ee9da",
+            "path": "src/nspawn/nspawn.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4214,
+            "original_line": 4214,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "hmm, these two variables both refer to the same object btw: the child's netns. One is used in the existing code when you specify --natwork-namespace-path= and the other in any case. I think we should just reuse the same variable here, it's going to be the same thing. Moreover, if netns_fd is already found initialized (because --network-namespace-path= is set) then we shouldn't open things a second time and just reuse the thing.",
+                "Done, but I renamed `netns_fd` to `child_netns_fd` for clarity."
+            ]
+        }
+    ]
+}

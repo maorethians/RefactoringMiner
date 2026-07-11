@@ -1,0 +1,54 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 77406,
+    "lang": "go",
+    "pr_title": "backupccl: test ignore ProtectionPolicy for exclude_data_from_backup",
+    "pr_body": "This change adds an end to end test to ensure that a table excluded\r\nfrom backup will not holdup GC on its replica even in the presence\r\nof a protected timestamp record covering the replica\r\n\r\nFrom a users point of view, this allows them to mark a table whose\r\nrow data will be excluded from backup, and to set that tables gc.ttl\r\nto a very low value. Backups that write PTS records will no longer\r\nholdup GC on such low GC TTL tables.\r\n\r\nFixes: https://github.com/cockroachdb/cockroach/issues/73536\r\n\r\nRelease note: None\r\n\r\nRelease justification: low risk update to new functionality",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/77406)\n<!-- Reviewable:end -->\n",
+        "@irfansharif removing this from your review queue since this has become a test only change after https://github.com/cockroachdb/cockroach/pull/77392. This is RFAL now that that has merged!",
+        "@irfansharif removing this from your review queue since this has become a test only change after https://github.com/cockroachdb/cockroach/pull/77392. This is RFAL now that that has merged!",
+        "friendly ping @dt",
+        "CI failure is TestDockerCLI\r\n\r\nTFTR!\r\nbors r=dt",
+        "Build failed (retrying...):\n  * [GitHub CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=4544256&buildTypeId=Cockroach_UnitTests)",
+        "Build succeeded:\n  * [GitHub CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=4545238&buildTypeId=Cockroach_UnitTests)"
+    ],
+    "merged": true,
+    "created_at": "2022-03-05T21:30:17Z",
+    "issue_context": {
+        "number": 73536,
+        "title": "sql,protectedts: mark tables as ephemeral to exclude them from backups",
+        "body": "This is a tracking issue that captures an idea proposed by @dt.\r\n\r\nSome users have encountered challenges with tables that contain high-churn, ephemeral data, where they want to GC history in that table quickly, but cannot simply configure it to do so because it is contained within a database, tenant or cluster that is backed up incrementally, which requires that history be preserved until that backup can back it up. \r\n\r\nIn many such cases, the user does not actually explicitly desire data in these tables to be backed up at all, and are only doing so because it is part of the larger database, tenant or cluster being backed up. Thus one possible solution would be to provide a mechanism for a table like this to _opt out_ of inclusion in backups, freeing it to configure more aggressive GC without affecting the ability of its containing database to backup. Simply excluding the table entirely could be challenging -- it may still be referenced in jobs, logs, views, etc. However excluding its row data would allow the backup to succeed even if its that table's span has been GCed, and would result in it just being empty when restored.\r\n\r\nApproach:\r\n\r\nOne proposed approach would be to mark a table as `ephemeral`. The simplest solution would be to store this information on the `TableDescriptor` but this does not work because of the way tenants are backed up. A `BACKUP TENANT` from the system tenant simply backs up a single-tenant span, and does not look inside the tenant to be able to exclude certain tables. Thus, this information needs to be written to the ZoneConfig, and will subsequently rely on the transport infrastructure that was introduced to support zcfgs in a multi-tenant environment.\r\n\r\nThe tasks can then largely be broken up into:\r\n\r\n- [ ] Add `epehemeral` bit to ZoneConfig for a table, and the corresponding SpanConfig created as a result of reconciliation.\r\n\r\n- [ ] Teach `ExportRequest` to return an empty `ExportResponse` when attempting to export a replica that has an assocaited `SpanConfig` marked as `ephemeral`.\r\n\r\n- [ ] Teach GC to ignore any protected timestamp records that might be written to a replica that is marked as ephemeral. This way, even if a backup were to protect a set of schema objects that included the ephemeral table, it would allow the low GC TTL to continue garbage collecting the data.\r\n\r\n- [ ] Add a migration to mark system tables that opt-out from a cluster backup as `ephemeral` so that they are never backed up or protected.\r\n\r\n- [ ] Add SQL to set/unset a table as ephemeral. This might work out of the box with `ALTER ZONE CONFIGURATION`.\r\n\r\n- [ ] Think about how to make the fact that a table is `ephemeral` observable to the user during a backup. To avoid surprises where they expect a table to be a part of the backup, but it is silently ignored. This might be solved via documentation, but it is worth calling out explicitly.\r\n\r\nEpic: CRDB-10306\n\nJira issue: CRDB-11627",
+        "comments": [
+            "cc @cockroachdb/bulk-io",
+            "Is this synonymous with exclusion? Is `ephemeral` a hint?",
+            "> Is this synonymous with exclusion? Is ephemeral a hint?\r\n\r\nYep, `ephemeral` is an indicator that will be used to determine if the row data is considered short-lived and should therefore not be backed up.\r\n",
+            "With the new protected timestamp subsystem potentially protecting schema objects instead of spans, there is an increased importance to addressing this issue. In particular, the new protection scheme is going to unlock the ability to chain protected timestamps between backups (https://github.com/cockroachdb/cockroach/issues/67282). By chaining protected timestamp records we decouple backup cadence from GC TTL which has been a longstanding thorn in our side. This way we can move to a future where cluster-wide TTLs do not have to default to 25 hours, and CRDB is not burdened by garbage buildup.\r\n\r\nIn this chaining future, we do not want to hold up GC on high churn tables with short TTLs for the duration of a backup.",
+            "The KV side of things LGTM, just a minor change for the MVCC GC queue.",
+            "Wondering if there is really a need to restrict this ephemeral bit to just tables? With the knew reconciler, if we were to set the ephemeral bit on the zone config of a database, it would propagate to the table span configs, and so both GC and ExportRequest would just skip for all tables in the database. This seems okay \ud83e\udd37 \r\n\r\nOn the other hand, we probably don't want to allow setting this on an INDEX or PARTITION level, because then you might end up partially backing up a non-ephemeral table with an ephemeral index.",
+            "Naming nit: the term \"ephemeral\" suggests something beyond not including the table in backups. For example, I could imagine an \"ephemeral\" table as not surviving a cluster crash (in-memory only), or being automatically deleted after some time period. Unfortunately, I don't have a better suggestion than ephemeral. Did you consider trying to find a term/syntax that explicitly mentions \"backup\"? ",
+            "> Did you consider trying to find a term/syntax that explicitly mentions \"backup\"?\r\n\r\nWe had a round of bikeshedding the term in this [internal thread](https://cockroachlabs.slack.com/archives/C2C5FKPPB/p1642624125070400), and similar concerns were brought up by @dt about `ephemeral` getting confused with `temporary` tables which we already support. The one argument against naming this something specific to backups is that we will be ignoring protected timestamps that apply to ephemeral ranges so as to not hold up GC on these high churn tables. CDC and the soon to be tenant to tenant streaming are also users of the protected timestamp subsystem (PTS). While they are initially going to configure the PTS records they write to **not** be ignored on ephemeral ranges, there might be a future where other systems want similar behavior as backups? Maybe it is okay to name it something backup specific, to begin with, and if and when we see a more general use case we can revisit the syntax.",
+            "There is a final PR required to teach the GC queue to ignore protection policies that apply to spans where:\r\n`exclude_data_from_backup` introduced in https://github.com/cockroachdb/cockroach/pull/75295 && `ignore_if_excluded_from_backup` introduced in https://github.com/cockroachdb/cockroach/pull/76831 are both true. This can only happen once #73727 is complete, therefore marking it as a release blocker."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14760,
+            "commit_id": "3470def5aaad83042e5cdf81c83cc3eb74cba11b",
+            "original_commit_id": "d384f953bc238b818f0c8aca41c7234792134837",
+            "path": "pkg/ccl/backupccl/backup_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 9728,
+            "original_line": 9728,
+            "side": "RIGHT",
+            "original_position": 117,
+            "position": 117,
+            "subject_type": "line",
+            "review_comments": [
+                "I solemnly swear to datadriven-ify these tests as part of https://github.com/cockroachdb/cockroach/issues/77129, but to derisk this change I wanted to postpone building out our backup datadriven framework. I have ideas on how to wrap all these GC/SpanConfig operations that I'll work on as part of our test revamp."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,78 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 103528,
+    "lang": "c_sharp",
+    "pr_title": "Intrinsify typeof(T).GetGenericTypeDefinition()",
+    "pr_body": "Closes #96898\r\n\r\n```csharp\r\npublic static Type? Test1<T>() =>\r\n    typeof(T).IsGenericType\r\n    ? typeof(T).GetGenericTypeDefinition()\r\n    : null;\r\n```\r\n\r\nCodegen diffs:\r\n\r\n```diff\r\n; Assembly listing for method Foo:Test1[System.Collections.Generic.KeyValuePair`2[System.__Canon,int]]():System.Type (FullOpts)\r\n\r\n-   sub      rsp, 40\r\n-   mov      qword ptr [rsp+0x20], rcx\r\n-   mov      rcx, qword ptr [rcx+0x40]\r\n-   mov      rcx, qword ptr [rcx]\r\n-   call     CORINFO_HELP_TYPEHANDLE_TO_RUNTIMETYPE\r\n-   mov      rcx, rax\r\n-   call     [System.RuntimeType:GetGenericTypeDefinition():System.Type:this]\r\n-   nop      \r\n-   add      rsp, 40\r\n+   mov      rax, 0x275000095B0\r\n    ret\r\n```\r\n\r\n```csharp\r\npublic static bool Test2<T>() =>\r\n        typeof(T).IsGenericType &&\r\n        typeof(T).GetGenericTypeDefinition() == typeof(KeyValuePair<,>);\r\n```\r\n\r\nCodegen diffs:\r\n\r\n```diff\r\n; Assembly listing for method Foo:Test2[System.Collections.Generic.KeyValuePair`2[System.__Canon,int]]():ubyte (FullOpts)\r\n\r\n-   sub      rsp, 40\r\n-   mov      qword ptr [rsp+0x20], rcx\r\n-   mov      rcx, qword ptr [rcx+0x40]\r\n-   mov      rcx, qword ptr [rcx]\r\n-   call     CORINFO_HELP_TYPEHANDLE_TO_RUNTIMETYPE\r\n-   mov      rcx, rax\r\n-   call     [System.RuntimeType:GetGenericTypeDefinition():System.Type:this]\r\n-   mov      rcx, 0x19F800095D8      ; 'System.Collections.Generic.KeyValuePair`2[TKey,TValue]'\r\n-   cmp      rax, rcx\r\n-   sete     al\r\n-   movzx    rax, al\r\n-   add      rsp, 40\r\n+   mov      eax, 1\r\n    ret    \r\n```\r\n\r\n> [!NOTE]\r\n> Reopening from #97159 because the bot closed that one.",
+    "pr_comments": [
+        "@MihuBot",
+        "@Sergio0694 wrong command it seems? Box => bot",
+        "Oops, typo, thank you! \ud83d\ude05",
+        "@MihuBot",
+        "@MihuBot",
+        "LGTM otherwise, cc @jkotas for VM side\r\n\r\nIt feels a bit unfortunate that intrinsification of various Type::* APIs takes that much of efforts, I don't think we should continue intrinsifing its APIs unless there is a strong motivation/nice diffs",
+        "no way to avoid the regression?\r\n\r\n          74 (1.39 % of base) : System.Private.DataContractSerialization.dasm - System.Runtime.Serialization.DataContracts.CollectionDataContract:IsCollectionOrTryCreate(System.Type,ubyte,byref,byref,ubyte,ubyte):ubyte (FullOpts)",
+        "> no way to avoid the regression?\r\n> \r\n> ```\r\n>       74 (1.39 % of base) : System.Private.DataContractSerialization.dasm - System.Runtime.Serialization.DataContracts.CollectionDataContract:IsCollectionOrTryCreate(System.Type,ubyte,byref,byref,ubyte,ubyte):ubyte (FullOpts)\r\n> ```\r\n\r\nit seems to be \"regressed\" by inlining (`IsArraySegment`) so it's fine.",
+        "Mmh it seems like the latest changes somehow broke the intrinsic. It seems it's now always returning the input type?\r\n\r\n```\r\nTypeIntrinsics.cs:L282 test failed (expected: 'GenericEnumClass`1[SimpleEnum]' to be equal to 'GenericEnumClass`1[T]')\r\n```\r\n\r\nFor\r\n```csharp\r\nAreEqual(typeof(GenericEnumClass<SimpleEnum>).GetGenericTypeDefinition(), typeof(GenericEnumClass<>));\r\n```\r\n\r\nLooking into it... \ud83e\udd14",
+        "I'm not sure that `IsTypicalTypeDefinition()` check is correct. It returns the equivalent of `!HasInstantiation() || IsGenericTypeDefinition()`, according to the docs. Doesn't that mean we'll never take this path for constructed generic types, which is not what we want? Shouldn't we rather call `LoadTypeDefThrowing` for `HasInstantiation() & !IsGenericTypeDefinition()`?",
+        "Yes, I think you are right",
+        "Failures are unrelated and changes in the recent force push look good, merging"
+    ],
+    "merged": true,
+    "created_at": "2024-07-10T07:35:27Z",
+    "issue_context": {
+        "number": 96898,
+        "title": "Make Type.IsGenericType and GetGenericTypeDefinition() JIT intrinsics (and JIT time constants)",
+        "body": "### Overview\r\n\r\nThis is one more codegen improvement we could leverage for CsWinRT, related to #95929. One scenario we have ([here](https://github.com/microsoft/CsWinRT/blob/eb066e4a179767e5598fd901652a625941f0b9db/src/WinRT.Runtime/Marshalers.cs#L1483C113-L1483C121)) is to check whether a given type `T` is some `KeyValuePair<,>` instantiation. This needs to be marshalled in a specific way to match the expectations of WinRT. Right now however, the only way we have to check for this case is to use `IsGenericType` and `GetGenericTypeDefinition()`, which are not JIT intrinsics. This makes the linker not see this special case, and therefore not correctly trim the code away (or just specialize it on the other hand). This is both marginally slower, but most importantly leaves some codegen size reduction opportunities on the table. We're seeing a bunch of `KeyValuePair<__Canon, __Canon>` instantiations in sizoscope even in sample WinRT components that never use `KeyValuePair<,>` at all anywhere. It would be nice if this could just be properly inlined as a constant instead.\r\n\r\n### Codegen\r\n\r\n```csharp\r\nusing SharpLab.Runtime;\r\n\r\n[JitGeneric(typeof(System.Collections.Generic.KeyValuePair<int, int>))]\r\n[JitGeneric(typeof(int))]\r\nstatic bool IsKVP<T>()\r\n{\r\n    return typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(System.Collections.Generic.KeyValuePair<,>);\r\n}\r\n```\r\n\r\n**Current codegen on .NET 8 x64 ([sharplab](https://sharplab.io/#v2:EYLgxg9gTgpgtADwGwBYA0AXEBDAzgWwB8ABABgAIBlAC2ygAcAZbYAOgCUBXAOwwEt8MANwBYAFDiA2gCk+GAOIxuMKHzAAKDAE96MCADN1xAIwpWAaRhaAatgA2nGAAVsfKAB4+vNOS8YAfACUgQC64iZI5MAQEHbkAJK45tZO7gAq/uqB4gDe4uQF5MQA7OTaugbqaYGsiYrKqmBpOjDkAGRtZS2V1ayKCkoqas26ACIw+l5yfBDcWeQAvAtdFYYmZpY29o4ubu5oQaJiAL5AA===))**:\r\n```asm\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Collections.Generic.KeyValuePair`2[[System.Int32, System.Private.CoreLib],[System.Int32, System.Private.CoreLib]], System.Private.CoreLib]]()\r\n    L0000: sub rsp, 0x28\r\n    L0004: mov rcx, 0x23e784e3260\r\n    L000e: call qword ptr [0x7ffb1060a518]\r\n    L0014: test eax, eax\r\n    L0016: je short L0040\r\n    L0018: mov rcx, 0x23e784e3260\r\n    L0022: call qword ptr [0x7ffb1060a568]\r\n    L0028: mov rcx, 0x23e783e2728\r\n    L0032: cmp rax, rcx\r\n    L0035: sete al\r\n    L0038: movzx eax, al\r\n    L003b: add rsp, 0x28\r\n    L003f: ret\r\n    L0040: xor eax, eax\r\n    L0042: add rsp, 0x28\r\n    L0046: ret\r\n\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Int32, System.Private.CoreLib]]()\r\n    ; pretty much the same as above\r\n```\r\n\r\n**Expected codegen**:\r\n```asm\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Collections.Generic.KeyValuePair`2[[System.Int32, System.Private.CoreLib],[System.Int32, System.Private.CoreLib]], System.Private.CoreLib]]()\r\n    L0000: mov eax, 1\r\n    L0005: ret\r\n\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Int32, System.Private.CoreLib]]()\r\n    L0000: xor eax, eax\r\n    L0002: ret\r\n```\r\n\r\ncc. @jkoritzinsky @MichalStrehovsky @EgorBo",
+        "comments": [
+            "Tagging subscribers to this area: @JulieLeeMSFT, @jakobbotsch\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\n### Overview\r\n\r\nThis is one more codegen improvement we could leverage for CsWinRT, related to #95929. One scenario we have ([here](https://github.com/microsoft/CsWinRT/blob/eb066e4a179767e5598fd901652a625941f0b9db/src/WinRT.Runtime/Marshalers.cs#L1483C113-L1483C121)) is to check whether a given type `T` is some `KeyValuePair<,>` instantiation. This needs to be marshalled in a specific way to match the expectations of WinRT. Right now however, the only way we have to check for this case is to use `IsGenericType` and `GetGenericTypeDefinition()`, which are not JIT intrinsics. This makes the linker not see this special case, and therefore not correctly trim the code away (or just specialize it on the other hand). This is both marginally slower, but most importantly leaves some codegen size reduction opportunities on the table. We're seeing a bunch of `KeyValuePair<__Canon, __Canon>` instantiations in sizoscope even in sample WinRT components that never use `KeyValuePair<,>` at all anywhere. It would be nice if this could just be properly inlined as a constant instead.\r\n\r\n### Codegen\r\n\r\n```csharp\r\nusing SharpLab.Runtime;\r\n\r\n[JitGeneric(typeof(System.Collections.Generic.KeyValuePair<int, int>))]\r\n[JitGeneric(typeof(int))]\r\nstatic bool IsKVP<T>()\r\n{\r\n    return typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(System.Collections.Generic.KeyValuePair<,>);\r\n}\r\n```\r\n\r\n**Current codegen on .NET 8 x64 ([sharplab](https://sharplab.io/#v2:EYLgxg9gTgpgtADwGwBYA0AXEBDAzgWwB8ABABgAIBlAC2ygAcAZbYAOgCUBXAOwwEt8MANwBYAFDiA2gCk+GAOIxuMKHzAAKDAE96MCADN1xAIwpWAaRhaAatgA2nGAAVsfKAB4+vNOS8YAfACUgQC64iZI5MAQEHbkAJK45tZO7gAq/uqB4gDe4uQF5MQA7OTaugbqaYGsiYrKqmBpOjDkAGRtZS2V1ayKCkoqas26ACIw+l5yfBDcWeQAvAtdFYYmZpY29o4ubu5oQaJiAL5AA===))**:\r\n```asm\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Collections.Generic.KeyValuePair`2[[System.Int32, System.Private.CoreLib],[System.Int32, System.Private.CoreLib]], System.Private.CoreLib]]()\r\n    L0000: sub rsp, 0x28\r\n    L0004: mov rcx, 0x23e784e3260\r\n    L000e: call qword ptr [0x7ffb1060a518]\r\n    L0014: test eax, eax\r\n    L0016: je short L0040\r\n    L0018: mov rcx, 0x23e784e3260\r\n    L0022: call qword ptr [0x7ffb1060a568]\r\n    L0028: mov rcx, 0x23e783e2728\r\n    L0032: cmp rax, rcx\r\n    L0035: sete al\r\n    L0038: movzx eax, al\r\n    L003b: add rsp, 0x28\r\n    L003f: ret\r\n    L0040: xor eax, eax\r\n    L0042: add rsp, 0x28\r\n    L0046: ret\r\n\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Int32, System.Private.CoreLib]]()\r\n    ; pretty much the same as above\r\n```\r\n\r\n**Expected codegen**:\r\n```asm\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Collections.Generic.KeyValuePair`2[[System.Int32, System.Private.CoreLib],[System.Int32, System.Private.CoreLib]], System.Private.CoreLib]]()\r\n    L0000: mov eax, 1\r\n    L0005: ret\r\n\r\nProgram.<<Main>$>g__IsKVP|0_0[[System.Int32, System.Private.CoreLib]]()\r\n    L0000: xor eax, eax\r\n    L0002: ret\r\n```\r\n\r\ncc. @jkoritzinsky @MichalStrehovsky @EgorBo\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>Sergio0694</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-CodeGen-coreclr`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+            "Sharing some notes from Discord:\r\n- @MichalPetryka mentioned that `IsConstructedGenericType` would be easier to make an intrinsic compared to `IsGenericType`, and it would still be sufficient for this scenario. Either of them would be completely fine, really.\r\n- @SingleAccretion mentioned that making `GetGenericTypeDefinition()` could be difficult to make an intrinsic, but it would be possible to just make direct comparisons over that return value be an intrinsic. That would also work in this scenario.",
+            "grep.app:\r\n\r\n- https://grep.app/search?q=typeof%5C%28%2A.%5C%29.IsGenericType&regexp=true&filter[lang][0]=C%23\r\n- https://grep.app/search?q=typeof%5C%28%2A.%5C%29.GetGenericTypeDefinition&regexp=true&filter[lang][0]=C%23",
+            "I agree there's not many hits, but this would be beneficial for CsWinRT. We're really trying to minimize the binary size in minimal applications and WinRT components, to make the adoption of C# easier to justify in place of C++ (and binary size is one of the main problems you immediately hit when doing so). We have lots of heavily generic code especially in our marshallers, and they all end up being instantiated over `KeyValuePair<,>` today because we can't tell the linker that branch is really not used. Having a linker-friendly way of doing that check would be nice to have, is all \ud83d\ude42",
+            "There are more hits with GitHub Search:\r\n\r\n- https://github.com/search?q=%2Ftypeof%5C%28%5BA-Za-z0-9._%3C%3E+%5D*%5C%29%5C.IsGenericType%2F+language%3AC%23&type=code\r\n-  https://github.com/search?q=%2Ftypeof%5C%28%5BA-Za-z0-9._%3C%3E+%5D*%5C%29%5C.GetGenericTypeDefinition%5C%28+*%5C%29%2F+language%3AC%23&type=code",
+            "It would also help with F#'s `typedefof`.",
+            "Can we also intrinsify `typeof(T).IsConstructedGenericType` as well?",
+            "Thank you for volunteering! \ud83d\ude04"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 5386,
+            "commit_id": "4cbe7f301f2a3917c274c9ccc923cd302fd93f54",
+            "original_commit_id": "37253e00c30e0ee234fa64a71222f9a7b0786ed1",
+            "path": "src/coreclr/tools/Common/JitInterface/CorInfoImpl.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1253,
+            "original_line": 1253,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "does it need an assert that the input must be generic? (coreclr's impl does validate that)",
+                "Added a check for `HasInstantiation` in 9dacde374ad1398d7c9c87f783d6f854ddc54843."
+            ]
+        },
+        {
+            "hunk_id": 5385,
+            "commit_id": "4cbe7f301f2a3917c274c9ccc923cd302fd93f54",
+            "original_commit_id": "37253e00c30e0ee234fa64a71222f9a7b0786ed1",
+            "path": "src/tests/JIT/Intrinsics/TypeIntrinsics.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 301,
+            "original_line": 301,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you add some test cases for _Canon? e.g. for `typeof(T)` and `typeof(GenericClass<T>)` ?\r\n\r\nfor that you need to define a separate NoInlining generic method and then call it with T being e.g. String ",
+                "Done! Both for generic cases, and for cases where it should throw `InvalidOperationException` \ud83d\ude42"
+            ]
+        }
+    ]
+}

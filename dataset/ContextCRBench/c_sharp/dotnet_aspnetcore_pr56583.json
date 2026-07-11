@@ -1,0 +1,41 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 56583,
+    "lang": "c_sharp",
+    "pr_title": "Support IAsyncEnumerable<T> and ChannelReader<T> with ValueTypes in SignalR native AOT",
+    "pr_body": "Support streaming ValueTypes from a SignalR Hub method in both the client and the server in native AOT. In order to make this work, we need to use pure reflection to read from the streaming object.\r\n\r\nSupport passing in an IAsyncEnumerable/ChannelReader of ValueType to a parameter in SignalR.Client. This works because the user code creates the concrete object, and the SignalR.Client library just needs to read from it using reflection.\r\n\r\nThe only scenario that can't be supported is on the SignalR server we can't support receiving an IAsyncEnumerable/ChannelReader of ValueType. This is because there is no way for the SignalR library code to construct a concrete instance to pass into the user-defined method on native AOT.\r\n\r\nFix #56179",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2024-07-03T16:29:12Z",
+    "issue_context": {
+        "number": 56179,
+        "title": "SignalR: Using IAsyncEnumerable<T> and ChannelReader<T> with ValueTypes in native AOT",
+        "body": "With https://github.com/dotnet/aspnetcore/pull/56079, native AOT support for SignalR client was added. But one scenario that isn't supported is to use \"streaming\" APIs (`IAsyncEnumerable<T>` and `ChannelReader<T>`) with ValueTypes. In order to work with `IAsyncEnumerable<T>` and `ChannelReader<T>` we either need to \"jump\" to a `<T>` generic method (which is what it does today, and not supported with native AOT because it can't generate the code up front) or by using reflection to invoke the `MoveNextAsync()` and `WaitToReadAsync()` methods.\r\n\r\nIt was decided to not support this scenario until we get data that shows we need to implement this in SignalR.\r\n\r\nNote that using ValueTypes in these scenarios isn't necessarily a performance gain because the `T` will be boxed (i.e. an allocation will occur) into the `StreamItemMessage` in:\r\n\r\nhttps://github.com/dotnet/aspnetcore/blob/206b0aeca39d5eb12e55ce4e35ef4c8b9bc63c86/src/SignalR/clients/csharp/Client.Core/src/HubConnection.cs#L856-L858\r\n\r\ncc @BrennanConroy ",
+        "comments": [
+            "Backlog, waiting for customer feedback.",
+            "I found out that Blazor Server uses `IAsyncEnumerable<ArraySegment<byte>>` in its Hub:\r\n\r\nhttps://github.com/dotnet/aspnetcore/blob/94259788d58e16ba753900b4bf855a6aee08dcb1/src/Components/Server/src/ComponentHub.cs#L269\r\n\r\nWhich means Blazor Server won't work if we keep this limitation.\r\n\r\nGiven this information, we will need to support this scenario (at least for the server, but we might as well do the client as well). Right now, the only way I can see this working is by using pure reflection to read from the streaming objects.",
+            "There is a scenario here we can't solve without a source generator. Say I have a Hub defined like the following:\r\n\r\n```csharp\r\npublic class MyHub : Hub\r\n{\r\n    public async Task EnumerableValueTypeParameter(IAsyncEnumerable<int> source)\r\n    {\r\n        await foreach (var item in source)\r\n        {\r\n            // do something with item\r\n        }\r\n    }\r\n}\r\n```\r\n\r\nThe problem is that in order to invoke the `MyHub.EnumerableValueTypeParameter` method on the SignalR server, we need to be able to create an **actual** `IAsyncEnumerable<int>` instance on the server. We need a real instance of this type because we are going to pass it into the user-defined Hub's method. However, it isn't possible to create an instance of this type in native AOT using reflection. For classes / reference types, we can call MakeGenericMethod/Type to dynamically create the concrete object. But for a ValueType, it isn't guaranteed the AOT'd code for the ValueType will exist (and very likely won't exist since we call MakeGenericMethod on our own methods, which never get instantiated for the ValueType). The same applies for a `ChannelReader<ValueType>` parameter on the server as well.\r\n\r\nFor the other 3 cases, we can provide support on native AOT using reflection. The other 3 cases are:\r\n\r\n1. The server Hub's method returns an IAsyncEnumerable/ChannelReader of ValueType.\r\n3. On the client, passing in a parameter of IAsyncEnumerable/ChannelReader of ValueType.\r\n    1. The difference here (and for a server Hub's method return value) is that the user's code is creating the IAsyncEnumerable/ChannelReader of ValueType. The SignalR library code just needs to read from it, which can be done using reflection.\r\n4. On the client, consuming a return value of IAsyncEnumerable/ChannelReader of ValueType.\r\n    1. The difference here is that in order to consume the IAsyncEnumerable/ChannelReader, the user's code calls a generic method, passing in the type - `IAsyncEnumerable<TResult> StreamAsync<TResult>` or `Task<ChannelReader<TResult>> StreamAsChannelAsync<TResult>`. In this case, since we know the generic type, we can create a generic `Channel<TResult>` or have a generic class that implements `IAsyncEnumerable<TResult>`. There's no need for reflection/MakeGenericMethod.\r\n\r\nFor .NET 9 we are able to support these 3 cases. For the case on the server where a parameter of a Hub method takes an IAsyncEnumerable/ChannelReader of ValueType, we will continue throwing an exception for `PublishAot=true`."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 13509,
+            "commit_id": "2d2e147fa824cdb0a7b08fbcb73c3c500828d588",
+            "original_commit_id": "102f4bdbf10aac8dc821a8ef2e00a086a1fcdea6",
+            "path": "src/SignalR/clients/csharp/Client.Core/src/HubConnection.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 888,
+            "original_line": 888,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we move `ReadAsyncEnumerableStream` from below into a non-local function and then use it in this method as well? Removes code duplication.",
+                "We can't easily refactor this because `ReadAsyncEnumerableStream` below is in terms of `IAsyncEnumerable` and this method is in terms of `IAsyncEnumerator`.\r\n\r\nIt's really only 2 lines of code duplication, right?\r\n\r\n```\r\nawait SendWithLock(connectionState, new StreamItemMessage(streamId, enumerator.Current), tokenSource.Token).ConfigureAwait(false);\r\nLog.SendingStreamItem(_logger, streamId);\r\n```\r\n\r\nI can refactor that out to a separate method and use it in 3 places."
+            ]
+        }
+    ]
+}

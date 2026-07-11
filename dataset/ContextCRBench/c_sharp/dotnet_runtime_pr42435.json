@@ -1,0 +1,74 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 42435,
+    "lang": "c_sharp",
+    "pr_title": "Extract bundled files when IncludeAllContentForSelfExtract is set",
+    "pr_body": "Fixes #42352 ",
+    "pr_comments": [
+        "Tagging subscribers to this area: @agocke\nSee info in area-owners.md if you want to be subscribed.",
+        "I tested lot of cases around the APIs which behave in a different/interesting way in single-file cases - AFAIK the behavior is as expected now. That is - for 3.1 backcompat, almost all APIs behave as non-single, with a couple of exceptions.\r\n\r\n@elinor-fung @agocke  could you please take a second look?",
+        "Re: testing - not sure if this has already been done or how simple it would be, but it might be interesting to grab a known consumer of 3.x single-file and try building/running it against 5.0 with this backcompat property. I remember Greenshot being a common reporter of issues with single-file in 3.x",
+        "@elinor-fung You're correct that this is broken on Linux due to not finding CoreLib. Unfortunately this is a bigger issue:\r\nIn runtime there's a notion of \"system directory\", which currently is always deduced from the location of the runtime module. For non-single-file this points to the path of the coreclr.dll. For single-file this points to the path of the bundle .exe. This works well for all cases except this special case - since we want the system to behave as if the app is loaded from the extracted location fully.\r\n\r\nCoreLib's path is derived from the system path.\r\nThere are several other places where system path is used - for example that's where we look for DAC, that's where GC looks for plugin GCs, that's where we look for runtime resources, ....\r\n\r\nI can see several possible ways to \"fix\" this:\r\n* Introduce a fallback when we look for corelib and look into the path passed by APP_CONEXT_BASE_DIRECTORY runtime property - which will point to the extraction directory. This would fix the CoreLib problem, but the other dependencies on system path would still be broken.\r\n* Introduce a new runtime property SYSTEM_PATH - the host would set this only in this special case and we would use that everywhere. This would simulate the old behavior pretty well.\r\n* Change how we package single-file in the 3.1 case - basically go back to 3.1 behavior fully - so don't use superhost - bundle coreclr.dll as normal.\r\n  * We could use the 3.1 apphost for this (the one which can self-extract) - but it would be a servicing nightmare probably\r\n  * We would have to introduce a new binary on linux - superhost can't do this, so we would have to build the singlefilehost just like Windows does on Linux as well - and ship that.\r\n\r\nIf I could get any solution for free I would pick the last one - go back to exactly how 3.1 did it, but that's very expensive and introduces lot of differences in behavior in 5.0.\r\nThe next best solution right now seems to introduce the SYSTEM_PATH property and wire it up internally in the runtime. It's still not ideal, but it's better than hacking around CoreLib alone.",
+        "Yet another possible solution would be to hardcode CoreLib into the bundle such that the probe always returns true for CoreLib (even if it's extracted onto disk) - the downside is that corelib would be memory-loaded so without Location and so on - less compatible.",
+        "Candidate fix for the CoreLib issue on Linux - passing system path from host approach:\r\nhttps://github.com/mateoatr/runtime/pull/1\r\n\r\nIt works well on Linux - also works on Windows (since it will sue the same codepath on Windows as well for consistency).\r\nPlease take a look - I didn't want to push it here if we don't think it's the right way to fix the problem.",
+        "> Change how we package single-file in the 3.1 case - basically go back to 3.1 behavior fully - so don't use superhost - bundle coreclr.dll as normal\r\n\r\nThis is the most compatible solution. It would be my top pick. Note that it will also address all not-yet-known issues where the true single file is breaking layout assumptions hardcoded in components out there (e.g. debugger?).\r\n\r\nThe next best solution that I can think of is to extract the CoreLib path from `TRUSTED_PLATFORM_ASSEMBLIES`. The host send the CoreLib path in `TRUSTED_PLATFORM_ASSEMBLIES`, but runtime ignores it and tries to find corelib next to coreclr.dll.",
+        "> If I could get any solution for free I would pick the last one - go back to exactly how 3.1 did it\r\n\r\nAgreed. But, but yeah - the host build / packaging / sdk changes might be a bit expensive at this point.\r\n\r\nThe CoreLib from `TRUSTED_PLATFORM_ASSEMBLIES` solution would only hit the CoreLib problem, but not other dependencies on the system path? Or would we be using that as the system path as well?",
+        "I would fix just the CoreLib problem and leave the rest alone (for the 5.0 fix). The system directory concept is overloaded and it would be best to eliminate it.",
+        "So I prepared a fix which adds a fallback to CoreLib search - if we don't find it in the bundle, nor \"next\" to the runtime, we will also look for it in TPA and use that path there.\r\n\r\nTested it that it works in the single-file scenario on Linux.\r\n\r\nThe change is not super clean as doing that would require non-trivial refactorings, so I avoided that. I just did the minimum to avoid too much code duplication. The general idea:\r\n* Use the Configuration class to get to the TPA value (this is also not very clean, but it works and effectively does the right thing)\r\n* Use the same code we use to parse TPA - we can now end up parsing it twice\r\n* Search of CoreLib in the TPA that way\r\n\r\nThe change is here (didn't push it here to get some feedback on the approach first)\r\nhttps://github.com/mateoatr/runtime/pull/2\r\n\r\n@elinor-fung @jank could you please take a quick look if this approach sounds reasonable?",
+        "Looks reasonable as release/5.0 fix.",
+        "That seems reasonable for 5.0",
+        "I ported changes from https://github.com/dotnet/runtime/pull/42611 into this PR now - fixes presence of app.deps.json in the runtime property (Since in the compat mode the .deps.json file actually exists on disk, so we can return path to it).",
+        "There's still a bug in this - the APP_CONTEXT_DEPS_FILES reported with 3.0 backward compat mode points to the app.deps.json as if it was next to the .exe - not into the extraction directory.",
+        "Adding a few additional code reviewers as we are really late in .NET 5.",
+        "The other thing I found is that if there is no .deps.json file (e.g. `GenerateDependencyFile=false`), the published single-file app doesn't run - self-contained can't find coreclr on Windows, can't find SPCL on Linux. Runs fine with 3.1 single-file (or `IncludeAllContentForSelfExtract=false`)",
+        "Sad face...\r\nI guess we could make that work with a fix which I think Mateo actually implemented at one point - the piece of code you asked about (why do we add CoreLib to TPA  at the end, always). We could tweak that to add CoreLib to TPA in the 3.0 compat case (it is currently disabled when CoreLib exists in the bundle, because we expect it to be loaded from the bundle - which is technically wrong).",
+        "That said - I would be fine not supporting that case if it came down to it - it's such a niche thing ... I think",
+        "Yeah, I'd also be fine not supporting it - seems like we'd have to special case where we load coreclr from and adding SPCL to the TPA in compat-mode... I think it is pretty niche as well, but we do talk about how loading works in our [default dependency probing](https://docs.microsoft.com/dotnet/core/dependency-loading/default-probing) doc.",
+        "So the last commit should fix the .deps.json problem (had trouble with local setup, somehow everything got corrupted and I had to rebuild the entire repo again). That leaves only the no .deps.json case - I may look at that as well - since we know about it and the fix seems simple enough - we might as well.",
+        "I tried the missing .deps.json case and it actually asserts in the host... pretty bad. I will probably look into this a little bit.\r\nOn a bright side - it works without .deps.json and without backward compat mode - I don't know why we find the runtime in the host, but after that finding everything else is easy because we probe the bundle every time we need instead of enumerating files in the TPA - so as long as it's in the bundle, it doesn't have to be in .deps.json for runtime to find it.",
+        "@jkotas @janvorli @davidwrighton Would one of you have some time to do a last review here?",
+        " Changes under src/coreclr/src look good to me. I have glanced over the rest and I did not find anything suspect, but I do not understand that part well.",
+        "@janvorli Any more comments?",
+        "@agocke no, I don't. Things look reasonable, but I am not much familiar with the code being updated.",
+        "Understandable, thanks for the input!\r\n\r\n@vitek-karas @mateoatr @elinor-fung Ready to merge?",
+        "I read through it once more - looks good to me.",
+        "Looks good to me as well.",
+        ":shipit: ",
+        "/backport to release/5.0",
+        "Started backporting to release/5.0: https://github.com/dotnet/runtime/actions/runs/281381356",
+        "@agocke backporting to release/5.0 failed, the patch most likely resulted in conflicts:\n\n```shell\n$ git am --3way --ignore-whitespace --keep-non-patch changes.patch\n\nApplying: Extract bundled files when IncludeAllContentForSelfExtract is set\nApplying: Don't pass bundle probe to the runtime for netcoreapp3 compat mode\nerror: sha1 information is lacking or useless (src/installer/corehost/cli/bundle/file_entry.h).\nerror: could not build fake ancestor\nhint: Use 'git am --show-current-patch=diff' to see the failed patch\nPatch failed at 0002 Don't pass bundle probe to the runtime for netcoreapp3 compat mode\nWhen you have resolved this problem, run \"git am --continue\".\nIf you prefer to skip this patch, run \"git am --skip\" instead.\nTo restore the original branch and stop patching, run \"git am --abort\".\nError: The process '/usr/bin/git' failed with exit code 128\n```\n\nPlease backport manually!"
+    ],
+    "merged": true,
+    "created_at": "2020-09-21T23:42:24Z",
+    "issue_context": {
+        "number": 42352,
+        "title": "IncludeAllContentForSelfExtract only extracts native assemblies, when it should extract everything",
+        "body": "`dotnet publish -r win-x64 -p:PublishSingleFile=true -p:IncludeAllContentForSelfExtract` shouldn't be loading managed assemblies from the bundle, but it seems it still is.",
+        "comments": [
+            "I couldn't figure out the best area label to add to this issue. If you have write-permissions please help me learn by adding exactly one [area label](https://github.com/dotnet/runtime/blob/master/docs/area-owners.md).",
+            "Tagging subscribers to this area: @agocke\nSee info in area-owners.md if you want to be subscribed.",
+            "@mateoatr Could you take a look at this?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 4487,
+            "commit_id": "19ea932d8dcf6060f917a8ba760c4a8ed5f57d67",
+            "original_commit_id": "92b125fc7671b82433f3adbd085b7e6b29b1a73d",
+            "path": "src/installer/tests/Assets/TestProjects/SingleFileApiTests/Program.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 14,
+            "original_line": 14,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we also have a case for `AppContext.BaseDirectory`?",
+                "Good point - I added it - and reworked the tests to validate more things."
+            ]
+        }
+    ]
+}

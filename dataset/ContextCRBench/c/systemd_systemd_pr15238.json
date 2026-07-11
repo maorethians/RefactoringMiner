@@ -1,0 +1,47 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 15238,
+    "lang": "c",
+    "pr_title": "network: can: add support for CAN-FD related properties",
+    "pr_body": "This adds support for enabling the CAN-FD mode of CAN netdevs and setting the data phase bitrate and samplepoint. \r\n\r\nCloses #15219 ",
+    "pr_comments": [
+        "@poettering & @ssahani: Should I change all the value checking and 32-bit type related stuff for the old CAN code as well? I might as well, cause that's where I copied the pattern from. If that's ok, I'll overhaul the CAN bitrate stuff a bit in general.",
+        "yes, clean-ups are always welcome. i.e. stay close to the kernel's own types for stuff, but use the right userspace types. i.e. __u32 usually means uint32_t in userspace, and so on. bools should be bools though, and tristates \"int\"s, and percentages/permilles `unsigned`s",
+        "I tested the patch on the `aarch64` platform with the MCP2517FD CAN-FD chip. It has the intended effect, so I removed the WIP flag.",
+        "Resolved everything as suggested.",
+        "thanks! lgtm!"
+    ],
+    "merged": true,
+    "created_at": "2020-03-27T02:34:53Z",
+    "issue_context": {
+        "number": 15219,
+        "title": "CAN-FD networking support in networkd",
+        "body": "**Is your feature request related to a problem? Please describe.**\r\nPR #9185 added support for CAN type network devices. Adding support for CAN-FD, an extended version of the standard, shoud be fairly easy. The CAN-FD standard introduces a second bitrate, which is used by the network during the \"data\" phase of a CAN frame. Furthermore, the maximum MTU is raised considerably from 8 to 64 bytes. Support for CAN-FD is present in the linux mainline for some time, devices and drivers exist as well.\r\n\r\n**Describe the solution you'd like**\r\nThe easist solution would be to simply extend the configuration to allow a specification of the bitrate for the data bitrate. Example config file:\r\n```\r\n[Match]\r\nName=*can*\r\n\r\n[CAN]\r\nBitRate=500000\r\nSamplePoint=80%\r\nDataBitRate=2000000\r\nDataSamplePoint=80%\r\nFDMode=yes\r\n```\r\nThe `FDMode` could also be implicitly turned on, as soon as `DataBitRate` has a non-zero value. However, a \"non-ISO\" mode should also be supported, so the `FDMode` could be be some form of ternary switch between `(no|yes|noniso)`. One even easier cop-out could also be to simply not support the \"non-ISO\" variant. I'm not even sure if there are real world use cases for it. The feature, however, is present in the kernel (and some drivers).\r\n\r\nI already made a patch for the CAN code of networkd, if anyone is interested. But I have no idea how I could extend the configuration file parser. The code, however, could work (unless I grossly misunderstood some things, e.g. how a `FDMode` flag would be parsed). The `linux/can/netlink.h` header included in the systemd sources already has the necessary flags etc. to support CAN-FD, so its just a matter of appending another attribute and setting a flag.\r\n\r\n```C\r\ndiff --git a/src/network/networkd-can.c b/src/network/networkd-can.c\r\nindex 18533843e3..54785dcf8e 100644\r\n--- a/src/network/networkd-can.c\r\n+++ b/src/network/networkd-can.c\r\n@@ -119,6 +119,36 @@ static int link_set_can(Link *link) {\r\n                         return log_link_error_errno(link, r, \"Could not append IFLA_CAN_BITTIMING attribute: %m\");\r\n         }\r\n \r\n+        if (link->network->can_data_bitrate > 0 || link->network->can_data_sample_point > 0) {\r\n+                struct can_bittiming bt = {\r\n+                        .bitrate = link->network->can_data_bitrate,\r\n+                        .sample_point = link->network->can_data_sample_point,\r\n+                };\r\n+\r\n+                if (link->network->can_data_bitrate > UINT32_MAX) {\r\n+                        log_link_error(link, \"data bitrate (%\" PRIu64 \") too big.\", link->network->can_data_bitrate);\r\n+                        return -ERANGE;\r\n+                }\r\n+\r\n+                log_link_debug(link, \"Setting data bitrate = %d bit/s\", bt.bitrate);\r\n+                if (link->network->can_data_sample_point > 0)\r\n+                        log_link_debug(link, \"Setting data sample point = %d.%d%%\", bt.sample_point / 10, bt.sample_point % 10);\r\n+                else\r\n+                        log_link_debug(link, \"Using default data sample point\");\r\n+\r\n+                r = sd_netlink_message_append_data(m, IFLA_CAN_DATA_BITTIMING, &bt, sizeof(bt));\r\n+                if (r < 0)\r\n+                        return log_link_error_errno(link, r, \"Could not append IFLA_CAN_DATA_BITTIMING attribute: %m\");\r\n+        }\r\n+\r\n+        cm.mask |= CAN_CTRLMODE_FD;\r\n+        SET_FLAG(cm.flags, CAN_CTRLMODE_FD, link->network->can_fd_mode > 0);\r\n+        log_link_debug(link, \"%sabling FD mode\", link->network->can_data_bitrate > 0 ? \"En\" : \"Dis\");\r\n+\r\n+        cm.mask |= CAN_CTRLMODE_FD_NON_ISO;\r\n+        SET_FLAG(cm.flags, CAN_CTRLMODE_FD_NON_ISO, link->network->can_fd_mode > 1);\r\n+        log_link_debug(link, \"%sabling FD non-ISO mode\", link->network->can_fd_mode > 1 ? \"En\" : \"Dis\");\r\n+\r\n         if (link->network->can_restart_us > 0) {\r\n                 char time_string[FORMAT_TIMESPAN_MAX];\r\n                 uint64_t restart_ms;\r\ndiff --git a/src/network/networkd-network.h b/src/network/networkd-network.h\r\nindex f747ccaf10..171b922375 100644\r\n--- a/src/network/networkd-network.h\r\n+++ b/src/network/networkd-network.h\r\n@@ -205,6 +205,11 @@ struct Network {\r\n         int can_termination;\r\n         int can_listen_only;\r\n \r\n+        /* CAN-FD support */\r\n+        uint64_t can_data_bitrate;\r\n+        unsigned can_data_sample_point;\r\n+        int can_fd_mode;\r\n+\r\n         AddressFamily ip_forward;\r\n         bool ip_masquerade;\r\n\r\n```\r\n\r\n**Describe alternatives you've considered**\r\nAnother, more detailed option would be to also support a more detailed configuration, which allows a fine grained control over bitrate calculation. A CAN(-FD) bitrate setting actually consists of the settings TQ (time-quanta in nanoseconds), PROP-SEG (technically only part of CAN-FD), PHASE1-SEG, PHASE2-SEG and SJW. Each of the SEG segments and SJW are multipliers for TQ. The actual bitrate is equal to `1s / TQ*(1 + PROP + PHASE1 + PHASE2)`, the SJW is the synchronization jump width. The sample point is simply the ratio `(1 + PROP + PHASE1)/(1 + PROP + PHASE1 + PHASE2)`. If one wants to support a more fine grained variant, the configuration format has to be extended quite a bit. Maybe with some fancy parsed format? But that's probably outside of the scope of this feature request.\r\n\r\n```\r\n[Match]\r\nName=*can*\r\n\r\n[CAN]\r\nBitTiming=tq:prop:seg1:seg2 # Each an integer\r\nDataBitTiming=tq:prop:seg1:seg2\r\nFDMode=yes\r\n```\r\n",
+        "comments": [
+            "Please submit as a PR.",
+            "Is there any documentation on how I would go about extending the parsers? Because otherwise it would be an incomplete PR.",
+            "From what I gather, I have to extend the gperf files?",
+            "yes it's very strate forward. Please see how other CAN variables are defined and do the same. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32715,
+            "commit_id": "7e025e9cdba1bce4e7e8259df0a9440f886c3be7",
+            "original_commit_id": "6829d8ce6927c151e4391c6a5e69b76906fbd2be",
+            "path": "src/network/networkd-can.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 164,
+            "original_line": 164,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "Add a black line"
+            ]
+        }
+    ]
+}

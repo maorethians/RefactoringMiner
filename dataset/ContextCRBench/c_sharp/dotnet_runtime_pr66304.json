@@ -1,0 +1,178 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 66304,
+    "lang": "c_sharp",
+    "pr_title": "[wasm]: JavaScript interop with [JSImport] and [JSExport] attributes and Roslyn",
+    "pr_body": "## Design\r\nThis evolved from https://github.com/dotnet/runtime/pull/64493 and steals many ideas from https://github.com/dotnet/runtime/pull/60765 and also from conversations with @kg\r\nRelated API proposal is https://github.com/dotnet/runtime/issues/70133\r\nContributes to https://github.com/dotnet/runtime/issues/46378\r\nContributes to https://github.com/dotnet/runtime/issues/47909\r\nFixes https://github.com/dotnet/runtime/issues/65959\r\nFixes https://github.com/dotnet/runtime/issues/69394\r\n\r\n- C# generated on compile time\r\n    - improves trimming of managed code for `JSImport`\r\n    - `JSExport` code is always retained as we don't have linker visibility to JavaScript usage.\r\n    - only C# and JS, no generated C code.\r\n- JS generated on runtime\r\n    - improves download size and it's easier to implement.\r\n    - but it's not [CSP Compliant](https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP)\r\n    - buffer for method signature passed during method binding\r\n- the \"wire\" format is bespoke, versioned\r\n    - JS interop is not generic RPC:\r\n    - WASM can't create JS objects, JS doesn't have natural notion of memory space\r\n    - We handle 2 garbage collectors and optimize for speed.\r\n    - Code generators like flatbuffers or protobuffers are not practical to use inside runtime.\r\n    - structure of the buffers is opaque to the public API\r\n    - use `stackalloc` for call arguments, both directions\r\n        - because Mono has conservative GC, we use it to pin `MonoString*`\r\n- As compared to existing private JS interop\r\n    - It has public C# API\r\n    - There are always generated stubs at both sides of the C#/JS boundary\r\n    - Never pass `MonoObject*` to user javaScript\r\n        - use GCHandle for C# objects\r\n        - use JSHandle for JS objects\r\n        - internally `MonoString*` is still used for strings and exception Message\r\n    - JS boundary is not crossed to marshal individual argument\r\n        - except for some Task/Promise scenarios\r\n        - except for some String scenarios\r\n    - primitive types are not boxed, calls could be zero allocation\r\n    - generated C# code inline marshallers\r\n    - It could bind functions both directions, only `[JSExport]` marked methods are accessible from JS side.\r\n- Roslyn analyzer enforces that non-trivial parameters are annotated with `[JSMarshalAs]` attribute.\r\n    - Roslyn analyzer enforces that only supported combinations of C# type and `JSType` could be used.\r\n    - Explicit definition of intent for nontrivial arg types, will help with backward compatibility.\r\n\r\n## Examples\r\n```cs\r\n[JSImport(\"console.log\")]\r\ninternal static partial void Log(string message);\r\n\r\n[JSImport(\"INTERNAL.http_wasm_get_response_header_names\")]\r\nprivate static partial string[] _GetResponseHeaderNames(\r\n    JSObject fetchResponse);\r\n\r\n[JSImport(\"INTERNAL.ws_wasm_send\")]\r\npublic static partial Task? WebSocketSend(\r\n    JSObject webSocket,\r\n    [JSMarshalAs<JSType.MemoryView>] ArraySegment<byte> buffer,\r\n    int messageType,\r\n    bool endOfMessage);\r\n\r\n[JSImport(\"INTERNAL.create_function\")]\r\n[return: JSMarshalAs<JSType.Function<JSType.Number, JSType.Number, JSType.Number>>]\r\npublic static partial Func<double, double, double> CreateFunctionDoubleDoubleDouble(\r\n    string arg1Name, \r\n    string arg2Name, \r\n    string code);\r\n\r\n[JSExport(\"JavaScriptTestHelper.AwaitTaskOfObject\")]\r\npublic static async Task<string> SlowFailure(Task<int> promisedNumber)\r\n{\r\n    var delayMs = await promisedNumber;\r\n    if (promisedNumber<0) throw new ArgumentException(\"delayMs\");\r\n\r\n    await Task.Delay(delayMs);\r\n    return \"Slow hello\";\r\n}\r\n```\r\n\r\n## In scope\r\n- [x] `JSImportAttribute`, `JSExportAttribute`\r\n- [x] `Function.New(string code, out Action function)` and few other `Func<>` signatures\r\n- [x] `JSObject.GetPropertyAsXXX`\r\n- [x] `JSObject.SetProperty` as extension method\r\n- [x] `JSMarshalAsAttribute` and `JSType`\r\n    - [x] Require that all parameters of exported and imported functions are explicitly annotated, so that we don't have to guess correct default behavior.\r\n    - [x] `JSType.Bool` - C# `bool` as JS boolean as opposed to possible but unusual `Number` in JS.\r\n         - [x] also `Nullable<>`\r\n    - [x] `JSType.Number` - it's actually like `double` inside\r\n         - [x] valid for C# number types, `bool` and `char`, `decimal`, `float`, `double`\r\n         - [x] could represent also `IntPtr`, `void*` for people who know what they are doing with it\r\n         - [x] also `Nullable<>`\r\n    - [x] `JSType.BigInt` \r\n         - [x] for `Int64` and `Nullable<Int64>`\r\n    - [x] `JSType.String` - `System.String`\r\n         - [x] pinned by the buffer on stack\r\n         - [x] including interned strings\r\n    - [x] `JSType.Date` - `System.DateTime`, `System.DateTimeOffset`\r\n         - [x] also `Nullable<>`\r\n    - [x] `JSType.Promise` - `Task`, `Task<>`\r\n         - [x] including GC on both sides\r\n    - [x] `JSType.Function` - `Func<>` and `Action<>`\r\n         - up to 3 generic arguments\r\n    - [x] `JSType.MemoryView` - `ArraySegment<byte>`, `ArraySegment<int>`, `ArraySegment<double>` \r\n        - zero copy, `Uint8Array`-like view, with API protecting user from wasm memory resize\r\n        - with underlying managed array `Pinned` GCHandle until the JS view is collected\r\n        - could be only created on C# side\r\n    - [x] `JSType.MemoryView` - `Span<byte>`, `Span<int>`, `Span<double>` \r\n        - useful for short term shared buffer, usually C# stack allocated\r\n        - with caller responsible for pinning and de-allocation\r\n    - [x] `JSType.Error` - `System.Exception` and `JSException`\r\n        - including lazy stack trace\r\n    - [x] `JSType.Array` \r\n        - copy of the array, one direction only\r\n        - [x] for `string[]` as JavaScript `Array` \r\n            - with `_RegisterGCRoot`/`mono_wasm_register_root` on the list buffer\r\n        - [x] for `object[]` as JavaScript `Array`\r\n            - dynamic marshling of the elements by type\r\n        - [x] for `JSObject[]` as JavaScript `Array`\r\n        - [x] for `byte[]` as JavaScript `Uint8Array`\r\n        - [x] for `int[]` as JavaScript `Int32Array`\r\n        - [x] for `double[]` as JavaScript `Float64Array`\r\n    - [x] `JSType.Object` for `JSObject` proxy\r\n    - [x] `JSType.Discard`, `JSType.Void`\r\n    - [x] `JSType.Any` for `System.Object` - by dynamic type of parameter instance\r\n        - JS->C#: `string`, `double`, `bool`, `DateTime`, `JSObject`, `Exception`, and C# proxy back get default mapping\r\n        - JS->C#: otherwise `JSObject` proxy would be created\r\n        - C# -> JS: `string`, `bool`, `byte`, `char`, `short`, `int`, `float`, `double`, `DateTime`, `DateTimeOffset`, `JSObject`, `Exception`, `DateTime`, `Nullable<>` get default mapping\r\n        - C# -> JS:  otherwise `ManagedObject` proxy would be created\r\n        - Task/Promise only with `Task<object>` signature\r\n        - `byte[]`, `int[]`, `double[]` <-> `Uint8Array`, `Int32Array`, `Float64Array` and back\r\n        - `string[]`, `object[]` -> `Array`\r\n        - `Array` -> `object[]`\r\n        - not supported: `long`, functions, `Span`, `ArraySegment`, will throw `NotImplementedException`\r\n- [x] `JSMarshalAsAttribute` on generic parameters with multiple params.\r\n    - `void Foo([JSMarshalAs<JSType.Promise<JSType.BigInt>>] Task<long> value)`\r\n- [x] generate code instead of `GetArgumentSignature`\r\n- [x] convert WebSocket to `[JSImport]`\r\n- [x] convert BrowserHttpHandler` to `[JSImport]`\r\n- [ ] Blazor https://github.com/dotnet/aspnetcore/pull/41665\r\n- [x] old JS API compatibility for JSHandle/GCHandle and interned strings\r\n- [x] large `Int64` values could throw overflow when passed as `System.Object`, instead we throw `NotImplementedException` when we see `Int64`. Same for `bigint`.\r\n- [x] Good enough roslyn diagnostic messages \r\n- [x] test ref assembly compilation on non-wasm target\r\n- [x] make sure that it can AOT well!\r\n- [x] add to samples\r\n\r\n## Consider\r\n- [x] implement micro benchmark in `Wasm.BrowserProfile.Sample`\r\n- [ ] JS side lazy stack trace\r\n- [ ] interpreted JS side marshaling\r\n- [ ] JSExport lazy binding\r\n\r\n## Possible Future\r\n- [ ] enable `bind_static_method` to consume `[JSExport]`\r\n- [ ] Tests for Roslyn diagnostic scenarios\r\n- [ ] Roslyn Auto-correct analysis for missing `[JSMarshalAs(JSType.XXX)]`\r\n- [ ] What is the error experience for things that are out-of-scope? And if they will become in-scope, what is the light-up experience?\r\n- [ ] What analyzer/fixers might be added to help users do the \u2018right\u2019 thing when using the new APIs?\r\n- [ ] measure number of `ccall`s\r\n- [ ] measure interp/AOT transitions\r\n- [ ] provide more detailed message about what failed why on runtime\r\n- [ ] move old interop into separate `.js` optional file, get rid of private interop DLL\r\n- [ ] make interpreted version of JS marshaling which is CSP friendly\r\n- [ ] `JSType.Array` - `[MarshalUsing]` for with P/Invoke native custom marshaler\r\n    - allocation managed by marshaler, copy bytes\r\n    - `JSImport` only\r\n- [ ] `Uri` as `string` as custom marshaler\r\n- [ ] `JSMarshalAsAttribute` with `JSType.Custom` and `JSCustomTypeMarshaller`, `JSMarshallingAttribute`\r\n    - with user provided JS code to un-marshal the value on JS side too.\r\n- [ ] generate JS code on compile time and make it CSP Compliant\r\n- [ ] `JSMarshalAsAttribute` with `JSType.MemoryView` \r\n    - over `[MarshalUsing]`\r\n    - over `Memory<byte>`\r\n- [ ] `JSMarshalAsAttribute` with `JSType.BigInt` \r\n    - over `UInt64`\r\n- [ ] `JSMarshalAsAttribute` with `JSType.String` \r\n    - over `DateTime`, `DateTimeOffset`\r\n- [ ] `JSMarshalAsAttribute` with `JSType.Number` \r\n    - over `SByte`, `UInt16`, `UInt32`, `UInt64`, `UIntPtr`\r\n    - over `Boolean`, `Char`\r\n    - over `DateTime`, `DateTimeOffset`\r\n- [ ] `[MarshalUsing]` for `JSExport`\r\n- [ ] `JSMarshalAsAttribute` and `JSType`\r\n    - `JSType.Int32Array` for `Span<int>`\r\n    - `JSType.Int16Array` for `Span<short>`\r\n    - etc..\r\n- [ ] old JS API compatibility for `MonoString*`\r\n- [ ] old JS API compatibility for `MonoObject*`\r\n- [ ] drop `InFlight`\r\n- [ ] drop `System.Private.Runtime.InteropServices.JavaScript` assembly\r\n\r\n\r\n## Out of scope\r\n- anything with nested generic parameters\r\n- untyped `Delegate`\r\n- C# arrays by reference\r\n- C# arrays as delegate parameter/return or as task return\r\n- P/Invoke `MarshalAsAttribute` and `UnmanagedType` behavior on method params\r\n    - `UnmanagedType.LPArray` & `UnmanagedType.LPStruct` is not supported by generated marshalers\r\n    - `UnmanagedType.FunctionPtr` - maybe for another wasm C function via JS ? What marshaler would be used to marshal the parameters of the function.\r\n    - `UnmanagedType.Bool`, `VariantBool` - we could represent System.Boolean as `number` or as `boolean` in JS.\r\n    - `UnmanagedType.I1, I2, I4, I8, U1, U2, U4, U8, Currency, SysInt, SysUInt` - all of that is always `number` or `BigInt` in JS\r\n    - `UnmanagedType.BStr, LPStr, LPWStr, LPTStr, ByValTStr, VBByRefStr, AnsiBStr, TBStr, HString, LPUTF8Str` - all of this is `string` in JS. \r\n    - `UnmanagedType.IUnknown, IDispatch, Interface, SafeArray, AsAny, Error, IInspectable` - not relevant\r\n    - `UnmanagedType.Struct, ByValArray` - we could not map struct to JS call stack\r\n    - `UnmanagedType.IUnknown, IDispatch, Interface, SafeArray, AsAny, Error, IInspectable`\r\n\r\n",
+    "pr_comments": [
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\nThis serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, to please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "Tagging subscribers to 'arch-wasm': @lewing\nSee info in area-owners.md if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\njust prototyping\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>pavelsavara</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`NO-REVIEW`, `arch-wasm`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>7.0.0</td>\n  </tr>\n</table>\n</details>",
+        "/azp run runtime-wasm ",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "> Roslyn analyzer enforces that all parameters are annotated with [JSMarshalAs] or [MarshalUsing] attribute. \r\n\r\nI really don't like this. I think it's reasonable to have defaults for some of the primitive types (and ```string```).",
+        "In this example:\r\n\r\n```C#\r\n\r\n[JSImport(\"INTERNAL.create_function\")]\r\n[return: JSMarshalAs(JSType.Function, JSType.Number, JSType.Number, JSType.Number)]\r\npublic static partial Func<double, double, double> CreateFunctionDoubleDoubleDouble(\r\n```\r\nI think the use of JSMarshalAs for JS -> C# marshaling of return values is very confusing, because it's instead specifying that we only (?) accept one input JS type to convert to this C# value type, but there may in fact be multiple JS value types we're willing to accept. For example, if I want a ```Task<object>```, ```JSMarshalAs(JSType.Promise, JSType.Object)``` is not actually correct since on the JS side a string is not of type ```object``` but on the C# side it is an ```object``` so we would want to be able to accept either ```JSType.Object``` or ```JSType.String```. In the other direction however ```JSMarshalAs(JSType.String)``` would be explicitly saying that we are converting to a JS string, always. In this example also, we're specifying type information for a function that doesn't and can't actually exist on the JS side, the function's parameter types could be anything.\r\n\r\nIt's awkward but I think it might be best to somehow distinguish between 'i want to convert C# values to this specific JS type' and 'I want to accept JS values of this type/these types and convert them to the C# type'. ```JSMarshalAs``` and ```JSUnmarshalFrom``` perhaps? And have a way to explicitly say you want to unmarshal from anything if the types are compatible, for scenarios like 'accept ```object``` or ```string```'?",
+        "Another problem with asserting static types this way in particular comes up with strings and nullability. On the C# side with nullability analysis enabled you have 4 possible types that can contain a JS ```string``` or C# ```string```: ```string```, ```string?```, ```object```, and ```object?```. The mapping between JS types and C# types already gets complicated here:\r\n\r\n|C# type|C# value|JS type|JS value|\r\n|-|-|-|-|\r\n|string|\"hello\"|JSType.String|\"hello\"|\r\n|string|?????|JSType.Object|null|\r\n|string?|\"hello\"|JSType.String|\"hello\"|\r\n|string?|null|JSType.Object|null|\r\n|string?|null|JSType.String|?????|\r\n\r\nThe answer to this might be things like ```JSType.StringOrNull``` or something? I'm not sure, it gets messy. You also have the nullable primitive scenario (```int?```, ```double?```) to consider, which would map to a ```JSType.NumberOrNull```.\r\n\r\nAlso, ```typeof(BigInt(64))``` isn't ```object``` either, just to make our lives more interesting :(",
+        "```JSType.Number``` also mapping types like ```char``` seems sketchy, I think we would want a ```JSType.IntegralNumber``` that represents 'I want an integer, not a float or NaN or infinity'. ```JSType.Number``` would still be universal for the C#->JS direction.\r\n\r\n```ArraySegment<>``` and ```JSType.MemoryView``` only works zero-copy in one direction (we have no way to turn a JS memory view into a managed array without copying). It might be OK to ignore this and just make a temporary managed array when going in the JS->C# direction but it might lead to some surprising and bad behavior.",
+        "While I agree with the decision to constrain it, naming a heavily constrained 'multiple types' type ```JSType.Any``` is a big mistake. It means that we can't ever add new types to ```Any``` in the future without potentially breaking existing code (by handing it types it's never seen before), so we suddenly have to add an ```Any2``` or something. We should give it a name that's clearer about what it is, or consider a better way of expressing the purpose it serves.\r\n\r\nIt should be possible to have a ```JSObject[]```, though I don't think we need to implement it now. I didn't see this mentioned in your list.",
+        "> > Roslyn analyzer enforces that all parameters are annotated with [JSMarshalAs] or [MarshalUsing] attribute.\r\n> I really don't like this. I think it's reasonable to have defaults for some of the primitive types (and `string`).\r\n\r\nThis is based on previous feedback I got from interop team. I don't insist. I think we should keep it and add roslyn analyzer auto-fix, to propose the default for the developer.",
+        "> > > Roslyn analyzer enforces that all parameters are annotated with [JSMarshalAs] or [MarshalUsing] attribute.\r\n> > > I really don't like this. I think it's reasonable to have defaults for some of the primitive types (and `string`).\r\n> \r\n> This is based on previous feedback I got from interop team. I don't insist. I think we should keep it and add roslyn analyzer auto-fix, to propose the default for the developer.\r\n\r\nYeah, if our intended use case is people in visual studio and the analyzer can fix it for them, that's probably good enough. People won't be writing imports or exports from scratch often.",
+        "> I think the use of JSMarshalAs for JS -> C# marshaling of return values is very confusing, because it's instead specifying that we only (?) accept one input JS type to convert to this C# value type, but there may in fact be multiple JS value types we're willing to accept. For example, if I want a `Task<object>`, `JSMarshalAs(JSType.Promise, JSType.Object)` is not actually correct since on the JS side a string is not of type `object` but on the C# side it is an `object` so we would want to be able to accept either `JSType.Object` or `JSType.String`. In the other direction however `JSMarshalAs(JSType.String)` would be explicitly saying that we are converting to a JS string, always. In this example also, we're specifying type information for a function that doesn't and can't actually exist on the JS side, the function's parameter types could be anything.\r\n> \r\n> It's awkward but I think it might be best to somehow distinguish between 'i want to convert C# values to this specific JS type' and 'I want to accept JS values of this type/these types and convert them to the C# type'. `JSMarshalAs` and `JSUnmarshalFrom` perhaps? And have a way to explicitly say you want to unmarshal from anything if the types are compatible, for scenarios like 'accept `object` or `string`'?\r\n\r\nWhat could we do to make it less confusing ?\r\nIn fact, we only do accept one JS type in all cases except `JSType.Any`-> `System.Object` signature.\r\nThe Roslyn generator allows only supported combinations.\r\nAnd the `Task<object>` only maps to `JSMarshalAs(JSType.Promise, JSType.Any)` not `JSType.Object`.\r\nAnd the `Task<IJSObject>` only maps to `JSMarshalAs(JSType.Promise, JSType.Object)`.\r\nWhat would be better name for `JSType.Any` ?\r\n\r\nI don't want to support  things like `JSType.StringOrNumber` and such.",
+        "> Another problem with asserting static types this way in particular comes up with strings and nullability. \r\n\r\nThe proposal handles all JS side things as nullable. \r\nWhen the null is passed to C# non-nullable value type parameter, it will be `default(T)`.\r\nWhen the null is passed to C# reference type, we don't check the nullability.\r\nShould we start asserting nullability on runtime ?",
+        "> `JSType.Number` also mapping types like `char` seems sketchy, I think we would want a `JSType.IntegralNumber` that represents 'I want an integer, not a float or NaN or infinity'. `JSType.Number` would still be universal for the C#->JS direction.\r\n> \r\n> `ArraySegment<>` and `JSType.MemoryView` only works zero-copy in one direction (we have no way to turn a JS memory view into a managed array without copying). It might be OK to ignore this and just make a temporary managed array when going in the JS->C# direction but it might lead to some surprising and bad behavior.\r\n\r\n`char` now only maps to `JSType.String` producing single character JS string rigth now.\r\nI'm not sure if mapping it to number is useful.\r\n`JSType.IntegralNumber` is interesting idea, it may be useful for `Int52` too.\r\n\r\nYou are right, `System.ArraySegment<T>` can't be created on the JS side. `ArraySegment` wrapper is new JS class. It only accepts offsets and internally creates short-lived views of `Module.HEAPxxx` as necessary.\r\n\r\n",
+        "> It should be possible to have a `JSObject[]`, though I don't think we need to implement it now. I didn't see this mentioned in your list.\r\n\r\nIt's actually implemented. I added it to list now, thanks.",
+        "> It's awkward but I think it might be best to somehow distinguish between 'i want to convert C# values to this specific JS type' and 'I want to accept JS values of this type/these types and convert them to the C# type'. `JSMarshalAs` and `JSUnmarshalFrom` perhaps? And have a way to explicitly say you want to unmarshal from anything if the types are compatible, for scenarios like 'accept `object` or `string`'?\r\n\r\nWe discussed further and agreed that we could make `JSType` flags, so that in the future `JSType.Number | JSType.String` could be possible. We have the information about the direction already.",
+        "/azp run runtime-wasm ",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "AOT Looks good\r\n```\r\n[MONO] AOT: FOUND method Sample.Test:__Wrapper_IsPrime_162282995 (System.Runtime.InteropServices.JavaScript.JSMarshalerArgument*) [0x283b - 0x283c 0x725d8] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method Sample.Test:__Wrapper_TestMeaning_587671822 (System.Runtime.InteropServices.JavaScript.JSMarshalerArgument*) [0x2839 - 0x283a 0x725d8] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method Sample.Test:Main (string[]) [0x2834 - 0x2835 0x725d8] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method System.Runtime.InteropServices.JavaScript.JSFunctionBinding:BindJSFunction (string,string,System.ReadOnlySpan`1<System.Runtime.InteropServices.JavaScript.JSMarshalerType>) [0x26d0 - 0x26d1 0x6f338] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method System.Runtime.InteropServices.JavaScript.JSFunctionBinding:BindManagedFunction (string,int,System.ReadOnlySpan`1<System.Runtime.InteropServices.JavaScript.JSMarshalerType>) [0x26d1 - 0x26d2 0x6f338] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method System.Runtime.InteropServices.JavaScript.JSHostImplementation:.cctor () [0x26de - 0x26df 0x6f338] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method System.Runtime.InteropServices.JavaScript.JSHostImplementation:ThrowException (System.Runtime.InteropServices.JavaScript.JSMarshalerArgument&) [0x26dc - 0x26dd 0x6f338] dotnet.js:3:25471\r\n[MONO] AOT: FOUND method System.Runtime.InteropServices.JavaScript.JSMarshalerType:.cctor () [0x26bc - 0x26bd 0x6f338] dotnet.js:3:25471\r\n```",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "@kg @maraf @lewing, I rebased it and did another pass of cleanup.\r\nI would like to merge it on Monday before preview 7 snap.\r\nPlease review and approve :)",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-wasm",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "Test failure `Fatal error in IL Linker Unhandled exception. System.NotImplementedException: switch` is https://github.com/dotnet/runtime/issues/71848",
+        "Test failure `Not found: args[0] = x` is also known issue with long logs _TODO link_",
+        "> Test failure `Not found: args[0] = x` is also known issue with long logs\r\n\r\nhttps://github.com/dotnet/runtime/issues/71887\r\n"
+    ],
+    "merged": true,
+    "created_at": "2022-06-01T01:14:35Z",
+    "issue_context": {
+        "number": 65959,
+        "title": "[WASM] Better double (F64) support in MonoPlatform.ts",
+        "body": "### Is there an existing issue for this?\r\n\r\n- [X] I have searched the existing issues\r\n\r\n### Is your feature request related to a problem? Please describe the problem.\r\n\r\nI am sending many double arrays per Unmarshalled invokes to my JS functions\r\nI saw the [Blazor.platform.toUint8Array](https://github.com/dotnet/aspnetcore/blob/8a95ee9b8b1bbd41357cd756375d78cec6936116/src/Components/Web.JS/src/Platform/Mono/MonoPlatform.ts#L70) function but it seems that this is the only helper function so far\r\n\r\n\r\n### Describe the solution you'd like\r\n\r\nIt could be new APIs like toFloat(32/64)Array [like here](https://stackoverflow.com/questions/63902497/blazor-wasm-invoke-javascript-pass-large-array-is-very-slow)\r\nAlso some helper functions could be implemented like the ones for float (F32)\r\n\r\n\r\n### Additional context\r\n\r\nThe types for F64 support are implemented here https://github.com/dotnet/aspnetcore/blob/main/src/Components/Web.JS/@types/dotnet/dotnet.d.ts\r\n\r\nI have now a function in javascript like this:\r\n\r\n```\r\nfunction toFloat64Array(array){\r\n    const dataPtr = Blazor.platform.getArrayDataPointer(array);\r\n    const length = Blazor.platform.getValueI32(dataPtr);\r\n    const f64Array = new Float64Array(length);\r\n    f64Array.set(Module.HEAPF64.subarray(dataPtr + 4, dataPtr + 4 + length));\r\n    return f64Array;\r\n}\r\n```\r\nI wasn't able to test it due to lack of time.",
+        "comments": [
+            "Tagging subscribers to 'arch-wasm': @lewing\nSee info in area-owners.md if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\n### Is there an existing issue for this?\r\n\r\n- [X] I have searched the existing issues\r\n\r\n### Is your feature request related to a problem? Please describe the problem.\r\n\r\nI am sending many double arrays per Unmarshalled invokes to my JS functions\r\nI saw the [Blazor.platform.toUint8Array](https://github.com/dotnet/aspnetcore/blob/8a95ee9b8b1bbd41357cd756375d78cec6936116/src/Components/Web.JS/src/Platform/Mono/MonoPlatform.ts#L70) function but it seems that this is the only helper function so far\r\n\r\n\r\n### Describe the solution you'd like\r\n\r\nIt could be new APIs like toFloat(32/64)Array [like here](https://stackoverflow.com/questions/63902497/blazor-wasm-invoke-javascript-pass-large-array-is-very-slow)\r\nAlso some helper functions could be implemented like the ones for float (F32)\r\n\r\n\r\n### Additional context\r\n\r\nThe types for F64 support are implemented here https://github.com/dotnet/aspnetcore/blob/main/src/Components/Web.JS/@types/dotnet/dotnet.d.ts\r\n\r\nI have now a function in javascript like this:\r\n\r\n```\r\nfunction toFloat64Array(array){\r\n    const dataPtr = Blazor.platform.getArrayDataPointer(array);\r\n    const length = Blazor.platform.getValueI32(dataPtr);\r\n    const f64Array = new Float64Array(length);\r\n    f64Array.set(Module.HEAPF64.subarray(dataPtr + 4, dataPtr + 4 + length));\r\n    return f64Array;\r\n}\r\n```\r\nI wasn't able to test it due to lack of time.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>GeroL</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>pavelsavara</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`arch-wasm`, `area-VM-meta-mono`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 4065,
+            "commit_id": "4bf7a56d3c211423a1d85c404dbdaaa858955038",
+            "original_commit_id": "4f39d7738be58017caff5df1b58a4f0a2362330e",
+            "path": "src/libraries/System.Net.Http/src/System/Net/Http/BrowserHttpHandler/BrowserHttpHandler.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 204,
+            "original_line": 204,
+            "side": "RIGHT",
+            "original_position": 220,
+            "position": 206,
+            "subject_type": "line",
+            "review_comments": [
+                "i can imagine it being useful in the .net 8 or 9 time period to be able to marshal List<T> across the boundary instead of needing to call ToArray on it",
+                "Do you mean marshal `List` by proxy and have `Add`, `Remove`, `GetEnumerator` API visible from JS side ? \r\nThat is already possible to do in the user code, they could use [JSExport] to do it.\r\nBut I think OOP is bad idea for interop scenarios. It creates chatty interactions, they are slow and expensive overall.",
+                "Marshaling List as a JS array, since it has a C# array under the hood the marshaling can work roughly the same. It gets copied either way so the .ToArray is pointless\r\nAgain though you don't need to do it for 7."
+            ]
+        },
+        {
+            "hunk_id": 3795,
+            "commit_id": "4bf7a56d3c211423a1d85c404dbdaaa858955038",
+            "original_commit_id": "4f39d7738be58017caff5df1b58a4f0a2362330e",
+            "path": "src/libraries/System.Net.Http/src/System/Net/Http/BrowserHttpHandler/BrowserHttpHandler.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 204,
+            "original_line": 204,
+            "side": "RIGHT",
+            "original_position": 220,
+            "position": 206,
+            "subject_type": "line",
+            "review_comments": [
+                "i can imagine it being useful in the .net 8 or 9 time period to be able to marshal List<T> across the boundary instead of needing to call ToArray on it",
+                "Do you mean marshal `List` by proxy and have `Add`, `Remove`, `GetEnumerator` API visible from JS side ? \r\nThat is already possible to do in the user code, they could use [JSExport] to do it.\r\nBut I think OOP is bad idea for interop scenarios. It creates chatty interactions, they are slow and expensive overall.",
+                "Marshaling List as a JS array, since it has a C# array under the hood the marshaling can work roughly the same. It gets copied either way so the .ToArray is pointless\r\nAgain though you don't need to do it for 7."
+            ]
+        },
+        {
+            "hunk_id": 4067,
+            "commit_id": "4bf7a56d3c211423a1d85c404dbdaaa858955038",
+            "original_commit_id": "4f39d7738be58017caff5df1b58a4f0a2362330e",
+            "path": "src/libraries/System.Runtime.InteropServices.JavaScript/src/System/Runtime/InteropServices/JavaScript/Marshaling/JSMarshalerArgument.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 90,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 72,
+            "subject_type": "line",
+            "review_comments": [
+                "Shouldn't this be `NotSupportedException`?",
+                "I don't have strong opinion. It may be implemented in the future releases."
+            ]
+        },
+        {
+            "hunk_id": 4066,
+            "commit_id": "4bf7a56d3c211423a1d85c404dbdaaa858955038",
+            "original_commit_id": "4f39d7738be58017caff5df1b58a4f0a2362330e",
+            "path": "src/libraries/System.Net.Http/src/System/Net/Http/BrowserHttpHandler/BrowserHttpHandler.cs",
+            "start_line": 134,
+            "original_start_line": 134,
+            "start_side": "RIGHT",
+            "line": 137,
+            "original_line": 137,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "perf nit: We can calculate number of headers and options and avoid `ToArray`.",
+                "Next time ;)"
+            ]
+        },
+        {
+            "hunk_id": 3797,
+            "commit_id": "4bf7a56d3c211423a1d85c404dbdaaa858955038",
+            "original_commit_id": "4f39d7738be58017caff5df1b58a4f0a2362330e",
+            "path": "src/libraries/System.Runtime.InteropServices.JavaScript/src/System/Runtime/InteropServices/JavaScript/Marshaling/JSMarshalerArgument.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 90,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 72,
+            "subject_type": "line",
+            "review_comments": [
+                "Shouldn't this be `NotSupportedException`?",
+                "I don't have strong opinion. It may be implemented in the future releases."
+            ]
+        },
+        {
+            "hunk_id": 3796,
+            "commit_id": "4bf7a56d3c211423a1d85c404dbdaaa858955038",
+            "original_commit_id": "4f39d7738be58017caff5df1b58a4f0a2362330e",
+            "path": "src/libraries/System.Net.Http/src/System/Net/Http/BrowserHttpHandler/BrowserHttpHandler.cs",
+            "start_line": 134,
+            "original_start_line": 134,
+            "start_side": "RIGHT",
+            "line": 137,
+            "original_line": 137,
+            "side": "RIGHT",
+            "original_position": 63,
+            "position": 63,
+            "subject_type": "line",
+            "review_comments": [
+                "perf nit: We can calculate number of headers and options and avoid `ToArray`.",
+                "Next time ;)"
+            ]
+        }
+    ]
+}

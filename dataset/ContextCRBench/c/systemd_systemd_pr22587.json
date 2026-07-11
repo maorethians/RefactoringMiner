@@ -1,0 +1,341 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 22587,
+    "lang": "c",
+    "pr_title": "core: NFT sets",
+    "pr_body": "New directives `ControlGroupNFTSet=`, `DynamicUserNFTSet=`, `IPv4NFTSet=` and\r\n`IPv6NFTSet=` provide methods for integrating configuration of control groups,\r\ndynamic users and dynamic networks into firewall rules with NFT sets.\r\n\r\nExamples:\r\nControlGroupNFTSet:\r\n```\r\ntable inet filter {\r\n        set timesyncd {\r\n                type cgroupsv2\r\n        }\r\n\r\n        chain ntp_output {\r\n                socket cgroupv2 != @timesyncd counter drop\r\n                accept\r\n        }\r\n}\r\n```\r\n\r\n/etc/systemd/system/systemd-timesyncd.service.d/override.conf\r\n```\r\n[Service]\r\nControlGroupNFTSet=inet:filter:timesyncd\r\n```\r\n\r\n```\r\n$ sudo nft list set inet filter timesyncd\r\ntable inet filter {\r\n        set timesyncd {\r\n                type cgroupsv2\r\n                elements = { \"system.slice/systemd-timesyncd.service\" }\r\n        }\r\n}\r\n```\r\n\r\nDynamicUser:\r\n```\r\ntable inet filter {\r\n        set u {\r\n                typeof meta skuid\r\n        }\r\n\r\n        chain service_output {\r\n                meta skuid != @u drop\r\n                accept\r\n        }\r\n}\r\n```\r\n/etc/systemd/system/dunft.service\r\n\r\n```\r\n[Service]\r\nExecStart=/bin/sleep 1000\r\nDynamicUser=yes\r\nDynamicUserNFTSet=inet:filter:u\r\n\r\n[Install]\r\nWantedBy=multi-user.target\r\n```\r\n\r\n```\r\n$ sudo nft list set inet filter u\r\ntable inet filter {\r\n        set u {\r\n                typeof meta skuid\r\n                elements = { 64864 }\r\n        }\r\n}\r\n$ ps -n --format user,group,pid,command -p `pgrep sleep`\r\n    USER    GROUP     PID COMMAND\r\n   64864    64864   55158 /bin/sleep 1000\r\n```\r\nNetwork:\r\n/etc/systemd/network/lan.network\r\n```\r\n[Network]\r\n...\r\nIPv4NFTSet=netdev:filter:lan-ipv4-address\r\nIPv6NFTSet=netdev:filter:lan-ipv6-address\r\n```\r\n\r\n```\r\ntable netdev filter {\r\n        set lan-ipv4-address {\r\n                type ipv4_addr\r\n                flags interval\r\n        }\r\n        chain lan_ingress {\r\n                type filter hook ingress device \"lan\" priority filter; policy drop;\r\n                ip saddr != @lan-ipv4-address drop\r\n                accept\r\n        }\r\n}\r\n```\r\n```\r\n$ sudo nft list set netdev filter lan-ipv4-address\r\ntable netdev filter {\r\n        set lan-ipv4-address {\r\n                type ipv4_addr\r\n                flags interval\r\n                elements = { 10.0.0.0/24 }\r\n        }\r\n}\r\n```\r\n\r\nCloses: #22527.\r\n",
+    "pr_comments": [
+        "Hmm it seems that in more recent `nft` you can actually match on Cgroup paths directly? Wouldn't that be the way to go?\r\n\r\ne.g.:\r\nhttps://man.archlinux.org/man/nft.8.en#SOCKET_EXPRESSION\r\n```\r\ntable inet x {\r\n  chain y {\r\n    type filter hook input priority filter; policy accept;\r\n    socket cgroupv2 level 2 \"system.slice/systemd-network.service\" counter\r\n  }\r\n}\r\n```",
+        "I was wondering why the filter wouldn't work as expected even though the cgroup numbers are correctly inserted to the set. Looking at [here](https://github.com/torvalds/linux/blob/23d04328444a8fa0ca060c5e532220dac8e8bc26/net/netfilter/nft_meta.c#L174), [here](https://github.com/torvalds/linux/blob/23d04328444a8fa0ca060c5e532220dac8e8bc26/include/linux/cgroup-defs.h#L783) and [here](https://github.com/torvalds/linux/blob/23d04328444a8fa0ca060c5e532220dac8e8bc26/include/linux/cgroup-defs.h#L764), it seems that `meta cgroup` operates with `net_cls` cgroup v1 controller.\r\n\r\nThe cgroupv2 version, `socket cgroupv2 level x \"path\"` has the same problems as cgroupv1 ID had, the path (/sys/fs/cgroup/path) is resolved immediately when the rules are loaded and this fails since the cgroups don't exist yet. This is exactly what https://github.com/mk-fg/systemd-cgroup-nftables-policy-manager tries to solve. The NFT set approach can't work since strings can't be used in sets.\r\n\r\nMaybe cgroupv2 could be made to work with bit more invasive approach: PID1 would install filters which match cgroups (once they are realized). The filter would then set socket marks. Firewall rules would then be able to use the socket marks as they please.",
+        "> Hmm it seems that in more recent `nft` you can actually match on Cgroup paths directly? Wouldn't that be the way to go?\r\n\r\nThe path is resolved when the firewall rules are loaded and if the cgroup path doesn't exist (since the service hasn't been started yet), it will fail. This makes them equally useless directly.\r\n\r\nPerhaps there's a way (PID1 would manage cgroupv2 rules which use socket marks and store the marks in sets so that rules can reference them).",
+        "Yeh sounds to me like upstreaming something along the lines of https://github.com/mk-fg/systemd-cgroup-nftables-policy-manager seems to be the way to go. Also if it turns out that `cgroup` mark only works for `net_cls` (which doesn't exist in cgroups v2)",
+        "> Yeh sounds to me like upstreaming something along the lines of https://github.com/mk-fg/systemd-cgroup-nftables-policy-manager seems to be the way to go.\r\n\r\nIt works by loading arbitrary NFT filters when a service starts. I think this level of complexity was rejected earlier, leading to simpler `IPAddressAllow=`/`IPAddressDeny=` features. Maybe this could be implemented with `ExecStartPre=+nft -f /etc/nftables-%p.conf` with no changes, if the cgroup is realized and unchanging at that point. If not, perhaps that could be ensured with a new flag (like `[+-@:!]` now). Also `ExecStartPost=+nft ...` may work, though the starting order may leave a vulnerable window depending on the firewall design.\r\n\r\nPerhaps network namespace support could be beefed up so that interfaces would be available inside the namespace without `ExecStartPre=` stuff.\r\n\r\n> Also if it turns out that `cgroup` mark only works for `net_cls` (which doesn't exist in cgroups v2)\r\n\r\nThis is indeed the case.\r\n",
+        "The `ExecStartPre=`/`ExecStartPost=` version seems to be flaky, don't know why but the filter isn't accepted since the cgroup doesn't exist. It works if I start the service and then manually load the rules.\r\n\r\n```\r\n/etc/nftables-systemd-timesyncd.conf\r\n#!/usr/sbin/nft -f\r\n\r\nflush table inet io.systemd.systemd-timesyncd.service\r\n\r\ntable inet io.systemd.systemd-timesyncd.service {\r\n        chain systemd-timesyncd_input {\r\n                udp dport 123 counter accept\r\n                counter drop\r\n        }\r\n\r\n        chain systemd-timesyncd_output {\r\n                udp dport 123 counter accept\r\n                counter reject with icmpx type admin-prohibited\r\n        }\r\n\r\n        chain input {\r\n                type filter hook input priority filter; policy drop;\r\n\r\n                socket cgroupv2 level 2 \"system.slice/systemd-timesyncd.service\" counter jump systemd-timesyncd_input\r\n                # nothing else may use NTP\r\n                udp dport 123 counter drop\r\n                counter accept\r\n        }\r\n\r\n        chain output {\r\n                type filter hook output priority filter; policy drop;\r\n\r\n                socket cgroupv2 level 2 \"system.slice/systemd-timesyncd.service\" counter jump systemd-timesyncd_output\r\n                # nothing else may use NTP\r\n                udp dport 123 counter reject with icmpx type admin-prohibited\r\n                counter accept\r\n        }\r\n}\r\n```\r\n```\r\n/etc/systemd/system/systemd-timesyncd.service.d/nftables.conf \r\n[Service]\r\nExecStartPre=+/usr/sbin/nft -f /etc/nftables-%p.conf\r\n```\r\n```\r\n$ sudo nft list ruleset|grep cgroup\r\n                socket cgroupv2 level 2 30152 counter packets 0 bytes 0 jump systemd-timesyncd_input\r\n                socket cgroupv2 level 2 30152 counter packets 10 bytes 760 jump systemd-timesyncd_output\r\n$ ls -lid /sys/fs/cgroup/system.slice/systemd-timesyncd.service\r\n30152 drwxr-xr-x. 2 root root 0 Feb 24 21:32 /sys/fs/cgroup/system.slice/systemd-timesyncd.service/\r\n```\r\n",
+        "Updated with `DynamicUserNFTSets=` directive for automatic insertion of UID of the dynamic user into NFT set.",
+        "In this version: `Network.IPv4NFTSet=nfproto:table:set` and `Network.IPv6NFTSet=nfproto:table:set`.\r\n\r\nI noticed a possible problem in testing this that if the set already includes a range (10.0.0.0/8) and `networkd` changes the address (say, because of new address from DHCP) but the ranges overlap (10.0.0.0/24), kernel rejects the new set with EEXISTS. I don't know if this would happen in real life. Does `networkd` always drop the old address (`address_drop()`) before adding the new address (`address_update()`)? If not, the old addresses could be simply dropped from the set before adding new addresses.\r\n\r\nNow there's an assumption with directive processing that only one set will ever will be used, but this should be relaxed. The admin could want to use multiple sets in different protocol tables (ARP/bridge/inet/ip/ip6/netdev).",
+        "@yuwata @poettering  While working on this, I noticed that `sd_nfnl_socket_open()`, called by `fw_nftables_init()`, eventually calls `socket_open()`, which uses `SOCK_NONBLOCK` flag when opening. I don't think the callers (in systemd, at least) expect non-blocking semantics, especially nothing handles `EINPROGRESS` or `EWOULDBLOCK` errno cases. At least when I reused nfnl code here, I saw failures due to`EINPROGRESS` and they disappeared when I explicitly used `fcntl()` to remove `O_NONBLOCK`. Is this correct analysis?",
+        "@topimiettinen client side queuing on EAGAIN was dropped in  bbe181b489921e5afeaa2b0bc1c16c62aeef8f65. don#t remember the details.",
+        "Created #22792",
+        "I dropped the cgroupv1 feature (needs more thought for cgroupv2) and I'm not 100% happy with the resolved integration (resolved needs more capabilites etc), so this version only contains integration with `DynamicUser=` (`DynamicUserNFTSet=`) and networkd (`Network.IPv4NFTSet=` and `Network.IPv6NFTSet=`).",
+        "mkosi / ci (centos_epel, 8-stream) failed in unrelated package problems but I restarted the job.",
+        "All green! @poettering ptal.",
+        "Now with cgroupv2 integration. Sadly it seems that cgroupv2 rules are only usable on the output side of filters.",
+        "It looks like everything works except for bus operations. For example, `systemctl show systemd-timesyncd` gives error: `Failed to get properties: No such device or address`. But to me it looks like the bus talking code is pretty much identical to what other similar directives use. Any clues?",
+        "Wohoo, found and fixed the bug with bus protocol.\r\n\r\nMeanwhile, a bug in NFT affecting use of `socket cgroupv2` expressions on input filters was also found and a patch was [submitted](https://marc.info/?l=netfilter-devel&m=164950322924987&w=2). With a fixed kernel, cgroups work nicely for input and output.",
+        "All green. @poettering PTAL.",
+        "/cc @poettering\r\n\r\nRemoved also GitHub review request.",
+        "Split commits for easier review, updated from lessons learned of #23269 and rebased to it.",
+        "mkosi / ci (arch, rolling) fails with\r\n```\r\n\u2023 Error: Workspace command bootctl install returned non-zero exit code 1.\r\n```\r\nUnit tests / build (CLANG, gcrypt):\r\n```\r\n384/1394 systemd / test-repart                                                                                TIMEOUT         30.02s   killed by signal 15 SIGTERM\r\n```\r\nand CentOS CI (Arch Linux):\r\n```\r\nTEST-60-MOUNT-RATELIMIT\r\n```\r\nI don't think these are related (nothing to do with networking). @mrc0mmand do they look familiar?",
+        "Hah, you've hit the bingo of known issues:\r\n\r\n> mkosi / ci (arch, rolling) fails with\r\n> \r\n> ```\r\n> \u2023 Error: Workspace command bootctl install returned non-zero exit code 1.\r\n> ```\r\n\r\nThat's #23485.\r\n\r\n> Unit tests / build (CLANG, gcrypt):\r\n> \r\n> ```\r\n> 384/1394 systemd / test-repart                                                                                TIMEOUT         30.02s   killed by signal 15 SIGTERM\r\n> ```\r\n\r\nSpurious, but known timeout.\r\n\r\n> and CentOS CI (Arch Linux):\r\n> \r\n> ```\r\n> TEST-60-MOUNT-RATELIMIT\r\n> ```\r\n\r\nAaand that's #23424.\r\n\r\n> I don't think these are related (nothing to do with networking). @mrc0mmand do they look familiar?\r\n\r\nI'll retrigger the jobs and will cross my fingers for better luck :-)\r\n\r\n",
+        "@mrc0mmand All green!\r\n\r\n@yuwata @poettering please review.",
+        "I converted my firewalls to use cgroups for examining packets: first by cgroup level 1 (`system.slice` / `user.slice`), then by L4 protocol and port, and finally again by cgroup level 2 (for system services). The order could be equally cgroup levels 1 & 2 first and then by L4 protocol and port for the service.\r\n```\r\ntable inet filter {\r\n        set system_slice {\r\n                type cgroupsv2\r\n        }\r\n\r\n        set user_slice {\r\n                type cgroupsv2\r\n        }\r\n\r\n        set systemd_networkd {\r\n                type cgroupsv2\r\n        }\r\n...\r\n        chain dhcpd_output {\r\n                meta skuid != systemd-network reject with icmpx type admin-prohibited\r\n....\r\n                accept\r\n        }\r\n...\r\n        chain tcp_output_sys {\r\n                tcp dport { 547, 548, 647, 847, 7911 } socket cgroupv2 level 2 @systemd_networkd jump dhcpd_output\r\n...\r\n                reject with icmpx type admin-prohibited\r\n        }\r\n...\r\n        chain system_slice_out {\r\n                meta l4proto vmap { tcp : jump tcp_output_sys, udp : jump udp_output_sys }\r\n                reject with icmpx type admin-prohibited\r\n        }\r\n...\r\n        chain input {\r\n                type filter hook input priority filter; policy drop;\r\n...\r\n                ct state new socket cgroupv2 level 1 @system_slice jump system_slice_in\r\n                ct state new socket cgroupv2 level 1 @user_slice jump user_slice_in\r\n...\r\n        }\r\n...\r\n        chain output {\r\n                type filter hook output priority filter; policy drop;\r\n...\r\n                ct state new socket cgroupv2 level 1 @system_slice jump system_slice_out\r\n                ct state new socket cgroupv2 level 1 @user_slice jump user_slice_out\r\n...\r\n        }\r\n...\r\n}\r\n```\r\nThis kind of setup allows very fine firewall control over individual services since all NFT features can be used at that point. This can be contrasted with `IPAddressDeny=`, which also gives a simple firewall for services, or more powerful `BPFProgram=` which isn't very easy to use.\r\n\r\nThe feature doesn't work well for user services since the cgroups are realized by user manager, which doesn't have privileges to fill in the NFT sets. That doesn't matter much for server systems. I suppose a trusted SUID program like Firejail could manage the sets for desktop apps.\r\n\r\nFlushing the NFT rulesets also clears the NFT sets. Then PID1 only repopulates them when the cgroup is restarted and that isn't ever going to happen for `system.slice` / `user.slice`, so the filters may become invalid. A workaround could be that PID1 would also repopulate the sets on for example `daemon-reload` or a DBus call, but it could be also argued that there could be a feature on NFT side to keep the sets, the admin should be careful when flushing rulesets, or that kernel should use cgroup paths instead of cgroup IDs.",
+        "@topimiettinen Did this get another look by @poettering or @yuwata?",
+        "> @topimiettinen Did this get another look by @poettering or @yuwata?\r\n\r\nNot that I know of.",
+        "Same here. This needs final review. Temporary setting 'merged-but-needs-fixing' label.",
+        "Created https://github.com/systemd/systemd/pull/23712 for the fixes."
+    ],
+    "merged": true,
+    "created_at": "2022-02-22T10:59:39Z",
+    "issue_context": {
+        "number": 22527,
+        "title": "RFE/RFD: lightweight integration of NFT sets for use in firewalls",
+        "body": "**Is your feature request related to a problem? Please describe.**\r\nIntegrating firewall rules with systemd services is difficult or impossible. There are BPF options but they aren't very nice to administrate. Also, kernel's netfilter system for cgroup matching is based on numeric cgroup IDs, which change every time a service is restarted, making them useless in systemd environment. Typically DNS information isn't available for firewalls.\r\n\r\n**Describe the solution you'd like**\r\nPID1, networkd and resolved should optionally put discovered network and cgroup ID information to NFT sets, for use with firewall rules.\r\n* PID1 should put cgroupv2 IDs to NFT sets named using cgroup path like `systemd.user.slice/user-1000.slice/user@1000.service/app.slice/`, or perhaps to set specified with `Service.CGroupNFTSet=systemd-app`\r\n* networkd should put interface IP address ranges and possibly other information (at the extreme, same as [NetworkManager-dispatcher](https://developer-old.gnome.org/NetworkManager/unstable/NetworkManager-dispatcher.html)) to set named for example `systemd-eth0-ipv4` or perhaps instead specified with `Network.IPv4NFTSet=systemd-eth0-ipv4`\r\n* resolved should put DNS information from resolved to set named according to requesting service (see also #17126) or explicitly configured\r\n\r\nThen the firewall rules can make arbitrarily complex use of the sets. Systemd would not need to gain further firewalling abilities besides the rather simple management of specific NFT sets.\r\n\r\nExample NFT rules:\r\n```\r\ntable inet filter {\r\n        set systemd-eth0-ipv4 {\r\n                type ipv4_addr;\r\n                flags interval;\r\n        }\r\n        set systemd-app {\r\n                type integer;\r\n        }\r\n        set systemd-timesyncd {\r\n                type ipv4_addr;\r\n        }\r\n\r\n        chain service_x_input {\r\n                ip saddr @systemd-eth0-ipv4 counter accept\r\n                counter drop\r\n        }\r\n        chain service_y_input {\r\n                meta cgroup @systemd-app counter accept\r\n                counter drop\r\n        }\r\n        chain systemd_timesyncd_output {\r\n                ip daddr @systemd-timesyncd counter accept\r\n                counter reject with icmpx admin-prohibited\r\n        }\r\n}\r\n```\r\n\r\nRelated discussion in #7327 and #21899.\r\n\r\n**Describe alternatives you've considered**\r\nDaemons to manage cgroup IDs:\r\nhttps://github.com/helsinki-systems/nft_cgroupv2/\r\nhttps://github.com/mk-fg/systemd-cgroup-nftables-policy-manager\r\n\r\nIPSet module for Unbound DNS puts resolved A and AAAA addresses to IPSet (but it can't identify the calling service):\r\nhttps://github.com/NLnetLabs/unbound/blob/master/ipset/ipset.c",
+        "comments": [
+            "Benefit of using NFT sets compared to external daemons is that modifying the set is synchronous but very lightweight operation. For example, `networkd` can set the IP address from DHCP to the set before applying it to the interface, so there are no time windows where the set would be updated too late. This could easily happen if there's an external daemon listening to events (unless PID1 or `networkd` would wait while scripts execute and signal completion).\r\n\r\n@poettering @yuwata @keszybz @bluca WDYT?",
+            "Sounds nice!",
+            "[libnftnl](https://netfilter.org/projects/libnftnl/index.html) is licensed under GPL2+. Would that be a problem?\r\n\r\nIts dependency, [libmnl](https://netfilter.org/projects/libmnl/index.html) is under LGPLv2.1+.",
+            "Yes, GPL2 library would be a problem, as the combined work after linking would be GPL2 as a whole - weird license choice for a library?",
+            "> Yes, GPL2 library would be a problem, as the combined work after linking would be GPL2 as a whole - weird license choice for a library?\r\n\r\nYes, not very inviting. Luckily our own `sd-netlink` already can process some [netlink messages]( https://github.com/systemd/systemd/blob/9fa31df62dd504e8f3e43710df504a467ed430fa/src/libsystemd/sd-netlink/netlink-message-nfnl.c).\r\n\r\n",
+            "Conceptually the networkd ip address thing, and the cgroup id thing make sense to me. Not sure I am convinced by the resolved thing, it sucks for access control...",
+            "So we recently discussed whether we should add support to .network files to automatically load nft rules files on interface activation. i.e. that if networkd actviates foobar.network we also load the foobar.nft firewall. \r\n\r\nIt appears to me that the concept suggested here of maintaining NFT set objects is a more flexible approach, right?\r\n\r\ni.e. what model is preferable: having a static firewall ruleset with dynamic sets \u2013 or having a dynamic firewall ruleset? It appears to me the former makes more sense.\r\n\r\nThoughts?",
+            "I think the models are complementary. Loading rules on interface activation is useful for `netdev` rules, which can't use a set for the interface name. In other cases, set objects may contain information which can be used with static (but also per-interface) rules.\r\n\r\nThe per-interface rules can be implemented with no changes. Example:\r\n\r\n```\r\n# /etc/udev/rules.d/90-netfilter.rules \r\nSUBSYSTEM!=\"net\", GOTO=\"netfilter_end\"\r\nENV{SYSTEMD_WANTS}+=\"nftables-dev@$name.service\"\r\nLABEL=\"netfilter_end\"\r\n```\r\n\r\n```\r\n# /etc/systemd/system/nftables-dev@.service\r\n[Unit]\r\nDescription=nftables for device %i\r\nDocumentation=man:nft(8) http://wiki.nftables.org\r\nWants=network-pre.target nftables.service\r\nBefore=network-pre.target shutdown.target\r\nConflicts=shutdown.target\r\nDefaultDependencies=no\r\nAfter=nftables.service\r\n\r\n[Service]\r\nType=oneshot\r\nRemainAfterExit=yes\r\nStandardInput=null\r\nProtectSystem=full\r\nProtectHome=true\r\nExecStart=/usr/sbin/nft -f /etc/nftables-%i.conf\r\nExecReload=/usr/sbin/nft -f /etc/nftables-%i.conf\r\n\r\n[Install]\r\nWantedBy=sysinit.target\r\n```\r\n\r\n```\r\n# /etc/nftables-lan.conf \r\n#!/usr/sbin/nft -f\r\n\r\ntable netdev filter {\r\n        chain lan_ingress {\r\n                type filter hook ingress device lan priority filter; policy drop;\r\n        }\r\n}\r\n\r\nflush chain netdev filter lan_ingress\r\n\r\ntable netdev filter {\r\n        chain lan_ingress {\r\n                type filter hook ingress device lan priority filter; policy drop;\r\n\r\n                meta protocol vmap {\r\n                     ip : jump validate_ipv4,\r\n                     ip6 : jump validate_ipv6,\r\n                     arp : jump validate_arp\r\n                }\r\n                counter log prefix \"[netdev-lan-ingress] \" flags all drop\r\n        }\r\n}\r\n```\r\nThis uses static device name 'lan', but I suppose I could use `@@DEVICE@@` insted and use `sed` to replace the interface name with `%i` and feed its output in a pipe to `nft`.\r\n\r\nSome rules above (like `validate_ipv4`) are defined in static part.",
+            "**re: resolved and DNS query nft sets**\r\nI think just that is a great idea, I'm using dnsmasq **v2.87** for this specific use case (easily backported to Debian bullseye).\r\n\r\nAs you might know [`dnsmasq v2.87`](https://thekelleys.org.uk/gitweb/?p=dnsmasq.git) added the `--nftset` domain name option.\r\nIt's great because the nft sets are populated when, and only when, an actual DNS query is performed by the application / service with the ip addresses returned to them by the DNS reply.  It's very efficient.\r\n\r\nI had been trying to work out an allowlist firewall using systemd cgroupv2...\r\nInstead I settled on forcing every service and application to use specific Linux users and or groups (one for _every_ that requires any network resources).\r\nnftables is indeed easier, more powerful and flexible, and now better for [statistics](https://github.com/sta-c0000/galaf#generating-statistics).\r\nI've detailed how I'm using nftables with dnsmasq nft sets (with some caveats) here: [Group Allow-List Application Firewall](https://github.com/sta-c0000/galaf)\r\n",
+            "> **re: resolved and DNS query nft sets** I think just that is a great idea, I'm using dnsmasq **v2.87** for this specific use case (easily backported to Debian bullseye).\r\n> \r\n> As you might know [`dnsmasq v2.87`](https://thekelleys.org.uk/gitweb/?p=dnsmasq.git) added the `--nftset` domain name option. It's great because the nft sets are populated when, and only when, an actual DNS query is performed by the application / service with the ip addresses returned to them by the DNS reply. It's very efficient.\r\n\r\nThanks, I didn't know about this feature. I have a pretty much complete PR for DNS access control for resolved in #17126. My plan is to integrate it with NFT sets. The advantage of using resolved instead of dnsmasq is tighter integration with NSS (nss_resolve). It uses Unix sockets instead of UDP, so much more information on the calling process is available, which could then be used for filtering.\r\n\r\n> I had been trying to work out an allowlist firewall using systemd cgroupv2... \r\n\r\nI think the problem is that the kernel interface for accessing cgroups from NFT filters is poor. The cgroupv1 IDs or cgroupv2 paths should not need to be resolvable when the firewall is installed. Perhaps the kernel should perform path checks at cgroup creation time and then automatically resolve cgroup IDs for NFT. Doing this in userspace is a poor choice. It could work for systemd because it's the entity creating the cgroups in most cases, but I don't think this scales to unprivileged `systemd --user`, containers or delegated cgroups etc.\r\n\r\n> Instead I settled on forcing every service and application to use specific Linux users and or groups (one for _every_ that requires any network resources). nftables is indeed easier, more powerful and flexible, and now better for [statistics](https://github.com/sta-c0000/galaf#generating-statistics). I've detailed how I'm using nftables with dnsmasq nft sets (with some caveats) here: [Group Allow-List Application Firewall](https://github.com/sta-c0000/galaf)\r\n\r\nWhat a coincidence, I also discovered GALAF a few days ago. Using a different UID/GID for every application is a nice idea. For system services, this is pretty easy since many services already run with either a fixed UID with `User=` or use `DynamicUser=` and then `meta skuid` can be used for access control. Perhaps the remaining UID 0 services could be convinced to use a different GID (and drop CAP_SETGID). For unprivileged user apps there should be a way to switch to UID/GID per app with [Firejail](https://github.com/netblue30/firejail) or [bubblewrap](https://github.com/containers/bubblewrap) so that it's integrated with other sandboxing features. It would be awesome if also GUI tools like gnome-system-monitor could show network statistics at app level, perhaps even drilling down to each process/thread.\r\n\r\nSELinux can be also integrated with firewall tables, but the design choice is that the access rules are on SELinux side. This makes sense, but the actual implementation is a bit weird. It would be simpler if the SELinux domain label for the process or socket could be also used directly on NFT side for further access control.",
+            "Further integration idea: `DynamicUser=yes` should be also enhanced so that PID1 would keep a NFT set updated when the dynamic UID is allocated and deallocated. The directive could be for example `DynamicUserNFTSet=nfproto:tablename:setname`. Then the firewall rules for protocol `nfproto` and table `tablename` could use the dynamic UID for access control with `meta skuid != @setname counter drop`.",
+            "Another simple integration feature idea for networkd, this time not with firewalls but [NetLabel](https://github.com/netlabel/netlabel_tools) system (SELinux, Smack, perhaps AppArmor and other LSMs too): new directives `Network.IPv4NetLabelUnlabel=` and `Network.IPv6NetLabelUnlabel=` (perhaps the names could be improved...). This would improve handling of dynamic network interfaces with NetLabel subsystem.\r\n\r\nProposed manual page text:\r\n\r\n`Network.IPv4NetLabelUnlabel=label...` and `Network.IPv6NetLabelUnlabel=label...`\r\n- These settings provide a method for integrating dynamic network configuration into Linux NetLabel subsystem rules, used by Linux security modules (LSMs) for network access control. The options expect a whitespace separated list of NetLabel labels. The labels must conform to lexical restrictions of LSM labels. When an interface is configured with IP addresses, the addresses and subnetwork masks will be appended to the NetLabel Fallback Peer Labeling rules. They will be removed when the interface is deconfigured. Failures to manage the labels will be ignored.\r\n\r\n- As an example for `IPv4NetLabelUnlabel=system_u:object_r:localnet_peer_t:s0` for interface `eth0`, when the interface is configured with an IPv4 address 10.0.0.0/8, networkd performs the equivalent of `netlabelctl` operation `unlbl add interface eth0 address:10.0.0.0/8 label:system_u:object_r:localnet_peer_t:s0` and the reverse when the IPv4 address is deconfigured.\r\n\r\nI think this would also help with [NetLabel issue #8](https://github.com/netlabel/netlabel_tools/issues/8), for systems with systemd-networkd. @pcmoore WDYT?",
+            "The NetLabel integration seems reasonable to me, although there would likely need to be some additional configuration (or very prominent warnings!) as once you start labeling network traffic a lot of access control points go from dormant to active and it is easy for someone not familiar with the LSM per-packet access controls to get into a bad situation.",
+            "I should also add, if NetLabel integration is something systemd is serious about, I can make the netlabel_tools static library a shared library (and likely clean it up a bit too) if systemd wanted to take that approach instead of calling `netlabelctl` directly.",
+            "> The NetLabel integration seems reasonable to me, although there would likely need to be some additional configuration (or very prominent warnings!) as once you start labeling network traffic a lot of access control points go from dormant to active and it is easy for someone not familiar with the LSM per-packet access controls to get into a bad situation.\r\n\r\nYes, the static configuration would have to be managed with `netlabelctl` like before, the new directive should be needed only if dynamic interfaces need extra configuration. There should be a warning and maybe a reference to NetLabel docs.\r\n\r\nThere could be a full-blown implementation, where networkd could be used to configure all NetLabel features, but I don't think that makes too much sense. Testing all features (CIPSO etc) with a CI setup would be also _interesting_ exercise.\r\n\r\n> I should also add, if NetLabel integration is something systemd is serious about, I can make the netlabel_tools static library a shared library (and likely clean it up a bit too) if systemd wanted to take that approach instead of calling `netlabelctl` directly.\r\n\r\nThat would be great, assuming that the license will be compatible with systemd's LGPL2.1. Systemd also has an internal implementation of netlink message handling which could be used.",
+            "> > I should also add, if NetLabel integration is something systemd is serious about, I can make the netlabel_tools static library a shared library (and likely clean it up a bit too) if systemd wanted to take that approach instead of calling `netlabelctl` directly.\r\n> \r\n> That would be great, assuming that the license will be compatible with systemd's LGPL2.1. Systemd also has an internal implementation of netlink message handling which could be used.\r\n\r\nIt would also need to be dlopen-safe, which usually is not a problem, but worth mentioning. But it looks like it's GPL-2.0-only https://github.com/netlabel/netlabel_tools/blob/main/LICENSE which is a problem - we'd need LGPL-2.1-or-later to use it here",
+            "> Testing all features (CIPSO etc) with a CI setup would be also interesting exercise.\r\n\r\nWe do basic SELinux/NetLabel testing as part of the kernel-secnext automated testing, via the selinux-testsuite, but I wouldn't consider that exhaustive testing.  In some sense, a fully exhaustive test is out-of-scope for the selinux-testsuite.\r\n\r\n> That would be great, assuming that the license will be compatible with systemd's LGPL2.1. Systemd also has an internal implementation of netlink message handling which could be used.\r\n\r\n... and ...\r\n\r\n> ... it looks like it's GPL-2.0-only which is a problem ...\r\n\r\nPart of that comes from the original idea that the only consumers of the netlabel_tools static library were going to be tools included in netlabel_tools.  I'm not sure I want to go through the hassle of re-licensing the package/library at this point, especially since systemd already knows how to talk to the kernel via netlink/attributes; it's likely easier and quicker to just have systemd issue whatever NetLabel commands it wants direclty via netlink.",
+            "> Part of that comes from the original idea that the only consumers of the netlabel_tools static library were going to be tools included in netlabel_tools. I'm not sure I want to go through the hassle of re-licensing the package/library at this point, especially since systemd already knows how to talk to the kernel via netlink/attributes; it's likely easier and quicker to just have systemd issue whatever NetLabel commands it wants direclty via netlink.\r\n\r\nAgreed. The [unlabeled](https://github.com/netlabel/netlabel_tools/blob/d41600dd298a9f8a1621a48e41cc978a557221ac/libnetlabel/mod_unlabeled.c#L362) protocol seems simple (command, iface, secctx, addr+mask), so we can implement it without any new libraries.",
+            "Made a separate PR #23269 for NetLabel, since it doesn't use NFT sets."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32525,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/firewall-util-nft.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1150,
+            "original_line": 1150,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 144,
+            "subject_type": "line",
+            "review_comments": [
+                "why a macro for this? why not just specify the size literally in the variable declaration, and then use ELEMENTSOF to reference the size when you need it?",
+                "I have no preference, but similar `#define`s are used elsewhere in this file.",
+                "I agree that there seems to be little reason to make a define for this, which survives beyond the end of the function, and only use it once in the function."
+            ]
+        },
+        {
+            "hunk_id": 32531,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/firewall-util-nft.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1339,
+            "original_line": 1339,
+            "side": "RIGHT",
+            "original_position": 333,
+            "position": 333,
+            "subject_type": "line",
+            "review_comments": [
+                "Same."
+            ]
+        },
+        {
+            "hunk_id": 32538,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/bus-unit-util.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 492,
+            "original_line": 492,
+            "side": "RIGHT",
+            "original_position": 66,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "return 0?\r\n\r\nshould be `return log_error_errno(SYNTHETIC_ERRNO(EINVAL), \u2026`",
+                "(similar above)"
+            ]
+        },
+        {
+            "hunk_id": 32530,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/firewall-util-nft.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1336,
+            "original_line": 1336,
+            "side": "RIGHT",
+            "original_position": 330,
+            "position": 330,
+            "subject_type": "line",
+            "review_comments": [
+                "Here too, `cunescape` probably needs to be used."
+            ]
+        },
+        {
+            "hunk_id": 32539,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/core/execute.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4324,
+            "original_line": 4324,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "please don't do this from the child, but PID 1, i.e. we send the resolved UID/GID to PID 1 further down, look for  send_user_lookup(). Put the registration in the NFT tables at the receiving end of that."
+            ]
+        },
+        {
+            "hunk_id": 32533,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/core/cgroup.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1273,
+            "original_line": 1273,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "ditto"
+            ]
+        },
+        {
+            "hunk_id": 32534,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/basic/parse-util.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 759,
+            "original_line": 759,
+            "side": "RIGHT",
+            "original_position": 10,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "this is weird. In all other cases where we validate strings we keep lists of what is good, not what is bad, and the functions hence are called xyz_valid() or xyz_is_valid() or valid_xyz() or so. This here is the only one that is inverted. Could you please swap this around to match the general style?"
+            ]
+        },
+        {
+            "hunk_id": 32537,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/bus-unit-util.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 502,
+            "original_line": 502,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "missing error handling"
+            ]
+        },
+        {
+            "hunk_id": 32535,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/core/load-fragment.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 6558,
+            "original_line": 6558,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "r is not necessarily an error here, but positive (e.g. 1 or 2). but log_syntax will consider it an error code and pass it to ERRNO.\r\n\r\nHence, the 5th argument must be chosen more carefully here"
+            ]
+        },
+        {
+            "hunk_id": 32528,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/firewall-util-nft.c",
+            "start_line": 1140,
+            "original_start_line": 1140,
+            "start_side": "RIGHT",
+            "line": 1145,
+            "original_line": 1145,
+            "side": "RIGHT",
+            "original_position": 139,
+            "position": 139,
+            "subject_type": "line",
+            "review_comments": [
+                "Please align the strings to the same columns."
+            ]
+        },
+        {
+            "hunk_id": 32529,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/firewall-util-nft.c",
+            "start_line": 1191,
+            "original_start_line": 1191,
+            "start_side": "RIGHT",
+            "line": 1197,
+            "original_line": 1197,
+            "side": "RIGHT",
+            "original_position": 191,
+            "position": 191,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is `tsize` incremented twice?",
+                "See similar uses in for example [above line 1091](https://github.com/systemd/systemd/blob/9c3e2a2a97d41f3a758c5815421122fc3e3dd3fb/src/shared/firewall-util-nft.c#L1091), `tsize` is used to keep track of used space in the array and `assert()`s guard that the array size isn't exceeded at any point."
+            ]
+        },
+        {
+            "hunk_id": 32527,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/shared/firewall-util-nft.c",
+            "start_line": 928,
+            "original_start_line": 928,
+            "start_side": "RIGHT",
+            "line": 934,
+            "original_line": 934,
+            "side": "RIGHT",
+            "original_position": 94,
+            "position": 94,
+            "subject_type": "line",
+            "review_comments": [
+                "Hmm, if `r < 0`, this debug stmt is wrong."
+            ]
+        },
+        {
+            "hunk_id": 32536,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/core/cgroup.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1242,
+            "original_line": 1242,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "this should not even be attempted if we aren't in cgroupv2 unified mode"
+            ]
+        },
+        {
+            "hunk_id": 32532,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/core/cgroup.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1253,
+            "original_line": 1253,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 49,
+            "subject_type": "line",
+            "review_comments": [
+                "you must validate `u->cgroup_id` first here, it's not guaranteed to be initialized, as we require privs for that, we might not have"
+            ]
+        },
+        {
+            "hunk_id": 32526,
+            "commit_id": "e176f855278d5098d3fecc5aa24ba702147d42e0",
+            "original_commit_id": "db6f9b02a74beb151107c6a83b14f239346a7db9",
+            "path": "src/basic/parse-util.c",
+            "start_line": 762,
+            "original_start_line": 762,
+            "start_side": "RIGHT",
+            "line": 767,
+            "original_line": 767,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe call this `next_char_good()` (positive conditions are easier to grok, we generally prefer positive booleans and checks), and just write\r\n```C\r\nreturn (c >= 'a' && c <= 'z') ||\r\n       (c >= 'A' && c <= 'Z') ||\r\n       ...;\r\n```\r\n"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,56 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 20892,
+    "lang": "c",
+    "pr_title": "network: drop and warn duplicated address settings",
+    "pr_body": "Fixes #20891.\r\nReplaces #20900.",
+    "pr_comments": [
+        "@anitazha and @DaanDeMeyer PTAL.\r\n\r\n@bluca Thank you for the previous review. I added more commits after your review, so the green label is dropped.",
+        "Thanks for fixing this! Logically LGTM besides the stuff Daan wants addressed",
+        "@DaanDeMeyer and @anitazha Thank you for you comments. I will update this later.",
+        "Updated. All above comments are addressed. Also, added two more commits which make OOM errors not ignored. PTAL."
+    ],
+    "merged": true,
+    "created_at": "2021-10-01T10:34:27Z",
+    "issue_context": {
+        "number": 20891,
+        "title": "PreferredLifetime = 0 isn't setting the lifetime to 0",
+        "body": "**systemd version the issue has been seen with**\r\n > 249.4\r\n\r\nI've been using the config below:\r\n\r\n```\r\n$ cat /etc/systemd/network/1-eth0.network \r\n\r\n[Network]\r\nAddress = <primary address>\r\nAddress = <secondary address>\r\nIPv6AcceptRA = true\r\n\r\n[Match]\r\nMACAddress = <mac address>\r\nName = eth0\r\n\r\n[IPv6AcceptRA]\r\nUseAutonomousPrefix = false\r\nUseOnLinkPrefix = false\r\nDHCPv6Client = false\r\n\r\n[Address]\r\nAddress = <secondary address>\r\nPreferredLifetime = 0\r\n```\r\n\r\nIf I do `ip addr` and the secondary address has preferred lifetime set to forever, running `networkctl reload && networkctl reconfigure eth0` on systemd 248.5 would change the lifetime to 0. However in systemd 249.4 this isn't changing to 0.",
+        "comments": [
+            "If we look at the documentation for the Address property in the Network section, we find the following:\r\n\r\n> A static IPv4 or IPv6 address and its prefix length, separated by a \"/\" character. Specify this key more than once to configure several addresses. The format of the address must be as described in inet_pton(3). This is a short-hand for an [Address] section only containing an Address key (see below). This option may be specified more than once.\r\n\r\nSo what you're doing here is configuring the same address twice, once with the default preferred lifetime and once with the preferred lifetime set to 0. Internally, networkd stores addresses in a ordered hashmap by the config file section (and filename). So in practice, the same address appears twice in that hashmap and gets configured twice. In this case, the address with preferred lifetime 0 appears before the same address with preferred lifetime forever in the hashmap, meaning it gets configured with lifetime zero and immediately after gets configured with lifetime forever again.\r\n\r\nSo I think this is working as intended (not sure if we still need to keep the old behavior working as well for backwards compat). It should suffice to simply remove the `Address = <secondary address>` line from the [Network] config section to fix the issue.",
+            "Hm? the two `<secondary address>` in the above is the same address?\r\n\r\nBTW, at least, current HEAD does not have the reported issue. See #20892. But, note that yesterday I merged slightly big PR which changes how addresses are internally managed by networkd.",
+            "Yes, they're the same address.\r\n\r\nShould we warn on the same address appearing in an [Address] section and the [Network] section?",
+            "One more note, even if the `<secondary address>` are equivalent, the issue should NOT happen.\r\nAs described in the above, each addresses are stored in ordered hashmap, so, first the address is configured with lifetime _forever_, then later re-configured _lifetime=0_.",
+            "I have some logging (not sure if I can share, will need to ask Anita) that shows the opposite happening, first the secondary address is configured with lifetime 0, afterwards its reconfigured with lifetime forever.",
+            "> Should we warn on the same address appearing in an [Address] section and the [Network] section?\r\n\r\nYeah, maybe. We should dedup sections before configuring addresses, routes, and so on. But that may not be simple. As, we need to implement the exactly same way what kernel uses. And, sometimes, kernel changes that...",
+            "> I have some logging (not sure if I can share, will need to ask Anita) that shows the opposite happening, first the secondary address is configured with lifetime 0, afterwards its reconfigured with lifetime forever.\r\n\r\nInteresting.",
+            "Scrubbed relevant log lines:\r\n\r\n```\r\neth0: Requesting address: <secondary-address>(valid forever, preferred for 0), flags: n/a\r\neth0: Requesting address: <secondary-address> (valid forever, preferred forever), flags: n/a\r\neth0: Requesting address: <primary-address> (valid forever, preferred forever), flags: n/a\r\n```\r\n\r\nSo it seems the hashmap is iterated in reverse insertion order (assuming config section are processed from start to end of file)",
+            "Indeed... Strange.\r\n\r\nAs you can see the log in `NetworkdNetworkTests.test_address_static` in `systemd-networkd-tests.py` running on CentOS CIs, all `Address=` settings or `[Address]` sections are processed in order.",
+            "Anyway, workaround is simple. Please drop the redundant `Address=` in [Network] section. (I am happy that the issue is not so critical than I initially expected, hehe)",
+            "I'll make a PR to warn when users do this",
+            "> Scrubbed relevant log lines:\r\n> \r\n> ```\r\n> eth0: Requesting address: <secondary-address>(valid forever, preferred for 0), flags: n/a\r\n> eth0: Requesting address: <secondary-address> (valid forever, preferred forever), flags: n/a\r\n> eth0: Requesting address: <primary-address> (valid forever, preferred forever), flags: n/a\r\n> ```\r\n> \r\nAh so these logs I sent Daan they were gotten with `journalctl -r` so they're reversed! The addresses are processed in order. \r\n\r\nBut the odd thing is later on in the logs I see:\r\n`eth0: Forgetting address: <secondary-address> (valid forever, preferred forever), flags: permanent` and later on `eth0: Remembering updated address: <secondary address> (valid forever, preferred forever)`\r\nwith no further mentions of `preferred for 0` anymore.\r\n\r\nAnyways I tried dropping the first `Address=<secondary address>` from `[Network]` and it works so I can work around that. I can also try with the HEAD and see if the issue exists (since https://github.com/systemd/systemd/pull/20892 doesn't have this issue?)",
+            "Okay it was really bothering me because I think this should work; the later address specification should definitely override the first when they have the same address, right? Since the config is processed top to bottom.\r\n\r\nmain branch seems to have the issue still. I saw the word \"dedup\" in 40b12fa20dcf8ae3138de4384a869a298a69ee19 and thought it looked suspicious. So I tested the config with it and with the commit before it. It's definitely 40b12fa20dcf8ae3138de4384a869a298a69ee19. @yuwata is this the correct handling when the same address is supplied multiple times?",
+            "Oh, nice catch! You are right! I will work on that."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32701,
+            "commit_id": "40971657ceb9cedce87f3dab3c42e877a3acbc64",
+            "original_commit_id": "9d0ad242b84ccf08a370aa019c638300429ad5eb",
+            "path": "src/network/networkd-address.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1947,
+            "original_line": 1947,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 108,
+            "subject_type": "line",
+            "review_comments": [
+                "I would add a comment here saying that `address_free` removes the address from `addresses_by_section` as well since that's non-trivial to infer from the code here."
+            ]
+        }
+    ]
+}

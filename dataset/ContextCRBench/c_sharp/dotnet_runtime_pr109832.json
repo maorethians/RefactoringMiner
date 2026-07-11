@@ -1,0 +1,88 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 109832,
+    "lang": "c_sharp",
+    "pr_title": "Add SseFormatter",
+    "pr_body": "Fix #109294.",
+    "pr_comments": [
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\n    This serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\n    This serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change."
+    ],
+    "merged": true,
+    "created_at": "2024-11-15T10:00:03Z",
+    "issue_context": {
+        "number": 109294,
+        "title": "[API Proposal]: Add formatting support to `System.Net.ServerSentEvents`",
+        "body": "### Background and motivation\n\nThe `System.Net.ServerSentEvents` library added support for parsing SSE events. We should also add support for formatting SSE events on the server side, in a way that unlocks work for https://github.com/dotnet/aspnetcore/issues/56172.\n\n### API Proposal\n\n```diff\nnamespace System.Net.ServerSentEvents;\n\n// Extends the existing type to support writing\npublic readonly struct SseItem<T>\n{\n-   public SseItem(T data, string eventType);\n+   public SseItem(T data, string? eventType);\n\n    public T Data { get; }\n\n-   public string EventType { get; }\n+   public string? EventType { get; } \n\n+   public string? EventId { get; init; }\n}\n\npublic delegate T SseItemParser<out T>(string eventType, ReadOnlySpan<byte> data);\n+public delegate byte[] SseItemFormatter<T>(T value);\n\n+public sealed class SseFormatter\n+{\n+    public static SseFormatter Create<T>(IAsyncEnumerable<SseItem<string>> source);\n+    public static SseFormatter Create<T>(IAsyncEnumerable<SseItem<T>> source, SseItemFormatter<T> itemFormatter);\n+\n+    public Task WriteToStreamAsync(Stream stream, CancellationToken cancellationToken = default);\n+    public void WriteToStream(Stream stream, CancellationToken cancellationToken = default);\n+}\n```\n\n\n### API Usage\n\n```csharp\nIAsyncEnumerable<SseItem<int>> source = ...;\nSseFormatter formatter = SseFormatter.Create<int>(source, value => JsonSerializer.SerializeToBytes(value));\nawait formatter.WriteToStreamAsync(targetStream, cancellationToken);\n```\n\n\n### Alternative Designs\n\nThe current SseItemFormatter delegate uses an allocating design, but which is simpler to use. Alternative designs would involve writing either to a `Stream`:\n\n```csharp\npublic delegate ValueTask SseItemFormatter<T>(Stream stream, T value);\n```\n\nBut this would require wrapping the underlying stream in order to intercept potential line breaks. Alternatively, we could use an `IBufferWriter<byte>` which also composes better with `PipeWriter` targets:\n\n```csharp\npublic delegate void SseItemFormatter<T>(IBufferWriter<byte> writer, T value);\n```\n\nThe downside of either approach is that it becomes harder to define formatters from the user's perspective:\n\n```csharp\nSseFormatter formatter = SseFormatter.Create<int>(source, (bufferWriter, value) => \n{ \n    var writer = new Utf8JsonWriter(bufferWriter);\n    return JsonSerializer.SerializeToBytes(bufferWriter, value); \n});\n```\n\n### Risks\n\n_No response_",
+        "comments": [
+            "cc @captainsafia @stephentoub ",
+            ">-   public string EventType { get; }\n>+   public string? EventType { get; } \n\nThis will introduce warnings into folks' code. Why is it necessary?",
+            "> +    public static SseFormatter Create<T>(IAsyncEnumerable<SseItem<T>> source, SseItemFormatter<T> itemFormatter);\n\nSeems like this design forces a `byte[]` allocation for every item. What about writing it directly to the destination stream?",
+            "I noticed that our `SseItem` struct doesn't define a `retry` field. Should it since the underlying spec supports it as an optional property?\n\n> This will introduce warnings into folks' code. Why is it necessary?\n\nIt seems like according to the spec, the event type is actually optional. We may introduce new warnings here but it strikes me as valid given the it's possible for the underlying value to be null. We're a lot more permissive about making non-nullable properties nullable in ASP.NET Core reviews so I tend to be more relax about introducing new warnings if they actually make sense. \ud83d\ude05 ",
+            "> Seems like this design forces a `byte[]` allocation for every item. \n\nI initially experimented with a signature matching that of [`IUtf8SpanFormattable`](https://learn.microsoft.com/en-us/dotnet/api/system.iutf8spanformattable.tryformat?view=net-8.0) but realized that it doesn't compose well with how most serializers work. A typical implementation would have to allocate its own `byte[]` which it then needs to compare against the destination buffer. If it doesn't fit, it would need to be rerun up until the point a matching destination has been provided.\n\n> What about writing it directly to the destination stream?\n\nWe need a way to intercept line breaks. Maybe it's possible to do so by wrapping the underlying stream but I haven't tested this out. Worth a try you think?\n\n```C#\npublic delegate ValueTask SseItemFormatter<T>(Stream stream, T value);\n```\n\nBut not sure how well this would compose with a hypothetical future API that targets `PipeWriter`. Perhaps using `IBufferWriter<byte>` might be preferable here:\n\n```C#\npublic delegate void SseItemFormatter<T>(IBufferWriter<byte> writer, T value);\n```\n",
+            "cc: @dotnet/ncl since the bot was lazy",
+            "> It seems like according to the spec, the event type is actually optional\n\nIt is optional, and when it's not supplied, implementations are supposed to infer \"message\". So we exposed SseParser.EventTypeDefault, so that if it's not there in the wire data, the .NET representation of it can provide it explicitly.\n\nIf we want to make the ctor parameter optional and have the constructor supply \"message\" when the event type is null, I'm fine with that. But making the property be nullable doesn't seem warranted; it's just introducing friction. What's the case where someone is going to behave differently based on whether EventType returns null or returns \"message\"? Presumably we actually make it harder for consumers with this being nullable, as someone wanting to handle the default case needs to check for both null and \"message\".",
+            "> Presumably we actually make it harder for consumers with this being nullable, as someone wanting to handle the default case needs to check for both null and \"message\".\n\nThe downside of keeping it non-nullable is that we'd mandating event types to be written on the formatter side. Unless of course we use a separate type to model written events or decide that `\"message\"` is the magic string that results in event types being omitted.",
+            "> The downside of keeping it non-nullable is that we'd mandating event types to be written on the formatter side.\n\nWhy? If it returns \"message\", the formatter can choose to elide it. That's true whether or not the property can also return null.",
+            "> Why? If it returns \"message\", the formatter can choose to elide it. That's true whether or not the property can also return null.\n\nSo we make \"message\" a magic string?",
+            "> So we make \"message\" a magic string?\n\nThe spec makes it a magic string.",
+            "[Video](https://www.youtube.com/watch?v=ehUiLj2KvCg&t=1h17m59s)\n\n\n* Removed the custom delegate type in favor of Action\n* SseItem.EventType will stay non-nullable even though the ctor now accepts null\n* Replaced instance SseFormatter with a static class.\n\n```diff\nnamespace System.Net.ServerSentEvents;\n\npublic readonly struct SseItem<T>\n{\n-   public SseItem(T data, string eventType);\n+   public SseItem(T data, string? eventType);\n```\n\n```c#\nnamespace System.Net.ServerSentEvents;\n\n// Extends the existing type to support writing\npublic readonly partial struct SseItem<T>\n{\n    public string? EventId { get; init; }\n}\n\npublic static class SseFormatter\n{\n    public static Task WriteAsync(IAsyncEnumerable<SseItem<string>> source, Stream destination, CancellationToken cancellationToken = default);\n    public static Task WriteAsync(IAsyncEnumerable<SseItem<T>> source, Stream destination, Action<T, IBufferWriter<byte>> itemFormatter, CancellationToken cancellationToken = default);\n}\n```",
+            "I want to propose the following amendments to the API as approved above:\n\n1. The `itemFormatter` delegate should accept the full `SseItem<T>` envelope and not just `T`. This is consistent with the parsing delegate which accepts the event type as input.\n2. During review, we stopped short of including an `SseItem<T>` property representing the `retry` field in the specification. We already expose the aggregate value in `SseParser<T>` via the [`ReconnectionInterval` property](https://learn.microsoft.com/en-us/dotnet/api/system.net.serversentevents.sseparser-1.reconnectioninterval?view=net-9.0-pp) so I propose we use the identical name and type for the field.\n\nThus, the amended design looks as follows:\n\n```diff\nnamespace System.Net.ServerSentEvents;\n\n// Extends the existing type to support writing\npublic readonly partial struct SseItem<T>\n{\n    public string? EventId { get; init; }\n+    public TimeSpan? ReconnectionInterval { get; init; }\n}\n\npublic static class SseFormatter\n{\n    public static Task WriteAsync(IAsyncEnumerable<SseItem<string>> source, Stream destination, CancellationToken cancellationToken = default);\n-    public static Task WriteAsync(IAsyncEnumerable<SseItem<T>> source, Stream destination, Action<T, IBufferWriter<byte>> itemFormatter, CancellationToken cancellationToken = default);\n+   public static Task WriteAsync(IAsyncEnumerable<SseItem<T>> source, Stream destination, Action<SseItem<T>, IBufferWriter<byte>> itemFormatter, CancellationToken cancellationToken = default); \n}\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 6292,
+            "commit_id": "5060dbaff2747bd719f1aee3f4da6e073947e227",
+            "original_commit_id": "1e3544ec04e27538f3d38d274f7a65277f0d681f",
+            "path": "src/libraries/System.Net.ServerSentEvents/src/System/Net/ServerSentEvents/Helpers.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 91,
+            "original_line": 67,
+            "side": "RIGHT",
+            "original_position": 67,
+            "position": 91,
+            "subject_type": "line",
+            "review_comments": [
+                "Is the `try-finally` here needed?\r\nThe array pool should handle dropped arrays in case of an exception.",
+                "> The array pool should handle dropped arrays in case of an exception.\r\n\r\nHow is that?",
+                "In case of an exception the array won't be returned to the pool, so ultimately it will be GCed.\r\nThat's no problem for the array pool, so the `try-finally` isn't needed.\r\n\r\nIn the previous comment the cited statement wasn't very clear -- sorry.",
+                "> In case of an exception the array won't be returned to the pool, so ultimately it will be GCed.\r\n\r\nWhy is that desirable? Why discard the buffer just because an exception was thrown?",
+                "The exception here isn't the common case, so one can avoid additional complexity brought by try-finally that is not needed.\r\n\r\nThe pattern with try-finally for the array pool was used at the beginning of AP, but recently renting / returning is just done w/o try-finally. See e.g. https://github.com/dotnet/runtime/issues/71249#issuecomment-1165486832 and lots of other comments for this.",
+                "I don't think inserting a try/finally is so terrible from a code complexity standpoint. We use that pattern pervasively and I don't think we need to remove it here.",
+                "> We use that pattern pervasively\r\n\r\nReally? Recently I see it the other way around.\r\n\r\nBut to shorten this discussion to whatever you think is right here.",
+                "I don't at all agree with that approach. Should we be starving the buffer pool just because of a transient network outage?",
+                "async operations aren't necessarily done referencing the buffer when they throw (it's possible the native half can write after the managed half throws a timeout exception, for example), so they're not supposed to return it except in successful flows.",
+                "> it's possible the native half can write after the managed half throws a timeout exception, for example\r\n\r\nCan you give an example in the repo where that might happen?",
+                "Not off the top of my head.  I remember it being A Thing that Levi was pushing in 2919 or earlier (I see a commit I made in 2019 getting rid of a bunch of async finally-returns); but I can't find the written version of that.\r\n\r\nSomething involving patterns where you call a native equivalent of BeginRead(state, dest, onEndCallback), then Task cancellation tries to cancel the OS async operation, but that causes a race condition with the IO completion event and the async operation cancellation event.\r\n\r\n@GrabYourPitchforks might be able to spout one off... or perhaps correct my mis-saved \"fact\"",
+                "In any case, we're using this pattern pervasively including in the SseParser class of this project:\r\n\r\nhttps://github.com/dotnet/runtime/blob/2c7c6bf5d18a7d42f4b9f48fe4bced22f1d292ae/src/libraries/System.Net.ServerSentEvents/src/System/Net/ServerSentEvents/SseParser_1.cs#L233-L240\r\n\r\nIf this turns out to be problematic, it would probably require a more systematic approach to fix it."
+            ]
+        },
+        {
+            "hunk_id": 6293,
+            "commit_id": "5060dbaff2747bd719f1aee3f4da6e073947e227",
+            "original_commit_id": "1e3544ec04e27538f3d38d274f7a65277f0d681f",
+            "path": "src/libraries/System.Net.ServerSentEvents/src/System/Net/ServerSentEvents/PooledByteBufferWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 9,
+            "original_line": 9,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "Could this use https://github.com/dotnet/runtime/blob/main/src/libraries/Common/src/System/Net/ArrayBuffer.cs?\r\n(looks like the same idea at a quick glance)",
+                "Looks similar, but AFAICT it doesn't implement IBufferWriter. FWIW this is duplicated from STJ so clearly we would benefit from a shared thing.",
+                "> FWIW this is duplicated from STJ so clearly we would benefit from a shared thing.\r\n\r\nDuplicated, as in copy/paste? Can you move the code from STJ to a shared location and just include it in both then?",
+                "Yep. The STJ type implements `PipeWriter` instead of `IBufferWriter` so we can't just share the source without taking an extra dependency in pre 9.0 targets.",
+                "> Yep. The STJ type implements `PipeWriter` instead of `IBufferWriter` so we can't just share the source without taking an extra dependency in pre 9.0 targets.\r\n\r\nAnd that's not a case of just having two partial files, one with this type implementing IBufferWriter and one with it also adding the PipeWriter derivation?\r\n\r\nOr putting all of this logic into a shared type that's then just delegated to with one-liners from the two different wrappers?\r\n\r\nThere is a lot of non-trivial logic here. We should avoid copy/pasting it.",
+                "What I had in mind re: `ArrayBuffer` is if we can replace this file with something along the lines of\r\n```c#\r\ninternal sealed class PooledByteBufferWriter : IBufferWriter<byte>, IDisposable\r\n{\r\n    private ArrayBuffer _buffer = new(initialSize: 256, usePool: true);\r\n\r\n    public Memory<byte> GetMemory(int sizeHint = 0)\r\n    {\r\n        _buffer.EnsureAvailableSpace(sizeHint);\r\n        return _buffer.AvailableMemory;\r\n    }\r\n\r\n    public Span<byte> GetSpan(int sizeHint = 0)\r\n    {\r\n        _buffer.EnsureAvailableSpace(sizeHint);\r\n        return _buffer.AvailableSpan;\r\n    }\r\n    \r\n    public ReadOnlyMemory<byte> WrittenMemory => _buffer.ActiveMemory;\r\n    \r\n    public int Capacity => _buffer.Capacity;\r\n    \r\n    public int WrittenCount => _buffer.ActiveLength;\r\n    \r\n    public void Advance(int count) => _buffer.Commit(count);\r\n    \r\n    public void Reset() => _buffer.Discard(_buffer.ActiveLength);\r\n    \r\n    public void Dispose() => _buffer.Dispose();\r\n}\r\n```",
+                "Thanks, this is a huge improvement."
+            ]
+        }
+    ]
+}

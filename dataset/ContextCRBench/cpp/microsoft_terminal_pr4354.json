@@ -1,0 +1,115 @@
+{
+    "repo": "microsoft/terminal",
+    "pr_number": 4354,
+    "lang": "cpp",
+    "pr_title": "When the Terminal is resized, don't remove lines from scrollback",
+    "pr_body": "## Summary of the Pull Request\r\n\r\nThis PR fixes a bug in the Windows Terminal, where decreasing the height of the window would cause some lines from the scrollback to be lost. While a seemingly trivial bug, this actually involved some elaborate manipulation of how conpty decides to render a resize operation.\r\n\r\n## References\r\n\r\n## PR Checklist\r\n* [x] Closes #3490\r\n* [x] I work here\r\n* [x] Tests added/passed - you don't even know\r\n* [n/a] Requires documentation to be updated\r\n\r\n## Detailed Description of the Pull Request / Additional comments\r\n\r\nConpty was not emitting the correct thing when you'd decrease the height of the viewport. When you increase the height of the window, we'd both invalidate the entire buffer, and insert new lines to the bottom of the buffer. What this meant is that on every height-only resize, we'd re-emit the entire viewport.\r\n  - If you resized down twice (From `R` to `R-1` to `R-2`), once _during the frame being emitted by conpty_, the Terminal would try to process the `R-1` lines emitted by conpty when there are only `R-2` available rows in the terminal buffer. This would lead to duplicated lines.\r\n\r\nThis involved a bunch of changes throughout the codebase to make sure we weren't just calling `TriggerRedraw` on the entire viewport when we resize the buffer. Magically, conpty was pretty good about knowing what actually changed, though that did need some updating as well (in `VtEngine::UpdateViewport`).\r\n - Importantly, there's a minor change to `ScreenInfo` to cause it to only invalidate wrapped lines during a ResizeWithReflow. Previously, we'd be invalidating the entire viewport, but that caused issues terminal-side. It's better to only tell the terminal what actually changed during the reflow. \r\n\r\nWith those changes, the Terminal was changed to more intelligently stick to the right location in the buffer. When increasing the height of conpty, new lines always get inserted at the bottom of the viewport, so the terminal needs to stick to _roughly_ the old top's position to re-create this stateWhen resizing down, _empty_ lines are clipped from the conpty if there are any, then lines from the top are removed. \r\n\r\nThis is obviously all very complicated, so I've added some tests to validate all this. `ConptyRoundtripTests::TestResizeHeight` is _elaborate_ and it does the right thing here, validating the contents of both conpty and the Terminal after emitting various numbers of lines into the buffer and doing arbitrary resizes.\r\n\r\nAs with any conpty change, I'm horrified that this will break in new and more horrifying ways. I'm hoping that a long bake time will help us identify bugs in this changelist (if there are any).\r\n\r\n## Validation Steps Performed\r\nIn VtPipeTerm and Windows Terminal:\r\n1. `wsl seq 100`\r\n2. resize down - scroll to make sure buffer has the right contents\r\n3. resize up - scroll to make sure buffer has the right contents\r\n4. resize down _quickly_ - scroll to make sure buffer has the right contents\r\n5. resize up _quickly_ - scroll to make sure buffer has the right contents\r\n\r\nAdditionally, resize quickly from the corner, and ensure ll the lines are right.\r\n\r\nAditionally, perform all the above with less than a full viewport of output.\r\n\r\nAditidionally, after the above tests, perform a `sleep 2 ; printf \"\\e[6n\"` and quickly hit <kbd>esc</kbd> to query the cursors position in conpty, and make sure it lines up with the Terminal's.\r\n\r\nAlso play with resizing and PSReadline, and all the lovely things PSR does to the cursor. \r\n\r\n<details>\r\n<summary> This was the original PR body I had for this change. It's included here for future code archeologists. It's not really accurate, but it might guide people with the text that's in #3490 to help recreaate how I got here.</summary>\r\n\r\nThis PR encompasses a pair of fixes that are needed simultaneously to make the Windows Terminal work correctly.\r\n* Conpty was not emitting the correct thing when you'd decrease the height of the viewport. When you increase the height of the window, we'd both invalidate the entire buffer, and insert new lines to the bottom of the buffer. What this meant is that on every height-only resize, we'd re-emit the entire viewport.\r\n  - If you resized down twice (From `R` to `R-1` to `R-2`), once _during the frame being emitted by conpty_, the Terminal would try to process the `R-1` lines emitted by conpty when there are only `R-2` available rows in the terminal buffer. This would tlead to duplicated lines.\r\n* This buggy conpty behavior was causing us to correctly believe that the terminal viewport should remain \"stuck\" to the top position. That was what was causing us to apparently erase lines from the scrollback as we'd resize down. So this also changes the terminal to stick to the bottom when the viewport height changes.\r\n\r\n\r\nThis involved a bunch of changes throughout the codebase to make sure we weren't just calling `TriggerRedraw` on the entire viewport when we resize the buffer. Magically, conpty was pretty good about knowing what actually changed, though that did need some updating as well (in `VtEngine::UpdateViewport`).\r\n\r\nAs with any conpty change, I'm horrified that this will break in new and more horrifying ways. I'm hoping that a long bake time will help us identify bugs in this changelist (if there are any).\r\n\r\n## Validation Steps Performed\r\nIn VtPipeTerm and Windows Terminal:\r\n1. `wsl seq 100`\r\n2. resize down - scroll to make sure buffer has the right contents\r\n3. resize up - scroll to make sure buffer has the right contents\r\n4. resize down _quickly_ - scroll to make sure buffer has the right contents\r\n5. resize up _quickly_ - scroll to make sure buffer has the right contents\r\n\r\n</details>",
+    "pr_comments": [
+        "I might need to self block this - Looks like VtPipeTerm is _aggressively_ worse in this scenario actually. Since this is a replication of how WSL interop in conhost is supposed to work, this is a bad sign. I'll test more.\r\n\r\nEDIT:\r\nOkay I think I figured out what I did wrong here. It's the change to `screenInfo.cpp:L1451-1469`. Here we're trying to figure out the part of the viewport to invalidate, based off of what lines in the _new_ buffer are wrapped. This was supposed to be a heuristic on \"what lines that were wrapped that might have changed\". But that doesn't work - in the scenario where we're going from a wrapped line to a non-wrapped line, after the resize, all the contents of the buffer below the wrapped line will have shifted up one line. However, the problem with this algorithm is that we're only checking the wrap state at the end - which means that since there are _no_ wrapped lines in the new buffer, we never invalidate, and the host and terminal get out of sync.\r\n\r\nI thought this was a bad heuristic originally, and I guess I'm glad that my gut was right about that.\r\n\r\nmy repro is essentially print a line that doesn't wrap, resize width down to have it wrap, then resize the width up to have the line unwrap. Chaos ensues.",
+        "You know what, this PR is a mess, and I can fix the \"decrease the height removes a row from the scrollback\" (#3490) bug with a combination of:\r\n* Linewrapping in conpty #405 / #4415 \r\n* Fixed EOL cursor movement from #4403\r\n* Making the Terminal `ResizeWithReflow` the buffer\r\n* A modified version of `Terminal::_UserResize` from this PR\r\n* _NO_ other Conpty changes\r\n\r\nIn fact, all these tests even still pass, so that's good and makes me happy. I'm going to close this, and the new PR for #3490 will come after #4415 and #4403 get merged."
+    ],
+    "merged": false,
+    "created_at": "2020-01-29T19:21:34Z",
+    "issue_context": {
+        "number": 3490,
+        "title": "Flattening the window loses scrollback lines",
+        "body": "<!-- \r\n\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\ud83d\udea8\r\n\r\nI ACKNOWLEDGE THE FOLLOWING BEFORE PROCEEDING:\r\n1. If I delete this entire template and go my own path, the core team may close my issue without further explanation or engagement.\r\n2. If I list multiple bugs/concerns in this one issue, the core team may close my issue without further explanation or engagement.\r\n3. If I write an issue that has many duplicates, the core team may close my issue without further explanation or engagement (and without necessarily spending time to find the exact duplicate ID number).\r\n4. If I leave the title incomplete when filing the issue, the core team may close my issue without further explanation or engagement.\r\n5. If I file something completely blank in the body, the core team may close my issue without further explanation or engagement.\r\n\r\nAll good? Then proceed!\r\n-->\r\n\r\n<!--\r\nThis bug tracker is monitored by Windows Terminal development team and other technical folks.\r\n\r\n**Important: When reporting BSODs or security issues, DO NOT attach memory dumps, logs, or traces to Github issues**.\r\nInstead, send dumps/traces to secure@microsoft.com, referencing this GitHub issue.\r\n\r\nIf this is an application crash, please also provide a Feedback Hub submission link so we can find your diagnostic data on the backend. Use the category \"Apps > Windows Terminal (Preview)\" and choose \"Share My Feedback\" after submission to get the link.\r\n\r\nPlease use this form and describe your issue, concisely but precisely, with as much detail as possible.\r\n\r\n-->\r\n\r\n# Environment\r\n\r\n```none\r\nWindows build number: 10.0.18362.0\r\nWindows Terminal version (if applicable): 0.6.2951.0\r\n```\r\n\r\n# Steps to reproduce\r\n\r\n- `ssh` to a Linux box\r\n- `seq 100`\r\n- shrink the window vertically (fewer lines)\r\n- scroll back\r\n\r\n# Expected behavior\r\n\r\nSee the numbers from 1 to 100\r\n\r\n# Actual behavior\r\n\r\nLines get permanently lost as the window is made smaller, e.g. the sequence goes like ... 70 71 72 73 78 79 80 81 ...",
+        "comments": [
+            "Wow this might be crazy hard to fix with conpty. I've put together a prototype branch to fix this, and it just keeps getting more and more ridiculous. Closer and closer to the expected behavior, but the edge cases might not be solvable here.\r\n\r\nFrom a PR description that I typed up before realizing my fixes weren't quite right:\r\n> * Conpty was not emitting the correct thing when you'd decrease the height of the viewport. When you increase the height of the window, we'd both invalidate the entire buffer, and insert new lines to the bottom of the buffer. What this meant is that on every height-only resize, we'd re-emit the entire viewport.\r\n>   - If you resized down twice (From `R` to `R-1` to `R-2`), once _during the frame being emitted by conpty_, the Terminal would try to process the `R-1` lines emitted by conpty when there are only `R-2` available rows in the terminal buffer. This would tlead to duplicated lines.\r\n> * This buggy conpty behavior was causing us to correctly believe that the terminal viewport should remain \"stuck\" to the top position. That was what was causing us to apparently erase lines from the scrollback as we'd resize down. So this also changes the terminal to stick to the bottom when the viewport height changes.\r\n\r\n\r\nWhat I've gathered from other terminal is that when you _increase_ the height of the buffer, one of two things happens:\r\n1. If there are still lines in the scrollback, those scrollback lines get pushed back into the viewport.\r\n2. If there _aren't_, then blank lines are inserted at the bottom.\r\n\r\nThe trick for us here is that conpty isn't a dumb pipe - there's fundamentally a console buffer that we're trying to sync with the state of the terminal connected to it. Additionally, conpty doesn't have a scrollback _at all_, and it doesn't know anything about the terminal. It doesn't know if the terminal has a scrollback at all, or how many lines are in the terminal's scrollback. \r\n\r\nI had a good amount of success with \"padding the top\" of the conpty buffer when we increase in height, trying to cover case 1. By \"padding the top\", conpty can create space in it's buffer where it thinks that lines from the terminal will be. However, things break down at that case 2 scenario. Conpty doesn't know when there aren't more lines in the scrollback. Conpty can know how many lines it's _theoretically_ moved to scrollback, but it doesn't actually know if all of those were _kept_ by the terminal - consider emitting 100 lines to something with only 10 lines of scrollback. Conpty would mistakenly think that it would need to \"pad the top\" 90 more times than the terminal actually would. \r\n\r\nPeculiarly enough, this all works well enough _until_ a client application tries to get the cursor position. Until then, the text we're emitting from conpty just so happens to work well enough _relative to previous output_ that the terminal has the expected text in it. As soon as a client app requests the cursor position, that's when things start to break down. The case I'm thinking of particularly is `powershell` with PSReadline. PSReadline will get the cursor position, and re-move the cursor to that position while typing at the prompt. When PSR tries this after we've incorrectly padded the top, then the cursor in the terminal seems to \"jump down\" to where the conpty thinks the cursor should be.\r\n\r\nI could maybe solve this by having conpty immediately ask the terminal for its cursor position on a `ResizePseudoconsole` (with a DSR). With that response, we could know where the terminal thinks the cursor is - if it's on the same line, then the terminal inserted blank lines to the bottom of the buffer. If the cursor has moved down, then lines were moved from scrollback. \r\n\r\nHowever, the problem would be that the response would come in asynchronously to that thread. The `ResizePseudoconsole` handler is on a separate thread from the input handler. The input handler might already be blocked on a `ReadFile` from the input handle, so if the `PtySignalThread` tried to also `ReadFile` the input handle, there'd be no way to know who would handle the read first. The `PtySignalThread` would need to release the global lock before the read, but one of the input thread or signal thread would complete the read, but maybe after the renderer thread has another go at it. Having the signal thread do the read is a bad idea. But there would be no way to ensure the input thread is the next thread scheduled. We might paint a bad frame to the terminal _after_ the terminal requested a resize, but before we've actually handled the resize.\r\n\r\nThis last paragraph altogether feels hacky to me anyways. I'll have to keep thinking about this, and maybe prototyping more.",
+            "_I'm getting the sinking suspicion that #4354 is wrong, but without more time to complete it, I'm leaving a note for here, so that I'll remember._\r\n\r\nThere's probably benefit in improving the conpty invalidating story - I've long thought that just `InvalidateAll`ing is the wrong solution. I'm not sure 4354 is right either. \r\n\r\n**Maybe it's possible that just the viewport moving code is sufficient to get this right.** Maybe pull the rest and just move the viewport a little better. I came at this a really strange angle, from first thinking the terminal was doing it wrong, because other terminal behaved a certain way, then changing conpty to try and act like other terminals, realizing it really really doesn't, then changing Terminal to try and behave in accordance with conpty, **without** reverting everything and starting fresh. I made too many wrong assumptions in a row, and I think I maybe accumulated some of those bad assumptions when I shouldn't have. I'm thinking now that I should scope this smaller - resizing down quickly might still be broken, resizing diagonally might still be broken, but it'll be no worse than it currently is in both those cases"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 43553,
+            "commit_id": "2d078168454f0f2366ad0bfb4b356c304e3d552d",
+            "original_commit_id": "830c22b73e3299cde552208597ddebffbeb0a898",
+            "path": "src/cascadia/TerminalCore/Terminal.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 197,
+            "original_line": 197,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "Avoid hungarian"
+            ]
+        },
+        {
+            "hunk_id": 43554,
+            "commit_id": "2d078168454f0f2366ad0bfb4b356c304e3d552d",
+            "original_commit_id": "830c22b73e3299cde552208597ddebffbeb0a898",
+            "path": "src/cascadia/TerminalCore/Terminal.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 210,
+            "original_line": 210,
+            "side": "RIGHT",
+            "original_position": 37,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this math a candidate for the new `base::ClampedAdd` or `base::CheckedAdd`? Looks like it might be. If `oldTop` and `adjustment` are `SHORT` or you declare `SHORT proposedTop`, I think those could help you clamp/check it to be in bounds or set a reasonable default if it goes past and avoid the need to `gsl::narrow_cast<SHORT>` unchecked below."
+            ]
+        },
+        {
+            "hunk_id": 43557,
+            "commit_id": "2d078168454f0f2366ad0bfb4b356c304e3d552d",
+            "original_commit_id": "830c22b73e3299cde552208597ddebffbeb0a898",
+            "path": "src/cascadia/UnitTests_TerminalCore/ConptyRoundtripTests.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 416,
+            "original_line": 416,
+            "side": "RIGHT",
+            "original_position": 149,
+            "position": 149,
+            "subject_type": "line",
+            "review_comments": [
+                "OK, well, with this level of coverage... maybe I'm not that mad about the PTY-specific stuff going into `ResizeWithReflow` because if we decide it's a bad place for it later, this test should cover it and make sure we didn't screw up the future refactor."
+            ]
+        },
+        {
+            "hunk_id": 43556,
+            "commit_id": "2d078168454f0f2366ad0bfb4b356c304e3d552d",
+            "original_commit_id": "830c22b73e3299cde552208597ddebffbeb0a898",
+            "path": "src/host/screenInfo.cpp",
+            "start_line": 1445,
+            "original_start_line": 1445,
+            "start_side": "RIGHT",
+            "line": 1470,
+            "original_line": 1470,
+            "side": "RIGHT",
+            "original_position": 51,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "Nnnnnn. I don't really like this but I don't have another offering at hand so maybe it has to stick for the short term.\r\n\r\nI can see this going where the `Resize` method on the `TextBuffer` becomes more responsible for providing appropriate viewport notifications since it seems like every caller needs to figure out something based on the `Cursor.GetPosition()` after the fact. And then to add some... intricate rendering details about the `VtRenderer` to this side of the equation feels dirty, design wise. I felt like determining what was different fit better in the renderer side.\r\n\r\nBut I don't know what to do about it right now. I'm guessing there just isn't enough data available to the `VtRenderer` to know that this happened? What specifically was missing? Isn't the width available to the `VtRenderer` via the `RenderData` interface? Or is it that it can't reach that specifically because `RenderData` is only in the base renderer and it can't query that?",
+                "Okay so this is the part that actually might have messed up `gnome-terminal` and conhost/inception. \r\n\r\nThe real trick here is that we _don't_ want to just invalidate the blank lines at the bottom of the buffer. However, I'm afarid now that this might _never_ work quite right, if the terminal resized again before this frame is printed. I'm still investigating if this PR is the right solutions - it might not turn out that way."
+            ]
+        },
+        {
+            "hunk_id": 43555,
+            "commit_id": "2d078168454f0f2366ad0bfb4b356c304e3d552d",
+            "original_commit_id": "830c22b73e3299cde552208597ddebffbeb0a898",
+            "path": "src/cascadia/UnitTests_TerminalCore/TerminalBufferTests.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 105,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "why commented?"
+            ]
+        }
+    ]
+}

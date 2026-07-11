@@ -1,0 +1,88 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 64747,
+    "lang": "c_sharp",
+    "pr_title": "Consolidate _handshakeBuffer and _internalBuffer in SslStream",
+    "pr_body": "Fixes #52037.\r\n\r\nI the two buffers have been merged together since they are never used in parallel (i.e. receciving appdata is not allowed during renegotiation etc.).\r\n\r\nOne thing that is kinda open still is when to rent/return the actual buffer, currently, the code rents the buffer during construction and keeps it until the `SslStream` is disposed. Maybe we can do better.\r\n\r\nShould probably undergo performance testing before merging.",
+    "pr_comments": [
+        "Tagging subscribers to this area: @dotnet/ncl, @vcsjones\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nFixes #52037.\r\n\r\nI the two buffers have been merged together since they are never used in parallel (i.e. receciving appdata is not allowed during renegotiation etc.).\r\n\r\nWill need performance testing before merging.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>rzikm</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Net.Security`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "> One thing that is kinda open still is when to rent/return the actual buffer, currently, the code rents the buffer during construction and keeps it until the SslStream is disposed. \r\n\r\nWe intentionally return the buffer at certain times in order to reduce memory usage. In particular, when the user does a zero-byte read.\r\n\r\n@wfurt did a bunch of work to enable this not too long ago (I think it was in 6.0?). We should not regress this.\r\n\r\nEdit: Actually, the work from @wfurt was to read from multiple TLS frames if we can. I think we already supported the zero-byte read optimization before that. \r\n\r\nRegardless, here's the relevant code for zero byte read handling: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Net.Security/src/System/Net/Security/SslStream.Implementation.cs#L913",
+        "I have tried to copy the non-async-machine path from `FillHandshakeBufferAsync` to `EnsureFullTlsFrameAsync`, but I did not manage to get it working (the tests would hang for resons unknown to me). Any help with that would be appreciated:\r\n\r\n<details>\r\n<summary>WIP version</summary>\r\n\r\n```csharp\r\n        private ValueTask<int> EnsureFullTlsFrameAsync<TIOAdapter>(TIOAdapter adapter)\r\n            where TIOAdapter : IReadWriteAdapter\r\n        {\r\n            int frameSize;\r\n            if (HaveFullTlsFrame(out frameSize))\r\n            {\r\n                return ValueTask.FromResult(frameSize);\r\n            }\r\n\r\n            // We may have enough space to complete frame, but we may still do extra IO if the frame is small.\r\n            // So we will attempt larger read - that is trade of with extra copy.\r\n            // This may be updated at some point based on size of existing chunk, rented buffer and size of 'buffer'.\r\n            _buffer.EnsureAvailableSpace(Math.Min(frameSize, InitialBufferSize) - _buffer.ActiveLength);\r\n\r\n            while (_buffer.EncryptedLength < frameSize)\r\n            {\r\n                // there should be space left to read into\r\n                Debug.Assert(_buffer.AvailableLength > 0, \"_buffer.AvailableBytes > 0\");\r\n\r\n                // We either don't have full frame or we don't have enough data to even determine the size.\r\n                ValueTask<int> t = adapter.ReadAsync(_buffer.AvailableMemory);\r\n                if (!t.IsCompletedSuccessfully)\r\n                {\r\n                    return InternalEnsureFullTlsFrameAsync(adapter, t, frameSize);\r\n                }\r\n                int bytesRead = t.Result;\r\n                if (bytesRead == 0)\r\n                {\r\n                    if (_buffer.EncryptedLength != 0)\r\n                    {\r\n                        // we got EOF in middle of TLS frame. Treat that as error.\r\n                        throw new IOException(SR.net_io_eof);\r\n                    }\r\n\r\n                    return ValueTask.FromResult(0);\r\n                }\r\n\r\n                _buffer.Commit(bytesRead);\r\n                if (frameSize == int.MaxValue && _buffer.EncryptedLength > TlsFrameHelper.HeaderSize)\r\n                {\r\n                    // recalculate frame size if needed e.g. we could not get it before.\r\n                    frameSize = GetFrameSize(_buffer.EncryptedReadOnlySpan);\r\n                    _buffer.EnsureAvailableSpace(frameSize - _buffer.ActiveLength);\r\n                }\r\n            }\r\n\r\n            return ValueTask.FromResult(frameSize);\r\n\r\n            async ValueTask<int> InternalEnsureFullTlsFrameAsync(TIOAdapter adapter, ValueTask<int> task, int frameSize)\r\n            {\r\n                while (true)\r\n                {\r\n                    int bytesRead = await task.ConfigureAwait(false);\r\n                    if (bytesRead == 0)\r\n                    {\r\n                        if (_buffer.EncryptedLength != 0)\r\n                        {\r\n                            // we got EOF in middle of TLS frame. Treat that as error.\r\n                            throw new IOException(SR.net_io_eof);\r\n                        }\r\n\r\n                        return 0;\r\n                    }\r\n\r\n                    _buffer.Commit(bytesRead);\r\n\r\n                    if (_buffer.EncryptedLength >= frameSize)\r\n                    {\r\n                        break;\r\n                    }\r\n\r\n                    task = adapter.ReadAsync(_buffer.AvailableMemory);\r\n\r\n                    if (frameSize == int.MaxValue && _buffer.EncryptedLength > TlsFrameHelper.HeaderSize)\r\n                    {\r\n                        // recalculate frame size if needed e.g. we could not get it before.\r\n                        frameSize = GetFrameSize(_buffer.EncryptedReadOnlySpan);\r\n                        _buffer.EnsureAvailableSpace(frameSize - _buffer.ActiveLength);\r\n                    }\r\n                }\r\n\r\n                return frameSize;\r\n            }\r\n        }\r\n```\r\n</details>",
+        "> I have tried to copy the non-async-machine path from `FillHandshakeBufferAsync` to `EnsureFullTlsFrameAsync`, but I did\r\n\r\nI don't think we need it. We abandoned it `EnsureFullTlsFrameAsync` for simplification. ",
+        "/azp run runtime-libraries-coreclr outerloop",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "There is one possibly related test failure in outerloop tests:\r\n`System.Net.Security.Tests.CertificateValidationRemoteServer.CertificateValidationRemoteServer_EndToEnd_Ok`\r\nbut I am unable to reproduce the failure locally (the test passes)\r\n\r\n```\r\n&{ pushd C:\\source\\runtime\\artifacts\\bin\\System.Net.Security.Tests\\Debug\\net7.0-windows\\\r\n>>   &\"C:\\source\\runtime\\artifacts\\bin\\testhost\\net7.0-windows-Debug-x64\\dotnet.exe\" exec --runtimeconfig System.Net.Security.Tests.runtimeconfig.json --depsfile System.Net.Security.Tests.deps.json xunit.console.dll System.Net.Security.Tests.dll -xml testResults.xml -nologo -method System.Net.Security.Tests.CertificateValidationRemoteServer.CertificateValidationRemoteServer_EndToEnd_Ok -notrait category=failing\r\n>>   popd }\r\n  Discovering: System.Net.Security.Tests (method display = ClassAndMethod, method display options = None)\r\n  Discovered:  System.Net.Security.Tests (found 1 of 474 test case)\r\n  Starting:    System.Net.Security.Tests (parallel test collections = on, max threads = 20)\r\n  Finished:    System.Net.Security.Tests\r\n=== TEST EXECUTION SUMMARY ===\r\n   System.Net.Security.Tests  Total: 2, Errors: 0, Failed: 0, Skipped: 0, Time: 1.381s\r\n```",
+        "/azp run runtime-libraries-coreclr outerloop",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "CI failures are unrelated:\r\n- `System.Threading.ThreadPools.Tests.ThreadPoolTests.CooperativeBlockingCanCreateThreadsFaster` - https://github.com/dotnet/runtime/issues/64964\r\n- `System.Net.Security.Tests.TelemetryTest.EventSource_SuccessfulHandshake_LogsStartStop` - https://github.com/dotnet/runtime/issues/63008\r\n- `System.Net.NetworkInformation.Tests.PingTest.SendPingToExternalHostWithLowTtlTest` - https://github.com/dotnet/runtime/issues/65065"
+    ],
+    "merged": true,
+    "created_at": "2022-02-04T21:07:23Z",
+    "issue_context": {
+        "number": 52037,
+        "title": "consolidate _handshakeBuffer and _internalBuffer inside SslStream",
+        "body": "related to  #49346\r\nrelated to #49000\r\n\r\nboth buffers are currently rented from ArrayBuufer. Aside from code duplication we need to copy leftovers when we transition from handshake to read, read to handshake during TLS 1.3 processing or during renegotiation/late cert retrieval. \r\n\r\nusing single buffer would simplify internal logic and reduce code.",
+        "comments": [
+            "Tagging subscribers to this area: @dotnet/ncl, @vcsjones\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nrelated to  #49346\r\nrelated to #49000\r\n\r\nboth buffers are currently rented from ArrayBuufer. Aside from code duplication we need to copy leftovers when we transition from handshake to read, read to handshake during TLS 1.3 processing or during renegotiation/late cert retrieval. \r\n\r\nusing single buffer would simplify internal logic and reduce code.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>wfurt</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Net.Security`, `enhancement`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 5808,
+            "commit_id": "6ea392e3834a424bbe87c13aa2a99d370ce77502",
+            "original_commit_id": "a24364a09d9aea98b545f16689a53bafc6b18c14",
+            "path": "src/libraries/System.Net.Security/src/System/Net/Security/SslStream.Implementation.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 765,
+            "original_line": 765,
+            "side": "LEFT",
+            "original_position": 208,
+            "position": 215,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't know if this matters but the else would put next decrypted data to the beginning of the buffer. \r\nThe encrypted should be always same or bigger so it may not matter.",
+                "I think it does not matter, since `ResetReadBuffer` is called before receiving and that function moves the data if there is any."
+            ]
+        },
+        {
+            "hunk_id": 5807,
+            "commit_id": "6ea392e3834a424bbe87c13aa2a99d370ce77502",
+            "original_commit_id": "a24364a09d9aea98b545f16689a53bafc6b18c14",
+            "path": "src/libraries/System.Net.Security/src/System/Net/Security/SslStream.Implementation.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 500,
+            "original_line": 500,
+            "side": "RIGHT",
+            "original_position": 163,
+            "position": 170,
+            "subject_type": "line",
+            "review_comments": [
+                "I know this is exciting code. But I'm wondering now if there is possibility this could confuse some of the cleanup logic.  ",
+                "I don't think so, since the data are read immediately afterwards and there are those locks that prevent multiple concurrent reads or other conflicting operations."
+            ]
+        },
+        {
+            "hunk_id": 5806,
+            "commit_id": "6ea392e3834a424bbe87c13aa2a99d370ce77502",
+            "original_commit_id": "a24364a09d9aea98b545f16689a53bafc6b18c14",
+            "path": "src/libraries/System.Net.Security/src/System/Net/Security/SslStream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 78,
+            "original_line": 78,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "padding seems little bit strange to me. I would probably just track where the encrypted chunk starts. ",
+                "It was a small optimization, by keeping the padding length we have one less field to update when we discard data read by the user code."
+            ]
+        }
+    ]
+}

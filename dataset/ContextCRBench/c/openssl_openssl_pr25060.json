@@ -1,0 +1,48 @@
+{
+    "repo": "openssl/openssl",
+    "pr_number": 25060,
+    "lang": "c",
+    "pr_title": "Revert \"QUIC CHANNEL: Defer transport parameter generation\"",
+    "pr_body": "This reverts commit 69616017a613c7442fa51794d51f167b0de2fc9c.\r\n\r\nRecently discovered (in #25054 ) that QUIC when used to connect to a quic server via s_client, that the TLS client hello header contains and empty quic_transport_parameters extension, causing the connection to be aborted by the server.\r\n\r\nIt occurs because in 69616017a613c7442fa51794d51f167b0de2fc9c we deferred the initialization of these parameters until a connection was established. The way s_client handles the TLS handshake, this is too late however, and produces the previously mentioned empty extension\r\n\r\nLooking at the code suggests that while its possible to do so in some cases, theres no real reason to defer the establishment of these parameters.  As such revert the change\r\n\r\nFixes #25054 ",
+    "pr_comments": [
+        "I believe the transport parameter generation was deferred to ossl_quic_channel_start() for a reason. IMO the problem rather is that ossl_quic_channel_start() is being called too late in s_client. That needs to be investigated and fixed properly.",
+        "If I understand the s_client code right, it will trigger the handshake implicitly by doing SSL_write() of size 0. This should be fully equivalent to calling SSL_connect() so we need to investigate further why it isn't or if there is something else in s_client that confuses the quic handshake logic in libssl.",
+        "Some notes based on our conversation in stand up:\r\n\r\n1) The handshake is triggered in s_client based on the call to SSL_has_pending.  not sure if thats relevant, but it may be\r\n\r\n2) The deferral reason is something of a mystery based on the changelog that comitted it, but from testing it appears that it was driven by the quic multistream test, which fails without deferral.\r\n\r\nto dig into that a bit, the multistream test uses the function modify_idle_timeout to set several features which get encoded into the transport params field in the client hello.  This calls down eventually into qc_getset_idle_timeout() which fails if ossl_quic_channel_have_generated_transport_params() returns true (i.e. if ch_generate_transport_params has already been called).\r\n\r\nIf the call to ch_generate_transport_params() is called to early, this modification fails.  So the commit I reverted modified where its called to only occur when quic_do_handshake is run.  But the call in s_client to SSL_has_pending winds up doing the handshake vi the qc->tls SSL object, which querys the transport params that are still NULL when done that late in the sequence.\r\n\r\nAs such, my reasoning here was, that while modifications can't be made to the transport params after the handshake completes (i.e. after the channel is started), its perfectly acceptable to modify them _before_ that handshake is done, so the second commit in this pr gates that failure in qc_getset_idle_timeout() to only be reported if the channel state is ACTIVE.  Before that, it (I think) should be fine to modify the parameters, as they haven't been send in a client hello yet.\r\n\r\nNot sure if thats 100% correct, but its my current reasoning.",
+        "@t8m there are already tests for this (the quic multistream tests exercise all the setters and getters for the transport params).  The problem appears to be that, when calling ch_generate_transport_params early in the channel creation, those setters and getters start returning errors (because they use set once semantics), thats what the second commit here is meant to address, i.e. to allow changing of the parameters until such time as the channel is started, and the handshake is transmitted"
+    ],
+    "merged": false,
+    "created_at": "2024-08-01T07:11:28Z",
+    "issue_context": {
+        "number": 25054,
+        "title": "QUIC when used via s_client fails to populate quic_transport_parameters extension in client hello",
+        "body": "While investigating interop testing, I was experimenting with https://interop.seemann.io/?run=2024-07-30T08:28 .\r\n\r\nSpecifically when running an interop test between our s_client implementation for quic and the quic-go implementation, I noted that the quic-go implementation dropped a connection from s_client indicating a fatal error due to the initial source connection id being unspecified.\r\n\r\nInterestingly, when I attempted the same test with a slightly modified version of quic-client-non-block (modified to pass the h3 alpn), the connection succeded.\r\n\r\nA comparitive tcpdump set revealed the following:\r\n\r\nWhen using quic-client-non-block:\r\n![Screenshot from 2024-07-30 15-10-01](https://github.com/user-attachments/assets/a024de6d-e5e8-4771-813b-fef88828cc9d)\r\n\r\n\r\n\r\n\r\n\r\nWhen using s_client:\r\n![Screenshot from 2024-07-30 15-10-34](https://github.com/user-attachments/assets/9bf77b03-b68f-4fc9-8034-e3590eb22901)\r\n\r\n\r\nnote in the quic-client-non-block case the quic_transport_parameters extension is specified and several parameters are included, while in the s_client case, the extension is added, but without any parameters.\r\n\r\nSome debugging revealed that in the quic-client-non-block case, the parameters are generated during a call to SSL_connect\r\n\r\nIn the s_client case SSL_connect is not called. As a result, while ossl;_quic_channel_start gets called during the handshake, it occurs _after_ tls_construct_extensions is called",
+        "comments": [
+            "It appears that in s_client we have two SSL objects:\r\n\r\nthe SSL object created in ossl_quic_new (ssl_base, which is of type SSL_TYPE_QUIC_CONNECTION)\r\nthe quic channel tls SSL object (qc->tls) (which is of type SSL_TYPE_SSL_CONNECTION)\r\nWhen we start s_client it connects with (1), but via SSL_has_pending, which triggers the tick reactor, which iterates over our port->channel_list (which contains (2) above). The qc->tls object, being of type SSL_CONNECTION uses the quic extension callbacks correctly, but because ossl_quic_do_handshake hasn't run yet, there are no parameters generated via ch_generate_transport_params",
+            "@t8m FWIW, I tested with openssl-3.2.0 and the problem seems to not occur, so this appears to be a regression.  I'm doing a bisect now\r\n",
+            "bisect indicates that  69616017a613c7442fa51794d51f167b0de2fc9c is the commit that introduced this problem.  Looking at it now\r\n",
+            "reverting that commit fixes the issue.  \r\n\r\nLooking at it, I'm a bit hard pressed to understand why we want to defer this call.  It might be generally appropriate from a lazy \"don't init something until you need it standpoint\", but it appears we have use cases in which its required.\r\n\r\nI think reverting the change to fix the regression for now seems like the most appropriate action here.  All the values that are needed for transport parameter encoding are initialized by ch_init already, so we should be good here"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 42575,
+            "commit_id": "d2521498ea14a4eec7291ef0ddaa03bb8d0fcef9",
+            "original_commit_id": "96b59ec4b61e10b1b2eb705a4f8f06ea5f976d08",
+            "path": "ssl/quic/quic_channel.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1727,
+            "original_line": 1727,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "Under what circumstances will we already have prior params? Aren't we only supposed to do this once per connection?",
+                "I think the best answer there is that, generally speaking we shouldn't need to call this twice.  The defaults are setup in ch_init, which is called very early.  There are getters and setters for each field, but they appear unused outside of the quic_multistream test\r\nThere are getters and setters for all the fields, but they generally only appear to be used in the multistream test\r\n\r\nSo I suppose its possible that the deferral of the transport param generation was done to avoid the problems in the quic multistream test.  Really unsure though",
+                "put another way, the parameters are/arguably should be changeable up to the point they are transmitted, though it seems like they _should_ only need to be set once."
+            ]
+        }
+    ]
+}

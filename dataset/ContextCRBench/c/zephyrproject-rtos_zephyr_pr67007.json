@@ -1,0 +1,255 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 67007,
+    "lang": "c",
+    "pr_title": "posix: semaphore: implement named semaphore functions",
+    "pr_body": "Implemented:\r\n- `sem_open()`\r\n- `sem_close()`\r\n- `sem_unlink()`\r\n\r\nFixes #66955\r\nFixes #66956\r\nFixes #66957",
+    "pr_comments": [
+        "This code is racy.\n\n```\nsem_t *sem_open(const char *name, int oflags, ...)\n{\n       /* Check if the named semaphore exists */\n       k_mutex_lock(&nsem_mutex, K_FOREVER);\n       nsem = find_nsem(name);\n       k_mutex_unlock(&nsem_mutex);\n\n       /* !!! preemption point !!! */\n       [...]\n\n       if (nsem == NULL) {\n                [...]\n       } else {\n               atomic_inc(&nsem->ref_count);\n       }\n```\n\nWhen `find_nsem()` returns a valid non-null pointer for `nsem`,\nnothing prevents another thread calling `sem_unlink()` and `sem_close()`\nat the indicated preemption point, turning `nsem` into a zombie pointer \nand corrupting freed and potentially reused memory.\n\n\n",
+        "The code now looks correct, the race is gone.\n\nHere's some suggestions that aren't critical but could optimize the code\nfurther:\n\n- All `ref_count` manipulations, except for one case, happen while \n  `nsem_mutex` is taken. The exception is `sem_close()` which is unlikely \n  to be on any performance-critical path. By enlarging the `nsem_mutex`\n  coverage in `sem_close()` you could drop all atomic operations and convert \n  `ref_count` to a plain int which would reduce the binary footprint, and\n  possibly run faster on some architectures.\n\n- You could consider the presence of a name as `ref_count` worthy. This \n  means initializing `ref_count` to 2 instead of 1 in `sem_open()` and\n  decrementing `ref_count` in `sem_unlink()`. This would allow for removing \n  the `nsem->name == NULL` test in `sem_close()` relying on the count alone\n\n- With the above, the `ref_count` decrements could be factored into\n  `remove_nsem_if_unused()` (and the function properly renamed to something\n  like e.g. nsem_put_ref() or the like) which would reduce binary footprint \n  further. This would open the possibility for cleanly asserting that the \n  count does not go negative and there is no longer a name if the count is 0 \n  in only one place.\n\n\n- \n",
+        "And another comment. You have:\n\n```\n#define SEM_FAILED (-1)\n```\n\nSince this is used where a pointer is normally returned, it would be nicer \nto add the cast to the definition directly. Also, it is typically defined \nas 0 so the error case can be seen as a null pointer return. So I'd suggest:\n\n```\n#define SEM_FAILED ((sem_t *) 0)\n```\n",
+        "> * You could consider the presence of a name as `ref_count` worthy. This\r\n>   means initializing `ref_count` to 2 instead of 1 in `sem_open()` and\r\n>   decrementing `ref_count` in `sem_unlink()`. This would allow for removing\r\n>   the `nsem->name == NULL` test in `sem_close()` relying on the count alone\r\n> * With the above, the `ref_count` decrements could be factored into\r\n>   `remove_nsem_if_unused()` (and the function properly renamed to something\r\n>   like e.g. nsem_put_ref() or the like) which would reduce binary footprint\r\n>   further. This would open the possibility for cleanly asserting that the\r\n>   count does not go negative and there is no longer a name if the count is 0\r\n>   in only one place.\r\n\r\nHey @npitre, thanks for the suggestions!\r\n\r\nRegarding to point 2 and 3, I've added assert tests to make sure that the `ref_count` doesn't underflow or overflow, but I'm not sure how to properly 'encodes' the unlink function call into the `ref_count` while still be able to guarantee that a named semaphore is destroyed only if it is unlinked and closed, i.e. without the `nsem->name == NULL` test, wouldn't `sem_close` + `sem_close` equals to `sem_unlink` + `sem_close`?",
+        "Updated to:\r\n- adopt suggestions from @npitre (refactor for the removal of atomic, under/overflow tests)\r\n- added a little stress test for the named semaphore (one thread `sem_open` a semaphore repeatedly and finally `sem_unlink`, the other thread doing `sem_close`)\r\n- added a bit more testpoints for using a named semaphore in the normal semaphore test.",
+        "> i.e. without the `nsem->name == NULL` test, wouldn't `sem_close` +\n> `sem_close` equals to `sem_unlink` + `sem_close`?\n\nConsider these events:\n\n```\noperation                refcount change          refcount state\n----------------------------------------------------------------\n\nsem_open()               = 2 (created)            2\nsem_open()               + 1 (already exists)     3\nsem_close()              - 1                      2\nsem_close()              - 1                      1\nsem-unlink()             - 1                      0 (destroyed)\n\nsem_open()               = 2 (created)            2\nsem_open()               + 1 (already exists)     3\nsem_unlink()             - 1                      2\nsem_close()              - 1                      1\nsem_close()              - 1                      0 (destroyed)\n```\n\nI'll push this change with a few misc tidbits on top of your pull request.\nFeel free to fold them in your original commits or have them merged as is.\n",
+        ">>  if (nsem->ref_count == 0) {\n>>+   __ASSERT(nsem->name == NULL, \"ref_count is 0 but sem is not unlinked\");\n>\n> @npitre This means that the following behavior is guaranteed only when\n> `CONFIG_ASSERT` is enabled, is that intended?\n\nYes. This would happen only if the semaphore user's code is buggy.\nThis should never happen with well behaved code. Assertions can be configured\nout to save on binary size and runtime overhead once the code is proven to \nbehave properly.\n\n>> If the semaphore has not been removed with a successful call to\n>> sem_unlink()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_unlink.html),\n>> then em_close()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_close.html)\n>> has no effect on the state of the semaphore.\n>\n> i.e.: a named semaphore can be closed without being unlinked\n\nYes, that is what the code does. The test suite exercizes that condition too.\n\n> ```\n> operation                refcount change          refcount state\n> ----------------------------------------------------------------\n>\n> sem_open()               = 2 (created)            2\n> sem_close()              - 1                      1\n> sem_close()              - 1                      0\n> ```\n\nThat is a bad example. You normally must have balanced `open()` and\n`close()`. Closing your own instance twice is buggy. Inagine what would\nhappen if you have an `open()` from two different threads and one thread\ndoes a `close()` twice. The other thread is unlikely to be happy about that.\n\nMultiple `close()` for a single `open()` is so unusual and unexpected\nthat the spec would mention it explicitly if that were allowed.\n",
+        "> Feel free to fold them in your original commits or have them merged as is.\r\n\r\n@npitre I've took the liberty to fold some of the fixes from your commits into the original commits where they where initially introduced and reworded your commits, but left the `ref_count` changes as-is in your commits"
+    ],
+    "merged": true,
+    "created_at": "2024-01-10T03:40:08Z",
+    "issue_context": {
+        "number": 66956,
+        "title": "posix: implement `sem_open()`",
+        "body": "This is part of the See [POSIX Roadmap for LTSv3](https://github.com/zephyrproject-rtos/zephyr/issues/51211) (RFC #51211).\r\n\r\n`sem_open()` is required as part of `POSIX_SEMAPHORES` [Subprofiling Option Group](https://pubs.opengroup.org/onlinepubs/9699919799/xrat/V4_subprofiles.html).\r\n\r\nFor more information, please refer to https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_open.html\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 29129,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 18,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "@npitre I've modified other part that uses `ref_count` to `int` as well, and changed the overflow test from `__ASSERT_NO_MSG(nsem->ref_count != UINT_MAX)` to `__ASSERT_NO_MSG(nsem->ref_count != INT_MAX)`"
+            ]
+        },
+        {
+            "hunk_id": 27370,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 68,
+            "original_line": 68,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "@npitre This means that the following behavior is guaranteed only when `CONFIG_ASSERT` is enabled, is that intended?\r\n\r\n> If the semaphore has not been removed with a successful call to [sem_unlink()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_unlink.html), then [sem_close()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_close.html) has no effect on the state of the semaphore.\r\n\r\ni.e.: a named semaphore can be closed without being unlinked:\r\n\r\n```\r\noperation                refcount change          refcount state\r\n----------------------------------------------------------------\r\n\r\nsem_open()               = 2 (created)            2\r\nsem_close()              - 1                      1\r\nsem_close()              - 1                      0\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 26640,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "We could avoid malloc if allocated like this\r\n```\r\nchar name[CONFIG_SEM_NAMELEN_MAX];\r\n```\r\nI think we have this pattern in many places in the code space.",
+                "I'm gonna gather more comments for this one, doing so will allocate a fixed sized array regardless of the actual length of the name.\r\n\r\nAlternatively we can allocate the buffer for the `nsem_obj` and the `name` array in one go and the total memory allocated will depend on the name length. Ideally we would be able to `k_realloc` the buffer once the sem is unlinked, however the `k_realloc` isn't available (#41151), so I opted for the current implementation as the name buffer can be freed separately upon `sem_unlink`.",
+                "I would say a good follow-up PR would be to add static allocation support.\r\n\r\nI'm ok with dynamic going in first and static coming in later, but I think both use cases are valuable for Zephyr.\r\n\r\nThe existing pattern that doesn't use malloc should be fine for filling the static gap later. Thanks for your help \u2764\ufe0f "
+            ]
+        },
+        {
+            "hunk_id": 29128,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 68,
+            "original_line": 68,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "@npitre This means that the following behavior is guaranteed only when `CONFIG_ASSERT` is enabled, is that intended?\r\n\r\n> If the semaphore has not been removed with a successful call to [sem_unlink()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_unlink.html), then [sem_close()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_close.html) has no effect on the state of the semaphore.\r\n\r\ni.e.: a named semaphore can be closed without being unlinked:\r\n\r\n```\r\noperation                refcount change          refcount state\r\n----------------------------------------------------------------\r\n\r\nsem_open()               = 2 (created)            2\r\nsem_close()              - 1                      1\r\nsem_close()              - 1                      0\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 29127,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 334,
+            "original_line": 334,
+            "side": "RIGHT",
+            "original_position": 177,
+            "position": 199,
+            "subject_type": "line",
+            "review_comments": [
+                "`malloc()` / `free()` would probably also be fine to use here instead of `k_malloc()` / `k_free()`",
+                "Are they better? I used `k_` variant as that is what the `key.c` & `mqueue.c` implementations used",
+                "`k_` variants are fine too (probably better than malloc, to be honest)"
+            ]
+        },
+        {
+            "hunk_id": 27371,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 18,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "@npitre I've modified other part that uses `ref_count` to `int` as well, and changed the overflow test from `__ASSERT_NO_MSG(nsem->ref_count != UINT_MAX)` to `__ASSERT_NO_MSG(nsem->ref_count != INT_MAX)`"
+            ]
+        },
+        {
+            "hunk_id": 27368,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "We could avoid malloc if allocated like this\r\n```\r\nchar name[CONFIG_SEM_NAMELEN_MAX];\r\n```\r\nI think we have this pattern in many places in the code space.",
+                "I'm gonna gather more comments for this one, doing so will allocate a fixed sized array regardless of the actual length of the name.\r\n\r\nAlternatively we can allocate the buffer for the `nsem_obj` and the `name` array in one go and the total memory allocated will depend on the name length. Ideally we would be able to `k_realloc` the buffer once the sem is unlinked, however the `k_realloc` isn't available (#41151), so I opted for the current implementation as the name buffer can be freed separately upon `sem_unlink`.",
+                "I would say a good follow-up PR would be to add static allocation support.\r\n\r\nI'm ok with dynamic going in first and static coming in later, but I think both use cases are valuable for Zephyr.\r\n\r\nThe existing pattern that doesn't use malloc should be fine for filling the static gap later. Thanks for your help \u2764\ufe0f "
+            ]
+        },
+        {
+            "hunk_id": 26641,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 334,
+            "original_line": 334,
+            "side": "RIGHT",
+            "original_position": 177,
+            "position": 199,
+            "subject_type": "line",
+            "review_comments": [
+                "`malloc()` / `free()` would probably also be fine to use here instead of `k_malloc()` / `k_free()`",
+                "Are they better? I used `k_` variant as that is what the `key.c` & `mqueue.c` implementations used",
+                "`k_` variants are fine too (probably better than malloc, to be honest)"
+            ]
+        },
+        {
+            "hunk_id": 29126,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 19,
+            "original_line": 19,
+            "side": "RIGHT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "We could avoid malloc if allocated like this\r\n```\r\nchar name[CONFIG_SEM_NAMELEN_MAX];\r\n```\r\nI think we have this pattern in many places in the code space.",
+                "I'm gonna gather more comments for this one, doing so will allocate a fixed sized array regardless of the actual length of the name.\r\n\r\nAlternatively we can allocate the buffer for the `nsem_obj` and the `name` array in one go and the total memory allocated will depend on the name length. Ideally we would be able to `k_realloc` the buffer once the sem is unlinked, however the `k_realloc` isn't available (#41151), so I opted for the current implementation as the name buffer can be freed separately upon `sem_unlink`.",
+                "I would say a good follow-up PR would be to add static allocation support.\r\n\r\nI'm ok with dynamic going in first and static coming in later, but I think both use cases are valuable for Zephyr.\r\n\r\nThe existing pattern that doesn't use malloc should be fine for filling the static gap later. Thanks for your help \u2764\ufe0f "
+            ]
+        },
+        {
+            "hunk_id": 26642,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 68,
+            "original_line": 68,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 68,
+            "subject_type": "line",
+            "review_comments": [
+                "@npitre This means that the following behavior is guaranteed only when `CONFIG_ASSERT` is enabled, is that intended?\r\n\r\n> If the semaphore has not been removed with a successful call to [sem_unlink()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_unlink.html), then [sem_close()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/sem_close.html) has no effect on the state of the semaphore.\r\n\r\ni.e.: a named semaphore can be closed without being unlinked:\r\n\r\n```\r\noperation                refcount change          refcount state\r\n----------------------------------------------------------------\r\n\r\nsem_open()               = 2 (created)            2\r\nsem_close()              - 1                      1\r\nsem_close()              - 1                      0\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 26643,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 18,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "@npitre I've modified other part that uses `ref_count` to `int` as well, and changed the overflow test from `__ASSERT_NO_MSG(nsem->ref_count != UINT_MAX)` to `__ASSERT_NO_MSG(nsem->ref_count != INT_MAX)`"
+            ]
+        },
+        {
+            "hunk_id": 27369,
+            "commit_id": "b316cca633a91705a1e2c1afb234fdb045cd582e",
+            "original_commit_id": "14c68c9438476268e4de25b6a2778883993c955c",
+            "path": "lib/posix/semaphore.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 334,
+            "original_line": 334,
+            "side": "RIGHT",
+            "original_position": 177,
+            "position": 199,
+            "subject_type": "line",
+            "review_comments": [
+                "`malloc()` / `free()` would probably also be fine to use here instead of `k_malloc()` / `k_free()`",
+                "Are they better? I used `k_` variant as that is what the `key.c` & `mqueue.c` implementations used",
+                "`k_` variants are fine too (probably better than malloc, to be honest)"
+            ]
+        }
+    ]
+}

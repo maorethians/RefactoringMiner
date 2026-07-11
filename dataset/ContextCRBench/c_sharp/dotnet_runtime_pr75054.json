@@ -1,0 +1,383 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 75054,
+    "lang": "c_sharp",
+    "pr_title": "Fix thread-safety issues with enumerating ResourceManager.",
+    "pr_body": "Concurrently enumerating a ResourceManager while also calling GetString()\r\nand similar methods was prone to both transient errors and deadlock.\r\n\r\nThe transient errors were caused by RuntimeResourceSet calling internal\r\nmethods on ResourceReader that did not properly lock. Now, all exposed\r\nmethods on the Reader are thread-safe.\r\n\r\nThe deadlock was called by inconsistent lock ordering between\r\nResourceReader.ResourceEnumerator and RuntimeResourceSet which both lock\r\non the RuntimeResourceSet's cache and on the ResourceReader itself. Now,\r\nthe enumerator does not need to take both locks at the same time.\r\n\r\nFix #74052\r\nFix #74868",
+    "pr_comments": [
+        "Tagging subscribers to this area: @dotnet/area-system-resources\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nConcurrently enumerating a ResourceManager while also calling GetString()\r\nand similar methods was prone to both transient errors and deadlock.\r\n\r\nThe transient errors were caused by RuntimeResourceSet calling internal\r\nmethods on ResourceReader that did not properly lock. Now, all exposed\r\nmethods on the Reader are thread-safe.\r\n\r\nThe deadlock was called by inconsistent lock ordering between\r\nResourceReader.ResourceEnumerator and RuntimeResourceSet which both lock\r\non the RuntimeResourceSet's cache and on the ResourceReader itself. Now,\r\nthe enumerator does not need to take both locks at the same time.\r\n\r\nFix #74052\r\nFix #74868\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>madelson</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Resources`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "> I've left some comments but overall this is looking good\r\n\r\nThanks @joperezr . I've pushed a change addressing your feedback. Let me know if there is anything else to do.",
+        ">         private void SkipString()\r\n\r\nWhat about `private void SkipString()`? That one seems to be using `_store` as well.",
+        "Same for `private unsafe string AllocateStringForNameIndex(int index, out int dataOffset)` that one also seems to be accessing _store",
+        "So following the lines of my last two comments, there seems to be two different approaches when `_store` gets accessed outside of the constructor:\r\n- You use `lock(this)`\r\n- You don't need to use `lock(this)` given the method could only be called by something that is already locked, so you add a comment to mention that on the method.\r\n\r\nThere are some places where we still use `_store` and are not doing either of the above (my assumption is the fall into the second category), so I t hink it would be good to add a comment to those places to explain why is locking not required, as the comment you added on `_store` field itself requires this.",
+        "> What about private void SkipString()? That one seems to be using _store as well.\r\n\r\n@joperezr this one can't have an assertion because it is called both during initialization (which per my comment on `_store` does not use locking) _and_ post-initialization.\r\n\r\n**Do you think it is worth adding a comment like this to SkipString()?**:\r\n```\r\n// Note: this method assumes that it is called either from the constructor or within another method that locks on this\r\n```\r\n\r\n> Same for private unsafe string AllocateStringForNameIndex(int index, out int dataOffset) that one also seems to be accessing _store\r\n\r\nThis one accesses `_store` but note that the access is wrapped in a `lock(this)` block within that method. I only added assertions to methods that make assumptions about locking happening in the caller.\r\n\r\n> There are some places where we still use _store and are not doing either of the above\r\n\r\nI believe all of those places are called during initialization, which is called out by the comment on `_store`:\r\n\r\n```\r\n        // Backing store we're reading from. Usages outside of constructor\r\n        // initialization must be protected by lock (this).\r\n```\r\n\r\nIn cases which are _always_ called during initialization (e.g. `_ReadResources()`) I assert that the lock is _not_ taken.",
+        "I see thanks for the explanation and sorry that I missed some of those comments.\r\n\r\n> Do you think it is worth adding a comment like this to SkipString()?:\r\n\r\nYes, I do think this would be good for consistency.",
+        "Wanted to bump this in case it fell through the cracks.",
+        "@joperezr looking at the new build failures these seem unrelated? https://helixre107v0xdeko0k025g8.blob.core.windows.net/dotnet-runtime-refs-pull-75054-merge-b07193f9df6f4ac4a6/JIT.1/1/console.735a06a0.log?helixlogtype=result what do you think?",
+        "The new failure is https://github.com/dotnet/runtime/issues/79517",
+        "@joperezr anything else to do here?",
+        "/backport to release/6.0",
+        "Started backporting to release/6.0: https://github.com/dotnet/runtime/actions/runs/4027066289",
+        "@buyaa-n assuming you also plan to backport to 7.0?",
+        "/backport to release/7.0",
+        "Started backporting to release/7.0: https://github.com/dotnet/runtime/actions/runs/4027191479"
+    ],
+    "merged": true,
+    "created_at": "2022-09-06T13:29:24Z",
+    "issue_context": {
+        "number": 74868,
+        "title": "Deadlock when enumerating resources with ResourceManager",
+        "body": "### Description\r\n\r\nEnumerating resources with `ResourceManager.GetResourceSet` while concurrently calling `ResourceManager.GetString` can result in a hang which appears to be due to deadlock.\r\n\r\n### Reproduction Steps\r\n\r\nThe following code snippet hangs with high probability on .NET 6. Most commonly, this happens after printing the first entry on each thread.\r\n\r\n```csharp\r\nvoid Main()\r\n{\r\n\tvar resourceType = typeof(MyResource); // standard resx with 15 entries\r\n\tvar resourceManager = new ResourceManager(resourceType.FullName, resourceType.Assembly);\r\n\t\r\n\tvar threads = 10;\r\n\tusing var barrier = new Barrier(threads);\r\n\tTask.WaitAll(\r\n\t\tEnumerable.Range(0, threads)\r\n\t\t\t.Select(_ => Task.Run(() =>\r\n\t\t\t{\r\n\t\t\t\tbarrier.SignalAndWait();\r\n\t\t\t\tEnumerateResources();\r\n\t\t\t}))\r\n\t\t\t.ToArray()\r\n\t); // never returns\r\n\t\r\n\tvoid EnumerateResources()\r\n\t{\r\n\t\tvar set = resourceManager.GetResourceSet(CultureInfo.InvariantCulture, createIfNotExists: true, tryParents: true);\r\n\t\tforeach (var entry in set.Cast<DictionaryEntry>())\r\n\t\t{\r\n\t\t\tConsole.WriteLine(resourceManager.GetString((string)entry.Key));\r\n\t\t\tThread.Sleep(1);\r\n\t\t}\r\n\t}\r\n}\r\n```\r\n\r\n### Expected behavior\r\n\r\nResourceManager is supposed to be [thread safe](https://docs.microsoft.com/en-us/dotnet/api/system.resources.resourcemanager?view=net-6.0#thread-safety), so this code should work.\r\n\r\n### Actual behavior\r\n\r\nFrequent hangs.\r\n\r\n### Regression?\r\n\r\nI know that this used to be broken in some early versions of .NET Framework as well and was fixed at some point (perhaps in one of the 4.6 releases?). Testing the same snippet on .NET Framework latest does not hang, so I believe this is a regression.\r\n\r\nEDIT: based on further testing this appears to be a regression vs. .NET Core 3.1 as well.\r\n\r\n### Known Workarounds\r\n\r\nAllocate a new `ResourceManager` instance when planning to call `GetResourceSet` rather than re-using a shared instance.\r\n\r\nAnother sort-of workaround is to use the `Key` property on the enumerator instead of the `Current` property. This avoids the deadlock and makes more progress, but we instead run into https://github.com/dotnet/runtime/issues/74052 .\r\n\r\n### Configuration\r\n\r\n.NET 6 (6.0.5) Windows 10 x64.\r\n\r\n### Other information\r\n\r\n[In RuntimeResourceSet](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Resources/RuntimeResourceSet.cs#L286), we lock the cache first and then lock the `ResourceReader`.\r\n\r\n[In ResourceReader.ResourceEnumerator](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs#L1082), we lock the reader first and then the cache.\r\n\r\nI believe that this is the cause of the deadlock.",
+        "comments": [
+            "Tagging subscribers to this area: @dotnet/area-system-resources\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\n### Description\n\nEnumerating resources with `ResourceManager.GetResourceSet` while concurrently calling `ResourceManager.GetString` can result in a hang which appears to be due to deadlock.\n\n### Reproduction Steps\n\nThe following code snippet hangs with high probability on .NET 6. Most commonly, this happens after printing the first entry on each thread.\r\n\r\n```csharp\r\nvoid Main()\r\n{\r\n\tvar resourceType = typeof(MyResource); // standard resx with 15 entries\r\n\tvar resourceManager = new ResourceManager(resourceType.FullName, resourceType.Assembly);\r\n\t\r\n\tvar threads = 10;\r\n\tusing var barrier = new Barrier(threads);\r\n\tTask.WaitAll(\r\n\t\tEnumerable.Range(0, threads)\r\n\t\t\t.Select(_ => Task.Run(() =>\r\n\t\t\t{\r\n\t\t\t\tbarrier.SignalAndWait();\r\n\t\t\t\tEnumerateResources();\r\n\t\t\t}))\r\n\t\t\t.ToArray()\r\n\t); // never returns\r\n\t\r\n\tvoid EnumerateResources()\r\n\t{\r\n\t\tvar set = resourceManager.GetResourceSet(CultureInfo.InvariantCulture, createIfNotExists: true, tryParents: true);\r\n\t\tforeach (var entry in set.Cast<DictionaryEntry>())\r\n\t\t{\r\n\t\t\tConsole.WriteLine(resourceManager.GetString((string)entry.Key));\r\n\t\t\tThread.Sleep(1);\r\n\t\t}\r\n\t}\r\n}\r\n```\n\n### Expected behavior\n\nResourceManager is supposed to be [thread safe](https://docs.microsoft.com/en-us/dotnet/api/system.resources.resourcemanager?view=net-6.0#thread-safety), so this code should work.\n\n### Actual behavior\n\nFrequent hangs.\n\n### Regression?\n\nI know that this used to be broken in some early versions of .NET Framework as well and was fixed at some point (perhaps in one of the 4.6 releases?). Testing the same snippet on .NET Framework latest does not hang, so I believe this is a regression.\n\n### Known Workarounds\n\nAllocate a new `ResourceManager` instance when planning to call `GetResourceSet` rather than re-using a shared instance.\r\n\r\nAnother sort-of workaround is to use the `Key` property on the enumerator instead of the `Current` property. This avoids the deadlock and makes more progress, but we instead run into https://github.com/dotnet/runtime/issues/74052 .\n\n### Configuration\n\n.NET 6 (6.0.5) Windows 10 x64.\n\n### Other information\n\n[In RuntimeResourceSet](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Resources/RuntimeResourceSet.cs#L286), we lock the cache first and then lock the `ResourceReader`.\r\n\r\n[In ResourceReader.ResourceEnumerator](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs#L1082), we lock the reader first and then the cache.\r\n\r\nI believe that this is the cause of the deadlock.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>madelson</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Resources`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+            "I'd be happy to work on this as part of working on https://github.com/dotnet/runtime/issues/74052",
+            "Thanks for the report @madelson, and also for checking when did this regressed. From your original post though, I see that this issue was present in .NET 6 (meaning it wasn't a regression from .NET 6 to .NET 7), so I'm going to move this issue out of .NET 7 by setting the milestone to .NET 8 for now. Thanks again for working on this!",
+            "@joperezr it isn't a regression from 6->7, but it _is_ a regression from the previous LTS release (3.1) to the current LTS release (6). I imagine that the bar is too high to consider backporting this to 6 but given the severity of the issue if you encounter it (deadlocking the app) and the fact that apps may be unprepared for this given its previous fix, it would be nice to at least consider that.",
+            "That's right, I didn't mean that this shouldn't get fixed in servicing, sorry for not making that clear. What I meant was that the fix is likely not going to hit .NET 7 before we ship, so I just adjusted the milestone to vNext for now. The process to get this regression fixed in servicing would be to:\r\n1. Fix the issue in main branch (which today means 8.0 and the reason why I picked that milestone)\r\n2. Once the fix is ready and we have validated that the fix works as expected, we can then make a case for us to service this in all impacted releases (which would be 6.0, and 7.0). If approved, then we can cherry-pick the change from main into those servicing branches and create PRs for them in order to get the fix serviced."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3890,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 479,
+            "original_line": 472,
+            "side": "RIGHT",
+            "original_position": 90,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "I took a quick look and it seems like the _store is only ever initialized with a Stream that's under our control, right? Meaning this isn't going to now be calling out to arbitrary user code while holding a lock?",
+                "> it seems like the _store is only ever initialized with a Stream that's under our control, right?\r\n\r\n@stephentoub I don't think that's correct. There is a public `ResourceReader(Stream)` constructor that populates `_store` with the user `Stream`. Of course most users are probably going through `ResourceManager` / `RuntimeResourceSet` where the runtime owns the stream. \r\n\r\nHowever, when it comes to calling arbitrary user code while holding the lock, this class is _already doing that_ because locking on `this` is `ResourceReader`'s primary existing synchronization mechanism. For example, consider the following code:\r\n```\r\nvoid Main()\r\n{\r\n\tvar myStream = new MyStream();\r\n\tvar reader = new ResourceReader(myStream);\r\n\tmyStream.Reader = reader;\r\n\t// prints \"Calling user code from within locked ResourceReader\" many times\r\n\tforeach (DictionaryEntry entry in reader) { }\r\n}\r\n\r\nclass MyStream : MemoryStream\r\n{\r\n\tpublic ResourceReader Reader { get; set; }\r\n\t\r\n\tpublic MyStream() : base(GetBytes()) { }\r\n\t\r\n\tprivate static byte[] GetBytes()\r\n\t{\r\n\t\tusing var stream = typeof(Expression).Assembly.GetManifestResourceStream(\"FxResources.System.Linq.Expressions.SR.resources\");\r\n\t\tvar bytes = new byte[stream.Length];\r\n\t\tif (stream.Read(bytes, 0, bytes.Length) != bytes.Length) { throw new Exception(); }\r\n\t\treturn bytes;\r\n\t}\r\n\t\r\n\tpublic override int Read(byte[] buffer, int offset, int count)\r\n\t{\r\n\t\tif (this.Reader != null && Monitor.IsEntered(this.Reader)) \r\n\t\t{ \r\n\t\t\tConsole.WriteLine(\"Calling user code from within locked ResourceReader\");\r\n\t\t}\r\n\t\treturn base.Read(buffer, offset, count);\r\n\t}\r\n}\r\n```",
+                "Any thoughts with this @stephentoub ? My view is that since we were already using this locking approach merely extending it to be used consistently shouldn't be a concern. \r\n\r\nToday, `ResourceReader` is \"mostly\" thread-safe apart from a couple methods missing locks. If we wanted to avoid this, I think we'd need to remove all locking from `ResourceReader` and lock in `RuntimeResourceSet` instead to preserve thread-safety. This could be a breaking change for people relying on `ResourceReader`'s thread-safety, though."
+            ]
+        },
+        {
+            "hunk_id": 3893,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 529,
+            "original_line": 529,
+            "side": "RIGHT",
+            "original_position": 46,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "We should probably avoid depending on the thread pool here, or else with the concurrency in unit tests these work items could be delayed arbitrarily long.\r\n```suggestion\r\n            Task task = Task.WhenAll(Enumerable.Range(0, Threads).Select(_ => Task.Factory.StartNew(WaitForBarrierThenEnumerateResources, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)));\r\n```",
+                "Changed to LongRunning task"
+            ]
+        },
+        {
+            "hunk_id": 7898,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 529,
+            "original_line": 529,
+            "side": "RIGHT",
+            "original_position": 46,
+            "position": 46,
+            "subject_type": "line",
+            "review_comments": [
+                "We should probably avoid depending on the thread pool here, or else with the concurrency in unit tests these work items could be delayed arbitrarily long.\r\n```suggestion\r\n            Task task = Task.WhenAll(Enumerable.Range(0, Threads).Select(_ => Task.Factory.StartNew(WaitForBarrierThenEnumerateResources, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)));\r\n```",
+                "Changed to LongRunning task"
+            ]
+        },
+        {
+            "hunk_id": 3889,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/RuntimeResourceSet.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 367,
+            "original_line": 367,
+            "side": "LEFT",
+            "original_position": 30,
+            "position": 39,
+            "subject_type": "line",
+            "review_comments": [
+                "This comment was not (no longer?) correct. We do typically call these within a lock, but it is a lock on either `_resCache` or `_caseInsensitiveTable`. That lock was previously making things thread-safe so long as the caller was only using `GetString/GetObject` and was not flipping `ResourceManager.IgnoreCase` on and off. \r\n\r\nNow, `LoadString`/`LoadObject` _do_ lock internally so there is no edge case here."
+            ]
+        },
+        {
+            "hunk_id": 3888,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 177,
+            "original_line": 173,
+            "side": "RIGHT",
+            "original_position": 37,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "`ResourceReader` had a few methods marked as `internal` but not actually used outside of the class. I made them `private` to hopefully avoid these contributing to new thread-safety bugs in the future.",
+                "I assumed we also checked if this was used in System.Resources.Extesnions and their tests? That assembly also compiles this file, so it will be good to make sure.",
+                "Confirmed that that project still builds and its tests pass. It includes RuntimeResourceSet but doesn't seem to reference it at all..."
+            ]
+        },
+        {
+            "hunk_id": 7899,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 531,
+            "original_line": 531,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "Is 10 seconds going to be sufficient to avoid spurious timeouts in CI?",
+                "Bumped it to 30s to be extra safe."
+            ]
+        },
+        {
+            "hunk_id": 3894,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 531,
+            "original_line": 531,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "Is 10 seconds going to be sufficient to avoid spurious timeouts in CI?",
+                "Bumped it to 30s to be extra safe."
+            ]
+        },
+        {
+            "hunk_id": 7897,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1116,
+            "original_line": 1110,
+            "side": "RIGHT",
+            "original_position": 265,
+            "position": 265,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we have a Debug.Assert(!Monitor.IsEntered(...)) here to help flag that?  Or we don't have access to the other object here, thus making that not possible?",
+                "Nope, we can add this check."
+            ]
+        },
+        {
+            "hunk_id": 7895,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 479,
+            "original_line": 472,
+            "side": "RIGHT",
+            "original_position": 90,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "I took a quick look and it seems like the _store is only ever initialized with a Stream that's under our control, right? Meaning this isn't going to now be calling out to arbitrary user code while holding a lock?",
+                "> it seems like the _store is only ever initialized with a Stream that's under our control, right?\r\n\r\n@stephentoub I don't think that's correct. There is a public `ResourceReader(Stream)` constructor that populates `_store` with the user `Stream`. Of course most users are probably going through `ResourceManager` / `RuntimeResourceSet` where the runtime owns the stream. \r\n\r\nHowever, when it comes to calling arbitrary user code while holding the lock, this class is _already doing that_ because locking on `this` is `ResourceReader`'s primary existing synchronization mechanism. For example, consider the following code:\r\n```\r\nvoid Main()\r\n{\r\n\tvar myStream = new MyStream();\r\n\tvar reader = new ResourceReader(myStream);\r\n\tmyStream.Reader = reader;\r\n\t// prints \"Calling user code from within locked ResourceReader\" many times\r\n\tforeach (DictionaryEntry entry in reader) { }\r\n}\r\n\r\nclass MyStream : MemoryStream\r\n{\r\n\tpublic ResourceReader Reader { get; set; }\r\n\t\r\n\tpublic MyStream() : base(GetBytes()) { }\r\n\t\r\n\tprivate static byte[] GetBytes()\r\n\t{\r\n\t\tusing var stream = typeof(Expression).Assembly.GetManifestResourceStream(\"FxResources.System.Linq.Expressions.SR.resources\");\r\n\t\tvar bytes = new byte[stream.Length];\r\n\t\tif (stream.Read(bytes, 0, bytes.Length) != bytes.Length) { throw new Exception(); }\r\n\t\treturn bytes;\r\n\t}\r\n\t\r\n\tpublic override int Read(byte[] buffer, int offset, int count)\r\n\t{\r\n\t\tif (this.Reader != null && Monitor.IsEntered(this.Reader)) \r\n\t\t{ \r\n\t\t\tConsole.WriteLine(\"Calling user code from within locked ResourceReader\");\r\n\t\t}\r\n\t\treturn base.Read(buffer, offset, count);\r\n\t}\r\n}\r\n```",
+                "Any thoughts with this @stephentoub ? My view is that since we were already using this locking approach merely extending it to be used consistently shouldn't be a concern. \r\n\r\nToday, `ResourceReader` is \"mostly\" thread-safe apart from a couple methods missing locks. If we wanted to avoid this, I think we'd need to remove all locking from `ResourceReader` and lock in `RuntimeResourceSet` instead to preserve thread-safety. This could be a breaking change for people relying on `ResourceReader`'s thread-safety, though."
+            ]
+        },
+        {
+            "hunk_id": 3891,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.ResourceManager/tests/ResourceManagerTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 255,
+            "original_line": 244,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Does it make sense to add equivalent tests in System.Resources.Extensions as well and perhaps with a resource file that has something other than strings?"
+            ]
+        },
+        {
+            "hunk_id": 3896,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 543,
+            "original_line": 543,
+            "side": "RIGHT",
+            "original_position": 60,
+            "position": 60,
+            "subject_type": "line",
+            "review_comments": [
+                "This is going to be close to 10-15ms.  Is that sufficiently small to generate enough possibility for collision?  Does this test frequently fail before the fix?",
+                "At least on my machine it does. Just ran again 3 times and got a failure each time without the fix."
+            ]
+        },
+        {
+            "hunk_id": 3892,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1116,
+            "original_line": 1110,
+            "side": "RIGHT",
+            "original_position": 265,
+            "position": 265,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we have a Debug.Assert(!Monitor.IsEntered(...)) here to help flag that?  Or we don't have access to the other object here, thus making that not possible?",
+                "Nope, we can add this check."
+            ]
+        },
+        {
+            "hunk_id": 7896,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.ResourceManager/tests/ResourceManagerTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 255,
+            "original_line": 244,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Does it make sense to add equivalent tests in System.Resources.Extensions as well and perhaps with a resource file that has something other than strings?"
+            ]
+        },
+        {
+            "hunk_id": 7893,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/ResourceReader.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 177,
+            "original_line": 173,
+            "side": "RIGHT",
+            "original_position": 37,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "`ResourceReader` had a few methods marked as `internal` but not actually used outside of the class. I made them `private` to hopefully avoid these contributing to new thread-safety bugs in the future.",
+                "I assumed we also checked if this was used in System.Resources.Extesnions and their tests? That assembly also compiles this file, so it will be good to make sure.",
+                "Confirmed that that project still builds and its tests pass. It includes RuntimeResourceSet but doesn't seem to reference it at all..."
+            ]
+        },
+        {
+            "hunk_id": 7894,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Resources/RuntimeResourceSet.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 367,
+            "original_line": 367,
+            "side": "LEFT",
+            "original_position": 30,
+            "position": 39,
+            "subject_type": "line",
+            "review_comments": [
+                "This comment was not (no longer?) correct. We do typically call these within a lock, but it is a lock on either `_resCache` or `_caseInsensitiveTable`. That lock was previously making things thread-safe so long as the caller was only using `GetString/GetObject` and was not flipping `ResourceManager.IgnoreCase` on and off. \r\n\r\nNow, `LoadString`/`LoadObject` _do_ lock internally so there is no edge case here."
+            ]
+        },
+        {
+            "hunk_id": 7901,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 543,
+            "original_line": 543,
+            "side": "RIGHT",
+            "original_position": 60,
+            "position": 60,
+            "subject_type": "line",
+            "review_comments": [
+                "This is going to be close to 10-15ms.  Is that sufficiently small to generate enough possibility for collision?  Does this test frequently fail before the fix?",
+                "At least on my machine it does. Just ran again 3 times and got a failure each time without the fix."
+            ]
+        },
+        {
+            "hunk_id": 3895,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 531,
+            "original_line": 531,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "Why Task.WhenAll(...).Wait() rather than Task.WaitAll(...)?",
+                "Just a missed refactor opportunity"
+            ]
+        },
+        {
+            "hunk_id": 7900,
+            "commit_id": "73079957cfc7d61e9668ce99b86481204735ef6b",
+            "original_commit_id": "4aae104908d98a46014b5d569d77d67b001c9d19",
+            "path": "src/libraries/System.Resources.Extensions/tests/BinaryResourceWriterUnitTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 531,
+            "original_line": 531,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "Why Task.WhenAll(...).Wait() rather than Task.WaitAll(...)?",
+                "Just a missed refactor opportunity"
+            ]
+        }
+    ]
+}

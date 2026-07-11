@@ -1,0 +1,43 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 4523,
+    "lang": "cpp",
+    "pr_title": "Fixes issue #4123",
+    "pr_body": "This PR fixes #4123 \r\n\r\n## Problem\r\n\r\nSetValue was only using PhysicalType, causing types that carry ExtraTypeInfo that might be relevant in casting to not convert properly, because the cast is not performed.\r\nAfter changing this to comparing the entire LogicalType, I found that there are casts missing for types that share the same physical type, which makes sense because those should never need to be cast, so I don't compare LogicalTypeId anymore.\r\n\r\nThen I discovered that GetValue does not properly inherit `alias` ExtraTypeInfo, and I figured that's probably irrelevant to casting, so I stopped comparing alias to determine if a cast should happen.\r\nWhich resulted in this:\r\n\r\n```sql\r\nSQL Query\r\nSELECT add_point(({'x': 2, 'y': 3})::POINT, ({'x': 3, 'y': 4})::POINT)\r\n================================================================================\r\nActual result:\r\nBinder Error: No function matches the given name and argument types 'add_point(STRUCT(x INTEGER, y INTEGER), STRUCT(x INTEGER, y INTEGER))'. You might need to add explicit type casts.\r\n        Candidate functions:\r\n        add_point(POINT, POINT) -> POINT\r\n```\r\n\r\nIt seems `alias` *is* relevant when casting.\r\nThis previously succeeded because no cast was performed, since POINT and STRUCT share a PhysicalType (not entirely sure still why this did not work anymore when I stopped comparing the alias)\r\n\r\n## Changes\r\n\r\nI eventually landed on adding the type_info of the Vector to all Values that come out of Vector::GetValue.\r\nIf there are other places this becomes relevant (Value inheriting a LogicalType) it might be better to handle this by adding an optional `const LogicalType &type` parameter to all Value constructors.",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2022-09-05T00:30:21Z",
+    "issue_context": {
+        "number": 4123,
+        "title": "Vector::SetValue not always casting when it should",
+        "body": "#### What happens?\r\nWhen determining whether or not to cast, SetValue only considers PhysicalType.\r\nThis can be problematic in case there is additional type_info present on the LogicalType.\r\n(For a comprehensive list of the possible TypeInfo see PR #1851)\r\n\r\nAn example I came across is DECIMAL ignoring the width/scale, producing wrong results by not casting if the width/scale differ.\r\nI have attempted to fix the issue by always comparing the LogicalTypes using the equality operator but this caused enough issues to demand a separate PR.  \r\nSo for now there is only a simple band aid fix targeting DECIMAL.\r\n\r\n#### To Reproduce\r\nThere's not really a reproducible example to this issue, it's more a potential problem that should be addressed.\r\nSince this has caused issues with DECIMAL, there's a high probability other issues could arise from this.\r\n\r\n#### Notes\r\nWhen attempting to patch this potential issue I have observed two (semi) big hurdles.\r\n1. Value::CastAs(LogicalType& target_type) is not inheriting collation when target_type is VARCHAR, which caused this to infinite recurse:\r\n```c++\r\n\tif (val.type() != GetType()) {\r\n\t\tSetValue(index, val.CastAs(GetType()));\r\n\t\treturn;\r\n\t}\r\n```\r\n2. When not just comparing using `PhysicalType` but instead comparing using `LogicalTypeId` a lot of tests break that relied on there never needing to be an actual Cast performed if the PhysicalType was the same, such as:\r\n```\r\nInvalid Input Error: Failed to cast value: Unimplemented type for cast (BIGINT -> TIMESTAMP)\r\n```\r\n\r\nThe second issue is only relevant if there is a difference in the way that data should be represented between two LogicalType's that share the same PhysicalType. To which I unfortunately don't know the answer yet.",
+        "comments": [
+            "Issues I was facing are likely caused by missing support for the ALIAS `ExtraTypeInfo` introduced by PR #3668 ",
+            "The issue is highlighted by this test:\r\n\r\n```sql\r\nstatement ok\r\nCREATE TYPE alias AS VARCHAR;\r\n\r\nstatement ok\r\nCREATE TABLE test AS select 'happy'::ALIAS;\r\n```\r\n\r\nWhen we force a cast, this causes the following assertion to be triggered:\r\n```\r\nTransactionContext Error: Failed to commit: INTERNAL Error: Assertion triggered in file \"duckdb/src/common/types/vector.cpp\" on line 94: other.GetType() == GetType()\r\n```\r\n\r\n~~Currently on master, Vector::SetValue does not cast when the physical types are the same, but when we force a cast, this issue arises.~~\r\ndespite hitting an assertion, the query completes succesfully on release",
+            "If I change SetValue to always compare on the LogicalType level, this causes an infinite recursion between `Vector::SetValue` and `Vector::CastAs`\r\n\r\n```sql\r\nstatement ok\r\nCREATE TYPE alias AS VARCHAR;\r\n\r\nstatement ok\r\nCREATE TABLE person (\r\n    current_alias alias\r\n);\r\n\r\nstatement ok\r\nINSERT INTO person VALUES ('happy');\r\n```\n\nEdit: This is caused by GetValue, it does not copy the extra type info from the Vector, but is used in the comparison - so they are never equal"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23700,
+            "commit_id": "5d4e7040636bb6f4424c88e9e46e8a4c04456843",
+            "original_commit_id": "9656abd17652e620e9d56b0ffa3a2974a80d38ea",
+            "path": "src/common/types/vector.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 567,
+            "original_line": 567,
+            "side": "LEFT",
+            "original_position": 221,
+            "position": 36,
+            "subject_type": "line",
+            "review_comments": [
+                "The alias inheriting already happens here, no?",
+                "It does and it doesn't.\r\n\r\nSince we can also have nested vectors (dictionary for example), the TypeInfo might not be part of the DictionaryVector right?\r\nEDIT: I've made the changes anyways so we can see if it breaks anything",
+                "The `GetValueInternal` itself should generally do this - I think an assertion here would be very appropriate, however (asserting that the type of the value is equal to the type of the vector).",
+                "I've added the assertion and tested that it doesn't break (it did break when the typeid was AggregateState, hence the weird if statement). And I changed it to use CopyAuxInfo instead of altering/creating a new TypeInfo object"
+            ]
+        }
+    ]
+}

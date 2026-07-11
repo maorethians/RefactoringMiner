@@ -1,0 +1,48 @@
+{
+    "repo": "dotnet/orleans",
+    "pr_number": 8288,
+    "lang": "c_sharp",
+    "pr_title": "Fix incorrect behavior of record codec code generator",
+    "pr_body": "Hi there!\r\nThis fixes https://github.com/dotnet/orleans/issues/8286.\r\n\r\nThe problem is that if derived record has the same properties as base record e.g.\r\n```\r\n  [GenerateSerializer]\r\n    [Id(8286)]\r\n    public abstract record TestType2(string TestString)\r\n    {\r\n        [GenerateSerializer]\r\n        public sealed record TestType2A(string TestString) : TestType2(TestString);\r\n\r\n        [GenerateSerializer]\r\n        public sealed record TestType2B(string TestString) : TestType2(TestString);\r\n    }\r\n```\r\nthen the code generator will generate extra call (even if we're not writing any fields).\r\n```\r\npublic void Serialize<TBufferWriter>(ref global::Orleans.Serialization.Buffers.Writer<TBufferWriter> writer, global::OrleansBugRepro.Interfaces.TestType2.TestType2B instance)\r\n    where TBufferWriter : global::System.Buffers.IBufferWriter<byte>\r\n{\r\n    _baseTypeSerializer.Serialize(ref writer, instance);\r\n    writer.WriteEndBase();\r\n    writer.WriteEndBase();  // <-- redundant call\r\n}\r\n```\r\n\r\nSo I assumed that it only happens with records as it have more things inside than regular class hierarchy (primary constructors, overriden ToString/Equals, etc) and then I tried to do the same thing with class hierarchy:\r\n```\r\n[Immutable, GenerateSerializer, Alias(\"TestType2\")]\r\npublic abstract class TestType2\r\n{\r\n    public string? TestString { get; }\r\n\r\n    protected TestType2(string? testString)\r\n    {\r\n        TestString = testString;\r\n    }\r\n\r\n    [Immutable, GenerateSerializer, Alias(\"TestType2A\")]\r\n    public sealed class TestType2A : TestType2\r\n    {\r\n        public TestType2A(string? testString) : base(testString)\r\n        {\r\n        }\r\n    }\r\n\r\n    [Immutable, GenerateSerializer, Alias(\"TestType2B\")]\r\n    public sealed class TestType2B : TestType2\r\n    {\r\n        public TestType2B(string? testString) : base(testString)\r\n        {\r\n        }\r\n    }\r\n}\r\n```\r\nand we're okay with that. The code is generated properly and tests are pass!\r\n```\r\npublic void Serialize<TBufferWriter>(ref global::Orleans.Serialization.Buffers.Writer<TBufferWriter> writer, global::OrleansBugRepro.Interfaces.TestType2.TestType2B instance)\r\n            where TBufferWriter : global::System.Buffers.IBufferWriter<byte>\r\n        {\r\n            _baseTypeSerializer.Serialize(ref writer, instance);\r\n            writer.WriteEndBase();\r\n            // <-- no redundant call here\r\n        }\r\n```\r\n\r\n\r\n\n\n###### Microsoft Reviewers: [Open in CodeFlow](https://portal.fabricbot.ms/api/codeflow?pullrequest=https://github.com/dotnet/orleans/pull/8288)",
+    "pr_comments": [
+        "[![CLA assistant check](https://cla.dotnetfoundation.org/pull/badge/signed)](https://cla.dotnetfoundation.org/dotnet/orleans?pullRequest=8288) <br/>All CLA requirements met.",
+        "Hi @ReubenBond , I mentioned you because you're assigned to this https://github.com/dotnet/orleans/issues/8286",
+        "Hi @ahydrax, thank you for taking a look at this! I only see changes under the test/ directory in the commits here.",
+        "@ReubenBond could you review that? I would also like to add more unit test to cover more polymorphic cases. If you have any ideas about what could be tested I would appreciate that.",
+        "I found a similar issue https://github.com/dotnet/orleans/issues/8275",
+        "I should have mentioned in my first comment, but I have been working on this in response to #8275, too. I opened a PR for my approach: https://github.com/dotnet/orleans/pull/8289",
+        "Since you're more familiar with the codebase I'm sure that your approach will be better than mine. I'll close this PR so I have only one question: any ETA? @ReubenBond "
+    ],
+    "merged": false,
+    "created_at": "2023-01-27T21:44:07Z",
+    "issue_context": {
+        "number": 8286,
+        "title": "The serializer works incorrectly with records",
+        "body": "Hey!\r\n\r\nThere is a bug in the serializer.\r\nThe explanation is a little bit complicated sorry about that :-)\r\n\r\n**Prerequisites**\r\n1. We have such a set of types\r\n```csharp\r\n  [Immutable, GenerateSerializer, Alias(\"TestType2\")]\r\n  public abstract record TestType2(string? TestString)\r\n  {\r\n      [Immutable, GenerateSerializer, Alias(\"TestType2A\")]\r\n      public sealed record TestType2A(string? TestString) : TestType2(TestString);\r\n  \r\n      [Immutable, GenerateSerializer, Alias(\"TestType2B\")]\r\n      public sealed record TestType2B(string? TestString) : TestType2(TestString);\r\n  }\r\n  \r\n  [Immutable, GenerateSerializer, Alias(\"TestType1\")]\r\n  public record TestType1(TestType2[] TestArray);\r\n  \r\n  [Immutable, GenerateSerializer, Alias(\"TestType0\")]\r\n  public record TestType0(TestType1 TestType1, string? SomeString);\r\n```\r\n2. We have a cluster with two silos (`silo 1`, `silo 2`). Basically, we just need more than one\r\n3. And all the data hardcoded\r\n```csharp\r\npublic class TestSubGrain : Grain, ITestSubGrain\r\n{\r\n    public Task<TestType0> GetTestType0()\r\n    {\r\n        return Task.FromResult(\r\n            new TestType0(TestType1:\r\n                new TestType1(\r\n                    TestArray: new TestType2[]\r\n                    {\r\n                        new TestType2.TestType2A(\"a\"),\r\n                        new TestType2.TestType2A(\"b\"), // WILL BE NULL\r\n                    }\r\n                ),\r\n                SomeString: \"test\" // WILL BE NULL\r\n            )\r\n        );\r\n    }\r\n}\r\n```\r\n\r\n**The problem**\r\nWhen `silo 1` requests this model from `silo 2`, then `silo 1` receives nulls in some fields.\r\n\r\nThe problem is with the types `TestType2A`, `TestType2B`, their superclass `TestType2`, and the field `TestString` they all share. If we remove the field from the superclass \u2014 the problem disappears.\r\n\r\n**There is a repro**\r\nhttps://github.com/aurokk/orleans-bug-repro",
+        "comments": [
+            "I've noticed an issue with record serialization as well. My scenario is slightly different, but also involves records with inheritance hierarchy:\r\n\r\n```\r\n    [Immutable]\r\n    [GenerateSerializer]\r\n    public abstract record Identity(Guid Id);\r\n\r\n    [Immutable]\r\n    [GenerateSerializer]\r\n    public record SomeIdentity(Guid Id) : Identity(Id);\r\n\r\n    public interface IMyGrain\r\n    {\r\n        Task<List<SomeIdentity>> GetIdentities();\r\n    }\r\n```\r\n\r\nWhen the `GetIdentities()` method is called, a List is returned to the client, but it contains only 1 element, even if the grain returned a List instance with more elements.\r\n\r\n```\r\nvar results = await this.Client.GetGrain<IMyGrain>(\"some id\").GetIdentities();\r\n```\r\n\r\nI've debugged through the generated code, and can confirm that the serializer is called for each element in the source List<T>. \r\nThe serializer is actually processing the list twice. \r\nHowever, the `results` List contains only the first element from the source collection.\r\n\r\nPlease note that removing the parameter from the base record doesn't cause this issue:\r\n\r\n```\r\n    [Immutable]\r\n    [GenerateSerializer]\r\n    public record SomeIdentity(Guid Id) : Identity();\r\n```\r\n\r\nI suspect the `SomeIdentity` serializer may be confused by the fact that the `Id` is actually present on the base type.",
+            "I opened a PR with a fix (linked above, I'm on mobile right now). I'll see if that also fixes your case. I think it will.",
+            "Thank you so much! \r\nDo you have any fix release planned? If not, are there any chances for a pre-release nuget package?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 30408,
+            "commit_id": "c881b36e78e34d5c6b3c0a936821efc139ecb686",
+            "original_commit_id": "d08e286fe0f3c967087e426165b7637369f33d94",
+            "path": "src/Orleans.CodeGenerator/SerializerGenerator.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 345,
+            "original_line": 345,
+            "side": "RIGHT",
+            "original_position": 22,
+            "position": 22,
+            "subject_type": "line",
+            "review_comments": [
+                "This seems a little fragile - if some unrelated code is inserted in between then this check would break"
+            ]
+        }
+    ]
+}

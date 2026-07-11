@@ -1,0 +1,744 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 32669,
+    "lang": "c_sharp",
+    "pr_title": "Don't allow null converters and add Path support to NotSupportedException",
+    "pr_body": "Address feedback and issues from https://github.com/dotnet/runtime/pull/2259 including\r\n- Nulls were being passed to converters when using collections. Fixes https://github.com/dotnet/runtime/issues/32523\r\n- Per discussion, we should not support `JsonConverterFactory.CreateConverter()` returning _null_\r\n- Extra boxing avoided. Fixes https://github.com/dotnet/runtime/issues/32147\r\n\r\nNote after this PR is in, there will be a follow-up PR that adds the correct XML doc regarding exceptions.\r\n\r\n### Details on JsonConverterFactory.CreateConverter()` should not return _null._\r\nAfter this PR we align with 3.0\\3.1 behavior of not supporting _null._\r\n\r\nWhen a _null_ value was returned from `CreateConverter()` the previous code (and in 3.0\\3.1) threw `ArgumentNullException`. This was changed to `InvalidOperationException` and an exception message was added.\r\n\r\nBackground: allowing null from `CreateConverter()` was done in https://github.com/dotnet/runtime/pull/2259 because before that PR the collection code threw a \"nice\" exception that contained the parent Type and property name. Before that PR, this could not be done in `CreateConverter()` because collections were not converters and didn't share that code path. With https://github.com/dotnet/runtime/pull/2259 collections became converters, and thus needed a way to identify a \"not supported\" case so code further up the call stack could throw the \"nice\" exception message. If a `NotSupportedException` was thrown directly from within `CreateConverter()` then the message would only contain the name of the Type that is not supported, not the parent Type or the property name.\r\n\r\nPer offline discussion, it was decided we would add Path information to `NotSupportedException` similarly like we do for `JsonException`. This means throwing a `NotSupportedException` directly from a converter (or converter factory) would re-throw the exception with Path appended to the original message.\r\n\r\nExamples of the previous exceptions:\r\n```The type 'System.Int32[,]' on 'System.Text.Json.Serialization.Tests.ExceptionTests+ClassWithInvalidArray.UnsupportedArray' is not supported.```\r\nor if a converter threw its own `NotSupportedException` or the exception occurred in a collection element Type, not the property Type:\r\n```The type 'System.Int32[,]' is not supported.```\r\n\r\nThe latter case is especially bad because it provided no way to determine where the unsupported Type exists in the JSON or the object graph.\r\n\r\nExamples of exceptions with this PR:\r\n``` The type 'System.Int32[,]' is not supported. The unsupported member type is located on type 'System.Text.Json.Serialization.Tests.GenericIEnumerableWrapper`1[System.Int32[]]'. Path: $.UnsupportedDictionary.\"```\r\nor this (for read cases):\r\n``` The type 'System.Int32[,]' is not supported. The unsupported member type is located on type 'System.Text.Json.Serialization.Tests.GenericIEnumerableWrapper`1[System.Int32[]]'. Path: $.UnsupportedDictionary | LineNumber: 0 | BytePositionInLine: 10.\"```\r\n\r\n### Details on extra boxing avoided\r\nhttps://github.com/dotnet/runtime/pull/2259 added an extra box+unbox for value types passed into the root. This PR fixes that. In addition, for structs that have their own converter (and thus are not treated as \"POCO structs\" with properties) no boxing occurs at all (previously and in 3.0\\3.1 a box was done).\r\n\r\nIn addition, boxing operations were removed that helped reduce non-stack boxing. The result is less stack allocations and boxing\\unboxing. There doesn't appear to be any significant CPU performance changes but there is some minor reductions in allocations:\r\n\r\n`WriteJson<SimpleStructWithProperties>` **before**:\r\n|                  Method |     Mean |   Error |  StdDev |   Median |      Min |      Max |  Gen 0 | Gen 1 | Gen 2 | Allocated |\r\n|------------------------ |---------:|--------:|--------:|---------:|---------:|---------:|-------:|------:|------:|----------:|\r\n|       SerializeToString | 289.5 ns |  5.81 ns |  6.69 ns | 286.0 ns | 282.2 ns | 303.3 ns | 0.0452 |     - |     - |     288 B |\r\n|    SerializeToUtf8Bytes | 270.9 ns |  5.81 ns |  6.70 ns | 268.3 ns | 263.8 ns | 285.4 ns | 0.0419 |     - |     - |     264 B |\r\n|       SerializeToStream | 360.0 ns |  6.91 ns |  7.96 ns | 358.3 ns | 349.8 ns | 374.7 ns | 0.0344 |     - |     - |     216 B |\r\n| SerializeObjectProperty | 445.1 ns | 10.86 ns | 12.50 ns | 441.3 ns | 428.4 ns | 473.0 ns | 0.0880 |     - |     - |     552 B |\r\n**after**  (32 byte savings)\r\n|       SerializeToString | 286.8 ns |  5.68 ns |  6.08 ns | 287.6 ns | 279.3 ns | 299.8 ns | 0.0403 |     - |     - |     256 B |\r\n|    SerializeToUtf8Bytes | 262.7 ns |  6.16 ns |  7.09 ns | 260.5 ns | 255.1 ns | 276.4 ns | 0.0362 |     - |     - |     232 B |\r\n|       SerializeToStream | 352.7 ns |  8.67 ns |  9.99 ns | 347.7 ns | 342.5 ns | 374.7 ns | 0.0286 |     - |     - |     184 B |\r\n| SerializeObjectProperty | 450.0 ns | 10.13 ns | 11.66 ns | 445.5 ns | 435.3 ns | 475.0 ns | 0.0868 |     - |     - |     552 B |\r\n\r\n`ReadJson<SimpleStructWithProperties>` **before**:\r\n|                   Method |     Mean |   Error |  StdDev |   Median |      Min |      Max |  Gen 0 | Gen 1 | Gen 2 | Allocated |\r\n|------------------------- |---------:|--------:|--------:|---------:|---------:|---------:|-------:|------:|------:|----------:|\r\n|    DeserializeFromString | 384.2 ns |  7.80 ns |  8.98 ns | 382.4 ns | 373.2 ns | 399.0 ns | 0.0152 |     - |     - |      96 B |\r\n| DeserializeFromUtf8Bytes | 336.7 ns |  7.76 ns |  8.93 ns | 336.5 ns | 324.4 ns | 357.0 ns | 0.0142 |     - |     - |      96 B |\r\n|    DeserializeFromStream | 592.5 ns | 13.99 ns | 16.11 ns | 585.8 ns | 574.5 ns | 629.2 ns | 0.0279 |     - |     - |     176 B |\r\n**after**  (32 byte savings)\r\n|    DeserializeFromString | 367.5 ns | 6.93 ns | 6.48 ns | 366.4 ns | 358.9 ns | 379.2 ns | 0.0089 |     - |     - |      64 B |\r\n| DeserializeFromUtf8Bytes | 314.6 ns | 2.63 ns | 2.46 ns | 314.0 ns | 310.6 ns | 319.8 ns | 0.0091 |     - |     - |      64 B |\r\n|    DeserializeFromStream | 571.8 ns | 1.89 ns | 1.47 ns | 571.6 ns | 568.8 ns | 574.3 ns | 0.0221 |     - |     - |     144 B \r\n\r\n`WriteJson<Int32>` **before**\r\n|                  Method |     Mean |   Error |  StdDev |   Median |      Min |      Max |  Gen 0 | Gen 1 | Gen 2 | Allocated |\r\n|------------------------ |---------:|--------:|--------:|---------:|---------:|---------:|-------:|------:|------:|----------:|\r\n|       SerializeToString | 163.2 ns | 3.48 ns | 4.01 ns | 162.9 ns | 157.7 ns | 171.4 ns | 0.0331 |     - |     - |     208 B |\r\n|    SerializeToUtf8Bytes | 146.3 ns | 4.16 ns | 4.79 ns | 144.4 ns | 140.6 ns | 155.6 ns | 0.0327 |     - |     - |     208 B |\r\n|       SerializeToStream | 212.5 ns | 4.65 ns | 5.36 ns | 209.8 ns | 206.4 ns | 222.6 ns | 0.0277 |     - |     - |     176 B |\r\n| SerializeObjectProperty | 257.8 ns | 6.20 ns | 7.13 ns | 254.6 ns | 248.8 ns | 271.8 ns | 0.0314 |     - |     - |     200 B |\r\n**after** (24 byte savings)\r\n|       SerializeToString | 166.4 ns | 3.39 ns | 3.90 ns | 166.1 ns | 160.7 ns | 173.9 ns | 0.0291 |     - |     - |     184 B |\r\n|    SerializeToUtf8Bytes | 140.4 ns | 0.99 ns | 0.88 ns | 140.3 ns | 139.2 ns | 142.2 ns | 0.0289 |     - |     - |     184 B |\r\n|       SerializeToStream | 209.1 ns | 1.68 ns | 1.57 ns | 209.2 ns | 206.6 ns | 212.3 ns | 0.0236 |     - |     - |     152 B |\r\n| SerializeObjectProperty | 256.4 ns | 2.01 ns | 1.88 ns | 256.7 ns | 252.9 ns | 258.9 ns | 0.0313 |     - |     - |     200 B |\r\n\r\n`ReadJson<Int32>` **before**:\r\n|                   Method |     Mean |   Error |  StdDev |   Median |      Min |      Max |  Gen 0 | Gen 1 | Gen 2 | Allocated |\r\n|------------------------- |---------:|--------:|--------:|---------:|---------:|---------:|-------:|------:|------:|----------:|\r\n|    DeserializeFromString | 174.9 ns | 3.64 ns | 4.20 ns | 173.6 ns | 170.3 ns | 183.3 ns | 0.0035 |     - |     - |      24 B |\r\n| DeserializeFromUtf8Bytes | 129.0 ns | 2.48 ns | 2.86 ns | 129.5 ns | 125.7 ns | 133.8 ns | 0.0037 |     - |     - |      24 B |\r\n|    DeserializeFromStream | 353.4 ns | 7.16 ns | 8.25 ns | 355.9 ns | 342.3 ns | 365.9 ns | 0.0151 |     - |     - |      96 B |\r\n**after** (24 byte savings)\r\n|    DeserializeFromString | 171.6 ns | 3.45 ns | 3.23 ns | 170.5 ns | 168.4 ns | 178.1 ns |      - |     - |     - |         - |\r\n| DeserializeFromUtf8Bytes | 121.4 ns | 0.94 ns | 0.88 ns | 121.2 ns | 120.0 ns | 123.4 ns |      - |     - |     - |         - |\r\n|    DeserializeFromStream | 343.6 ns | 8.43 ns | 9.37 ns | 339.6 ns | 332.3 ns | 366.1 ns | 0.0107 |     - |     - |      72 B |\r\n\r\nHere are all benchmarks with >=3% threshold. No noted regression with latest changes. The benchmarks were run twice; below is the slightly less favorable results:\r\n```\r\nsummary:\r\nbetter: 19, geomean: 1.048\r\ntotal diff: 19\r\n\r\nNo Slower results for the provided threshold = 2% and noise filter = 0.3ns.\r\n\r\n| Faster                                                                           | base/diff | Base Median (ns) | Diff Median (ns) | Modality|\r\n| -------------------------------------------------------------------------------- | ---------:| ----------------:| ----------------:| -------- |\r\n| System.Text.Json.Serialization.Tests.WriteJson<BinaryData>.SerializeToStream     |      1.07 |           485.93 |           453.19 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<SimpleStructWithProperties>.Deseri |      1.07 |           336.51 |           313.97 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<Int32>.DeserializeFromUtf8Bytes    |      1.07 |           129.50 |           121.18 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<MyEventsListerViewModel>.Deseriali |      1.07 |        380413.09 |        357132.57 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<MyEventsListerViewModel>.Serializ |      1.06 |        417522.37 |        393750.16 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<Location>.SerializeToUtf8Bytes    |      1.06 |           878.60 |           832.25 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<ArrayList>.SerializeObjectPropert |      1.05 |         11980.63 |         11373.18 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<Location>.DeserializeFromUtf8Bytes |      1.05 |          1172.51 |          1113.40 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<BinaryData>.DeserializeFromUtf8Byt |      1.05 |           520.51 |           494.50 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<Dictionary<String, String>>.Seria |      1.05 |         11909.04 |         11338.84 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<SimpleStructWithProperties>.Deseri |      1.04 |           382.43 |           366.40 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<BinaryData>.SerializeToUtf8Bytes  |      1.04 |           422.66 |           405.37 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<BinaryData>.SerializeObjectProper |      1.04 |           741.50 |           711.32 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<LargeStructWithProperties>.Serial |      1.04 |           719.10 |           694.73 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<HashSet<String>>.DeserializeFromUt |      1.03 |         13756.11 |         13303.09 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<LargeStructWithProperties>.Serial |      1.03 |           751.40 |           729.69 | several?|\r\n| System.Text.Json.Serialization.Tests.ReadJson<MyEventsListerViewModel>.Deseriali |      1.03 |        309202.87 |        300340.31 |         |\r\n| System.Text.Json.Serialization.Tests.WriteJson<ArrayList>.SerializeToStream      |      1.03 |         11177.42 |         10880.01 |         |\r\n| System.Text.Json.Serialization.Tests.ReadJson<LargeStructWithProperties>.Deseria |      1.03 |          1144.67 |          1114.37 |         |\r\n```",
+    "pr_comments": [
+        "Some value-typed benchmarks added in https://github.com/dotnet/performance/pull/1211",
+        "Unrelated and previously hit CI failures in:\r\nSystem.Diagnostics.PerformanceCounter.Tests\r\nSystem.Net.Http.Functional.Tests.HttpClientTest\r\n",
+        "This PR introduced a breaking change - https://github.com/dotnet/runtime/issues/35422. See that issue for more info. I'll file a breaking change doc.",
+        "Filed a breaking change doc - https://github.com/dotnet/docs/issues/21376.",
+        "Update: a breaking change doc was already filed: https://github.com/dotnet/docs/issues/20823, https://docs.microsoft.com/en-us/dotnet/core/compatibility/3.1-5.0#jsonserializerserialize-throws-argumentnullexception-when-type-parameter-is-null.",
+        "https://github.com/dotnet/docs/issues/20823 was meant to cover https://github.com/dotnet/runtime/pull/528#issuecomment-589298591 not this, but if they surface in the same API / behavior then agree we don't need two.",
+        "@ericstj on a second look, the breaking change was made in https://github.com/dotnet/runtime/pull/528 but refactored in this PR. So this PR wasn't the breaking change."
+    ],
+    "merged": true,
+    "created_at": "2020-02-28T00:48:11Z",
+    "issue_context": {
+        "number": 32523,
+        "title": "When serializing arrays and dictionaries, null values are being passed to the custom JsonConverter<T>.Write method",
+        "body": "While reviewing the nullability analysis PR: https://github.com/dotnet/runtime/pull/32474, found this issue.\r\n\r\nThis issue got introduced recently in https://github.com/dotnet/runtime/pull/2259 and regresses the 3.1 behavior.\r\n\r\n```C#\r\n[Fact]\r\npublic static void WritePocoArray()\r\n{\r\n    var input = new MyPoco[] { null, new MyPoco { Foo = \"foo\" } };\r\n\r\n    // On 5.0/master, this fails with InvalidOperationException since the MyPocoConverter.Write gets called with null.\r\n    string json = JsonSerializer.Serialize(input, new JsonSerializerOptions { Converters = { new MyPocoConverter() } });\r\n\r\n    // On 3.1, correctly outputs the expected value:\r\n    Assert.Equal(\"[null,{\\\"Foo\\\":\\\"foo\\\"}]\", json);\r\n}\r\n\r\npublic class MyPoco\r\n{\r\n    public string Foo { get; set; }\r\n}\r\n\r\npublic class MyPocoConverter : JsonConverter<MyPoco>\r\n{\r\n    public override MyPoco Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)\r\n    {\r\n        throw new NotImplementedException();\r\n    }\r\n\r\n    public override void Write(Utf8JsonWriter writer, [DisallowNull] MyPoco value, JsonSerializerOptions options)\r\n    {\r\n        // Debug.Assert(value != null);\r\n        if (value == null)\r\n        {\r\n            throw new InvalidOperationException(\"The custom converter should never get called with null value.\");\r\n        }\r\n\r\n        writer.WriteStartObject();\r\n        writer.WriteString(nameof(value.Foo), value.Foo);\r\n        writer.WriteEndObject();\r\n    }\r\n}\r\n```\r\n\r\n```text\r\nSystem.Text.Json.Serialization.Tests.ArrayTests.WritePocoArray [FAIL]\r\n        System.InvalidOperationException : The custom converter should never get called with null value.\r\n        Stack Trace:\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\tests\\Serialization\\Array.WriteTests.cs(50,0): at System.Text.Json.Serialization.Tests.ArrayTests.MyPocoConverter.Write(Utf8JsonWriter writer, MyPoco value, JsonSerializerOptions options)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonConverterOfT.cs(251,0): at System.Text.Json.Serialization.JsonConverter`1.TryWrite(Utf8JsonWriter writer, T value, JsonSerializerOptions options, WriteStack& state)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\Converters\\Collection\\ArrayConverter.cs(59,0): at System.Text.Json.Serialization.Converters.ArrayConverter`2.OnWriteResume(Utf8JsonWriter writer, TCollection value, JsonSerializerOptions options, WriteStack& state)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\Converters\\Collection\\IEnumerableDefaultConverter.cs(274,0): at System.Text.Json.Serialization.Converters.IEnumerableDefaultConverter`2.OnTryWrite(Utf8JsonWriter writer, TCollection value, JsonSerializerOptions options, WriteStack& state)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonConverterOfT.cs(267,0): at System.Text.Json.Serialization.JsonConverter`1.TryWrite(Utf8JsonWriter writer, T value, JsonSerializerOptions options, WriteStack& state)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonConverterOfT.cs(60,0): at System.Text.Json.Serialization.JsonConverter`1.TryWriteAsObject(Utf8JsonWriter writer, Object value, JsonSerializerOptions options, WriteStack& state)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Write.cs(24,0): at System.Text.Json.JsonSerializer.WriteCore(Utf8JsonWriter writer, Object value, JsonSerializerOptions options, WriteStack& state, JsonConverter jsonConverter)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Write.Helpers.cs(105,0): at System.Text.Json.JsonSerializer.WriteCore(Utf8JsonWriter writer, Object value, Type type, JsonSerializerOptions options)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Write.Helpers.cs(82,0): at System.Text.Json.JsonSerializer.WriteCore(PooledByteBufferWriter output, Object value, Type type, JsonSerializerOptions options)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Write.Helpers.cs(56,0): at System.Text.Json.JsonSerializer.WriteCoreString(Object value, Type type, JsonSerializerOptions options)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Write.String.cs(21,0): at System.Text.Json.JsonSerializer.Serialize[TValue](TValue value, JsonSerializerOptions options)\r\n          E:\\GitHub\\Fork\\runtime\\src\\libraries\\System.Text.Json\\tests\\Serialization\\Array.WriteTests.cs(27,0): at System.Text.Json.Serialization.Tests.ArrayTests.WritePocoArray()\r\n```\r\n\r\nOn 3.1:\r\nhttps://github.com/dotnet/corefx/blob/29a6367ee4311da8ce984cfbd358d3214779fe59/src/System.Text.Json/src/System/Text/Json/Serialization/JsonPropertyInfoNotNullable.cs#L115-L122\r\n\r\nCurrent master (5.0):\r\nhttps://github.com/dotnet/runtime/blob/5d8f92435ebfeab67b41aba0bce12e1e8af3187e/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/Converters/Collection/ArrayConverter.cs#L58-L59\r\n\r\nI believe this needs to special-case/handle null:\r\nhttps://github.com/dotnet/runtime/blob/5d8f92435ebfeab67b41aba0bce12e1e8af3187e/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs#L63-L68\r\n\r\nAlso, we have a test gap here for null elements in collections and enumerables (both with custom converter and default converter).\r\n\r\ncc @Jozkee, @layomia ",
+        "comments": [
+            "Re-opening. Please clean up the TODO comments in source that link to this issue and update nullability (these comments were introduced in https://github.com/dotnet/runtime/pull/32474).\r\n\r\nFor example:\r\nhttps://github.com/dotnet/runtime/blob/385b4d4296f9c5cb82363565aa210a1a37f92d90/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs#L70-L75\r\n\r\nI am going to assume all the test cases/examples are now covered :)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 7792,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterFactory.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 61,
+            "original_line": 61,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            return converter;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 3609,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/ExceptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 452,
+            "original_line": 452,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "This case does not include the Path because this throws on `Initialize` and we can only append Path information once we get into the ReadCore loop, right? \r\n\r\nDid you consider wrapping `state.Initialize` on a try-catch block so we can append the Path on this case? ",
+                "Yes per discussion the root type would always have \"$\" as the path and also the Type information would just be the `<T>` passed in (or `returnType` argument) so it is not normally useful.\r\n\r\nAdding the extra `try\\catch` is possible but does add a little cost in terms of performance and makes the code a bit more difficult to follow since now we have just a single `try\\catch` and wrapping it would cause at least 3 more."
+            ]
+        },
+        {
+            "hunk_id": 7798,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.ReadCore.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 36,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we keep consistency and either just return the `T` value or make this a void method and set the return value in `state.Current.ReturnValue`? Why does the returning value needs to be different to state's `ReturnValue`?",
+                "Without the check, we'll get a NullReferenceException.\r\n\r\nIf we use `state.Current.ReturnValue` then we will box (again).\r\n"
+            ]
+        },
+        {
+            "hunk_id": 7794,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.ByteArray.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 34,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's add a test for this branch.",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 3600,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.ReadCore.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 36,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we keep consistency and either just return the `T` value or make this a void method and set the return value in `state.Current.ReturnValue`? Why does the returning value needs to be different to state's `ReturnValue`?",
+                "Without the check, we'll get a NullReferenceException.\r\n\r\nIf we use `state.Current.ReturnValue` then we will box (again).\r\n"
+            ]
+        },
+        {
+            "hunk_id": 3596,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.ByteArray.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 34,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's add a test for this branch.",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 7800,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonClassInfo.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "`PolicyProperty` apperas to be non-nullable now, can you mark it as such?",
+                "I did this previously in the last iteration and based on our discussion I removed it since it affected so many files for this PR. It should be its own PR. Currently there is no issue although I can create that PR right after this."
+            ]
+        },
+        {
+            "hunk_id": 3602,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonClassInfo.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "`PolicyProperty` apperas to be non-nullable now, can you mark it as such?",
+                "I did this previously in the last iteration and based on our discussion I removed it since it affected so many files for this PR. It should be its own PR. Currently there is no issue although I can create that PR right after this."
+            ]
+        },
+        {
+            "hunk_id": 7795,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 51,
+            "original_line": 51,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's add a test for this."
+            ]
+        },
+        {
+            "hunk_id": 7793,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonClassInfo.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "Did you consider caching this lazily (like `ElementClassInfo`) as discussed, or is it guaranteed to be used by all `ClassType`s  anywhere they occur in the type graph? Maybe we could measure if/how much allocations could be saved.",
+                "This didn't change with this PR (PropertyPolicy was always created).\r\n\r\nCurrently PolicyProperty is always accessed for a given property, so deferring the construction will cause an extra `if` check at runtime instead of doing the creation up-front (which is cached).\r\n\r\nSince there's a reference back to the parent, caching would only help for properties on a given type if they're the same Type. PropertyPolicy could pehaps be improved here, but not in scope for this PR anyway."
+            ]
+        },
+        {
+            "hunk_id": 3608,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializerOptions.Converters.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            JsonConverter? converter = null;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 3593,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/Converters/Object/ObjectDefaultConverter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 280,
+            "original_line": 280,
+            "side": "LEFT",
+            "original_position": 9,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Forgot to remove this from continuation case on line 341, also from dictionary and enumerable converters? \r\n\r\nIn addition, if this can't be null maybe we should add `[DisallowNull]` to the parameter or a `notnull` constraint.",
+                "Yes thanks. Added constraint.\r\n"
+            ]
+        },
+        {
+            "hunk_id": 3595,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonClassInfo.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 125,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "Did you consider caching this lazily (like `ElementClassInfo`) as discussed, or is it guaranteed to be used by all `ClassType`s  anywhere they occur in the type graph? Maybe we could measure if/how much allocations could be saved.",
+                "This didn't change with this PR (PropertyPolicy was always created).\r\n\r\nCurrently PolicyProperty is always accessed for a given property, so deferring the construction will cause an extra `if` check at runtime instead of doing the creation up-front (which is cached).\r\n\r\nSince there's a reference back to the parent, caching would only help for properties on a given type if they're the same Type. PropertyPolicy could pehaps be improved here, but not in scope for this PR anyway."
+            ]
+        },
+        {
+            "hunk_id": 7791,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/Converters/Object/ObjectDefaultConverter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 280,
+            "original_line": 280,
+            "side": "LEFT",
+            "original_position": 9,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Forgot to remove this from continuation case on line 341, also from dictionary and enumerable converters? \r\n\r\nIn addition, if this can't be null maybe we should add `[DisallowNull]` to the parameter or a `notnull` constraint.",
+                "Yes thanks. Added constraint.\r\n"
+            ]
+        },
+        {
+            "hunk_id": 3598,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 72,
+            "original_line": 72,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "Test here as well."
+            ]
+        },
+        {
+            "hunk_id": 3610,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Helpers.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 91,
+            "original_line": 91,
+            "side": "LEFT",
+            "original_position": 99,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "Before we were not calling Initialize when the root was `null`; now we do and that causes a change in behavior for unsupported root types.\r\n\r\n```cs\r\n[Fact]\r\npublic static void QuickTest()\r\n{\r\n    int[,] arr = null;\r\n    string json = JsonSerializer.Serialize(arr);\r\n    Console.WriteLine(json);\r\n}\r\n```\r\n\r\non master, the previous example returns null. with these changes we will throw.",
+                "I think this can be fixed if you just keep this condition.",
+                "Since we want to support converters writing their own `null` we must ask the converter if they want to handle null. For example a custom String converter may want to write `null` as `\"\"`. So we just can't write `null` here.\r\n\r\nI'll add a test to assert this and track for any potential breaking changes.\r\n"
+            ]
+        },
+        {
+            "hunk_id": 7802,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.String.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 33,
+            "original_line": 33,
+            "side": "LEFT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "Seems like same thing here, we were always boxing on this case.",
+                "Yes that was part of the goal of the PR - to remove this boxing (and others)."
+            ]
+        },
+        {
+            "hunk_id": 7799,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "I think you can remove `HandleNullValue` and `ShouldHandleNullValue` and use `IsValueType` directly.",
+                "This is set-up for likely feature where we make `HandleNullValue` public."
+            ]
+        },
+        {
+            "hunk_id": 7804,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Utf8JsonWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            Serialize(writer, value, typeof(TValue), options);\r\n```",
+                "Same as above (prefer explicit syntax)"
+            ]
+        },
+        {
+            "hunk_id": 3601,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 25,
+            "original_line": 25,
+            "side": "RIGHT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "I think you can remove `HandleNullValue` and `ShouldHandleNullValue` and use `IsValueType` directly.",
+                "This is set-up for likely feature where we make `HandleNullValue` public."
+            ]
+        },
+        {
+            "hunk_id": 7797,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.String.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 52,
+            "original_line": 52,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Pls verify with code coverage/tests that all the input validation checks in the helpers are needed + not handled upstream.",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 7806,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializerOptions.Converters.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            JsonConverter? converter = null;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 3611,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 56,
+            "original_line": 56,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "This is incorrect usage of nullability annotation. If value can be null (and looking at the null checks happening later, it can), the `TValue value` parameter on `WriteAsyncCore` should be correctly annotated to be nullable.\r\n\r\nAvoid using `!` to circumvent null warnings unless absolutely necessary, and instead annotate the implementation to reflect nullability accurately.",
+                "I agree. This should be called with `WriteAsyncCore<object?>`.",
+                "Maybe a helpful note for reviewers: Make sure to pay close attention to uses of `!` in the code :)"
+            ]
+        },
+        {
+            "hunk_id": 7809,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 56,
+            "original_line": 56,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 20,
+            "subject_type": "line",
+            "review_comments": [
+                "This is incorrect usage of nullability annotation. If value can be null (and looking at the null checks happening later, it can), the `TValue value` parameter on `WriteAsyncCore` should be correctly annotated to be nullable.\r\n\r\nAvoid using `!` to circumvent null warnings unless absolutely necessary, and instead annotate the implementation to reflect nullability accurately.",
+                "I agree. This should be called with `WriteAsyncCore<object?>`.",
+                "Maybe a helpful note for reviewers: Make sure to pay close attention to uses of `!` in the code :)"
+            ]
+        },
+        {
+            "hunk_id": 7808,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Helpers.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 91,
+            "original_line": 91,
+            "side": "LEFT",
+            "original_position": 99,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "Before we were not calling Initialize when the root was `null`; now we do and that causes a change in behavior for unsupported root types.\r\n\r\n```cs\r\n[Fact]\r\npublic static void QuickTest()\r\n{\r\n    int[,] arr = null;\r\n    string json = JsonSerializer.Serialize(arr);\r\n    Console.WriteLine(json);\r\n}\r\n```\r\n\r\non master, the previous example returns null. with these changes we will throw.",
+                "I think this can be fixed if you just keep this condition.",
+                "Since we want to support converters writing their own `null` we must ask the converter if they want to handle null. For example a custom String converter may want to write `null` as `\"\"`. So we just can't write `null` here.\r\n\r\nI'll add a test to assert this and track for any potential breaking changes.\r\n"
+            ]
+        },
+        {
+            "hunk_id": 3594,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterFactory.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 61,
+            "original_line": 61,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            return converter;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 7796,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 72,
+            "original_line": 72,
+            "side": "RIGHT",
+            "original_position": 44,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "Test here as well."
+            ]
+        },
+        {
+            "hunk_id": 3605,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.String.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 21,
+            "original_line": 21,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            return Serialize(value, typeof(TValue), options);\r\n```",
+                "I prefer the explict code here since the very next method in the same file has the same name+arguments except the first arg is `object?` instead of TValue and at first glance looks like it would get called (but doesn't due to the generic method below that)."
+            ]
+        },
+        {
+            "hunk_id": 7803,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.String.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 21,
+            "original_line": 21,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            return Serialize(value, typeof(TValue), options);\r\n```",
+                "I prefer the explict code here since the very next method in the same file has the same name+arguments except the first arg is `object?` instead of TValue and at first glance looks like it would get called (but doesn't due to the generic method below that)."
+            ]
+        },
+        {
+            "hunk_id": 3606,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Utf8JsonWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            Serialize(writer, value, typeof(TValue), options);\r\n```",
+                "Same as above (prefer explicit syntax)"
+            ]
+        },
+        {
+            "hunk_id": 7801,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.Span.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 26,
+            "original_line": 26,
+            "side": "LEFT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "So before we were always boxing when some used the `ROS<byte>` overload.",
+                "Yes, `ParseCore` returned System.Object."
+            ]
+        },
+        {
+            "hunk_id": 3599,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.String.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 52,
+            "original_line": 52,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Pls verify with code coverage/tests that all the input validation checks in the helpers are needed + not handled upstream.",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 7805,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Utf8JsonWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 79,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 40,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            WriteCore(writer, value, type, options);\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 3603,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.Span.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 26,
+            "original_line": 26,
+            "side": "LEFT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "So before we were always boxing when some used the `ROS<byte>` overload.",
+                "Yes, `ParseCore` returned System.Object."
+            ]
+        },
+        {
+            "hunk_id": 7807,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/ExceptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 452,
+            "original_line": 452,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "This case does not include the Path because this throws on `Initialize` and we can only append Path information once we get into the ReadCore loop, right? \r\n\r\nDid you consider wrapping `state.Initialize` on a try-catch block so we can append the Path on this case? ",
+                "Yes per discussion the root type would always have \"$\" as the path and also the Type information would just be the `<T>` passed in (or `returnType` argument) so it is not normally useful.\r\n\r\nAdding the extra `try\\catch` is possible but does add a little cost in terms of performance and makes the code a bit more difficult to follow since now we have just a single `try\\catch` and wrapping it would cause at least 3 more."
+            ]
+        },
+        {
+            "hunk_id": 3604,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.String.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 33,
+            "original_line": 33,
+            "side": "LEFT",
+            "original_position": 19,
+            "position": 19,
+            "subject_type": "line",
+            "review_comments": [
+                "Seems like same thing here, we were always boxing on this case.",
+                "Yes that was part of the goal of the PR - to remove this boxing (and others)."
+            ]
+        },
+        {
+            "hunk_id": 3607,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Utf8JsonWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 79,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 40,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            WriteCore(writer, value, type, options);\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 3597,
+            "commit_id": "417254ef0f13dd453496cecf0b175161378c98c2",
+            "original_commit_id": "9dd7cb549efb04a26e6a02482686c390220b09bd",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Write.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 51,
+            "original_line": 51,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's add a test for this."
+            ]
+        }
+    ]
+}

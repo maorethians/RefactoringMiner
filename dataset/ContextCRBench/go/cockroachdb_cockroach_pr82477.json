@@ -1,0 +1,234 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 82477,
+    "lang": "go",
+    "pr_title": "sql: introduce new internal executor interfaces",
+    "pr_body": "This PR aims to provide a set of safer interfaces for the internal executor, making it less easy to abuse.\r\n\r\nCurrently, each conn executor underneath the internal executor (we call it \u201cchild executor\u201d) has its own set of information, such as descriptor collection, job collection, schema change jobs, etc, even when it\u2019s run with a not-nil outer `kv.Txn`, or there're multiple SQL executions under the same `kv.Txn`.\r\nThis is not intuitive, since it violates a rather deep principle that a `descs.Collection` and a SQL txn have a 1:1 relationship. The code doesn\u2019t enforce that, but it ought to. The more places that make it possible to decouple this, the more anxious we get.\r\n\r\nIdeally, internal executor with a not-nil txn is either planner or `collectionFactory` oriented, so that the txn is always tightly coupled with the descriptor collection. We thus propose a set of new interfaces to ensure this coupling.\r\n\r\nCurrently, the usage of an internal executor query function (e.g. `InternalExecutor.ExecEx()`) falls into the following 3 categories:\r\n1. The query is run under a planner context and with a not-nil kv.Txn from this planner.\r\n2. The query is run without a kv.Txn. (e.g. InternalExecutor.ExecEx(..., nil /* txn */, stmt...)\r\n3. The query is running with a not-nil kv.Txn but not under the planner context.\r\n\r\nFor usage 1, the descriptor collections, txn state, job collections, and session data from the parent planner are expected to be passed to the internal executor's child conn executor.\r\nFor usage 2 and 3, if multiple SQL statements are run under the same txn, these executions should share the descs.Collection, txn state machine, job collections and session data for their conn executors. \r\n\r\nTo suit these 3 use cases, we proposed 3 interfaces for each of the query function:\r\n(In the following we use `InternalExecutor.ExecEx` as the example)\r\n- For case 1, refactor to use `func (p *planner) ExecExUpdated()`, where the internal executor is always initialized with `descs.Collection`, `TxnState` and etc. from the `sql.planner`. \r\n- For case 2, refactor to use `ieFactory.WithoutTxn()`, where the query is always run with a nil kv.Txn. \r\n- For case 3, refactor to use `CollectionFactory.TxnWithExecutor()`. In this function, the internal executor is generated and passed to the call back function to run the query.\r\n\r\nWe also tried refactoring some of the existing use cases to give an example of the new interface.\r\n\r\n(Note that the ultimate goal of this improvement is to deprecate all the \"free-hanging\" `InternalExecutor` objects (such as `sql.ExecutorConfig.InternalExecutor`) and replace them with an `InternalExecutorFactory` field. `InternalExecutorFactory` is to initialize a REAL internal executor, but it cannot be used directly to run SQL statement queries.\r\nInstead, we wrap the initialization of an internal executor inside each query function, i.e. init it only when you really need to run a query. In other words, the creation of an internal executor becomes closer to the query running.)\r\n\r\nfixes https://github.com/cockroachdb/cockroach/issues/69495\r\nfixes https://github.com/cockroachdb/cockroach/issues/78998\r\n\r\nRelease Note: None\r\n\r\n",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/82477)\n<!-- Reviewable:end -->\n",
+        "If I understand correctly, nothing really has been made worse by this interface change. I'd like to unpack the extent to which it has. \r\n\r\n> Could you explain to us what you recommend happens in the following \"common\" use case:\r\n\r\nThe `db.Txn` use case is not *that* common, it's pattern (3) in the list. A similarly common pattern today is to pass the `nil /* txn */` (pattern (2)). In the nil txn case, the connExecutor does all of the restart management, as you propose.\r\n\r\n>It seems to me that it would be \"expensive\" to re-initialize an internalexecutor from scratch every time db.Txn invokes the closure.\r\n\r\nI don't think I buy this. The internalExecutor we have today is shockingly thin. We already build a new connExecutor for each invocation. That means this change is not worse than any existing code which uses an explicit `txn` argument, right?\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/cc6aa337dc3c327b512b283ce9842afc942a244d/pkg/sql/internal.go#L129-L140\r\n",
+        "ok, that's a good explanation thanks",
+        "Thanks @ajwerner for the explanation! Yes the understanding is correct. \r\n\r\n> Would there be a way to \"refresh\" the kv.Txn object inside the executor, the same way that sql.connExecutor does internally for auto-retries (like in prepareTxnForRetryWithRewind())?\r\n\r\nAs Andrew mentioned, the initialization of an internal executor itself is to call `sql.MakeInternalExecutor()` coupled with some addition setting for session data, descs.Collection and etc. It does create and start new monitor for the new ie, but it doesn't seem that expensive. \r\n\r\nSo if it's acceptable to re-init the internal executor for each retry in the `db.Txn()` example, I don't think we need to enable \"refreshing\" the `kv.Txn` inside the internal executor, since in each retry, a new `kv.Txn` will be passed to the new ie.\r\n\r\n",
+        "Per @ajwerner and @rafiss's suggestions, I removed the `internalExecutorProto` and kept using the `InternalExecutorFunction`. ",
+        "I'm converting this PR back to draft because I will push some additional commits to fix the CI failures.",
+        "RFAL, the latest changes have passed the CI.\r\nNote that I commented out [this part](https://github.com/cockroachdb/cockroach/pull/82477/files#diff-33e67e82fe9a3425c6a1106d17cf70dd189c408513d7caf4ba1951a67c402309R304-R308) that passes the caller's `schemaChangeJobsRecord` to the child conn executor, because it caused `pkg/sql/logictest/testdata/logic_test/schema_change_in_txn` hang forever. Not sure about why yet.\r\n\r\n```\r\n\t\t// TODO(janexing): uncomment the following will make schema_change_in_txn hang\r\n\t\t//if ie.extraTxnState.schemaChangeJobRecords != nil {\r\n\t\t//\tex.extraTxnState.schemaChangeJobRecords = ie.extraTxnState.schemaChangeJobRecords\r\n\t\t//}\r\n```",
+        "RFAL",
+        "Discussed with @ajwerner offline:\r\n\r\nIdeally, internal executor with a not-nil txn is either planner  or collectionFactory oriented, so that the  txn is always tightly coupled with the descriptor collection.\r\nSo there\u2019s no need for a new `ieFactory.WithTxn()` function to deal with not-nil txn without planner. Instead, we will use\r\n``` go\r\nfunc (cf *CollectionFactory) TxnWithExecutor(\r\n\tctx context.Context,\r\n\tief sqlutil.InternalExecutorFactory,\r\n        sd *sessiondata.SessionData,\r\n\tdb *kv.DB,\r\n\tf func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor, descriptors *Collection) error,\r\n) error {\r\n\tie := ief(ctx, sd)\r\n    return cf.Txn(ctx, ie, db, func(ctx context.Context, txn *kv.Txn, descriptors *Collection) error {\r\n    ie.SetExtraTxnState(descriptors)\r\n    f(ctx, txn, ie, descriptors)\r\n})\r\n}\r\n```\r\nfor this case.\r\n\r\nSo the existing use cases with\r\n``` go\r\ns.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error{\r\n\tie.ExecEx(...)\r\n})\r\n```\r\nwill be replaced with\r\n``` go\r\ns.collectionFactory.TxnWithExecutor(ctx, ief, s.db, sessionData, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor, descriptors *Collection){\r\n\tie.ExecEx(...)\r\n})\r\n```",
+        "@rafiss @ajwerner The latest version has passed GithubCI. RFAL, thanks!",
+        "To make this PR easier to review, I made some notes to divide commits into layers:\r\n1. The first 4 commits, with the first 3 rebased from https://github.com/cockroachdb/cockroach/pull/84948, are to move certain logics into separate packages. They are made just to avoid dependency loop.\r\n2. The 5th and 6th commits (`skip release` and `modified conn executor init`) are to change how the child conn executor is initialized. We let it look at `InternalExecutor.extraTxnState`, and inherit txn related info from this field. (i.e., it's about the `read` usage of `InternalExecutor.extraTxnState`.)\r\n3. The 7~9th commits (`ieFactory.WithoutTxn()`, `collectionFactory.TxnWithExecutor()` and `planner.QueryXX()`) are to create 3 new interfaces for the 3 use cases we mentioned in the PR description. In other words, it's about how to pass txn-related info to `Internal.extraTxnState`, when initializing an internal executor. (i.e., it's about the `write` usage of `InternalExecutor.extraTxnState`.)\r\n4. The last 2 commits (with `refactor`) are to give examples for using these new interfaces. \r\n\r\nActually, I think we should split this PR based on the layers above. What about we make 3 PRs, with \r\n\r\n- [ ] Make separate packages (point 1 above)\r\n- [ ] Modified how conn executor is inited under internal executor (point 2 above)\r\n- [ ] Introduce new interfaces for internal executor (point 3 and 4 above)\r\n\r\nThis way it will be easier to review and to track the progress of this project. What do you think? cc @rafiss @ajwerner ",
+        "Thanks @rafiss for reviewing! \r\n@ajwerner could you give this PR a look too? Thanks!",
+        "> My gut is that this work is on a path to somewhere better than the internal executor we started with, but if we just leave things like this, we'll have made the story worse.\r\n\r\nI disagree that it makes the story worse; I view this as an incremental improvement. This is evident by the fact that we already see the roundtrip tests improving. If your concern is just about tech debt, then with clear commenting and documentation, I really don't think we are setting ourselves for the disaster that you fear.\r\n\r\n> I hope we can get rid of the extraTxnState object soon and that we can actually make the APIs reflect the lifecycles which you're starting to create. If the status quo created here exists in 23.1, I'll be very sad.\r\n\r\nI feel that we need these new interfaces merged for us to have common ground when discussing how to make further improvements. I feel pretty strongly that the way forward to this goal is to merge this PR and to tackle the other issues you raise in future PRs. I worry that trying to tackle each issue in this PR might have been making it harder to iterate on addressing the concerns you are raising.\r\n\r\n> what's acceptable in terms of the state of the world for 22.2.\r\n\r\nWe still plan to work through tech debt in this area during the stability period.\r\n\r\n---\r\n\r\nI hope it's clear that I'm not trying to dismiss your feedback. I'm trying to say that the best way to address your valuable feedback is to merge this large PR and continue working on improvements.",
+        "Does this PR fix #70888?",
+        "> Does this PR fix https://github.com/cockroachdb/cockroach/issues/70888?\r\n\r\nSadly no. This PR doesn't deprecate the existing `ExecCfg.InternalExecutor`, which we proposed to do after merging this one. This PR proposes a new interface to initialize an internal executor, which is expected to eventually replace the current `ExecCfg.InternalExecutor` and solve this issue. But given the large number of usages of the latter, we'd prefer to have the replacement in a future PR.\r\n\r\n ",
+        "Okay thanks for the update! No worries, Rome wasn't built in a day. Could we get an Informs: in your commit message to that issue just so things are looped together?    Thanks!",
+        "> Could we get an Informs: in your commit message to that issue just so things are looped together?\r\n\r\nYeah, sure! I'll add that.",
+        "Made changes per comments, except changing `sqlutil.InternalExecutorFactory` into an interface, for I'm not 100% sure about how to define the `InternalExecutorFactory` field of structs: https://github.com/cockroachdb/cockroach/pull/82477#discussion_r940851470",
+        "Made changes including changing `sqlutil.InternalExecutorFactory` to an interface. Ready for another look.",
+        "Friendly reping-ing @ajwerner for another look. Thanks!",
+        "Thanks all for reviewing!\nbors r=rafiss,ajwerner",
+        "Build failed (retrying...):\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=6064550&buildTypeId=Cockroach_BazelEssentialCi)",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=6064690&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2022-08-08T03:19:54Z",
+    "issue_context": {
+        "number": 78998,
+        "title": "sql: internal executor is very confusing about managing transaction state",
+        "body": "The way the internal executor works is that when it manages the txn lifecycle (i.e. you pass it nil), then it runs the whole transaction state machine. \r\n\r\nHowever, when you pass in a `txn`, then it moves itself to the open state with totally bogus `extraTxnState` and then when the statement finishes, it throws that bogus `extraTxnState` away.\r\n\r\nThis can lead to problems, since it bypasses the lifecycle and state management which normally happens for SQL transactions. For example: the deferred creation of jobs and the checking of the two version invariant.\r\n\r\nSee https://github.com/cockroachdb/cockroach/issues/76764 for an example where this caused real corruption.\r\n\r\nJira issue: CRDB-14493\r\n\r\nEpic CRDB-14492",
+        "comments": [
+            "cross-referencing for future discoverability: https://github.com/cockroachdb/cockroach/issues/69495 https://github.com/cockroachdb/cockroach/issues/71467",
+            "> cross-referencing for future discoverability\r\n\r\n+1. I'm also putting all these in the same jira epic",
+            "We should probably make the internal executor return an error if you feed it more than one statement in a batch. It has odd semantics both with and without a `txn`. We should also probably reject statements which perform any schema changes when providing a transaction explicitly, as we know that's not handled correctly. ",
+            "> We should probably make the internal executor return an error if you feed it more than one statement in a batch. It has odd semantics both with and without a `txn`. We should also probably reject statements which perform any schema changes when providing a transaction explicitly, as we know that's not handled correctly.\r\n\r\nIt actually does error right now now since we call `ParseOne`",
+            "Okay, cool. One thing we could do is return an error for any schema change statement or non-DML that has a transaction provided by the call. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15949,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/catalog/descs/collection.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 53,
+            "original_line": 53,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "the `make` terminology is differentiated from the `new` terminology in this codebase and other to indicate that it's returning a struct and not a pointer. You need to rename this `newCollection`. ",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 14542,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/server/server.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 805,
+            "original_line": 805,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 3,
+            "subject_type": "line",
+            "review_comments": [
+                "Hopefully we can get rid of this"
+            ]
+        },
+        {
+            "hunk_id": 15950,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/catalog/descs/txn.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 80,
+            "original_line": 80,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "why did you make this change?",
+                "It's because `descsCol` will take the return value from `cf.MakeCollection()` below , which I changed to return a pointer, and as you said, this is incorrect."
+            ]
+        },
+        {
+            "hunk_id": 14544,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/internal.go",
+            "start_line": 317,
+            "original_start_line": 308,
+            "start_side": "RIGHT",
+            "line": 318,
+            "original_line": 318,
+            "side": "RIGHT",
+            "original_position": 205,
+            "position": 214,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't know exactly know what this means. Can you add more words to explain why we can't do this now? ",
+                "The ideal final case with `extraTxnState` (though I know now that we'd like to replace it with a conn executor hanging off the internal executor) is that `txn` will always be stored in `ie.extraTxnState.txn`, so these function will use it from there instead of from `txn` in the parameter list here. This is minor, but I think storing the txn in `ie.extraTxnState` will make it look more tightly coupled with the other txn-related info."
+            ]
+        },
+        {
+            "hunk_id": 15948,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/internal.go",
+            "start_line": 317,
+            "original_start_line": 308,
+            "start_side": "RIGHT",
+            "line": 318,
+            "original_line": 318,
+            "side": "RIGHT",
+            "original_position": 205,
+            "position": 214,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't know exactly know what this means. Can you add more words to explain why we can't do this now? ",
+                "The ideal final case with `extraTxnState` (though I know now that we'd like to replace it with a conn executor hanging off the internal executor) is that `txn` will always be stored in `ie.extraTxnState.txn`, so these function will use it from there instead of from `txn` in the parameter list here. This is minor, but I think storing the txn in `ie.extraTxnState` will make it look more tightly coupled with the other txn-related info."
+            ]
+        },
+        {
+            "hunk_id": 14545,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/catalog/descs/collection.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 53,
+            "original_line": 53,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "the `make` terminology is differentiated from the `new` terminology in this codebase and other to indicate that it's returning a struct and not a pointer. You need to rename this `newCollection`. ",
+                "Done"
+            ]
+        },
+        {
+            "hunk_id": 15946,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/server/server.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 805,
+            "original_line": 805,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 3,
+            "subject_type": "line",
+            "review_comments": [
+                "Hopefully we can get rid of this"
+            ]
+        },
+        {
+            "hunk_id": 15947,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/internal.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "can you put a TODO that this is a wart that we never really wanted to exist in the first place and intend to remove ASAP by tightly coupling the internal executor to a connExecutor instance? I'm afraid that if we just leave this here some future person might think it was something we intended to invest in when in fact it's something we detest. "
+            ]
+        },
+        {
+            "hunk_id": 14546,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/catalog/descs/txn.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 80,
+            "original_line": 80,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "why did you make this change?",
+                "It's because `descsCol` will take the return value from `cf.MakeCollection()` below , which I changed to return a pointer, and as you said, this is incorrect."
+            ]
+        },
+        {
+            "hunk_id": 14543,
+            "commit_id": "afb5db4cf1afad8eba265e2238a0e175b936e79c",
+            "original_commit_id": "9fb8d361ecb349dda4bfee10a17a6e19277762f0",
+            "path": "pkg/sql/internal.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "can you put a TODO that this is a wart that we never really wanted to exist in the first place and intend to remove ASAP by tightly coupling the internal executor to a connExecutor instance? I'm afraid that if we just leave this here some future person might think it was something we intended to invest in when in fact it's something we detest. "
+            ]
+        }
+    ]
+}

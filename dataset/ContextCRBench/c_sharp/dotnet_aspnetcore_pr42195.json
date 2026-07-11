@@ -1,0 +1,899 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 42195,
+    "lang": "c_sharp",
+    "pr_title": "[Route Groups] Support AddFilter, WithOpenApi and other additive conventions",
+    "pr_body": "The nice thing about this fix is that more local \"conventions\" can see and modify metadata added by outer groups. At first, I wasn't sure this was going to be possible for groups, but I found the solution by adding the new virtual `EndpointDataSource.GetGroupedEndpoints(RouteGroupContext)` method, and then creating a custom `RouteEndointDataSource` that takes over a lot of the complicated logic that used to exist in `EndpointRouteBuilderExtensions`.\r\n\r\nThe upside of moving this logic into `RouteEndointDataSource` other than general cleanliness, is that as a custom `EndpointDataSource`, it can override `EndpointDataSource.GetGroupedEndpoints(GroupContext)` and inspect the full group prefix and all the group metadata before calling `RequestDelegateFactory.Create()` or running any filters.\r\n\r\nEven though `RequestDelegateFactory` now runs after any conventions are added to the endpoint (aside from conventions added by the `RequestDelegateFactory`), `WithOpenApi` is fixed by having the `RouteEndointDataSource` add `MethodInfo` before running any conventions. `RouteEndointDataSource` also adds any attributes as metadata. This is more similar to the previous behavior of `RequestDelegateFactory` in .NET 6 where it did not add this metadata.\r\n\r\nThe new-to-.NET-7 `RequestDelegateFactoryOptions.InitialEndpointMetadata` is now just `RequestDelegateFactoryOptions.EndpointMetadata` because now it's mutable and is equivalent to the `RouteEndpointBuilder.Metadata` at this very late stage of building. This gives the absolute most flexibility to filters and metadata providers because they can add metadata wherever they want, but they have to be careful not to override metadata they don't want to by simply adding to the end without looking if anything has already been configured. I think this is fine because the filter and metadata provider APIs are new .NET 7 so there aren't expectations that metadata added will have a low precedence yet. @captainsafia @DamianEdwards \r\n\r\nYou can see how this works by looking at some of the tests. For example, `WithOpenApi_GroupMetadataCanBeSeenByAndOverriddenByMoreLocalMetadata`:\r\n\r\n```csharp\r\nstring GetString() => \"Foo\";\r\n\r\nstatic void WithLocalSummary(RouteHandlerBuilder builder)\r\n{\r\n    builder.WithOpenApi(operation =>\r\n    {\r\n        operation.Summary += $\" | Local Summary | 200 Status Response Content-Type: {operation.Responses[\"200\"].Content.Keys.Single()}\";\r\n        return operation;\r\n    });\r\n}\r\n\r\nWithLocalSummary(builder.MapDelete(\"/root\", GetString));\r\n\r\nvar outerGroup = builder.MapGroup(\"/outer\");\r\nvar innerGroup = outerGroup.MapGroup(\"/inner\");\r\n\r\nWithLocalSummary(outerGroup.MapDelete(\"/outer-a\", GetString));\r\n\r\n// The order WithOpenApi() is relative to the MapDelete() methods does not matter.\r\nouterGroup.WithOpenApi(operation =>\r\n{\r\n    operation.Summary = \"Outer Group Summary\";\r\n    return operation;\r\n});\r\n\r\nWithLocalSummary(outerGroup.MapDelete(\"/outer-b\", GetString));\r\nWithLocalSummary(innerGroup.MapDelete(\"/inner-a\", GetString));\r\n\r\ninnerGroup.WithOpenApi(operation =>\r\n{\r\n    operation.Summary += \" | Inner Group Summary\";\r\n    return operation;\r\n});\r\n\r\nWithLocalSummary(innerGroup.MapDelete(\"/inner-b\", GetString));\r\n\r\nvar summaries = builder.DataSources.SelectMany(ds => ds.Endpoints).Select(e => e.Metadata.GetMetadata<OpenApiOperation>().Summary).ToArray();\r\n\r\nAssert.Equal(5, summaries.Length);\r\nAssert.Contains(\" | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Inner Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Inner Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\n```\r\n\r\nAnd `AddRouteHandlerFilterMethods_WorkWithMapGroup`.\r\n\r\n```csharp\r\nstring PrintId(int id) => $\"ID: {id}\";\r\n\r\nstatic void AddParamIncrementingFilter(IEndpointConventionBuilder builder)\r\n{\r\n    builder.AddRouteHandlerFilter(async (context, next) =>\r\n    {\r\n        context.Arguments[0] = ((int)context.Arguments[0]!) + 1;\r\n        return await next(context);\r\n    });\r\n}\r\n\r\nAddParamIncrementingFilter(builder.Map(\"/{id}\", PrintId));\r\n\r\nvar outerGroup = builder.MapGroup(\"/outer\");\r\nAddParamIncrementingFilter(outerGroup);\r\nAddParamIncrementingFilter(outerGroup.Map(\"/{id}\", PrintId));\r\n\r\nvar innerGroup = outerGroup.MapGroup(\"/inner\");\r\nAddParamIncrementingFilter(innerGroup);\r\nAddParamIncrementingFilter(innerGroup.Map(\"/{id}\", PrintId));\r\n\r\nvar endpoints = builder.DataSources\r\n    .SelectMany(ds => ds.Endpoints)\r\n    .ToDictionary(e => ((RouteEndpoint)e).RoutePattern.RawText!);\r\n\r\nAssert.Equal(3, endpoints.Count);\r\n\r\n// For each layer of grouping, another filter is applies which increments the expectedId by 1 each time.\r\nawait AssertIdAsync(endpoints[\"/{id}\"], expectedPattern: \"/{id}\", expectedId: 3);\r\nawait AssertIdAsync(endpoints[\"/outer/{id}\"], expectedPattern: \"/outer/{id}\", expectedId: 4);\r\nawait AssertIdAsync(endpoints[\"/outer/inner/{id}\"], expectedPattern: \"/outer/inner/{id}\", expectedId: 5);\r\n```\r\n\r\nFixes #41427\r\nFixes #42137\r\nFixes #41722",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2022-06-17T16:26:52Z",
+    "issue_context": {
+        "number": 41427,
+        "title": "[Route Groups] Support AddFilter, WithOpenApi and other additive conventions",
+        "body": "Many metadata-adding extension methods like `RequireCors()`, `RequireAuthorization()`, `WithGroupName()`, etc... can already be applied to an entire group using the `GroupRouteBuilder` added in #36007.\r\n\r\nHowever, extension methods like `AddFilter` for `RouteHandlerBuilder` don't work because `GroupRouteBuilder` is not a `RouteHandlerBuilder`. This makes it impossible to apply a route handler filter to a group of endpoints today.\r\n\r\n\r\n### Describe the solution you'd like\r\n\r\nOriginally there was a proposal to add an `public void OfBuilder<T>(Action<T> configureBuilder) where T : IEndpointConventionBuilder;` method to `GroupRouteBuilder` that would support types like `RouteHandlerBuilder`, but that wasn't approved for the initial design. This is partially due to the ugliness of using an `Action<T>` to use the  `RouteHandlerBuilder` and the ugliness of the `IGroupEndpointDataSource` interfaces required to support the API.\r\n\r\nNow I'm thinking it could be some abstract static interface method on the type implementing IEndpointConventionBuilder (e.g. RouteHandlerBuilder) could construct itself using an arbitrary IEndpointConventionBuilder and rely on EndpiontBuilder.Metadata to keep state.\r\n\r\n```csharp\r\ninterface IEndpointConventionBuilderFactory<TSelf>\r\n  where T : class, IEndpointConventionBuilder, IEndpointConventionBuilderFactory<TSelf>\r\n{\r\n   abstract static T CreateBuilder(IEndpointConventionBuilder builder);\r\n}\r\n// ...\r\npublic sealed class RouteHandlerBuilder : IEndpointConventionBuilder, IEndpointConventionBuilderFactory<RouteHandlerBuilder>\r\n{\r\n    // ...\r\n    // This would be called by GroupRouteBuilder.OfBuilder<T>() or whatever\r\n    // with the GroupRouteBuilder as an argument. This should allow returning T\r\n    // instead of us relying on on the caller to provide an Action<T> callback.\r\n    static RouteHandlerBuilder IEndpointConventionBuilderFactory<RouteHandlerBuilder>.CreateBuilder(IEndpointConventionBuilder builder)\r\n    {\r\n        return new RouteHandlerBuilder(builder);\r\n    }\r\n}\r\n```\r\n\r\nThe trick is going to be using EndpointBuilder.Metadata to store the RouteHanderFilterFactories and to read them so it can be rehydrated rather than assuming that the RouteHandlerBuilder returned from the initial call to MapGet/MapPost/etc... is the only RouteHandlerBuilder adding filters to a given endpoint.\r\n\r\nFiguring out exactly how we can read the metadata late enough is going to be tough. We need to create a RequestDelegate before adding group metadata given the current design. We might want to build the final handler the first time Endpoint.RequestDelegate is called so we can read the final endpoint metadata off of the HttpContext, then create a new RequestDelegate with all the filters and call that from then on out for the new endpoint. This is probably better than [locking routing globally](https://github.com/dotnet/aspnetcore/blob/4b514766b2c119fffde8b4e3290ead8861dacab1/src/Http/Routing/src/DataSourceDependentCache.cs#L64) on [RequestDelegateFactory.Create like we do today in .NET 7 previews.](https://github.com/dotnet/aspnetcore/blob/4b514766b2c119fffde8b4e3290ead8861dacab1/src/Http/Routing/src/Builder/EndpointRouteBuilderExtensions.cs#L559)",
+        "comments": [
+            "### Design meeting notes\r\n\r\n- Intro: We want AddFilter, WithOpenApi (and also things like WithTags, WithSummary, WithDescription, etc... but possibly in a different way) to work with groups. [ASP.NET Core endpoint routing type & extension hierarchy](https://gist.github.com/DamianEdwards/56a8834aa917a8b2cfd5bcb1952ba634).\r\n- AddFilter and WithOpenApi are somewhat special because we *only* want these to work with minimal endpoints and groups and not things like MapControllers. Things like WithTags, WithSummary and WithDescription can possibly be retargeted to IEndpontConventionBuilder as suggested in https://github.com/dotnet/aspnetcore/issues/41428\r\n- Ideally, we *only* want APIs and AddFilter these to work with minimal endpoints and groups, but maybe this is too hard in practice. Perhaps retargeting to IEndpontConventionBuilder instead of RouteHandlerBuiler is okay. Should GroupRouteBuilder implement an interface if extension methods are going target? (IGroupRouteBuilder?).\r\n- Routing has terrible names. IEndointRouteBuilder, IEndpointConventionBuilder, RouteHandlerBuiler. Can we fix this?\r\n- Can AddFilter be renamed to AddEndpointRouteFilter and extend IEndpointConventionBuilder directly? Retarget without the rename?\r\n\r\n### Goals\r\n- We should target AddFilter, WithOpenApi and everything else to `TBuilder where TBuilder : IEndpointConventionBuilder`.\r\n  - Open question: If we do, do we need to rename AddFilter to AddRouteHandlerFilter, AddEndpointFilter or similar?\r\n- It'd be nice to avoid building all endpoints on the first request, but not strictly required as part of this change.\r\n- It would be nice to make it possible for filters to modify endpoint metadata (https://github.com/dotnet/aspnetcore/issues/41722) even when applied to a group. With the current hacky prototype[1] the RequestDelegateFactory gets called too late after the final `Endpoint` has been created and therefore cannot participate in adding metadata.\r\n\r\n1: Here's a [hacky prototype](https://github.com/dotnet/aspnetcore/compare/3aaf4cd0f94333933e605f11d6f9b9f2923a73b9..4fd1a51f2c658f9dec3fa79dbeaac51c80d2483b). It currently rebuilds the RequestDelegate every time, but could be updated",
+            "> The trickiness with `MapGroup` is that it defines and `IEndpointRouteBuilder` that registers itself as a `EndpointDataSource` of a parent `IEndpointRouteBuilder`.\r\n> \r\n> Unfortunately, this means that the metadata from the \"inner\" `EndpointDataSource.Endpoints` has already been added by endpoint-specific `Action<EndpointBuilder>` conventions before the groupwide `Action<EndpointBuilder>` conventions time-wise. Metadata added by the groupwide conventions still get added first to the final `Endpoint.Metadata` collection returned to the root `IEndpointRouteBuilder`, but endpoint-specific conventions never \"see\" the group metadata because of how early they are run.\r\n> \r\n> That's why I suggest adding a new API. For example, `EndpointDataSource` that are group aware that allow `MapGroup` to pass in the group conventions to the \"inner\" `EndpointDataSource`. Maybe via something like:\r\n> \r\n> ```diff\r\n> public abstract class EndpointDataSource\r\n> {\r\n> +    IReadOnlyList<Endpoint> GetEndpointsForGroup(RoutePattern prefix, IEnumerable<Action<EndpointBuilder>> conventions);\r\n> }\r\n> ```\r\n> \r\n> It might be better as an interface so we could easily check which `EndpointDataSource` implemented the API.\r\n> \r\n> I don't see another great way to let existing conventions \"see\" metadata from outer groups without updating all the conventions themselves. In practice, I suspect most of the `EndpointDataSource` implementations are our own, and we can always fallback to the existing `MapGroup` behavior of reordering metadata for `EndpointDataSource` implementations that don't implement the new API.\r\n\r\nhttps://github.com/dotnet/aspnetcore/pull/41779#issuecomment-1140045463\r\n\r\nI think the above API is a better solution than the [hacky prototype](https://github.com/dotnet/aspnetcore/compare/3aaf4cd0f94333933e605f11d6f9b9f2923a73b9..4fd1a51f2c658f9dec3fa79dbeaac51c80d2483b) I linked to in the last comment even if we cached the `RequestDelegate` after the first request. To me, this seems way cleaner than calling `RequestDelegateFactory.Create()` the first time the `RequestDelegate` is run. Lazily calling `RequestDelegateFactory.Create()` in the `Endpoint.RequestDelegate` getter is still probably a good idea so all the `RequestDelegateFactory.Create()` call for a single application don't happen under a single lock.",
+            "## Background and Motivation\r\n\r\nMany metadata-adding extension methods like `RequireCors()`, `RequireAuthorization()`,` WithGroupName()`, `WithTags()`, etc... can already be applied to an entire group using `MapGroup`.\r\n\r\nHowever, `AddFilter` and `WithOpenApi` target `RouteHandlerBuilder` which don't work because (amoung other things) `RouteGroupBuilder` does not derive from `RouteHandlerBuilder`. This makes it impossible to apply a route handler filter to a group of endpoints today.\r\n\r\nIt should be possible to apply both route handler filters an OpenAPI metadata using groups. And anything done at an outer group level should have a lower precedence than anything specified directly on the endpoint. This means ideally the filters and `Func<OpenApiOperation, OpenApiOperation> configureOperation` callbacks applied to outer groups should be run before those added applied inner groups and all of that should run before anything applied directly to the endpoint.\r\n\r\nTo support this, I added a new virtual `EndpointDataSource.GetGroupedEndpoints(RouteGroupContext)` method. Then I created an internal `RouteEndointDataSource` that takes over a lot of the complicated logic that used to exist in `EndpointRouteBuilderExtensions`.\r\n\r\nThe upside of moving this logic into RouteEndointDataSource other than general cleanliness, is that as a custom EndpointDataSource, it can override EndpointDataSource.GetGroupedEndpoints(GroupContext) and inspect the full group prefix and all the group metadata before calling RequestDelegateFactory.Create() or running any filters.\r\n\r\nEven though `RequestDelegateFactory` now runs after any conventions are added to the endpoint (aside from conventions added by the `RequestDelegateFactory`), `WithOpenApi` is fixed by having the `RouteEndointDataSource` add `MethodInfo` before running any conventions. `RouteEndointDataSource` also adds any attributes as metadata. This is more similar to the previous behavior of `RequestDelegateFactory` in .NET 6 where it did not add this metadata.\r\n\r\n## Proposed API\r\n\r\n```diff\r\nnamespace Microsoft.AspNetCore.Http;\r\n\r\npublic sealed class RequestDelegateFactoryOptions\r\n{\r\n-    public IEnumerable<object>? InitialEndpointMetadata { get; init; }\r\n+    public IList<object>? EndpointMetadata { get; init; }\r\n}\r\n\r\nnamespace Microsoft.AspNetCore.Routing;\r\n\r\npublic sealed class RouteGroupBuilder : IEndpointRouteBuilder, IEndpointConventionBuilder\r\n{\r\n-    // It was too easy for this to get out of sync with RouteGroupContext.Prefix in real life given RouteGroupBuilder decorators.\r\n-    public RoutePattern GroupPrefix { get; }\r\n}\r\n\r\n+public sealed class RouteGroupContext\r\n+{\r\n+    public RouteGroupContext(RoutePattern prefix, IReadOnlyList<Action<EndpointBuilder>> conventions, IServiceProvider applicationServices);\r\n+\r\n+    public RoutePattern Prefix { get; }\r\n+    public IReadOnlyList<Action<EndpointBuilder>> Conventions { get; }\r\n+    public IServiceProvider ApplicationServices { get; }\r\n+}\r\n\r\npublic abstract class EndpointDataSource\r\n{\r\n+    // What do we think about the name? We could also separate out the parameters, but this would mean breaking\r\n+    // decorators every time we add a parameter. This is also something that will likely never be called by user code\r\n+    // unless they were decorating or implementing their own version of RouteGroupBuilder.\r\n+    // e.g. GetGroupedEndpoints(prefix, conventions, applicationServices). \r\n+    public virtual IReadOnlyList<Endpoint> GetGroupedEndpoints(RouteGroupContext context);\r\n}\r\n\r\n// The composite data source was never disposing change token registrations previously.\r\n// It also didn't even listen to change tokens from EndponitDataSources added to the observable collection late.\r\n-public sealed class CompositeEndpointDataSource : EndpointDataSource\r\n+public sealed class CompositeEndpointDataSource : EndpointDataSource, IDisposable\r\n{\r\n+    public override IReadOnlyList<Endpoint> GetGroupedEndpoints(RouteGroupContext context);\r\n+    public void Dispose();\r\n}\r\n\r\n// REVIEW: Renamed `AddFilter` to `AddRouteHandlerFilter` now that it will show up in intellisense after `MapControllers()` and stuff\r\n// Can we come up with a better name? `AddRouteFiter`? Should we rename `RouteHandlerFilterExtensions`?\r\npublic static class RouteHandlerFilterExtensions\r\n{\r\n-    public static RouteHandlerBuilder AddFilter(this RouteHandlerBuilder builder, IRouteHandlerFilter filter);\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder>(this TBuilder builder, IRouteHandlerFilter filter) where TBuilder : IEndpointConventionBuilder;\r\n\r\n-    public static RouteHandlerBuilder AddFilter<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this RouteHandlerBuilder builder)\r\n-        where TFilterType : IRouteHandlerFilter;\r\n+    public static RouteHandlerBuilder AddRouteHandlerFilter<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this RouteHandlerBuilder builder)\r\n+        where TFilterType : IRouteHandlerFilter;\r\n\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this TBuilder builder)\r\n+        where TBuilder : IEndpointConventionBuilder\r\n+        where TFilterType : IRouteHandlerFilter;\r\n\r\n+    public static RouteGroupBuilder AddRouteHandlerFilter<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this RouteGroupBuilder builder)\r\n+        where TFilterType : IRouteHandlerFilter;\r\n\r\n\r\n-    public static RouteHandlerBuilder AddFilter(this RouteHandlerBuilder builder, Func<RouteHandlerInvocationContext, RouteHandlerFilterDelegate, ValueTask<object?>> routeHandlerFilter);\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder>(this TBuilder builder, Func<RouteHandlerInvocationContext, RouteHandlerFilterDelegate, ValueTask<object?>> routeHandlerFilter)\r\n+        where TBuilder : IEndpointConventionBuilder;\r\n\r\n-    public static RouteHandlerBuilder AddFilter(this RouteHandlerBuilder builder, Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate> filterFactory);\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder>(this TBuilder builder, Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate> filterFactory)\r\n+        where TBuilder : IEndpointConventionBuilder;\r\n}\r\n\r\nnamespace Microsoft.AspNetCore.OpenApi;\r\n\r\n// REVIEW: I decided `WithOpenApi()` isn't too confusing of a name even though it shows up in places it won't work now\r\n// Do we agree this doesn't need renamed?\r\npublic static class OpenApiRouteHandlerBuilderExtensions\r\n{\r\n-    public static RouteHandlerBuilder WithOpenApi(this RouteHandlerBuilder builder);\r\n+    public static TBuilder WithOpenApi<TBuilder>(this TBuilder builder) where TBuilder : IEndpointConventionBuilder;\r\n\r\n-    public static RouteHandlerBuilder WithOpenApi(this RouteHandlerBuilder builder, Func<OpenApiOperation, OpenApiOperation> configureOperation);\r\n+    public static TBuilder WithOpenApi<TBuilder>(this TBuilder builder, Func<OpenApiOperation, OpenApiOperation> configureOperation);\r\n}\r\n```\r\n\r\n## Usage Examples\r\n\r\n```csharp\r\nstring GetString() => \"Foo\";\r\n\r\nstatic void WithLocalSummary(RouteHandlerBuilder builder)\r\n{\r\n    builder.WithOpenApi(operation =>\r\n    {\r\n        operation.Summary += $\" | Local Summary | 200 Status Response Content-Type: {operation.Responses[\"200\"].Content.Keys.Single()}\";\r\n        return operation;\r\n    });\r\n}\r\n\r\nWithLocalSummary(builder.MapDelete(\"/root\", GetString));\r\n\r\nvar outerGroup = builder.MapGroup(\"/outer\");\r\nvar innerGroup = outerGroup.MapGroup(\"/inner\");\r\n\r\nWithLocalSummary(outerGroup.MapDelete(\"/outer-a\", GetString));\r\n\r\n// The order WithOpenApi() is relative to the MapDelete() methods does not matter.\r\nouterGroup.WithOpenApi(operation =>\r\n{\r\n    operation.Summary = \"Outer Group Summary\";\r\n    return operation;\r\n});\r\n\r\nWithLocalSummary(outerGroup.MapDelete(\"/outer-b\", GetString));\r\nWithLocalSummary(innerGroup.MapDelete(\"/inner-a\", GetString));\r\n\r\ninnerGroup.WithOpenApi(operation =>\r\n{\r\n    operation.Summary += \" | Inner Group Summary\";\r\n    return operation;\r\n});\r\n\r\nWithLocalSummary(innerGroup.MapDelete(\"/inner-b\", GetString));\r\n\r\nvar summaries = builder.DataSources.SelectMany(ds => ds.Endpoints).Select(e => e.Metadata.GetMetadata<OpenApiOperation>().Summary).ToArray();\r\n\r\nAssert.Equal(5, summaries.Length);\r\nAssert.Contains(\" | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Inner Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\nAssert.Contains(\"Outer Group Summary | Inner Group Summary | Local Summary | 200 Status Response Content-Type: text/plain\", summaries);\r\n```\r\n\r\n```csharp\r\nstring PrintId(int id) => $\"ID: {id}\";\r\n\r\nstatic void AddParamIncrementingFilter(IEndpointConventionBuilder builder)\r\n{\r\n    builder.AddRouteHandlerFilter(async (context, next) =>\r\n    {\r\n        context.Arguments[0] = ((int)context.Arguments[0]!) + 1;\r\n        return await next(context);\r\n    });\r\n}\r\n\r\nAddParamIncrementingFilter(builder.Map(\"/{id}\", PrintId));\r\n\r\nvar outerGroup = builder.MapGroup(\"/outer\");\r\nAddParamIncrementingFilter(outerGroup);\r\nAddParamIncrementingFilter(outerGroup.Map(\"/{id}\", PrintId));\r\n\r\nvar innerGroup = outerGroup.MapGroup(\"/inner\");\r\nAddParamIncrementingFilter(innerGroup);\r\nAddParamIncrementingFilter(innerGroup.Map(\"/{id}\", PrintId));\r\n\r\nvar endpoints = builder.DataSources\r\n    .SelectMany(ds => ds.Endpoints)\r\n    .ToDictionary(e => ((RouteEndpoint)e).RoutePattern.RawText!);\r\n\r\nAssert.Equal(3, endpoints.Count);\r\n\r\n// For each layer of grouping, another filter is applies which increments the expectedId by 1 each time.\r\nawait AssertIdAsync(endpoints[\"/{id}\"], expectedPattern: \"/{id}\", expectedId: 3);\r\nawait AssertIdAsync(endpoints[\"/outer/{id}\"], expectedPattern: \"/outer/{id}\", expectedId: 4);\r\nawait AssertIdAsync(endpoints[\"/outer/inner/{id}\"], expectedPattern: \"/outer/inner/{id}\", expectedId: 5);\r\n```\r\n\r\n## Alternative Designs\r\n\r\nWhen discussing the original desiging in https://github.com/dotnet/aspnetcore/issues/41427#issuecomment-1130350831, I had originally planned to wait for the request to call `RequestDelegateFacotry.Create()` so only the final order of `Endpoint.Metadata` as the request came in would matter. @brunolins16 pointed out that this means you would not see any errors from `RequestDelegateFactory.Create()` until the specific endpoint being built was actually hit by a request. I think this would be a terrible development experience.\r\n\r\nFurthermore, `RequestDelegateFactory` would then be unable to modify the endpoint metadata which is a **complete non-starter**. We designed entire `IEndpointMetadataProvider` and `IEndpointParameterMetadataProvider` around adding metadata in `RequestDelegateFactory`, and we filed an issue to also make this possible for filters (#41722). That's separate public API, but that's also added fixed by #42195 which implements this proposed API. \r\n\r\nThis also allows other custom `EndopintDataSources` to observe group conventions and prefix prior to creating their `Endpoint` instances.\r\n\r\n## Risks\r\n\r\nThis preserves the prior (in .NET 7 previews at least) behavior of calling `RequestDelegateFactory.Create()` for all the endpoints when all the `Endpoint` instances are initially built. This means locking routing globally while all this is happing.\r\n\r\n",
+            "Thank you for submitting this for API review. This will be reviewed by @dotnet/aspnet-api-review at the next meeting of the ASP.NET Core API Review group. Please ensure you take a look at [the API review process documentation](https://github.com/dotnet/aspnetcore/blob/main/docs/APIReviewProcess.md) and ensure that:\n\n* The PR contains changes to the reference-assembly that describe the API change. **Or**, you have included a snippet of reference-assembly-style code that illustrates the API change.\n* The PR describes the impact to users, both positive (useful new APIs) and negative (breaking changes).\n* Someone is assigned to \"champion\" this change in the meeting, and they understand the impact and design of the change.",
+            "API Review Notes:\r\n\r\n- Demo time!\r\n- `GetGroupedEndpoints` name?\r\n  - What about `GetEndpointGroup`?\r\n  - I think I prefer this.\r\n- What about `AddRouteHandlerFilter`?\r\n  - Is it too long?\r\n  - We don't think `AddRouteHandlerFilter` could ever work with other kinds of endpoints.\r\n- Is everyone okay with the `RouteHandlerBuiler` and `RouteGroupBuilder` overloads for the typed `AddRouteHandlerFilter` method?\r\n  - I hear no objections.\r\n- What about `WithOpenApi`?\r\n  - Is it too generic?\r\n  - I did make it work if *anything* adds an `OpenApiOperation` to the metadata.\r\n\r\n```diff\r\nnamespace Microsoft.AspNetCore.Http;\r\n\r\npublic sealed class RequestDelegateFactoryOptions\r\n{\r\n-    public IEnumerable<object>? InitialEndpointMetadata { get; init; }\r\n+    public IList<object>? EndpointMetadata { get; init; }\r\n}\r\n\r\nnamespace Microsoft.AspNetCore.Routing;\r\n\r\npublic sealed class RouteGroupBuilder : IEndpointRouteBuilder, IEndpointConventionBuilder\r\n{\r\n-    // It was too easy for this to get out of sync with RouteGroupContext.Prefix in real life given RouteGroupBuilder decorators.\r\n-    public RoutePattern GroupPrefix { get; }\r\n}\r\n\r\n+public sealed class RouteGroupContext\r\n+{\r\n+    public RouteGroupContext(RoutePattern prefix, IReadOnlyList<Action<EndpointBuilder>> conventions, IServiceProvider applicationServices);\r\n+\r\n+    public RoutePattern Prefix { get; }\r\n+    public IReadOnlyList<Action<EndpointBuilder>> Conventions { get; }\r\n+    public IServiceProvider ApplicationServices { get; }\r\n+}\r\n\r\npublic abstract class EndpointDataSource\r\n{\r\n+    public virtual IReadOnlyList<Endpoint> GetEndpointGroup(RouteGroupContext context);\r\n}\r\n\r\n-public sealed class CompositeEndpointDataSource : EndpointDataSource\r\n+public sealed class CompositeEndpointDataSource : EndpointDataSource, IDisposable\r\n{\r\n+    public override IReadOnlyList<Endpoint> GetEndpointGroup(RouteGroupContext context);\r\n+    public void Dispose();\r\n}\r\n\r\npublic static class RouteHandlerFilterExtensions\r\n{\r\n-    public static RouteHandlerBuilder AddFilter(this RouteHandlerBuilder builder, IRouteHandlerFilter filter);\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder>(this TBuilder builder, IRouteHandlerFilter filter) where TBuilder : IEndpointConventionBuilder;\r\n\r\n-    public static RouteHandlerBuilder AddFilter<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this RouteHandlerBuilder builder)\r\n-        where TFilterType : IRouteHandlerFilter;\r\n+    public static RouteHandlerBuilder AddRouteHandlerFilter<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this RouteHandlerBuilder builder)\r\n+        where TFilterType : IRouteHandlerFilter;\r\n\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this TBuilder builder)\r\n+        where TBuilder : IEndpointConventionBuilder\r\n+        where TFilterType : IRouteHandlerFilter;\r\n\r\n+    public static RouteGroupBuilder AddRouteHandlerFilter<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFilterType>(this RouteGroupBuilder builder)\r\n+        where TFilterType : IRouteHandlerFilter;\r\n\r\n-    public static RouteHandlerBuilder AddFilter(this RouteHandlerBuilder builder, Func<RouteHandlerInvocationContext, RouteHandlerFilterDelegate, ValueTask<object?>> routeHandlerFilter);\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder>(this TBuilder builder, Func<RouteHandlerInvocationContext, RouteHandlerFilterDelegate, ValueTask<object?>> routeHandlerFilter)\r\n+        where TBuilder : IEndpointConventionBuilder;\r\n\r\n-    public static RouteHandlerBuilder AddFilter(this RouteHandlerBuilder builder, Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate> filterFactory);\r\n+    public static TBuilder AddRouteHandlerFilter<TBuilder>(this TBuilder builder, Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate> filterFactory)\r\n+        where TBuilder : IEndpointConventionBuilder;\r\n}\r\n\r\nnamespace Microsoft.AspNetCore.OpenApi;\r\n\r\npublic static class OpenApiRouteHandlerBuilderExtensions\r\n{\r\n-    public static RouteHandlerBuilder WithOpenApi(this RouteHandlerBuilder builder);\r\n+    public static TBuilder WithOpenApi<TBuilder>(this TBuilder builder) where TBuilder : IEndpointConventionBuilder;\r\n\r\n-    public static RouteHandlerBuilder WithOpenApi(this RouteHandlerBuilder builder, Func<OpenApiOperation, OpenApiOperation> configureOperation);\r\n+    public static TBuilder WithOpenApi<TBuilder>(this TBuilder builder, Func<OpenApiOperation, OpenApiOperation> configureOperation);\r\n}\r\n```\r\n\r\nAPI Approved!",
+            "We want to rename the new `GetEndpointGroup` back to `GetGroupedEndpoints` as originally proposed. See https://github.com/dotnet/aspnetcore/pull/42195#discussion_r901044410. Here's the proposed API diff vs what was last approved.\r\n\r\n```diff\r\nnamespace Microsoft.AspNetCore.Http;\r\n\r\npublic abstract class EndpointDataSource\r\n{\r\n-    public virtual IReadOnlyList<Endpoint> GetEndpointGroup(RouteGroupContext context);\r\n+    public virtual IReadOnlyList<Endpoint> GetGroupedEndpoints(RouteGroupContext context);\r\n}\r\n```",
+            "Thank you for submitting this for API review. This will be reviewed by @dotnet/aspnet-api-review at the next meeting of the ASP.NET Core API Review group. Please ensure you take a look at [the API review process documentation](https://github.com/dotnet/aspnetcore/blob/main/docs/APIReviewProcess.md) and ensure that:\n\n* The PR contains changes to the reference-assembly that describe the API change. **Or**, you have included a snippet of reference-assembly-style code that illustrates the API change.\n* The PR describes the impact to users, both positive (useful new APIs) and negative (breaking changes).\n* Someone is assigned to \"champion\" this change in the meeting, and they understand the impact and design of the change.",
+            "Keeping open to track reacting to feedback in https://github.com/dotnet/aspnetcore/pull/42195 and for the API proposal in https://github.com/dotnet/aspnetcore/issues/41427#issuecomment-1159903969",
+            "API review notes:\r\n- `GetEndpointGroup` implies that an `EndpointGroup` type is being returned\r\n- `GetGroupedEndpoints` has side-effects like running conventions and doing prefix pre-pending, can we come up with a name that suggests that?\r\n  - No, not really without it being really ugly :D\r\n- Let's just make sure the doc comment is really clear about what the method is supposed to be doing.\r\n\r\n```diff\r\nnamespace Microsoft.AspNetCore.Http;\r\n\r\npublic abstract class EndpointDataSource\r\n{\r\n-    public virtual IReadOnlyList<Endpoint> GetEndpointGroup(RouteGroupContext context);\r\n+    public virtual IReadOnlyList<Endpoint> GetGroupedEndpoints(RouteGroupContext context);\r\n}\r\n```\r\n\r\nAPI approved!",
+            "Reopening to track `GetEndpointGroup` -> `GetGroupedEndpoints` rename."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 13806,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/OpenApi/src/OpenApiRouteHandlerBuilderExtensions.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 54,
+            "original_line": 54,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "If I'm understanding this correctly, the callback provided to `WithOpenApi` will run on operations inserted by the parent group. So if I have something like:\r\n\r\n```\r\nvar outer = app.MapGroup(\"/1\").WithOpenApi();\r\nvar inner = outer.MapGroup(\"/2\").WithOpenApi();\r\nvar nested = inner.MapGroup(\"/3\").WithOpenApi(o => o.Summary = \"foo\");\r\nvar anotherOne = inner.MapGroup(\"/4\").WithOpenApi();\r\n```\r\n\r\nThen the operation in the summary will be applied to the operations in `inner` and `outer`? What would `anotherOne` see in this case?",
+                "Assuming that there was an endpoint added to `anotherOne` via `MapGet` or something, the path would be prefixed by \"/1/2/4\" (no 3 since `anotherOne` isn't under `nested`).\r\n\r\nIt would not see the \"foo\" summary since that was applied to the `nested`, but it would see anything done by callbacks to the `outer` and `inner` group. In this case, that's nothing.\r\n\r\nAny endpoint defined under `nested` would have a \"foo\" summary unless overridden by a more nested group or on the endpoint specifically."
+            ]
+        },
+        {
+            "hunk_id": 12347,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 128,
+            "original_line": 128,
+            "side": "RIGHT",
+            "original_position": 128,
+            "position": 128,
+            "subject_type": "line",
+            "review_comments": [
+                "So thinking about this more I think I'd like to see one change to clean up how we're handling filters currently. Instead of treating it like metadata that we have to hunt from the collection, create a `RouteHandlerEndpointBuilder` that has the list of filters instead (we would unseal RouteEndpointBuilder).\r\n\r\n```C#\r\npublic sealed class RouteHandlerEndpointBuilder : RouteEndpointBuilder\r\n{\r\n         public IReadOnlyList<Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate>>? RouteHandlerFilterFactories { get; init; }\r\n  \r\n     public RouteHandlerEndpointBuilder(\r\n       RequestDelegate requestDelegate,\r\n       RoutePattern routePattern,\r\n       int order) : base(requestDelegate, routePattern, order) { }\r\n}\r\n```\r\n\r\nI like this for a couple reasons:\r\n- It's a pattern for identifying these endpoints specifically so we can choose to skip applying metadata to endpoints based on this type.\r\n- No aggregation of RouteHandlerFilterMetadata entries is required.\r\n- We don't need to expose the `RouteHandlerFilterMetadata`.\r\n- Conventions can mutate the list.",
+                "That's a really good idea. We'd have to unseal `RouteEndpointBuilder`, but no big deal. I think we can do one better though.\r\n\r\nWe could consider adding `RouteHandlerFilterFactories` directly to `RouteEndpointBuilder`. \r\n\r\n`RequestDelegate` is just a special case of our `Delegate` handling from a functional perspective. We should still keep things as they are today if there are no filters to avoid any possible startup penalty and trimming issues. But if someone does apply a filter to a `RequestDelegate` call to `MapPost(...)`, etc..., they should get to have their filter run on it if they want to.\r\n\r\nI know this also means if someone calls something `MapControllers()`, `MapHub<Hub>()` in a filtered group, the filters will run on those endpoints too, but I think most developers will actually really enjoy seeing the all registered routes and stuff in their filters if they filter an entire group. It's easy to separate Controllers and Hubs from other routes in the group so they don't get filtered if you want. It's also easy enough for a filter to skip over route handlers `Delegate`s that are really just `RequestDelegate`s if you want to incur no per-request performance penalty.\r\n\r\nThis would involve calling RDF.Create() in `RouteEndpointBuilder.Build()` if and only if there are filters set. I know it might sound like going too far, but I really think it's super powerful and worth doing if we make it clear this is how filters work, and make it very easy to choose to no-op in your filter for plain `RequestDelegate`'s if you want to and incur no per request performance penalty. People writing their own debugging and diagnostic tools are going to love it. I might write a few now to show it off.",
+                "I've done this. See [this commit](https://github.com/dotnet/aspnetcore/pull/42195/commits/1aa70bb60e8d64b748c8fb8a45cbbf121b3ce2fb) for most of the implementation. Absolutely zero cost per-request unless a filter is added directly to the `RouteEndpointBuilder` *and* the filter actually modifies the per-invocation `RouteHandlerFilterDelegate`. If the filter does modify `RouteHandlerFilterDelegate` for the `RequestDelegate` endpoint, the modified `RouteHandlerFilterDelegate` does run of course, but that's what you asked for. A `RequestDelegate` is just one kind a `Delegate` after all. And aside from applying filters and handling `Task<T>`-returning `RequestDelegate`s (for more than just `MapGet` after that commit I might add), RDF does not change the behavior of the `RequestDelegate` compared to just running it directly.\r\n\r\nThis is all new API in .NET 7. No one is forcing anyone to `AddRouteHandlerFilter`s to everyday plain-`RequestDelegate` backed `RouteEndpointBuilder`s, but if you do, it's' very nice to have them run. What's really nice is this allows filters to run on practically any endpoint in existence. `MapHub`, `MapHealthChecks`, `MapControllers`, `MapRazorPages`, etc... But again, only if you ask for it. This is the first time people can even try doing this now that `AddRouteHandlerFilter` can be applied to any `IEndpointConventionBuilder`.",
+                "I think this should be decoupled from this PR and the implementation shouldn't use RDF.",
+                "Throwing in my two cents here now that I've reviewed the change. While I can recognize that there might be compelling scenarios for it, I'm a little cautious about:\r\n\r\n- Changing our direction on whether or not route handler-filters could be applied to non-route handlers. We were committed enough to that stance to rename the API from `AddFilter` to `AddRouteHandlerFilter`. Side note: if we do want to pursue this direction then we should consider changing it back to `AddFilter`. \r\n- Invoking the RDF in all route endpoint builders. This change accounts invoking RDF from non-route handler scenarios when there are filters involved but have we considered other changes in the RDF that need to be made so that it can be invoked in more places.\r\n\r\nIn general, this seems high-risk/medium-reward and would be more sensible to approach as an independent change."
+            ]
+        },
+        {
+            "hunk_id": 12344,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": 139,
+            "original_start_line": 140,
+            "start_side": "RIGHT",
+            "line": 142,
+            "original_line": 143,
+            "side": "RIGHT",
+            "original_position": 143,
+            "position": 142,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this added before group conventions run? Same question with the method info.",
+                "Found in the description:\r\n\r\n> Even though RequestDelegateFactory now runs after any conventions are added to the endpoint (aside from conventions added by the RequestDelegateFactory), WithOpenApi is fixed by having the RouteEndointDataSource add MethodInfo before running any conventions. RouteEndointDataSource also adds any attributes as metadata. This is more similar to the previous behavior of RequestDelegateFactory in .NET 6 where it did not add this metadata.\r\n\r\nAdd this as a comment please \ud83d\ude04 "
+            ]
+        },
+        {
+            "hunk_id": 13812,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": 114,
+            "original_start_line": 114,
+            "start_side": "RIGHT",
+            "line": 122,
+            "original_line": 122,
+            "side": "RIGHT",
+            "original_position": 122,
+            "position": 122,
+            "subject_type": "line",
+            "review_comments": [
+                "What is this for? How would it show up? Are you guarding against conventions calling the delegate before it's we call into the request delegate factory?",
+                "I see now. If a convention decorates the request delegate. Then we can't set overwrite the instance. The null check is just an extra safeguard but in practice nobody would call this before it's built."
+            ]
+        },
+        {
+            "hunk_id": 13815,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointRoutingMiddleware.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we resolve this elsewhere? Doesnt it get resolved elsewhere today?",
+                "Not usually. I was also surprised by this. It's only resolved if app code wants more visibility into the `ObservableCollection<EndpointDataSource>` backing `RouteOptions.EndpointDataSources`.\r\n\r\nhttps://github.com/dotnet/aspnetcore/blob/main/src/Http/Routing/src/DependencyInjection/RoutingServiceCollectionExtensions.cs#L55-L65\r\n\r\nIf this wasn't resolved before, none of its properties accessed still, so the lazy nature of the `CompositeDataSource` makes this very inexpensive. It's only purpose in that case is disposing any `EndpointDataSource`s added to `RouteOptions.EndpointDataSources` when the host is disposed.\r\n\r\nAs you've seen (and I'm reiterating for other readers of this comment) with the changes, I've also made `CompositeDataSource` now clean up its own registrations while fixing a few race conditions and a function bug where it didn't listen for changes on newly-added data sources or stop listening to removed ones all while making it even lazier than before in that it doesn't initialize endpoints just to get a change token."
+            ]
+        },
+        {
+            "hunk_id": 13610,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": 47,
+            "original_start_line": 47,
+            "start_side": "RIGHT",
+            "line": 50,
+            "original_line": 50,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Throw vs skip?",
+                "No one is forcing anyone to put non-`RouteEndpoint`s in a group returned by `MapGroup()`. It's thrown like this since preview4 and no one has complained yet as far as I know.\r\n\r\nI know not many people have used groups yet, but non-`RouteEndpoint`s are extremely rare which I think is the main reason for the lack of complaints. Also, more people are likely to complain about throwing than skipping if they really care about the behavior in either cause. And the non-breaking change post .NET 7 is to stop throwing and start skipping if we decide that's better. We cannot walk skipping back and later throw without brreaking.\r\n\r\nLastly, a custom `EndpointDataSource` is an escape hatch if you really think you want to group non-`RouteEndpoint`s for some reason which I think is a very advanced scenario. Realistically, everyone is dealing with `RouteEndpoint`s anyway, I just don't want to completely lock that in by putting `RouteEndpoint` in the type signature of this method."
+            ]
+        },
+        {
+            "hunk_id": 13608,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 78,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 79,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "I didn't see a test for this error case. Is it because it's not really possible today?",
+                "This really only called by our tests. I put this `throw` here only to make things easier on ourselves later if we mess up authoring a test and define multiple endpoints but expect a single builder..\r\n\r\nThere are a bunch of existing tests that define a single endpoint using `MapGet` or similar and want to get a single `RouteEndpointBuilder`. They all only define one endpoint, because defining more would just make it harder to get the right builder."
+            ]
+        },
+        {
+            "hunk_id": 13820,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 76,
+            "original_line": 76,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "This syntax.... @jaredpar have you seen this pattern much?",
+                "Seen it a few times but it's pretty rare. The `==` and `!=` for primitive values is still more common. "
+            ]
+        },
+        {
+            "hunk_id": 13819,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Http.Extensions/src/RequestDelegateFactory.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 283,
+            "original_line": 283,
+            "side": "RIGHT",
+            "original_position": 140,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "Are you trying to validate that the return type wasn't modified by the logic above here? I'm not sure what value this check is adding. "
+            ]
+        },
+        {
+            "hunk_id": 12349,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 16,
+            "original_line": 16,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\ninternal sealed class RouteHandlerEndpointDataSource : EndpointDataSource\r\n```\r\n\r\nNit for consistency."
+            ]
+        },
+        {
+            "hunk_id": 13808,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 78,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 79,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "I didn't see a test for this error case. Is it because it's not really possible today?",
+                "This really only called by our tests. I put this `throw` here only to make things easier on ourselves later if we mess up authoring a test and define multiple endpoints but expect a single builder..\r\n\r\nThere are a bunch of existing tests that define a single endpoint using `MapGet` or similar and want to get a single `RouteEndpointBuilder`. They all only define one endpoint, because defining more would just make it harder to get the right builder."
+            ]
+        },
+        {
+            "hunk_id": 13807,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 35,
+            "original_line": 35,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "Can this also be `RouteEndpoint` like `RouteEndpointDataSource` is doing?",
+                "It could, and it originally was, but that's just unnecessarily restrictive.\r\n\r\nMy reason for originally having it more restrictive is because, the default implementation will throw for any non `RouteEndpoint` anyway, and if you're going to prefix with a `RoutePattern`, don't you want the `Endpoint` type with a `RoutePattern`?\r\n\r\nThe reason I ultimately decided against it is because you can override the default implementation, and maybe you can meaningfully prefix a custom endpoint or at least apply conventions to it.\r\n\r\nThe bigger thing is no caller to `GetEndpointGroup` (I still prefer `GetGroupedEndpoints`, but I digress) actually needs the return type to only be `RouteEndpoint`s. That's the biggest reason I decided against it.\r\n\r\nI kept `RouteEndpointDataSource` returning `IReadOnlyList<RoutePattern>` because its internal and was a chance to show off an obscure-ish covariant return feature introduced by C# 9, so it doesn't limit any public consumers. It has no practical benefit though.",
+                "Why does the doc comment say it returns a RouteEndPoint, is that a typo?",
+                "I also think we should rename this to what it was originally `GetGroupedEndpoints`",
+                "I agree. That can be a simple API review and follow up PR. Perhaps @anhthidao or @pedro-camargo-MSFT could do it.\r\n\r\nEdit: I've [updated the issue](https://github.com/dotnet/aspnetcore/issues/41427#issuecomment-1159903969) and marked it `api-ready-for-review`."
+            ]
+        },
+        {
+            "hunk_id": 13818,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 16,
+            "original_line": 16,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\ninternal sealed class RouteHandlerEndpointDataSource : EndpointDataSource\r\n```\r\n\r\nNit for consistency."
+            ]
+        },
+        {
+            "hunk_id": 13614,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 48,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "I was so confused by this and only remember that C# allows for this now \ud83d\ude04 ",
+                "I originally had a comment above `GetEndpointGroup` explaining that this has no practical benefit and I was just showing off a C# 9 covariant returns, but I thought it was just noise for the benefit of PR reviewers since it has no practical benefit after all. Should I add the comment back?"
+            ]
+        },
+        {
+            "hunk_id": 13607,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 35,
+            "original_line": 35,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "Can this also be `RouteEndpoint` like `RouteEndpointDataSource` is doing?",
+                "It could, and it originally was, but that's just unnecessarily restrictive.\r\n\r\nMy reason for originally having it more restrictive is because, the default implementation will throw for any non `RouteEndpoint` anyway, and if you're going to prefix with a `RoutePattern`, don't you want the `Endpoint` type with a `RoutePattern`?\r\n\r\nThe reason I ultimately decided against it is because you can override the default implementation, and maybe you can meaningfully prefix a custom endpoint or at least apply conventions to it.\r\n\r\nThe bigger thing is no caller to `GetEndpointGroup` (I still prefer `GetGroupedEndpoints`, but I digress) actually needs the return type to only be `RouteEndpoint`s. That's the biggest reason I decided against it.\r\n\r\nI kept `RouteEndpointDataSource` returning `IReadOnlyList<RoutePattern>` because its internal and was a chance to show off an obscure-ish covariant return feature introduced by C# 9, so it doesn't limit any public consumers. It has no practical benefit though.",
+                "Why does the doc comment say it returns a RouteEndPoint, is that a typo?",
+                "I also think we should rename this to what it was originally `GetGroupedEndpoints`",
+                "I agree. That can be a simple API review and follow up PR. Perhaps @anhthidao or @pedro-camargo-MSFT could do it.\r\n\r\nEdit: I've [updated the issue](https://github.com/dotnet/aspnetcore/issues/41427#issuecomment-1159903969) and marked it `api-ready-for-review`."
+            ]
+        },
+        {
+            "hunk_id": 12348,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 57,
+            "original_line": 57,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "You need to copy the filters now as well right?",
+                "I see we don't because the conventions will add them"
+            ]
+        },
+        {
+            "hunk_id": 13618,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 16,
+            "original_line": 16,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\ninternal sealed class RouteHandlerEndpointDataSource : EndpointDataSource\r\n```\r\n\r\nNit for consistency."
+            ]
+        },
+        {
+            "hunk_id": 12341,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": 47,
+            "original_start_line": 47,
+            "start_side": "RIGHT",
+            "line": 50,
+            "original_line": 50,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Throw vs skip?",
+                "No one is forcing anyone to put non-`RouteEndpoint`s in a group returned by `MapGroup()`. It's thrown like this since preview4 and no one has complained yet as far as I know.\r\n\r\nI know not many people have used groups yet, but non-`RouteEndpoint`s are extremely rare which I think is the main reason for the lack of complaints. Also, more people are likely to complain about throwing than skipping if they really care about the behavior in either cause. And the non-breaking change post .NET 7 is to stop throwing and start skipping if we decide that's better. We cannot walk skipping back and later throw without brreaking.\r\n\r\nLastly, a custom `EndpointDataSource` is an escape hatch if you really think you want to group non-`RouteEndpoint`s for some reason which I think is a very advanced scenario. Realistically, everyone is dealing with `RouteEndpoint`s anyway, I just don't want to completely lock that in by putting `RouteEndpoint` in the type signature of this method."
+            ]
+        },
+        {
+            "hunk_id": 12350,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Http.Extensions/src/RequestDelegateFactory.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 283,
+            "original_line": 283,
+            "side": "RIGHT",
+            "original_position": 140,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "Are you trying to validate that the return type wasn't modified by the logic above here? I'm not sure what value this check is adding. "
+            ]
+        },
+        {
+            "hunk_id": 12351,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 76,
+            "original_line": 76,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "This syntax.... @jaredpar have you seen this pattern much?",
+                "Seen it a few times but it's pretty rare. The `==` and `!=` for primitive values is still more common. "
+            ]
+        },
+        {
+            "hunk_id": 13616,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 128,
+            "original_line": 128,
+            "side": "RIGHT",
+            "original_position": 128,
+            "position": 128,
+            "subject_type": "line",
+            "review_comments": [
+                "So thinking about this more I think I'd like to see one change to clean up how we're handling filters currently. Instead of treating it like metadata that we have to hunt from the collection, create a `RouteHandlerEndpointBuilder` that has the list of filters instead (we would unseal RouteEndpointBuilder).\r\n\r\n```C#\r\npublic sealed class RouteHandlerEndpointBuilder : RouteEndpointBuilder\r\n{\r\n         public IReadOnlyList<Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate>>? RouteHandlerFilterFactories { get; init; }\r\n  \r\n     public RouteHandlerEndpointBuilder(\r\n       RequestDelegate requestDelegate,\r\n       RoutePattern routePattern,\r\n       int order) : base(requestDelegate, routePattern, order) { }\r\n}\r\n```\r\n\r\nI like this for a couple reasons:\r\n- It's a pattern for identifying these endpoints specifically so we can choose to skip applying metadata to endpoints based on this type.\r\n- No aggregation of RouteHandlerFilterMetadata entries is required.\r\n- We don't need to expose the `RouteHandlerFilterMetadata`.\r\n- Conventions can mutate the list.",
+                "That's a really good idea. We'd have to unseal `RouteEndpointBuilder`, but no big deal. I think we can do one better though.\r\n\r\nWe could consider adding `RouteHandlerFilterFactories` directly to `RouteEndpointBuilder`. \r\n\r\n`RequestDelegate` is just a special case of our `Delegate` handling from a functional perspective. We should still keep things as they are today if there are no filters to avoid any possible startup penalty and trimming issues. But if someone does apply a filter to a `RequestDelegate` call to `MapPost(...)`, etc..., they should get to have their filter run on it if they want to.\r\n\r\nI know this also means if someone calls something `MapControllers()`, `MapHub<Hub>()` in a filtered group, the filters will run on those endpoints too, but I think most developers will actually really enjoy seeing the all registered routes and stuff in their filters if they filter an entire group. It's easy to separate Controllers and Hubs from other routes in the group so they don't get filtered if you want. It's also easy enough for a filter to skip over route handlers `Delegate`s that are really just `RequestDelegate`s if you want to incur no per-request performance penalty.\r\n\r\nThis would involve calling RDF.Create() in `RouteEndpointBuilder.Build()` if and only if there are filters set. I know it might sound like going too far, but I really think it's super powerful and worth doing if we make it clear this is how filters work, and make it very easy to choose to no-op in your filter for plain `RequestDelegate`'s if you want to and incur no per request performance penalty. People writing their own debugging and diagnostic tools are going to love it. I might write a few now to show it off.",
+                "I've done this. See [this commit](https://github.com/dotnet/aspnetcore/pull/42195/commits/1aa70bb60e8d64b748c8fb8a45cbbf121b3ce2fb) for most of the implementation. Absolutely zero cost per-request unless a filter is added directly to the `RouteEndpointBuilder` *and* the filter actually modifies the per-invocation `RouteHandlerFilterDelegate`. If the filter does modify `RouteHandlerFilterDelegate` for the `RequestDelegate` endpoint, the modified `RouteHandlerFilterDelegate` does run of course, but that's what you asked for. A `RequestDelegate` is just one kind a `Delegate` after all. And aside from applying filters and handling `Task<T>`-returning `RequestDelegate`s (for more than just `MapGet` after that commit I might add), RDF does not change the behavior of the `RequestDelegate` compared to just running it directly.\r\n\r\nThis is all new API in .NET 7. No one is forcing anyone to `AddRouteHandlerFilter`s to everyday plain-`RequestDelegate` backed `RouteEndpointBuilder`s, but if you do, it's' very nice to have them run. What's really nice is this allows filters to run on practically any endpoint in existence. `MapHub`, `MapHealthChecks`, `MapControllers`, `MapRazorPages`, etc... But again, only if you ask for it. This is the first time people can even try doing this now that `AddRouteHandlerFilter` can be applied to any `IEndpointConventionBuilder`.",
+                "I think this should be decoupled from this PR and the implementation shouldn't use RDF.",
+                "Throwing in my two cents here now that I've reviewed the change. While I can recognize that there might be compelling scenarios for it, I'm a little cautious about:\r\n\r\n- Changing our direction on whether or not route handler-filters could be applied to non-route handlers. We were committed enough to that stance to rename the API from `AddFilter` to `AddRouteHandlerFilter`. Side note: if we do want to pursue this direction then we should consider changing it back to `AddFilter`. \r\n- Invoking the RDF in all route endpoint builders. This change accounts invoking RDF from non-route handler scenarios when there are filters involved but have we considered other changes in the RDF that need to be made so that it can be invoked in more places.\r\n\r\nIn general, this seems high-risk/medium-reward and would be more sensible to approach as an independent change."
+            ]
+        },
+        {
+            "hunk_id": 13810,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": 47,
+            "original_start_line": 47,
+            "start_side": "RIGHT",
+            "line": 50,
+            "original_line": 50,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Throw vs skip?",
+                "No one is forcing anyone to put non-`RouteEndpoint`s in a group returned by `MapGroup()`. It's thrown like this since preview4 and no one has complained yet as far as I know.\r\n\r\nI know not many people have used groups yet, but non-`RouteEndpoint`s are extremely rare which I think is the main reason for the lack of complaints. Also, more people are likely to complain about throwing than skipping if they really care about the behavior in either cause. And the non-breaking change post .NET 7 is to stop throwing and start skipping if we decide that's better. We cannot walk skipping back and later throw without brreaking.\r\n\r\nLastly, a custom `EndpointDataSource` is an escape hatch if you really think you want to group non-`RouteEndpoint`s for some reason which I think is a very advanced scenario. Realistically, everyone is dealing with `RouteEndpoint`s anyway, I just don't want to completely lock that in by putting `RouteEndpoint` in the type signature of this method."
+            ]
+        },
+        {
+            "hunk_id": 13814,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 48,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "I was so confused by this and only remember that C# allows for this now \ud83d\ude04 ",
+                "I originally had a comment above `GetEndpointGroup` explaining that this has no practical benefit and I was just showing off a C# 9 covariant returns, but I thought it was just noise for the benefit of PR reviewers since it has no practical benefit after all. Should I add the comment back?"
+            ]
+        },
+        {
+            "hunk_id": 13813,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": 139,
+            "original_start_line": 140,
+            "start_side": "RIGHT",
+            "line": 142,
+            "original_line": 143,
+            "side": "RIGHT",
+            "original_position": 143,
+            "position": 142,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this added before group conventions run? Same question with the method info.",
+                "Found in the description:\r\n\r\n> Even though RequestDelegateFactory now runs after any conventions are added to the endpoint (aside from conventions added by the RequestDelegateFactory), WithOpenApi is fixed by having the RouteEndointDataSource add MethodInfo before running any conventions. RouteEndointDataSource also adds any attributes as metadata. This is more similar to the previous behavior of RequestDelegateFactory in .NET 6 where it did not add this metadata.\r\n\r\nAdd this as a comment please \ud83d\ude04 "
+            ]
+        },
+        {
+            "hunk_id": 13613,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": 139,
+            "original_start_line": 140,
+            "start_side": "RIGHT",
+            "line": 142,
+            "original_line": 143,
+            "side": "RIGHT",
+            "original_position": 143,
+            "position": 142,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this added before group conventions run? Same question with the method info.",
+                "Found in the description:\r\n\r\n> Even though RequestDelegateFactory now runs after any conventions are added to the endpoint (aside from conventions added by the RequestDelegateFactory), WithOpenApi is fixed by having the RouteEndointDataSource add MethodInfo before running any conventions. RouteEndointDataSource also adds any attributes as metadata. This is more similar to the previous behavior of RequestDelegateFactory in .NET 6 where it did not add this metadata.\r\n\r\nAdd this as a comment please \ud83d\ude04 "
+            ]
+        },
+        {
+            "hunk_id": 12337,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/OpenApi/src/OpenApiRouteHandlerBuilderExtensions.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 54,
+            "original_line": 54,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "If I'm understanding this correctly, the callback provided to `WithOpenApi` will run on operations inserted by the parent group. So if I have something like:\r\n\r\n```\r\nvar outer = app.MapGroup(\"/1\").WithOpenApi();\r\nvar inner = outer.MapGroup(\"/2\").WithOpenApi();\r\nvar nested = inner.MapGroup(\"/3\").WithOpenApi(o => o.Summary = \"foo\");\r\nvar anotherOne = inner.MapGroup(\"/4\").WithOpenApi();\r\n```\r\n\r\nThen the operation in the summary will be applied to the operations in `inner` and `outer`? What would `anotherOne` see in this case?",
+                "Assuming that there was an endpoint added to `anotherOne` via `MapGet` or something, the path would be prefixed by \"/1/2/4\" (no 3 since `anotherOne` isn't under `nested`).\r\n\r\nIt would not see the \"foo\" summary since that was applied to the `nested`, but it would see anything done by callbacks to the `outer` and `inner` group. In this case, that's nothing.\r\n\r\nAny endpoint defined under `nested` would have a \"foo\" summary unless overridden by a more nested group or on the endpoint specifically."
+            ]
+        },
+        {
+            "hunk_id": 12338,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 35,
+            "original_line": 35,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "Can this also be `RouteEndpoint` like `RouteEndpointDataSource` is doing?",
+                "It could, and it originally was, but that's just unnecessarily restrictive.\r\n\r\nMy reason for originally having it more restrictive is because, the default implementation will throw for any non `RouteEndpoint` anyway, and if you're going to prefix with a `RoutePattern`, don't you want the `Endpoint` type with a `RoutePattern`?\r\n\r\nThe reason I ultimately decided against it is because you can override the default implementation, and maybe you can meaningfully prefix a custom endpoint or at least apply conventions to it.\r\n\r\nThe bigger thing is no caller to `GetEndpointGroup` (I still prefer `GetGroupedEndpoints`, but I digress) actually needs the return type to only be `RouteEndpoint`s. That's the biggest reason I decided against it.\r\n\r\nI kept `RouteEndpointDataSource` returning `IReadOnlyList<RoutePattern>` because its internal and was a chance to show off an obscure-ish covariant return feature introduced by C# 9, so it doesn't limit any public consumers. It has no practical benefit though.",
+                "Why does the doc comment say it returns a RouteEndPoint, is that a typo?",
+                "I also think we should rename this to what it was originally `GetGroupedEndpoints`",
+                "I agree. That can be a simple API review and follow up PR. Perhaps @anhthidao or @pedro-camargo-MSFT could do it.\r\n\r\nEdit: I've [updated the issue](https://github.com/dotnet/aspnetcore/issues/41427#issuecomment-1159903969) and marked it `api-ready-for-review`."
+            ]
+        },
+        {
+            "hunk_id": 12346,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointRoutingMiddleware.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we resolve this elsewhere? Doesnt it get resolved elsewhere today?",
+                "Not usually. I was also surprised by this. It's only resolved if app code wants more visibility into the `ObservableCollection<EndpointDataSource>` backing `RouteOptions.EndpointDataSources`.\r\n\r\nhttps://github.com/dotnet/aspnetcore/blob/main/src/Http/Routing/src/DependencyInjection/RoutingServiceCollectionExtensions.cs#L55-L65\r\n\r\nIf this wasn't resolved before, none of its properties accessed still, so the lazy nature of the `CompositeDataSource` makes this very inexpensive. It's only purpose in that case is disposing any `EndpointDataSource`s added to `RouteOptions.EndpointDataSources` when the host is disposed.\r\n\r\nAs you've seen (and I'm reiterating for other readers of this comment) with the changes, I've also made `CompositeDataSource` now clean up its own registrations while fixing a few race conditions and a function bug where it didn't listen for changes on newly-added data sources or stop listening to removed ones all while making it even lazier than before in that it doesn't initialize endpoints just to get a change token."
+            ]
+        },
+        {
+            "hunk_id": 13811,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 38,
+            "original_line": 38,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "The dependency between `Endpoints` and `GetEndpointGroup` is a little scary. If you build a data source that implements Endpoints by calling `GetEndpointGroup`, it'll explode.",
+                "Don't be scared. `GetEndpointGroup` (soon to be `GetGroupedEndpoints` again) is a new method, so no one is calling it yet. If someone ever calls the base implementation this from their own `Endpoints` implementation, it will immediately stack overflow. This is something that can only realistically only happen at debug time.\r\n\r\nIt makes sense some of the handful of people writing a custom `EndpointDataSource` in the future will consolidate their logic by having `Endpoints` call their custom override of this method. And just maybe (but I doubt this), some of them will later try to switch back to the default implantation of this method and forget they were calling it from `Endpoints` (which would immediately throw a clear exception crashing the process), but I highly doubt anyone providing public and unsealed `EndpointDataSource` via a library (which I've never actually seen, and we certainly don't do anywhere except here ofc) would conceivably ever do this.\r\n\r\nI'll bet this stack overflow never happens to anyone in the first place. And even if it somehow does, it will be very easy to debug as soon as someone makes the mistake."
+            ]
+        },
+        {
+            "hunk_id": 13619,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Http.Extensions/src/RequestDelegateFactory.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 283,
+            "original_line": 283,
+            "side": "RIGHT",
+            "original_position": 140,
+            "position": 140,
+            "subject_type": "line",
+            "review_comments": [
+                "Are you trying to validate that the return type wasn't modified by the logic above here? I'm not sure what value this check is adding. "
+            ]
+        },
+        {
+            "hunk_id": 13615,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointRoutingMiddleware.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 29,
+            "original_line": 29,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we resolve this elsewhere? Doesnt it get resolved elsewhere today?",
+                "Not usually. I was also surprised by this. It's only resolved if app code wants more visibility into the `ObservableCollection<EndpointDataSource>` backing `RouteOptions.EndpointDataSources`.\r\n\r\nhttps://github.com/dotnet/aspnetcore/blob/main/src/Http/Routing/src/DependencyInjection/RoutingServiceCollectionExtensions.cs#L55-L65\r\n\r\nIf this wasn't resolved before, none of its properties accessed still, so the lazy nature of the `CompositeDataSource` makes this very inexpensive. It's only purpose in that case is disposing any `EndpointDataSource`s added to `RouteOptions.EndpointDataSources` when the host is disposed.\r\n\r\nAs you've seen (and I'm reiterating for other readers of this comment) with the changes, I've also made `CompositeDataSource` now clean up its own registrations while fixing a few race conditions and a function bug where it didn't listen for changes on newly-added data sources or stop listening to removed ones all while making it even lazier than before in that it doesn't initialize endpoints just to get a change token."
+            ]
+        },
+        {
+            "hunk_id": 12345,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 48,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "I was so confused by this and only remember that C# allows for this now \ud83d\ude04 ",
+                "I originally had a comment above `GetEndpointGroup` explaining that this has no practical benefit and I was just showing off a C# 9 covariant returns, but I thought it was just noise for the benefit of PR reviewers since it has no practical benefit after all. Should I add the comment back?"
+            ]
+        },
+        {
+            "hunk_id": 12343,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": 114,
+            "original_start_line": 114,
+            "start_side": "RIGHT",
+            "line": 122,
+            "original_line": 122,
+            "side": "RIGHT",
+            "original_position": 122,
+            "position": 122,
+            "subject_type": "line",
+            "review_comments": [
+                "What is this for? How would it show up? Are you guarding against conventions calling the delegate before it's we call into the request delegate factory?",
+                "I see now. If a convention decorates the request delegate. Then we can't set overwrite the instance. The null check is just an extra safeguard but in practice nobody would call this before it's built."
+            ]
+        },
+        {
+            "hunk_id": 12340,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Http.Extensions/test/RequestDelegateFactoryTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5748,
+            "original_line": 5748,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "These are interesting changes. So the caller of RDF.Create is now responsible for adding metadata, is that 6.0 behavior basically?",
+                "Yes. We were trying to make the RDF more \"helpful\" in .NET 7 (I'm pretty sure this was my idea), by adding more metadata for you.\r\n\r\nI figured few if any callers other than `EndpointRouteBuilderExtensions` bothered adding the `MethodInfo` or attributes anyway. I'm glad we didn't go through with it obviously. Because the lack of flexibility meant that `WithOpenApi()` on a group couldn't read the route handler's `MethodInfo` metadata because it hadn't been added by RDF yet.",
+                "Yep!"
+            ]
+        },
+        {
+            "hunk_id": 13611,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 38,
+            "original_line": 38,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "The dependency between `Endpoints` and `GetEndpointGroup` is a little scary. If you build a data source that implements Endpoints by calling `GetEndpointGroup`, it'll explode.",
+                "Don't be scared. `GetEndpointGroup` (soon to be `GetGroupedEndpoints` again) is a new method, so no one is calling it yet. If someone ever calls the base implementation this from their own `Endpoints` implementation, it will immediately stack overflow. This is something that can only realistically only happen at debug time.\r\n\r\nIt makes sense some of the handful of people writing a custom `EndpointDataSource` in the future will consolidate their logic by having `Endpoints` call their custom override of this method. And just maybe (but I doubt this), some of them will later try to switch back to the default implantation of this method and forget they were calling it from `Endpoints` (which would immediately throw a clear exception crashing the process), but I highly doubt anyone providing public and unsealed `EndpointDataSource` via a library (which I've never actually seen, and we certainly don't do anywhere except here ofc) would conceivably ever do this.\r\n\r\nI'll bet this stack overflow never happens to anyone in the first place. And even if it somehow does, it will be very easy to debug as soon as someone makes the mistake."
+            ]
+        },
+        {
+            "hunk_id": 13817,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 57,
+            "original_line": 57,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "You need to copy the filters now as well right?",
+                "I see we don't because the conventions will add them"
+            ]
+        },
+        {
+            "hunk_id": 12342,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 38,
+            "original_line": 38,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "The dependency between `Endpoints` and `GetEndpointGroup` is a little scary. If you build a data source that implements Endpoints by calling `GetEndpointGroup`, it'll explode.",
+                "Don't be scared. `GetEndpointGroup` (soon to be `GetGroupedEndpoints` again) is a new method, so no one is calling it yet. If someone ever calls the base implementation this from their own `Endpoints` implementation, it will immediately stack overflow. This is something that can only realistically only happen at debug time.\r\n\r\nIt makes sense some of the handful of people writing a custom `EndpointDataSource` in the future will consolidate their logic by having `Endpoints` call their custom override of this method. And just maybe (but I doubt this), some of them will later try to switch back to the default implantation of this method and forget they were calling it from `Endpoints` (which would immediately throw a clear exception crashing the process), but I highly doubt anyone providing public and unsealed `EndpointDataSource` via a library (which I've never actually seen, and we certainly don't do anywhere except here ofc) would conceivably ever do this.\r\n\r\nI'll bet this stack overflow never happens to anyone in the first place. And even if it somehow does, it will be very easy to debug as soon as someone makes the mistake."
+            ]
+        },
+        {
+            "hunk_id": 13612,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": 114,
+            "original_start_line": 114,
+            "start_side": "RIGHT",
+            "line": 122,
+            "original_line": 122,
+            "side": "RIGHT",
+            "original_position": 122,
+            "position": 122,
+            "subject_type": "line",
+            "review_comments": [
+                "What is this for? How would it show up? Are you guarding against conventions calling the delegate before it's we call into the request delegate factory?",
+                "I see now. If a convention decorates the request delegate. Then we can't set overwrite the instance. The null check is just an extra safeguard but in practice nobody would call this before it's built."
+            ]
+        },
+        {
+            "hunk_id": 13609,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Http.Extensions/test/RequestDelegateFactoryTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5748,
+            "original_line": 5748,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "These are interesting changes. So the caller of RDF.Create is now responsible for adding metadata, is that 6.0 behavior basically?",
+                "Yes. We were trying to make the RDF more \"helpful\" in .NET 7 (I'm pretty sure this was my idea), by adding more metadata for you.\r\n\r\nI figured few if any callers other than `EndpointRouteBuilderExtensions` bothered adding the `MethodInfo` or attributes anyway. I'm glad we didn't go through with it obviously. Because the lack of flexibility meant that `WithOpenApi()` on a group couldn't read the route handler's `MethodInfo` metadata because it hadn't been added by RDF yet.",
+                "Yep!"
+            ]
+        },
+        {
+            "hunk_id": 13809,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Http.Extensions/test/RequestDelegateFactoryTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5748,
+            "original_line": 5748,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "These are interesting changes. So the caller of RDF.Create is now responsible for adding metadata, is that 6.0 behavior basically?",
+                "Yes. We were trying to make the RDF more \"helpful\" in .NET 7 (I'm pretty sure this was my idea), by adding more metadata for you.\r\n\r\nI figured few if any callers other than `EndpointRouteBuilderExtensions` bothered adding the `MethodInfo` or attributes anyway. I'm glad we didn't go through with it obviously. Because the lack of flexibility meant that `WithOpenApi()` on a group couldn't read the route handler's `MethodInfo` metadata because it hadn't been added by RDF yet.",
+                "Yep!"
+            ]
+        },
+        {
+            "hunk_id": 12339,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 78,
+            "original_line": 79,
+            "side": "RIGHT",
+            "original_position": 79,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "I didn't see a test for this error case. Is it because it's not really possible today?",
+                "This really only called by our tests. I put this `throw` here only to make things easier on ourselves later if we mess up authoring a test and define multiple endpoints but expect a single builder..\r\n\r\nThere are a bunch of existing tests that define a single endpoint using `MapGet` or similar and want to get a single `RouteEndpointBuilder`. They all only define one endpoint, because defining more would just make it harder to get the right builder."
+            ]
+        },
+        {
+            "hunk_id": 13617,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/EndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 57,
+            "original_line": 57,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 45,
+            "subject_type": "line",
+            "review_comments": [
+                "You need to copy the filters now as well right?",
+                "I see we don't because the conventions will add them"
+            ]
+        },
+        {
+            "hunk_id": 13606,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/OpenApi/src/OpenApiRouteHandlerBuilderExtensions.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 54,
+            "original_line": 54,
+            "side": "RIGHT",
+            "original_position": 47,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "If I'm understanding this correctly, the callback provided to `WithOpenApi` will run on operations inserted by the parent group. So if I have something like:\r\n\r\n```\r\nvar outer = app.MapGroup(\"/1\").WithOpenApi();\r\nvar inner = outer.MapGroup(\"/2\").WithOpenApi();\r\nvar nested = inner.MapGroup(\"/3\").WithOpenApi(o => o.Summary = \"foo\");\r\nvar anotherOne = inner.MapGroup(\"/4\").WithOpenApi();\r\n```\r\n\r\nThen the operation in the summary will be applied to the operations in `inner` and `outer`? What would `anotherOne` see in this case?",
+                "Assuming that there was an endpoint added to `anotherOne` via `MapGet` or something, the path would be prefixed by \"/1/2/4\" (no 3 since `anotherOne` isn't under `nested`).\r\n\r\nIt would not see the \"foo\" summary since that was applied to the `nested`, but it would see anything done by callbacks to the `outer` and `inner` group. In this case, that's nothing.\r\n\r\nAny endpoint defined under `nested` would have a \"foo\" summary unless overridden by a more nested group or on the endpoint specifically."
+            ]
+        },
+        {
+            "hunk_id": 13816,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 128,
+            "original_line": 128,
+            "side": "RIGHT",
+            "original_position": 128,
+            "position": 128,
+            "subject_type": "line",
+            "review_comments": [
+                "So thinking about this more I think I'd like to see one change to clean up how we're handling filters currently. Instead of treating it like metadata that we have to hunt from the collection, create a `RouteHandlerEndpointBuilder` that has the list of filters instead (we would unseal RouteEndpointBuilder).\r\n\r\n```C#\r\npublic sealed class RouteHandlerEndpointBuilder : RouteEndpointBuilder\r\n{\r\n         public IReadOnlyList<Func<RouteHandlerContext, RouteHandlerFilterDelegate, RouteHandlerFilterDelegate>>? RouteHandlerFilterFactories { get; init; }\r\n  \r\n     public RouteHandlerEndpointBuilder(\r\n       RequestDelegate requestDelegate,\r\n       RoutePattern routePattern,\r\n       int order) : base(requestDelegate, routePattern, order) { }\r\n}\r\n```\r\n\r\nI like this for a couple reasons:\r\n- It's a pattern for identifying these endpoints specifically so we can choose to skip applying metadata to endpoints based on this type.\r\n- No aggregation of RouteHandlerFilterMetadata entries is required.\r\n- We don't need to expose the `RouteHandlerFilterMetadata`.\r\n- Conventions can mutate the list.",
+                "That's a really good idea. We'd have to unseal `RouteEndpointBuilder`, but no big deal. I think we can do one better though.\r\n\r\nWe could consider adding `RouteHandlerFilterFactories` directly to `RouteEndpointBuilder`. \r\n\r\n`RequestDelegate` is just a special case of our `Delegate` handling from a functional perspective. We should still keep things as they are today if there are no filters to avoid any possible startup penalty and trimming issues. But if someone does apply a filter to a `RequestDelegate` call to `MapPost(...)`, etc..., they should get to have their filter run on it if they want to.\r\n\r\nI know this also means if someone calls something `MapControllers()`, `MapHub<Hub>()` in a filtered group, the filters will run on those endpoints too, but I think most developers will actually really enjoy seeing the all registered routes and stuff in their filters if they filter an entire group. It's easy to separate Controllers and Hubs from other routes in the group so they don't get filtered if you want. It's also easy enough for a filter to skip over route handlers `Delegate`s that are really just `RequestDelegate`s if you want to incur no per-request performance penalty.\r\n\r\nThis would involve calling RDF.Create() in `RouteEndpointBuilder.Build()` if and only if there are filters set. I know it might sound like going too far, but I really think it's super powerful and worth doing if we make it clear this is how filters work, and make it very easy to choose to no-op in your filter for plain `RequestDelegate`'s if you want to and incur no per request performance penalty. People writing their own debugging and diagnostic tools are going to love it. I might write a few now to show it off.",
+                "I've done this. See [this commit](https://github.com/dotnet/aspnetcore/pull/42195/commits/1aa70bb60e8d64b748c8fb8a45cbbf121b3ce2fb) for most of the implementation. Absolutely zero cost per-request unless a filter is added directly to the `RouteEndpointBuilder` *and* the filter actually modifies the per-invocation `RouteHandlerFilterDelegate`. If the filter does modify `RouteHandlerFilterDelegate` for the `RequestDelegate` endpoint, the modified `RouteHandlerFilterDelegate` does run of course, but that's what you asked for. A `RequestDelegate` is just one kind a `Delegate` after all. And aside from applying filters and handling `Task<T>`-returning `RequestDelegate`s (for more than just `MapGet` after that commit I might add), RDF does not change the behavior of the `RequestDelegate` compared to just running it directly.\r\n\r\nThis is all new API in .NET 7. No one is forcing anyone to `AddRouteHandlerFilter`s to everyday plain-`RequestDelegate` backed `RouteEndpointBuilder`s, but if you do, it's' very nice to have them run. What's really nice is this allows filters to run on practically any endpoint in existence. `MapHub`, `MapHealthChecks`, `MapControllers`, `MapRazorPages`, etc... But again, only if you ask for it. This is the first time people can even try doing this now that `AddRouteHandlerFilter` can be applied to any `IEndpointConventionBuilder`.",
+                "I think this should be decoupled from this PR and the implementation shouldn't use RDF.",
+                "Throwing in my two cents here now that I've reviewed the change. While I can recognize that there might be compelling scenarios for it, I'm a little cautious about:\r\n\r\n- Changing our direction on whether or not route handler-filters could be applied to non-route handlers. We were committed enough to that stance to rename the API from `AddFilter` to `AddRouteHandlerFilter`. Side note: if we do want to pursue this direction then we should consider changing it back to `AddFilter`. \r\n- Invoking the RDF in all route endpoint builders. This change accounts invoking RDF from non-route handler scenarios when there are filters involved but have we considered other changes in the RDF that need to be made so that it can be invoked in more places.\r\n\r\nIn general, this seems high-risk/medium-reward and would be more sensible to approach as an independent change."
+            ]
+        },
+        {
+            "hunk_id": 13620,
+            "commit_id": "8e4ece67cb1583dfa627b3dd834637671b45e064",
+            "original_commit_id": "bad61768c1d05bf042943c01b5c3c0c56c16b49b",
+            "path": "src/Http/Routing/src/RouteEndpointDataSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 76,
+            "original_line": 76,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 76,
+            "subject_type": "line",
+            "review_comments": [
+                "This syntax.... @jaredpar have you seen this pattern much?",
+                "Seen it a few times but it's pretty rare. The `==` and `!=` for primitive values is still more common. "
+            ]
+        }
+    ]
+}

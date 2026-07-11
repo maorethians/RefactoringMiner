@@ -1,0 +1,481 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 65473,
+    "lang": "c_sharp",
+    "pr_title": "Adding Regex.IsMatch(Span) and RegexRunner.Scan() methods",
+    "pr_body": "Fixes https://github.com/dotnet/runtime/issues/59629\r\n\r\nThis is mainly superseding https://github.com/dotnet/runtime/pull/62509 now that the APIs have been approved. I have addressed most of the comments from @stephentoub  there except for two things which I plan to do in this PR by adding one more commit which are:\r\n- [x] Implement Regex.Run<TState> on top of Regex.Run in order to avoid duplication.\r\n- [x] For most of the tests where we are testing isMatch with string, also call in the isMatch(span) new methods to get test coverage into the new surface area.\r\n\r\nWhile I add the above two bullets into a commit, I thought of pushing this PR as it is ready for review other than those two things.\r\n",
+    "pr_comments": [
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\nThis serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, to please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "Tagging subscribers to this area: @dotnet/area-system-text-regularexpressions\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nFixes https://github.com/dotnet/runtime/issues/59629\r\n\r\nThis is mainly superseding https://github.com/dotnet/runtime/pull/62509 now that the APIs have been approved. I have addressed most of the comments from @stephentoub  there except for two things which I plan to do in this PR by adding one more commit which are:\r\n- [ ] Implement Regex.Run<TState> on top of Regex.Run in order to avoid duplication.\r\n- [ ] For most of the tests where we are testing isMatch with string, also call in the isMatch(span) new methods to get test coverage into the new surface area.\r\n\r\nWhile I add the above two bullets into a commit, I thought of pushing this PR as it is ready for review other than those two things.\r\n\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>joperezr</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Text.RegularExpressions`, `new-api-needs-documentation`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "The remaining failure is unrelated to this PR, So I\u2019ll go ahead and merge. I will also log an issue for that failure in case there isn\u2019t one yet."
+    ],
+    "merged": true,
+    "created_at": "2022-02-17T02:48:28Z",
+    "issue_context": {
+        "number": 59629,
+        "title": "Augment Regex extensibility point for better perf and span-based matching",
+        "body": "### Background and motivation\r\n\r\nThere are several related `Regex` efforts planned for .NET 7:\r\n1. Adding a regex source generator (merged into runtime in #59186)\r\n2. Adding a DFA-based engine (merged into runtime in https://github.com/dotnet/runtime/pull/60607)\r\n \r\nOn top of that, there are several long-standing issues to be addressed:\r\n\r\n3. Add support for matching with `ReadOnlySpan<char>` inputs in addition to string inputs.\r\n4. Allow regex matching to be zero-alloc.  Today, finding the locations of matches requires allocating `Match` objects (and supporting data structures) for every match (on my 64-bit machine, a successful Match(string) with no subcaptures allocates three objects for a total of ~170b).\r\n5. Continual push to improve performance of matching. #1349)\r\n \r\nEach of these brings with it some difficulties that, altogether, suggest we augment how `Regex` supports extensibility. `Regex` enables compilation of regular expressions via an extensibility point (such compilation includes in-memory with `RegexOptions.Compiled`, `Regex.CompileToAssembly` on .NET Framework, and now the `RegexGenerator` in .NET 7).  Regex exposes several protected fields (!), one of which is of type `RegexRunnerFactory`.  When the public APIs on `Regex` need to perform a match, they do so via a `RegexRunner`, and if no `RegexRunner` is available (e.g. we\u2019ve not performed a match yet), that `RegexRunnerFactory` is used to create one.  `RegexRunner` then has several abstract methods, the most important ones being `bool FindFirstChar()` and `void Go()`.  Thus, when we compile a regex, we need to produce a `RegexRunner`-derived type that overrides `FindFirstChar`/`Go`, a `RegexRunnerFactory`-derived type that overrides `CreateInstance()`, and a Regex-derived type that sets the protected factory field to an instance of this `RegexRunnerFactory`.  This is exactly what the source generator spits out for a given use of `[RegexGenerator(\u2026)]`.\r\n \r\nNow, there are a few relevant issues here:\r\n1. We can\u2019t store a span onto a `RegexRunner`, and as `FindFirstChar`/`Go` are parameterless, we don\u2019t have any way to pass a span into them.  Thus, we currently lack a means for having the code generated in overrides of these from operating on `ReadOnlySpan<char>`.  To match an input `ReadOnlySpan<char>`, we could convert the input `ReadOnlySpan<char>` into a string, but obviously that defeats the point.\r\n2. The original split between `FindFirstChar` and `Go` was likely predicated on the notion that there was no benefit to combining them because the employed matching algorithm logically splits them in this way: find a place that could match, try to match, find the next place, try to match, etc.  But that is not how a DFA-based engine operates, where every character moves to the next state, whether that character is ultimately part of the match or not.  This split is thus very artificial for a DFA-based matcher, which essentially has all of the logic in Go, with FindFirstChar effectively being a nop.\r\n3. With our current engine, it\u2019s effectively zero cost to determine the bounds of a match once we know that there is a match.  With the DFA-based engine, we don\u2019t know the starting position of a match when we determine there is a match, only the ending position, and thus we need to do more work to determine the bounds of the match.  These costs could be avoided for IsMatch operations, where the starting position isn\u2019t relevant, but whereas the internal loop today that invokes FindFirstChar/Go knows whether this is IsMatch or not, that information isn\u2019t available to overrides of FindFirstChar/Go, which means today it\u2019s unavailable to source generated code.\r\n4. Even for the existing implementation, the split between FindFirstChar and Go leads to various inefficiencies.  For example, every time we find a possible match location, we need to make two virtual calls, one to FindFirstChar and one to Go.  Each of those calls needs to load the relevant state from fields.  We end up duplicating some matching logic because FindFirstChar wants to validate some things about the match before handing it off to Go in order to avoid those exact costs through the outer bump loop.  Etc.\r\n \r\nThese issues could all be addressed internally to the library, except that doing so can\u2019t support the source generator, as doing so would require internal APIs that the code it generates can\u2019t see.  We thus need just enough new surface area to support this.  We also want to address this in the same release as shipping the source generator initially; otherwise, any implementations generated based on .NET 7 would lack the support necessary to enable these things, and all such libraries would need to be recompiled to benefit, e.g. we could make an `IsMatch(ReadOnlySpan<char>)` work without recompilation, but it would involving converting the span to a string.\r\n\r\nThis issue mostly replaces https://github.com/dotnet/runtime/issues/23602.  However, that issue proposes additional span-based Split, Replace, and {Un}Escape methods, all of which could be built once this functionality is in place.\r\n\r\n### API Proposal\r\n\r\nWe should:\r\n \r\n1. Expose a new virtual RegexRunner.Scan method:\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class RegexRunner\r\n    {\r\n+        protected virtual void Scan(ReadOnlySpan<char> text);\r\n    }\r\n}\r\n```\r\nThe base implementation would effectively contain the existing bumpalong loop that invokes both `FindFirstChar` and `Go`.  It would compare the provided span against `runtext` and set `runtext` to `span.ToString()` only if they differ (as noted below, this base implementation will rarely be used and will be there purely for compat).\r\n \r\n2. Override this `Scan` method on all our implementations and in the source generator-generated code: the only time you\u2019d get the base implementation would be if you were using an old .NET Framework-generated `CompileToAssembly` assembly, and the only time it would lead to inefficiencies is if you then used those in combination with the new span-based public APIs.  The implementations of `FindFirstChar`/`Go` for the interpreter, `RegexOptions.Compiled`, and source generator would all be combined into this single method.  `NonBacktracking` effectively already has its combined.\r\n \r\n3. Make the existing `FindFirstChar`/`Go`/`InitTrackCount` methods virtual instead of abstract. The first two would throw `NotImplementedExceptions`; the third would return `0`.  None of our implementations would need to override these methods anymore, just `Scan`.\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n  public class RegexRunner\r\n  {\r\n-    protected abstract bool FindFirstChar();\r\n-    protected abstract void Go();\r\n-    protected abstract void InitTrackCount();\r\n+    protected virtual bool FindFirstChar() => throw new NotImplementedException(); //default implementation\r\n+    protected virtual void Go() => throw new NotImplementedException(); //default implementation\r\n+    protected virtual void InitTrackCount() => return 0; //default implementation\r\n  }\r\n}\r\n```\r\n \r\n4. Add new public `IsMatch` methods to `Regex` (these are the same set of overloads as for string, but with a `ReadOnlySpan<char>` input):\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class Regex\r\n    {\r\n+        public bool IsMatch(ReadOnlySpan<char> input);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern, RegexOptions options);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern, RegexOptions options, TimeSpan matchTimeout);\r\n    }\r\n}\r\n```\r\n\r\n### API Usage\r\n\r\n```C#\r\nbool matched = Regex.IsMatch(spanInput, \"pattern\");\r\n```\r\n\r\n### Risks\r\n\r\n_No response_",
+        "comments": [
+            "Tagging subscribers to this area: @eerhardt, @dotnet/area-system-text-regularexpressions\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\n### Background and motivation\n\nThere are several related `Regex` efforts planned for .NET 7:\r\n1. Adding a regex source generator (merged into runtime in #59186)\r\n2. Adding a DFA-based engine (currently being worked on in runtimelab)\r\n \r\nOn top of that, there are several long-standing issues to be addressed:\r\n\r\n3. Add support for matching with `ReadOnlySpan<char>` inputs in addition to string inputs.\r\n4. Allow regex matching to be zero-alloc.  Today, finding the locations of matches requires allocating `Match` objects (and supporting data structures) for every match (on my 64-bit machine, a successful Match(string) with no subcaptures allocates three objects for a total of ~170b).\r\n5. Continual push to improve performance of matching. #1349)\r\n \r\nEach of these brings with it some difficulties that, altogether, suggest we augment how `Regex` supports extensibility. `Regex` enables compilation of regular expressions via an extensibility point (such compilation includes in-memory with `RegexOptions.Compiled`, `Regex.CompileToAssembly` on .NET Framework, and now the `RegexGenerator` in .NET 7).  Regex exposes several protected fields (!), one of which is of type `RegexRunnerFactory`.  When the public APIs on `Regex` need to perform a match, they do so via a `RegexRunner`, and if no `RegexRunner` is available (e.g. we\u2019ve not performed a match yet), that `RegexRunnerFactory` is used to create one.  `RegexRunner` then has several abstract methods, the most important ones being `bool FindFirstChar()` and `void Go()`.  Thus, when we compile a regex, we need to produce a `RegexRunner`-derived type that overrides `FindFirstChar`/`Go`, a `RegexRunnerFactory`-derived type that overrides `CreateInstance()`, and a Regex-derived type that sets the protected factory field to an instance of this `RegexRunnerFactory`.  This is exactly what the source generator spits out for a given use of `[RegexGenerator(\u2026)]`.\r\n \r\nNow, there are a few relevant issues here:\r\n1. We can\u2019t store a span onto a `RegexRunner`, and as `FindFirstChar`/`Go` are parameterless, we don\u2019t have any way to pass a span into them.  Thus, we currently lack a means for having the code generated in overrides of these from operating on `ReadOnlySpan<char>`.  To match an input `ReadOnlySpan<char>`, we could convert the input `ReadOnlySpan<char>` into a string, but obviously that defeats the point.\r\n2. The original split between `FindFirstChar` and `Go` was likely predicated on the notion that there was no benefit to combining them because the employed matching algorithm logically splits them in this way: find a place that could match, try to match, find the next place, try to match, etc.  But that is not how a DFA-based engine operates, where every character moves to the next state, whether that character is ultimately part of the match or not.  This split is thus very artificial for a DFA-based matcher, which essentially has all of the logic in Go, with FindFirstChar effectively being a nop.\r\n3. With our current engine, it\u2019s effectively zero cost to determine the bounds of a match once we know that there is a match.  With the DFA-based engine, we don\u2019t know the starting position of a match when we determine there is a match, only the ending position, and thus we need to do more work to determine the bounds of the match.  These costs could be avoided for IsMatch operations, where the starting position isn\u2019t relevant, but whereas the internal loop today that invokes FindFirstChar/Go knows whether this is IsMatch or not, that information isn\u2019t available to overrides of FindFirstChar/Go, which means today it\u2019s unavailable to source generated code.\r\n4. Even for the existing implementation, the split between FindFirstChar and Go leads to various inefficiencies.  For example, every time we find a possible match location, we need to make two virtual calls, one to FindFirstChar and one to Go.  Each of those calls needs to load the relevant state from fields.  We end up duplicating some matching logic because FindFirstChar wants to validate some things about the match before handing it off to Go in order to avoid those exact costs through the outer bump loop.  Etc.\r\n \r\nThese issues could all be addressed internally to the library, except that doing so can\u2019t support the source generator, as doing so would require internal APIs that the code it generates can\u2019t see.  We thus need just enough new surface area to support this.  We also want to address this in the same release as shipping the source generator initially; otherwise, any implementations generated based on .NET 7 would lack the support necessary to enable these things, and all such libraries would need to be recompiled to benefit, e.g. we could make an `IsMatch(ReadOnlySpan<char>)` work without recompilation, but it would involving converting the span to a string.\r\n\r\nThis issue mostly replaces https://github.com/dotnet/runtime/issues/23602.  However, that issue proposes additional span-based Split, Replace, and {Un}Escape methods, all of which could be built once this functionality is in place.\n\n### API Proposal\n\nThis is a work-in-progress.  We will need to prototype the APIs to confirm they\u2019re both necessary and sufficient, and augment the proposal until they are.\r\n \r\nWe should:\r\n \r\n1. Expose a new virtual RegexRunner.Scan method:\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class RegexRunner\r\n    {\r\n+        protected virtual void Scan(ReadOnlySpan<char> text);\r\n    }\r\n}\r\n```\r\nThe base implementation would effectively contain the existing bumpalong loop that invokes both `FindFirstChar` and `Go`.  It would compare the provided span against `runtext` and set `runtext` to `span.ToString()` only if they differ (as noted below, this base implementation will rarely be used and will be there purely for compat).  We would also add several new protected fields or properties to go along with the ones already there, in order to expose further information to the `Scan` method (exposing protected fields makes me feel dirty, but it\u2019s what RegexRunner already does with lots of fields):\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class RegexRunner\r\n    {\r\n+        protected bool quick; // or `bool isMatch`\r\n+        protected int timeoutMilliseconds;\r\n+        protected int previousMatchLength;\r\n    }\r\n}\r\n```\r\nThese are all inputs today to the internal `Scan` loop function and would be needed for a fully-functioning externally-provided implementation with the source generator. Alternatively, we could pass all of the values as additional arguments to the method.\r\n \r\n2. Override this `Scan` method on all our implementations and in the source generator-generated code: the only time you\u2019d get the base implementation would be if you were using an old .NET Framework-generated `CompileToAssembly` assembly, and the only time it would lead to inefficiencies is if you then used those in combination with the new span-based public APIs.  The implementations of `FindFirstChar`/`Go` for the interpreter, `RegexOptions.Compiled`, and source generator would all be combined into this single method.  `NonBacktracking` effectively already has its combined.\r\n \r\n3. Make the existing `FindFirstChar`/`Go`/`InitTrackCount` methods virtual instead of abstract. The first two would throw `NotImplementedExceptions`; the third would return `0`.  None of our implementations would need to override these methods anymore, just `Scan`.\r\n \r\n4. Add new public `IsMatch` methods to `Regex` (these are the same set of overloads as for string, but with a `ReadOnlySpan<char>` input):\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class Regex\r\n    {\r\n+        public bool IsMatch(ReadOnlySpan<char> input);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern, RegexOptions options);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern, RegexOptions options, TimeSpan matchTimeout);\r\n    }\r\n}\r\n```\r\n \r\n5.\tAdd a set of new `Enumerate` methods to `Regex`:\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class Regex\r\n    {\r\n+        public MatchPositionEnumerator Enumerate(ReadOnlySpan<char> input);\r\n+        public static MatchPositionEnumerator Enumerate(ReadOnlySpan<char> input, string pattern);\r\n+        public static MatchPositionEnumerator Enumerate(ReadOnlySpan<char> input, string pattern, RegexOptions options);\r\n+        public static MatchPositionEnumerator Enumerate(ReadOnlySpan<char> input, string pattern, RegexOptions options, TimeSpan matchTimeout);\r\n\r\n+        public ref struct MatchPositionEnumerator\r\n+        {\r\n+            public MatchPositionEnumerator GetEnumerator();\r\n+            public bool MoveNext();\r\n+            public Range Current { get; } // could also add a new struct for the return type here rather than System.Range\r\n+        }\r\n    }\r\n}\r\n```\r\n`Enumerate` would not permit access to the full list of groups and captures, just the index/offset of the top-level capture, but in doing so, these `Enumerate` methods can become amortized zero-alloc: the enumerator is a ref struct, no objects are yielded, the input is a span, and the matching engine can reuse the internal `Match` object (and its supporting arrays) just as is done today with `IsMatch` to make it ammortized zero-alloc.  If someone still needs the full details, they can fall back to using strings to begin with and the existing either `Match` or `Matches`, or (for some patterns, e.g. ones that don\u2019t have anchors or lookaheads or lookbehinds that might go beyond the matching boundaries) re-run the engine with `Match(matchString)` just on the string representing the area of the input that matched. (The trouble with adding `Regex.Match`/`Matches` overloads for spans is the `Match` and `MatchCollection` types can\u2019t store a `Span`; thus various surface area on these types couldn\u2019t function with spans, like `NextMatch`\u2026 if we were to accept that, we could add span-based methods for those as well, but it would likely be confusing and inconsistent).\n\n### API Usage\n\n```C#\r\nbool matched = Regex.IsMatch(spanInput, \"pattern\");\r\n...\r\nforeach (Range r in Regex.Enumerate(spanInput, \u201cpattern\u201d))\r\n{\r\n    Process(spanInput[r]);\r\n} \r\n```\n\n### Risks\n\n_No response_\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>stephentoub</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`api-needs-work`, `area-System.Text.RegularExpressions`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>7.0.0</td>\n  </tr>\n</table>\n</details>",
+            "@jeffhandley, this would be a good issue for someone as a way to ramp up on S.T.RE while also accomplishing several impactful results. It could be split into a handful of PRs, each moving the ball forward, e.g.\r\n\r\nPRs:\r\n1. Update the engines to read base.runtext once at the beginning of `FindFirstChar` and `Go`, `AsSpan()` it into a local,  and then all reads of the text should be via that local for the rest of the method.  All engines could be done together, or one PR each. No test changes should be needed.  At that point, the implementations are all span-based, and everything else is hooking stuff up.\r\n\r\n2. (Optional) Update the implementations to slice that span once upfront based on runtextend (and possibly runtextbeg, though that could complicate some other things around the exact indices returned for matches), and then all subsequent checks can be based on the span length instead of runtextend (and maybe 0 instead of runtextbeg). The primary goal would be cleaning up the implementation a bit and helping perf by removing bounds checks in some cases on the span accesses.  This would help highlight benefits of using span internally, but is not strictly necessary for the rest of the work.\r\n\r\n3. Refactor the existing `Scan` loop into an internal virtual method that looks like the one we'd want to expose as protected.\r\n\r\n4. Override that new virtual on each of the engines,  other than in the source generator, which would require the functionality be exposed publicly. This could be one PR per engine or one all-up. This should include changing the existing `FindFirstChar`/`Go` overrides to be non-virtual and accept the input span from the `Scan` loop; the abstract methods can then be temporarily overridden with methods that just throw `NotSupportedException`.\r\n\r\nAt this point, the internal implementations should be able to fully support span inputs (which can't be passed in yet), and it should be trivial to prototype the public surface area in order to confirm it works and get it approved.  At which point...\r\n\r\n4. Make `FindFirstChar`/`Go` virtual.\r\n\r\n5. Expose the new protected surface area and update the source generator to target it, overriding `Scan` instead of `FindFirstChar`/`Go` as was done with the other internal engines. \r\n\r\n6. Add the new public `IsMatch` methods taking spans. \r\n\r\n7. Add the new public `Enumerate` methods. \r\n\r\n8. (Optional) With one PR per interpreter,  compiled,  and source generator,  update the implementations to combine `FindFirstChar`/`Go` into a single method,  rather than being a loop that calls both.  The goal here is perf, and in the case of the source generator,  easier to understand code flow for someone reading/debugging the generated source.",
+            "cc: @veanes, @olsaarik ",
+            "Small question about the new static APIs: should they add several overloads (to stay consistent with the old API) or would it be better to add just one overload with optional parameters (to make the API simpler and easier to understand)?",
+            "> Small question about the new static APIs: should they add several overloads (to stay consistent with the old API) or would it be better to add just one overload with optional parameters (to make the API simpler and easier to understand)?\r\n\r\nTimeSpan's can't be optional, and the TimeSpan matchTimeout should be at the end to be consistent with all the other methods; it could be made nullable, but that then introduces multiple values for infinite, which I don't love.  Combine that with a desire for consistency across all the APIs, and my preference is to use multiple overloads instead of optional parameters here.  But it's something that can be discussed in API review.",
+            ">protected virtual void Scan(ReadOnlySpan<char> text);\r\n\r\nRegarding this API suggestion, I suppose you meant `protected internal virtual...` instead of just `protected` right? If not, then it isn't possible to call it from the Regex.Run method.",
+            "> I suppose you meant protected internal virtual\r\n\r\nYes. (I left out the internal part as it's an implementation detail and not part of the public signature.)",
+            "Another thing that would need to be exposed in order for this to work (with the source generator) I believe is something in `RegexRunner` to be used as a temporary match object that the new virtual `Scan` would be in charge of setting. Basically, the new Span-based `Scan` method would be in charge of gathering the captures for the passed-in span, and then saving those into this new protected match field which could then be read by `RegexRunner.Run()` method to see if the Match was successful or not. We could consider using the existing protected `RegexRunner.runmatch` field for this, but today this one is reused for doing `Match.NextMatch()` on the `Match` object returned by the existing `Match()` methods, so we probably don't want to use that one.\r\n\r\nThe additional proposed field would be something like:\r\n\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class RegexRunner\r\n    {\r\n+        protected Match? scanMatchResult;\r\n    }\r\n}\r\n```\r\n",
+            "@joperezr, can you help me understand why that's needed? You may very well be right,  but I'm not seeing it. For example,  SymbolicRegexRunner.Go is essentially the new Scan (albeit without the span argument) and doesn't need such a field:\r\nhttps://github.com/dotnet/runtime/blob/1996f3d0179bbe3464b7d47e185008bfae4d9326/src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Symbolic/SymbolicRegexRunnerFactory.cs#L90\r\nIt just uses Capture, and then the caller can see whether a match occurred by checking the state set by Capture.",
+            ">but today this one is reused for doing Match.NextMatch() on the Match object returned\r\n\r\nLooks like I got confused a bit and I was wrong about this assumption. That said, I did see that runmatch is not always set back to null after running Scan, for example, when `quick` is true (meaning when just doing `IsMatch()` and not actually returning Match to caller):\r\n\r\nhttps://github.com/dotnet/runtime/blob/1996f3d0179bbe3464b7d47e185008bfae4d9326/src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs#L190-L194\r\n\r\nAs well as when using Split/Replace:\r\n\r\nhttps://github.com/dotnet/runtime/blob/1996f3d0179bbe3464b7d47e185008bfae4d9326/src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs#L308-L313\r\n\r\nIn those cases, runmatch will be kept alive and reused and simply just reset to the right positions using:\r\n\r\nhttps://github.com/dotnet/runtime/blob/1996f3d0179bbe3464b7d47e185008bfae4d9326/src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs#L452-L462\r\n\r\nThis may mean that it is ok for us to reuse since it will never be handed out to caller, so I will continue the prototype to see if it can be reused or if we would need the additional protected field in order to not break an existing scenario.",
+            "I have updated the top level proposal and factored out the `Enumerate` method for now. The proposed APIs have been prototyped in the following draft PR: https://github.com/dotnet/runtime/pull/62509",
+            "Looks good as proposed\r\n\r\n```diff\r\nnamespace System.Text.RegularExpressions\r\n{\r\n    public class RegexRunner\r\n    {\r\n-        protected abstract bool FindFirstChar();\r\n-        protected abstract void Go();\r\n-        protected abstract void InitTrackCount();\r\n+        protected virtual bool FindFirstChar() => throw new NotImplementedException(); //default implementation\r\n+        protected virtual void Go() => throw new NotImplementedException(); //default implementation\r\n+        protected virtual void InitTrackCount() => return 0; //default implementation\r\n\r\n+        protected virtual void Scan(ReadOnlySpan<char> text);\r\n\r\n    }\r\n    public class Regex\r\n    {\r\n+        public bool IsMatch(ReadOnlySpan<char> input);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern, RegexOptions options);\r\n+        public static bool IsMatch(ReadOnlySpan<char> input, string pattern, RegexOptions options, TimeSpan matchTimeout);\r\n    }\r\n}\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 6175,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 473,
+            "original_line": 496,
+            "side": "RIGHT",
+            "original_position": 120,
+            "position": 97,
+            "subject_type": "line",
+            "review_comments": [
+                "I think you said you're going to rewrite this in this PR, so I'll hold off on reviewing it. #Resolved"
+            ]
+        },
+        {
+            "hunk_id": 6195,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.Match.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 26,
+            "original_line": 23,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 14,
+            "subject_type": "line",
+            "review_comments": [
+                "Code coverage suggests this is never invoked.  Are we missing tests?"
+            ]
+        },
+        {
+            "hunk_id": 6193,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs",
+            "start_line": 136,
+            "original_start_line": 130,
+            "start_side": "RIGHT",
+            "line": 139,
+            "original_line": 133,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 77,
+            "subject_type": "line",
+            "review_comments": [
+                "Subsequently, as part of https://github.com/dotnet/runtime/issues/62573, I do think we should consider obsoleting these methods and just making them throw PlatformNotSupportedException.  We don't use them, the docs state \"This API supports the product infrastructure and is not intended to be used directly from your code.\", and the docs also state \"Used by a Regex object generated by the CompileToAssembly method.\" which simply isn't true.",
+                "In the meantime, though, please add at least one test to make sure things aren't totally busted.  We should either validate that the API is functional or PNSE it."
+            ]
+        },
+        {
+            "hunk_id": 6194,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 377,
+            "original_line": 368,
+            "side": "RIGHT",
+            "original_position": 451,
+            "position": 460,
+            "subject_type": "line",
+            "review_comments": [
+                "It'd be good to add some simple tests that confirm these throw NIE."
+            ]
+        },
+        {
+            "hunk_id": 6180,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 529,
+            "original_line": 533,
+            "side": "RIGHT",
+            "original_position": 157,
+            "position": 153,
+            "subject_type": "line",
+            "review_comments": [
+                "Same question"
+            ]
+        },
+        {
+            "hunk_id": 6191,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Match.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 95,
+            "original_line": 87,
+            "side": "RIGHT",
+            "original_position": 22,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Nit: can you add an XML comment to this that highlights the difference from Match.Success?"
+            ]
+        },
+        {
+            "hunk_id": 6179,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 508,
+            "original_line": 511,
+            "side": "RIGHT",
+            "original_position": 135,
+            "position": 132,
+            "subject_type": "line",
+            "review_comments": [
+                "We don't need to null out runtext as was previously being done?"
+            ]
+        },
+        {
+            "hunk_id": 6189,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 103,
+            "original_line": 99,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            string? s = runtext;\r\n\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 6186,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/gen/RegexGenerator.Emitter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 344,
+            "original_line": 346,
+            "side": "RIGHT",
+            "original_position": 93,
+            "position": 91,
+            "subject_type": "line",
+            "review_comments": [
+                "That said, this method is tiny and there's little-to-no customization of it.  The function could just be deleted and its code moved into the call site.",
+                "Yeah, I believe this is what I was suggesting offline, the only customization is whether or not we should call CheckTimeout depending on if there is one or not. If we prefer to not have to generate one more method, I'm fine with keeping Scan inside regex dll and only emit FFC and Go (with new names) for now. This is how I originally had it but I believe you asked to instead move to generate Scan instead in favor of a future move away from the FFC/Go design.",
+                "I very well may have :)  It's fine as-is."
+            ]
+        },
+        {
+            "hunk_id": 6174,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": 380,
+            "original_start_line": 380,
+            "start_side": "RIGHT",
+            "line": 391,
+            "original_line": 391,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "Why don't we need to do any of this in the span-based Run overload?",
+                "We will eventually, but we don't for `IsMatch`. What I did in this PR is basically the minimum to support isMatch overload which basically is: return null if you found a match, and Match.Empty otherwise. I plan to add the rest of the body of this method when I add Count, Enumerate, etc.",
+                "Ok. FWIW, that makes it harder to review that it's doing the right thing, since it's obviously not for the coming functionality. "
+            ]
+        },
+        {
+            "hunk_id": 6188,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexCompiler.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 184,
+            "original_line": 184,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "Subsequently I'm really tempted to go and delete all of these \"macros\".  I don't know that they bring a lot of value, and frequently evolving the code means we end up adding and removing them based on the exact opcodes required.",
+                "In my opinion they do tend to make the code slightly easier to read, and also it makes our code look closer to the IL on a regular assembly so I don't mind them. I'm not opposed to removing them either, but I wouldn't be opposed to keep them either."
+            ]
+        },
+        {
+            "hunk_id": 6190,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 140,
+            "original_line": 125,
+            "side": "RIGHT",
+            "original_position": 68,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "Don't these changes break the behavior of this protected method? e.g. it's no longer setting the fields based on these values, it's no longer validating the timeout, etc.?",
+                "It does, if somebody was manually overriding this Scan method (which AFAIK the answer is nobody) they could end up setting the timeout and all of the rest of the fields twice, as tehy would have been set already via InitializeForScan and they would be resetting them.",
+                "This method isn't virtual.  I'm not asking about someone overriding it, but about someone calling it.",
+                "Oh right, sorry misunderstood your comment. Yes you are right, this is for sure breaking people directly calling this with values since pretty much all of the parameters now are thrown away essentially. If you think that there are potential consumers calling this, I could just replay the logic of re-setting the values inside this method body (with the added cost that there would be a small perf hit on CompiledToAssembly scenarios).",
+                "I expect there's close to 0 users of this, but as it stands they'd all be broken, so we should fix it unless we explicitly choose to break it, in which case we should obsolete it and make it throw PNSE. At the same time, we don't _need_ to call this method ourselves, so if you're concerned about overhead, you can call to an internal method that this also uses. It's not virtual so there are no concerns about using an override. "
+            ]
+        },
+        {
+            "hunk_id": 6187,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 458,
+            "original_line": 474,
+            "side": "RIGHT",
+            "original_position": 104,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "Technically we probably can't assume runmatch is non-null here, since a derived runner could have set it to null.  I don't think I care, though, since there's a lot of things a RegexRunner could do that will result in null refs. Just calling it out.",
+                "I can still adjust the condition and also return null when runmatch is null."
+            ]
+        },
+        {
+            "hunk_id": 6184,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 116,
+            "original_line": 96,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "This is clever. I hadn't comprehended what you were doing here before, but you're basically assuming (validly) that the span will always be a subset of the string, and you're using that to recreate the original runtextbeg and runtextend values without complicating the 99.99% case to store them earlier. Nice. A more detailed comment about that would be helpful. ",
+                "yeah the idea was to not require to pass in runtextbeg and runtextend everytime but now that I look at it again, it won't work in all cases so I think I'll have to rewrite this. The scenario where this won't work is if I do something like:\r\n\r\n```c#\r\nmyPrecompiledRegex.Match(\"Some string that has many words but I only want to test the second one\", beginning: 5, length: 6);\r\n```\r\n\r\nthe slice would only be the word `string`, but when I calculate beginning I will be incorrectly setting it to be the last 6 characters `nd one`.  I can see two possible solutions to this, one is to pass in runtextbeg every time, or the other is to special case precompiled scenario (which is the only one that cares about original runtextbeg and end) where it calls back into a new internal property in RegexRunner where we previously save the value during Run()."
+            ]
+        },
+        {
+            "hunk_id": 6182,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexInterpreter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 359,
+            "original_line": 363,
+            "side": "RIGHT",
+            "original_position": 43,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Similar question here.  Can this loop be:\r\n```C#\r\nwhile (_code.FindOptimizations.TryFindNextStartingPosition(text, ref runtextpos, runtextbeg, runtextstart, runtextend))\r\n{\r\n    CheckTimeout();\r\n\r\n    if (Go(text) || runtextpos == stoppos)\r\n    {\r\n        return;\r\n    }\r\n\r\n    // Reset state for another iteration.\r\n    runtrackpos = runtrack!.Length;\r\n    runstackpos = runstack!.Length;\r\n    runcrawlpos = runcrawl!.Length;\r\n\r\n    runtextpos += bump;\r\n}\r\n```\r\n?"
+            ]
+        },
+        {
+            "hunk_id": 6173,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 378,
+            "original_line": 378,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "I know I previously said you didn't need to pass beginning here, but I think you may need to.  The base Scan virtual implementation (that should only be used with legacy CompileToAssembly implementations) is doing this:\r\n```C#\r\n            string? s = runtext;\r\n            if (text != s) throw new Exception(...);\r\n```\r\nIf beginning isn't 0, that's going to fail erroneously, because the span won't match the runtext.  I think you'll need to store beginning into runtextbeg, and then in that base method do something like `if (s is not null && s.AsSpan(runtextbeg, runtextend) != text) throw new Exception(...)`, or something along those lines.  And augment the test we have for a precompiled assembly to try different ways of matching... today it's only calling Match, and it's not using any overloads other than the ones that just take a string:\r\nhttps://github.com/dotnet/runtime/blob/c3f57277b178e11d3a2b495bcff5888b61db1f5c/src/libraries/System.Text.RegularExpressions/tests/PrecompiledRegexScenarioTest.cs#L23-L25 #Resolved",
+                "Good catch, this was indeed broken for the other overloads with the precompiled scenario. I have fixed that and added some overload checks into that same test."
+            ]
+        },
+        {
+            "hunk_id": 6185,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/gen/RegexGenerator.Emitter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 343,
+            "original_line": 345,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 90,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n        /// <summary>Emits the body of the Scan method override.</summary>\r\n        private static void EmitScan(IndentedTextWriter writer, RegexMethod rm, string id)\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 6176,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/tests/PrecompiledRegexScenarioTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 89,
+            "original_line": 33,
+            "side": "RIGHT",
+            "original_position": 14,
+            "position": 78,
+            "subject_type": "line",
+            "review_comments": [
+                "It'd be good to test Matches as well to ensure we get back multiple matches properly, to help validate state is being set appropriately between matches.  #Resolved"
+            ]
+        },
+        {
+            "hunk_id": 6178,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 514,
+            "original_line": 517,
+            "side": "RIGHT",
+            "original_position": 141,
+            "position": 138,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 6183,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/tests/PrecompiledRegexScenarioTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 100,
+            "original_line": 52,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 90,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you also add use of Replace, Split, and Count, since those go through different code paths from IsMatch/Match/Matches? #Resolved"
+            ]
+        },
+        {
+            "hunk_id": 6196,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Capture.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 45,
+            "original_line": 45,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 39,
+            "subject_type": "line",
+            "review_comments": [
+                "Code coverage suggests that the null case is never exercised.  If it's invalid by construction, we can instead assert it's not null.  If it's potentially hittable but our tests just don't, we should add tests."
+            ]
+        },
+        {
+            "hunk_id": 6177,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/Regex.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 377,
+            "original_line": 377,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Doesn't need to be now, but we might consider deleting the above `if ((uint)length > (uint)input.Length)` check, as this `input.AsSpan(beginning, length)` is also going to validate the length (albeith the error message probably won't be as specific).",
+                "Why null it out in InternalPerformScan at all? Why not just not it out in the callers that are setting it to non-null in the first place? e.g. pseudo-code\r\n```C#\r\nrunner.runtext = input;\r\nMatch? match = runner.InternalPerformScan(...);\r\nrunner.runtext = null;\r\nreturn match;\r\n```\r\n?"
+            ]
+        },
+        {
+            "hunk_id": 6192,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexRunner.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 103,
+            "original_line": 97,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n            // This base implementation is overridden by all of the built-in engines and by all source-generated\r\n            // implementations.  The only time this should end up being used is if someone is using a Regex-derived\r\n            // type created by .NET Framework's Regex.CompileToAssembly, in which case it will have overridden\r\n            // FindFirstChar and Go but not Scan (which didn't exist yet).  This isn't an officially supported configuration,\r\n            // using assemblies built for .NET Framework and targeting .NET Framework surface area against this\r\n            // implementation, but we make a best-effort to keep things functional.\r\n            \r\n            string? s = runtext;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 6181,
+            "commit_id": "7dc8ca70e0284d28b1a443fef5dbb31d290945e9",
+            "original_commit_id": "c8da2fd5d8b841fc34845218158399cf35eb8bcf",
+            "path": "src/libraries/System.Text.RegularExpressions/gen/RegexGenerator.Emitter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 360,
+            "original_line": 370,
+            "side": "RIGHT",
+            "original_position": 117,
+            "position": 107,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this logic right?  In what situation does FindNextPossibleStartingPosition return false but it still needs to loop around again?  I would have expected the logic to be:\r\n```C#\r\nwhile (FindNextPossibleStartingPosition(text))\r\n{\r\n    if (ValidateCurrentPositionMatches(text) ||\r\n        base.runtextpos == text.Length)\r\n    {\r\n        return;\r\n    }\r\n\r\n    base.runtextpos++;\r\n}\r\n```"
+            ]
+        }
+    ]
+}

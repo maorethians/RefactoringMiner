@@ -1,0 +1,42 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 58232,
+    "lang": "c",
+    "pr_title": "net: sockets: tcp: Fix possible race between connect/recv",
+    "pr_body": "Installing recv callback with net_context_recv() after net_context_connect() left an opening for a possible race - in case the server send some data immediately after establishing TCP connection, and Zephyr did not manage to install the callback on time, the data would be lost, corrupting the stream.\r\n\r\nThis can be avoided, by installing the recv callback before the connection is triggered. As net_context_recv() called w/o timeout only registers the callback function, it should have no negative impact. The only change on the TCP side is when the connection is closed - in case TCP is in connect stage, do not call the recv callback (before this change it'd be NULL at that point).\r\n\r\nFixes #58084",
+    "pr_comments": [
+        "I tested using Zephyr 2.7 by dropping the changes related to the asynchronous connect introduced in ee720b541268ca7caa8221db226ead8de0e08bb0.\r\n\r\nI cannot reproduce the issue observed in #58084 so all good on my side. Thank you for the fix @rlubos !"
+    ],
+    "merged": true,
+    "created_at": "2023-05-30T16:15:30Z",
+    "issue_context": {
+        "number": 58084,
+        "title": "tcp: packet dropped if received right after connection is open",
+        "body": "**Describe the bug**\r\n\r\nI have a firmware based on Zephyr 2.7 (+ some backported fixes like #56324) running on a STM32L4 which connects to a Linux host. I think that the issue is still present in the latest versions of Zephyr because the code in that area is not overly different. \r\n\r\nWhat happens:\r\n- Zephyr opens a TCP connection. I see the 3-way handshake which completes\r\n- The host sends a packet as soon as the connection is established\r\n- `net_context_recv()` was not yet called at this point, since it is done at the end of `zsock_connect_ctx()`\r\n  - As a result `tcp_data_get()` sees that `conn->context->recv_cb` is NULL, thus the result is NET_DROP. The packet is ACK'ed but never handled by the application\r\n- Finally `net_context_recv()` is called in order to install the receive callback `zsock_received_cb()`, but the received packet was already dropped\r\n\r\nTo summarize, it looks like there is a window during `zsock_connect_ctx()` where a received packet can be accepted but dropped between the calls to `net_context_connect()` and `net_context_recv()`. Since the packet was ACK'ed, it will never be retransmitted by the peer.\r\n\r\nI did not observed this behaviour while using older versions of Zephyr with TCP1, but the overall architecture looks similar, so it was maybe just by luck or a different scheduling of the threads?\r\n\r\n**Expected behavior**\r\n\r\nAll packets are correctly received and processed by the firmware as soon as the connection is established. Worst case, if the packet is dropped without sending an ACK, it would be retransmitted by the peer.\r\n\r\n**Impact**\r\n\r\nThe host application waits for the answer and finally closes the connection after some timeout. This breaks our existing process.\r\n\r\n**Logs and console output**\r\n\r\nHere is a debug log where we see that `net_tcp_recv()` is called after `tcp_in()` from the 1st received packet:\r\n```\r\n[2023-05-19 15:44:53.931] [00:00:22.970,000] <dbg> net_tcp.net_tcp_connect: (xxx_send): context: 0x20012a6c, local: ::, remote: fd11:8963:2111::1  \r\n[2023-05-19 15:44:53.943] [00:00:22.980,000] <dbg> net_tcp.net_tcp_connect: (xxx_send): conn: 0x200237c8 src: fd11:8963:1c1:9:60ef:c4ff:fe4d:ffbc, dst: fd11:8963:2111::1  \r\n[2023-05-19 15:44:53.958] [00:00:23.000,000] <dbg> net_tcp.tcp_in: (xxx_send): \u00a0[LISTEN Seq=1148679436 Ack=0]  \r\n[2023-05-19 15:44:53.968] [00:00:23.010,000] <dbg> net_tcp.tcp_out_ext: (xxx_send): SYN Seq=1148679436 Len=0 \u00a0  \r\n[2023-05-19 15:44:53.977] [00:00:23.020,000] <dbg> net_tcp.tcp_send_process_no_lock: (xxx_send): SYN Seq=1148679436 Len=0\u00b7  \r\n[2023-05-19 15:44:53.988] [00:00:23.030,000] <dbg> net_tcp.tcp_send: (xxx_send): SYN Seq=1148679436 Len=0 \u00a0  \r\n[2023-05-19 15:44:54.000] [00:00:23.040,000] <dbg> net_tcp.tcp_in: (xxx_send): LISTEN->SYN_SENT  \r\n[2023-05-19 15:44:54.010] [00:00:23.050,000] <dbg> net_tcp.tcp_in: (rx_q[0]): SYN,ACK Seq=2071107776 Ack=1148679437 Len=0 [SYN_SENT Seq=1148679437 Ack=0]  \r\n[2023-05-19 15:44:54.023] [00:00:23.060,000] <dbg> net_tcp.tcp_options_check: (rx_q[0]): len=4 \u00a0  \r\n[2023-05-19 15:44:54.031] [00:00:23.070,000] <dbg> net_tcp.tcp_options_check: (rx_q[0]): opt: 2, opt_len: 4  \r\n[2023-05-19 15:44:54.040] [00:00:23.080,000] <dbg> net_tcp.tcp_options_check: (rx_q[0]): MSS=1440  \r\n[2023-05-19 15:44:54.048] [00:00:23.090,000] <dbg> net_tcp.tcp_in: (rx_q[0]): Lowering send window from 64800 to 6826  \r\n[2023-05-19 15:44:54.058] [00:00:23.100,000] <dbg> net_tcp.tcp_send_timer_cancel: (rx_q[0]): SYN Seq=1148679436 Len=0 \u00a0  \r\n[2023-05-19 15:44:54.068] [00:00:23.110,000] <dbg> net_tcp.tcp_conn_ref: (rx_q[0]): conn: 0x200237c8, ref_count: 2  \r\n[2023-05-19 15:44:54.078] [00:00:23.120,000] <dbg> net_tcp.tcp_out_ext: (rx_q[0]): ACK Seq=1148679437 Ack=2071107777 Len=0\r\n[2023-05-19 15:44:54.089] [00:00:23.130,000] <dbg> net_tcp.tcp_send_process_no_lock: (rx_q[0]): ACK Seq=1148679437 Ack=2071107777 Len=0\u00b7  \r\n[2023-05-19 15:44:54.101] [00:00:23.140,000] <dbg> net_tcp.tcp_send: (rx_q[0]): ACK Seq=1148679437 Ack=2071107777 Len=0 \u00a0  \r\n\r\n/* ACK sent, connection is open */\r\n\r\n/* Receiving the first packet - it is ACK'ed but dropped */\r\n[2023-05-19 15:44:54.111] [00:00:23.150,000] <db[00:00:23.160,000] <dbg> net_tcp.tcp_in: (rx_q[0]): ACK,PSH Seq=2071107777 Ack=1148679437 Len=10 [ESTABLISHED Seq=1148679437 Ack=2071107777]  \r\n[2023-05-19 15:44:54.131] [00:00:23.170,000] <dbg> net_tcp.tcp_in: (rx_q[0]): Lowering send window from 64800 to 6826  \r\n[2023-05-19 15:44:54.142] [00:00:23.180,000] <dbg> net_tcp.tcp_out_ext: (rx_q[0]): ACK Seq=1148679437 Ack=2071107787 Len=0\r\n[2023-05-19 15:44:54.152] [00:00:23.190,000] <dbg> net_tcp.tcp_send_process_no_lock: (rx_q[0]): ACK Seq=1148679437 Ack=2071107787 Len=0\u00b7  \r\n[2023-05-19 15:44:54.164] [00:00:23.210,000] <dbg> net_tcp.tcp_send: (rx_q[0]): ACK Seq=1148679437 Ack=2071107787 Len=0\r\n\r\n(...)\r\n\r\n/* zsock_connect_ctx() completes */\r\n[2023-05-19 15:44:54.243] [00:00:23.280,000] <dbg> net_tcp.net_tcp_connect: (xxx_send): conn: 0x200237c8, ret=0 \u00a0  \r\n[2023-05-19 15:44:54.254] [00:00:23.300,000] <dbg> net_tcp.net_tcp_recv: (xxx_send): context: 0x20012a6c, cb: 0x80383c1, user_data: (nil) \u00a0  \r\n```\r\n",
+        "comments": [
+            "@rlubos - any chance we could get a quick turnaround for this? I might be able to add it to v2.7.5 if so",
+            "I've opened https://github.com/zephyrproject-rtos/zephyr/pull/58232 to address the issue - it seems to me that it should be safe to register the recv callback before calling connect, and in result avoid the race. \r\n\r\n@cfriedt The fix most likely won't apply cleanly on the 2.7 branch, due to other changs in the TCP stack.",
+            "Thank you @rlubos for the quick fix, I will test on my side today.\r\n\r\nI tried a similar approach without success before reporting, but without your changes in the TCP stack and the ~connect callback~ (not in Zephyr 2.7). I also discovered other network issues that likely made this first test less reliable."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 27637,
+            "commit_id": "ed9a6a6e217632534668ca1254e96151d573a98d",
+            "original_commit_id": "7aa618d288fb87a1b886db342d9ce95abb00ed47",
+            "path": "subsys/net/lib/sockets/sockets.c",
+            "start_line": 524,
+            "original_start_line": 524,
+            "start_side": "RIGHT",
+            "line": 525,
+            "original_line": 525,
+            "side": "RIGHT",
+            "original_position": 40,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "This changes stop sockets for working; these lines should be before the recv function.\r\n```\r\n\r\n\t\tSET_ERRNO(net_context_connect(ctx, addr, addrlen, cb, timeout,\r\n\t\t\t\t\t      ctx->user_data));\r\n\t\tSET_ERRNO(net_context_recv(ctx, zsock_received_cb, K_NO_WAIT,\r\n\t\t\t\t\t   ctx->user_data));\r\n```"
+            ]
+        }
+    ]
+}

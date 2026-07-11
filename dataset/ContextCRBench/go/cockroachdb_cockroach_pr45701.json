@@ -1,0 +1,84 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 45701,
+    "lang": "go",
+    "pr_title": "kv: support unreplicated locks, hook up SELECT FOR UPDATE end-to-end",
+    "pr_body": "Closes #40205.\r\nCloses #43775.\r\nInforms #41720.\r\n\r\nThis change teaches the KV client and the KV API about unreplicated locks. It then adds a KeyLocking mode to ScanRequest and ReverseScanRequest, which allows their users to select the locking strength that they would like the scan to use. This locking strength defaults to None, which corresponds to the current behavior. However, some users will want to acquire locks on each row scanned, which is now possible by setting the locking strength to a stronger level. For now, only the Exclusive strength is supported.\r\n\r\nThe change then revisits SQL's row-level locking support, which is supported all the way down to the row fetcher for implicit (e.g. UPDATE) and explicit (e.g. SELECT ... FOR UPDATE) upgrade locking. The change uses the new key-locking functionality in the KV API to hook up row-level locking, completing the integration of SELECT FOR UPDATE with the KV layer and, in particular, the new lock-table structure.\r\n\r\nhttps://github.com/cockroachdb/cockroach/pull/43775 described the three main benefits of this change:\r\n- higher throughput under contention\r\n- lower latency and improved fairness under contention\r\n- a reduction in transaction retries under contention\r\n\r\nI've revisited those results a few times in the last two months and seen that the results continue to hold, and in some cases they have improved. I intend to update this PR with a more complete analysis of its impact on those three areas.\r\n\r\nRelease note (sql change): SELECT FOR UPDATE now hooks into a new leaseholder-only locking mechanism. This allows the feature to be used to improve performance of transactions that read, modify, and write contended to rows. Similarly, UPDATE statements now use this new mechanism by default, meaning that their performance under contention is improved. This is only enabled for UPDATE statements that can push their filter all the way into their key-value scan. To determine whether an UPDATE statement is implicitly using SELECT FOR UPDATE locking, look for a \"locking strength\" field in the EXPLAIN output for the statement.",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/45701)\n<!-- Reviewable:end -->\n",
+        "@rytaft do you mind signing off on the `sql: move calls to planner.maybeSetSystemConfig into execFactory` commit? This relates to the discussion we were having on slack.",
+        "In the release note, could you be a little more precise on when we implicitly apply FOR UPDATE (only when all filters are pushed down, also for UPSERT, etc)? Also, that we only support exclusive locks (auto-upgrade to that). Also, a way to use EXPLAIN to verify whether locks are implicitly acquired.\r\n\r\nVery happy to see this all go in.",
+        "> Don't forget to update the PR message with the updated release note before merge (not sure it matters, but I think they will both get picked up and so they better be the same).\r\n\r\nDone."
+    ],
+    "merged": true,
+    "created_at": "2020-03-05T10:35:16Z",
+    "issue_context": {
+        "number": 40205,
+        "title": "sql: add non-trivial implementations of FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, FOR NO KEY SHARE",
+        "body": "#40206 added parsing for the various row-level lock modes, and treats them like no-ops. This is acceptable for CockroachDB, which only supports `SERIALIZABLE` transactions, because from a client's perspective there's no way to observe whether any particular transaction needed to be restarted because of a conflict on the rows that were declared as `FOR UPDATE`, or because of some other conflict - the transaction will have to be restarted in either case.\r\n\r\nThis issue tracks improving this behavior for performance reasons. There's ongoing work in core to support at least some of these semantics.",
+        "comments": [
+            "The issue lists four lock types, which are documented in PG's docs [here](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS). Here are a few takeways from thinking about how these will play into CRDB in the future:\r\n1. CRDB does not distinguish between locking on a KV's key and locking its key and value. Because of that, I think it makes sense to upgrade all `FOR NO KEY [SHARE/UPDATE]` variants to its corresponding `FOR [SHARE/UPDATE]` locking mode. This is correct per PG's lock conflict table. The only false conflict it introduces is between `FOR NO KEY UPDATE` and `FOR KEY SHARE`. I don't think this is worth worrying about, especially because of the next point.\r\n2. We can leave the `FOR SHARE` locking mode as a no-op, as CRDB's default concurrency control scheme is already similar to this. We wouldn't want to upgrade these locking modes to `FOR UPGRADE` and introduce synthetic conflicts between multiple `FOR SHARE` locking modes. This might cause deadlocks in user applications.\r\n3. If/when we eventually introduce read-locks at the KV level, the `FOR SHARE` locking mode should line up with their semantics.\r\n\r\nIn addition to supporting these locking modes, we'll also want to use the same approach that Postgres uses for using these locking modes in UPDATE and DELETE statements. From Postgres' docs:\r\n> The FOR UPDATE lock mode is also acquired by any DELETE on a row, and also by an UPDATE that modifies the values on certain columns. Currently, the set of columns considered for the UPDATE case are those that have a unique index on them that can be used in a foreign key (so partial indexes and expressional indexes are not considered), but this may change in the future.\r\n\r\nCockroachDB implements serializability, so this is not needed for correctness, but acquiring these locks implicitly in UPDATE and DELETE statements has the potential to:\r\n1. reduce transaction retries\r\n2. improve performance by reducing thrashing and enforcing better queueing",
+            "> 1. CRDB does not distinguish between locking on a KV's key and locking its key and value. Because of that, I think it makes sense to upgrade all `FOR NO KEY [SHARE/UPDATE]` variants to its corresponding `FOR [SHARE/UPDATE]` locking mode. This is correct per PG's lock conflict table. The only false conflict it introduces is between `FOR NO KEY UPDATE` and `FOR NO KEY SHARE`. I don't think this is worth worrying about, especially because of the next point.\r\n\r\nnit: I assume you meant `FOR KEY SHARE`.\r\n\r\n> 2. We can leave the `FOR SHARE` locking mode as a no-op, as CRDB's default concurrency control scheme is already similar to this. We wouldn't want to upgrade these locking modes to `FOR UPGRADE` and introduce synthetic conflicts between multiple `FOR SHARE` locking modes. This might cause deadlocks in user applications.\r\n> 3. If/when we eventually introduce read-locks at the KV level, the `FOR SHARE` locking mode should line up with their semantics.\r\n\r\nI'm not clear about how not \"worth worrying about\" is not contradicted by bullet 3 -- if upgrading `KEY SHARE` to `SHARE` (for a transaction that is reading keys) and `NO KEY UPDATE` to `UPDATE` (for a transaction that is updating the non key columns) can introduce deadlocks when `FOR SHARE` is implemented with locking, isn't that something to be concerned about?\r\n",
+            "> nit: I assume you meant FOR KEY SHARE.\r\n\r\nYes, updated.\r\n\r\n> isn't that something to be concerned about?\r\n\r\nI had the same thought when writing this. There is a bit of a contradiction in this reasoning, as you pointed out. We don't want to weaken these locking modes any further because then they become no-ops and not useful to expose. However, we don't want to strengthen them because then that presents the possibility of creating unexpected deadlocks for unsuspecting users. We also likely don't want to actually support them properly as that would be a large undertaking.\r\n\r\nThe way I've been reconciling this is that in my mind there are two primary row-level locking classes (`SHARE` and `UPDATE`) and each class contains two locking modes differentiated by the `KEY` vs. `NO KEY` distinction. This secondary distinction feels like a Postgres implementation detail. For instance, there is no such secondary distinction in MySQL: https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html. It also doesn't map to CockroachDB today.\r\n\r\nSo I think we have two choices here:\r\n1. reject the `KEY/NO KEY` specifier and only accept the `FOR SHARE` and `FOR UPDATE`. This isn't a terrible option as I highly doubt people use `KEY/NO KEY` frequently in practice. However, it does prevent people who currently do use these specifiers from running on CRDB without modification to their code.\r\n2. ignore uses of the `KEY/NO KEY` specifier and document that it is ignored and that only the primary row-level locking classes are considered. This does create the opportunity for deadlock if a user has built their application in such a way that they are using these clauses for correctness and not just performance. However, it does not force people who are using the specifiers for performance only from needing to modify their code.\r\n\r\nI think a strong argument could be made for both approached. @rafiss I'm curious if you have an opinion here.\r\n\r\nAlso, to add a little more context here, `KEY/NO KEY` were added to PG in this commit: https://github.com/postgres/postgres/commit/0ac5ad5134f2769ccbaefec73844f8504c4d6182 and the motivation was primarily so that they could be used internally by PG to improve concurrency between UPDATEs that did not modify the key-portion of a row and FK checks. Interestingly, our attempt to solve the same problem is through the use of column families. To this day, PG does still occasionally ignore the `KEY/NO KEY` specifiers and collapse locking modes along locking classes. This is most common when interfacing with foreign data wrappers: https://github.com/postgres/postgres/blob/1281a5c907b41e992a66deb13c3aa61888a62268/contrib/postgres_fdw/deparse.c#L1274.",
+            "I did a very unscientific Github search to see how often the various syntaxes appear in public codebases:\r\n```\r\nSELECT FROM \"FOR UPDATE\" - 523,512\r\nSELECT FROM \"FOR NO KEY UPDATE\" - 4,602\r\nSELECT FROM \"FOR SHARE\" - 112,272\r\nSELECT FROM \"FOR KEY SHARE\" - 8,796\r\n```\r\n\r\nThat is useful data that suggests that many people probably would not be affected by either choice. But apart from that, another consideration is to figure out if any ORMs generate queries with the KEY/NO KEY specifiers. I would guess none do it by default, and those that do support it probably see similar proportions of usage as above. For what it's worth, looking at some of the ORMs we are focusing on right now: Hibernate does not support it but has [an open issue](https://hibernate.atlassian.net/browse/HHH-13135) for it, and Django also does not support it [but has an open issue/PR](https://code.djangoproject.com/ticket/30375). For both of these we are creating a CockroachDB dialect/adapter, so if these issues ever do get implemented we should still be able to avoid using the KEY/NO KEY specifiers with CockroachDB, if necessary.\r\n\r\nSo I think my vote is for option 1 -- rejecting the KEY/NO KEY specifiers, and also adding telemetry on how often the unimplemented syntax is used. I worry that ignoring them (even with documentation elsewhere) will not be obvious to users, and I would claim that deadlocks happening randomly at runtime are worse than syntax errors happening deterministically at runtime. Though I'm definitely open to being convinced otherwise, and my position isn't held very strongly.\r\n\r\nI do want other stakeholders to weigh in. My understanding is that we usually only go with the \"accept the syntax but ignore it\" approach if the syntax in question has no meaning in CockroachDB and causes no behavior change... which arguably does apply in this case.",
+            "Thanks for gathering those numbers and finding references to this in Hibernate and Django Rafi!\r\n\r\nI also have conflicted opinions here, but I'm actually leaning towards option 2 for the following reasons:\r\n- after looking at some of the uses in Github, it looks like this will come up almost exclusively in ORM test suites. Rejecting these modes will prevent some tests from succeeding when they otherwise could.\r\n- The Github search also confirmed that there is [precedence](https://github.com/yugabyte/yugabyte-db/commit/dd91081cb0d53fd6e416c666d9220816d1942c8b) for treating these two strengths the same. See: `\"This is still correct but less efficient (will conflict more often than required).\"`\r\n- the two ORM discussions you posted confirm that people look at these primarily as performance optimizations.\r\n- I suspect that any developer who would actually depend on the subtleties of these locking modes would be more comfortable reading our documentation on it than developers who observe them being rejected and don't understand the difference between the modes.\r\n- It's worth keeping in mind that we do have transaction deadlock detection, so this wouldn't cause an application to deadlock indefinitely. Instead, applications would get transaction aborted errors if their use of these locking modes does cause deadlocks.\r\n\r\nAlso, keep in mind that for the next release we won't even perform any FOR SHARE locking at all, so we don't need to resolve this immediately.",
+            "@nvanbenschoten Thanks for the further reasoning -- option 2 does seem quite minimally impactful, so I'm fine with it."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14882,
+            "commit_id": "a98be1fcd5d8e8948b3602ebfeb426bb2c6cdcb5",
+            "original_commit_id": "023c83e3f31201cc8e96fd7fb5f252b936f15b08",
+            "path": "pkg/kv/kvserver/replica_evaluate_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 279,
+            "original_line": 279,
+            "side": "RIGHT",
+            "original_position": 52,
+            "position": 52,
+            "subject_type": "line",
+            "review_comments": [
+                "Test the interaction of scans that a) have a limit (=acquire only locks for keys returned) and b) return tombstones (do we put locks on the tombstone keys and is this intentional? Add commentary on the flag that turns tombstone retrieval on)."
+            ]
+        },
+        {
+            "hunk_id": 14883,
+            "commit_id": "a98be1fcd5d8e8948b3602ebfeb426bb2c6cdcb5",
+            "original_commit_id": "023c83e3f31201cc8e96fd7fb5f252b936f15b08",
+            "path": "pkg/kv/kvserver/replica_evaluate_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 432,
+            "original_line": 432,
+            "side": "RIGHT",
+            "original_position": 124,
+            "position": 201,
+            "subject_type": "line",
+            "review_comments": [
+                "What hit this?"
+            ]
+        },
+        {
+            "hunk_id": 14884,
+            "commit_id": "a98be1fcd5d8e8948b3602ebfeb426bb2c6cdcb5",
+            "original_commit_id": "023c83e3f31201cc8e96fd7fb5f252b936f15b08",
+            "path": "pkg/kv/txn_interceptor_pipeliner.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 452,
+            "original_line": 452,
+            "side": "RIGHT",
+            "original_position": 140,
+            "position": 235,
+            "subject_type": "line",
+            "review_comments": [
+                "Ah, now I understand. The footprint only has spans, it doesn't care whether a lock is replicated or not. It's just for cleanup."
+            ]
+        }
+    ]
+}

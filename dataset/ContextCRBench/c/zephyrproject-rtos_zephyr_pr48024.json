@@ -1,0 +1,86 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 48024,
+    "lang": "c",
+    "pr_title": "Extend pipes to support use from ISR",
+    "pr_body": "This set of commits updates the pipes implementation and its documentation.\r\n\r\nIt has a few notable differences as compared to the previous implementation.\r\n\r\n1. The use of schedule locking has been eliminated in favour of spinlocks. This both makes it safer for SMP and allows pipes to be used from the context of an ISR. This comes at the price of increasing interrupt latency while copying large amounts of data to/from the pipe.\r\n2. Instead of using custom copy loops depending upon the location of source and destination buffers, I've tried to unify things more so that copies are done using a sort of scatter-gather. When both writing to and reading from the pipe, we set up descriptors that track where the data is going/coming from as well as how much is list. The copying then just loops over these descriptors processing them one by one.\r\n3. The manner in which the \"working list\" is generated and linked has also been simplified. Instead of re-purposing the thread's queuing node to link the list together, the descriptors are linked together using k_pipe_desc instances on the stack.\r\n    \r\nFixes #47061",
+    "pr_comments": [
+        "Unless I missed something, the failing checks do appear related to the pipes changes.",
+        "Note that this kind of \"record used by a thread only when it's pended\" thing is something other areas might productively need to (there's something similar for k_poll vs. COHERENCE IIRC).  Might be useful to have a framework for unioning them together to save space.",
+        "This latest set of changes fixes a build error found during the last set of checks.  When CONFIG_NET_SOCKETPAIR is defined, it drags in pipe code, which in turn requires CONFIG_PIPES to be defined.\r\n"
+    ],
+    "merged": true,
+    "created_at": "2022-08-08T17:08:30Z",
+    "issue_context": {
+        "number": 47061,
+        "title": "pipes: Usage between task and ISR results in corrupted pipe state",
+        "body": "Using a pipe to marshal data between a uart isr callback and a task we ran into a case where the pipe appears to be corrupted after a call to k_pipe_get() in the ISR.\r\n\r\n```\r\nuart_isr_handler() {\r\n...\r\n   k_pipe_get(&pipe, 1)\r\n   // at this point the pipe bytes_used == 0 but read_index > write_index, expected that read_index == write_index when bytes_used == 0\r\n...\r\n```\r\n\r\nResult is that we have some corrupted bytes in the pipe that are sent via the uart.\r\n\r\nUsing zephyr 140837ce3ac6ba6ac01d804ebd40c8aaf00a3011 (we plan to upgrade to v3.1.0 shortly), there have been no kernel/pipes.c changes of consequence since this ~v3.0 git version.\r\n\r\nRunning on stm32h743zi\r\n\r\nSee pull request #47050 for additional context.\r\n\r\n\r\n**To Reproduce**\r\nWe don't have an easily reproducible test case yet. We reproduce by running some code that puts data into a pipe for the isr to transmit. Adding a task/isr test to the ztests for pipes would be one idea that came to mind.\r\n\r\n**Expected behavior**\r\n\r\nThe documentation for pipes indicates they are not allowed to be used from ISRs, however @andyross believes they should work in that context. I've been kicking myself as I've used similar approaches to pass data in other oses, like embOS, and didn't spot the \"no isr\" note until we've been using pipes for a few months. \r\n\r\nWhile the note says no ISR, and the pipes don't appear to work correctly in ISR/task context, it would be great if they did. We are going to use MessageQueue as a work around until more is known here or pipes can work in isr.\r\n\r\n**Impact**\r\nWe had to swap Pipes -> MessageQueue\r\nWhat impact does this issue have on your progress (e.g., annoyance, showstopper)\r\n\r\n**Logs and console output**\r\nNone captured yet but we can attach some if it would be helpful.\r\n\r\n",
+        "comments": [
+            "Had a chance to take a quick look.  Indeed, k_pipe is using k_sched_lock()!  I had no idea.  It has a spinlock around most of the operations, but the actual copies being done in the put() and get() internal utilities are done outside of it, it will actually release the lock and take the scheduler lock instead.\r\n\r\nThat's actually quite bad, as it means that not only is it not safe vs. interrupts, it's also not usable at all in SMP contexts.\r\n\r\nIt's almost certainly possible to fix this by replacing the use of  sched_lock with the existing spinlock.  But my guess is that the reason this was done was a concern about interrupt latency (i.e. not wanting to hold the lock for very large block copies).  So there might need to be a fallback layer that does a quick checkpoint of state than then unlocks/locks to permit interrupts to fire.  It might be as simple as putting a little for loop in at the top of k_pipe_put/get() that does the requested operation in 64 byte chunks or whatever.\r\n\r\nBut then, the whole pipes.c file seems just wildly complicated for what it does (834 lines for what amounts to a dressed up ringbuffer?), so maybe a broader rewrite is in order.\r\n\r\nMaybe @peter-mitsis wants to take a shot at this?",
+            "I've marked this as a high-prio bug given that it actually describes a real issue in the pipe functionality inside the kernel itself.",
+            "Just saw this.  I'll take a closer look.  When pipes were first written, it was assumed that Zephyr was only going to be for single core systems. With that assumption in mind, the schedule lock was used for exactly the reason that @andryross identified--reduce interrupt latency on large copies. Since that single core assumption no longer holds, it is time to revisit the implementation details.",
+            "I just wanted to leave an update here for interested parties.\r\n\r\n1. I came up with a design for pipes that should be usable from ISRs.\r\n2. The new design is much simpler, and should maintain backwards compatibility.\r\n3. On x86, this new design reduces the code size of the pipes module by about 17%, and chops out over 150+ lines of code.\r\n4. Tests are currently passing on x86.\r\n\r\nI still need to run twister to test against multiple architectures and other potential use cases.\r\n\r\nIn short, things are looking good. I am a little concerned that they may be looking too good, so I will be analyzing it with a more critical eye searching for that thing that might be wrong."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 26047,
+            "commit_id": "39ca759e292cb1dc3cba47da4a88d6acd29fe501",
+            "original_commit_id": "6f8ee2cdf7dd4d746de58909204ea0ce156d5bb4",
+            "path": "kernel/pipes.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 518,
+            "original_line": 518,
+            "side": "RIGHT",
+            "original_position": 643,
+            "position": 665,
+            "subject_type": "line",
+            "review_comments": [
+                "The logic in this loop is almost but not quite identical to the same copy loop in k_pipe_put(), and I'm wondering if it's worth further unifying the treatment.  Both schemes are just iterating over two lists of buffers to copy N bytes between them, it's just that one side of each version is guaranteed to have only one element (the buffer provided to the API by the caller).\r\n\r\nBut beyond that?  They're the same code.  And the \"only one element\" distinction is something that can be handled with just one extra test at the top of the loop (and an extra dummy list head somewhere).\r\n\r\nI love the semantic unification of this PR, but it does seem like there's more fruit on the tree.",
+                "Let's see what I can do. :)",
+                "On the surface, there are a lot of similarities in the two loops. So much so that it does seem natural enough to want to unify them. However, there are a substantial number of minor differences that stem from the direction that data flows (adding vs subtraction, whether its a source or destination descriptor's thread that must be NULL, ...) . With the current proposal, my initial attempts just generate a hacky mess--nothing elegant (yet).\r\n\r\nConsequently, I would like to propose that we track this specific cleanup request as an enhancement."
+            ]
+        },
+        {
+            "hunk_id": 26046,
+            "commit_id": "39ca759e292cb1dc3cba47da4a88d6acd29fe501",
+            "original_commit_id": "6f8ee2cdf7dd4d746de58909204ea0ce156d5bb4",
+            "path": "kernel/pipes.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 375,
+            "original_line": 375,
+            "side": "RIGHT",
+            "original_position": 415,
+            "position": 434,
+            "subject_type": "line",
+            "review_comments": [
+                "Seems like this test is (or could be) already subsumed by the list exit condition in pipe_buffer_list_populate, no?",
+                "I'll revisit this.",
+                "I've been thinking about this some more and I am sure that this is still the right thing.\r\n\r\nThe routine pipe_buffer_list_populate() is used by both z_impl_k_pipe_put() and pipe_get_internal() to create a linked list of copy-work to do. Those two functions have one key difference in how the routine is used. When writing to the pipe, we do not want to call it when the pipe is full. When reading from the pipe, we do not want to call it when the pipe is empty. The problem is that from an index perspective, a full pipe looks like an empty pipe. That is, both the read and write indices are the same. The only way to currently distinguish between the two is by comparing bytes_used to size.\r\n\r\nWithout the check (whether internal to pipe_buffer_list_populate() or external to it), we run the risk of either reading a buffer size worth of data that is not there, or over-writing a buffer size worth of data."
+            ]
+        },
+        {
+            "hunk_id": 26045,
+            "commit_id": "39ca759e292cb1dc3cba47da4a88d6acd29fe501",
+            "original_commit_id": "6f8ee2cdf7dd4d746de58909204ea0ce156d5bb4",
+            "path": "kernel/pipes.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 406,
+            "original_line": 406,
+            "side": "RIGHT",
+            "original_position": 486,
+            "position": 507,
+            "subject_type": "line",
+            "review_comments": [
+                "Seems like this is doing the entire transfer inside a spinlock?  I'm not completely opposed, but this is a genuine latency cost: apps which do large transfers using k_pipe are going to see significantly higher worst-case interrupt latencies.",
+                "Yes, it is doing it all inside a spinlock. There definitely are latency costs when transferring large amounts of data at once. I thought that I had made mention of this somewhere, but perhaps that was an earlier draft. I should update the documentation to make note of this.\r\n\r\nThe source of this stems from the initial design decision that is systemic throughout the Zephyr kernel--if someone is waiting on a resource when it is made available, we assign it immediately to the first waiter(s)."
+            ]
+        }
+    ]
+}

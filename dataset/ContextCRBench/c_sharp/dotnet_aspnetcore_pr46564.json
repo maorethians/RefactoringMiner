@@ -1,0 +1,48 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 46564,
+    "lang": "c_sharp",
+    "pr_title": "Prevent NRE when body is not set",
+    "pr_body": "Fixes #46333\r\n",
+    "pr_comments": [
+        "/backport to release/7.0",
+        "Started backporting to release/7.0: https://github.com/dotnet/aspnetcore/actions/runs/4166893516",
+        "Looks like this PR hasn't been active for some time and the codebase could have been changed in the meantime.\nTo make sure no breaking changes are introduced, please remove the `pending ci rerun` label to kick off a new CI run."
+    ],
+    "merged": true,
+    "created_at": "2023-02-10T16:45:13Z",
+    "issue_context": {
+        "number": 46333,
+        "title": "OutputCacheMiddleware throws NullReferenceException when trying to serve requests from cache",
+        "body": "### Is there an existing issue for this?\r\n\r\n- [X] I have searched the existing issues\r\n\r\n### Describe the bug\r\n\r\nI saw in our logs occasional `NullReferenceException`s being thrown by OutputCacheMiddleware but wasn't able to replicate that error locally until I also added the Rate Limiting feature. Now I'm able to consistently replicate the exception.\r\n\r\nJust clone the sample project and hammer it with requests, and some of the queued requests will fail with a 500 error and a `NullReferenceException`. I have the queue set to 5, and some will fail and some will succeed. E.g. in the test I just did the first queued request failed failed, then the next two succeeded, then the last two also failed.\r\n\r\nIt seems to be specific to the case that the request is not able to be cached because cookies were set as part of the request.\r\n\r\nI don't believe this error is unique to `RateLimitingMiddleware` because I did see this error in our logs before adding that. I'm not able to replicate it in the sample project below without using the RateLimitingMiddleware.\r\n\r\n### Expected Behavior\r\n\r\n`OutputCacheMiddleware` should never throw a `NullReferenceException`\r\n\r\n### Steps To Reproduce\r\n\r\nSample project: https://github.com/DanielStout5/OutputCacheNullReferenceException\r\n\r\n### Exceptions (if any)\r\n\r\n```\r\nMicrosoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddleware: Error: An unhandled exception has occurred while executing the request.\r\n\r\nSystem.NullReferenceException: Object reference not set to an instance of an object.\r\n   at Microsoft.AspNetCore.OutputCaching.OutputCacheMiddleware.TryServeCachedResponseAsync(OutputCacheContext context, OutputCacheEntry cacheEntry, IReadOnlyList`1 policies)\r\n   at Microsoft.AspNetCore.OutputCaching.OutputCacheMiddleware.InvokeAwaited(HttpContext httpContext, IReadOnlyList`1 policies)\r\n   at Microsoft.AspNetCore.Authorization.AuthorizationMiddleware.Invoke(HttpContext context)\r\n   at Microsoft.AspNetCore.RateLimiting.RateLimitingMiddleware.InvokeInternal(HttpContext context, EnableRateLimitingAttribute enableRateLimitingAttribute)\r\n   at Microsoft.AspNetCore.Authentication.AuthenticationMiddleware.Invoke(HttpContext context)\r\n   at Microsoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddlewareImpl.Invoke(HttpContext context)\r\n```\r\n\r\n### .NET Version\r\n\r\n7.0.101\r\n\r\n### Anything else?\r\n\r\nASP.NET Core 7.0.2\r\n\r\nVisual Studio 2022",
+        "comments": [
+            "I think I identified two bugs:\r\n\r\n- First the body can be null (empty body) which is what the sample is showing. We need to handle that case for queries that could be cached. But this wouldn't be an issue in that sample without the next bug because the `Set-Cookie` header should prevent the entry from being cached in the first place.\r\n- Second bug is related to Locking. We are not checking if the `AllowStorage` property is modified by the first request after the initial check:\r\n\r\nHere we check if the current request can be cached: https://github.com/dotnet/aspnetcore/blob/main/src/Middleware/OutputCaching/src/OutputCacheMiddleware.cs#L120\r\n\r\nImagine this is the first request, it will be actually executed while others \"in the queue\" will wait for it to finish (this is why Rate Limiting is exacerbating this bug, it's easier to get requests all coming at the same time).\r\nThe `executed` boolean is `true` for the first request and will be returned to the http client, while the other awaiting requests will go to https://github.com/dotnet/aspnetcore/blob/main/src/Middleware/OutputCaching/src/OutputCacheMiddleware.cs#L136 to get served the same cached response entry. However, the first request might have been invalidated by a policy in the `ServeResponseAsync` event, so it shouldn't be cached. And it won't be cached, but the other requests awaiting are not going through the same re-validation. In the sample the response has a `Set-Cookie` so it should not be cached (`AllowCacheStorage` is set to `false` by the default policy). I believe we should check for `AllowCacheStorage` in `TryServeCachedResponseAsync`. It's also called when an entry is retrieved from cache, but I believe it should/may also be set to `true` anyhow.\r\n\r\n@DanielStout5 best repro ever, thank you, it shows up because of two bugs that collide, and it would be hard to reproduce without rate limiting.",
+            "I spent some time trying to reproduce the issues in unit tests and after having a hard time getting in the same state, I now realize that the sample is actually not something that we would expect to see:\r\n- The middleware setting a cookie is executed before rate limiting\r\n- Rate limiting is executed before output caching\r\n\r\nIn a ideal scenario this should be the order:\r\n- Output Cache\r\n- Rate limiting\r\n- Application middleware\r\n\r\n@DanielStout5 Is there a reason you didn't setup the middleware in this order?\r\n\r\n",
+            "@sebastienros it might work in that order. I did need output cache and rate limiting to be after UseAuthentication since they need to exclude users in certain roles, and I also wanted them to be after UseStaticFiles.\r\n\r\nMy rationale for having the cookie setting middleware be above the output cache was that I wanted to make sure it wouldn't serve a cached response to the requests that would normally be setting a cookie. I'll try moving it after UseOutputCache and see if that works",
+            "@sebastienros I tested the order you suggested and it doesn't work for three reasons:\r\n\r\n1. If UseOutputCache comes before UseMyCookieMiddleware it serves cached responses to requests that should have a cookie set, because OutputCacheMiddleware acts as terminal middleware when there is a stored cached response\r\n2. Cached responses are not rate limited. This isn't the end of the world but my intent was for all requests to be rate limited, even ones that are being served from the cache\r\n3. If I use the order of:  1. UseMyCookieMiddleware 2. UseOutputCache 3. UseRateLimiter this bug still occurs. I'm still able to replicate the NullReferenceException inside OutputCacheMiddleware with the above order. I believe the issue occurs at the time the cache entry expires.\r\n\r\n",
+            "Triage: Let's strongly consider backporting this",
+            "PR submitted, and found a simpler repro\r\n\r\n```c#\r\nvar builder = WebApplication.CreateBuilder(args);\r\n\r\nbuilder.Services.AddOutputCache(bld =>\r\n{\r\n    bld.AddBasePolicy(opt =>\r\n    {\r\n        opt.Expire(TimeSpan.FromSeconds(10)).SetLocking(true);\r\n    });\r\n});\r\n\r\nvar app = builder.Build();\r\n\r\napp.Use((ctx, next) =>\r\n{\r\n    ctx.Response.Cookies.Append(\"Test\", \"Value\");\r\n    return next.Invoke();\r\n});\r\n\r\napp.UseOutputCache();\r\n\r\napp.Use(async (HttpContext ctx, RequestDelegate next) =>\r\n{\r\n    await ctx.Response.WriteAsync(\"OK\");\r\n});\r\n\r\napp.Run();\r\n\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 12682,
+            "commit_id": "28eebc0628341cf0e531d5c048144a3340f2dfeb",
+            "original_commit_id": "ce510f1a52418f3717aa758bdbbab8ce424f45e5",
+            "path": "src/Middleware/OutputCaching/test/OutputCacheMiddlewareTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 885,
+            "original_line": 871,
+            "side": "RIGHT",
+            "original_position": 78,
+            "position": 99,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you write something unique to the bodies and verify that the response contains it as well as is different between the two responses (showing it wasn't cached)",
+                "Updated"
+            ]
+        }
+    ]
+}

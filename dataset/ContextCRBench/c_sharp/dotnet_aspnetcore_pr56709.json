@@ -1,0 +1,100 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 56709,
+    "lang": "c_sharp",
+    "pr_title": "Apply schema transformers on properties and other subschemas",
+    "pr_body": "Closes https://github.com/dotnet/aspnetcore/issues/56584.\r\n\r\nSchema transformers are currently only called on schemas that are generated at the top-level for respones, parameters, and request bodies. This PR allows schema transformers to be applied recursively into sub-schemas that might appear in these arguments (for example, the schema for an `int` property that is part of a `Todo` type). We currently apply transformations to subschema types where we understand how to resolve `TypeInfo` for them:\r\n\r\n- `schema.items`: for schemas that represent lists of elements\r\n- `schema.anyOf`: for schemas that represent polymorphic schemas with subtypes\r\n- `schema.properties`: for schemas associated with properties in a type\r\n\r\nChanges in this PR include:\r\n\r\n- Remove the `OpenApiSchemaTransformerContext.Type` property and adding `OpenApiSchemaTransformerContext.JsonTypeInfo` and `OpenApiSchemaTransformerContext.JsonPropertyInfo`\r\n- Changes to `OpenApiSchemaService` to support applying schemas recursively into the subschemas mentioned above\r\n- Additional tests in `SchemaTransformerTests` to cover relevant scenarios\r\n\r\nNote: One of the new tests introduced here (`SchemaTransformer_CanModifyListOfPolymorphicTypes`) is currently skipped because of a bug I discovered in `ApplyPolymorphismOptions` where we don't handle things correctly if a polymorphic type is a child of another type (like `List<Shape>` or a type with a `Shape` property) because of the [context.Path.Length == 0 check](https://github.com/dotnet/aspnetcore/blob/c52c28458e86029555bf1a88e94b64e7f37ef6d3/src/OpenApi/src/Extensions/JsonNodeSchemaExtensions.cs#L329) we currently use to check for base types. This should be resolved once we have can consume https://github.com/dotnet/runtime/issues/104046 in an upcoming runtime update.\r\n\r\nAnother note: I'm hoping to bring these changes in to https://github.com/dotnet/aspnetcore/pull/56599 for more complete perf coverage for these transformer types.",
+    "pr_comments": [
+        "> I left a few comments/questions that I hope are helpful.\r\n\r\nPosting a response to all the comments here since they all relate to the same concept: the constraint associated with this implementation that we only apply transformations to subschemas that we can resolve a `JsonTypeInfo` for. The subschemas that we don't recurse into are:\r\n\r\n- `schema.not`\r\n- `schema.allOf`\r\n- `schema.oneOf`\r\n- `schema.additionalProperties`\r\n\r\nIf a user sets one of these subschemas explicitly in their own transformer, we have no way of constructing a complete context object for it because we don't know the type associated with the schema.\r\n\r\n```\r\noptions.UseSchemaTransformer((schema, context, cancellationToken) =>\r\n{\r\n\t// What is the JsonTypInfo assocaited with this schema?\r\n\tschema.Not = new OpenApiSchema { Type = \"string\" };\r\n});\r\n```\r\n\r\nThere's two approaches to solving this:\r\n\r\nWe could relax the constraints on the `OpenApiSchemaTransformerContext` so that the `JsonTypeInfo` is optional and recurse into the subschemas above. At the point, there's no way for you to know what the context of the schema you're modifying is. Is it a `not` schema, is it an `allOf`? There's no way to tell without adding additional state to the context object.\r\n\r\nAlternatively, we could set the `OpenApiSchemaTransformerContext.JsonTypeInfo` property to the parent type associated with the schema (for example, a `not` inside a `Todo` schema would have `JsonTypeInfo` = `Todo`. This has the opposite problem though: you'd recurse into a `schema` with the wrong type and potentially make unexpected modifications to the target schema.\r\n\r\nSo, stuck between a rock and a hard place, I opted not to recurse into these as part of the default implementation. If a user explicitly needs it though, it should be possible to construct their own schema transformer implementation that supports the recursion into these properties and they can initialize the `OpenApiSchemaTransformerContext` with whatever state makes sense for their scenario. I'll add a test to model how I think this approach would look.\r\n\r\nLet me know if you have any other questions or if there is some other way to solve the ambigous context problem.",
+        "Bump for reviews! Hoping to get this in before Friday...",
+        "FWIW I had a look at it last week and didn't spot anything."
+    ],
+    "merged": true,
+    "created_at": "2024-07-10T04:10:24Z",
+    "issue_context": {
+        "number": 56584,
+        "title": "Expose additional info about properties and JSON types in OpenApiSchemaTransformerContext",
+        "body": "## Background and Motivation\r\n\r\nOpenAPI schema transformers currently only run on schemas that are generated at the top-level for parameters and responses. For example, in the following case:\r\n\r\n```csharp\r\nvar builder = WebApplication.CreateBuilder();\r\n\r\nbuilder.Services.AddOpenApi(options => \r\n{\r\n\toptions.UseSchemaTransformer((schema, context, ct) =>\r\n\t{\r\n\t\tif (context.Type == typeof(int))\r\n\t\t{\r\n\t\t\tschema.Format = \"some-custom-format\";\r\n\t\t}\r\n\t}\r\n});\r\n\r\nvar app = builder.Build();\r\n\r\napp.MapOpenApi();\r\n\r\napp.MapGet(\"/todos/{id}\", (int id) => Results.Ok<Todo>(new Todo()));\r\n\r\npublic record Todo(int Id, string Name, bool IsCompleted);\r\n```\r\n\r\nThe transformer will only apply the modification on the schema generated for the `id` route parameter and not the `id` property within `Todo`. To resolve this issue, schemas need to be applied recursively into properties and child schemas (like those in `anyOf` and `allOf`). To support this, the implementation will apply transformers on child schemas. As part of this work, we need to expose additional APIs on `OpenApiSchemaTransformerContext` in order to be able to analyze \r\n\r\n## Proposed API\r\n\r\n```diff\r\n// Assembly: Microsoft.AspNetCore.OpenApi;\r\n\r\nnamespace Microsoft.AspNetCore.OpenApi;\r\n\r\npublic sealed class OpenApiSchemaTransformerContext\r\n{\r\n+\tpublic JsonTypeInfo TypeInfo { get; init; }\r\n+\tpublic JsonPropertyInfo? PropertyInfo { get; init; }\r\n}\r\n```\r\n\r\n## Usage Examples\r\n\r\n```csharp\r\nvar builder = WebApplication.CreateBuilder();\r\n\r\nbuilder.Services.AddOpenApi(options => \r\n{\r\n\toptions.UseSchemaTransformer((schema, context, ct) =>\r\n\t{\r\n\t\tif (context.Type == typeof(int))\r\n\t\t{\r\n\t\t\tif (context.PropertyInfo is { AttributeProvider: { } attributeProvider } jsonPropertyInfo)\r\n\t\t\t{\r\n\t\t\t\tif (attributeProvider.GetCustomAttributes(inherit: false).OfType<MyCustomAttribute>().LastOrDefault() is {} attr)\r\n\t\t\t\t{\r\n\t\t\t\t\tschema.Description = attr.Value;\r\n\t\t\t\t}\r\n\t\t\t}\r\n\t\t\tschema.Format = \"some-custom-format\";\r\n\t\t}\r\n\t}\r\n});\r\n\r\nvar app = builder.Build();\r\n\r\napp.MapOpenApi();\r\n\r\napp.MapGet(\"/todos/{id}\", (int id) => Results.Ok<Todo>(new Todo()));\r\n\r\npublic record Todo(int Id, string Name, bool IsCompleted);\r\n```\r\n\r\n## Alternative Designs\r\n\r\n- Provide `TypeInfo` and `PropertyInfo` instead of `JsonTypeInfo` and `JsonPropertyInfo`?\r\n- Should properties only expose public accessors instead of initializers as well?\r\n\r\n## Risks\r\n\r\n- This API shape requires that users apply a null-check to disambiguate if they are in the schema for a property or not.\r\n- This API shape does not provide a consistent way to determine if a sub-schema that is being generated is in the `anyOf` of a parent type.\r\n\r\n",
+        "comments": [
+            "Thank you for submitting this for API review. This will be reviewed by @dotnet/aspnet-api-review at the next meeting of the ASP.NET Core API Review group. Please ensure you take a look at [the API review process documentation](https://github.com/dotnet/aspnetcore/blob/main/docs/APIReviewProcess.md) and ensure that:\n\n* The PR contains changes to the reference-assembly that describe the API change. **Or**, you have included a snippet of reference-assembly-style code that illustrates the API change.\n* The PR describes the impact to users, both positive (useful new APIs) and negative (breaking changes).\n* Someone is assigned to \"champion\" this change in the meeting, and they understand the impact and design of the change.\n<!-- Policy app identification https://img.shields.io/static/v1?label=PullRequestIssueManagement. -->",
+            "Are you expecting users to code the recursion into subschemas themselves or will that be done by the framework? I'm hoping it is the latter, and that the new context fields are needed to implement that.",
+            "It's the later. The implementation referenced in the proposal is referring to the framework.\r\n\r\n>  To support this, the implementation will apply transformers on child schemas. As part of this work, we need to expose additional APIs on OpenApiSchemaTransformerContext in order to be able to analyze",
+            "API Review Notes:\r\n\r\n- Can the UseSchemaTransformer callback be called multiple times for the same type?\r\n    - Yes. It was per-type and will be per property.\r\n- Do we want to use `TypeInfo` and `PropertyInfo` instead of `JsonTypeInfo` and `JsonPropertyInfo`?\r\n  - No. We can get can get TypeInfo from JsonTypeInfo but not vice-versa. We might as well provide as much info as possible for things like JSON capitalization.\r\n  - JsonTypeInfo might be mutable, but that's okay.\r\n- Can  `JsonTypeInfo` be null in valid scenarios?\r\n  - We don't think so. Even for reflection only scenarios, there should be an instance.\r\n-  Should we rename `TypeInfo` to `JsonTypeInfo` and `PropertyInfo` to `JsonPropertyInfo`?\r\n  - Yes. Otherwise, it looks like it's the reflection types and not the S.T.J ones even though an IDE would clarify this.\r\n- Should we get rid of the  `Type` property now that it's redundant?\r\n  - Yes\r\n- Should `JsonTypeInfo` be required?\r\n  - Yes\r\n- Should we make the `OpenApiSchemaTransformerContext` (and other contexts) so it can only be constructed internally?\r\n  - Let's let people construct them for testing \r\n\r\nAPI Approved!\r\n\r\n```diff\r\n// Assembly: Microsoft.AspNetCore.OpenApi;\r\n\r\nnamespace Microsoft.AspNetCore.OpenApi;\r\n\r\npublic sealed class OpenApiSchemaTransformerContext\r\n{\r\n-\tpublic required Type Type { get; init; }\r\n+\tpublic required JsonTypeInfo JsonTypeInfo { get; init; }\r\n+\tpublic JsonPropertyInfo? JsonPropertyInfo { get; init; }\r\n}\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 12716,
+            "commit_id": "96531784bba9bef958619467413998267bd16cad",
+            "original_commit_id": "2d47d49abc058954dbcabf15bf5e26f3fe2e82a5",
+            "path": "src/OpenApi/src/Services/Schemas/OpenApiSchemaService.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 205,
+            "original_line": 183,
+            "side": "RIGHT",
+            "original_position": 42,
+            "position": 64,
+            "subject_type": "line",
+            "review_comments": [
+                "What about `allOf` and `oneOf`? I think these could be introduced by schema transformers that run before this one ..."
+            ]
+        },
+        {
+            "hunk_id": 12715,
+            "commit_id": "96531784bba9bef958619467413998267bd16cad",
+            "original_commit_id": "2d47d49abc058954dbcabf15bf5e26f3fe2e82a5",
+            "path": "src/OpenApi/src/Services/Schemas/OpenApiSchemaService.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 191,
+            "original_line": 173,
+            "side": "RIGHT",
+            "original_position": 32,
+            "position": 50,
+            "subject_type": "line",
+            "review_comments": [
+                "Why only when `PolymorphismOptions is not null`? What happens if someone writes a schema transformer that runs before this one that adds an `anyOf` without the `PolymorphismOptions`? Do it's subschemas just get skipped?"
+            ]
+        },
+        {
+            "hunk_id": 12718,
+            "commit_id": "96531784bba9bef958619467413998267bd16cad",
+            "original_commit_id": "2d47d49abc058954dbcabf15bf5e26f3fe2e82a5",
+            "path": "src/OpenApi/src/Services/Schemas/OpenApiSchemaService.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 202,
+            "original_line": 180,
+            "side": "RIGHT",
+            "original_position": 39,
+            "position": 61,
+            "subject_type": "line",
+            "review_comments": [
+                "`schema.AnyOf[anyOfIndex]`\r\n\r\nI don't see any bounds checking here. If it's done earlier, it's far from this callsite and doesn't feel safe.",
+                "Yeah, this takes an assumption on the implementation details of the schema generator which generates the anyOf child schemas based on the ordering in `JsonTypeInfo.DerivedTypes`. I added a check here but things will get spooky for people if they are inserting subschemas into `anyOf` that don't match what is understood by STJ from the derived type attributes."
+            ]
+        },
+        {
+            "hunk_id": 12717,
+            "commit_id": "96531784bba9bef958619467413998267bd16cad",
+            "original_commit_id": "2d47d49abc058954dbcabf15bf5e26f3fe2e82a5",
+            "path": "src/OpenApi/src/Services/Schemas/OpenApiSchemaService.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 224,
+            "original_line": 199,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 83,
+            "subject_type": "line",
+            "review_comments": [
+                "One more possibility: `additionalProperties`. It's value can be a schema, just like `items`, and I think we should recurse into it as well."
+            ]
+        }
+    ]
+}

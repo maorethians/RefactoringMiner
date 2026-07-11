@@ -1,0 +1,45 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 71319,
+    "lang": "go",
+    "pr_title": "release-21.2: backupresolver: handle namespace migration in NewDescriptorResolver",
+    "pr_body": "This commit fixes a bug in the creation of\r\na backupresolver.DescriptorResolver, which effectively prevents upgraded\r\nclusters from doing backups and changefeeds as of a time prior to the\r\nupgrade.\r\n\r\nThe constructor of this struct does not take into account the combined\r\neffects of:\r\n1. time travel, which can cause the deprecated namespace table\r\n   descriptor with ID = 2 to be retrieved;\r\n2. the migration that runs at\r\n   clusterversion.DeleteDeprecatedNamespaceTableDescriptorMigration\r\n   which deletes that descriptor (it's long since unused) and changes\r\n   the 'name' field of the current namespace table descriptor at ID = 30\r\n   from \"namespace2\" to \"namespace\";\r\n3. the associated changes to the RunPostDeserializationChanges method\r\n   for the table descriptor builder, which changes the name from\r\n   \"namespace2\" to \"namespace\" if the ID is 30.\r\n\r\nWhen time travel returns descriptors 2 and 30, the post-deserialization\r\nchanges cause both of their 'name' fields to be set to 'namespace'. The\r\nconstructor notices the collision and returns an error.\r\n\r\nThis commit fixes the bug by making the constructor aware of this fact\r\nthat it might see both namespace table descriptors, and by then making it\r\nignore the deprecated namespace table descriptor.\r\n\r\nFixes #71301.\r\n\r\nRelease note (bug fix): fixes a bug which, in enterprise clusters which\r\nare upgraded to this version, prevents changefeeds and backups from\r\nbeing exercised as of a point in time prior to the upgrade.\r\n\r\n----\r\n\r\nRelease justification: fix for release-blocking bug",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/71319)\n<!-- Reviewable:end -->\n",
+        "Just want to confirm: we only need this PR on 21.2 branch (and we don't need it on the master?)",
+        "We can front-port the change in `target.go` but we can't exercise that code there in unit tests, because the migration has been removed (as it should).",
+        "Going to merge this on Marius's behalf."
+    ],
+    "merged": true,
+    "created_at": "2021-10-08T15:49:02Z",
+    "issue_context": {
+        "number": 71301,
+        "title": "sql: upgrades to 21.2 break in-progress backups, restores, and CDC jobs",
+        "body": "Upgrading a 21.1 cluster with in-progress backups, restores or CDC jobs will cause the jobs to fail with descriptor resolution errors related to `namespace` and `namespace2`.\n\nDetails to be filled, but this is a release blocker for 21.2.\n\ngz#10039",
+        "comments": [
+            "A bit more details: if any bulk operation (backup, restore, changefeed) starts after upgrade finalized with the cursor that points prior to upgrade, then that operation will fail due to target resolution code shared by all bulk-y operations.",
+            "## Bug explanation\r\n\r\nThe cause of the bug is this namespace-table tenant migration I added early on in the 21.2 release cycle. What this migration does is:\r\n1. Delete the deprecated `system.namespace` descriptor at ID = 2. This is the legacy namespace table, the one that doesn't have parent schema IDs. The table itself hasn't been used in a while, the descriptor was just hanging around for some reason.\r\n2. Just to make sure, the migration actually checks that this is the case and that there are no records in this table.\r\n3. Rename the `name` field in the table descriptor for `system.namespace`, which has ID = 30. This `name` field used to be set at `namespace2` for a variety of unfortunate reasons. In practice, `system.namespace` actually resolves to this table, there's no need for this `namespace2` token to actually exist any more, it's just confusing.\r\n\r\nWhen we add a migration which modifies the contents of `system.descriptor` we also replicate the same logic in the `RunPostDeserializationChanges` method of the descriptor builder, to make sure that these changes also apply to descriptors restored from backups, or any other source of serialized `descpb.Descriptor` protos. This way we know all descriptors are brought up to date. For a concrete example, see how we upgrade from the deprecated foreign key representation: there was a migration a few releases ago, and there's also code in this method for when we restore a backup from, say, 19.1.\r\n\r\nSo, `RunPostDeserializationChanges` also checks if the descriptor proto being upgraded has ID = 30 and name = `namespace2` and if it does it sets the name to `namespace`. I can't, off the top of my head, remember why exactly I added this, but I remember that I had to for some reason.\r\n\r\nNow here's the problem. Consider a cluster happily running in version 21.1. Then, upgrade the cluster to 21.2. This runs the migration. Now, soon after, kick off a changefeed but with an as-of time prior to the migration. Kicking off a changefeed begins with scraping the descriptor table as it was at that point in time. The result set will include descriptors with IDs 2 and 30. The `RunPostDeserializationChanges` method gets applied as it always does and sets the `name` field of the descriptor with ID 30 to `namespace`, just like that in ID 2. When building a `DescriptorResolver` with this set of descriptors, we notice a name collision and throw an error.\r\n\r\n## Immediate fix\r\n\r\nThe immediate way to deal with this is to patch 21.2, specifically the `backupresolver.NewDescriptorResolver` function or thereabouts, to toss out the descriptor with ID = 2 if present alongside ID = 30. It's OK to pretend it never has existed, it arguably should have been removed in previous major versions.\r\n\r\nThis change will be accompanied with a unit test. I'm thinking: start a test cluster at v21.1, disable automatic upgrades, upsert descriptors at IDs 2 and 30 to mimic a cluster bootstrapped in a pre-21.2 release, upgrade past the migration to execute it, then do a full-cluster backup as-of a time prior to the migration. Without the change to `LoadAllDescs` it would fail.\r\n\r\nThe patch will be front-ported to `master` minus the test, which will no longer make sense as the migration is not present in it (nor should it be) and the base version will be 21.2.\r\n\r\n## Subsequent actions\r\n\r\nFinding this bug while upgrading a production cluster to a beta highlights a gap in our test coverage regarding time travel. We should have an integration test which spins up a multi-node cluster with the previous binary, populates it, then upgrades to the current binary, then does various time travel operations as of pre-upgrade time, including backups and changefeeds.\r\n\r\n## Broader impact\r\n\r\nI've thought about these kinds of scenarios and my opinion right now is that this bug is a one-off due to the namespace table being handled in such a special way and the creation of `system.namespace2` predating the tenant migration framework. I don't expect `RunPostDeserializationChanges` to mess with such a sensitive field as `name` in the future. I'm confident that having an integration test like the one above will prevent future mistakes of this kind.",
+            "Closing now that backport has merged. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15416,
+            "commit_id": "f8fc12885bcd9c26cc59096670988815879629ab",
+            "original_commit_id": "3cf3b0ea3b08cb24e4d6b84c6c237b856ce6b411",
+            "path": "pkg/ccl/migrationccl/migrationsccl/namespace_migration_time_travel_external_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 116,
+            "original_line": 116,
+            "side": "RIGHT",
+            "original_position": 115,
+            "position": 116,
+            "subject_type": "line",
+            "review_comments": [
+                "I've checked: without my changes in `NewDescriptorResolver` this test does fail with the `duplicate table name` error we've been seeing yesterday."
+            ]
+        }
+    ]
+}

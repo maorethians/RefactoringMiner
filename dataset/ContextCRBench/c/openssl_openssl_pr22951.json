@@ -1,0 +1,62 @@
+{
+    "repo": "openssl/openssl",
+    "pr_number": 22951,
+    "lang": "c",
+    "pr_title": "ENGINE_load_private_key(): Do foreign key detection without side effects",
+    "pr_body": "Doing set1()/get1() has unwanted side effects.\r\nInstead just set the foreign flag appropriately.\r\n\r\nFixes #22945\r\n",
+    "pr_comments": [
+        "Approved if fixes #22945 ",
+        "This seems to fix segfaults I'm getting signing with my yubikey with `sbsign`, `pesign`, as well as using the `org.openssl.engine:` notation with `openssl dgst` with libp11 or ykcs11.",
+        "Ping for second review",
+        "Sorry, no. It breaks the problem originally fixed: https://github.com/openssl/openssl/pull/19965#issuecomment-1382889805 \r\n\r\nI'm sorry that I approved it before without testing. #22977 seems working.",
+        "@beldmit I do not think the other approach is right. Instead I would like to know why this patch does not work. Can you please identify why setting the foreign key bit does not work with this patch? IMO we ideally have testcases in the codebase for this and they should have been added with the first fix.\r\n",
+        "I think I got it. the NSS engine doesn't deal with EVP_PKEY_METHOD, it uses old-style RSA_METHOD/EC_METHOD etc. So the assignment of the low-level object stores the linked RSA_METHOD in the struct. ",
+        "> I think I got it. the NSS engine doesn't deal with EVP_PKEY_METHOD, it uses old-style RSA_METHOD/EC_METHOD etc. So the assignment of the low-level object stores the linked RSA_METHOD in the struct.\r\n\r\nThen it needs to actively create the EVP_PKEYs as legacy and not just assume d2i_PUBKEY will produce legacy keys. But I see the current code of e_nss already fixed that.",
+        "@t8m how do you run tests? I tried to test your patch with e_nss 4.3 but didn't manage to initialize the database...",
+        "@beldmit I did not run tests I just looked at the e_nss source in their repo in gitlab.",
+        "I managed to run the test, it passes. \r\nI don't like that we enforce the authors of engines to update their code and lose the attached `*_METHOD`s but as we don't have proper tests, let's live with it.",
+        "@beldmit this is misunderstanding - we should actually revert https://github.com/openssl/openssl/commit/2b74e75331a27fc89cad9c8ea6a26c70019300b5 completely. This PR is not right. \r\n\r\nThe foreign flag would be detected properly anyway when the key is created _properly_, i.e. by EVP_PKEY_set1_RSA() inside the engine or by having a non-default EVP_PKEY method.\r\n",
+        "Closing in favor of #23063"
+    ],
+    "merged": false,
+    "created_at": "2023-12-05T21:19:27Z",
+    "issue_context": {
+        "number": 22945,
+        "title": "Private key loaded via ENGINE_load_private_key is not usable due to \"pkey->pmeth_engine\" becomes NULL",
+        "body": "Hello.\r\nI have a problem to use private key which is loaded using OpenSSL v3.0.12 engine.\r\nIt works well in previous versions including v3.0.11.\r\nBelow are error logs.\r\n\r\n```\r\n[RSA]\r\n4076AAB67F000000:error:020000B3:rsa routines:rsa_ossl_private_encrypt:missing private key:../openssl-3.0.12/crypto/rsa/rsa_ossl.c:332:\r\n4076AAB67F000000:error:1C880004:Provider routines:rsa_sign:RSA lib:../openssl-3.0.12/providers/implementations/signature/rsa_sig.c:588:\r\n4076AAB67F000000:error:06880006:asn1 encoding routines:ASN1_item_sign_ctx:EVP lib:../openssl-3.0.12/crypto/asn1/a_sign.c:284:\r\n[EC]\r\n40E63E917F000000:error:0800007D:elliptic curve routines:ossl_ecdsa_simple_sign_sig:missing private key:../openssl-3.0.12/crypto/ec/ecdsa_ossl.c:225:\r\n40E63E917F000000:error:06880006:asn1 encoding routines:ASN1_item_sign_ctx:EVP lib:../openssl-3.0.12/crypto/asn1/a_sign.c:284:\r\n```\r\n\r\nFollow commit causes the problem.\r\nhttps://github.com/openssl/openssl/commit/2b74e75331a27fc89cad9c8ea6a26c70019300b5\r\n\r\n```e->load_privkey()``` sets engine specific evp methods.\r\n```EVP_PKEY_set1_RSA``` (introduced by above commit) calls ```EVP_PKEY_assign``` and ```EVP_PKEY_set_type```.\r\n\r\n``` \r\nEVP_PKEY *ENGINE_load_private_key(ENGINE *e, const char *key_id,\r\n                                  UI_METHOD *ui_method, void *callback_data)\r\n{\r\n\u2003EVP_PKEY *pkey;\r\n\u2003...\r\n    // [Reporter] Engine sets its own EVP method which should be called instead of default OpenSSL EVP method\r\n    pkey = e->load_privkey(e, key_id, ui_method, callback_data);\r\n    ...\r\n    /* We enforce check for legacy key */\r\n    switch (EVP_PKEY_get_id(pkey)) {\r\n    case EVP_PKEY_RSA:\r\n        {\r\n        RSA *rsa = EVP_PKEY_get1_RSA(pkey);\r\n        // [Reporter] By calling below, pkey loses its EVP engine information\r\n        EVP_PKEY_set1_RSA(pkey, rsa);\t\t//  [Reporter] Causes problem\r\n        RSA_free(rsa);\r\n        }\r\n        break;\r\n\u2003...\r\n```\r\n \r\nWithin ```pkey_set_type```, information about EVP methods provided by the engine is invalidated, that is, can't access (call) engine specific EVP methods.\r\n \r\n```\r\nstatic int pkey_set_type(EVP_PKEY *pkey, ENGINE *e, int type, const char *str,\r\n                         int len, EVP_KEYMGMT *keymgmt)\r\n{\r\n\t...\r\n\t// At here, pmeth_engine is reset to NULL\r\n\t# ifndef OPENSSL_NO_ENGINE\r\n        /* If we have ENGINEs release them */\r\n        ENGINE_finish(pkey->engine);\r\n        pkey->engine = NULL;\r\n        ENGINE_finish(pkey->pmeth_engine);\r\n        pkey->pmeth_engine = NULL;\r\n\t# endif\r\n\t...\r\n \r\n```\r\n \r\n```EVP_DigestSignInit```\r\n-> ```do_sigver_init```\r\n-> ```EVP_PKEY_CTX_new_from_pkey```\r\n-> ```int_ctx_new```\r\n \r\nIn above example ```pkey->pmeth_engine``` is null, so ```int_ctx_new``` calls OpenSSL default EVP methods.\r\nBecause default EVP methods can't handle engine specific pkey, it results in failure.\r\n \r\nWe fully understand that provider is recommend instead of engine, but there still exists various S/W components which use engine.\r\nSo kindly address above issue.",
+        "comments": [
+            "Possible fix in #22951 \r\n\r\nCan you please test it?",
+            "> Possible fix in #22951\r\n> \r\n> Can you please test it?\r\n\r\nI tested and checked that RSA private key is being loaded well by the engine I am using.\r\nHowever, my test is limited only to loading RSA private key, so I carefully think that more various test with different algorithms might be needed.\r\nThank you for your fast support.\r\n",
+            "Yet another post factum correction. \r\nThe real , as is pointed in https://github.com/openssl/openssl/pull/19965#issuecomment-1399592137 is to improve decoder do not touch \"external(foregin)\" keys.",
+            "> The real , as is pointed in [#19965 (comment)](https://github.com/openssl/openssl/pull/19965#issuecomment-1399592137) is to improve decoder do not touch \"external(foregin)\" keys.\r\n\r\nThe question is what do you mean @petrovr by \"external(foreign)\" keys in this context. What I see that e_nss is doing simply cannot work properly because it calls d2i_PUBKEY() and it expects that key to be something \"externally managed\" that is simply impossible to do by default and it would break all expectations that keys are by default something managed by providers and the foreign keys are exceptions. However what I see in the current e_nss code is that the get1/set dance is being done so I do not see why we would need this incorrect workaround anymore. IMO it should be reverted. Possibly we could keep the foreign key set up as of #22951 but maybe it is unnecessary as the foreign key flag should have been already set when the engine creates the key.\r\n",
+            "\r\nWhat is \"external(foreign)\" key - attributes set on structure internal to the cryptographic library ( brief details in  https://github.com/openssl/openssl/pull/19965#issuecomment-1399592137 ) in case of classical key management (pre 3.0).\r\nAlso comment is my objection to proposed and now committed correction. \r\n\r\nSo nevertheless that internal structure has attributes set as for key that cannot be managed by provider key is imported to provider store. As expected exported key lost all those attributes.\r\n\r\n----\r\nE_NSS engine always will use work-around for all 3+ releases.",
+            "It seems to me engine mentioned in this issue is based on PKEY functionality.",
+            "> It seems to me engine mentioned in this issue is based on PKEY functionality.\r\n\r\nYes, it is.",
+            "Hello, \r\nI expected this fix in latest release OpenSSL3.0.13. But, It is not yet fixed. Could you tell me, In which version I can expect fix for this issue.",
+            "The fix seems to now be in #23063 which has not yet been merged although it was recently approved. Should be merged soon and be available in 3.0.14",
+            "Thanks for the update @mattcaswell "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 43049,
+            "commit_id": "ce3817673a0827f610682efc006f439ab5c81f2d",
+            "original_commit_id": "d177754686cac5025ffb6e994523ad624d3c1fd7",
+            "path": "crypto/engine/eng_pkey.c",
+            "start_line": 92,
+            "original_start_line": 92,
+            "start_side": "LEFT",
+            "line": 99,
+            "original_line": 99,
+            "side": "LEFT",
+            "original_position": 29,
+            "position": 29,
+            "subject_type": "line",
+            "review_comments": [
+                "There is a change in behavior with the new code: `EVP_PKEY_SM2` simply breaks out of the `switch` without doing anything. The original code at least tried to see if it was an EC key.\r\nIt also means that `pkey->foreign` is never set for `EVP_PKEY_SM2`.",
+                "Fixed @beldmit please re-approve. IMO we actually do not want to change the key type here but yeah, the foreign key detection for SM2 seems broken so... Although I would be very much surprised if there were any engines which work with SM2 keys.\r\n",
+                "Still approved if fixes #22945\r\n"
+            ]
+        }
+    ]
+}

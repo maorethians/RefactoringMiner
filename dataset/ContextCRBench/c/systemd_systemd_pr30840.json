@@ -1,0 +1,349 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 30840,
+    "lang": "c",
+    "pr_title": "Homed bulk directories v2",
+    "pr_body": "This is a reimagined approach for #30646, as I described in [this comment](https://github.com/systemd/systemd/pull/30646#issuecomment-1879380426)\r\n\r\nDepends on #31004 \r\n\r\nFixes: #18323",
+    "pr_comments": [
+        "Unforeseen issue I ran into w/ this approach: signatures\r\n\r\nRight now the code works something like this. If a caller wants to change the bulk directory, they add `bulkDirectory` to the regular section. This is passed through homed into homework. homework then calls `user_record_steal_bulk_dir`, which extracts the value of `bulkDirectory` from the record (making sure to purge it from the JSON). homework then does the bulk directory replacement/reconciliation magic. Finally, homework returns the new JSON (now lacking `bulkDirectory`, with a possibly updated `binding` and so on) back up to homed, which writes it to disk.\r\n\r\nSo here's the problem: Before handing the JSON record into homework, homed signs it first. This signature happens _before_ homework strips the `bulkDirectory` out of the record. So when homework does strip out the field, the record no longer matches the signature.\r\n\r\nThis all also brings in a natural follow-up question: should the contents of the bulk directory be signed into the user record?\r\n\r\nCouple ideas on how to solve this:\r\n- Exclude `bulkDirectory` from the `signature`\r\n- Make clients pass an updated `bulkDirectory` into homed through the `status` section\r\n- Make a new section `transient` that behaves like `secret` but is for non-sensitive information\r\n- Sign the record _after_ homework is done with it, to allow homework to manipulate the record however it wishes (I think this is personally my favorite solution)",
+        "So for various fields we allow overriding via the binding section.\r\n\r\nI think a scheme where we have one of these dirs declared in the regular user record, and then overriden with the copied out version in the binding section does make sense to me.\r\n\r\nthta would would mean clients would always have to check the binding first, and only when not set use the original one. but we do something similar with `homeDirectory` itself already, it's automatically resolved when parsing.",
+        "btw, should we really name this \"bulk\"? i.e. is that really descriptive enough? it's just saying something about the size. But I think its more important to say something about the public exposure of the data contained in there. Hence maybe publicResourceDirectory?",
+        "I'd probably not try to hide the updating of the bulkdir in the updating of the record, but keep that a separaze operation, where you just pass in an fd to a temporary dir with the new bulkdir, and homed does the replacement.",
+        "I am still not onboard with moving the identity file down one level. This just opens uip the door to various vulnerabilities with symlinks.\r\n\r\ni.e. people could then replace .identity/ with a symlink to anything they like and a simple O_NOFOLLOW when opening the identity file won't suffice anymore to avoid being tricked. i.e. the tough bit here is that privileged code is going to access this, and we should not make it easy for an evil user to trick priv code to read stuff it shouldn't read, and trusting it because the object's perms actually indicate its owend by root. but in reality somebody just redirected things via symlinks.",
+        "So the \"status\" and \"binding\" sections are not part of the signed part of the user record, hence just leave the bulkd dir specified in the other part as it is, but override it with fields in those two sections, and the signature issue goes away.\r\n",
+        "So I like where are going with this, but I think we should be careful with doing things down the tree, beacuse of the symlink vulns. \r\n\r\nAnd I think the synchronization of the bulk dirs should not be hidden in the update logic but have its own API updatePublicBulkDataDirectory() or so, where you pass in an fd to a dir, and we'll make the directroies match this source. the data is of a different nature than the user record, and there's no shame in giving this a separate API, too.",
+        "> So for various fields we allow overriding via the binding section\r\n\r\n`bulkDirectory` is already overridden via the `status` section. I didn't put it in `binding` because, generally, the fields in `binding` never change once they're initialized by the managing service.\r\n\r\n> should we really name this \"bulk\"?\r\n\r\nPublicResourceDirectory seems too wordy... \"bulk\" was chosen because relative to the fields inside of the JSON record, these \"fields\" are relatively bulky (kbytes compared to < 100 bytes generally). But we do have size limits in place, so...\r\n\r\nMaybe instead of calling it a \"bulk\" directory we call it a \"blob\" directory, to indicate that it's for storing unstructured and/or binary data?\r\n\r\n> I'd probably not try to hide the updating of the bulkdir in the updating of the record, but keep that a separaze operation\r\n\r\nSo at a API level I'm OK with this. It should help solve the signature problem too.\r\n\r\nAt an implementation level, however, this breaks the synchronization of bulk directories. Part of the reason I wanted swapping the bulk dir to be part of the normal `Update` operation is that I use the reconciliation logic of the user record to decide which way the bulk directory should be sync'd. If we have a separate call, then we have no good way of knowing which bulk directory is newer if a home directory is migrated between systems for instance.\r\n\r\n> So the \"status\" and \"binding\" sections are not part of the signed part of the user record, hence just leave the bulkd dir specified in the other part as it is, but override it with fields in those two sections, and the signature issue goes away.\r\n\r\nSo you mean if a caller says `bulkDirectory: /tmp/some-random-tmpdir`, we store that in the record and even put it into the embedded identity? And just override it w/ the `bulkDirectory` that is put into the `status` section by homed whenever the record is read? I suppose that does solve the signature issue but it's rather ugly IMO...",
+        "For future reference: 3ded6145d6cd4b627bb70ca0daf769dc9a0f7fad is the last commit that migrates `~/.identity` -> `~/.identity/record.json` to make room for `~/.identity/bulk`. Out of concern for symlink shenanigans, we decided to keep it in `~/.identity` and put the blob files in the top level directory (`~/.identity-blob`). If we ever revisit this then 3ded6145d6cd4b627bb70ca0daf769dc9a0f7fad is the commit to recover the changes from. Note this commit has a symlink vulnerability that needs to be fixed (see https://github.com/systemd/systemd/pull/30840#discussion_r1450515016), and another in `home_reconcile_blob_dirs`",
+        "Here's the output produced by the new code in user-record-print:\r\n\r\n![Screenshot from 2024-01-16 21-05-10](https://github.com/systemd/systemd/assets/11251606/95660b76-ae92-4d8a-8e82-dcaaa5d88b50)\r\n\r\nClicking on the link works too.",
+        "`rpm-build:fedora-rawhide-i386` CI failure appears unrelated:\r\n\r\n```\r\nIn file included from ../src/basic/macro.h:13,\r\n                 from ../src/basic/alloc-util.h:10,\r\n                 from ../src/basic/hash-funcs.h:4,\r\n                 from ../src/basic/ether-addr-util.h:8,\r\n                 from ../src/basic/ether-addr-util.c:9:\r\n../src/basic/ether-addr-util.c: In function \u2018hw_addr_to_string_full\u2019:\r\n../src/fundamental/macro-fundamental.h:70:41: error: \u2018nonnull\u2019 argument \u2018buffer\u2019 compared to NULL [-Werror=nonnull-compare]\r\n   70 | #define _unlikely_(x) (__builtin_expect(!!(x), 0))\r\n      |                                         ^~~~~\r\ncc1: all warnings being treated as errors\r\n```",
+        "i like where this is going. some review points above.",
+        "btw, can you split out those commits i mentioned so that we can merge them right away? that way i don't have to re-review all those commits over and over again",
+        "Split out the commits you wanted into #31004, and rebased on top of it. Also fixed a merge conflict w/ main",
+        "Hmm I don't know how to get github to hide the commits in the parent branch so you don't have to keep seeing & re-reviewing them :shrug: ",
+        "Fedora rawhide CI failure appears unrelated... `mkosi / ci (fedora, rawhide) (pull_request)`  errors out from mkosi itself",
+        "I think this is ready for another look. There's still a couple unresolved review points but I replied to all of them.\r\n\r\nNote that github is hiding some of the unresolved review discussions for some reason, so you need to expand the entire history of the PR to see them! It's really stupid",
+        "Rebased on main to fix a merge conflict",
+        "`jammy-arm64` CI failure appears unrelated\r\n\r\n```\r\n<snip>\r\n21474s TEST-74-AUX-UTILS:                  FAIL     ( 60 s)\r\n<snip>\r\n21474s TOTAL FAILURES: 1 OF 64\r\n```\r\n\r\nAnd I can't tell with the other builds b/c the details link just points me right back to the exact same arm64 build's log. @bluca your troubles w/ `jammy-*` might not yet be over, unfortunately",
+        "please rebase",
+        "i don't like the passing down of the flags field still",
+        "please fix those error return things, and we are good to go.",
+        "CI failures appear unrelated:\r\n\r\n- `mkosi / ci (fedora, rawhide) (pull_request)`: \r\n```\r\nTransaction failed: Signature verification failed.\r\nPGP check for package \"filesystem-3.18-8.fc40.x86_64\" (/var/cache/libdnf5/fedora-306b6523e9c8dc02/packages/filesystem-3.18-8.fc40.x86_64.rpm) from repo \"fedora\" has failed: Import of the key didn't help, wrong key?\r\n```\r\n- All of the rest:\r\n```\r\n<snip>\r\nTEST-75-RESOLVED:                   FAIL     ( 66 s)\r\n<snip>\r\nTOTAL FAILURES: 1 OF 64\r\n```",
+        "too many failures for comfort, I've hit the rebase button for another run",
+        ":tada: Thank you!"
+    ],
+    "merged": true,
+    "created_at": "2024-01-18T10:26:05Z",
+    "issue_context": {
+        "number": 18323,
+        "title": "RFE userdb/homed: user entries should provide avatar/face field",
+        "body": "**systemd version the issue has been seen with**\r\n > 247\r\n\r\n<!-- **NOTE:** Do not submit bug reports about anything but the two most recently released (non-rc) systemd versions upstream! -->\r\n<!-- See https://github.com/systemd/systemd/releases for the list of most recent releases. -->\r\n<!-- For older version please use distribution trackers (see https://systemd.io/CONTRIBUTING#filing-issues). -->\r\n\r\n**Used distribution**\r\n > Arch Linux\r\n\r\n**Linux kernel version used** (`uname -a`)\r\n<!-- Make sure to enclose the pasted kernel version in `backticks`, so that\r\n     GitHub doesn't convert the `#` character typically included in it into a\r\n     reference to old GitHub issues. -->\r\n > `5.10.8-zen1-1-zen`\r\n\r\n**CPU architecture issue was seen on**\r\n > amd64\r\n\r\n**Expected behaviour you didn't see**\r\n > sddm show avatar which locate at ~/.face.icon\r\n\r\n**Unexpected behaviour you saw**\r\n > sddm cannot show avatar\r\n\r\n**Steps to reproduce the problem**\r\n >  Follow the [Arch Wiki](https://wiki.archlinux.org/index.php/SDDM#User_icon_(avatar)), but no avatar shown, here is the permissions about the `.face.icon`:\r\n```shell\r\nfor ~:\r\n# file: home/mt\r\n# owner: mt\r\n# group: mt\r\nuser::rwx\r\nuser:sddm:--x\r\ngroup::---\r\nmask::--x\r\nother::---\r\n\r\nfor ~/.face.icon:\r\n# file: home/mt/.face.icon\r\n# owner: mt\r\n# group: mt\r\nuser::rw-\r\nuser:sddm:r--\r\ngroup::r--\r\nmask::r--\r\nother::r--\r\n```",
+        "comments": [
+            "THis is by design. homed uses the user's password to decrypt te user's home directory. Thus, unless you already logged in (and provided a password) te home directory is impossible to access, and sddm can't either then. The security model of homed is simply much stricter than what came before.\r\n\r\nWe probably should add am avatar/face field to userdb, and sddm could pick it up there. if so it would be available as part of the user database, and this regardless if the user is logged in or not.",
+            "will convert this into a homed RFE now, asking for such an avatar field to be added. But note that even if we add this it won't fix your issue unless sddm eventually actually looks there.",
+            "> We probably should add am avatar/face field to userdb, and sddm could pick it up there. if so it would be available as part of the user database, and this regardless if the user is logged in or not.\r\n\r\nI think so : )\r\nHope this work will be completed!",
+            "I found this post through #21644, and I'm wondering what might make sense for this field, if there might be some influence from something like how icons are defined in Web App Manifests (I haven't checked in a while) - bottom line, to specify them as links, ie. by URL.\r\n\r\nSince the possibility of having a user record's presence trigger a network request is kind of gauche to say the least, this could be designed to only look in local object stores - not just `file:` paths (which aren't necessarily properly portable), but also something like IPFS, or whatever local object stores are used for Docker/Podman, or Nix, or ceph, or whatever else has acceptable content-addressable caching for \"bulk\" data like this (this isn't really my area of expertise)."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32978,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homed-manager-bus.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 586,
+            "original_line": 586,
+            "side": "RIGHT",
+            "original_position": 130,
+            "position": 103,
+            "subject_type": "line",
+            "review_comments": [
+                "as above",
+                "not addressed yet"
+            ]
+        },
+        {
+            "hunk_id": 32985,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homectl.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4262,
+            "original_line": 4262,
+            "side": "RIGHT",
+            "original_position": 383,
+            "position": 387,
+            "subject_type": "line",
+            "review_comments": [
+                "fd_verify_regular()"
+            ]
+        },
+        {
+            "hunk_id": 32982,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homed-home.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1249,
+            "original_line": 1249,
+            "side": "RIGHT",
+            "original_position": 70,
+            "position": 127,
+            "subject_type": "line",
+            "review_comments": [
+                "so i am pretty sure we should just stay close to the LISTEN_FDS= contract. or in other words, pass the fds to the child from fd 3 on, densely packed. e.g. if you want to pass 34 fds to a process you fork off, then you pass them as fds 3\u202636. And we could even set $LISTEN_FDS env var one day, if we like. And then, inside the json we'd just pass the index into the densely packed array around, rather than the fd number itself.\r\n\r\n(I mean, this will always be an array that just contains 0, 1, 2, 3, \u2026 strictly ordered, but that's fine, i think it makes sense to still do this, so that later on we can possibly pass more fds over, at which point it starts making sense to maintain this as indexes).\r\n\r\nhence, build the array as you already do, and then maybe reuse shift_fds() from core/exec-invoke.c to pack them densely into fd 3,4,5,\u2026 right before we invoke homework as child process.",
+                "I think I've done it. Please take a look"
+            ]
+        },
+        {
+            "hunk_id": 32973,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homework-blob.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 34,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "some assert()s would be good"
+            ]
+        },
+        {
+            "hunk_id": 32975,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/shared/user-record-show.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 242,
+            "original_line": 242,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 39,
+            "subject_type": "line",
+            "review_comments": [
+                "similar here"
+            ]
+        },
+        {
+            "hunk_id": 32980,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homework-blob.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 51,
+            "original_line": 51,
+            "side": "RIGHT",
+            "original_position": 52,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "frankly, i'd switch these checks, i.e. conceptually it makes sense to validate `name` first, and only then use it as key into the hashmap. i mean, this is technically correct both ways, but just conceptually it feels a bit weird using a string before it is validated."
+            ]
+        },
+        {
+            "hunk_id": 32981,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homework-blob.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 57,
+            "original_line": 57,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 57,
+            "subject_type": "line",
+            "review_comments": [
+                "job for stat_verify_regular()?"
+            ]
+        },
+        {
+            "hunk_id": 32977,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homed-manager-bus.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 509,
+            "original_line": 509,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 61,
+            "subject_type": "line",
+            "review_comments": [
+                "please refuse unrecognized flags early with a not supported error, so that we can later add more flags and clients have a nice way to detect whether they are supported: just use them and if they get an error back they aren't"
+            ]
+        },
+        {
+            "hunk_id": 32979,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homed-bus.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 123,
+            "original_line": 123,
+            "side": "RIGHT",
+            "original_position": 67,
+            "position": 67,
+            "subject_type": "line",
+            "review_comments": [
+                "So apparently `O_NOFOLLOW` continues existing in the list of flags after `open`.\r\n\r\nSo if a client opens the file with `O_NOFOLLOW`, then homed will refuse the FD on the grounds that `O_NOFOLLOW` is not one of the allowlisted flags here.\r\n\r\nShould we add `O_NOFOLLOW` to the list here? What about the other flags (`O_NOATIME`, `O_DIRECT`, `O_DYSNC`, `FASYNC`)?",
+                "hmm, are sure that O_NOFOLLOW is kept around? i am very surprised by this.\r\n\r\nI'd be careful with O_DIRECT and O_DSYNC. Rather refuse too much than too little.\r\n\r\nit sounds to me as if we should refuse everything remotely questionable, as long as noone complains.",
+                "(Looks like I caught GitHub deleting another one of my comments... I opened a support ticket with them; losing the integrity of the conversation is quite bad...)\r\n\r\nwell that's the behavior I observed. I even printed out the offending flags and O_NOFOLLOW and compared against the definitions of the various O_* flags, and O_NOFOLLOW was the one that was set and caused the check to fail. Removing O_NOFOLLOW in AccountsService fixed the error I was getting from homed too.\r\n\r\nNo idea if it's intentional \ud83e\udd37"
+            ]
+        },
+        {
+            "hunk_id": 32971,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/shared/user-record.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1145,
+            "original_line": 1145,
+            "side": "RIGHT",
+            "original_position": 53,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "please validate the filename here, and skip invalid ones.\r\n\r\ni.e. filename_is_valid()",
+                "or actually the suitable_blob_filename() helper you defined elsewhere should be used here."
+            ]
+        },
+        {
+            "hunk_id": 32986,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homectl.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4260,
+            "original_line": 4260,
+            "side": "RIGHT",
+            "original_position": 384,
+            "position": 385,
+            "subject_type": "line",
+            "review_comments": [
+                "here too, use the return val in the log message below"
+            ]
+        },
+        {
+            "hunk_id": 32972,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homework-blob.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 58,
+            "original_line": 58,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 58,
+            "subject_type": "line",
+            "review_comments": [
+                "i think it would be wise to fstat() the file here, and then refuse non-regular files via stat_verify_regular().\r\n\r\nand maybe even already do the size check early here because we can (but keep the one at the bottom, since people could give use an fd to sysfs/procfs or so where there are files that report a size of zero but which you can read GiB of data from",
+                "The reason I didn't add this is because we already check this before we call `copy_one_blob`. In the reconcile case, we check in `blob_copy_callback` via statx immediately before we call `copy_one_blob`. In the replace case, we make sure that any FD passed through dbus is a regular file. So `blobs` will only ever contain regular file FDs.\r\n\r\nI think what I'll do is add a check in the replace case (where it's not quite so obvious that `blobs` will always contain regular file FDs), and document in the function that FD must point to a regular file.\r\n\r\nAs for size: if the stat output can lie to us anyway, IDK if it's worthwhile",
+                "Reworking into `readdir_all` made this make more sense so I did it. Still without the size check; if it's going to be inaccurate sometimes and we're going to check it anyway shortly after and `sha256_fd` won't go on reading for too long, I see no reason to bother. It would be a tad complicated since we'd need to be careful about overflows there too"
+            ]
+        },
+        {
+            "hunk_id": 32984,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/basic/fd-util.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 478,
+            "original_line": 478,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "very same assert you already had above",
+                "whoops copy + paste error on my part"
+            ]
+        },
+        {
+            "hunk_id": 32976,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homework-blob.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 107,
+            "original_line": 107,
+            "side": "RIGHT",
+            "original_position": 104,
+            "position": 107,
+            "subject_type": "line",
+            "review_comments": [
+                "so this of course is racy: the clients could change the file after it was hashed but before we copy it out. In which case we have a corrupted file in place: one that doens't match its supposed hash.\r\n\r\nthe correct way i guess would be to copy first, and then hash once we are done?\r\n\r\ni.e use open_tmpfile_linkable_at() which allows you to use O_TMPFILE for creating the file, and then use link_tmpfile() to actually bind it into the dir if everything checked out.",
+                "heh that's annoying.\r\n\r\nCopy is rather expensive compared to a hash, no? Especially since we're copying across devices, through dm-crypt layers, etc. Perhaps we should hash first, then copy into a tmpfile, then hash a second time to ensure that it didn't change during the copy, then link. That way we skip the expensive copy I/O if the hash never matched in the first place, but still ensure that the client didn't race us. If the client didn't change anything (which is absolutely the common case), the second hash will probably be practically free since the file will already be in the page cache"
+            ]
+        },
+        {
+            "hunk_id": 32974,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/shared/user-record-show.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 240,
+            "original_line": 240,
+            "side": "RIGHT",
+            "original_position": 31,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "frankly, i'd just do:\r\n\r\n```c\r\nif (!path)\r\n        return (void) log_oom();\r\n```",
+                "I'm for it, but the rest of the function isn't written that way and it just silently continues through any error it encounters. Are you sure you want this to be an exception?",
+                "hmm. i guess it doesn't matter, just leave it as is"
+            ]
+        },
+        {
+            "hunk_id": 32983,
+            "commit_id": "fd93a16e7dabfd4be986f2b0bf6536e9fe3c62fa",
+            "original_commit_id": "034569150f88f9dd54f63b35d9d0e4f78a652504",
+            "path": "src/home/homectl.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1360,
+            "original_line": 1360,
+            "side": "RIGHT",
+            "original_position": 147,
+            "position": 142,
+            "subject_type": "line",
+            "review_comments": [
+                "add a `fd_verify_regular()` check here",
+                "not adressed?"
+            ]
+        }
+    ]
+}

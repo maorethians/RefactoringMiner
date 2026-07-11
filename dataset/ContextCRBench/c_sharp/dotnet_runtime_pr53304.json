@@ -1,0 +1,81 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 53304,
+    "lang": "c_sharp",
+    "pr_title": "[QUIC] Stream write cancellation",
+    "pr_body": "Created a test to verify write cancellation behavior. Fixed MockStream to also work as expected. Added throwing on msquic returning write canceled status.\r\n\r\nFixes #32077",
+    "pr_comments": [
+        "Tagging subscribers to this area: @dotnet/ncl\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nCreated a test to verify write cancellation behavior. Fixed MockStream to also work as expected. Added throwing on msquic returning write canceled status.\r\n\r\nFixes #32077\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>CarnaViire</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Net.Quic`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "Pre-cancellation indeed doesn't work as expected (for several reasons). Will change this PR to draft until I come up with a fix.",
+        "@scalablecory @geoffkizer will you take a look or shall I merge?"
+    ],
+    "merged": true,
+    "created_at": "2021-05-27T12:48:43Z",
+    "issue_context": {
+        "number": 32077,
+        "title": "[QUIC] Support cancellation of QUIC writes",
+        "body": "Current APIs do not report cancellation to the user and should throw an `OperationCanceledException`:\r\n\r\nhttps://github.com/dotnet/runtime/blob/65587ba7b402411b62ce877ee044aef2c2c71dfd/src/libraries/System.Net.Quic/src/System/Net/Quic/Implementations/MsQuic/MsQuicStream.cs#L758-L759",
+        "comments": [
+            "Is it documented what the state of the stream is when cancellation occurs? Is it defined what portion of the data was sent?",
+            "@scalablecory @geoffkizer \r\nI seem to have misread the purpose of this issue. Is it only to react to receiving Canceled=true inside SEND_COMPLETE event? Or proper reaction to canceling the cancellation token passed to WriteAsync should also be addressed here?",
+            "> @scalablecory @geoffkizer\r\n> I seem to have misread the purpose of this issue. Is it only to react to receiving Canceled=true inside SEND_COMPLETE event? Or proper reaction to canceling the cancellation token passed to WriteAsync should also be addressed here?\r\n\r\nProper reaction to cancellation token passed to WriteAsync is intention of this issue.",
+            "Do we want this cancellation to work as aborting all subsequent writes, or it should only affect current write and allow the next one? Though the second way seems to be conventional for streams (I've checked FileStream behavior), right now I don't see a way to actually cancel a single write we've sent to msquic, it's not in msquic API. If we just stop waiting for SEND_COMPLETE event to arrive, we would still have to wait for it before attempting the next write, and it doesn't make sense from a user's perspective.\r\n\r\nI may try to investigate how to implement cancel in msquic... this SEND_COMPLETE.Canceled=true now is only happening on aborting the stream or in case of protocol errors like sending after FIN. Maybe this code could be extracted and reused.\r\n\r\nThe main question is whether it will be beneficial to HTTP/3 in any way now? It seems to me that it will not, as the user cancellation would be for a whole request, so we don't need any subsequent writes on that stream. From what I see in the code, we do explicitly abort the stream in case of user's cancellation https://github.com/dotnet/runtime/blob/d3c77a57c2763f6907fb562130f2f156f8a713a9/src/libraries/System.Net.Http/src/System/Net/Http/SocketsHttpHandler/Http3RequestStream.cs#L259-L266\r\n\r\nWhat we have in QuicStream code now, we switch to Aborted state inside, i.e. go the first route but don't abort the stream upon cancellation. We may choose to send abort for writes upon cancellation, or we may choose to do nothing for now as it doesn't seem to affect HTTP/3, and address cancellation properly in future?\r\n\r\n(in the meanwhile, reaction to SEND_COMPLETE.Canceled=true still should be implemented)",
+            "> Do we want this cancellation to work as aborting all subsequent writes, or it should only affect current write and allow the next one?\r\n\r\nI think it's fine to abort all subsequent writes. It's true that some (many?) Streams allow you to perform another write after cancelling a previous one. But with connected streams like QuicStream or NetworkStream, you usually can't rely on the state of the stream after a write cancellation in general. \r\n\r\nWe can always revisit in the future if we want, but I'm not sure there's much value in supporting write after write cancellation.\r\n",
+            "> you usually can't rely on the state of the stream after a write cancellation in general.\r\n\r\nEssentially the caller can't know how much was written before cancellation, so the only safe thing for a caller to do is dispose the stream.\r\n\r\nIn my current PR for shutdown support, reads will go into aborted state once canceled. Writes should too.",
+            "As writes already go into aborted state, I guess nothing much to do here then? I will double-check everything works as expected though.\r\n\r\nThe only question I have left, do we want to send AbortWrite implicitly inside QuicStream, or do we want to leave HTTP/3 code explicitly aborting it? I am asking mainly because HTTP/3 code supplies error code inside, so I guess it's better to leave as is?",
+            "Yeah we can't actually protocol-wise abort. The way I'm treating this in reads is that it is \"soft aborted\" (exceptions will be thrown if you do more reads, etc.) with the expectation that next step caller will take is to actually call `Abort()`.",
+            "> Yeah we can't actually protocol-wise abort. \r\n\r\nWe could if the user provided an abort code somehow, as we will need them to do for aborting read anyway...",
+            "It feels kind of weird to me that cancelling the write leaves the QuicStream in an \"aborted\" state, but that the stream on the wire is not actually aborted.\r\n\r\nIs this true for read as well?",
+            "I do remember a discussion about \"default abort code\" that we would use e.g. in Dispose in case we are unable do a graceful shutdown. I don't remember what/if we decided about it.",
+            "> \r\n> \r\n> It feels kind of weird to me that cancelling the write leaves the QuicStream in an \"aborted\" state, but that the stream on the wire is not actually aborted.\r\n> \r\n> Is this true for read as well?\r\n\r\nYes. If you take a look at the \"recommended dispose pattern\" sample in the top comment here you'll see why this is probably okay. https://github.com/dotnet/runtime/pull/52929\r\n\r\nA reasonable alternative that I'd be happy with is to have some way to specify which abort codes to use when cancellation happens, but I haven't put in time to see how we can do that and remain flexible for non-HTTP/3 use.",
+            "> Yes. If you take a look at the \"recommended dispose pattern\" sample in the top comment here you'll see why this is probably okay. #52929\r\n\r\nYeah, that pattern makes a lot of sense. Thanks.\r\n\r\n> A reasonable alternative that I'd be happy with is to have some way to specify which abort codes to use when cancellation happens, but I haven't put in time to see how we can do that and remain flexible for non-HTTP/3 use.\r\n\r\nWe have talked about this in the past, specifically with regard to Dispose/Close and aborting the read side. Where are we landing on that? (I should probably just look at your PR before I ask any more questions...) ",
+            "> Where are we landing on that?\r\n\r\nDispose of stream doesn't ever abort - it's graceful like other streams. We do still need to figure out what dispose of connection does, I don't recall if we landed on something.",
+            "> Dispose of stream doesn't ever abort \r\n\r\nOkay, so what will happen if I Dispose a QuicStream without either (a) reading to EOF or (b) aborting the read side myself?",
+            "> > Dispose of stream doesn't ever abort\r\n> \r\n> Okay, so what will happen if I Dispose a QuicStream without either (a) reading to EOF or (b) aborting the read side myself?\r\n\r\nWe wait for full graceful shutdown, which includes receipt of FIN. It'll drain the stream.",
+            "> It'll drain the stream.\r\n\r\nDrain meaning, we are actively reading to EOF?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 7289,
+            "commit_id": "b7b2f85d72a266f5a7168f2c045d5b6a59f3ee28",
+            "original_commit_id": "44f050acc0f7791d6cd7ac772945444912bcf299",
+            "path": "src/libraries/System.Net.Quic/tests/FunctionalTests/QuicStreamTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 478,
+            "original_line": 451,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 52,
+            "subject_type": "line",
+            "review_comments": [
+                "This way of testing cancellation is not reliable. Sometimes it seems that task finishes before cancellation occurs. Does anyone have an idea on how to make sure write is not over before cancellation? Pre-cancelling before calling WriteAsync is not appealing to me...",
+                "I can only think of ways which touch `MsQuicStream` code so no help, sorry.\r\nBut I think that adding extra test for pre-cancellation is actually a good idea. I'm looking at the code and it looks like we will send the data even if the token has been cancelled beforehand. Is that expected behavior? Should we do some best-effort token check before we call into msquic? Or did I just overlook something :blush: ",
+                "Sending 64M instead of 1M helped, at least I didn't get any failures on my setup while running it ~20 times. If someone believes it is not reliable enough, the only option I see here is to remove this test completely. I've added a second one that checks pre-cancelled token.",
+                "Rewrote to an infinite loop until canceled, as per @geoffkizer suggestion",
+                "Could that infinite loop be somehow finite, but still big enough for the test? I already see hanging tests in CI :)"
+            ]
+        },
+        {
+            "hunk_id": 7290,
+            "commit_id": "b7b2f85d72a266f5a7168f2c045d5b6a59f3ee28",
+            "original_commit_id": "44f050acc0f7791d6cd7ac772945444912bcf299",
+            "path": "src/libraries/System.Net.Quic/src/System/Net/Quic/Implementations/MsQuic/MsQuicStream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 222,
+            "original_line": 222,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 16,
+            "subject_type": "line",
+            "review_comments": [
+                "If I don't wait for it before creating CancellationTokenRegistration, in case of pre-cancelled token, SendResettableCompletionSource.CompleteException fails with `InvalidOperationException: Operation is not valid due to the current state of the object.` \ud83e\udd14",
+                "Yeah, we guard the `ResettableCompletionSource` completion with `SendState`, but it \"breaks\" here since we're (ab)using `SendResettableCompletionSource` for `START_COMPLETE` as well.\nI don't have any better suggestions than what you did here."
+            ]
+        }
+    ]
+}

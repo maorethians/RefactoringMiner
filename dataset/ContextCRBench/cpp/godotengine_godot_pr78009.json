@@ -1,0 +1,213 @@
+{
+    "repo": "godotengine/godot",
+    "pr_number": 78009,
+    "lang": "cpp",
+    "pr_title": "Ensure that controls update all their sizing information when required",
+    "pr_body": "This PR reverts https://github.com/godotengine/godot/pull/77651 and supersedes https://github.com/godotengine/godot/pull/77825.\r\n\r\nIt still fixes https://github.com/godotengine/godot/issues/74052, the original issue from https://github.com/godotengine/godot/pull/77651. It also fixes regressions from that PR:\r\n- Fixes https://github.com/godotengine/godot/issues/77815.\r\n- Fixes https://github.com/godotengine/godot/issues/77885.\r\n- Fixes https://github.com/godotengine/godot/issues/77787 (though I couldn't reproduce it even with the current master, so please double-check).\r\n- Fixes #78118 (tested by Sauermann)\r\n- Fixes https://github.com/godotengine/godot/issues/78091\r\n\r\nI decided to take the approach of reverting and refixing the issue because I wasn't confident in the original solution. I had my doubts initially, but it looked sensible enough and fixed the issue at hand, so I approved and merged it. However, given all the new issues that popped up, I thought it would be better for me to investigate the problem further and try a safer approach.\r\n\r\nMy idea here is that instead of changing the order in which the data is invalidated, we should instead make sure that all the necessary routines are called when we think that the size might've changed. This happens on tree entry, but also on global changes, such as themes and translations. Previously we would only do some of the updates in these situations, but I'm not sure it was appropriate to do it like that.\r\n\r\nI have a suspicion, that for the most part it worked thanks to a very nasty hidden side-effect of `get_combined_minimum_size()`, which could in turn trigger a complete invalidation of the minimum size information. Yes, from an innocent getter. This wasn't originally the case, however, this was bolted on later, in https://github.com/godotengine/godot/pull/19871 (a follow up to https://github.com/godotengine/godot/pull/19334). I don't think this was a proper solution, but once again it solved the problems at hand at the time. I removed that side-effect, and with all the other changes haven't noticed any obvious regressions, testing the editor and the test scenes from all the linked issues.\r\n\r\nThis brings things closer to the original state of this commit: https://github.com/godotengine/godot/commit/005b69cf6e276209464cc8c36ebc7376679925b6#diff-2b7ba034670859ced66e442b9ec59f7351febc3b4352e535bc85da804bcca266\r\n\r\n-----\r\n\r\nI was faced with one regression of my own, where opening a scene in the editor in the background caused size calculations to misbehave once you switched to it. Turns out that when we request an update with `_update_minimum_size()` we set a guard flag to prevent doing it multiple times. However, when the node is out of the scene tree, this method hits an early return. Which means that the guard flag is never reset and the method cannot be triggered again either.\r\n\r\nFor some reason, this only happened in editor and only under those specific circumstances (instanced scenes weren't affected, for example). Changing the size of the control in the editor would also cause it to finally update, somehow. So it's still a bit of a mystery, but the logic seems flawed without this fix.\r\n\r\nEdit: Well, I guess for this situation to happen, the call to `update_minimum_size` must happen while the nodes are inside of the tree, and then the call to `_update_minimum_size` (with the underscore, the actual routine) needs to happen while the nodes are out of the tree. Which is... interesting? I guess as scenes are opened in the editor, the nodes are briefly added to the tree and then removed?\r\n\r\n-----\r\n\r\nAll in all, a lot of the original issue comes down to the old problem of cascading updates in labels (see https://github.com/godotengine/godot/pull/73809). Basically, when we do shaping of a text label, we use its current size. But shaping itself affects the minimum size, which in turn further affects the current size. This means that shaping is an unstable and unreliable operation whenever we have wrapping enabled (and thus cannot enforce any minimum size based on the contents).\r\n\r\nThis probably affects more stuff than labels, but somehow the entire GUI system manages to work to this day, and this PR seems to address the particular issue with auto-wrapping by doing just enough updates to make things right.",
+    "pr_comments": [
+        "CC @Rindbee ",
+        "The reason for this series of issues is `Label`.\r\n\r\n1. Issue a `NOTIFICATION_RESIZED` notification (`_size_changed()`); https://github.com/godotengine/godot/blob/e188d619227990001667821dac8bc8940076d4a9/scene/gui/control.cpp#L1736\r\n2. Mark `data.minimum_size_valid` as `false`; https://github.com/godotengine/godot/blob/e188d619227990001667821dac8bc8940076d4a9/scene/gui/control.cpp#L1589\r\n\r\nThen calling `get_combined_minimum_size()` may **immediately** update `data.minimum_size_cache`. And the update of `data.last_minimum_size` is **deferred** in `_update_minimum_size()`. This mechanism has a long history and is widely used. #77651 broke this mechanism, both `data.minimum_size_cache` and `data.last_minimum_size` are deferred.\r\n\r\nUnder this mechanism, the potential problem is that `data.minimum_size_cache` has been updated multiple times and then returns to `data.last_minimum_size`, so the following code will not be executed. https://github.com/godotengine/godot/blob/e188d619227990001667821dac8bc8940076d4a9/scene/gui/control.cpp#L1609-L1613\r\n\r\nInstead, the parent container was previously using ~~an outdated~~ a middle minimum size (not the first/final one) of child label to calculate its own minimum size. \r\n\r\nSo for labels, when `data.minimum_size_cache` returns to `data.last_minimum_size`, if `data.minimum_size_cache` has been updated, a `minimum_size_changed` signal may need to be emitted to notify the parent container to update the minimum size. \r\n\r\nI'm not sure if this PR can avoid the above situation. A flag (`data.minimum_size_cache_update_ahead`?) can be added to indicate whether `data.minimum_size_cache` ever changed between `update_minimum_size()` and `_update_minimum_size()`.\r\n\r\n\r\n\r\n\r\n\r\n",
+        "> I'm not sure if this PR can avoid the above situation.\r\n\r\nCan you provide a test case for that situation? It doesn't matter how many times the `data.minimum_size_cache` is invalidated, because it will get updated the moment it is requested next. And its value is the source of truth and it is to be trusted. So parent containers always receive the actual and correct information about children min sizes.\r\n\r\nAs for the trigger for the min size changed signal, it is the responsibility of each control to call `update_minimum_size` whenever it is expected that the min size was updated. And when that happens we will check what the current source of truth holds (or computes on the fly) and compare it with the stored value of `data.last_minimum_size`. This is the only place where `data.last_minimum_size` can be set, so I don't see how there can be any issue with that comparison. It will be reliably hit as long as the control calls `update_minimum_size` when appropriate.\r\n\r\n----\r\n\r\nTo reiterate:\r\n\r\n* The `data.minimum_size_cache` property is just a cache and we can flush and recalculate it as often as we want. It's not very fast to do it on the fly all the time, so we cache it, but whenever we suspect that the min size could've changed we must call `update_minimum_size()`, which ensures that it will be updated on the next fetch.\r\n\r\n* The `minimum_size_changed` signal is guarded by another cached value, `data.last_minimum_size`. This value is also updated when we call `update_minimum_size()` (though not immediately). By this time the `data.minimum_size_cache` property has been invalidated and is guaranteed to return an actual value, which we check against the last known value and then emit the signal if the last known value is different.\r\n\r\nI don't see a flaw in this system. Especially now that there is no side-effect from calling `get_combined_minimum_size()`.",
+        "> Can you provide a test case for that situation? \r\n\r\nI can't provide a test case for this PR. But I'm sure #74052 has this kind of problem. See https://github.com/godotengine/godot/issues/74052#issuecomment-1572048492 \r\n\r\nThe first two columns of the output, after the first signal is emitted, the values become unequal, and finally return to the equal state, but the signal is not emitted.\r\n\r\n![1](https://github.com/godotengine/godot/assets/30386067/eb4aa9c8-d1ac-461f-b62b-fe5402122564)\r\n\r\n\r\n\r\n\r\nThis PR does not change the mechanism. So I feel like this underlying problem is not resolved.\r\n",
+        "The underlying problem is that auto-wrapping makes label sizing unstable, and we cannot fix that with a patch like that. It also affects other controls that behave similarly, like the FlowContainer.\r\n\r\nWhen a control is designed to be elastic and adapt to whatever outer size restrictions there are (and does not have any internal restrictions), its size cannot be resolved in one step like we can do with all other controls. In this case the Label cannot enforce any minimum size because it has wrapping enabled, so its minimum width is 0. This means that, until the actual size is enforced by the parent container, the Label will shape its text as if the actual width was 0, increasing the height to fit all the text according to its wrapping rules.\r\n\r\nThen later, when the actual size is established by the container logic, the Label will shape the text closer to what is expected and will reset its minimum size requirements to a reasonable height. And after that the container needs to do the sorting of children again.\r\n\r\nSo it always takes several steps. The current GUI system is designed to propagate minimum size changes upwards and reach a state of stability in one such pass. But with wrapping controls there is this back and forth where parent containers affect the minimum size of their children, which changes where the wrap point is, which affects the actual size, and thus a second pass is needed. And as a result we get various bugs \u2014 where the second pass doesn't happen or where we get cascading changes snowballing and never reaching a stable state.\r\n\r\nI wasn't trying to fix the underlying problem, because it's not a simple fix. Fixing it would require us to redesign some things about our GUI system. At this point it's unsafe to try and do that for 4.1. What I was trying to do was to make sure we react to resizing in a more straightforward and predictable manner, without partial or hidden logic, and it happened to fix the issue without the same regressions your solution had.",
+        "> The underlying problem is that auto-wrapping makes label sizing unstable\r\n\r\nThis is a more underlying reason.\r\n\r\nhttps://github.com/godotengine/godot/blob/a5a23678c4e9bb4e137caf7db1bec8900d91cef3/scene/gui/control.cpp#L1607\r\n\r\nThe above code, viewed from another perspective, is equivalent to the following code:\r\n\r\n```cpp\r\n\tget_combined_minimum_size(); // Treat it as an update request.\r\n\tSize2 minsize = data.minimum_size_cache;\r\n```\r\n\r\nSo the work of `_update_minimum_size()` can be regarded as synchronizing `data.minimum_size_cache` to `data.last_minimum_size`. \r\n\r\n\r\nAnd the following code is somewhat equivalent to executing part of the `_update_minimum_size()` code immediately (just not emitting the `minimum_size_changed` signal):\r\n\r\n```cpp\r\nupdate_minimum_size();\r\n_size_changed();\r\n```\r\n\r\nIf it happens to be equal when comparing, the `minimum_size_changed` signal will not be emitted regardless of whether `data.minimum_size_cache` has changed (more than twice, `value0` -> `value1` -> ... -> `value0`) since the last comparison.\r\n\r\nhttps://github.com/godotengine/godot/blob/e188d619227990001667821dac8bc8940076d4a9/scene/gui/control.cpp#L1609\r\n\r\n\r\n",
+        "> And the following code is somewhat equivalent to executing part of the `_update_minimum_size()` code immediately (just not emitting the `minimum_size_changed` signal)\r\n\r\nThe difference here is that calling `_size_changed()` explicitly alongside `update_minimum_size()` means that we will double-check if the actual size has changed, and then, the next time the `MessageQueue` is flushed, we will check if the min size has changed, and if it did, check the actual size again. In the case of `Label` this also means that we would likely request a reshaping immediately, and then once again if the min size change, which seems to bring the balance to the whole thing.\r\n\r\nBut anyway, I'm sorry, I'm not sure if we're discussing semantics at this point or if you're pointing at some flaw? Can you elaborate if there is something that you believe I'm missing? So far everything seems to work without changing the overall logic.",
+        "Thanks!\r\n\r\nI suggest moving the remaining discussion on @Rindbee's points to a follow-up issue or PR. They didn't seem blocking for merging this regression fix.",
+        "\u00bfwill Godot with this pull request merged\r\nupdate Control sizes when changing the _window size_ project settings?\r\n\r\nin Godot 4.0 i have to repress the anchor preset on the canvas's topmost Control after changing the _window size_ project setting to preview how the new window size would really look like.\r\n\r\n(this is the only reason i added FullRectControl to my [_responsive UI plugin_ version 1.1](https://codeberg.org/sosasees/godot-4-responsive-ui-plugin/src/commit/ced9d13e9fab3469a71efcd8033035ab570b58b9).\r\nif the question hears yes, i can remove it in the add-on's possible version 2.0)\r\n\r\n### update\r\n\r\ni tried this in the [_Godot 4.1 beta 2_ web editor](https://editor.godotengine.org/releases/4.1.beta2/) \u2014 the question hears no.\r\n\r\ntest project: [test-2023-06-15.zip](https://github.com/godotengine/godot/files/11760618/test-2023-06-15.zip)\r\n(2.3 KiByte download, 3.0 KiByte unzipped)",
+        "> \u00bfwill Godot with this pull request merged update Control sizes when changing the _window size_ project settings?\r\n> \r\n> in Godot 4.0 i have to repress the anchor preset on the canvas's topmost Control after changing the _window size_ project setting to preview how the new window size would really look like.\r\n\r\nNo, this is unrelated to what you describe. Do you have a bug report about this problem?",
+        "> Do you have a bug report about this problem?\r\n\r\nno, i didn't open an issue about this.\r\n\r\ni think this should be a feature proposal \u2014 i didn't make that either. i am not sure when i will open that issue on godot-proposals, as i must rest.\r\n\r\n---\r\n\r\n**update:** i now made [the feature proposal](https://github.com/godotengine/godot-proposals/issues/7125), 5 days after this comment."
+    ],
+    "merged": true,
+    "created_at": "2023-06-08T23:56:06Z",
+    "issue_context": {
+        "number": 77885,
+        "title": "Container size not updating correctly when using call_deferred",
+        "body": "### Godot version\n\n543750a1b3f5696f9ba8e91cb49dc7db05d2ae62\n\n### System information\n\nWindows 10, Vulkan\n\n### Issue description\n\nThis is a regression since v4.1.dev4.official [5c2295ff5], I can't bisect atm to find the commit that caused it, maybe https://github.com/godotengine/godot/pull/77651 but that's just a guess.\r\nWhen a HBoxContainer has a label child, and that label's text is changed, one used to be able to find the new size of the container by using call_deferred, this is no longer the case.\r\n\r\nMRP correct behavior (v4.1.dev4.official [5c2295ff5]):\r\n![image](https://github.com/godotengine/godot/assets/115422160/1b4a2b6f-ef19-42c1-b3e5-9f0c499a7a8c)\r\nMRP incorrect (543750a1b3f5696f9ba8e91cb49dc7db05d2ae62):\r\n![image](https://github.com/godotengine/godot/assets/115422160/25b711ae-7c3a-4c48-aff7-383bb8f600c3)\r\n\r\n\r\n\n\n### Steps to reproduce\n\n```gdscript\r\nextends Control\r\n\r\n@onready var h_box_container: HBoxContainer = $HBoxContainer\r\n@onready var label: Label = $HBoxContainer/Label\r\n\r\nfunc _ready() -> void:\r\n\tlabel.text = \"larger non default text\"\r\n\tprint(\"h_box_container size.x: \", h_box_container.size.x)\r\n\tcall_deferred(\"size_after_text_changed\")\r\n\r\nfunc size_after_text_changed() -> void:\r\n\tprint(\"deferred h_box_container size.x: \", h_box_container.size.x)\r\n```\n\n### Minimal reproduction project\n\n[call_deferred bug.zip](https://github.com/godotengine/godot/files/11654441/call_deferred.bug.zip)\r\n",
+        "comments": [
+            "The order of calls is this: `label.set_text()` => `lable.update_minimum_size()` => `container.update_minimum_size()` => `container.size_changed`.\r\n\r\n`update_minimum_size` can be simply regarded as `call_deferred(\"_update_minimum_size\")`. There are at least **two** deferred calls here. \r\n\r\nThe `resized` or `minimum_size_changed` signals can be used.\r\n",
+            "> The resized or minimum_size_changed signals can be used.\r\n\r\nThose can be a work-around in some cases, but they are only emitted if the size changes. One might want to do something like a dynamic code-driven animation that relies on the correct size after setting the text, without knowing if that text will force a resize ahead of time, which makes things difficult. `await get_tree().process_frame` is also not the same because of the 1-frame delay, seemingly.\r\n\r\n\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 11527,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1589,
+            "original_line": 1589,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (minsize != data.last_minimum_size || data.minimum_size_cache_update_ahead ) {\r\n\t\tdata.minimum_size_cache_update_ahead = false;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 11528,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1668,
+            "original_line": 1668,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (data.minimum_size_cache != minsize) {\r\n\t\tdata.minimum_size_cache_update_ahead = true;\r\n\t\tdata.minimum_size_cache = minsize;\r\n\t}\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 11313,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1589,
+            "original_line": 1589,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (minsize != data.last_minimum_size || data.minimum_size_cache_update_ahead ) {\r\n\t\tdata.minimum_size_cache_update_ahead = false;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 10129,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1589,
+            "original_line": 1589,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (minsize != data.last_minimum_size || data.minimum_size_cache_update_ahead ) {\r\n\t\tdata.minimum_size_cache_update_ahead = false;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 10104,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1668,
+            "original_line": 1668,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (data.minimum_size_cache != minsize) {\r\n\t\tdata.minimum_size_cache_update_ahead = true;\r\n\t\tdata.minimum_size_cache = minsize;\r\n\t}\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 10929,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1589,
+            "original_line": 1589,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (minsize != data.last_minimum_size || data.minimum_size_cache_update_ahead ) {\r\n\t\tdata.minimum_size_cache_update_ahead = false;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 10930,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1668,
+            "original_line": 1668,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (data.minimum_size_cache != minsize) {\r\n\t\tdata.minimum_size_cache_update_ahead = true;\r\n\t\tdata.minimum_size_cache = minsize;\r\n\t}\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 10130,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1668,
+            "original_line": 1668,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (data.minimum_size_cache != minsize) {\r\n\t\tdata.minimum_size_cache_update_ahead = true;\r\n\t\tdata.minimum_size_cache = minsize;\r\n\t}\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 10103,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1589,
+            "original_line": 1589,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (minsize != data.last_minimum_size || data.minimum_size_cache_update_ahead ) {\r\n\t\tdata.minimum_size_cache_update_ahead = false;\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 11314,
+            "commit_id": "ccaab0e590ee5ebb343841a5acfb14f59a7d84c5",
+            "original_commit_id": "3a19d8169155141fec645136c985f7c01e11dc36",
+            "path": "scene/gui/control.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1668,
+            "original_line": 1668,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (data.minimum_size_cache != minsize) {\r\n\t\tdata.minimum_size_cache_update_ahead = true;\r\n\t\tdata.minimum_size_cache = minsize;\r\n\t}\r\n```"
+            ]
+        }
+    ]
+}

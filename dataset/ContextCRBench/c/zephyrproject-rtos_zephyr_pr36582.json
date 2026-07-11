@@ -1,0 +1,84 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 36582,
+    "lang": "c",
+    "pr_title": "net: ip: Fix assertion failure when tcp_send_data() with zero length packet",
+    "pr_body": "When tcp_send_data() is called to resend data, but there is no data\r\nto resend, zero length packet is allocated and NULL net_buf is passed\r\nto net_buf_frag_insert() in which assertion fails.\r\n\r\nFixes #36578\r\n\r\nSigned-off-by: Chih Hung Yu <chyu313@gmail.com>",
+    "pr_comments": [
+        "> I wonder if there's a deeper synchronization issue in this. I. e. why was `tcp_resend_data()` called if there's no unacknowledged data?\r\n\r\nTo speed up the occurrence of this condition, I set ```tcp_rto = 50``` in tcp2.c.\r\n\r\nTo find out why tcp_resend_data() is called, I add debug message in the place where ```k_work_delayable_remaining_get(&conn->send_data_time)==0``` in tcp_in().\r\n```\r\n\tif (!k_work_delayable_remaining_get(\r\n\t\t    &conn->send_data_timer)) {\r\n\t\tprintk(\"%s: conn=%p send_data_total=%d unacked_len=%d send_timer.work.flags=0x%x(%s) uptime=%lld\\n\",\r\n\t\t\t__func__, conn, conn->send_data_total, conn->unacked_len, conn->send_data_timer.work.flags, \r\n\t\t\t(conn->send_data_timer.work.flags & BIT(K_WORK_DELAYED_BIT)) ? \"delayed\" : \r\n\t\t\t(conn->send_data_timer.work.flags & BIT(K_WORK_QUEUED_BIT)) ? \"queued\" : \"\", k_uptime_get());\r\n\t\tNET_DBG(\"conn: %p, Missing a subscription \"\r\n\t\t\t\"of the send_data queue timer\", conn);\r\n\t\tbreak;\r\n\t}\r\n```\r\nDebug message when no data to send in tcp_send_data().\r\n```\r\n\tlen = MIN3(conn->send_data_total - conn->unacked_len,\r\n\t\t   conn->send_win - conn->unacked_len,\r\n\t\t   conn_mss(conn));\r\n\tif (len == 0) {\r\n\t\tprintk(\"%s: conn=%p no data to send, thread='%s', uptime=%lld\\n\", __func__, conn, _current->name, k_uptime_get());\r\n\t\tret = -ENODATA;\r\n\t\tgoto out;\r\n\t}\r\n```\r\nThe following is debug message printed in console. ```send_timer``` work has already been **_queued_** when ```k_work_delayable_remaining_get(&conn->send_data_time)==0```, and then the work is processed. The work is rescheduled again and again until the application calls zsock_send() to send new data and k_work_cancel_delayable() is called in tcp_in() when the ACK for the new data arrived.\r\n```\r\ntcp_in: conn=0x5689e9dc send_data_total=0 unacked_len=0 send_timer.work.flags=0x104(queued) uptime=4260\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=4260\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=4320\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=4380\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=4440\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=4500\r\ntcp_in: conn=0x5689e9dc send_data_total=0 unacked_len=0 send_timer.work.flags=0x104(queued) uptime=4980\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=4980\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=5040\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=5100\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=5160\r\ntcp_send_data: conn=0x5689e9dc no data to send, thread='tcp_work', uptime=5220\r\n```\r\n\r\nThen I make k_work_cancel_delayable() be called when k_work_delayable_remaining_get()==0, tcp_send_data() will not be called and \"no data to send\" condition will not occur.\r\n```\r\n\t\t\tif (!k_work_delayable_remaining_get(\r\n\t\t\t\t    &conn->send_data_timer)) {\r\n\t\t\t\tconn->send_data_retries = 0;\r\n\t\t\t\tk_work_cancel_delayable(&conn->send_data_timer);\r\n\t\t\t\tif (conn->data_mode == TCP_DATA_MODE_RESEND) {\r\n\t\t\t\t\tconn->unacked_len = 0;\r\n\t\t\t\t}\r\n                \t\tconn->data_mode = TCP_DATA_MODE_SEND;\r\n\t\t\t\tNET_DBG(\"conn: %p, Missing a subscription \"\r\n\t\t\t\t\t\"of the send_data queue timer\", conn);\r\n\t\t\t\tbreak;\r\n\t\t\t}\r\n```\r\n\r\nShould we solve this synchronization issue and discard this pull request?",
+        "@chyu313 Thank you for the detailed analysis.\r\n\r\n> The following is debug message printed in console. send_timer work has already been queued when k_work_delayable_remaining_get(&conn->send_data_time)==0, and then the work is processed.\r\n\r\nThat confirms what I wrote earlier about the work item being already processed, thanks for checking.\r\n\r\n> Then I make k_work_cancel_delayable() be called when k_work_delayable_remaining_get()==0, tcp_send_data() will not be called and \"no data to send\" condition will not occur.\r\n\r\nActually, that made me wonder whether the `k_work_delayable_remaining_get()` check at https://github.com/zephyrproject-rtos/zephyr/blob/main/subsys/net/ip/tcp2.c#L1840 is valid at all. Note that `0` can be returned also when the work is already submitted to the work_q (value > 0 would only be returned if the item is scheduled, but not yet submitted). It doesn't seem right that we prevent cancellation in that case.\r\n\r\n> Should we solve this synchronization issue and discard this pull request?\r\n\r\nI think that we still need the changes from this PR, regardless of the synchronization issues. A final corner case is when the work handler is already being processed by the work_q, in such case cancellation won't \"abort\" it. I think though, that a special attention should be put to the work rescheduling at https://github.com/zephyrproject-rtos/zephyr/blob/main/subsys/net/ip/tcp2.c#L1075 - when we detect that retransmission is no longer needed, it should be skipped I believe."
+    ],
+    "merged": true,
+    "created_at": "2021-06-30T06:22:12Z",
+    "issue_context": {
+        "number": 36578,
+        "title": "net: ip: Assertion fails when tcp_send_data() with zero length packet",
+        "body": "**Describe the bug**\r\nWhen testing TCP stack, assertion fails as following:\r\n```\r\nASSERTION FAIL [frag] @ /zephyr/zephyrmaster/zephyr/subsys/net/buf.c:640\r\n@ /zephyr/zephyrmaster/zephyr/lib/os/assert.c:45\r\nE: >>> ZEPHYR FATAL ERROR 4: Kernel panic on CPU 0\r\nE: Current thread: 0x3d87e0 (tcp_work)\r\nE: Halting system\r\n```\r\nThe flow of this failure is:\r\n```tcp_work thread``` -> tcp_resend_data() -> tcp_send_data()\r\n```\r\n{ \r\n        /* 1. send_data_totoal and unacked_len are all 0 in this case */\r\n\tlen = 0 = MIN3(conn->send_data_total - conn->unacked_len,\r\n\t\t   conn->send_win - conn->unacked_len,\r\n\t\t   conn_mss(conn));\r\n\r\n        /* 2. zero length packet (pkt->buffer=NULL) allocated */\r\n\tpkt = tcp_pkt_alloc(conn, len=0);\r\n\tret = tcp_pkt_peek(pkt, conn->send_data, pos, len=0);\r\n\r\n        /* 3. zero length packet passed to tcp_out_ext() */\r\n\tret = tcp_out_ext(conn, PSH | ACK, pkt, conn->seq + conn->unacked_len);\r\n}\r\n```\r\n-> tcp_out_ext() -> net_pkt_append_buffer(pkt, data->buffer=```NULL```) -> net_buf_frag_insert(..., buffer=```NULL```) -> _ASSERT_NO_MSG(frag) -> ```ASSERTION FAIL```\r\n\r\n**To Solve**\r\nDon't proceed if TCP resend length is zero.\r\n```\r\n\tlen = MIN3(conn->send_data_total - conn->unacked_len,\r\n\t\t   conn->send_win - conn->unacked_len,\r\n\t\t   conn_mss(conn));\r\n\tif (len == 0) {\r\n\t\tgoto out;\r\n\t}\r\n```\r\n\r\n**Environment**\r\n - OS: Linux\r\n - Toolchain: Zephyr SDK\r\n - Commit 89212a7fbf5fcd8e4d661c016344ae4bf2d46f53\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 29241,
+            "commit_id": "63979b576a4c5e1409874ce60c2d1351d54ae87d",
+            "original_commit_id": "cc0abee3db739413f2498d465386ab5a8bf7c1eb",
+            "path": "subsys/net/ip/tcp2.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1080,
+            "original_line": 1080,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "> when we detect that retransmission is no longer needed, it should be skipped I believe.\r\n\r\nI add this code so that no more retransmission if no data to send.\r\n\r\nThe following is debug message after this patch is applied. tcp_send_data() is not repeatedly called when no data to send. \r\n```\r\ntcp_in: conn=0x567e64b8 send_data_total=0 unacked_len=0 send_timer.work.flags=0x104(queued) uptime=4380\r\ntcp_send_data: conn=0x567e64b8 no data to send, thread='tcp_work', uptime=4380\r\ntcp_in: conn=0x567e69dc send_data_total=0 unacked_len=0 send_timer.work.flags=0x104(queued) uptime=4740\r\ntcp_send_data: conn=0x567e69dc no data to send, thread='tcp_work', uptime=4740\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 29240,
+            "commit_id": "63979b576a4c5e1409874ce60c2d1351d54ae87d",
+            "original_commit_id": "cc0abee3db739413f2498d465386ab5a8bf7c1eb",
+            "path": "subsys/net/ip/tcp2.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 931,
+            "original_line": 931,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Hmm, shouldn't we return <0 value in this case, now 0 value means in `tcp_resend_data()` that it will increase the retry counter but in this case there is nothing to send.",
+                "I agree, plus I'd add a log message here, so that it's visible how often this occurs.",
+                "Is this OK?\r\n```suggestion\r\n\t\tNET_DBG(\"conn: %p no data to send\", conn);\r\n\t\tret = -ENODATA;\r\n\t\tgoto out;\r\n```",
+                "Fine by me",
+                "IMHO `NET_DBG()` is enough here, this is not a very serious issue. Is there an easy way to trigger this condition, how are you testing this?\r\n",
+                "32 TCP clients running on host send data to 32 TCP echo server threads running on native posix, same test as in #32564.",
+                "2 TCP clients sending data to 2 TCP echo server threads can trigger this condition. \r\nI add k_uptime_get() in log message to see how often this condition occurs for this test.\r\n```\r\nE: conn: 0x567eaef0 no data to send, k_uptime_get()=5400\r\nE: conn: 0x567eaef0 no data to send, k_uptime_get()=7600\r\nE: conn: 0x567eb414 no data to send, k_uptime_get()=8550\r\nE: conn: 0x567eb414 no data to send, k_uptime_get()=20000\r\nE: conn: 0x567eaef0 no data to send, k_uptime_get()=121700\r\nE: conn: 0x567eaef0 no data to send, k_uptime_get()=152050\r\nE: conn: 0x567eb414 no data to send, k_uptime_get()=243450\r\n``` "
+            ]
+        },
+        {
+            "hunk_id": 29242,
+            "commit_id": "63979b576a4c5e1409874ce60c2d1351d54ae87d",
+            "original_commit_id": "cc0abee3db739413f2498d465386ab5a8bf7c1eb",
+            "path": "subsys/net/ip/tcp2.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1079,
+            "original_line": 1079,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "I just wonder if this is the right place to change the data_mode, or if this rather should be done in the TCP state machine.  This would be achieved if we removed the check at https://github.com/zephyrproject-rtos/zephyr/blob/main/subsys/net/ip/tcp2.c#L1840, which as I wrote earlier I don't think is correct. @jukkar I think you have the best insight into the TCP2 codebase, do you have an opinion on this?",
+                "That is a good question and I do not have clear answer to this. Tweaking/removing the check on line 1840 might be a good start for a fix. Sorry, but is difficult to give direct answer as there might be unseen consequences when changing the TCP code. So I would suggest we experiment with your suggestion before accepting the changes.",
+                "With https://github.com/zephyrproject-rtos/zephyr/commit/89212a7fbf5fcd8e4d661c016344ae4bf2d46f53 applying the patch in this pull request, my test described in #32564 did not crash system and the test had run for over 240 hours without problems. If the patch in this pull request is not applied, the NULL pointer access may occur with CONFIG_ASSERT=n. ",
+                "Ok, I think I can accept the fix as it is then. given that you've put it through so severe testing and it actually helps with the problem."
+            ]
+        }
+    ]
+}

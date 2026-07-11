@@ -1,0 +1,43 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 6435,
+    "lang": "cpp",
+    "pr_title": "Disable operator cache for pull",
+    "pr_body": "fixes #6284\r\n\r\nThe fix is disabling the operator caching on streaming query results alltogether. This code was quite complex and we want to move away from the pull based streaming anyways to be able to support parallelizing streaming query results",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2023-02-23T10:37:43Z",
+    "issue_context": {
+        "number": 6284,
+        "title": "Four table inner join drops rows unless joins are sequential",
+        "body": "### What happens?\n\nI have 15 tables with the same schema, to join on an integer column.  All tables have the same number of records and same values in the PK join column.  Joining any 3 works, but joining 4 or more drops a small percentage of the rows.  I join like so\r\n\r\n```\r\n   FROM T0 INNER JOIN T1 on T1.record_nb = T0.record_nb\r\n           INNER JOIN T2 on T2.record_nb = T0.record_nb\r\n   ...\r\n           INNER JOIN T14 on T14.record_nb = T0.record_nb\r\n```\r\n\r\nAltering this to join each table on the previous table causes the SQL to succeed.  No rows are dropped.  IOW, this works:\r\n\r\n```\r\n   FROM T0 INNER JOIN T1 on T1.record_nb = T0.record_nb\r\n           INNER JOIN T2 on T2.record_nb = T1.record_nb\r\n   ...\r\n           INNER JOIN T14 on T14.record_nb = T13.record_nb\r\n```\r\n\r\nbut uses significantly more memory.\r\n\r\nAny 3 tables join properly with either FROM clause, but any 4 or more yield inconsistent results.  Each execution yields a different number of rows.\r\n\n\n### To Reproduce\n\nThis drops rows:\r\n```python\r\nimport polars as pl\r\nimport duckdb\r\nimport random\r\n\r\nrecord_nb = set(random.randint(1,9_999_999) for _ in range(2_000_000))\r\n\r\nframes = [pl.DataFrame({'record_nb': list(record_nb), f'x_{i}': 0.0, f'y_{i}': 1.0}) \r\n          for i in range(4)]\r\ntbls = [df.to_arrow() for df in frames]\r\nwith duckdb.connect() as con:\r\n    select_ = 'SELECT T0.record_nb'\r\n    from_ = ' FROM T0 '\r\n    for i, (tbl, df) in enumerate((zip(tbls, frames))):\r\n        con.register(f'T{i}', tbl)\r\n        select_ += ',' + ','.join(f'\\n    T{i}.{x} {x}' for x in (f'x_{i}', f'y_{i}') )\r\n        if i > 0:\r\n            from_ += f'\\n   INNER JOIN T{i} on T0.record_nb = T{i}.record_nb'\r\n    sql = f'{select_}\\n{from_}'\r\n    con.execute(sql)\r\n    result_pd = con.fetchdf()\r\n\r\nprint(f'frames have shape {frames[0].shape} and joined result has shape {result_pd.shape}')\r\n```\r\nSince all frames have the same values in the column being joined, the result should have the same number of rows, but the output is:\r\n\r\n`frames have shape (1812272, 3) and joined result has shape (1811160, 9)`\r\n\r\nIf the `with duckdb.connect() as con` block is run repeatedly, the number of rows in the result changes each time.\r\n\r\nReducing the dataframe sizes by 10x, or number of tables to 3 eliminates the discrepancy.  If I change `T0.record_nb` to `T{i-1}.record_nb` in the `INNER JOIN` expression, the problem disappears.\r\n\r\nI tried using `.to_pandas()` in place of `.to_arrow()` but had the same result.\r\n\n\n### OS:\n\nUbuntu 18.04 on x64\n\n### DuckDB Version:\n\n0.7.0\n\n### DuckDB Client:\n\nPython\n\n### Full Name:\n\nKendall Bailey\n\n### Affiliation:\n\nFigure Technologies\n\n### Have you tried this on the latest `master` branch?\n\n- [X] I agree\n\n### Have you tried the steps to reproduce? Do they include all relevant data and configuration? Does the issue you report still appear there?\n\n- [X] I agree",
+        "comments": [
+            "Implicit joins seem to work.\r\n\r\n```\r\n   FROM T0, T1, ..., TN\r\n   WHERE\r\n       T0.record_nb = T1.record_nb AND\r\n       ...\r\n       T0.record_nb = TN.record_nb\r\n```\r\nworks as expected.",
+            "Thanks for the report!\r\n\r\nI took a brief look at this and the problem seems to be in the result conversion code - not in the actual join code. When doing a `COUNT(*)` over the join or storing the result in a table the rows do not seem to be cut-off. I will see if I can push a fix tomorrow.",
+            "After some more investigation this seems to be caused by operator caching not working correctly in case of a `StreamQueryResult`, CC @samansmink ",
+            "As a work-around, if you use the new `.sql` method (that works using the Relation objects) no streaming result is created. As such the problem does not exist there:\r\n\r\n```py\r\nimport polars as pl\r\nimport duckdb\r\nimport random\r\n\r\nrecord_nb = set(random.randint(1,9_999_999) for _ in range(2_000_000))\r\n\r\nframes = [pl.DataFrame({'record_nb': list(record_nb), f'x_{i}': 0.0, f'y_{i}': 1.0}) \r\n          for i in range(4)]\r\ntbls = [df.to_arrow() for df in frames]\r\nwith duckdb.connect() as con:\r\n    select_ = 'SELECT T0.record_nb'\r\n    from_ = ' FROM T0 '\r\n    for i, (tbl, df) in enumerate((zip(tbls, frames))):\r\n        con.register(f'T{i}', tbl)\r\n        select_ += ',' + ','.join(f'\\n    T{i}.{x} {x}' for x in (f'x_{i}', f'y_{i}') )\r\n        if i > 0:\r\n            from_ += f'\\n   INNER JOIN T{i} on T0.record_nb = T{i}.record_nb'\r\n    sql = f'{select_}\\n{from_}'\r\n    ############################################\r\n    # use the .sql method instead\r\n    ############################################\r\n    result_pd = con.sql(sql).fetchdf()\r\n\r\nprint(f'frames have shape {frames[0].shape} and joined result has shape {result_pd.shape}')\r\n```\r\n\r\n```\r\nframes have shape (1813447, 3) and joined result has shape (1813447, 9)\r\n```",
+            "I will add that we're also seeing this issue and are unable to upgrade to the newest version of duck as a result. I'll work on transforming our use-case into a minimally reproducible example soon. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23615,
+            "commit_id": "d78d01555ba42b5d38a9e67190b6290edf067c32",
+            "original_commit_id": "baf04ba00975fb8eff8f49206d0e3095836be326",
+            "path": "src/execution/physical_operator.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 262,
+            "original_line": 262,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "Does `IsOrderDependent` not imply this condition as well?",
+                "decided to leave as is as there might be cases where its not at some point"
+            ]
+        }
+    ]
+}

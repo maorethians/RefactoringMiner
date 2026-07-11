@@ -1,0 +1,208 @@
+{
+    "repo": "openssl/openssl",
+    "pr_number": 24257,
+    "lang": "c",
+    "pr_title": "QUIC Concurrency API Implementation",
+    "pr_body": "This is a partial implementation of just enough of #24256 to fix #24166 intended for 3.4. It introduces necessary concurrency model concepts to allow applications to opt in to reliable blocking functionality if they want it, and allows them to forego it if they do not.\r\n\r\nIt adopts the concept of a QUIC Domain SSL object which was previously discussed in the Server API design document but at that time deferred for possible (post Server MVP) future implementation. Explicit concurrency control makes having explicit control over an event domain, and the ability to have multiple listeners in the same domain, highly desirable, and the internal architecture for this was already implemented anyway.\r\n\r\nA new API is added to allow configuring a desired concurrency model.",
+    "pr_comments": [
+        "Ready for review.",
+        "This PR is in a state where it requires action by @openssl/otc but the last update was 30 days ago"
+    ],
+    "merged": false,
+    "created_at": "2024-05-21T13:53:38Z",
+    "issue_context": {
+        "number": 24166,
+        "title": "QUIC: Blocking calls are unreliable in multi-threaded usage",
+        "body": "## Problem\r\n\r\nThe implementation of blocking calls (e.g. to `SSL_read`) in the QUIC implementation in OpenSSL 3.2 and 3.3 has a somewhat fundamental conceptual error in the implementation approach which renders blocking calls (`SSL_set_blocking_mode(ssl, 1)`) unreliable when used with multiple threads performing (auto-)ticking calls on the same connection.\r\n\r\nTo recap, a blocking call to e.g. `SSL_read` calls the function `block_until_pred` in `quic_impl.c`, which is designed to block until a certain condition is met:\r\n\r\n```\r\nSSL_read(conn0)\r\n  block_until_pred()\r\n    waits on the network read/write BIOs and a timeout, calls select()/poll()\r\n```\r\n\r\nHowever, consider the following sequence involving two threads T1 and T2:\r\n\r\n```\r\nT1: connects conn0 and subsidiary streams stream0, stream1\r\nT1: enters blocking call to SSL_read(stream0), calls to OS poll(conn0_fd)\r\n\r\nT2: enters a call to SSL_write(stream1) (which happens to not block);\r\nT2:   call to stream1 autoticks conn0 (SSL_handle_events(conn0))\r\nT2:     recvmsg() receives datagram and processes it before T1's call to poll(2) wakes up\r\nT2:     stream0 is now ready to read\r\n\r\nT1: still blocking, and will continue to block until event timeout\r\n```\r\n\r\nThe underlying issue here is that if a datagram is received on a socket and a thread is currently blocking in a call to poll() on that socket, this does not guarantee that that thread will be woken up, for example if another thread calls recv() on that socket before a context switch occurs.\r\n\r\n## Resolution\r\n\r\nThe only viable resolution for this issue is to create another OS resource which can be passed to select()/poll() and use this to artificially wake other threads.[^1][^2]\r\n\r\nOn Linux, eventfd(2) etc. exists for this purpose. On other platforms, including Windows, this functionality can be emulated using a pipe or socketpair. It is possible to support all of our supported platforms this way.\r\n\r\nEssentially, a socketpair or eventfd is made readable by writing a byte to it, causing poll() in other threads to wake. The readability condition is then cleared by reading the byte from the FD. The final solution actually needs to be a fair bit more complicated than this as there is a need to reliably wake up all waiting threads, not just one; the solution will probably look similar to the condition variable emulation code for Windows XP I wrote found in crypto/thread/arch/thread_win.c.\r\n\r\nIn any case, the problem with this approach is that it requires creating OS socket resources behind the back of the application, which feels at best rude for a library, particularly one like OpenSSL which seeks to allow the application to control all I/O. I intend to find a better story here (e.g. allowing the application to choose between non-blocking usage only, blocking but single-threaded usage, neither of which requires internal sockets to be created, and blocking multi-threaded usage with internal polling sockets created by OpenSSL).\r\n\r\nIn any case, IMO the solution is too invasive to backport to 3.2 and 3.3 and this will need to be documented as a known issue.\r\n\r\n[^1]: At least, in the non-thread-assisted case. When we are allowed to spin up a thread, as in thread-assisted mode, all I/O processing could be moved to the assist thread and a condition variable could then be used instead. Note that there are compelling reasons to do this in many use cases, especially server-side, so this is likely to become a supported model in the future anyway.\r\n\r\n[^2]: Technically you can wake a poll() call via a signal which results in EINTR. This is obviously not a sane or portable solution.",
+        "comments": [
+            "Couldn't this problem be solved more efficiently with the use of a muted, condition variable, and state variable (the last of which records which streams are readable)?  It would save a potentially significant number of syscalls, and as you note, avoid having to create socket resources under the covers",
+            "> Couldn't this problem be solved more efficiently with the use of a muted, condition variable, and state variable (the last of which records which streams are readable)? It would save a potentially significant number of syscalls, and as you note, avoid having to create socket resources under the covers\r\n\r\nThe problem is that modern OSes generally don't have syscalls which can block on both a condition variable and a socket at the same time.\r\n\r\nThis basically means your options for blocking on something are:\r\n\r\n- Block on a condition variable and have it woken up by another thread (which means we have to spin up another thread to do background processing, and *that* thread makes the poll() call)\r\n- Block on some set of sockets (as described above)\r\n\r\nSo there will always be more resources consumed &mdash; the choice is between creating a socketpair/eventfd and creating a thread.",
+            "Sorry, Ii wasn't being clear, all I meant to suggest was that you could implement what you needed without creating an additional thread - i.e. a \"someone is waiting\" heuristic.  something like the following pseudo code:\r\n```\r\nlock_mutex\r\n   if another_thread_is_blocking_on_the_socket\r\n      wait_on_condition_variable\r\n   set another_thread_is_blocking_on_the_socket = true\r\nunlock_mutex\r\nblock_on_socket_ready\r\nread_socket_data\r\nlock_mutex\r\nset_another_thread_is_blocking_on_the_socket = false\r\nsignal_condition_variable\r\nunlock_mutex\r\nreturn socket data\r\n```\r\n\r\nThats pretty simplistic of course, and it doesn't account for cases in which the socket data has to be from a given stream in the quic connection, but you could setup a per stream signal variable, so that whatever thread gets into your critical section only wakes the correct thread (which may be itself, in which case you should signal all waiting threads, so another one can take over the blocking operation.  The resource fanout is still linear of course if you do a per stream condition variable, but it might be less egregious than having to pump data through various socket pairs, or spawn a new entire thread.\r\n",
+            "@nhorman So, this is a nice idea, but won't quite work. There are various reasons, but here's an arbitrary one:\r\n\r\n```\r\nT1 calls some blocking API call, and enters block_until_pred and goes to sleep\r\n  There was no data queued for the network when this happened, so poll() is listening to POLLIN but not POLLOUT\r\n    (since the UDP socket kernel buffers are not full, listening to POLLOUT would make it wake up immediately)\r\n\r\nLater T2 calls a non-blocking API call, and the connection is ticked\r\nData is generated and queued for transmission to the network\r\nThe amount of data generated fills the UDP socket kernel buffers, which means some\r\n  data needs to be transmitted in the future when POLLOUT is asserted\r\n \r\nThe data to be transmitted may e.g. be an application message which yields a response which T1 is waiting for\r\nTherefore to make forward progress, T1's internal poll(2) call must return and be re-executed\r\n  so that it is now listening for POLLOUT\r\nSince this can't happen without T2 having some way to notify T1 to wake up, T1 still has circumstances where\r\n  blocking calls will incorrectly hang (at least until an event timeout)\r\n```\r\n\r\nBut it's a nice idea and closing in on a decent solution. My take on the fix here (which does still need a notifier) is in https://github.com/openssl/openssl/pull/24257."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 43111,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/ssl_lib.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4098,
+            "original_line": 4098,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Not enough spaces between `#` and `if`"
+            ]
+        },
+        {
+            "hunk_id": 43116,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "include/internal/quic_reactor.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 119,
+            "original_line": 114,
+            "side": "RIGHT",
+            "original_position": 16,
+            "position": 48,
+            "subject_type": "line",
+            "review_comments": [
+                "typo: protected **by** the caller's"
+            ]
+        },
+        {
+            "hunk_id": 43109,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/quic/quic_impl.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 250,
+            "original_line": 250,
+            "side": "LEFT",
+            "original_position": 40,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "The first line at the start of this comment needs updating to mention QDSO"
+            ]
+        },
+        {
+            "hunk_id": 43113,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/rio/rio_notifier.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 35,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 36,
+            "subject_type": "line",
+            "review_comments": [
+                "Again shouldn't we use INVALID_SOCKET here? (and similar instances below)"
+            ]
+        },
+        {
+            "hunk_id": 43114,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/rio/rio_notifier.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 83,
+            "original_line": 82,
+            "side": "RIGHT",
+            "original_position": 82,
+            "position": 83,
+            "subject_type": "line",
+            "review_comments": [
+                "Compare with `INVALID_SOCKET`"
+            ]
+        },
+        {
+            "hunk_id": 43117,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/quic/quic_reactor.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 246,
+            "original_line": 239,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 97,
+            "subject_type": "line",
+            "review_comments": [
+                "INVALID_SOCKET",
+                "I believe there should be also matching else branch which returns 0."
+            ]
+        },
+        {
+            "hunk_id": 43112,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/rio/rio_notifier.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 35,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "Shouldn't this be a check for INVALID_SOCKET here (which is != -1 on Windows)?"
+            ]
+        },
+        {
+            "hunk_id": 43110,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/quic/quic_impl.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 715,
+            "original_line": 713,
+            "side": "RIGHT",
+            "original_position": 135,
+            "position": 179,
+            "subject_type": "line",
+            "review_comments": [
+                "Isn't this just an \"else\" on the end of the previous `if`?"
+            ]
+        },
+        {
+            "hunk_id": 43108,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/rio/rio_notifier.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 42,
+            "original_line": 41,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "why WSAsocketA here?  Seems like you could just use BIO_socket in both cases, no?",
+                "This allows WSA_FLAG_NO_HANDLE_INHERIT to be set, which is the equivalent of O_CLOEXEC... `BIO_socket` does have an unused `options` flag so we could add this functionality to `BIO_socket`, of course, though that's a public API augmentation."
+            ]
+        },
+        {
+            "hunk_id": 43115,
+            "commit_id": "d98dfb2f0ae87b8ddffcccdacf6f521ee38f7719",
+            "original_commit_id": "036dc4fc1a96f5af734fc347b5eacff3098a09f9",
+            "path": "ssl/rio/rio_notifier.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 215,
+            "original_line": 210,
+            "side": "RIGHT",
+            "original_position": 210,
+            "position": 215,
+            "subject_type": "line",
+            "review_comments": [
+                "INVALID_SOCKET"
+            ]
+        }
+    ]
+}

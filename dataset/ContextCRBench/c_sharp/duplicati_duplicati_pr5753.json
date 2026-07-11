@@ -1,0 +1,582 @@
+{
+    "repo": "duplicati/duplicati",
+    "pr_number": 5753,
+    "lang": "c_sharp",
+    "pr_title": "Simplified task control",
+    "pr_body": "This PR moves all task pause/resume/stop/abort logic into the `TaskControl` class.\r\nThis makes it possbile to replicate some of the functionality that broke with the removal of `System.Threading.Abort()`\r\n\r\nThis fixes #3565\r\nThis fixes #5760 \r\nThis fixes #1088",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2024-12-16T08:04:36Z",
+    "issue_context": {
+        "number": 1088,
+        "title": "\"pause\" doesn't stop the upload",
+        "body": "When I click the pause button in the GUI or at the tray icon, duplicati still continues to upload. \r\n\r\nI'm running Duplicati 2.0.0.57- 2.0_preview_2014-08-12 on Windows 7 and Windows 8.1.\r\n\r\nI guess it just doesn't start new jobs, but it would be good to be able to pause running backups as well. Sometimes you need the bandwith for other things (sending a big email, gaming, ...)",
+        "comments": [
+            "It pauses the backup also, but it does not pause the upload, because that\nwill create a timeout and require the upload to restart.\n\nI am not sure how we can communicate this technical problem to the user, so\nfor now it just stops processing files, but completes the upload.\n\n2014-08-13 12:18 GMT+02:00 agrajaghh notifications@github.com:\n\n> When I click the pause button in the GUI or at the tray icon, duplicati\n> still continues to upload.\n> \n> I'm running Duplicati 2.0.0.57- 2.0_preview_2014-08-12 on Windows 7 and\n> Windows 8.1.\n> \n> I guess it just doesn't start new jobs, but it would be good to be able to\n> pause running backups as well. Sometimes you need the bandwith for other\n> things (sending a big email, gaming, ...)\n> \n> \u2014\n> Reply to this email directly or view it on GitHub\n> https://github.com/duplicati/duplicati/issues/1088.\n",
+            "Ah okay, so just the file currently beeing uploaded will be finished?\n\nWhat about something like that:\nIf less than 20% (?) are uploaded, just cancel the upload. If more than 20% are already uploaded, show a warning that x.x Mb will be lost and have to be uploaded again if its paused now. The user should be able to decide, if he wants to stop the upload or wait until this file is finished\n",
+            "I like that solution personally agrajaghh. I'm going to take a stab at doing that by adding a new event which if queried returns the percentage the current file is uploaded. That way the gui can make a choice about what logic to prompt the user with and finally commit to pause() if the user desires, which will always cut off the current upload. Doesn't seem too trivial though given the inheritance hierarchy :/\n",
+            "The progress event contains the current upload progress.\nThe fields BackendFileSize and BackendFileProgress should contain the relevant information.\n\nThis is reported in the event 'server-progress-updated' and in the function 'update_progress_and_schedules'.\n\nPatches are always welcome :)\n",
+            "Cool. That's kind of the easy part of that done then. The hard part, I'm finding, is how to make pause() stop the current upload, but still keep the state in the pause state.\n",
+            "That needs to be handled in the the callback for the upload:\nhttps://github.com/duplicati/duplicati/blob/master/Duplicati/Library/Main/BackendManager.cs#L591\n",
+            "I'm confused.. what does TaskControlRendevouz() do? The code inside it seems to indicate it pauses? Also out of curiosity, what's a dry-run?\n",
+            "The task control is the method I use to signal changes to the running task.\nIn the current setup, it appears that pause() will actually also pause an active upload.\nIt has been a while since I looked at that part, so there might be something else going on.\n\nThe idea is that the active thread occasionally calls TaskControlRendevouz(). If a request for stop, pause or similar is active, the call will block or throw an exception.\n\nA dry-run is a run where no files are updated (local and remote stays the same), like a simulation run.\n",
+            "I think I see the issue that is happening here. The project code everywhere is pausing correctly. However, (at least for the S3 backend), we have the line:\n    PutObjectResponse objectAddResponse = m_client.PutObject(objectAddRequest);\nWhich has already spawned its own background worker thread to upload the file. If the owning thread is paused, then it doesn't mean that the internal thread in AWSSDK is paused, and so the file completes upload in the background so long as there are no exceptions. I need to figure out a way to cancel this background AWS transfer, then look into the other backend systems.\n",
+            "The idea is that the upload (AWSSDK in this case) reads from a stream.\nThis actual file stream is wrapped in a ThrottledStream and a ProgressReportingStream.\nThis means that even if the AWSSDK thread is trying to upload data, the pause should block the ProgressReportingStream so that AWSSDK cannot read data.\n\nThe same \"trick\" works for the other backends.\n",
+            "Oh that's so smart! I finally get it. Hmm.. now why is it not pausing then... _goes back to debugging_\n",
+            "Ok, spent a few hours debugging and I just can't figure it out. Inside TaskControlRendevouz() every time I check m_controlState it's set to Run. Only after pausing does it immediately change, but Resume() is never called, so there is no way that variable can be set back to Run. Yet it is being set back to Run before the next call to TaskControlRendevouz() !! I double checked there is only one instance of the worker thread and its task running.\n",
+            "@kenkendk do you have any ideas about how to debug this further? I just find myself constantly wishing that data breakpoints were a thing in .NET like they were in C++ and Visual Basic 6.0\n",
+            "I think I found the culprit. The LiveControls worker thread which pauses the controller is on a different thread to the Backend Async Worker thread which runs through the progress reporting stream. Because it's a different thread that was paused, the backend worker thinks its still running and continues ahead. It's actually a different results object that is being paused. I'm going to try fixing up the controller's current thread/task to match the correct thread.\n",
+            "I did it! Near instant pausing and resuming. It's not in a 100% robust thread-safe way, but I'll post the patch anyway so you can see what I did. I basically paused not only the current task, but the backend worker thread too.\n",
+            "Here's a link to the diffs http://1drv.ms/1CkDg13. There are two formats:\n\n.u.diff - unified diff\n.diff - normal diff (I used WinMerge to generate it)\n\nUse whichever one suits. @kenkendk  I think it should merge straight in to your current working version, judging by what I know you are working on (should be compatible with source safe if you are using that).\n\nSo you can see it ended up to be a fairly straightforward change, however, I don't think passing 'out' variables is technically thread safe. Although it doesn't matter, because the function calls are always spread out fairly slowly, so there doesn't seem to be chance of a conflict - can you think of a better way to do this?\n",
+            "@rocifier From reading your patch, it seems that most of the code is just for getting a reference to the current BackendManager instance.\n\nFrom what I can see you can go another way and use the StateChanged event:\nhttps://github.com/duplicati/duplicati/blob/master/Duplicati/Library/Main/BackendManager.cs#L371\n\nThis event is fired whenever the current state changes. This should allow you to set/reset a mutex local to the current backendmanager instance, and then use that in the callback:\nhttps://github.com/duplicati/duplicati/blob/master/Duplicati/Library/Main/BackendManager.cs#L591\n\nThe current way of attaching it seems to only work for backups. This way works for all operations.\n\nPS: If you fork the repository on Github, you can make a pull request instead of sending file-patches.\n",
+            "Any update on this issue?\n",
+            "This is concerning.",
+            "Having the same problem. I need to pause upload once and a while, because it takes a while and it prevents me from fully using my computer.",
+            "Pull request #3836 should fix some issues we've had with stopping a backup while allowing the current file to finish uploading.\r\n",
+            "This issue has been mentioned on **Duplicati**. There might be relevant details there:\n\nhttps://forum.duplicati.com/t/pause-is-not-pausing/5543/17\n",
+            "It seems that this problem still exists and is not affecting a single file upload to S3, but an entire job upload (i.e. doesn't pause for days in my case taking 100% of the network). It's a serious usability problem.\r\n\r\nIt also affects network throttling, which you may change in the UI but the workers never get the news about it."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23788,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 104,
+            "original_line": 104,
+            "side": "RIGHT",
+            "original_position": 70,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/162)"
+            ]
+        },
+        {
+            "hunk_id": 23828,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 678,
+            "original_line": 678,
+            "side": "RIGHT",
+            "original_position": 211,
+            "position": 211,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/177)"
+            ]
+        },
+        {
+            "hunk_id": 23820,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 302,
+            "original_line": 302,
+            "side": "RIGHT",
+            "original_position": 106,
+            "position": 106,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/167)"
+            ]
+        },
+        {
+            "hunk_id": 23826,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 575,
+            "original_line": 575,
+            "side": "RIGHT",
+            "original_position": 184,
+            "position": 184,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/175)"
+            ]
+        },
+        {
+            "hunk_id": 23797,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 438,
+            "original_line": 438,
+            "side": "RIGHT",
+            "original_position": 156,
+            "position": 156,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/173)"
+            ]
+        },
+        {
+            "hunk_id": 23821,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 396,
+            "original_line": 396,
+            "side": "RIGHT",
+            "original_position": 134,
+            "position": 134,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/169)"
+            ]
+        },
+        {
+            "hunk_id": 23796,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 437,
+            "original_line": 437,
+            "side": "RIGHT",
+            "original_position": 155,
+            "position": 155,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/172)"
+            ]
+        },
+        {
+            "hunk_id": 23825,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 574,
+            "original_line": 574,
+            "side": "RIGHT",
+            "original_position": 183,
+            "position": 183,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/174)"
+            ]
+        },
+        {
+            "hunk_id": 23792,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 301,
+            "original_line": 301,
+            "side": "RIGHT",
+            "original_position": 105,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/166)"
+            ]
+        },
+        {
+            "hunk_id": 23793,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 302,
+            "original_line": 302,
+            "side": "RIGHT",
+            "original_position": 106,
+            "position": 106,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/167)"
+            ]
+        },
+        {
+            "hunk_id": 23817,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 208,
+            "original_line": 208,
+            "side": "RIGHT",
+            "original_position": 87,
+            "position": 87,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/164)"
+            ]
+        },
+        {
+            "hunk_id": 23794,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 396,
+            "original_line": 396,
+            "side": "RIGHT",
+            "original_position": 134,
+            "position": 134,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/169)"
+            ]
+        },
+        {
+            "hunk_id": 23815,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 104,
+            "original_line": 104,
+            "side": "RIGHT",
+            "original_position": 70,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/162)"
+            ]
+        },
+        {
+            "hunk_id": 23795,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 397,
+            "original_line": 397,
+            "side": "RIGHT",
+            "original_position": 135,
+            "position": 135,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/170)"
+            ]
+        },
+        {
+            "hunk_id": 23816,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 71,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/163)"
+            ]
+        },
+        {
+            "hunk_id": 23791,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 209,
+            "original_line": 209,
+            "side": "RIGHT",
+            "original_position": 88,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/165)"
+            ]
+        },
+        {
+            "hunk_id": 23801,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 678,
+            "original_line": 678,
+            "side": "RIGHT",
+            "original_position": 211,
+            "position": 211,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/177)"
+            ]
+        },
+        {
+            "hunk_id": 23800,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 677,
+            "original_line": 677,
+            "side": "RIGHT",
+            "original_position": 210,
+            "position": 210,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/176)"
+            ]
+        },
+        {
+            "hunk_id": 23824,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 438,
+            "original_line": 438,
+            "side": "RIGHT",
+            "original_position": 156,
+            "position": 156,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/173)"
+            ]
+        },
+        {
+            "hunk_id": 23819,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 301,
+            "original_line": 301,
+            "side": "RIGHT",
+            "original_position": 105,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/166)"
+            ]
+        },
+        {
+            "hunk_id": 23802,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 679,
+            "original_line": 679,
+            "side": "RIGHT",
+            "original_position": 212,
+            "position": 212,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/178)"
+            ]
+        },
+        {
+            "hunk_id": 23790,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 208,
+            "original_line": 208,
+            "side": "RIGHT",
+            "original_position": 87,
+            "position": 87,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/164)"
+            ]
+        },
+        {
+            "hunk_id": 23822,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 397,
+            "original_line": 397,
+            "side": "RIGHT",
+            "original_position": 135,
+            "position": 135,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/170)"
+            ]
+        },
+        {
+            "hunk_id": 23827,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 677,
+            "original_line": 677,
+            "side": "RIGHT",
+            "original_position": 210,
+            "position": 210,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/176)"
+            ]
+        },
+        {
+            "hunk_id": 23789,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 71,
+            "position": 71,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/163)"
+            ]
+        },
+        {
+            "hunk_id": 23823,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 437,
+            "original_line": 437,
+            "side": "RIGHT",
+            "original_position": 155,
+            "position": 155,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/172)"
+            ]
+        },
+        {
+            "hunk_id": 23798,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 574,
+            "original_line": 574,
+            "side": "RIGHT",
+            "original_position": 183,
+            "position": 183,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"10mb\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/174)"
+            ]
+        },
+        {
+            "hunk_id": 23829,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 679,
+            "original_line": 679,
+            "side": "RIGHT",
+            "original_position": 212,
+            "position": 212,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/178)"
+            ]
+        },
+        {
+            "hunk_id": 23799,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 575,
+            "original_line": 575,
+            "side": "RIGHT",
+            "original_position": 184,
+            "position": 184,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/175)"
+            ]
+        },
+        {
+            "hunk_id": 23818,
+            "commit_id": "ea7669afc78a7c8153ec84d36b67ea48c42c3cdf",
+            "original_commit_id": "46e5bf3f6f5f95da8ea36aea31fb4f03411d74ca",
+            "path": "Duplicati/UnitTest/DisruptionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 209,
+            "original_line": 209,
+            "side": "RIGHT",
+            "original_position": 88,
+            "position": 88,
+            "subject_type": "line",
+            "review_comments": [
+                "## Hard-coded credentials\n\nThe hard-coded value \"true\" flows to [access to local variable username](1) which is compared against [access to field Username](2).\n\n[Show more details](https://github.com/duplicati/duplicati/security/code-scanning/165)"
+            ]
+        }
+    ]
+}

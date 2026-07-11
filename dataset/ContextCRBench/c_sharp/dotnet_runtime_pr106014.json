@@ -1,0 +1,88 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 106014,
+    "lang": "c_sharp",
+    "pr_title": "EventSource startup initialization",
+    "pr_body": "Fixes https://github.com/dotnet/runtime/issues/105845\r\n\r\nPreviously MetricsEventSource wasn't being created for apps that didn't ever create a Meter. This caused a chicken-and-egg problem for RuntimeMetrics which weren't created until MetricsEventSource started a tracing session. This change ensures that MetricsEventSource will be created on demand if ETW, EventPipe, or EventListener based tooling starts a tracing session. I took some extra effort to create the EventSource in a deferred fashion to avoid eager loading System.Diagnostics.DiagnosticSource.dll when it might never be needed.\r\n\r\nAside from the fix there were some small improvements:\r\n- Moved NativeRuntimeEventSource to initialize in the same place as other startup EventSources\r\n- Removed a useless lock(EventListener.EventListenersLock) around EventPipe eventProvider registration",
+    "pr_comments": [
+        "I think this is ready for review now. The CI failures appear spurious.\r\n@tarekgh @brianrob @dotnet/dotnet-diag @lambdageek @lateralusX",
+        "@LakshanF @MichalStrehovsky - this change also adjusted the NativeAOT startup slightly by moving the ModuleInitializer attribute from RuntimeEventSource.Initialize() to EventSource.InitializeDefaultEventSources().\r\n\r\n@elinor-fung - this change adjusts the startup path you were just editing earlier this week.",
+        "I suspect that I just missed something here, but want to check - I see where you register the listeners for ETW and EventPipe and trigger creation if/when a command comes in.  How is EventListener handled?  Something will need to create the MetricsEventSource so that OnEventSourceCreated gets called.  I'm assuming you have this covered and I just missed it.",
+        "> How is EventListener handled? Something will need to create the MetricsEventSource so that OnEventSourceCreated gets called. I'm assuming you have this covered and I just missed it.\r\n\r\nYep, thats this part right here to handle EventListener callbacks:\r\nhttps://github.com/dotnet/runtime/pull/106014/files#diff-ebcaac338c0ea28059b6d78c1d8725941f461bb7d6b08d83024c3f873ce012a1R4579-R4581",
+        "> @LakshanF @MichalStrehovsky - this change also adjusted the NativeAOT startup slightly by moving the ModuleInitializer attribute from RuntimeEventSource.Initialize() to EventSource.InitializeDefaultEventSources().\r\n\r\nThis means any app with EventSourceSupport=true will pay for this in terms of size, but it doesn't look terrible. I triggered a rt-sz run and it seems like we'll have a 30 kB regression in `dotnet new webapiaot`: https://github.com/MichalStrehovsky/rt-sz/issues/60#issuecomment-2275751722. Most of this cost actually comes from Type.GetType since nothing else uses that API.\r\n\r\nIt doesn't make a huge difference in EventSource cost (`dotnet new webapiaot` followed by `dotnet publish` vs `dotnet publish -p:EventSourceSupport=false` shows EventSourceSupport increases size by 11%, or 1 MB).",
+        "> > How is EventListener handled? Something will need to create the MetricsEventSource so that OnEventSourceCreated gets called. I'm assuming you have this covered and I just missed it.\r\n> \r\n> Yep, thats this part right here to handle EventListener callbacks: https://github.com/dotnet/runtime/pull/106014/files#diff-ebcaac338c0ea28059b6d78c1d8725941f461bb7d6b08d83024c3f873ce012a1R4579-R4581\r\n\r\nThanks! LGTM.",
+        "Thanks for the feedback, it should all be addressed now. Once CI confirms no new issues I'll merge."
+    ],
+    "merged": true,
+    "created_at": "2024-08-07T23:18:11Z",
+    "issue_context": {
+        "number": 105845,
+        "title": "Initializing RuntimeMetrics",
+        "body": "### Description\r\n\r\nWe recently added [RuntimeMetrics](https://github.com/dotnet/runtime/pull/104680), part of our long-running plan to offer all runtime metrics using OpenTelemetry standardized semantic conventions + the new Meter API added in .NET 6. For most metrics it is expected the Meter gets created either because the developer directly invoked new Meter(), or they invoked some higher level API that indirectly creates the Meter on their behalf. However we expect RuntimeMetrics to be available in all .NET apps by default without the developer invoking any explicit API to match the existing behavior available with runtime EventCounters. In particular we expect this repro scenario to work:\r\n\r\n### Repro\r\n\r\n1. Create a new console app using `dotnet new console` and modify it so that it doesn't exit immediately like this:\r\n```C#\r\nConsole.WriteLine(\"Hello, World!\");\r\nConsole.ReadLine();\r\n```\r\n2. `dotnet run`\r\n3. In a separate console run `dotnet-counters monitor -n <name_of_app>`\r\n\r\n**Expected behavior**\r\ndotnet-counters should display the new metrics:\r\n```\r\nPress p to pause, r to resume, q to quit.\r\n    Status: Running\r\n\r\n[System.Runtime]\r\n    dotnet.assembly.count ({assembly})                                    14\r\n    dotnet.gc.collections ({collection} / 1 sec)\r\n        gc.heap.generation=gen0                                            0\r\n        gc.heap.generation=gen1                                            0\r\n        gc.heap.generation=gen2                                            0\r\n  ...\r\n```\r\n\r\n**Actual behavior**\r\ndotnet-counters shows the pre-existing EventCounters\r\n```\r\nPress p to pause, r to resume, q to quit.\r\n    Status: Running\r\n\r\n[System.Runtime]\r\n    % Time in GC since last GC (%)                                         0\r\n    Allocation Rate (B / 1 sec)                                            0\r\n    CPU Usage (%)                                                          0\r\n    Exception Count (Count / 1 sec)                                        0\r\n    GC Committed Bytes (MB)                                                0\r\n    GC Fragmentation (%)                                                   0\r\n    GC Heap Size (MB)                                                      0.938\r\n    ...\r\n```\r\n\r\n### Cause\r\n\r\nIn order to create the RuntimeMetrics automatically the current implementation initializes the Meter in response to any [MeterListener being created](https://github.com/dotnet/runtime/blob/280f2a0c60ce0378b8db49adc0eecc463d00fe5d/src/libraries/System.Diagnostics.DiagnosticSource/src/System/Diagnostics/Metrics/MeterListener.cs#L43). The premise was that it only matters if the Meter exists when something is capable of listening to it. For dotnet-counters we expect MetricsEventSource to create a MeterListener whenever dotnet-counters starts a new monitoring session. \r\n[OnEventCommand](https://github.com/dotnet/runtime/blob/280f2a0c60ce0378b8db49adc0eecc463d00fe5d/src/libraries/System.Diagnostics.DiagnosticSource/src/System/Diagnostics/Metrics/MetricsEventSource.cs#L283) triggers the lazy creation of the CommandHandler, which creates AggregationManager, which creates MeterListener. Unforetunately we overlooked that MetricsEventSource itself isn't created [unless a Meter exists](https://github.com/dotnet/runtime/blob/280f2a0c60ce0378b8db49adc0eecc463d00fe5d/src/libraries/System.Diagnostics.DiagnosticSource/src/System/Diagnostics/Metrics/Meter.cs#L99). This made a chicken-egg situation where RuntimeMetrics Meter depends on MetricsEventSource being created first, but MetricsEventSource is depending on some Meter, such as RuntimeMetrics being created first. Many apps would have code that create some other Meter which breaks the cycle and causes everything to get bootstrapped but a simple console app doesn't do that.\r\n\r\n### Proposed solution\r\n\r\nWe need some code in the initialization path of .NET Core apps to ensure that MetricsEventSource is created, similar to what we already do for RuntimeEventSource. Since loading MetricsEventSource will cause another assembly to load (System.Diagnostics.DiagnosticSource) this has some startup performance overhead. We planned to mitigate this overhead by checking both `EventSource.IsSupported` and the AppContext switch `System.Diagnostics.Metrics.Meter.IsSupported` before doing the load. This would let form factors that are particularly size or startup cost sensitive to opt out of this as they already do for other EventSource/Meter related overhead. For apps that didn't opt-out we would then use reflection to get a delegate for some well-known non-public method in DiagnosticSource.dll, similar to the approach we use for [StackTraceSymbols](https://github.com/dotnet/runtime/blob/1337553ef2f1cb7a78bb1c19a85b8a9c929064b2/src/coreclr/System.Private.CoreLib/src/System/Diagnostics/StackFrameHelper.cs#L104-L106).\r\nI see that currently CoreCLR, NativeAOT, and Mono all use slightly different approaches for getting RuntimeEventSource initialized ([Mono](https://github.com/dotnet/runtime/blob/1337553ef2f1cb7a78bb1c19a85b8a9c929064b2/src/mono/mono/eventpipe/ep-rt-mono.c#L841), [NativeAOT](https://github.com/dotnet/runtime/blob/1337553ef2f1cb7a78bb1c19a85b8a9c929064b2/src/libraries/System.Private.CoreLib/src/System/Diagnostics/Tracing/RuntimeEventSource.cs#L58), [CoreCLR](https://github.com/dotnet/runtime/blob/1337553ef2f1cb7a78bb1c19a85b8a9c929064b2/src/coreclr/System.Private.CoreLib/src/System/StartupHookProvider.CoreCLR.cs#L15)). I assume we'd also do a little bit of refactoring to create some common EventSource initialization method that handles both RuntimeEventSource and MetricsEventSource.\r\n\r\n### Questions/Feedback\r\n\r\n@brianrob @jkotas @MichalStrehovsky @LakshanF @tarekgh \r\n- Are you aware of scenarios where we expect app developers want to leave Meters+EventSource turned on but the cost of the early assembly load may still be problematic?\r\n- Any specific startup perf or size scenarios we should be measuring to determine if the overhead is acceptable?\r\n- Does UnsafeAccessor work to load a type in a not yet loaded assembly? I know we added that capability but it wasn't clear if it was applicable here vs. Type.GetType().\r\n- Any other thoughts/concerns/recommendations on the approach?\r\nThanks!\r\n",
+        "comments": [
+            "> Does UnsafeAccessor work to load a type in a not yet loaded assembly?\r\n\r\nIt does not. You have to use regular reflection (`Type.GetType`).",
+            "> known non-public method in DiagnosticSource.dll, similar to the approach we use for [StackTraceSymbols](https://github.com/dotnet/runtime/blob/1337553ef2f1cb7a78bb1c19a85b8a9c929064b2/src/coreclr/System.Private.CoreLib/src/System/Diagnostics/StackFrameHelper.cs#L104-L106).\r\n\r\n`StackTraceSymbols` helper only ever ships with the runtime. It is not OOB. It makes the private method more acceptable - there are no concerns about version mixing and matching.\r\n\r\nDiagnosticSource is OOB. You need to worry about versions mixing and matching (e.g. .NET 9 runtime using .NET 10 version of DiagnosticSource). We tend to avoid hidden contracts for OOB. You can certainly do it, but our infrastructure won't detect when you make a mistake and remove the method by accident.",
+            "Can we use any public type in DiagnosticSource (like `Activity`) for binding from corelib? and then having DiagnsoticSource uses `ModuleInitializer` to force initializing the `MetricEventSource` when loading? ",
+            "I have a [PR](#106014) ready for review to resolve this.\r\n\r\n> Can we use any public type in DiagnosticSource (like Activity) for binding from corelib? and then having DiagnsoticSource uses ModuleInitializer to force initializing the MetricEventSource when loading?\r\n\r\nI didn't go that route because the deferred loading mechanism I created requires that I can get a reference to the EventSource being created. Using a DiagnosticSource ModuleInitializer would get MetricsEventSource created, but wouldn't make the reference to it available. If you think there is a better option I'm still glad to hear it - we should probably move discussion about implementation over to the PR though."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3122,
+            "commit_id": "daeb1284acde4665720bd97a9e89be4d40d5cbb2",
+            "original_commit_id": "16f752c4d2445e6bb7ee1b5ad9660ec953ea9b05",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Diagnostics/Tracing/EventSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3871,
+            "original_line": 3871,
+            "side": "RIGHT",
+            "original_position": 159,
+            "position": 162,
+            "subject_type": "line",
+            "review_comments": [
+                "Note to myself: Add a comment about ETW's deadlock behavior on Register when called within a callback. That is what requires us to use the provider we already registered rather than setting up a new one inside EventSource.Initialize"
+            ]
+        },
+        {
+            "hunk_id": 3121,
+            "commit_id": "daeb1284acde4665720bd97a9e89be4d40d5cbb2",
+            "original_commit_id": "16f752c4d2445e6bb7ee1b5ad9660ec953ea9b05",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Diagnostics/Tracing/EventSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3824,
+            "original_line": 3824,
+            "side": "RIGHT",
+            "original_position": 112,
+            "position": 115,
+            "subject_type": "line",
+            "review_comments": [
+                "Curious question. Why is this `#if #endif` and the code it encompasses required, if all it does is assign some values that are actually discarded and not used?",
+                "Its for the side effects. Reading the field forces the static constructor to run if it hasn't already. That in turn creates the two EventSource objects and stores them in static fields.",
+                "Ok I see. Thanks for clarifying!"
+            ]
+        },
+        {
+            "hunk_id": 3123,
+            "commit_id": "daeb1284acde4665720bd97a9e89be4d40d5cbb2",
+            "original_commit_id": "16f752c4d2445e6bb7ee1b5ad9660ec953ea9b05",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Diagnostics/Tracing/EventSource.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3826,
+            "original_line": 3826,
+            "side": "RIGHT",
+            "original_position": 114,
+            "position": 117,
+            "subject_type": "line",
+            "review_comments": [
+                "I assume these doesn't  need GC.KeepAlive anymore. right?",
+                "thats correct, the static field roots them."
+            ]
+        }
+    ]
+}

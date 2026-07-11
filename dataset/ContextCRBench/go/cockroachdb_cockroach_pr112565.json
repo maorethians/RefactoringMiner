@@ -1,0 +1,72 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 112565,
+    "lang": "go",
+    "pr_title": "*: add jobspb.ScheduleID to distinguish ids",
+    "pr_body": "#### aeec29996e7199575d7585a7851756d2331a81d2 *: add jobspb.ScheduleID to distinguish ids\n\nPreviously, the IDs of job schedules we're just `int64s`. This was\nidentified as one of the causes of a recent bug where a schedule ID was\nmisinterpreted as a job ID.\n\nThis commit adds a wrapper type, `ScheduleID`, to clarify values which\ncorrespond to the IDs of a job schedule vs the id of a job itself.\n\nFixes: #110909\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/112565)\n<!-- Reviewable:end -->\n",
+        "I think to really get value out of this we need to remove the `int64()` and `ScheduleID` casts as much as we can -- as long as the casting is prevalent we're still liable to mix things up and have a cast hide the mistake.\r\n\r\nIt seems like most of these casts are coming from not having a `customtype` or `casttype` annotation on `CreatedByInfo` and maybe one of the backup protos?",
+        "I don't think it's appropriate to add a `customtype` to `CreatedByInfo`. From what I can tell, [`CreateByInfo`](https://github.com/chrisseto/cockroach/blob/ebea3d41e4425000e688b927eed068cb8c2ef711/pkg/jobs/jobs.go#L97) represents a variety of ID types. At times it may be a ScheduledJob but that's not always the case.\r\n\r\nI could potentially add a helper function that makes an assertion about the `Name` field but I don't think there's an ergonomic way to handle errors.\r\n\r\nI think I spotted a case that I missed but the majority of the casts felt largely unavoidable. I do agree that we'll want to limit casting as much as possible though.",
+        "Actually, I forgot: CreatedByInfo isn't even a proto, it's just a job intermediate type we populate form discrete columns in the row. I'd argue we should rename `CreatedByInfo.ID` to `CreatedByInfo.ScheduleID` and changes its static type. When we populate it from a jobs table row, we should be switching on created_by_type and populating ScheduleID iff it is schedule. WDYT? ",
+        "I see at least instances where `CreatedByInfo` is populated with non-schedule data as it's shaped to accommodate such.\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/master/pkg/server/autoconfig/auto_config_task.go#L47-L49\r\nhttps://github.com/cockroachdb/cockroach/blob/master/pkg/upgrade/upgrades/create_auto_config_runner_job.go#L56\r\n\r\nOther than those two, it seems that all other cases are schedule IDs. It seems that `CreatedbyInfo` doesn't serve much of a purpose if it only contains a ScheduleID, as the `Name` column doesn't contain the name of the schedule but rather a [special string to indicate it should be interpreted as a schedule ID](https://github.com/cockroachdb/cockroach/blob/master/pkg/jobs/job_scheduler.go#L38-L40).\r\n\r\nI could see an argument for making a `ScheduleID` method that panics if `Name != jobs.CreatedByScheduledJobs`? Otherwise I worry about accidentally misinterpreting legacy data.\r\n\r\nOr did you mean that `CreatedByInfo` could contain both an `ID` and `ScheduleID` where only one would be populated?",
+        ">  where CreatedByInfo is populated with non-schedule data as it's shaped to accommodate such.\r\n\r\nRight, my suggestion here is we use separate, typed fields, so if it was created by a schedule, the CreatedByInfo.ScheduleID is set (and has type ScheduleID), otherwise it is zero. If it was created by an auto-config runner, then maybe some other field -- ConfigID? - is set, or maybe there is an untyped `OtherID` field, but that if it is a schedule ID, we should store it in a typed field.",
+        "Ah, gotcha. I'm not opposed to that but I think it would be best handled as a separate commit/PR (Despite the numerous tools, it seems that multiple commits in a single PR is quite difficult to review). WDYT?\r\n\r\nI guess alternatively, because this is all happening manually we could do something like:\r\n```go\r\ntype CreatedByMeta interface {\r\n    isCreatedByMeta()\r\n}\r\n\r\ntype CreatedByScheduledJob struct {\r\n    ScheduleID ScheduleID\r\n}\r\n\r\ntype CreatedByUnknown struct {\r\n    Name string\r\n    ID string\r\n}\r\n```\r\n\r\nWhich would force users of the field to perform a type switch and mitigate most accidental misusage. It's certainly a bit more heavy handed that way though.",
+        "Perhaps my suggestion is on master pre this change to the type, go rename ID to ScheduleID, then add `OtherID` along side it for the two non-schedule IDs. Merge that, rebase this on that and include in this the change of ScheduleID's type from int64 to the ScheduleID type?",
+        "SGTM!",
+        "@dt, so I poked around the code a little bit and I think that adding a second field is likely going to cause more problems than it would solve. It doesn't seem particularly ergonomic and there's a codepath in the schematelemetry job that could make a scheduled job or a manually spawned job.\r\n\r\nWe can probably get the same benefits you're thinking of by adding a method to the createdbyinfo struct and optionally a constructor.\r\n\r\n```go\r\n\r\n// Or we can make this an int64 for now and merge it ahead of this commit.\r\nfunc (i *CreatedByInfo) ScheduleID() ScheduleID {\r\n    if i.Name != CreatedBySchedule {\r\n        return 0 // Or the InvalidScheduleID constant    \r\n    }\r\n    return ScheduleID(i.ID)\r\n}\r\n\r\n// Optionally\r\nfunc (i *CreatedByInfo) CreatedBySchedule() bool {\r\n    return i.Name != CreatedBySchedule\r\n}\r\n\r\n// Optionally\r\nfunc CreatedBySchedule(scheduleID ScheduleID) *CreatedByInfo {\r\n    // You get the idea\r\n}\r\n```\r\n\r\nIMO, this gives us the type safety without the overhead of having to stumble across multiple fields during construction, marshalling, and unmarshalling. Misusage of the method would carry the same risks as misuse of the fields. If we ever want to \"first class\" other creator types we can tack on similar methods and/or constructors. WDYT?",
+        "After looking at all the casting cases, I only found 2 in the backupccl package that would actually be affected by making any changes to `CreatedByInfo`. As middle ground, I added the helper I described in the previous comment and used it when possible. All other instances of casting are cases where it can't really be avoided (loading directly from queried data or from protected timestamp data which hairily stores a JobID or ScheduleID in the same field).\r\n\r\nLet me know what you think!\r\n\r\n",
+        "@dt or @stevendanna any chance either of you will have time this week to take a peak at this PR?",
+        "TFTR!\r\n\r\nbors r=stevendanna",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=12556529&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2023-11-07T14:06:29Z",
+    "issue_context": {
+        "number": 110909,
+        "title": "jobs: Make the type difference between job and schedule ID distinct",
+        "body": "Right now a schedule ID does not have a type - it's just represented as an int64. In [this postmortem](https://cockroachlabs.atlassian.net/wiki/x/SIH3v) we discussed how using a more specialized ScheduleID type would have made it easier to realize that we should not interpret the schedule ID the same as a job ID.\r\n\r\nJira issue: CRDB-31672",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 16090,
+            "commit_id": "aeec29996e7199575d7585a7851756d2331a81d2",
+            "original_commit_id": "8b59597265ef55280e20691cfaaf8d1fbff88621",
+            "path": "pkg/sql/catalog/schematelemetry/scheduled_job_executor.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "We could push this cast down into CreateSchemaTelemetryJobRecord.",
+                "I don't think we actually can. There's another call of `CreateSchemaTelemetryJobRecord` from a `crdb_internal` function that allows manual triggers of the job :/.\r\n\r\nIs there a mechanism for causing scheduled jobs to run ahead of schedule? Perhaps we could replace the bespoke `crdb_internal` function with that?"
+            ]
+        },
+        {
+            "hunk_id": 16089,
+            "commit_id": "aeec29996e7199575d7585a7851756d2331a81d2",
+            "original_commit_id": "8b59597265ef55280e20691cfaaf8d1fbff88621",
+            "path": "pkg/ccl/backupccl/schedule_pts_chaining.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 319,
+            "original_line": 319,
+            "side": "RIGHT",
+            "original_position": 37,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "Not for this PR, but in a follow up perhaps we should change the API here so that we can take the correct type.",
+                "This one is trickier than would be ideal. From what I could find, this field inside of protectedts can hold either a scheduleID or a jobID.",
+                "Yeah, I think if we do this we just break this up into two different functions each of which just produces one kind of record rather than having the caller specify the type."
+            ]
+        }
+    ]
+}

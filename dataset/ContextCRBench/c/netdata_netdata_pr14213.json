@@ -1,0 +1,70 @@
+{
+    "repo": "netdata/netdata",
+    "pr_number": 14213,
+    "lang": "c",
+    "pr_title": "Improve file descriptor closing loops",
+    "pr_body": "##### Summary\r\nFixes https://github.com/netdata/netdata/issues/14177 , fixes https://github.com/netdata/netdata/issues/14062 .\r\n\r\nThere are 3 places in the agent where we either try to close all open file descriptors or mark them to be closed by the `exec()` stage of `posix_spawn()`. This is done in a bruteforce way, by looping through all FD IDs up to `_SC_OPEN_MAX`.\r\n\r\nWhile this is a valid approach, it creates issues on platforms that (incorrectly) set the maximum FD limit to infinity (in practice, it can be as high as `1073741816`).\r\n\r\nThis PR instead of bruteforcing its way through all possible FD IDs, it reads `/proc/self/fd` (if available) to discover which FDs are actually open and closes (or marks to be closed) only them (unless `STDIN`, `STDOUT` and/or `STDERR` are to be excluded).\r\n\r\nThis should also speed up slightly the agent initialisation time (by how much, it depends on the `_SC_OPEN_MAX` value) .\r\n\r\n##### Test Plan\r\n\r\nTest on a system with a very high `ulimit -n` such as `1073741816`. The agent should start up in reasonable time instead of taking >10min and consuming 100% CPU in the meantime.\r\n\r\nTODO: Revert https://github.com/netdata/netdata/pull/14178",
+    "pr_comments": [
+        "> TODO: Revert https://github.com/netdata/netdata/pull/14178\r\n\r\nWe can't do that until a new stable version is released.",
+        "> > TODO: Revert #14178\r\n> \r\n> We can't do that until a new stable version is released.\r\n\r\nThat's correct, that's why I didn't include it in this PR, but added it as TODO so that we don't forget about it.",
+        "Various operating systems have different methods for massively closing file descriptors.\r\n\r\n1. Linux has `close_range()`.\r\n2. BSDs have `closefrom()`.\r\n\r\nI think the `/proc/PID/fd`  traversal is slow and should be a fallback when the above are not available.\r\n\r\nSo, I think the process should be like this:\r\n\r\n1. Use `close_range()` when it is available.\r\n2. If not available, use `closefrom()` when it is available.\r\n3. If not available, use `/proc/PID/fd` traversal when it is available.\r\n4. If not available, use `sysconf()` like we currently do.\r\n\r\nTo use `close_range()` or `closefrom()` we need to test for them with `automake`.\r\n\r\nBy adding this line to `configure.ac` (I think between lines 254 and 255):\r\n\r\n```\r\nAC_CHECK_FUNCS([close_range closefrom])\r\n```\r\n\r\nWe are going to have in `config.h` the following:\r\n\r\n```c\r\n/* Define to 1 if you have the `closefrom' function. */\r\n#define HAVE_CLOSEFROM 1\r\n\r\n/* Define to 1 if you have the `close_range' function. */\r\n#define HAVE_CLOSE_RANGE 1\r\n```\r\n\r\nAfter this, we can do:\r\n\r\n```c\r\n#if defined(HAVE_CLOSE_RANGE)\r\n   // use close_range() to close the open file descriptors\r\n#elif defined(HAVE_CLOSEFROM)\r\n   // use closefrom() to close the open file descriptors\r\n#else\r\n   // try to use /proc/PID/fd to close the open file descriptors\r\n   // if the above fails, try to use getrlimit()\r\n   // if the above fails, fallback to sysconf(_SC_OPEN_MAX)\r\n#endif\r\n```\r\n",
+        "I see in the code that there are 2 possible actions: close and mark with `FD_CLOEXEC`.\r\n\r\nI think the later in `popene_internal()` is an attempt to use the `FD_CLOEXEC` flag to let `posix_spawn()` of the file descriptors to keep open and the ones to close.\r\n\r\nGenerally speaking, doing this loop at `popene_internal()` is kind of a waste. All the descriptors should be marked with `FD_CLOEXEC` when they are first opened, not before forking.\r\n\r\nIf we can't mark them like that when they are opened, I suggest to drop the marking entirely and once to fork is done by `posix_spawn()` to close them while running as the child process.\r\n\r\nThis means that we are going to need only one action for `for_each_open_fd()`, to close the open files, so we can also rename it to `close_all_open_fds()` given the exception list.",
+        "@Dim-P please also use `enum` not just `int`, to have better understanding of the type of values accepted. We make a lot of changes to the code base and having `enum` improves maintainability tremendously.",
+        "Thank you for the comments @ktsaou . \r\n\r\n1. `close_range()` is a good call, I've used it as the first candidate to close the fds. It exists on FreeBSD as well. \r\n2. re. `FD_CLOEXEC`, I had a look at the code and you are right, it can probably be removed altogether, but this required more changes than just the plain fixes this PR is meant to do, so it can be done in a future PR. Maybe it's simpler than I thought, but need to check all `netdata_popen()` occurrences. \r\n3. I didn't use `closefrom()` since it doesn't support `FD_CLOEXEC`, but I don't think it was going to be of much use anyway.\r\n4. I replaced `int` with `enum` where applicable.\r\n\r\nTested on `Ubuntu 22.04`, `Fedora 36`, `FreeBSD 13.1`, `Alpine 3.17`.",
+        "FWIW, I think we are overthinking this. The original reason to close open FDs was lxc-attach, see https://github.com/netdata/netdata/pull/1775.\r\n\r\n> There are 3 places in the agent where we either try to close all open file descriptors or mark them to be closed by the exec() stage of posix_spawn().\r\n\r\nSkimming through the code, this is (or should be) actually 2 places:\r\n\r\n1. When the agent starts,\r\n2. When the agent spawns the spawn server,\r\n3. Inside libnetdata's popen.\r\n\r\nWe should coalesce 1 and 2. That is, we should spawn the spawn server only after closing all open FDs.\r\n\r\n> This is done in a bruteforce way, by looping through all FD IDs up to _SC_OPEN_MAX.\r\n\r\nThe original issue was lxc-attach leaving an open pseudoterminal device open. I'd bet that closing just a small, fixed amount of open FDs (let's say 64-128) would be more than safe. We can handle then the opening of our own FDs with the proper flag to close on exec.",
+        "Thanks guys, @vkalintiris I will merge this now to fix the issue before the upcoming stable release and we can make a new PR to improve the code using your suggestions.",
+        "> TODO: Revert https://github.com/netdata/netdata/pull/14178\r\n\r\n@Dim-P it is time now!"
+    ],
+    "merged": true,
+    "created_at": "2023-01-05T20:07:28Z",
+    "issue_context": {
+        "number": 14177,
+        "title": "[Bug]: 100% CPU usage when the open FD limit is huge",
+        "body": "### Bug description\n\nThe issue was discovered in #14062\r\n\r\nI am not sure if that is a systemd or kernel thing but on some distributions `LimitNOFILE=infinity` translates into 1073741816 open FD limit.\r\n\r\ne.g. Fedora 37\r\n\r\n```cmd\r\n[cm@shared-fedora37 ~]$ docker run -d --rm --name nd netdata/netdata\r\n01cc20c86781ff63dea1f242bf921437e61e12b179bc2c6f49bdd3ad8ce2c08b\r\n[cm@shared-fedora37 ~]$ docker exec -it nd cat /proc/self/limits | grep open\r\nMax open files            1073741816\r\n```\r\n\r\nNetdata uses 100% CPU when the open FD limit is huge because of this loop\r\n\r\nhttps://github.com/netdata/netdata/blob/1f1fafeb86690d2844ee2ae08b8f35e6c938eea8/daemon/main.c#L1307-L1315\r\n\n\n### Expected behavior\n\nNetdata doesn't consume 100% CPU when the open FD limit is huge.\n\n### Steps to reproduce\n\n1. Install Docker Engine on Fedora 37 (or Rocky Linux 9). \r\n2. Start Netdata docker container\r\n\n\n### Installation method\n\ndocker\n\n### System info\n\n```shell\nLinux shared-fedora37 6.0.12-300.fc37.x86_64 #1 SMP PREEMPT_DYNAMIC Thu Dec 8 16:58:47 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux\n```\n\n\n### Netdata build info\n\n```shell\nnetdata v1.37.0-71-nightly\n```\n\n\n### Additional info\n\n_No response_",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 31972,
+            "commit_id": "c7ba48ab2771da639edcd37180fe75a2d4af42d9",
+            "original_commit_id": "147631bb8f17951a1eadf8ff8aeebd98442925d0",
+            "path": "libnetdata/libnetdata.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1964,
+            "original_line": 1964,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is the arbitrary value so high? \r\n\r\n```sh\r\nbash-5.2$ cat a.c \r\n#include <unistd.h>\r\n#include <stdio.h>\r\n\r\nint main()\r\n{\r\n    printf(\"%d\\n\", sysconf(_SC_OPEN_MAX));\r\n    return 0;\r\n}\r\nbash-5.2$ gcc a.c \r\nbash-5.2$ ./a.out \r\n1024\r\n````\r\n\r\nDid you get a `_SC_OPEN_MAX_`  higher than `1024` for a specific kernel version?",
+                "Or lib?",
+                "That was the highest value I could find one a quick Google search: https://www.unix.com/programming/131253-huge-difference-between-_posix_open_max-sysconf-_sc_open_max.html\r\n\r\nI don't think it's too high for a modern system, it shouldn't slow things down if we have to fall back to that (e.g. maybe on FreeBSD where the directory will return `NULL`). \r\n\r\nBut I see your point that usually it's 1024.",
+                "All right, thanks to explain.\r\nYour PR is working as expected, so I am waiting for you to address the other two comments."
+            ]
+        },
+        {
+            "hunk_id": 31920,
+            "commit_id": "c7ba48ab2771da639edcd37180fe75a2d4af42d9",
+            "original_commit_id": "147631bb8f17951a1eadf8ff8aeebd98442925d0",
+            "path": "libnetdata/libnetdata.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1964,
+            "original_line": 1964,
+            "side": "RIGHT",
+            "original_position": 20,
+            "position": 38,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is the arbitrary value so high? \r\n\r\n```sh\r\nbash-5.2$ cat a.c \r\n#include <unistd.h>\r\n#include <stdio.h>\r\n\r\nint main()\r\n{\r\n    printf(\"%d\\n\", sysconf(_SC_OPEN_MAX));\r\n    return 0;\r\n}\r\nbash-5.2$ gcc a.c \r\nbash-5.2$ ./a.out \r\n1024\r\n````\r\n\r\nDid you get a `_SC_OPEN_MAX_`  higher than `1024` for a specific kernel version?",
+                "Or lib?",
+                "That was the highest value I could find one a quick Google search: https://www.unix.com/programming/131253-huge-difference-between-_posix_open_max-sysconf-_sc_open_max.html\r\n\r\nI don't think it's too high for a modern system, it shouldn't slow things down if we have to fall back to that (e.g. maybe on FreeBSD where the directory will return `NULL`). \r\n\r\nBut I see your point that usually it's 1024.",
+                "All right, thanks to explain.\r\nYour PR is working as expected, so I am waiting for you to address the other two comments."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,38 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 106854,
+    "lang": "c_sharp",
+    "pr_title": "Stop counting work items from ThreadPoolTypedWorkItemQueue for ThreadPool.CompletedWorkItemCount",
+    "pr_body": "These work items are used to parallelize the actual work items but they don't do any actual work. It's more precise to only count actual work items for ThreadPool.CompletedWorkItemCount.\r\n\r\nFixes #104284",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2024-08-23T18:03:30Z",
+    "issue_context": {
+        "number": 104284,
+        "title": "ThreadPool.CompletedWorkItemCount double counting IO completion work items",
+        "body": "### Description\n\nWhile upgrading a service from .NET 6 to .NET 8, we noticed that the 'Thread Pool Completed Work Item Count' counter values roughly doubled for our app. Based on the repro below, I believe that .NET 8 may be double-counting IO completion work items in the `ThreadPool.CompletedWorkItemCount` property that this counter is based on, so that the counter is no longer accurate.\n\n### Reproduction Steps\n\n```cs\r\n// Submit one IO completion work item per second and log ThreadPool.CompletedWorkItemCount\r\n// to console.\r\npublic static void Main(string[] args)\r\n{\r\n    while (true)\r\n    {\r\n        SubmitIOCompletion();\r\n        Thread.Sleep(1000);\r\n        Console.WriteLine(ThreadPool.CompletedWorkItemCount);\r\n    }\r\n}\r\n\r\n// Manually submit an IO completion packet to the thread pool and wait\r\n// for the callback to run.\r\n// Note: Calling Socket.ConnectAsync(...).GetAwaiter().GetResult() or any other guaranteed-async API\r\n// gives the same repro as this code.\r\nprivate static unsafe void SubmitIOCompletion()\r\n{\r\n    using var manualResetEvent = new ManualResetEventSlim(false);\r\n\r\n    var overlapped = new Overlapped();\r\n    NativeOverlapped* nativeOverlapped = overlapped.Pack((errorCode, numBytes, innerNativeOverlapped) =>\r\n    {\r\n        Overlapped.Free(innerNativeOverlapped);\r\n        manualResetEvent.Set();\r\n    }, null);\r\n\r\n    ThreadPool.UnsafeQueueNativeOverlapped(nativeOverlapped);\r\n    manualResetEvent.Wait();\r\n}\r\n```\n\n### Expected behavior\n\nOn .NET 6, this code prints:\r\n\r\n1\r\n2\r\n3\r\n4\r\n...\r\n\r\nThe code is kicking off 1 IO completion per second, and `ThreadPool.CompletedWorkItemCount` counts 1 work item per second as expected.\n\n### Actual behavior\n\nOn .NET 8, this code prints:\r\n\r\n3\r\n6\r\n9\r\n12\r\n...\r\n\r\nThe code is now counting 3 work items per second.\n\n### Regression?\n\nYes - regression from .NET 6.\n\n### Known Workarounds\n\n_No response_\n\n### Configuration\n\n.NET 8.0.302\r\nWindows 11\r\nx64\r\n\n\n### Other information\n\nCompute work items submitted using `ThreadPool.QueueUserWorkItem()` don't repro this issue. It seems to be specific to IO completions.\r\n\r\nI tried setting breakpoints on calls to ThreadInt64PersistentCounter.Add()/Increment() and found that the the same worker thread would increment the counter twice per work item, from these two different call stacks:\r\n\r\n**Stack 1**\r\nSystem.Private.CoreLib.dll!System.Threading.ThreadInt64PersistentCounter.Increment(object threadLocalCountObject)\r\nSystem.Private.CoreLib.dll!System.Threading.PortableThreadPool.NotifyWorkItemProgress(object threadLocalCompletionCountObject, int currentTimeMs)\r\nSystem.Private.CoreLib.dll!System.Threading.PortableThreadPool.NotifyWorkItemComplete(object threadLocalCompletionCountObject, int currentTimeMs)\r\nSystem.Private.CoreLib.dll!System.Threading.ThreadPool.NotifyWorkItemComplete(object threadLocalCompletionCountObject, int currentTimeMs)\r\nSystem.Private.CoreLib.dll!System.Threading.ThreadPoolWorkQueue.Dispatch()\r\nSystem.Private.CoreLib.dll!System.Threading.PortableThreadPool.WorkerThread.WorkerThreadStart()\r\n\r\n**Stack 2**\r\nSystem.Private.CoreLib.dll!System.Threading.ThreadPoolTypedWorkItemQueue<System.Threading.PortableThreadPool.IOCompletionPoller.Event, System.Threading.PortableThreadPool.IOCompletionPoller.Callback>.System.Threading.IThreadPoolWorkItem.Execute()\r\nSystem.Private.CoreLib.dll!System.Threading.ThreadPoolWorkQueue.Dispatch()\r\nSystem.Private.CoreLib.dll!System.Threading.PortableThreadPool.WorkerThread.WorkerThreadStart()\r\n\r\nI also found that another worker thread would wake up each second, find 0 work items to consume, and go back to sleep. This was also hitting the NotifyWorkItemProgress() breakpoint (Stack 1), and explains the 3rd increment to the counter that happens every second.\r\n\r\n",
+        "comments": [
+            "Tagging subscribers to this area: @mangod9\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<!-- Policy app identification https://img.shields.io/static/v1?label=PullRequestIssueManagement. -->"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 4115,
+            "commit_id": "3aad3dcd515a335455d967c153afb822ff6a5279",
+            "original_commit_id": "5d3bac120166670a91048637da0564eb1bf4c367",
+            "path": "src/libraries/System.Private.CoreLib/src/System/Threading/ThreadPoolWorkQueue.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1396,
+            "original_line": 1396,
+            "side": "LEFT",
+            "original_position": 5,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "It should still count each of the IO completion callbacks that are called in batch above. `ThreadPoolWorkQueue.Dispatch` would also count the current work item (`ThreadPoolTypedWorkItemQueue`'s queue processing work item), which could be approximately discounted here. It could be something like:\r\n\r\n```c#\r\n// Discount a work item here to avoid counting most of the queue processing work items\r\nif (completedCount > 1)\r\n{\r\n    ThreadInt64PersistentCounter.Add(tl.threadLocalCompletionCountObject!, completedCount - 1);\r\n}\r\n```"
+            ]
+        }
+    ]
+}

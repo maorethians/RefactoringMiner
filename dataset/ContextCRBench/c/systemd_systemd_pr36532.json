@@ -1,0 +1,159 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 36532,
+    "lang": "c",
+    "pr_title": "core: Add DelegateNamespaces=",
+    "pr_body": "This delegates one or more namespaces to the service. Concretely,\r\nthis setting influences in which order we unshare namespaces. Delegated\r\nnamespaces are unshared *after* the user namespace is unshared. Other\r\nnamespaces are unshared *before* the user namespace is unshared.\r\n\r\nFixes https://github.com/systemd/systemd/issues/35369",
+    "pr_comments": [
+        "I must say I don't really like where this is going. If this should become a concept with first level support the ns management in pid1 should see some revamp: https://github.com/systemd/systemd/pull/34113#discussion_r1734684217. I know that it's half broken now, but let's not make it even more widespread...",
+        "> I must say I don't really like where this is going. If this should become a concept with first level support the ns management in pid1 should see some revamp: [#34113 (comment)](https://github.com/systemd/systemd/pull/34113#discussion_r1734684217). I know that it's half broken now, but let's not make it even more widespread...\r\n\r\nI think that that linked comment matters, but also is somewhat orthogonal to what this PR is about. Yes, pid1 should pin the relevant mount namespace (and possibly others, but maybe not?) of the invoked processes, and operate with them whenever re-entering the services' context. But this doesn't mean we cannot rearrange the ownership between the namespaces we are setting up.",
+        "I'd really prefer to maintain nested ns with the upper level remaining privileged, and send their fds back to pid1. I can add the latter later, but the semantics of delegation should be clear first...",
+        "> I'd really prefer to maintain nested ns with the upper level remaining privileged, and send their fds back to pid1. I can add the latter later, but the semantics of delegation should be clear first...\r\n\r\nI'm all in favor, but if we care about backwards compat, this should already be an opt-in switch and not something we can do by default since that changes the semantics for all services that unshare their own mount namespace.",
+        "Please add `DelegateNamespaces=false` to:\r\n\r\nsrc/portable/profile/default/service.conf\r\nsrc/portable/profile/nonetwork/service.conf\r\nsrc/portable/profile/strict/service.conf\r\n\r\nOtherwise services using those profiles (which add various namespaces) will be able to have privileges over them by setting this option\r\n"
+    ],
+    "merged": true,
+    "created_at": "2025-02-26T22:07:32Z",
+    "issue_context": {
+        "number": 35369,
+        "title": "Allow user namespace to own all namespaces (or at least mount and net)",
+        "body": "### Component\r\n\r\nsystemd\r\n\r\n### Is your feature request related to a problem? Please describe\r\n\r\nMeta is migrating to using transient systemd units to start containers. We've unblocked most major features: PrivatePIDs=, ProtectControlGroups=private and PrivateUsers=full. This is the last one (famous last words).\r\n\r\nWhen the Twine team tried to use `PrivateUsers=identity` in their container runtime, they saw errors when their processes tried to mount FUSE filesystems:\r\n```\r\nfusermount3: mount failed: Operation not permitted\r\n```\r\n\r\nWe root caused this to the user namespace not owning the mount namespace. Similarly, we also saw issues with containers changing network sysctls due to the user namespace not owning the network namespace. Currently, our Twine container runtime unshares the user namespace first and allows containers to mess with mount/network/hostname/etc settings to their heart's content.\r\n\r\nBy default, systemd unshares the user namespace last for sandboxing purposes which makes sense for the primary service sandboxing use case: https://github.com/systemd/systemd/blob/bbec1c87d3bf8d14eeb1ee3b4df973a53cca2e58/src/core/exec-invoke.c#L5145-L5151\r\n\r\nThe notable exception is user service manager because the kernel imposes this restriction for using unprivileged user namespaces: https://github.com/systemd/systemd/blob/bbec1c87d3bf8d14eeb1ee3b4df973a53cca2e58/src/core/exec-invoke.c#L4033\r\n\r\n### Describe the solution you'd like\r\n\r\nNEW PROPOSAL:\r\n\r\nUse DelegateNamespaces= which takes similar arguments to RestrictNamespaces=\r\n\r\nGeneric container runtime uses DelegateNamespaces=yes while restricted container runtime uses DelegateNamespaces=mount\r\n\r\nOLD PROPOSAL:\r\n\r\nTalking to the Twine team, they would prefer not to play whack-a-mole with each namespace, especially as the kernel adds new features based on userns permission checks. So we could add a `PrivateUsers=full-owned` that would unshare the user namespace before all other namespaces.\r\n\r\nThe Twine team also owns a more restrictive container runtime for batch jobs. Unfortunately, those jobs still need to do FUSE mounts but not other namespace operations. So we would like `PrivateMounts=owned` for that use case. This would ensure that the userns owns the mountns but not the other namespaces. Note this pattern is easy to extend for other namespaces `PrivateHostname=owned`, `PrivateIPC=owned`, etc.\r\n\r\nOne complexity is live mounting (e.g. `systemctl bind`) where we might not want the unprivileged user namespace messing with systemd mounts. Thus, for mount namespaces, it might make sense for us to unshare like `mntns -> userns -> mntns`. That way, the unprivieleged userns cannot mess with mounts from systemd. In the privileged case\r\n\r\nSo TL;DR:\r\n1. `PrivateUsers=full-owned` for generic container runtime where userns owns all namespaces\r\n2. `PrivateMounts=owned` for restrictive container runtime where userns owns just the mount namespace\r\n3. For both cases, unshare `mntns -> userns -> mntns` to better support systemctl bind\r\n\r\nIf (1) isn't suitable, at a minimum, we would need `PrivateMounts=owned` and `PrivateNetwork=owned` for the generic container runtime use case, with the risk we may come back and ask for more `Private<Namespace>=owned` options in the future.\r\n\r\nI am happy to hear other proposals and brainstorm!\r\n\r\n### Describe alternatives you've considered\r\n\r\nWe have workarounds e.g. just running a systemd unit then writing a custom binary that unshares userns prior to other namespaces. But it'd be nice to not do workarounds.\r\n\r\nSorry about the long essay, thanks for reading.\r\n\r\n### The systemd version you checked that didn't have the feature you are asking for\r\n\r\n257",
+        "comments": [
+            "Idea:\r\n\r\nMaybe add a new setting: DelegateNamespaces= that parses the same expressions as RestrictNamespaces=, and controls which namespaces are owned to the userns, and which ones are not. Of course specifiying \"user\" there would not make sense (and should be ignored/warned about).\r\n\r\nThe effect of this setting would be simply that the listed namespaces are either created before the userns (in case of unlisted namespace types) or created after them (otherwise).\r\n",
+            "and maybe DelegateNamespaces=\u2026 should imply PrivateUsers= in some form if not set otherwise.",
+            "How would this interact with/differ to [the idea of `PrivateUsers=rootidmap`](https://github.com/systemd/systemd/issues/35345)?",
+            "@poettering DelegateNamespaces= sounds good to me - its much cleaner! We can do DelegateNamespaces=yes for our generic container runtime and DelegateNamespaces=mount for restricted container runtime.\r\n\r\n@Winterhuman PrivateUsers=rootidmap only really works for user service manager? DelegateNamespaces= is ignored for user services since for unprivileged user namespaces, userns must always be unshared first and always own other namespaces.",
+            "btw, this would also be really nicely symmetric to the Delegate= switch for cgroup controllers, where one lists cgroup controllers to delegate to the payload.",
+            "Questions that have come up while implementing this:\n\n- If the mount namespace is delegated, do we always want to have an outer mount namespace that is managed by systemd and an inner mount namespace that is delegated to the service or should we enable this via a separate option?\n- Delegating the pid namespace without delegating the mount namespace doesn't make much sense since /proc will be mounted before unsharing the pid namespace in that case. Should we refuse delegating the pid namespace without delegating the mount namespace?\n- How do we handle NetworkNamespacePath=, JoinsNamespaceOf=, etc in combination with DelegateNamespaces=. More specifically, if NetworkNamespacePath= is used, should all other services with the same NetworkNamespacePath= join the corresponding owning user namespace as well? Or should we refuse DelegateNamespaces=net in combination with NetworkNamespacePath=?",
+            "> If the mount namespace is delegated, do we always want to have an outer mount namespace that is managed by systemd and an inner mount namespace that is delegated to the service\n\nYes, so that new mounts established via MountImage() and such doesn't end up getting owned by inner ns.",
+            "> > If the mount namespace is delegated, do we always want to have an outer mount namespace that is managed by systemd and an inner mount namespace that is delegated to the service\n> \n> Yes, so that new mounts established via MountImage() and such doesn't end up getting owned by inner ns.\n\nBut doesn't this already happen if the workload itself unshares its own mount namespace again? We seem to look up the mount namespace by pid so whether we delegate the mount namespace in systemd or the service just unshare the mount namespace itself, the mounts will end up owned by the inner ns already?\n\nNot saying we shouldn't fix this, but it doesn't seem like a regression to me if I understand correctly, since we'll already happily and without problems mount into whatever inner ns is unshared by the service."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32475,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4254,
+            "original_line": 4254,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 47,
+            "subject_type": "line",
+            "review_comments": [
+                "hmm, we should probably assert() if CLONE_USER is specified here, as that makes no sense."
+            ]
+        },
+        {
+            "hunk_id": 32481,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4214,
+            "original_line": 4214,
+            "side": "RIGHT",
+            "original_position": 2,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "i am pretty sure exec_context_need_unprivileged_private_users() should return true if namespaces are delegated in --user mode, no? "
+            ]
+        },
+        {
+            "hunk_id": 32479,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4257,
+            "original_line": 4257,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 50,
+            "subject_type": "line",
+            "review_comments": [
+                "commit message refers to old function name"
+            ]
+        },
+        {
+            "hunk_id": 32477,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4291,
+            "original_line": 4291,
+            "side": "RIGHT",
+            "original_position": 42,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "please emphasize in the comment that we care about CAP_NET_ADMIN in the userns we are running in *at* *this* *point*, which could be thw host's or the fresh one."
+            ]
+        },
+        {
+            "hunk_id": 32478,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5248,
+            "original_line": 5248,
+            "side": "LEFT",
+            "original_position": 282,
+            "position": 362,
+            "subject_type": "line",
+            "review_comments": [
+                "i'd really prefer if this bit was split out into a helper call in a first cmmit, and then extended by the delegation stuff in a second commit. so that one can follow what is going on"
+            ]
+        },
+        {
+            "hunk_id": 32480,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5262,
+            "original_line": 5262,
+            "side": "LEFT",
+            "original_position": 180,
+            "position": 391,
+            "subject_type": "line",
+            "review_comments": [
+                "should be dropped in earlier commit?"
+            ]
+        },
+        {
+            "hunk_id": 32476,
+            "commit_id": "8234cd9989d3834bf5c06e2b597ec097b985e1e8",
+            "original_commit_id": "aaa5065d8fae1abd8a17c210fe3525bf22b8c10f",
+            "path": "src/core/exec-invoke.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 4271,
+            "original_line": 4271,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 64,
+            "subject_type": "line",
+            "review_comments": [
+                "please add a comment here that explains that we call this function twice, and what the difference is"
+            ]
+        }
+    ]
+}

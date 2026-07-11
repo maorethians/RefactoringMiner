@@ -1,0 +1,68 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 72536,
+    "lang": "c_sharp",
+    "pr_title": "Avoid empty segments from PipeReader.ReadAsync",
+    "pr_body": "Fixes https://github.com/dotnet/runtime/issues/30786\r\n\r\nReuses a `BufferSegment` if it is unused and a larger memory buffer is requested.\r\n\r\nThere was already a memory pool test for this type of scenario, so I haven't added a new one.",
+    "pr_comments": [
+        "Both test failures have tracking issues and are unrelated to this change, merging."
+    ],
+    "merged": true,
+    "created_at": "2022-07-20T21:22:58Z",
+    "issue_context": {
+        "number": 30786,
+        "title": "PipeReader.ReadAsync can return empty segments",
+        "body": "I just noticed that segments in a ReadResult can be empty:\r\n\r\n![grafik](https://user-images.githubusercontent.com/10261186/64445911-ce590f80-d0d7-11e9-846d-ae255df18171.png)\r\nI assumed that the first segment was never empty, so I often use `result.Buffer.First.Span[0];` to access the first byte.\r\n\r\nIs this intended behaviour? Can this be caused by me writing to the pipe in a wrong way? This is how I fill my pipe from a `System.IO.Compression.DeflateStream`:\r\n\r\n```c#\r\nprivate async Task Decompress(PipeWriter writer, ReadOnlyMemory<byte> data, int count)\r\n{\r\n    InflateInputStream.Position = 0;\r\n    InflateInputStream.Write(data.Span.Slice(0, count));\r\n    InflateInputStream.Position = 0;\r\n    InflateInputStream.SetLength(count);\r\n    int read;\r\n\r\n    do\r\n    {\r\n        Memory<byte> memory = writer.GetMemory(data.Length * 2);\r\n        read = InflateOutputStream.Read(memory.Span);\r\n        writer.Advance(read);\r\n    }\r\n    while (read != 0);\r\n    await writer.FlushAsync();\r\n}\r\n```\r\n",
+        "comments": [
+            "@davidfowl @pakrym IIRC I believe this behavior can happen based on how the pipe advances internally. I remember you two had a conversation about it. Is it possible to check if the first segment is empty before returning the ReadResult?",
+            "Just FYI, this behaviour does not occur in my setup if I read the inflate stream's output into a dedicated buffer, and `WriteAsync` the buffer into the pipe.",
+            "Ugh yes we need to try to solve the empty segment problem. It\u2019s a real PITA to deal with that today. Honestly I\u2019d rather try to fix it with ReadOnlySequence itself but we\u2019d need to measure the impact.",
+            "> but we\u2019d need to measure the impact.\r\n\r\nWhat impact would it have?",
+            "ROS is very performance sensitive and we would have to add empty segment skipping code to multiple very hot paths (construction, First, enumeration etc)",
+            "I think we should at the very least try to avoid empty segments while building up the structure internally.",
+            "Wonder if we should make it a rule, don't produce `ROS<>` with empty segments. We won't be able to assert it unfortunately.",
+            "I think that rule works except when the `ROS<>` is empty. \r\n\r\n@Trolldemorted From what I can tell, this potentially was fixed in 3.0. Could you try the latest 3.0-preview9 release and see if you hit this behavior again? https://dotnet.microsoft.com/download/dotnet-core/3.0. \r\n\r\nedit: We believe https://github.com/dotnet/corefx/commit/34765c5934c4b2f45853d323f4c87617cd2f3158 should have fixed this issue. Please let us know if you are continuing to see this behavior.",
+            "@Trolldemorted can you show how you created the Pipe? In particular I want to see the PipeOptions",
+            "@jkotalik just making sure, you want me to upgrade to sdk preview9, but keep System.IO.Pipelines on the latest stable  release (4.5.3)? Was 34765c5 landed in the sdk? I upgraded the SDK to 3.0.100-preview9-014004 and kept System.IO.Pipelines 4.5.3 but it happened again. I also noticed other segments can be empty too:\r\n![grafik](https://user-images.githubusercontent.com/10261186/64609649-b03c2980-d3cd-11e9-82b1-0acb247517bd.png)\r\n\r\n\r\n@davidfowl I am using `new Pipe()` with no explicit options ([source](https://github.com/Trolldemorted/VncDotnet/blob/09a48a4012e43a6a29aa841990cd80ce3c5e9828/VncDotnet/Encodings/ZRLEEncoding.cs#L30)).",
+            "@Trolldemorted you need to update the package to preview9 of System.IO.Pipelines",
+            "I upgraded to 4.6.0-preview9.19421.4, but it still happens. Might be my imagination but it happens less frequently, though.",
+            "@Trolldemorted if you can provide a repro (set of steps to reproduce the empty segments) that would be great. It would mean logging what you wrote and how you called `AdvancedTo` on the other side. ",
+            "A repro for an empty **first** segment is tricky, as they happen pretty rarely (last time after >2GB of input). However, I found a small input for an empty non-first segment:\r\n\r\nhttps://github.com/Trolldemorted/EmptySegmentsBug/blob/371c7ceca7412f4313257c720965162a1b56ae76/EmptySegmentsBug/Program.cs\r\n\r\nIf you have VS and dotnet core 3 preview9 installed, opening it and pressing F5 should throw the \"segment empty!\" InvalidDataException, at least it does that reliably on my laptop.\r\n\r\nThanks a lot for your patience!",
+            "Marking this as reliability, as First.Span[0] and FirstSpan[0] are extremely common when processing ROS.",
+            "@Trolldemorted what content is inside of test.blob?",
+            "I committed and pushed it, if your VS executes it in `\\bin\\Debug\\netcoreapp3.0` the relative path should match.\r\n\r\nIt is just the beginning of an rfb stream, nothing extraordinary.",
+            "Do you depend on a reproducible setup that causes an empty first segment, or is my poc sufficient for now?",
+            "It's a key decision whether the first segment is *guaranteed* to be not empty or not. If it's not empty in 99.999% of the cases you still can't rely on that.\r\n\r\nIt's also problematic if just a certain API (such as PipeReader) always generates non-empty first segments. Code that does `First.Span[0]` would work with such an API but fail surprisingly with others.\r\n\r\nSo I think that non-emptiness guarantee must be made (or not made) at the sequence level, not at the API level (PipeReader).\r\n\r\nIf it is decided that empty first segments can occur then it would be best if they do occur regularly in practice. If they occur only under exceptional circumstances then people will still rely on non-emptiness and write bugs that testing does not find. \r\n\r\nIt's best if corner cases are either guaranteed not to happen, or they happen frequently enough to be exercised by testing.\r\n",
+            "I agree, while writing documentation it became evident that empty segments make the type pretty impossible to use...",
+            "A year has past, can you estimate when this will be fixed? I see you removed it from the 5.0 milestone, which is unfortunate.",
+            "so, what's the idiomatic way to get the first byte, since this is unsafe: `ros.First.Span[0]`\r\nwhat about the second byte, is this also problematic? `ros.Slice(1).First.Span[0]`",
+            "any chance we get a fix for 7.0?",
+            "@Trolldemorted How did you reproduce it?",
+            "I have built a repro project here: https://github.com/Trolldemorted/EmptySegmentsBug/tree/371c7ceca7412f4313257c720965162a1b56ae76/EmptySegmentsBug",
+            "So I upgraded the repro to  use netcoreapp3.1 and the System.IO.Pipelines 6.0.3 and I get an empty segment at the end. When I upgrade to .NET 6 the problems goes away (likely from changes to the Stream).\r\n\r\nPS: The code is also incorrect [here](https://github.com/Trolldemorted/EmptySegmentsBug/blob/371c7ceca7412f4313257c720965162a1b56ae76/EmptySegmentsBug/Program.cs#L66), it should be:\r\n\r\n```\r\nif (result.Buffer.Length == 0 && (result.IsCanceled || result.IsCompleted))\r\n```\r\n\r\nWe should fix any bugs that result in the PipeReader producing empty segments though. Narrowing down this repro on .NET Core 3.1 more might help figure out the exact reason why there's an empty segment at the end.",
+            "OK I have a repro. Generally when the length is passed into GetMemory we need to handle the case where's there's an existing segment allocated with nothing written into it, but more space is being requested than is available:\r\n\r\n```C#\r\nusing System;\r\nusing System.IO.Pipelines;\r\nusing System.Threading.Tasks;\r\n\r\nnamespace EmptySegmentsBug\r\n{\r\n    class Program\r\n    {\r\n        static async Task Main(string[] args)\r\n        {\r\n            var pipe = new Pipe();\r\n            \r\n            // Get a new block but don't write anything\r\n            var buffer = pipe.Writer.GetMemory();\r\n            pipe.Writer.Advance(0);\r\n            await pipe.Writer.FlushAsync();\r\n\r\n            // Get a new block\r\n            buffer = pipe.Writer.GetMemory(4096 * 2);\r\n            pipe.Writer.Advance(buffer.Length);\r\n            await pipe.Writer.FlushAsync();\r\n\r\n            await ReadAndDump();\r\n\r\n            async Task ReadAndDump()\r\n            {\r\n                var result = await pipe.Reader.ReadAsync();\r\n                Console.Write(\"[\");\r\n                bool first = true;\r\n                foreach (var segment in result.Buffer)\r\n                {\r\n                    if (!first)\r\n                    {\r\n                        Console.Write(\",\");\r\n                    }\r\n\r\n                    Console.Write(segment.Length);\r\n                    first = false;\r\n                }\r\n                Console.WriteLine(\"]\");\r\n                pipe.Reader.AdvanceTo(result.Buffer.End);\r\n            }\r\n        }\r\n    }\r\n}\r\n```\r\n\r\nThis prints: `[0,8192]`"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 5396,
+            "commit_id": "5e13f997e37be64d45b3b67e870dd7e9a4e6609d",
+            "original_commit_id": "58efb7ef7570b02cb2f4bb3ae0186f04fa264c31",
+            "path": "src/libraries/System.IO.Pipelines/src/System/IO/Pipelines/Pipe.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 200,
+            "original_line": 200,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "I would use _writingHeadBytesBuffered instead (but the logic would need to be reworked a bit)\r\n",
+                "I think I tried using that field initially, but it gets set to 0 in Advance with a non-zero value, so you need to check some other value anyways. What's wrong with `_writingHead.Length`?",
+                "Nothing wrong with it, it just avoids the indirection but this is fine."
+            ]
+        }
+    ]
+}

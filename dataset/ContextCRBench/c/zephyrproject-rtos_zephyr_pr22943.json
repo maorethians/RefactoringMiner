@@ -1,0 +1,48 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 22943,
+    "lang": "c",
+    "pr_title": "kernel: work_q: fix return value in non-error case",
+    "pr_body": "A recent patch allowed an error code to be returned even though the\r\nexecution path treated it as a non-error condition.  Clear the code\r\nbefore returning.\r\n\r\nFixes #22933",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2020-02-19T16:08:38Z",
+    "issue_context": {
+        "number": 22933,
+        "title": "k_delayed_work_submit_to_queue returns error code when resubmitting previously completed work.",
+        "body": "**Describe the bug**\r\nk_delayed_work_submit_to_queue returns error code -EALREADY when submitting previously completed task. Tak is submitted successfully. This response is not covered in doc. This should probably be changed to 0 since error code is propagated from k_delayed_work_cancel. \r\n\r\n**Expected behavior**\r\n0 result - work was submitted to queue. \r\nOR\r\nresponse described in doc \r\n",
+        "comments": [
+            "was this fixed by https://github.com/zephyrproject-rtos/zephyr/pull/22810?\r\n@Vudentz @joerchan @pabigot ",
+            "@LuxLuthor Can you specify which commit you are on?\r\nMaybe it is a regression from #22810?",
+            "I observe issue on 28298fa06a \r\nIt seems that it is regression from #22810 \r\nCode below causes setting err to -EALREADY although work is send to queue\r\n\r\n```\r\n/* Cancel if work has been submitted */\r\n\tif (work->work_q == work_q) {\r\n\t\terr = work_cancel(work);\r\n\t\t/* -EALREADY indicates the work has already completed so this\r\n\t\t * is likely a recurring work.\r\n\t\t */\r\n\t\tif (err < 0 && err != -EALREADY) {\r\n\t\t\tgoto done;\r\n\t\t}\r\n\t}\r\n```\r\n\r\n",
+            "I propose we should revert #22810, fix #22803 by changing the documentation to reflect what the API actually does, and fix #22756 with the alternative solution from #22769.",
+            "Clarification: I'm assuming that the bug here is a direct result of the change in API to match documentation by now returning an error from `k_delayed_work_cancel()` where before it returned success.  I take that as a sign that we shouldn't have changed the API in #22810, certainly not at this stage of the release cycle.  @jhedberg \r\n\r\nThis particular problem might be fixed by overriding the error return in this case and make it return success value; I don't know, haven't looked closely.  But that won't address any other cases that are going to be discovered.",
+            "@pabigot\r\nTo clarify what is happening. This is extracted RPA timeout handling which now has a bug that is being ignored because we don't check return value of k_delayed_work_submit in le_set_private_addr.\r\n\r\n```\r\nstatic int le_set_private_addr(u8_t id)\r\n{\r\n\tint err = k_delayed_work_submit(&bt_dev.rpa_update, RPA_TIMEOUT);\r\n\tBT_WARN(\"delayed work submit %d\", err);\r\n}\r\n\r\nstatic void rpa_timeout(struct k_work *work)\r\n{\r\n\tle_set_private_addr(BT_ID_DEFAULT);\r\n}\r\n\r\nstatic int bt_init(void)\r\n{\r\n\tk_delayed_work_init(&bt_dev.rpa_update, rpa_timeout);\r\n\r\n\tle_set_private_addr(BT_ID_DEFAULT);\r\n}\r\n\r\n```\r\nWill give:\r\n```\r\n[00:00:04.167,510] <wrn> bt_hci_core: delayed work submit 0\r\n[00:00:19.167,999] <wrn> bt_hci_core: delayed work submit -69\r\n```\r\nSo it is not that we changed the API. But that we broke k_delayed_work_submit by doing it.\r\n\r\nEDIT:\r\nThe problem is that work->work_q is not cleared once the work has finished. So the submit_handler tries to cancel it first.\r\n",
+            "I think using the function added here in #22826 (we could just have it internal) is the way to solve it.\r\nI cannot see a way to reset work->work_q to NULL. work_timeout would not be the right place it seems.\r\n\r\nTested using this approach and that solves it. Thoughts @pabigot @Vudentz ?\r\n\r\n```\r\ndiff --git a/kernel/work_q.c b/kernel/work_q.c\r\nindex 845a2670c8..fba3f36a34 100644\r\n--- a/kernel/work_q.c\r\n+++ b/kernel/work_q.c\r\n@@ -80,6 +80,12 @@ static int work_cancel(struct k_delayed_work *work)\r\n        return 0;\r\n }\r\n \r\n+static inline bool k_delayed_work_pending(struct k_delayed_work *work)\r\n+{\r\n+       return !z_is_inactive_timeout(&work->timeout) ||\r\n+              k_work_pending(&work->work);\r\n+}\r\n+\r\n int k_delayed_work_submit_to_queue(struct k_work_q *work_q,\r\n                                   struct k_delayed_work *work,\r\n                                   s32_t delay)\r\n@@ -94,7 +100,7 @@ int k_delayed_work_submit_to_queue(struct k_work_q *work_q,\r\n        }\r\n \r\n        /* Cancel if work has been submitted */\r\n-       if (work->work_q == work_q) {\r\n+       if (k_delayed_work_pending(work)) {\r\n                err = work_cancel(work);\r\n                /* -EALREADY indicates the work has already completed so this\r\n                 * is likely a recurring work.\r\n```\r\n\r\n",
+            "If we want a quick fix something like this might do it @Vudentz since #22810 left the non-zero `err` value to fall through causing the misbehavior:\r\n\r\n```\r\ndiff --git a/kernel/work_q.c b/kernel/work_q.c\r\nindex 845a2670c8..96cd2f644f 100644\r\n--- a/kernel/work_q.c\r\n+++ b/kernel/work_q.c\r\n@@ -99,7 +99,9 @@ int k_delayed_work_submit_to_queue(struct k_work_q *work_q,\r\n                /* -EALREADY indicates the work has already completed so this\r\n                 * is likely a recurring work.\r\n                 */\r\n-               if (err < 0 && err != -EALREADY) {\r\n+               if (err == -EALREADY) {\r\n+                       err = 0;\r\n+               } else if (err < 0) {\r\n                        goto done;\r\n                }\r\n        }\r\n```\r\n\r\nBut I'm still not really happy about changing the return value of `k_delayed_work_cancel()` from success to error in this case.  We have no idea who else depends on the existing behavior."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 28227,
+            "commit_id": "2df2ea442555d889ca66f7828c7c2f17f06acc08",
+            "original_commit_id": "6baff1b3b9c0c0447991f2fbbde279376f3f59b9",
+            "path": "kernel/work_q.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 101,
+            "original_line": 101,
+            "side": "RIGHT",
+            "original_position": 3,
+            "position": 3,
+            "subject_type": "line",
+            "review_comments": [
+                "This seems like further circumvention of the problem to me.\r\nIt would be better to have a better check for if the work should be canceled or not. because in this case it doesn't need to be canceled, which is why it returns EALREADY.\r\nThe work->work_q is not reset to NULL once finished, so it shouldn't be used in all this error handling.\r\n\r\nThe check above for example:\r\n```\r\n\tif (work->work_q != NULL && work->work_q != work_q) {\r\n\t\terr = -EADDRINUSE;\r\n\t\tgoto done;\r\n\t}\r\n```\r\nIs this one the correct behavior?",
+                "I would pick https://github.com/zephyrproject-rtos/zephyr/issues/22933#issuecomment-588287754 as the solution.",
+                "That seems like something that should go into work_cancel(), not here, though, right?",
+                "Yep, I though about moving that check ou of work_cancel now that you mentioned it might be the right thing to do as a separate patch."
+            ]
+        }
+    ]
+}

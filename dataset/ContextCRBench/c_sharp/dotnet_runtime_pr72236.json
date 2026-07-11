@@ -1,0 +1,65 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 72236,
+    "lang": "c_sharp",
+    "pr_title": "Make `Enum.GetValues` AOT-safe",
+    "pr_body": "...at the cost of a small compat break. We return `int[]` instead of `SomeInt32Enum[]`.\r\n\r\nFixes #72140.\r\n\r\nWe can also delete intrinsic handling of `Enum.GetValues` in dataflow analysis but I don't want to conflict with Vitek's #71485 right now.\r\n\r\nCc @dotnet/ilc-contrib",
+    "pr_comments": [
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\nThis serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, to please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "Who owns the System.Enum surface area? I presume this needs to go through a back-compat review",
+        "> Who owns the System.Enum surface area? I presume this needs to go through a back-compat review\r\n\r\nOnly changing it for NativeAOT.",
+        "Woops, missed that this was the nativeaot runtime",
+        "/azp run runtime-extra-platforms",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "> LGTM but there seems to be some related test failures\r\n\r\nThe [System.Numerics.Vectors.Tests](https://helixre107v0xdeko0k025g8.blob.core.windows.net/dotnet-runtime-refs-pull-72236-merge-f8e26dd859a74f6698/System.Numerics.Vectors.Tests/1/console.7589409b.log?helixlogtype=result) is #72149. I think that failure is non-deterministic. I'm not sure if it really should be closed unfortunately.\r\n\r\nI'm looking into the appcompat implications of the other failures (whether we just fixup/disable/add new tests and be done with it, or whether it's blockers).",
+        "I looked at the failing tests. The main implication is that if one does `Array Enum.GetValues(Type)` and then uses the non-generic `IEnumerable` to iterate over the elements of the arrays, it will return boxed underlying type instead of the boxed enum.\r\n\r\nSo the compat concern is basically that. Would someone call `GetValues` and then do a `foreach`, calling `ToString` on each element? We would see different values. Or would they call `object.Equals` on these? They would not be equal to boxed enums.\r\n\r\nIt's basically what the tests do:\r\n\r\n```\r\nAssert.Equal() Failure\r\n           \u2193 (pos 0)\r\nExpected: [Enum1, Enum2, Enum10, Enum18, Enum45]\r\nActual:   [1, 2, 10, 18, 45]\r\n           \u2191 (pos 0)\r\n```\r\n\r\nCouple other alternative:\r\n\r\n* Introduce a new annotations (e.g. `DynamicallyCreatedArrayAttribute`?). This would be similar to `DynamicallyAccessedMembers` but would imply the presence of an array of that type. We can make `Enum.GetValues`, and `Array.CreateInstance` AOT safe with this. Might be getting late for that.\r\n* Shared code over enums. It's getting late for that too.\r\n* Keep it as AOT-unsafe\r\n",
+        "This is unfortunate. I would expect in most code, the expectations on post operations after the call to this API, would be to see the Enum type and not the underlying type. I think we need to give an indicator to the developer of the behavioral change in native AOT but can see as you indicated. the options you listed above might be getting too late now.\r\n\r\nI think keeping it unsafe with the recommended message to use the generic API might be the best option :-(",
+        "> Would someone call GetValues and then do a foreach, calling ToString on each element?\r\n\r\nI looked around usage in grep.app.  While by far the most common usage is just foreach'ing, there are a non-trivial number of uses that do databinding, e.g.\r\nhttps://github.com/HearthSim/Hearthstone-Deck-Tracker/blob/4272f593cdb2282e65dcd73312cb4500ab1cb5da/Hearthstone%20Deck%20Tracker/Controls/Stats/ConstructedFilters.xaml.cs#L36\r\nor that use ToString, either directly, e.g.:\r\nhttps://github.com/Jimmey-Jiang/Common.Utility/blob/103fb680d2818144fe635f957cb262f7f9b810b6/src/Common.Utility_EN/RenumDropList/RenumDropList.cs#L17-L34\r\nor via interpolation, e.g.:\r\nhttps://github.com/AlanMorel/MapleServer2/blob/38e9e05f63eaf1f7c78de2c141d659537a4ab9a5/MapleServer2/Commands/Game/GMCommands.cs#L179-L182\r\nor that do type tests, e.g.:\r\nhttps://github.com/ShareX/ShareX/blob/6dec8a9a10a379fe3ae557813592bbfc252d97b8/ShareX.HelpersLib/Helpers/Helpers.cs#L187-L190\r\nor that use the non-generic Array.IndexOf, e.g.:\r\nhttps://github.com/ShareX/ShareX/blob/6dec8a9a10a379fe3ae557813592bbfc252d97b8/ShareX.HelpersLib/Extensions/EnumExtensions.cs#L86-L90\r\nSeems this change has the potential to break all such usage (with AOT).",
+        "The biggest issue is that the generic overload wasn't there in .Net Standard 2.0, so a lot of libraries targetting that use the type one. As such, having it work properly would be really useful. Personally I've always copied the data to properly typed arrays, but I've seen samples that just cast the arrays to the enum array type.",
+        "If we cannot fix the existing API, can we introduce a new one? I am thinking `GetEnumValuesAsUnderlyingType`.\r\n\r\nLibraries that target NS2.0 would be able to use this API using reflection light-up and still be AOT compatible. It is not the case with the generic overload. Calling the generic overload via reflection requires MakeGenericMethod that comes with the same AOT problem.",
+        "`GetEnumValuesAsUnderlyingType` would be also good for non-runtime reflection. `System.Reflection.MetadataLoadContext` does not support `GetEnumValues` today since it cannot create the enum array.",
+        "Another option that does not require new APIs and that is compatible with NS2.0: Enumerate the enum members as field info. It comes with performance penalty.\r\n\r\n```\r\nusing System.Reflection;\r\n\r\nforeach (var f in typeof(DayOfWeek).GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))\r\n{\r\n    Console.WriteLine(f.Name);\r\n    Console.WriteLine(f.GetRawConstantValue()); // This returns the field value as boxed underlying type\r\n}\r\n```",
+        "Can we make the NativeAOT compiler recognize `Enum.GetValues(typeof(T))` and transform it into `Enum.GetValues<T>()`? It would still raise a warning to suggest users to migrate to the generic overload, but will do what is expected to do at runtime. All but the last examples @stephentoub provided would work, and the last can be easily changed.",
+        "> Can we make the NativeAOT compiler recognize Enum.GetValues(typeof(T)) and transform it into Enum.GetValues<T>()? \r\n\r\nThe AOT compiler does that today: https://github.com/dotnet/runtime/blob/5fc5c68d8a9f1352ae1c4f92769a15d60e5516f3/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/Dataflow/ReflectionMethodBodyScanner.cs#L549-L571\r\n\r\nThe problem is what to do with `Enum.GetValues` where the type is not statically known. For example, https://github.com/dotnet/runtime/blob/215b39abf947da7a40b0cb137eab4bceb24ad3e3/src/libraries/System.ComponentModel.TypeConverter/src/System/ComponentModel/EnumConverter.cs#L174",
+        "Thanks for the data Stephen! The data binding scenario is very likely the reason why .NET Native backtracked on this too (nobody could remember why we backtracked there, only that we backtracked).\r\n\r\nI've submitted an API proposal for the API Jan proposed here: https://github.com/dotnet/runtime/issues/72498. I marked it blocking. If we can get it approved soon, I think it would be reasonable to land before RC 1 snaps off.",
+        "The next step is to get https://github.com/dotnet/runtime/issues/72498 API approved. This PR can be closed. "
+    ],
+    "merged": false,
+    "created_at": "2022-07-15T08:03:08Z",
+    "issue_context": {
+        "number": 72140,
+        "title": "[NativeAOT] Enum.GetValues(Type) should have an aot safe implementation",
+        "body": "We have annotated the above API, public static `System.Array GetValues(System.Type enumType)`, as dangerous (`RequiresDynamicCode(\"It might not be possible to create an array of the enum type at runtime. Use the GetValues<TEnum> overload instead.\")`). \r\n\r\nConsider removing the RDC and providing a native AOT safe implementation.",
+        "comments": [
+            "Looks like this already exists as `Enum.GetValues<Type>`",
+            "I think we still need an implementation when the source of the type is not known and not able to use the generic one",
+            "Well the issue is that AOT generally requires the type to be known since it can't generate code for every enum possible. So I'm not sure if this would be possible without keeping metadata about every enum.",
+            "The problem is with creating the array type at runtime, not with \"what values to fill in\". We keep enough metadata to be able to fill it in.\r\n\r\nWe are discussing \"fixing\" this by having the API return the underlying type of the array. The signature is `Array GetValues(Type)`. It currently returns `SomeInt32Enum[]` for `SomeInt32Enum`. But it could also return `int[]` and still satisfy the contract. There's an upper bound on primitive type arrays and we can pregenerate that.\r\n\r\nWe did this in the early days of .NET Native. Backtracked on that, but nobody remembers why. We want to try again :).",
+            "@MichalStrehovsky couldn't the TypeLoader dynamically typeload `SomeInt32Enum[]` by basing it off the underlying type? Given that they have identical layouts and calling conventions, etc.",
+            "> @MichalStrehovsky couldn't the TypeLoader dynamically typeload `SomeInt32Enum[]` by basing it off the underlying type? Given that they have identical layouts and calling conventions, etc.\r\n\r\nIt would probably leak out from the implementation of generic interfaces on the arrays. Maybe something like cast to IEnumerator(SomeEnum), do GetEnumerator and on the returned enumerator call the non-generic IEnumerator.Current. It would return a boxed Int because it's hardcoded in code. We need shared code over enums to get around that.",
+            "#72498 is the way forward for this."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 7640,
+            "commit_id": "0ea7befd33eab2ac61feb1e026c2c31f083679dd",
+            "original_commit_id": "81a3dcdad5235c38a329b372af132a0053dc1708",
+            "path": "src/coreclr/nativeaot/System.Private.CoreLib/src/System/RuntimeType.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 101,
+            "original_line": 101,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "What guarantees that `int[]` will exist though? Or for that matter other enum backing types, like `byte[]`, `short[]` and so on.\r\n\r\nThe comment here assumes that they are available, without explanation. I think it would be good to add a short explanation.",
+                "> What guarantees that `int[]` will exist though?\r\n\r\nGood old `new` keyword:\r\n\r\nhttps://github.com/dotnet/runtime/blob/6f13196cb096ef7c855fe1254214d25c578ad57e/src/coreclr/nativeaot/System.Private.CoreLib/src/System/Reflection/EnumInfo.cs#L53-L64\r\n\r\nI'll add a comment.",
+                "Sorry - I was too lazy to lookup what `ValuesAsUnderlyingType` does :-("
+            ]
+        }
+    ]
+}

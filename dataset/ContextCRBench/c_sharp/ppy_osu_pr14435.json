@@ -1,0 +1,48 @@
+{
+    "repo": "ppy/osu",
+    "pr_number": 14435,
+    "lang": "c_sharp",
+    "pr_title": "Fix difficulty cache lookups sharing underlying mod instances",
+    "pr_body": "Closes #14416.\r\n\r\n`DifficultyCacheLookup`s were storing raw `Mod` instances into their `OrderedMods` field. This could cause the cache lookups to wrongly succeed in cases of mods with settings. The particular case that triggered this fix was Difficulty Adjust.\r\n\r\nBecause the difficulty cache is backed by a dictionary, there are two stages to the lookup; first `GetHashCode()` is used to find the appropriate hash bucket to look in, and then items from that hash bucket are compared against the key being searched for via the implementation of `Equals()`.\r\n\r\nAs it turns out, the first hashing step ended up being the saving grace in most cases, as the hash computation included the values of the mod settings. But the Difficulty Adjust failure case was triggered by the quirk that `GetHashCode(0) == GetHashCode(null) == 0`.\r\n\r\nIn such a case, the `Equals()` fallback was used. But as it turns out, because the `Mod` instance stored to lookups was not cloned and therefore potentially externally mutable, it could be polluted after being stored to the dictionary, and therefore breaking the equality check. Even though all of the setting values were compared, the hash bucket didn't match the actual contents of the lookup anymore (because they were mutated externally, e.g. by the user changing the mod setting values in the mod settings overlay).\r\n\r\nTo resolve, clone out the mod structure before creating all difficulty lookups.\r\n\r\n---\r\n\r\nAs an aside, I briefly considered copying out to an `APIMod` rather than doing a full mod clone, but I don't know if that's a very clean usage of a structure that seems more dedicated to online. Maybe there should be an immutable mod or some kind, or `APIMod` could be generalised to that? I'll change on request (although it may turn out to be a bit too large of a change in general).",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2021-08-21T15:43:19Z",
+    "issue_context": {
+        "number": 14416,
+        "title": "StarRating not displaying correctly when using Difficulty Adjust Mod",
+        "body": "**Describe the bug:** \r\nSR resets to original Value when choosing a 0.0 Value in a Difficulty Adjust Slider.\r\n\r\n**Screenshots or videos showing encountered issue:** \r\n\r\nhttps://user-images.githubusercontent.com/43985368/130280932-e9450284-0b22-45f9-91bc-ae35c73ff3d5.mp4\r\n\r\n**osu!lazer version:** \r\n2021.820.0\r\n**Logs:**\r\n[performance.log](https://github.com/ppy/osu/files/7023576/performance.log)\r\n[runtime.log](https://github.com/ppy/osu/files/7023577/runtime.log)\r\n[updater.log](https://github.com/ppy/osu/files/7023578/updater.log)\r\n[database.log](https://github.com/ppy/osu/files/7023580/database.log)\r\n[network.log](https://github.com/ppy/osu/files/7023581/network.log)\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 23971,
+            "commit_id": "dfd61e413ae0c5b173ed0dddc0f88b49f75841f3",
+            "original_commit_id": "3c9718339c8441416228657c558a271b88efc9ab",
+            "path": "osu.Game/Beatmaps/BeatmapDifficultyCache.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 313,
+            "original_line": 313,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Note that this would actually cause a deep clone of each mod in each single lookup, which means that every single setting value change and every combination of the mods applied would keep cloning mods to their respective lookups. This *may* become bad over time, although I haven't, nor can I profile this currently, so just keeping this as a note.",
+                "Correct, which is why I was doubting the idea of caching setting-dependent difficulty values in the first place. But now that it's here something like this has to happen for it to work correctly. As stated in the OP I can copy the values out to a more light-weight structure but the fact remains that the data *has* to be there and be immutable for the cache to work.",
+                "Ah so that's what your intention were when you stated about considering to switch to using an `APIMod` instead. I think it would be best to switch to using that with a comment explaining why it's used there, or continue further and rename that class to something like `ModInfo` so it starts to make sense (although `Info` classes are usually databased, so maybe not, maybe something else, `LightweightMod`, `LiteMod`?).\r\n\r\nAlso I'm wondering how it would be possible to not cache star difficulties per setting value without actually dropping the  mod check entirely?",
+                "> Also I'm wondering how it would be possible to not cache star difficulties per setting value without actually dropping the mod check entirely?\r\n\r\nProbably with a change in `MemoryCachingComponent` that can be used to control whether a value should be cached or not. And setting it to not cache any star difficulties for nonstandard settings.",
+                "Rather than storing the mods directly, could it work by storing hashcodes? Like `mods?.OrderBy(m => m.Acronym).Select(m => m.GetHashCode()).ToArray()`",
+                "The problem with storing hashcodes is hash collisions, in which a `null` value setting would have the same hash code as a `0` value setting.\r\n\r\nAnd considering `null` hashcodes in that case makes it impossible to figure out to distinguish between which setting has a `null` value and the others don't.",
+                "And how is that different to how it's currently being done? You do have a point, but the solution to that is to add more heuristics to the hashcode like the count of mods?",
+                "`ConcurrentDictionary` first checks for the hash code of the items to be equal (which can have collisions), then checks for the equality of the items via `Equals` to ascertain they're equal.\r\n\r\nThe current solution deep-clones the mods so that they return constant hash codes and equality comparsion results.\r\n\r\nYour proposed solution would be to store the hashcodes of the mods and use them in both `Lookup.GetHashCode` and `Lookup.Equals`, that would keep the hash collision issue persisting (the one between 0 and null), while it was going to be resolved by checking for `Mod.Equals` on `Lookup.Equals`.",
+                "Adding more heuristics/fields to the hashcode could practically work but isn't theoretically correct. A hash function is not a unique mapping, it cannot be due to the pigeonhole principle. That's why the dictionary uses equality as fallback in the first place; a collision may never occur, and we'll be none the wiser, or it'll occur again, but only in some even more insanely specific case which will likely be impossible to trace back.",
+                "Also note that the underlying settings changing value makes the lookup effectively dead even with hashcode changes, because the *equality check* will start failing. So as far as I can see, the cache is actually *not even being used right now* in such a case, and therefore is *leaking memory and degrading performance* (although I haven't tested this).",
+                "I thought it shouldn't do that? how do you think the equality check will start failing if it's now deep-cloned from the original mod list?",
+                "My last comment was referring to the state of things in `master`. Maybe slightly confusing on my behalf not to state that explicitly.",
+                "Ah, I see."
+            ]
+        }
+    ]
+}

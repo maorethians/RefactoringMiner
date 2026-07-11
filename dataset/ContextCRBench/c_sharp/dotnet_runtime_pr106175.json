@@ -1,0 +1,56 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 106175,
+    "lang": "c_sharp",
+    "pr_title": "Fix concurrency issue with metrics gauge value collection",
+    "pr_body": "Fixes https://github.com/dotnet/runtime/issues/91591",
+    "pr_comments": [
+        "/azp run runtime-libraries-coreclr outerloop\r\n",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "/azp run runtime-libraries-coreclr outerloop",
+        "<samp>\nAzure Pipelines successfully started running 1 pipeline(s).<br>\r\n\n</samp>",
+        "This PR is probably introducing some perf regression (here is one when using HttpClient in a proxy)\r\n\r\n![image](https://github.com/user-attachments/assets/517cbd01-d66b-46dd-af74-1ae9431319ba)\r\n\r\nI think we should build a dedicated web app made for tracking telemetry/metrics performance (open to suggestions). It's a very important domain and its performance can be really impactful on apps. That would allow us to estimate the cost of changes, and detect regressions in related domains. We could also run this app retroactively and see if past changes have introduced changes we may have missed.",
+        "> Could this be enabling all metrics in a process that was otherwise subscribed to none?\r\n\r\nThis part of the change was fixing a regression occurred by other changes. When you have empty specs, it means you need to subscribe to all metrics in the process. This was the .NET 8.0 behavior. Recently, we have added the System.Runtime meter reporting metrics for different runtime areas GC, jit,....etc.\r\n\r\n@sebastienros how is the perf test written for the regressed part? does it listen to all meters? or just listen to the concerned meter? I expect some minor hits with the Gauge instrument as we started to synchronize the collected values but shouldn't be that much. \r\n\r\nCC @noahfalk ",
+        "> does it listen to all meters?\r\n\r\nThere could be an issue in Crank then. I will review all the arguments we pass for this specific app (it doesn't show up in other ones) and how meters are recorded."
+    ],
+    "merged": true,
+    "created_at": "2024-08-28T22:25:31Z",
+    "issue_context": {
+        "number": 91591,
+        "title": "System.Diagnostics.Metrics.LastValue looks like it could experience torn reads",
+        "body": "`LastValue`, which is used by `ObservableGauge<>`, has an `Update(double value)` method that just does:\r\n```C#\r\n        private double? _lastValue;\r\n\r\n        public override void Update(double value)\r\n        {\r\n            _lastValue = value;\r\n        }\r\n```\r\nWriting a `double` on a 32-bit platform is not guaranteed to be an atomic operation, and regardless of bitness, writing a `double?` is not guaranteed to be an atomic operation. We could thus end up in a situation where, for example, `_lastValue` reports it contains a value but the value hasn't actually been initialized, or where the reported value is an amalgum of an old value and one currently being written.",
+        "comments": [
+            "@noahfalk @tarekgh ",
+            "https://github.com/dotnet/runtime/blob/c53e4dcdaae1912b57b2bfb3c67d2e99d3a2bdd1/src/libraries/System.Diagnostics.DiagnosticSource/src/System/Diagnostics/Metrics/LastValueAggregator.cs#L10\r\n\r\n~~@stephentoub would using `Interlocked.Exchange` should fix that, right?~~\r\n\r\njust noticed `_lastValue` is nullable, so I guess `Interlocked.Exchange` is not going to work with it.",
+            "This type should never get accessed concurrently from multiple threads so I believe functionally we are fine, but certainly I made a mistake including the lock() statement on Update() which implies multi-threaded use. The LastValue aggregator is only used for the ObservableGauge instrument and the values of an ObservableGauge are only populated on-demand once per collection cycle. This collection always occurs on the same thread that is under our control, and the type never gets exposed to user code where some other thread might interact with it concurrently. \r\n\r\nI think the correct fix here is just to comment that the type is accessed in a single-threaded manner and to delete the misleading lock() statement in Update(). Since there is no functional issue we could easily make this change in .NET 9, no worry about squeezing anything into .NET 8 builds.",
+            "I moved it to 9.0. @noahfalk are you willing to submit a fix for it? no rush, I am asking just to avoid double working :-)",
+            "I'm glad to let you take it : )",
+            "@noahfalk, now that `Gauge<>` also uses this:\nhttps://github.com/dotnet/runtime/blame/c829f9c816384910bb88afd0fc4b5e3562f48db1/src/libraries/System.Diagnostics.DiagnosticSource/src/System/Diagnostics/Metrics/AggregationManager.cs#L320-L329\nis your statement above still accurate? `Gauge<>` is actually exposed in such a way that user code could interact with it from multiple threads, right?",
+            "Good memory @stephentoub! You are correct, adding `Gauge<>` now exposes the LastValue aggregator to multi-threaded concurrent writes and my suggestion from last year no longer holds. Thinking on it more, it looks like we have another bug as well that we probably want to fix by not using the same aggregator implementation for the Observable and Non-observable cases. Writing code like this should report the new value 123 indefinitely:\r\n```\r\nGauge<double> g = meter.CreateGauge(...);\r\ng.Record(123);\r\n```\r\nBut the [Collect()](https://source.dot.net/#System.Diagnostics.DiagnosticSource/System/Diagnostics/Metrics/LastValueAggregator.cs,20) call is clearing the previous value after one reporting cycle. That clearing behavior is only by-design for ObservableGauge<>() where failing to report a value in the callback is considered meaningful.\r\n\r\nProbably a decent fix would be having an ObservableLastValue that is single threaded + clearing behavior and a LastValue that is multi-threaded with no clearing behavior. Not supporting the clear is nice because we can use double instead of double? which should let us avoid tearing on x64 without doing anything expensive.\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 4715,
+            "commit_id": "873b03f73907e956d29ffcdaf3ef3453c78e1e5f",
+            "original_commit_id": "68511fd27fe4055ce5203742998ba12019dfcbd4",
+            "path": "src/libraries/System.Diagnostics.DiagnosticSource/src/System/Diagnostics/Metrics/MetricsEventSource.cs",
+            "start_line": 652,
+            "original_start_line": 652,
+            "start_side": "RIGHT",
+            "line": 656,
+            "original_line": 656,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Could this be enabling all metrics in a process that was otherwise subscribed to none?\r\n\r\nI added a simple\r\n```c#\r\nvar meter = new Meter(\"TestMeter\");\r\nvar testCounter = meter.CreateCounter<int>(\"test.testCounter\");\r\n\r\n_ = Task.Run(async () =>\r\n{\r\n    while (true)\r\n    {\r\n        await Task.Delay(1000);\r\n        Console.WriteLine($\"Enabled: {testCounter.Enabled}\");\r\n    }\r\n});\r\n```\r\n\r\ninto the benchmark project in question and it appears to be enabled after this change.",
+                "Previously my understanding was that one of Blanch's changes during Preview7 had regressed this behavior and @tarekgh's change here was intended to restore the previous .NET 8 behavior. However doing some testing now, thats not what I see. What I see in my test for .NET 8 is omitting the Metrics argument did not enable any metrics.\r\n\r\nWe probably need to dig deeper and make sure we understand exactly what happened, but now it looks like this change that was intended to re-align us to .NET 8 behavior instead changed us away from .NET 8 behavior. This is my test case:\r\n\r\n```C#\r\ninternal class Program\r\n{\r\n    static void Main(string[] args)\r\n    {\r\n        Meter m = new Meter(\"MyMeter\");\r\n        m.CreateObservableCounter(\"MyCounter\", () => 1);\r\n        MyEventListener listener = new MyEventListener();\r\n        Console.ReadLine();\r\n    }\r\n}\r\n\r\nclass MyEventListener : EventListener\r\n{\r\n    protected override void OnEventSourceCreated(EventSource eventSource)\r\n    {\r\n        Console.WriteLine(eventSource.Name);\r\n        if(eventSource.Name == \"System.Diagnostics.Metrics\")\r\n        {\r\n            EnableEvents(eventSource, EventLevel.Informational, (EventKeywords)0x7/*, new Dictionary<string,string?>() { { \"Metrics\", \"MyMeter\" } }*/);\r\n        }\r\n    }\r\n\r\n    protected override void OnEventWritten(EventWrittenEventArgs eventData)\r\n    {\r\n        if(eventData.EventSource.Name == \"System.Runtime\")\r\n        {\r\n            return;\r\n        }\r\n        Console.WriteLine(eventData.EventName);\r\n        for (int i = 0; i < eventData.Payload.Count; i++)\r\n        {\r\n            Console.WriteLine($\"\\t{eventData.PayloadNames[i]}: {eventData.Payload[i]}\");\r\n        }\r\n    }\r\n}\r\n```",
+                "I tried this code on .NET 8.0 and I am seeing `MyMeter` get reported as expected:\r\n\r\n```\r\nMicrosoft Windows 10.0.22631\r\n.NET 8.0.8\r\nSystem.Diagnostics.DiagnosticSource.dll 8.00.824.36612\r\n```\r\n\r\n```\r\nMicrosoft-Windows-DotNETRuntime\r\nSystem.Runtime\r\nSystem.Buffers.ArrayPoolEventSource\r\nSystem.Diagnostics.Metrics\r\nMessage\r\n        Message: New session started. SessionId auto-generated: 919cfab8-dc80-4eb5-af66-0ba09cfb9e42\r\nMessage\r\n        Message: No RefreshInterval argument received. Using default 1s.\r\nMessage\r\n        Message: No MaxTimeSeries argument received. Using default 1000\r\nMessage\r\n        Message: No MaxHistograms argument received. Using default 20\r\nMessage\r\n        Message: No Metrics argument received\r\nInstrumentPublished\r\n        sessionId: 919cfab8-dc80-4eb5-af66-0ba09cfb9e42\r\n        meterName: MyMeter\r\n        meterVersion:\r\n        instrumentName: MyCounter\r\n        instrumentType: ObservableCounter`1\r\n        unit:\r\n        description:\r\n        instrumentTags:\r\n        meterTags:\r\n        meterScopeHash:\r\n```",
+                "You will always see the InstrumentPublished events for all metrics, but you won't see the CounterRatePayload events that transmit the values of the counter. Sending CounterRatePayload is what requires the AggregationManager to allocate storage. If you run the same code against .NET 9 I expect you will see CounterRatePayload events.",
+                "I have submitted the PR https://github.com/dotnet/runtime/pull/107267 to fix the issue."
+            ]
+        }
+    ]
+}

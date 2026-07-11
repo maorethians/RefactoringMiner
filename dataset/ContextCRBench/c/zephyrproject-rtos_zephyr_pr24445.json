@@ -1,0 +1,72 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 24445,
+    "lang": "c",
+    "pr_title": "drivers: improve the arcv2_timer driver to update cycles correctly",
+    "pr_body": "\r\nreferring the ARM's Systick driver, we did the following improvements:\r\n\r\n* use 31 bits of 32-bit counter to avoid the rare but possible\r\n  overflow of elapsed(). If 32 bits val are used, elpased() may\r\n  return a wrong value. then wrong HW cycles.\r\n* two ways to update the correct cycles\r\n  - through systick timer irq\r\n  - when systick timer irq cann't be handled because of irq\r\n    locked/disabled, call z_timer_cycle_get_32->elapsed to update\r\n    the correct cylces. no more than one counter-wrap is allowed.\r\n* if elapsed() is not called too long (more than one counter-wrap) from\r\n  systick tiemr irq or from z_timer_cycle_get_32. The lost of HW cycles\r\n  is unavoidable.\r\n\r\n* some detailed discussion can be found in #24332\r\n\r\nSigned-off-by: Wayne Ren <wei.ren@synopsys.com>\r\n\r\nFixes #23476",
+    "pr_comments": [
+        "@ruuddw please approve if happy as-is",
+        "@ruuddw @andyross I changed the place of clearing counter in z_clock_set_timeout to reduce the cycles loss as few as possible. However didn't find a 0 loss solution by only changing LIMIT not COUNT.  Any ideas?   ",
+        "(with this location, the drift is likely lower than the timer accuracy anyway...)\r\nThe original implementation didn't touch count - but was less robust against long interrupt disable.\r\nARC has multiple timers (configurable HW IP, depending on the silicon design configuration), a combination of timer0 + RTC or timer1 (like for SMP) would likely be much simpler.\r\nNot for this PR, but something to consider adding in the future.\r\n\r\n",
+        "I'm OK with establishing an upper bound on how long you can busy-wait for. I don't know what that value should specifically be, but I agree that in practice people busy-wait for very short time periods.",
+        "@abrodkin , my understanding is your concern is about pulse trigger of ARC internal timer. Although it was rarely used before, and not clearly documented in ARCv2 ISA,  the pulse trigger of ARC internal timer should be supported,  nsim works, what we need to do is make a double check on hardware.  The self-clear of timer irq also avoids re-setting CTRL/clearing IP bit in isr, makes codes more generic. I don't think it's a trick.\r\n\r\nThe IP bit of CTRL takes two roles, COUNTER overflow and IP pending.  If in hardware two different bits for two different roles. Even pulse trigger is not supported, we also can separately clear IP pending bit in timer ISR. \r\n\r\nFor k_busy_wait ,  i don't mind whether a limit check is added, because in other places, drivers, application  etc. because of poor codes, poor design,  the irq can still be locked for long time although we all know it's not right.  But current cycle based k_busy_wait can update the total cycles correctly, so when irq is unlocked , we can get the correct cycles and ticks.\r\n\r\nAnd even a limit is added in k_busy_wait, this PR still works. In fact, this PR includes a fix of bugs found through k_busy_wait but not limited.\r\n\r\nAgain,\r\n**the core concern of this PR is whether we can use pulse trigger for timer irq.**   If really can't work because of hardware limitation ,  i will move clear of IP bit out of elapsed() , and into timer isr. \r\n\r\nWith this PR and some my previous PRs,  i got a clean sanitycheck results of test/kernel \r\n\r\n",
+        "@abrodkin I think the implementation is acceptable now. Similar to CM systick, and the drift is minimal. Losing ticks due to long interrupt disable times (also during busy wait) would not be normal, regular use (interrupt disable/busy waiting should normally be less than 2 tick periods).\r\nI believe there is or has been some discussion on a counter api vs timer api - using a separate RTC / timer1 could be something to do for supporting the RTC/counter driver and not timer for _cycle_get_32.",
+        "ping for merge, as the merge window is closing. ",
+        "> ping for merge, as the merge window is closing.\r\n\r\n@vonhust need @abrodkin to re-visit his current -1 review for that",
+        "> @abrodkin I think the implementation is acceptable now. Similar to CM systick, and the drift is minimal. Losing ticks due to long interrupt disable times (also during busy wait) would not be normal, regular use (interrupt disable/busy waiting should normally be less than 2 tick periods).\r\n\r\n@ruuddw if you approve of the patch....can you please approve it in GitHub?\r\n\r\n"
+    ],
+    "merged": true,
+    "created_at": "2020-04-21T09:53:05Z",
+    "issue_context": {
+        "number": 23476,
+        "title": "tests/kernel/interrupt failed on ARC",
+        "body": "**Describe the bug**\r\nRunning tests/kernel/interrupt on iotdk board, it will **stop at \"test_prevent_interruption\" and fail due to timeout.**\r\n\r\n**To Reproduce**\r\nSteps to reproduce the behavior:\r\n1. sanitycheck -p iotdk --device-testing --device-serial /dev/ttyUSB0 -T tests/kernel/interrupt/\r\n2. See error in hander.log file.\r\n\r\n\r\n**Screenshots or console output**\r\n```\r\n*** Booting Zephyr OS build zephyr-v2.2.0-368-g22b9167acb52  ***\r\nRunning test suite interrupt_feature\r\n\r\nstarting test - test_isr_dynamic\r\nPASS - test_isr_dynamic\r\n\r\nstarting test - test_nested_isr\r\nTriggering irq : 93\r\nisr0 running !!\r\nTriggering irq : 92\r\nisr1 ran !!\r\nisr0 execution completed !!\r\nPASS - test_nested_isr\r\n\r\n**starting test - test_prevent_interruption\r\nlocking interrupts**\r\n```\r\n\r\n**Environment (please complete the following information):**\r\n - OS: fedora 28\r\n - Toolchain: zephyr-sdk-0.11.1\r\n - Commit ID: 22b9167a\r\n\r\n",
+        "comments": [
+            "This also fails on nsim_sem, nsim_em, nsim_sem_mpu_stack_guard, nsim_em_mpu_stack_guard",
+            "@andrewboie @ruuddw @abrodkin , here is my investigation\r\nIn the following codes of prevent_irq.c\r\n```\r\n         key = irq_lock();\r\n\thandler_result = 0;\r\n\r\n\tk_timer_init(&irqlock_timer, timer_handler, NULL);\r\n\r\n\t/* Start the timer and busy-wait for a bit with IRQs locked. The\r\n\t * timer ought to have fired during this time if interrupts weren't\r\n\t * locked -- but since they are, check_lock_new isn't updated.\r\n\t */\r\n\tk_timer_start(&irqlock_timer, K_MSEC(DURATION), K_NO_WAIT);\r\n\tk_busy_wait(MS_TO_US(1000));\r\n\tzassert_not_equal(handler_result, HANDLER_TOKEN,\r\n\t\t\"timer interrupt was serviced while interrupts are locked\");\r\n\r\n\tprintk(\"unlocking interrupts\\n\");\r\n\tirq_unlock(key);\r\n```\r\nsystick timer irq cannot be handled as irq is locked.  So it means the sys tick may be lost.\r\n\r\nMeanwhile, k_busy_wait(MS_TO_US(1000)) relies on k_cycle_get_32, then to arch_k_cycle_get_32()->z_timer_cycle_get_32\r\n\r\nHowever, as the sys tick is not updated because of irq lock , the value return by z_timer_cycle_get_32 will wrap back. ARC's timer is a free running timer and will wrap to 0 when the counter reaches the LIMIT.  (other arch like ARM has similar issue)\r\n\r\nThis will cause processor loops forever in k_busy_wait.\r\n\r\nThe root issue is how to maintain the sys cycles when sys tick irq is not updated and there is no global wall clock.\r\n\r\nFor the test, a quick fix is don't k_busy_wait too long when irq is locked. e.g, \r\nk_busy_wait(MS_TO_US(1000)); -> k_busy_wait(MS_TO_US(K_MSEC(2 * DURATION)));\r\n\r\na second fix is  to implement CONFIG_ARCH_HAS_CUSTOM_BUSY_WAIT\r\n\r\na third fix is to maintain the correct wall clock in  arch_k_cycle_get_32/z_timer_cycle_get32.\r\n\r\nI think in high-level, it needs some discussion about this.\r\n\r\n\r\n\r\n",
+            "It could be argued that busy waiting for longer than 2 (dynamic) system ticks is a-typical use (\"A busy wait is typically used instead of thread sleeping when the required delay is too short to warrant having the scheduler context switch from the current thread to another thread and then back again.\").\r\nHowever, I think this is more than just a test issue, unless k_busy_wait() gets a pre-condition that (timer) interrupts should be enabled when calling -> I don't like the first proposed fix. I think an ARC custom busy wait is the better solution (e.g. calculate and count the number of required timer wraps, and/or test if the busy wait time exceeds the currently set timer alarm)."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 28592,
+            "commit_id": "17c355f797e9d4b28fe5a670d4f79dd5ac2f72ea",
+            "original_commit_id": "5d6770aeea374669b3d4c0041c7cf6e819f8d300",
+            "path": "drivers/timer/arcv2_timer0.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 195,
+            "original_line": 195,
+            "side": "RIGHT",
+            "original_position": 87,
+            "position": 87,
+            "subject_type": "line",
+            "review_comments": [
+                "I don't like force setup of all Timer's control fields. For example `_ARC_V2_TMR_CTRL_NH` makes no sense for most of people and it stands for possibility to halt the timer if ARC core is halted. That said for normal operation (not during debugging session) its value doesn't change anything. And so is completely irrelevant.\r\n\r\nThus I propose instead to implement more common \"Read-Modify-Write\" approach with explicit operation on fields we're concerned in this particular case.\r\n\r\nAs for `_ARC_V2_TMR_CTRL_NH` we may want to set it but do it only once on Timer init. And this is applicable to other places as well.\r\n\r\nI understand that it adds another AUX reg access overhead but logic becomes much cleaner and I guess overhead shouldn't be that huge overall.\r\n",
+                "the overhead in elapsed() must b as small as possible to avoid cycle loss in set_timeout.\r\nFor readability concern, i can merge _ARCH_V2_TMR_CTRL_NH with other macro.",
+                "No merging of 2 defines in one makes even less sense as it may mislead a reader.\r\nSpeaking of minimization of overhead I guess we already do a lot here as well as we'll possibly have prologue/epilogue generated by the compiler which we don't see in C-sources here. So another 2 instructions and few CPU cycles of overhead shouldn't hurt I guess."
+            ]
+        },
+        {
+            "hunk_id": 28593,
+            "commit_id": "17c355f797e9d4b28fe5a670d4f79dd5ac2f72ea",
+            "original_commit_id": "5d6770aeea374669b3d4c0041c7cf6e819f8d300",
+            "path": "drivers/timer/arcv2_timer0.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 284,
+            "original_line": 284,
+            "side": "RIGHT",
+            "original_position": 136,
+            "position": 136,
+            "subject_type": "line",
+            "review_comments": [
+                "If you specify an IRQ line mode instead of meaningless `1` it's better to have `ARCV2_IRQ_MODE_PULSE` etc. Otherwise this very special setup (I never saw configuration of ARC Timer done via Pulse mode before so won't be surprised if it might produce unexpected results) might not attract attention of the next reader.\r\n\r\nAlso I don't quite understand the whole idea of switching to pulse-triggered IRQ from the ARC Timer. Which problem does it solve? And if it is still usable with all our current HW and simulation platforms. I'd strongly suggest to not use pulse-triggered IRQ source if possible.",
+                "I run the tests on nsim_em/nsim_sem/nsim_hs,  the results shows pulse trigger is ok. If real hardware is also ok, i think there will be no problem.\r\n\r\nWhy we need pulse trigger?\r\nBecause we need to update the overflow_cyc  in elapsed() when irq is locked. Without pulse trigger, the clear of IP bit will also clear the irq request, then when irq is unlocked, the timer irq will be lost, then no announcement of systick.  I think this is unacceptable for RTOS.\r\n\r\nI have also considered to use software irq to keep the timer irq, but it will make things more complex.\r\n\r\nThe ARCv2 ISA also allows pulse trigger to do a self-clear of IRQ.\r\n\r\nFor wall clock , it relies on extra hardware. We can use one 32bit timer to do the same thing as ARM SysTick (24bit) does.",
+                "So I went once again over long discussion in https://github.com/zephyrproject-rtos/zephyr/pull/24332 and now is confused even more.\r\n\r\nYet I don't see any justification for that dark (or rather dirty) magic with IRQs except we may `busy_wait()` twice longer. But do we really want to trade that IMHO meaningless twice longer `busy_wait()` for:\r\n1. More tricky driver logic\r\n2. \"Delayed\" IRQ handling\r\n\r\nI'd propose to just add a check in `busy_wait()` for too long periods. Moreover I think long `busy_wait()` which implicitly means spinning w/ all [not only timer] IRQs disabled is something you don't want to happen in good RTOS-based solution as responsiveness of it will be quite slow in some cases :)\r\n\r\nSo first I'd like to figure out if we're trying to solve a valid problem here or we're overengineering something which has no real use in a sane software design.\r\n\r\nMaybe we even return to https://github.com/zephyrproject-rtos/zephyr/pull/24332 and continue discussion there before drafting fixes. @andyross @andrewboie what do you think?"
+            ]
+        }
+    ]
+}

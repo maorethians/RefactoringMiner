@@ -1,0 +1,135 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 21437,
+    "lang": "c",
+    "pr_title": "core: add Condition[Memory/CPU]Pressure",
+    "pr_body": "By default checks PSI on /proc/pressure, and causes a unit to be skipped\r\nif the threshold is above the given configuration for the avg300\r\nmeasurement.\r\nAlso allow to pass a custom comparison and average, and a particular\r\nslice unit to check under.\r\n\r\nFixes #20139",
+    "pr_comments": [
+        "> The implementation looks good.\r\n> \r\n> But the way that this check is defined seems very _ad-hoc_. In particular, one field uses `some`, the other `full`. And it seems likely that people will request different variants of the check. Thus I wonder if this should not be defined more generically, for example by allowing to specify whether to look at the root cgroup or some slice, and which of the pressure fields to use.\r\n\r\nSomething like: `foo.slice:avg10<30`?\r\nI thought about that, the counterargument is that with this flexibility comes a much more confusing syntax - for scheduling purposes, it seems to me average over 5 minutes would be the most useful metric, the other two are really small windows. Maybe I can try to add support for both formats, if it's just a percentage then assume it's avg300",
+        "/cc @anitazha ",
+        "Ok, updated: it still allows the simple form \"Condition=10%\", but also a more complex and complete \"Condition=avg10 < 10%\". Also can be optionally prefixed with a slice unit name. PTAL!",
+        "So yeah, I am not convinced about allowing arbitrary slices to be specified here. For simplicity I'd dumb it down and only look at the system as a whole",
+        "> So yeah, I am not convinced about allowing arbitrary slices to be specified here. For simplicity I'd dumb it down and only look at the system as a whole\r\n\r\nI think it would be quite useful as an optional parameter, so I've left it in. Applied the rest - now the syntax is `[slice:]percentage[/5min|/1min|/10sec]`"
+    ],
+    "merged": true,
+    "created_at": "2021-11-23T18:42:04Z",
+    "issue_context": {
+        "number": 20139,
+        "title": "RFE: skip job activation if not enough system resources (CPU/memory) are available",
+        "body": "**Is your feature request related to a problem? Please describe.**\r\nOn slow/overloaded/constrained systems it is common to partition system resources (CPU/memory) so that critical tasks are guaranteed to be able to run. This is especially true when memory overcommitting (swap) is disabled. Periodic tasks (eg: timer units) need to have resources carved out too, despite only needing them seldomly.\r\n\r\n**Describe the solution you'd like**\r\nLinux makes pressure stall information (PSI) available (https://www.kernel.org/doc/html/latest/accounting/psi.html), which indicate the state of system resources availability within a given window of time, as an indicator of system load.\r\nNew unit directives such as `ConditionMemoryPressure=`, `ConditionCPUPressure=` could be made available, which instructs systemd to skip the activation of a unit if the required threshold is not met, for example: `ConditionMemoryPressure=70` following oomd's syntax https://www.freedesktop.org/software/systemd/man/oomd.conf.html#DefaultMemoryPressureLimit=\r\n\r\n**Describe alternatives you've considered**\r\nCarving out resources specifically for period tasks, which leads to under-utilization, or carefully building dependency/ordering chains between all timed units, which is unwieldy and not really possible unless a single entity provides them all.\r\n\r\n",
+        "comments": [
+            "Thanks to oomd's implementation, the ground work is already in place. It should be just a matter of reading PSI in a new `condition_memory_pressure()` function. I would tend to keep the configuration syntax in line with oomd's, for consistency and simplicity. An alternative would be to allow 1:1 mapping to the kernel interface (eg: `ConditionMemoryPressure=avg10<80 avg300<50`) but it seems excessively complicated.",
+            "is \"condition\" really the right concept for this? I mean, you don't want to totally skip these services, but just delay them a bit more, no?\r\n\r\nso far our philosophy was to dump as much as we can on the CPU/IO schedulers and priorize the work via nice levels/ioprios/cpuprios and so on, and then let the kernel figure out things on its own, instead of second guessing these schedulers by monitoring them from userspace and dumping more work on them only when they don't appear overloaded. Having a scheduler in userspace that kinda works around the fact that the schedulers already implemented in the kernel apparently aren't that good at scheduling stuff sounds kinda sad no?\r\n\r\nignoring this issue, i wonder if this wouldn't better be implemented as part of the timer logic, or possibly in a new unit type \".idle\" or so? maybe with a timer unit like this:\r\n\r\n```\r\n[Timer]\r\nOnActiveSec=15min\r\nIdleDelaySec=6h\r\nIdleDelayCondition=avg10 < 80\r\n```\r\n\r\nWith a timer like this we'd wait at least 15min after the unit is started and then until the load falls below 80, but 6h at maximum.\r\n\r\nOr in other words, I'd use a concept such as RandomizedDelaySec= as model here: which adds random noise to the trigger time. With this idle concept we'd add not-quite-as-random noise to it.",
+            "> is \"condition\" really the right concept for this? I mean, you don't want to totally skip these services, but just delay them a bit more, no?\r\n> \r\n> so far our philosophy was to dump as much as we can on the CPU/IO schedulers and priorize the work via nice levels/ioprios/cpuprios and so on, and then let the kernel figure out things on its own, instead of second guessing these schedulers by monitoring them from userspace and dumping more work on them only when they don't appear overloaded. Having a scheduler in userspace that kinda works around the fact that the schedulers already implemented in the kernel apparently aren't that good at scheduling stuff sounds kinda sad no?\r\n\r\nIt's the same theory behind having systemd-oomd - when things get dire, the kernel is not the best place to make a choice on what to throw under the bus and what to leave alone. Having strong hints in the unit configuration in practice just yields better results. This is more relevant for memory, which is what I care about most - but CPU metrics are available too, and can be useful.\r\n\r\n> ignoring this issue, i wonder if this wouldn't better be implemented as part of the timer logic, or possibly in a new unit type \".idle\" or so? maybe with a timer unit like this:\r\n> \r\n> ```\r\n> [Timer]\r\n> OnActiveSec=15min\r\n> IdleDelaySec=6h\r\n> IdleDelayCondition=avg10 < 80\r\n> ```\r\n> \r\n> With a timer like this we'd wait at least 15min after the unit is started and then until the load falls below 80, but 6h at maximum.\r\n> \r\n> Or in other words, I'd use a concept such as RandomizedDelaySec= as model here: which adds random noise to the trigger time. With this idle concept we'd add not-quite-as-random noise to it.\r\n\r\nSo something like that was my first idea when I proposed in the chat, then it evolved into a condition. The advantage of having a condition is that it applies to all units, not just timers - think of a path-triggered service that watches for non-critical and relatively frequent disk changes, for example. Being able to codify \"watch this path, but it's fine to skip a round if the system is under pressure\" is something I definitely have use cases for and need to provide. Or a templated unit that get occasionally instantiated by another service.\r\n\r\nWhat you say about guaranteed retries is of course true as well, it would be good to have for timers. What if we had both options?",
+            "I'm not convinced this is generic enough use case to be useful in systemd (don't forget about `ExecCondition=`, why it doesn't work for you?).\r\n- What pressure should be watched? (global, target slice, a target slice parent,...)\r\n- What to do on kernels without PSI support? (give up or proceed regardless)\r\n- What's actually the goal? (not stressing the system when it's struggling -- as argued above kernel scheduling should deal with that; having enough resources for timely completion of the job -- what's the point of delay?)",
+            "> I'm not convinced this is generic enough use case to be useful in systemd (don't forget about `ExecCondition=`, why it doesn't work for you?).\r\n> \r\n> * What pressure should be watched? (global, target slice, a target slice parent,...)\r\n> * What to do on kernels without PSI support? (give up or proceed regardless)\r\n> * What's actually the goal? (not stressing the system when it's struggling -- as argued above kernel scheduling should deal with that; having enough resources for timely completion of the job -- what's the point of delay?)\r\n\r\nI don't see how it is not generic enough? Memory pressure is a thing on most systems, that's why oomd was added in the first place, and it's enabled by default in Fedora, for example.\r\n\r\n- the system-wide one (eg: proc/pressure/memory)\r\n- same that we do for all other optional features that require kernel support, skip it\r\n- same as oomd, in practice it's just not true, and results are and can only be suboptimal without \"hints\", especially for memory pressure",
+            "The note about generality means that there are too many options: memory or cpu pressure was mentioned, idle condition+wait window, observed slice (I still think target slice may be a use case too) -- those would be expressed with an `ExecCondition=` (and adding further flexibility). I see that could be more troublesome to evaluate under the stressing condition than a built-in directive.\r\n\r\nIf I understand the argument with systemd-oomd similarity, you're saying that a unit that'd be a candidate for killing under given circumstances is not worth starting at all. Maybe the directive shouldn't suggest similarity with static conditions (comparing with the existing conditions) but relatedness to systemd-oomd. Extending on that, adding something like `ManagedOOMPressureFilled=` directive on a *slice* instead that would reject any starts of under given slice if pressure is too high (I'm throwing this as a brainstorm idea, I can't tell what is more practical)."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 33205,
+            "commit_id": "5f126f0cf75e82dad6d86ed5bdebecfceac7290e",
+            "original_commit_id": "4248b9f6a5ce9947821cb425051d2c611f159c04",
+            "path": "src/shared/condition.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1029,
+            "original_line": 1029,
+            "side": "RIGHT",
+            "original_position": 65,
+            "position": 81,
+            "subject_type": "line",
+            "review_comments": [
+                "hmm, we should probably get PID1's own cgroup, then go one level up from that (i.e. drop the /init.scope/ part in the path). that way we'll look at the top of the current OS' cgroup tree.",
+                "I don't follow - the intention here is to check an arbitrary slice",
+                "the root of the cgroupfs and the root of what PID 1 manages are not necessarily the same. They often are, but we actually explicitly support if they are not. This has various usecases. Originally it was mostly about containers, i.e. when cgroup namespacing didn't exist: if we'd start a service manager in some cgroup down the tree it would take possesion of that and nothing else. It's still actively used for the --user stuff, there too we run things in a cgroup down the tree. But we officially allow people to also have some process as PID 1 before system starts that moves systemd down the cgroup tree somewhere, and leaves some sibling for other purposes outside of systemd's control.",
+                "I get that, but I don't understand how to apply it here? It's already looking at the top of the OS tree - `cg_get_path` actually ignores the controller, and simply appends what you pass to `\"/sys/fs/cgroup/`. So for example:\r\n\r\n`user-1000.slice:100%` returns `/sys/fs/cgroup/user.slice/user-1000.slice/cpu.pressure`\r\n`-.slice:100%` returns `/sys/fs/cgroup/cpu.pressure`\r\n`bork.slice:100%` returns `/sys/fs/cgroup/bork.slice/cpu.pressure`\r\n\r\nWhat's missing?",
+                "@bluca I'd say the missing part is `cgroup_root` (such as in [unit_default_cgroup_path](https://github.com/systemd/systemd/blob/312dac28695ebe7c316c9b2dec40bc7182f5e28e/src/core/cgroup.c#L1934), alternatively [without the manager](https://github.com/systemd/systemd/blob/312dac28695ebe7c316c9b2dec40bc7182f5e28e/src/basic/cgroup-util.c#L2002)).\r\n\r\n> But we officially allow people to also have some process as PID 1 before system starts that moves systemd down the cgroup tree somewhere, and leaves some sibling for other purposes outside of systemd's control.\r\n\r\n@poettering Citation needed (I mean where's that documented?)",
+                "how would the result be different? SYSTEMD_CGROUP_CONTROLLER is actually ignored since this only supports cgroups v2",
+                "The result would be different for the user instance of systemd (or some non-standard tree layouts as implied by @poettering ). For the PID 1, there'd be indeed no difference.",
+                "`cg_get_root_path` returns an empty path both under the system manager and the user instance",
+                "Oops, I confused it with `manager_setup_cgroup` where it's not called with PID 1 but 0 (self) instead. The latter is what I meant would be missing in the user instance.\r\nIOW, the condition in user instance should: a) without slice -- look at global pressure, b) with a slice specified -- look at user instance slice. Does that make sense?",
+                "see: https://github.com/systemd/systemd/pull/21594"
+            ]
+        },
+        {
+            "hunk_id": 33208,
+            "commit_id": "5f126f0cf75e82dad6d86ed5bdebecfceac7290e",
+            "original_commit_id": "4248b9f6a5ce9947821cb425051d2c611f159c04",
+            "path": "src/shared/condition.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1033,
+            "original_line": 1033,
+            "side": "RIGHT",
+            "original_position": 87,
+            "position": 85,
+            "subject_type": "line",
+            "review_comments": [
+                "And then this should be first?"
+            ]
+        },
+        {
+            "hunk_id": 33206,
+            "commit_id": "5f126f0cf75e82dad6d86ed5bdebecfceac7290e",
+            "original_commit_id": "4248b9f6a5ce9947821cb425051d2c611f159c04",
+            "path": "src/shared/condition.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 989,
+            "original_line": 989,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 41,
+            "subject_type": "line",
+            "review_comments": [
+                "I'd just say `pressure_path = strjoina(\"/proc/pressure/\", pressure_type);` and save on the oom check.",
+                "it's so that I can reuse the same variable in the other branch of this `if` block, which is set by `cg_get_path()` so it requires cleanup",
+                "Ah, OK, I missed that."
+            ]
+        },
+        {
+            "hunk_id": 33207,
+            "commit_id": "5f126f0cf75e82dad6d86ed5bdebecfceac7290e",
+            "original_commit_id": "4248b9f6a5ce9947821cb425051d2c611f159c04",
+            "path": "src/shared/condition.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1004,
+            "original_line": 1004,
+            "side": "RIGHT",
+            "original_position": 56,
+            "position": 56,
+            "subject_type": "line",
+            "review_comments": [
+                "Hm? Maybe `second`, instead of `first`.",
+                "Sorry, I misunderstood the man."
+            ]
+        },
+        {
+            "hunk_id": 33209,
+            "commit_id": "5f126f0cf75e82dad6d86ed5bdebecfceac7290e",
+            "original_commit_id": "4248b9f6a5ce9947821cb425051d2c611f159c04",
+            "path": "src/shared/condition.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1076,
+            "original_line": 1076,
+            "side": "RIGHT",
+            "original_position": 128,
+            "position": 128,
+            "subject_type": "line",
+            "review_comments": [
+                "One question. I guess it is not guaranteed that the path exists when this function is called, if a slice is specified. Is it true?",
+                "Yes, see the discussion above. We don't want to introduce a dependency on the slice. Instead, if the slice is not present, we assume that it has pressure == 0, and the condition succeeds.",
+                "I see, thanks."
+            ]
+        }
+    ]
+}

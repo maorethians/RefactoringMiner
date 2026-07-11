@@ -1,0 +1,46 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 15510,
+    "lang": "c",
+    "pr_title": "core: automatically add udev dependency for units using RootImage=",
+    "pr_body": "We use udev to wait for /dev/loopX devices to be fully proped hence we\r\nneed an implicit ordering dependency on it, for RootImage= to work\r\nreliably in early boot, too.\r\n\r\nFixes: #14972",
+    "pr_comments": [
+        "/cc @topimiettinen ",
+        "Let's merge this for now, if there's a strong case for replacing the other to mentions too, we can of course change this later",
+        "This probably means that udevd itself (or any of its dependencies, like journald, sysusers, tmpfiles-setup-dev, hwdb-update and their dependencies) can't use RootImage= anymore. At the moment on my setup, all of those work fine with RootImage= after #15051 (which would not help though if I had used partitions). What would be a good solution for those, perhaps bypass udevd in the partition scan if it's not yet started?",
+        "Hmm, so deps from a unit to itself are actually eaten implicitly and automatically by the engine of systemd. we never allow that and always remove them implicitly.\r\n\r\nWaiting for a loopback device without udev is nasty, because partitions can take any time to pop up but we care for them. I am not fond of avoiding udev for the purpose that udev is precisely intended for... i.e. i am leaning towards saying: don't use RootImage= on udev, there just have to be some bits in the OS that prepare stuff for other bits, and this is one of them...",
+        "I'm not too happy but I don't have a good idea either and this certainly makes sense for the late services. I can easily go back to using RootDirectory= for the earliest services, which I did before #15051. It does not give the same level of file system separation or hard read-only properties, but perhaps I can get very close by mounting read-only images to the directories to be used as RootDirectory=. The down side of that is that the directories are then accessible from PID1 side and one of my goals was to minimize the file system for PID1 too (I know, exercise in futility security wise as PID1 is all powerful but it's an interesting exercise). Perhaps I should finalize my PR for MountPaths=."
+    ],
+    "merged": true,
+    "created_at": "2020-04-21T11:59:47Z",
+    "issue_context": {
+        "number": 14972,
+        "title": "Maybe RootImage= should add a dependency to systemd-udevd.service",
+        "body": "**systemd version the issue has been seen with**\r\n> master / 244.3-1\r\n\r\n**Used distribution**\r\n > Debian\r\n\r\n**Expected behaviour you didn't see**\r\n > Successful boot\r\n\r\n**Unexpected behaviour you saw**\r\n \r\nI have an experimental setup where most services use a custom built `RootImage` (or `RootDirectory`). This works well with initramfs created by Debian mkinitramfs tool, but when trying Dracut, starting of several services hang before they reach execve(). The problem seems to be that the `RootImage` is probed for partitions and this wants to [talk to udevd](https://github.com/systemd/systemd/blob/e6e81ec0a56861b905db975fc32c83e2f2faca7d/src/shared/dissect-image.c#L188). With mkinitramfs initramfs, for some reason udevd is always available, but with Dracut initramfs, udevd has not been restarted at this point. Then there seems to be a dependency issue where udevd can't be started until later (why? udevd does not depend on anything?), so there's a deadlock. Perhaps with Dracut the dependencies are managed much more flexibly with systemd in initramfs, compared to a shell script which has quite rigid ordering.\r\n\r\nIt's not clear what are the failing units, at least systemd-remount-fs (RootImage) and systemd-udev-trigger (tried both RootDirectory and RootImage) seem to have this problem.\r\n\r\nI tried to avoid this by introducing a new drop-in for all units with RootImages which have `DefaultDependencies=no`, containing\r\n```\r\n[Unit]\r\nWants=systemd-udevd.service\r\nAfter=systemd-udevd.service\r\nRequires=systemd-udevd.service\r\n```\r\nbut this causes dependency loops.\r\n\r\nI also modified PID1 so that DISSECT_IMAGE_NO_UDEV is always enabled, but that didn't seem to change anything.\r\n\r\nThis is what strace from debug shell shows for a failing process (systemd-remount-fs but this is still systemd in control before execve()):\r\n\r\n```\r\nopenat(AT_FDCWD, \"/run/udev/data/b7:0\", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)\r\nepoll_create1(EPOLL_CLOEXEC)            = 3\r\naccess(\"/run/udev/control\", F_OK)       = 0\r\nsocket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT) = 4\r\nsetsockopt(4, SOL_SOCKET, SO_ATTACH_FILTER, {len=8, filter=0x7ffe064bae60}, 16) = 0\r\nsetsockopt(4, SOL_SOCKET, SO_PASSCRED, [1], 4) = 0\r\nbind(4, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=0x000002}, 12) = 0\r\ngetsockname(4, {sa_family=AF_NETLINK, nl_pid=836, nl_groups=0x000002}, [12]) = 0\r\nepoll_ctl(3, EPOLL_CTL_ADD, 4, {EPOLLIN, {u32=2163346048, u64=94839336209024}}) = 0\r\nopenat(AT_FDCWD, \"/run/udev/data/b7:0\", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)\r\nepoll_wait(3, \r\n```\r\n\r\nSorry for being vague but the problem isn't very clear to me either yet. Journald is also not running at this point. It's not clear if this is a bug, perhaps the setup is too experimental and unsupported. Maybe this already provokes some thoughts on the dependencies for `RootImages`.\r\n\r\n**Steps to reproduce the problem**\r\n\r\nNothing simple yet.",
+        "comments": [
+            "Regarding the dependencies: systemd-udevd.service has line `After: systemd-sysusers.service systemd-hwdb-update.service` and systemd-tmpfiles-setup-dev.service has `Before: systemd-udevd.service`. There is also an implied dependency for kmod-static-nodes.service due to systemd-tmpfiles-setup-dev.service. I'm not sure about systemd-remount-root.service and various LVM services (probably because rootfs uses LVM). After changing these to use a `RootDirectory` instead of `RootImage`, and adding a dependency to systemd-udevd.service for rest, my system finally boots with initrd made with dracut without assistance.\r\n\r\nThe boot problem is a bit nasty as it can't be broken by restarting services with systemctl. By killing processes by hand, the service gets considered failed and then it can be restarted manually, once the system gets to the point where systemd-udevd is also available.\r\n\r\nI think the same situation could be reached on shutdown, if you have a service using `RootImage` that is started after systemd-udevd is killed.\r\n\r\nThe problem can be reproduced by stopping udevd and its control sockets, running `udevadm info --cleanup-db` and then trying to restart a service with a `RootImage`.\r\n\r\nSo, how to fix this? My images only contain a squashfs filesystem without partitions, so for this specific case it would probably be enough to fix dissect_image() or its call site at setup_namespace() to handle this situation without help from udevd. This would not help in the more general case, where there actually could be a partition table. I don't like the idea of automatic dependency, perhaps there are other solutions. Also it would be nice to use `RootImage` for those early services which now use `RootDirectory`, even for systemd-udevd.",
+            "hmm, yeah, i guess we should add that implicit dep"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32338,
+            "commit_id": "b53dbbc5fe82629735fc43b3aed1929dd383ab55",
+            "original_commit_id": "e14a0c21e9c0caa1cf63844d3b1629756f2d2953",
+            "path": "src/basic/special.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 85,
+            "original_line": 85,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "There are two other uses, please substitute them too:\r\nsrc/test/test-unit-name.c:        test_unit_name_from_dbus_path_one(\"/org/freedesktop/systemd1/unit/systemd_2dudevd_2eservice\", 0, \"systemd-udevd.service\");\r\nsrc/udev/udevd.c:        r = terminal_urlify_man(\"systemd-udevd.service\", \"8\", &link);\r\n",
+                "hmm, are you sure? one is a testcase for unescaping, where udevd is just an example. and the other is the name of a man page. In both cases we don't actually mean the special service, we either use it as an example string (where it could be any other string too) or referencing something that is not actually the service itself (though admittedly a related resource).\r\n\r\nI think we should keep that separate, no?"
+            ]
+        }
+    ]
+}

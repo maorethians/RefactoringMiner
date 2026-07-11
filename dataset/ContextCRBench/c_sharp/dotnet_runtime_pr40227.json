@@ -1,0 +1,82 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 40227,
+    "lang": "c_sharp",
+    "pr_title": "Annotate DependencyInjection to make it linker friendly",
+    "pr_body": "Fix #39745\r\n\r\nWith this change, the remaining (current) ILLinker warnings for the 2 DependencyInjection libraries are:\r\n\r\n```\r\nF:\\git\\runtime2\\src\\libraries\\Microsoft.Extensions.DependencyInjection\\src\\ServiceLookup\\Expressions\\ExpressionResolverBuilder.cs(135,17): Trim analysis warning IL2006: Microsoft.Extensions.DependencyInjection.ServiceLookup.ExpressionResolverBuilder.VisitIEnumerable(IEnumerableCallSite,Object): Call to 'System.Reflection.MethodInfo.MakeGenericMethod' is not recognized.\r\nF:\\git\\runtime2\\src\\libraries\\Microsoft.Extensions.DependencyInjection\\src\\ServiceLookup\\ILEmit\\ILEmitResolverBuilder.cs(216,17): Trim analysis warning IL2006: Microsoft.Extensions.DependencyInjection.ServiceLookup.ILEmitResolverBuilder.VisitIEnumerable(IEnumerableCallSite,ILEmitResolverBuilderContext): Call to 'System.Reflection.MethodInfo.MakeGenericMethod' is not recognized.\r\nF:\\git\\runtime2\\src\\libraries\\Microsoft.Extensions.DependencyInjection\\src\\ServiceLookup\\CallSiteFactory.cs(241,17): Trim analysis warning IL2006: Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateOpenGeneric(ServiceDescriptor,Type,CallSiteChain,Int32): Calling to 'System.Type.MakeGenericType' on unrecognized value.\r\n```",
+    "pr_comments": [
+        "Tagging subscribers to this area: @eerhardt, @maryamariyan\nSee info in area-owners.md if you want to be subscribed.",
+        "cc @dadhi @alexmg @seesharper @tillig @ENikS @ipjohnson @pakrym\r\n\r\nMore on this general feature here https://github.com/mono/linker/blob/master/docs/design/reflection-flow.md",
+        "Is this for DI libraries or client code? Will it remove client constructors marked for injection?",
+        "DI libraries. Today if you link the entire application it will remove constructors use in DI registrations because the linker can't see the which constructors are in use:\r\n\r\n```C#\r\nvar services = new ServiceCollection();\r\nservices.AddSingleton<IFoo, Foo>();\r\nvar sp = services.BuildServiceProvider();\r\nvar foo = sp.GetService<IFoo>();\r\nfoo.Bar();\r\n```\r\n\r\nThis would fail before this PR because Foo's constructor would be removed after linking. The annotations instruct the linker to preserve constructors of the generic second argument (the implementation type in this case).",
+        "But what about constructors marked with [InjectionConstructor] attributes? I am assuming these will be gone as well?\r\nSome classes are annotated instead of registering them and never touched by xx.AddXXX() methods.",
+        "@ENikS I don't know if there's a pattern to preserve those. Usually attribute only approaches require assembly scanning, which is also not linker friendly. It's possible that pattern is just incompatible and will result in the user needing to manually preserve those types.\r\n\r\ncc @vitek-karas @MichalStrehovsky ",
+        "Without that MEF, MEF2, Unity and probable some other are not compatible with the pattern.\r\n\r\n@davidfowl  thank you for heads up!",
+        "> Without that MEF, MEF2, Unity and probable some other are not compatible with the pattern.\r\n\r\nCorrect. We haven't gotten to making MEF and MEF2 linker friendly. It isn't scheduled for .NET 5, but it may be included in .NET 6.",
+        "@davidfowl Thanks for letting us know about this.\r\n\r\nSo to preserve the constructors for a given type, the type needs to be mentioned in a method taking a `Type` parameter (or generic Type parameter )annotated with the `DynamicallyAccessedMembers`? If so, is that the only way to salvage these types? :)  ",
+        "> If so, is that the only way to salvage these types? :)\r\n\r\nIt's the only way that works with the dataflow analysis within the linker.\r\n\r\nThe problem is basically that code like:\r\n\r\n```csharp\r\nvar  o = Activator.CreateInstance(someType);\r\n```\r\n\r\nmay or may not work after trimming, depending on whether the default constructor for `someType` was preserved. By default, you'll get a warning at the time trimming runs for code like this. The warning will say \"hey, there's a piece of reflection that I can't analyze. the code may or may not work at runtime\".\r\n\r\nYou can get rid of that warning four ways:\r\n1. You annotate things with the new attributes like in this pull request so that you'll end up with an annotation on `someType` that guarantees the default constructor was kept. This is the preferred solution, because it both makes the API \"just work\" (if linker can reason about the annotated pieces of code), and you got rid of the warning.\r\n2. You suppress the warning with a suppression attribute and ensure the default constructor is kept through other means. E.g. add a direct call to the constructor somewhere. This is not great because by adding a warnings suppression, you're giving up on linker's warnings in the method and it's now your responsibility to make sure the API calls succeed after trimming.\r\n3. You get rid of reflection. E.g. use a source generator.\r\n4. You don't trim and mark the API with a new `RequiresUnreferencedCodeAttribute`. Linker will warn whenever a trimmed app calls into such API (this is to give a better user experience - instead of user getting a warning about a stray use of reflection in a library, they get a message that the library author made a deliberate choice not to be trimming friendly).",
+        "Does RequiresUnreferencedCodeAttribute disable trimming on the assembly/type/member specified?",
+        "> Does RequiresUnreferencedCodeAttribute disable trimming on the assembly/type/member specified?\r\n\r\nNo. It is a way to mark an API as unsafe for trimming. This lets the caller know that they should either call a different API or they need to do extra work to make this call safe (e.g. explicitly preserve types/methods/properties/etc).\r\n\r\nFor example `Assembly.Load(string | byte[])` methods will be marked with `RequiresUnreferencedCodeAttribute`.",
+        "> You annotate things with the new attributes like in this pull request so that you'll end up with an annotation on someType that guarantees the default constructor was kept. This is the preferred solution, because it both makes the API \"just work\" (if linker can reason about the annotated pieces of code), and you got rid of the warning.\r\n\r\nDoes it have to be new attribute? Can you use existing MEF attributes?\r\nThese are available on every framework and would spare a lot of refactoring for project owners. We are talking about thousands of types to annotate...\r\n\r\nPerhaps you could add an interface, so something like Unity could add to injection attributes as well? \r\n\r\nWithout support for custom constructor annotations you are cutting out huge chunk of corporate users that use third party IOC containers. Perhaps this could be revisited?",
+        "Nothing is being cut, those applications will still work with less aggressive trimming modes, they just won't be able to trim the assemblies completely (or at all). \r\n\r\nBTW, this trimming mode isn't the default and we're still a while away from being able to trim our own framework fully. We're just getting started here.",
+        "I understand, just trying to make sure this scenario is considered from the beginning and is not an afterthought when it is too late to change ",
+        "See https://github.com/mono/linker/issues/1402",
+        "@davidfowl thanks for the heads up. \r\n\r\nCan we apply `DynamicallyAccessedMembers` just to the api surface or do we need to put the attribute everywhere? \r\n\r\n",
+        "> Can we apply DynamicallyAccessedMembers just to the api surface or do we need to put the attribute everywhere?\r\n\r\nYou *can* apply it to just the API surface but the linker warns if it isn't applied transitively.",
+        "Thanks @MichalStrehovsky for such a detailed explanation.\ud83d\udc4d\r\n\r\nIs there any way we can start to test this? Is it possible to enable this using the preview 7 bits?\r\n\r\nI've tried `dotnet publish -c Release -r osx-x64 --self-contained true -p:PublishSingleFile=false -p:PublishTrimmed=true` on a console app , but that did not seems to yield any warnings nor did it trim unreferenced types.\r\n\r\nFinally I was just wondering if this is something that is mainly meant for Xamarin apps or do guys you see this as general feature that eventually can be applied to all .Net 5 apps? ",
+        "@seesharper I made this for you https://github.com/davidfowl/LinkedAspNetCoreApplication. Run it with `dotnet publish -r osx-x64`",
+        "Wow, that was fast. Thanks a lot, David. I'll have a look first thing tomorrow. Again, I gotta hand it to you guys. The way that you involve the community early on new features is just priceless. \ud83d\udc4d\ud83d\udcaa Really appreciate it"
+    ],
+    "merged": true,
+    "created_at": "2020-08-01T00:35:26Z",
+    "issue_context": {
+        "number": 39745,
+        "title": "Annotate DependencyInjection to make it linker friendly",
+        "body": "The DependencyInjection library uses IL Emit and Reflection in order to create service implementations. However, this isn't linker friendly because the ILLinker will trim the constructors from these types, since it doesn't know anyone is using them.\r\n\r\nWe should annotate the DependencyInjection library with `DynamicallyAccessedMembers` attributes, so the ILLinker knows to preserve the constructors correctly. This should allow us to remove the `Microsoft.Extensions.*` assemblies from [Blazor's \"type granularity\" list](https://github.com/dotnet/aspnetcore/blob/fb28ce3ec2531327d6f98bfb7d44ad160393a925/src/Razor/Microsoft.NET.Sdk.Razor/src/build/netstandard2.0/Microsoft.NET.Sdk.Razor.Components.Wasm.targets#L372-L374), and instead fully trim these assemblies, just like the `System.*` assemblies.\r\n\r\nI have a prototype of this [here](https://github.com/dotnet/runtime/compare/master...eerhardt:AnnotateDependencyInjection), where the size reduction is decent:\r\n\r\n**Uncompressed IL file sizes:**\r\n    - Before 2,425,856 bytes\r\n    - After    2,360,320 bytes\r\n\r\n**Compressed (.br) all file sizes in wwwroot\\_framework:**\r\n    - Before 1,464,786 bytes\r\n    - After    1,443,696 bytes\r\n\r\nWe can see a ~20 KB size reduction in the Brotli compressed file sizes with this change.\r\n\r\ncc @pranavkm @SteveSandersonMS @joperezr @layomia @davidfowl ",
+        "comments": [
+            "Tagging subscribers to this area: @eerhardt, @maryamariyan\nNotify danmosemsft if you want to be subscribed.",
+            "Moving to 6.0, as the size savings here is not critical for 5.0.",
+            "Any chance we can do this in 5.0? Is there any harm?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 5534,
+            "commit_id": "018766b7637ccab20777959449164fe813742ce8",
+            "original_commit_id": "d40d32bfec9a7f7b4c0bd9a34566ee40219b7d39",
+            "path": "src/libraries/Common/src/Extensions/ActivatorUtilities/ActivatorUtilities.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 56,
+            "original_line": 56,
+            "side": "LEFT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "Doesn't this change the runtime behavior?",
+                "```C#\r\nforeach (ConstructorInfo? constructor in instanceType.GetConstructors())\r\n```\r\n\r\nThat will only return `public` constructors.\r\nWhat we were doing before was getting ALL constructors, but then filtering just the public constructors.\r\n```C#\r\n                foreach (ConstructorInfo? constructor in instanceType\r\n                    .GetTypeInfo()\r\n                    .DeclaredConstructors)\r\n                {\r\n                    if (!constructor.IsStatic && constructor.IsPublic)\r\n                    {\r\n                    }\r\n                }\r\n```\r\n\r\n",
+                "Got it, GetConstructors returns public constructors only."
+            ]
+        },
+        {
+            "hunk_id": 5535,
+            "commit_id": "018766b7637ccab20777959449164fe813742ce8",
+            "original_commit_id": "d40d32bfec9a7f7b4c0bd9a34566ee40219b7d39",
+            "path": "src/libraries/Microsoft.Extensions.DependencyInjection/tests/TrimmingTests/ServiceCollectionExtensionsTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 57,
+            "original_line": 30,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 57,
+            "subject_type": "line",
+            "review_comments": [
+                "I would add two more more complex tests which is:\r\n\r\n```C#\r\npublic interface IA { }\r\npublic interface IB { }\r\npublic interface IC { }\r\npublic class A : IA { }\r\npublic class B : IA { B(IA a) { } }\r\npublic class C : IA { C(IB b) { } }\r\n```\r\n\r\n```C#\r\nIServiceCollection descriptors = new ServiceCollection();\r\ndescriptors.AddTransient<IA, A>();\r\ndescriptors.AddTransient<IB, B>();\r\ndescriptors.AddTransient(typeof(IC), typeof(C));\r\nvar provider = descriptors.BuildServiceProvider();\r\nprovider.GetService<IC>().Method();\r\n```\r\n\r\nand an open generic registration:\r\n\r\n```C#\r\npublic class Logger<T> { }\r\npublic interface IA { }\r\npublic class A : IA { }\r\n```\r\n\r\n```C#\r\nIServiceCollection descriptors = new ServiceCollection();\r\ndescriptors.AddTransient<IA, A>();\r\ndescriptors.AddTransient(typeof(ILogger<>), typeof(Logger<>));\r\nvar provider = descriptors.BuildServiceProvider();\r\nprovider.GetService<ILogger<IA>>().Method();\r\n```\r\n\r\nand an IEnumerable<T> resolution:\r\n\r\n```C#\r\npublic interface IA { }\r\npublic class A1 : IA { }\r\npublic class A2 : IA { }\r\n```\r\n\r\n```C#\r\nIServiceCollection descriptors = new ServiceCollection();\r\ndescriptors.AddTransient<IA, A1>();\r\ndescriptors.AddTransient<IA, A2>();\r\nprovider.GetServices<IA>().Method(); // Under the covers calls `GetService<IEnumerable<T>>`\r\n```"
+            ]
+        }
+    ]
+}

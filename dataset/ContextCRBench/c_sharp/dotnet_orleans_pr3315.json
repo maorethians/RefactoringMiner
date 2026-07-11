@@ -1,0 +1,62 @@
+{
+    "repo": "dotnet/orleans",
+    "pr_number": 3315,
+    "lang": "c_sharp",
+    "pr_title": "Directly propagate OnActivateAsync failures to callers",
+    "pr_body": "Fixes #3213\r\n\r\n* Failures in `OnActivateAsync` will be propagated directly back to the caller.\r\n* Calls will be retried up to `IMessagingConfiguration.MaxResendCount` times (default is 0) because the rejection is marked as `Transient`.\r\n* Other message rejections which include an exception will also be propagated directly back to the caller, but this doesn't seem undesirable. The difference is that previously the exception would be discarded in favor of a generic exception (`OrleansMessageRejectionException`) which typically contained the original exception's `Message` in its `Message` property.",
+    "pr_comments": [
+        "The test failure can be ignored.",
+        "Is this change available in 1.5.1 or 1.5.2 (and 1.5.1)?",
+        "No, it's only in master. Will be in 2.0.0-beta."
+    ],
+    "merged": true,
+    "created_at": "2017-08-18T15:50:23Z",
+    "issue_context": {
+        "number": 3213,
+        "title": "Retaining exceptions from grain OnActivateSync",
+        "body": "Hi - wondering if anyone can help.\r\n\r\nThe scenario we are after here is the following:\r\n\r\n- An Orleans Client calls a grain that is not currently active\r\n- The OnActivateAsync method of the grain errors (i.e. SqlException, database is down for whatever reason).\r\n- The exception of the error is bubbled up to the client's try-catch block as an \"OrleansException\".\r\n\r\nAt this point, the InnerException is null, leaving only the stack trace giving any indication of the error.\r\n\r\nMy question: is it possible for OrleansException to retain SqlException inside the InnerException?\r\nIs there something I've missed or it just simply not possible?\r\n\r\nThanks in advance.",
+        "comments": [
+            "Good suggestion, @RosscoPK79!\r\nCurrently the system will attempt to forward the request a couple of times after a failed activation, giving the grain a few attempts at activation. Should that behavior be retained or is it best to not retry and instead immediately propagate an exception back to the caller? I'm leaning towards the latter.\r\n\r\nWe could introduce a new exception, `OrleansActivationFailedException : OrleansException`, to wrap the exception thrown during activation. ",
+            "@ReubenBond I'm not sure it matters if it retries or not, just that it should be possible for the caller to know why activation failed.\r\n\r\n`OrleansActivationFailedException` is a good idea.",
+            "@ReubenBond , we can try a number of times and still, when the last attempt fails, return the original exception. That is also what we do I believe and there should be a test somewhere for that. \r\nThere is simply a bug somewhere that causes that original exc to be lost.",
+            "Is `SqlException` serializable?",
+            "@gabikliot in your opinion, should we have a purpose-built exception for activation failures? Should we keep all activation failure exceptions or just the last one?\r\n\r\nEDIT: I believe we should have a specific exception. I remember being confused at those \"forwarding failed\" messages which we currently throw.",
+            "I would love a \"fail immediately\" exception to throw during activation. This happens often enough to be annoying in my current application, where checking if the grain exists before making the call is a lot of work for a very rare event. Even though rare, such events are really noisy in our logs due to the retries, and are hard to distinguish from Azure networking blips, which also cause forwarding exceptions for us.",
+            "@kogir if you know of other areas where stack traces are swallowed or more diagnostics could be useful, please let us know so we can improve the troubleshooting experience.",
+            "I think Sergey might be right, it might be due to this exc not being serialized. In such a case, maybe we should provide just the name and write that the exception is not serializable, plus stack plus message.\r\n\r\nI think we should just throw the last one, without forwarding stuff of course. And I think we do Not want a special activation failed exc, since this will break the virtual Actor abstraction. ",
+            "How does an exception saying that activation failed break the abstraction? If that's true, then does any potentially transient exception break the abstraction? If not, what's the distinction?\r\n\r\nThe user experience is better when they are specifically told that activation failed rather than forwarding failed (Forwarding what where? Why are we forwarding? That's not even in the abstraction).\r\n\r\nFinally, this is not simply an issue of `SqlException` perhaps being unserializable (although that would be a valid concern \u2014 we can deal with that using the failsafe exception serializer). Even with in-built .NET exceptions (such as the `ApplicationException` used in our `BadActivate_Await` test) we do not see the exception propagated verbatim to the caller. Instead, we are including the exception message in the 'forwarding failed' message. See here:\r\n![image](https://user-images.githubusercontent.com/203839/28099648-0df2aef0-6701-11e7-8788-64f036a6dabd.png)\r\n\r\nNote that `InnerException` is null and the test checks that the specified exception message is included somewhere in the outer exception's message.",
+            "Reuben, I wrote that returning \"forwarding\" is bad. I agreed that we should not be returning forwarding. Instead, I think we should return the last exception thrown by the app.\r\n\r\nThe only undecided question is if to wrap it in special CouldNotActive exc or not. I suggest not.\r\n\r\nAny potential exc does not break the abstraction, since message loss is allowed. Saying to the caller there is a thing called \"Activation\" does (grain knows about lifecycle, caller/client does not). Anyway, it is a bit of a philosophical discussion and I don't feel strongiy about that. You just asked my opinion, so I shared it.\r\n\r\n",
+            "Got it, my bad :)\r\nI'm fine with not wrapping the exception - there will be a stack trace to show that the exception occurred during activation anyway.\r\n\r\nDoes anyone prefer that we do wrap the exception from `OnActivateAsync` in its own \"activation exception\"?",
+            "I agree with @gabikliot - exposing the notion of the activation process to the caller breaks the abstraction of eternal grains. I think returning the original exception should be enough. The call stack will have enough information for the developer.\r\n\r\nI don't understand/remember why we are trying to forward the request. Are we or is it just a misleading error message? I agree with @kogir that we better \"fail immediately\" and return the exception to the caller without retrying on another silo. Am I missing something here? ",
+            "I think the forwarding had some reason. I don't remember now.\r\nI need to look at the code to try to recall. Maybe it's historical and can be removed. Ping me again if I don't reply to it in a couple of days.",
+            "I should have pinged a month ago, but have you had additional thoughts on this, @gabikliot?\r\n\r\nThere may be reasons that activation is failing on a particular silo which do not apply to other silos. In these cases, though, I believe it is fine to fail fast and allow the caller to retry.\r\n\r\nI opened #3315 with an implementation if you would like to take a look.",
+            "I think it goes like this:\r\ninitially, we did not have the whole activation process broken into stages like now (`ActivationInitializationStage`). In this model, if we failed to read the state for example, we wanted to retry, and maybe on another silo, since we thought maybe this silo cannot talk to storage now but another can. Thus we did forwarding (retry from a different silo).\r\n\r\nBut now we do have stages. In your suggested PR #3315 we are still forwarding if failed to load state. And the question now what if we just failed to call Activate.\r\nI think it is OK not to retry, neither locally nor on another silo, and fail immediately. It will ALSO be ok to yes retry. Retrying Activate does  not break \"at least once delivery guarantee\" since this guarantee applies only to app msgs and not to activate calls (http://dotnet.github.io/orleans/Documentation/Runtime-Implementation-Details/Messaging-Delivery-Guarantees.html)\r\n\r\nSo both are OK and seems like indeed why do we need to retry Activate.\r\n\r\nThe thing to watch is: now there is more stuff going on in https://github.com/dotnet/orleans/blob/master/src/OrleansRuntime/Catalog/Catalog.cs#L1302\r\nThere is some kind of ILogConsistencyProtocolParticipant and activation.Lifecycle.OnStart();\r\nI don't know what are those and if they can fail and if they deserve to be in a separate ActivationInitializationStage or not.\r\n\r\nOverall, if you decide to do  #3315 (not retry failed Activate), just watch it carefully, since overall, in theory, clients may see more errors of failed Activate, since you essentially made it less reliable by not doing retries.\r\n\r\n\r\n\r\n",
+            "> Overall, if you decide to do #3315 (not retry failed Activate), just watch it carefully, since overall, in theory, clients may see more errors of failed Activate, since you essentially made it less reliable by not doing retries.\r\n\r\nThanks, @gabikliot, you raise a good point about the increased fragility without implicit retries. As it is in #3315 currently, storage failures should not result in additional failures since a distinction is made between `SetupState` and `InvokeActivate` - only the latter triggers this fast fail.  I believe what you're saying is that it's possible for this situation to change in future and that we should be wary for that purpose. I agree, and this change is likely so we should make sure that we retain acceptable semantics.",
+            "Not exactly. \r\nYes, I said be wary about future changes, but that is the least concern.\r\n\r\nI wrote already that reliability of storage access is not changed in #3315. You just acked it now. Storage is accessed in a separate stage (SetupStorage) and that one is retried. No problems here.\r\n\r\nWhat I said is that now the other stage `InvokeActivate ` is NOT retried, so InvokeActivate is less reliable.\r\n\r\n\r\n",
+            "Yep, I was acknowledging what you said and adding that it's *likely* that the activation path will change in the future. So if #3315 is merged, we will see a higher incidence of activation failures if `OnActivateAsync` itself is unreliable - eg if users are performing their own storage in `OnActivateAsync`. Fortunately the user has the ability to add their own retries there but unfortunately those retries will all be executed on the same silo.",
+            "I think we should not retry in case `OnActivateAsync()` throws. The implicit contract there is that if the application code throws, we abort the activation process, which I think is more intuitive than retrying it. Application logic can do its own retries if needed."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 30413,
+            "commit_id": "f735c54554b05b644ef49f968c71436c7df93078",
+            "original_commit_id": "0253b08ae3fd92f8a9dfc472241083e80e49cdc0",
+            "path": "src/OrleansRuntime/Catalog/Catalog.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 685,
+            "original_line": 685,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "Isn't there a race here that will allow new requests to get enqueue right after we reject all messages that are already in the queue? Are we preventing enqueuing of new requests before we start the rejection loop?",
+                "The activation is already marked as invalid and this is running inside of a lock on the activation. Is there room for a race?",
+                "If it's already marked as invalid, then I think we are fine."
+            ]
+        }
+    ]
+}

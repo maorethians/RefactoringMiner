@@ -1,0 +1,49 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 5965,
+    "lang": "cpp",
+    "pr_title": "[Import/Export] Exported databases can now be safely moved",
+    "pr_body": "This PR fixes #5868 \r\n\r\nPreviously we would EXPORT and bake the absolute path of the table data into the query e.g `path/to/exported/db/tbl.csv`\r\nWhen we only really need the `tbl.csv` part, because the path of the `db` folder is already provided on IMPORT.\r\n\r\nNow we prefix the path with a placeholder on EXPORT, and replace it with the `db` folder path on IMPORT.",
+    "pr_comments": [
+        "Actually, do we even need the placeholder?",
+        "Thanks for the PR!\r\n\r\nWhile the placeholder approach is relatively straightforward I do see some potential issues with this:\r\n\r\n* It won't work correctly with older versions of DuckDB - as they won't know how to handle a placeholder, and won't emit a placeholder\r\n* It won't work when loading into other systems, e.g. Postgres\r\n* Global text replacement is a bit hacky, since the `IMPORT` file can contain arbitrary user-defined input (e.g. the actual file name)\r\n\r\nPerhaps we can use the Parser for this - for example we can run the parser on the `load.sql` file. It should only contain `COPY` statements - and we can directly extract and modify the path for each of the `CopyStatements` within the file. We could then implement `CopyStatement::ToString` (similar to what we have for `SelectStatement`) to stringify it again. That should work while leaving the export code untouched.",
+        "You mean from new version -> old version\r\nIs that supported in general?\r\n\r\nBecause for old version -> new version this should still work\r\nit doesn't assert that the file is prefixed with the placeholder, only when it does it replaces it\r\n\r\nThe other points are fair though\r\nI like the approach you suggested, I felt the string replacements were kinda dirty/error-prone to begin with",
+        "> You mean from new version -> old version\r\n> Is that supported in general?\r\n\r\nIt used to work, so I would prefer not to break it unnecessarily\r\n",
+        "I've made some changes to the statement verifier to include the copy statement\r\n\r\nThough I went a little overboard and implemented Equals for every Statement\r\nI think I'll make a separate PR out of it, and also add Copy + Equals verification for all statements\r\n\r\nFound and fixed a few bugs in this ToString that I need to move over to this PR, but other than that it should be done",
+        "Thanks!"
+    ],
+    "merged": true,
+    "created_at": "2023-01-25T08:45:04Z",
+    "issue_context": {
+        "number": 5868,
+        "title": "Absolute paths in EXPORT DATABASE load.sql",
+        "body": "### What happens?\r\n\r\nIf you `EXPORT DATABASE 'mypath' (FORMAT PARQUET);` the **absolute paths** to `mypath` are written in to `load.sql`.\r\n\r\nThis means you can't copy the exported files to another location and  `IMPORT DATABASE 'mypath'` because you'll get:\r\n```\r\nduckdb.InvalidInputException: Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result\r\nError: IO Error: No files found that match the pattern \"/original/path/table.parquet\"\r\n```\r\n\r\n### To Reproduce\r\n\r\n1. `EXPORT DATABASE 'test' (FORMAT PARQUET);`\r\n\r\n1. Open `test/load.sql`\r\n\r\n1. Observe full paths in `test` directory, e.g.: `/home/dave/backup/test/table.parquet`\r\n\r\n1. Copy `test` to another location e.g. `test2`\r\n\r\n1. `IMPORT DATABASE 'test2'`\r\n\r\n1. Observe `IO Error`\r\n\r\n### OS:\r\n\r\nUbuntu 20.04.5 LTS\r\n\r\n### DuckDB Version:\r\n\r\nv0.6.1-dev83 dfae126\r\n\r\n### DuckDB Client:\r\n\r\nPython\r\n\r\n### Full Name:\r\n\r\nDave Tapley\r\n\r\n### Affiliation:\r\n\r\nJE Fuller\r\n\r\n### Have you tried this on the latest `master` branch?\r\n\r\n- [X] I agree\r\n\r\n### Have you tried the steps to reproduce? Do they include all relevant data and configuration? Does the issue you report still appear there?\r\n\r\n- [X] I agree",
+        "comments": [
+            "Here's my workaround in Python:\r\n\r\nTo export:\r\n```py\r\ncon.execute(f\"EXPORT DATABASE '{path}' (FORMAT PARQUET);\")\r\n\r\nloadSqlPath = path / 'load.sql'\r\nfor line in fileinput.input(loadSqlPath, inplace=True):\r\n    print(line.replace(str(path), 'ROOT'))\r\n```\r\n\r\nTo import:\r\n```py\r\nloadSqlPath = path / 'load.sql'\r\nfor line in fileinput.input(loadSqlPath, inplace=True):\r\n    print(line.replace('ROOT', str(path)))\r\n\r\ncon.execute(f\"IMPORT DATABASE '{str(path)}';\")\r\n```",
+            "Thanks for the report!\r\n\r\nThe problem with writing relative paths is that the `IMPORT` then only works from the same relative directory, e.g. this would fail:\r\n\r\n```sql\r\nEXPORT DATABASE 'mydir' (FORMAT PARQUET);\r\ncd ..\r\nIMPORT DATABASE 'root/mydir';\r\n```\r\n\r\nWe could make this a configuration option - or perhaps more cleanly would be to have the `IMPORT` modify the path automatically if it is different.",
+            "Yea I think so too, all the files that get written when we do an export database will be local to that created folder\r\nIt's probably nicest to just have IMPORT figure out what path the relevant files are at, it should have enough context",
+            "Hmm, since this is a pragma, all it does is directly interpret the schema.sql and load.sql files\r\nOnce the new query is finally bound the context that it came from a pragma is long forgotten.\r\n\r\nSo the easiest(hackiest) way to fix this is by doing a find and replace on the string representation.\r\nEither just looking for `FROM '%s'` or prefixing all paths with something like `DUCKDB_RELATIVE_PATH_IDENTIFIER` so we can find and replace that with the path given to us at IMPORT\r\n\r\nThat second option is probably best for backwards compatibility reasons, that way we won't accidentally change `path/to/db/tbl.csv` to `path/to/db/path/to/db/tbl.csv`\r\nThough we could also check if the path is only a single part e.g `tbl.csv`, in which case we know it was made after this change - only then prefix it\r\n\r\nOr actually.. do we even need to prefix it?\r\nThe actual `name` part of the path is only a single part, i.e we don't create nested folders within the created folder.\r\n\r\nSo just extracting the name and applying the IMPORT path to it should always be sufficient, no need for a placeholder"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23690,
+            "commit_id": "0a529ea762136b027f9620bf726ae4402007b104",
+            "original_commit_id": "8919619b8989c4b8c58eac0ba304a7fd4c0c3402",
+            "path": "src/parser/statement/copy_statement.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 93,
+            "original_line": 86,
+            "side": "RIGHT",
+            "original_position": 76,
+            "position": 83,
+            "subject_type": "line",
+            "review_comments": [
+                "We have verification for `ToString` round-trips for INSERT/DELETE/SELECT statements in `src/main/client_context.cpp:670` (in `PendingStatementOrPreparedStatementInternal`). Perhaps add the COPY statement there as well?",
+                "Oh I completely missed that, my mind instantly went to StatementVerifier\r\nso I made changes there to support other types of statements than Select, but that required skipping a lot of the functionality of the StatementVerifier, because we can't execute them - because of side-effects.\r\n\r\nSo this will definitely be better\r\nAlso a good place to add the Equals check I think"
+            ]
+        }
+    ]
+}

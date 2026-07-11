@@ -1,0 +1,190 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 91124,
+    "lang": "go",
+    "pr_title": "builtins: add crdb_internal.fingerprint builtin",
+    "pr_body": "This change adds a `crdb_internal.fingerprint` builtin\r\nthat accepts a `startTime`, `endTime`, `startKey` and `endKey`\r\nto define the interval the user wants to fingerprint. The builtin\r\nis powered by sending an ExportRequest with the defined intervals\r\nbut with the `ExportFingerprint` option set to true.\r\n\r\nSetting this option on the ExportRequest means that instead of\r\nwriting all point and rangekeys to an SST and sending them back to\r\nthe client, command evaluation will use the newly introduced\r\n`fingerprintWriter` (https://github.com/cockroachdb/cockroach/pull/90848) when exporting keys. This writer\r\ncomputes an `fnv64` hash of the key/timestamp, value for each point key\r\nand maintains a running XOR aggregate of all the point keys processed\r\nas part of the ExportRequest. Rangekeys are not fingerprinted during\r\ncommand evaluation, but instead returned to the client in a\r\npebble SST. This is because range keys do not have a stable,\r\ndiscrete identity and so it is up to the caller to define a deterministic\r\ningerprinting scheme across all returned range keys.\r\n\r\nThe ExportRequest sent as part of this builtin does not set any DistSender\r\nlimit, thereby allowing concurrent execution across ranges. We are not\r\nconcerned about the ExportResponses growing too large since the SSTs\r\nwill only contain rangekeys that should be few in number. If this assumption\r\nis proved incorrect in the future, we can revisit setting a `TargetBytes`\r\nto the header of the BatchRequest.\r\n\r\nFixes: https://github.com/cockroachdb/cockroach/issues/89336\r\n\r\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/91124)\n<!-- Reviewable:end -->\n",
+        "Pushing this out to get some initial comments, and ideas for more interesting cases to test.",
+        "friendly ping @stevendanna @erikgrinaker, if there are no blocking comments then I'd like to start using this in our C2C tests to shake out bugs/issues.\r\n\r\n> I suppose we could generate range tombstones through actual sql operations and then assert that splits and merges don't affect the fingerprint.\r\n\r\nThe test does have a case where it issues an admin split and ensures that we see two ExportRequests that are then combined by distsender. I think we'll also see more coverage once C2C in the face of SQL operations that write tombstones start comparing fingerprints.",
+        "Sorry, I'm running a bit behind on code reviews, will have a quick look now.",
+        "TFTRs!\r\n\r\nbors r=stevendanna,erikgrinaker",
+        "Build failed:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=7683583&buildTypeId=Cockroach_BazelEssentialCi)",
+        "Unsure what happened here.\r\n\r\nbors retry",
+        "Build failed:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=7683722&buildTypeId=Cockroach_BazelEssentialCi)",
+        "oh, rebasing:\r\n`panic: Multiple signatures have oid 2045: [pg_blocking_pids() -> int[] crdb_internal.fingerprint`",
+        "bors r+",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=7684430&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2022-11-18T00:16:13Z",
+    "issue_context": {
+        "number": 89336,
+        "title": "c2c: add fingerprinting for internal testing",
+        "body": "The following technical approach was replaced with:\r\n\r\n- https://github.com/cockroachdb/cockroach/pull/91124)\r\n\r\n...but the goal is the same.\r\n\r\n#### Previous plan\r\n\r\n`crdb_internal.scan(crdb_internal.tenant_span($1))` returns the raw keys and values from the specified span. We would like to extend this generator to return timestamped ordered revisions of each key. While this is useful as a standalone tool, the motivation behind this change is to drive the on-demand fingerprinting that we are developing for c2c replication. At a high level this primitive will be executed by each processor on a pre-defined chunk of spans, the output of which will be fed to a checksum algorithm and sent downstream in the DistSQL flow.\r\n\r\nAs part of this issue, we should investigate whether we can add a mode to `ExportRequest` (KV request that is already capable of reading and returning timestamp-ordered revisions of keys) that does not write these keys to an SST but returns them in a kvBuf slice that we can read from. We should benchmark, and trace what parts of `ExportRequest` that are being used during backup are \"slow\" and \"unnecessary\" for simply reading and returning revisions of all rows in a given timebound.\r\n\r\nEpic: CRDB-21075\r\n\r\nJira issue: CRDB-20208",
+        "comments": [
+            "cc @cockroachdb/disaster-recovery",
+            "From an offline conversation with @dt and @stevendanna:\r\n\r\n1. https://github.com/cockroachdb/cockroach/issues/90450 is likely not a hard requirement for using ExportRequest as the driver to read key revisions.\r\n\r\n2. What if we pushed down hashing into `evalExport`? \r\n\r\nUntil now we were planning to use a primitive such as `crdb_internal.scan()` to first fetch all the KVs with revisions in a given window of time, and then hash batches of those KVs. This would likely be done in a DistSQL flow that uses `PartitionSpans` to divvy work based on the leaseholders and then spins up processors on each node of the source cluster to hash their respective batches. The batched approach means that we would have to preserve the batching when generating the fingerprint on the destination cluster too since the hash would depend on the order of the keys. While this gives us more observability into what batch our fingerprinting failed on there is a simpler and potentially cheaper alternative we would like to consider.\r\n\r\nEach ExportRequest constructs an SST and ships it as part of the ExportResponse. For the purposes of fingerprinting, we could teach ExportRequest to funnel KVs into an fnv64 hasher instead of the sstWriter and return a XOR'ed hash of the span as part of the ExportResponse. This would eliminate the cost of transferring SSTs over the wire. Furthermore, ExportRequests are splittable and so we can lean entirely on the DistSender to split, send and combine all the responses (XOR the hashes) without setting up a DistSQL flow. Since we are hashing every KV (along with its timestamp) the outputted hash becomes order agnostic and can be run on the destination cluster without having to maintain any complicated batching logic.",
+            "This can be marked as done once some of our C2C tests uses the `crdb_internal.fingerprint` builtin.",
+            "Based on an oflfine discussion with @livlobo we are closing the epic linked in this issue since `crdb_internal.fingerprint` has been implemented and tested. Fallout from tests (existing and future) that will use this tool should be tracked in the more appropriate epic linked here - https://github.com/cockroachdb/cockroach/issues/93078"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15037,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/sql/sem/builtins/builtins.go",
+            "start_line": 7438,
+            "original_start_line": 7454,
+            "start_side": "RIGHT",
+            "line": 7440,
+            "original_line": 7440,
+            "side": "RIGHT",
+            "original_position": 122,
+            "position": 133,
+            "subject_type": "line",
+            "review_comments": [
+                "Can be a follow-up, but should we memory monitor this?",
+                "good catch, added a TODO."
+            ]
+        },
+        {
+            "hunk_id": 15039,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/sql/sem/builtins/fingerprint_builtin_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 136,
+            "original_line": 136,
+            "side": "RIGHT",
+            "original_position": 136,
+            "position": 136,
+            "subject_type": "line",
+            "review_comments": [
+                "Am I misreading? I don't think the store has a range tombstone until line 145 below?",
+                "Nope my bad, fixed the comment."
+            ]
+        },
+        {
+            "hunk_id": 15042,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/sql/sem/builtins/builtins.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7373,
+            "original_line": 7373,
+            "side": "RIGHT",
+            "original_position": 57,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "Would be nice to document this in the function description, I was looking for an `end_time` parameter.",
+                "added a comment to this effect."
+            ]
+        },
+        {
+            "hunk_id": 15040,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/storage/fingerprint_writer.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 274,
+            "original_line": 274,
+            "side": "RIGHT",
+            "original_position": 70,
+            "position": 107,
+            "subject_type": "line",
+            "review_comments": [
+                "This likely doesn't matter here at all, but combined point/range key iteration is usually a fair bit more expensive than iterating over them separately. We could set up a point-only iterator at the start of the function, and check if a seek lands on a valid position (found a point key), and then use range-only iteration for the fingerprinting.\n\nThis isn't going to matter unless a span has a bunch of range keys though, which we don't really expect to see, but I suppose it could e.g. in the case of import cancellations of coarsely interleaved data. Feel free to ignore this or leave a comment for later.",
+                "ahh TIL, changed to first use a point iter to assert we don't have any point keys."
+            ]
+        },
+        {
+            "hunk_id": 15038,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/kv/kvserver/batcheval/cmd_export.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 210,
+            "original_line": 210,
+            "side": "RIGHT",
+            "original_position": 36,
+            "position": 43,
+            "subject_type": "line",
+            "review_comments": [
+                "\ud83d\udcad I wonder if the tenant-eliding options should be the default or of we should thread those through the command args and allow the user to specify them. ",
+                "I think this is a good point, I can't think of a use case where someone wants to keep the tenant prefix and value checksum. I'm leaning towards defaulting to strip everything, and if we need it going forward we can always thread it through?",
+                "I also just realized I'll need to strip the tenant prefix and value checksum when fingerprinting range keys.",
+                "Okay I've set the default to true, and refactored things to strip the key/value checksum in rangekey fingerprinting. Let me know what you think!",
+                "Seems good to me. Since this is just for us at the moment, I like the default just being what we need. "
+            ]
+        },
+        {
+            "hunk_id": 15041,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/sql/sem/builtins/builtins.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7341,
+            "original_line": 7341,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 34,
+            "subject_type": "line",
+            "review_comments": [
+                "Don't we usually pass the start/end keys separately to functions like these? No idea what the convention or recommendation is, just wondering.",
+                "I think `crdb_internal.scan` has an overload for both passing in a span or a start/end key. I was optimizing for the use case of `crdb_internal.fingerprint(crdb_internal.tenant_span(<id>))` or `crdb_internal.fingerprint(crdb_internal.table_span(...))` but its likely we'll add the other overload soon enough. I'll leave it as a follow up when we need it."
+            ]
+        },
+        {
+            "hunk_id": 15036,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/sql/sem/builtins/builtins.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7492,
+            "original_line": 7492,
+            "side": "RIGHT",
+            "original_position": 171,
+            "position": 185,
+            "subject_type": "line",
+            "review_comments": [
+                "if this is true, then the function shouldn't appear in the public docs, and there shouldn't be a release note for it",
+                "good point, still working through whether we want to expose this or not but will make sure to tidy it up either way."
+            ]
+        },
+        {
+            "hunk_id": 15043,
+            "commit_id": "1acfcc8d512a66eefef148c6f1fbcb1421b62098",
+            "original_commit_id": "6475cce1783eafc2da38d0db1d86cbd37fa5541f",
+            "path": "pkg/sql/sem/builtins/builtins.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7335,
+            "original_line": 7335,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "We may want to check the `V23_1` version gate here and error out, since we'll otherwise effectively be sending export requests without the `ExportFingerprint` parameter set and run actual exports on 22.2 nodes, storing the SSTs in memory, which can OOM the node.",
+                "good point, done."
+            ]
+        }
+    ]
+}

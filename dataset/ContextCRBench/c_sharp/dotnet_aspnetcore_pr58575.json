@@ -1,0 +1,69 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 58575,
+    "lang": "c_sharp",
+    "pr_title": "if actual bytes to be written is negative, set to zero",
+    "pr_body": "# if actual bytes to be written is negative, set to zero\r\n\r\n<!-- Thank you for submitting a pull request to our repo. -->\r\n\r\n<!-- If this is your first PR in the ASP.NET Core repo, please run through the checklist\r\nbelow to ensure a smooth review and merge process for your PR. -->\r\n\r\n- [x] You've read the [Contributor Guide](https://github.com/dotnet/aspnetcore/blob/main/CONTRIBUTING.md) and [Code of Conduct](https://github.com/dotnet/aspnetcore/blob/main/CODE-OF-CONDUCT.md).\r\n- [x] You've included unit or integration tests for your change, where applicable.\r\n- [ ] You've included inline docs for your change, where applicable.\r\n- [x] There's an open issue for the PR that you are making. If you'd like to propose a new feature or change, please open an issue to discuss the change or find an existing issue.\r\n\r\n<!-- Once all that is done, you're ready to go. Open the PR with the content below. -->\r\n\r\n## Description\r\n\r\nFixes [#47452](https://github.com/dotnet/aspnetcore/issues/47452)\r\n\r\nWhen actual is zero, it will wait for stream window update.",
+    "pr_comments": [
+        "Any remaining concerns @mgravell?",
+        "@amcasey thanks for merging this\r\ncan we also back port this fix to 8.0, let me know if I need to create a PR for it.",
+        "@BrennanConroy @adityamandaleeka to consider for backporting",
+        "> @BrennanConroy @adityamandaleeka to consider for backporting\r\n\r\nHi, \r\nWe are also facing this issue with 8.0 , Can you please let us know when it is planned to be merged to 8.0 and to be released.\r\n\r\nThanks",
+        "Backport isn't an automatic / \"given\"; however, the change is small, reasonably safe, and doesn't involve API, so it isn't a hard \"no\" either, and there's multiple people requesting it. I'll raise it with the team."
+    ],
+    "merged": true,
+    "created_at": "2024-10-22T21:03:16Z",
+    "issue_context": {
+        "number": 47452,
+        "title": "Decreasing the window size below the amount of data sent can prematurely abort the connection",
+        "body": "The following error can occur in specific scenarios if the server has sent some data on a stream and the client updates the window size to some value below the amount already sent\r\n```\r\nMicrosoft.AspNetCore.Server.Kestrel.Http2 Critical: The event loop in connection 0HMP8EQDO1NJO failed unexpectedly.\r\nSystem.ArgumentOutOfRangeException: Specified argument was out of the range of valid values. (Parameter 'length')\r\n    at System.ThrowHelper.ThrowStartOrEndArgumentValidationException(Int64 start)\r\n    at System.Buffers.ReadOnlySequence`1.Slice(Int64 start, Int64 length)\r\n    at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2.Http2FrameWriter.WriteToOutputPipe() in /_/src/Servers/Kestrel/Core/src/Internal/Http2/Http2FrameWriter.cs:line 139\r\n```\r\n\r\n### Method 1\r\nFor example, if the server sends 2 bytes with an initial window size of 3, then the client updates the window to be 1. The server will successfully have scheduled a new item to the output loop for processing:\r\nhttps://github.com/dotnet/aspnetcore/blob/7aca30363667b13f80aae816dc9924de54284569/src/Servers/Kestrel/Core/src/Internal/Http2/Http2OutputProducer.cs#L312-L314\r\nBut before it starts processing the item in\r\nhttps://github.com/dotnet/aspnetcore/blob/c93d0d013b8f9e7baf2ae03fcc2fcade78687385/src/Servers/Kestrel/Core/src/Internal/Http2/Http2FrameWriter.cs#L111-L117\r\nThe updated Window can be processed:\r\nhttps://github.com/dotnet/aspnetcore/blob/ff6c5e7e3bc0a6cb9a033c9a295e1225a1065939/src/Servers/Kestrel/Core/src/Internal/Http2/Http2Connection.cs#L891-L897\r\nWhich will decrease the `_streamWindow` to a negative value, which will then fail the buffer slice at\r\nhttps://github.com/dotnet/aspnetcore/blob/c93d0d013b8f9e7baf2ae03fcc2fcade78687385/src/Servers/Kestrel/Core/src/Internal/Http2/Http2FrameWriter.cs#L131-L139\r\n\r\n--------\r\n\r\n### Method 2\r\nAnother way this can be hit is if `Stop` is called once the `_streamWindow` is negative, even if nothing has been scheduled yet, because it will call `Schedule` itself without any checks for `_streamWindow`\r\nhttps://github.com/dotnet/aspnetcore/blob/ff6c5e7e3bc0a6cb9a033c9a295e1225a1065939/src/Servers/Kestrel/Core/src/Internal/Http2/Http2OutputProducer.cs#L566-L583\r\n\r\n--------\r\n\r\n### Method 3\r\nDoing multiple writes can also cause this, if the window update happens after the first write, but before the second one (or if it happens during the race between starting to process the second write and reading the settings as described in method 1).\r\nThis path also calls `Schedule` without a check for `_streamWindow`.\r\nhttps://github.com/dotnet/aspnetcore/blob/ff6c5e7e3bc0a6cb9a033c9a295e1225a1065939/src/Servers/Kestrel/Core/src/Internal/Http2/Http2OutputProducer.cs#L388-L407\r\n\r\n---------\r\n\r\nThis following test will hit the issue in either the `Stop` path described in method 2 or the multi write path described in method 3.\r\n```csharp\r\n[Fact]\r\npublic async Task DecreaseWindowBelowCurrentSentAmount()\r\n{\r\n    const int windowSize = 3;\r\n    _clientSettings.InitialWindowSize = windowSize;\r\n\r\n    var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);\r\n\r\n    await InitializeConnectionAsync(async context =>\r\n    {\r\n        var bodyControlFeature = context.Features.Get<IHttpBodyControlFeature>();\r\n        bodyControlFeature.AllowSynchronousIO = true;\r\n        await context.Response.Body.WriteAsync(new byte[windowSize - 1], 0, windowSize - 1);\r\n        await tcs.Task;\r\n        context.Response.Body.Write(new byte[windowSize], 0, windowSize);\r\n    });\r\n\r\n    await StartStreamAsync(1, _browserRequestHeaders, endStream: true);\r\n\r\n    await ExpectAsync(Http2FrameType.HEADERS,\r\n        withLength: 32,\r\n        withFlags: (byte)Http2HeadersFrameFlags.END_HEADERS,\r\n        withStreamId: 1);\r\n\r\n    // Decrease window size after server has already sent the current window - 1 size of data\r\n    _clientSettings.InitialWindowSize = windowSize - 2;\r\n    await SendSettingsAsync();\r\n\r\n    await ExpectAsync(Http2FrameType.DATA,\r\n        withLength: windowSize - 1,\r\n        withFlags: (byte)Http2DataFrameFlags.NONE,\r\n        withStreamId: 1);\r\n\r\n    await ExpectAsync(Http2FrameType.SETTINGS,\r\n        withLength: 0,\r\n        withFlags: (byte)Http2DataFrameFlags.END_STREAM,\r\n        withStreamId: 0);\r\n\r\n    tcs.SetResult();\r\n\r\n    await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);\r\n}\r\n```\r\n",
+        "comments": [
+            "We've moved this issue to the Backlog milestone. This means that it is not going to be worked on for the coming release. We will reassess the backlog following the current release and consider this item at that time. To learn more about our issue management process and to have better expectation regarding different types of issues you can read our [Triage Process](https://github.com/dotnet/aspnetcore/blob/main/docs/TriageProcess.md).",
+            "Moving to backlog. This is a low-pri bug, only affects an edge case in the HTTP/2 spec and only sometimes since it's a race.",
+            "We are encountering this issue intermittently after we upgraded our service from .NET 6 to 8.\r\n```\r\ncrit: Microsoft.AspNetCore.Server.Kestrel.Http2[63]\r\n\u00a0 \u00a0 \u00a0 The event loop in connection 0HN3R40QVJ560 failed unexpectedly.\r\n\u00a0 \u00a0 \u00a0 System.ArgumentOutOfRangeException: Specified argument was out of the range of valid values. (Parameter 'length')\r\n\u00a0 \u00a0 \u00a0 \u00a0 \u00a0at System.ThrowHelper.ThrowStartOrEndArgumentValidationException(Int64 start)\r\n\u00a0 \u00a0 \u00a0 \u00a0 \u00a0at System.Buffers.ReadOnlySequence`1.Slice(Int64 start, Int64 length)\r\n\u00a0 \u00a0 \u00a0 \u00a0 \u00a0at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2.Http2FrameWriter.WriteToOutputPipe()\r\n```\r\nOur service is a grpc server that provides streaming calls to transfer large volumes of data. The grpc client in our case is written in C++. After the error, the grpc client is not notified of any errors, and it remains waiting for a response."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 13261,
+            "commit_id": "79f14611340941940e922475a8456dd706e93f3d",
+            "original_commit_id": "34b7e9310656a206b4f401039b8a403e426d1c98",
+            "path": "src/Servers/Kestrel/Core/src/Internal/Http2/Http2FrameWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 207,
+            "original_line": 202,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 10,
+            "subject_type": "line",
+            "review_comments": [
+                "This does seem to fix it; it *feels* like we're powering over the real problem, though - like one of the values used in either CheckStreamWindow or CheckConnctionWindow is already at a value we should have clamped. Maybe I'm overthinking... I tend to do that, and this has the advantage of simplicity ",
+                "I vaguely recall that the spec allows the window size to go negative.  I do think it might be helpful to include a comment about when that can happen.",
+                "Do we actually want to continue if it's negative/zero or should we short-circuit something?",
+                "@amcasey yes, when the window size becomes we (sender) should wait for window update from the receiver, by continuing the code flow will mark as waiting for window updates, as there are still more data to be written. This will also handle the case if the receiver aborts the connection without sending window update.\r\nAdded inline comment to describe the change",
+                "Crucially, we're only setting a local to 0, right?  Not our actual window size state?",
+                "yes, that's correct, only the local is set to 0\r\nthe actual window size remains negative"
+            ]
+        },
+        {
+            "hunk_id": 13262,
+            "commit_id": "79f14611340941940e922475a8456dd706e93f3d",
+            "original_commit_id": "34b7e9310656a206b4f401039b8a403e426d1c98",
+            "path": "src/Servers/Kestrel/Core/src/Internal/Http2/Http2FrameWriter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 203,
+            "original_line": 203,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                    // in this case, reset to 0 and continue, no data will be sent but will wait for window update\r\n                    // RFC 9113 section 6.9.2 specifically calls out that the window size can go negative.  As required,\r\n                    // we continue to track the negative value but use 0 for the remainder of this write to avoid \r\n                    // out-of-range errors.\r\n```"
+            ]
+        }
+    ]
+}

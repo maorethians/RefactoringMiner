@@ -1,0 +1,66 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 38402,
+    "lang": "c_sharp",
+    "pr_title": "Use shared instances of OID where possible.",
+    "pr_body": "This uses some shared statics for OID where possible.\r\n\r\nThis omits doing OIDs that don't have a friendly name, (`LocalKeyId` as an example, and the majority of Pkcs OIDs) since it's possible for those to leak out to callers and the caller could assign any friendly name that they want, as long as it doesn't map to an OID.\r\n\r\nIt might be worth changing OID to carry a `bool` for `_hasInitializedFriendlyName` so that we can tell the difference between \"I haven't lazily initialized friendly name yet\" vs \"there is no friendly name and/or it has been explicitly initialized to null\"\r\n\r\nFixes #2043 ",
+    "pr_comments": [
+        "Tagging subscribers to this area: @bartonjs, @vcsjones, @krwq\nNotify danmosemsft if you want to be subscribed.",
+        "> It might be worth changing OID to carry a bool for _hasInitializedFriendlyName so that we can tell the difference between \"I haven't lazily initialized friendly name yet\" vs \"there is no friendly name and/or it has been explicitly initialized to null\"\r\n\r\nI think that's reasonable, if you want to go ahead and do it as part of this change.",
+        "The X.509 extensions (and, more complexly, the PKCS attributes)  could certainly benefit from this:\r\n\r\nhttps://github.com/dotnet/runtime/blob/f40c6b60252912f87d42711290c8d7f86927218e/src/libraries/System.Security.Cryptography.X509Certificates/src/System/Security/Cryptography/X509Certificates/X509SubjectKeyIdentifierExtension.cs#L47",
+        "There is a couple of ways to go about doing this.\r\n\r\nWhat we are trying to solve for is creating a \" immutable Oid even if the friendly name is null.\r\n\r\nDo we want to change the `(string? value, string? friendlyName)` constructor to say \"a null friendly name to the second arg\" counts as initializing? Right now the answer is \"no\", and friendly name will be on demand computed. So, do we want this unit test to pass?\r\n\r\n```c#\r\nOid oid = new Oid(SHA1_Oid, null);\r\nAssert.Null(oid.FriendlyName);\r\n```\r\n\r\nThe alternative would be if you want a real read-only `Oid`, leave the constructors as-is and use the `FriendlyName` setter for explicit null.\r\n\r\n```c#\r\nOid oid = new Oid(SHA1_Oid, null) { FriendlyName = null }\r\n```\r\n\r\nThis looks a little odd to me, but it seems less likely to be a breaking change.",
+        "I talked myself in to `Oid oid = new Oid(\"thevalue\", null) { FriendlyName = null }` being the right way to have a fully initialized OID with a null friendly name.",
+        "The places that are passing null as the second parameter are avoiding the potential network call on Windows (which, IIRC, no longer happens, because Windows Crypto changed their defaults to avoid the AD fallback) for resolving unknown OIDs, so those are \"delay load the FriendlyName only if someone asks for it\".\r\n\r\nSo there are a couple of states that an Oid can be in:\r\n\r\n* Created using the default ctor, someone plans on assigning the properties late, and hopefully understands that they interrelate.\r\n* Created using the single-string \"I'm either friendlyName or value, and I'll do some work to figure out which I think I am\" but apparently only sets Value (which ends up case-normalizing FriendlyName on a delayed lookup).\r\n* Created using (value, null). It means a) the string is Value, not a FriendlyName; and b) don't look up FriendlyName until you need to.  The first read of FriendlyName will lock it in.  That does leave a gap where a FriendlyName can be assigned as authoritative, particularly if the OID doesn't have a known FriendlyName (and/or a FriendlyName is assigned that doesn't map to a known different OID).\r\n* Oid.FromValue: Removes role ambiguity from the single string ctor, but throws.\r\n* Oid.FromFriendlyName: Why, people?  I mean, uh, \"does what it says on the tin.\"\r\n\r\nThe thoughts I had for what to do about this look like they're all covered by the extra bool you added, modulo the one bug I'm about to point out :smile:",
+        "@bartonjs I pushed up some changes. Still \"draft\" because more OIDs can become shared now. Just wanted to ask about the PKCS library before I dig a very deep hole. \r\n\r\nSome of the Pkcs9 objects say something to the effect of \"CAPI doesn't have an OID mapping for szOID_CAPICOM_documentDescription, so we cannot use the....\"\r\n\r\nhttps://github.com/dotnet/runtime/pull/38402/files#diff-139aee6694a1c8a00bcbe99421d95cdfR21\r\n\r\nAre these comments valid and I don't understand, or are they hold overs from when Pkcs was ported from netfx? Is there some special care that I am missing here?",
+        "I.. think it just means `Oid.FromOidValue(whateverThatOidIs)` throws because the value isn't known.  I think your \"lock this into null\" in MakeOid is good enough.",
+        "Hm, thanks. Their value seemed dubious in the first place, guess I'll remove them.",
+        "Thanks for taking care of this."
+    ],
+    "merged": true,
+    "created_at": "2020-06-26T15:43:45Z",
+    "issue_context": {
+        "number": 2043,
+        "title": "Make System.Security.Cryptography.Oid write-once (initializable read-only)",
+        "body": "The Oid class, reductio ad absurdum, is\r\n\r\n```C#\r\npublic class Oid\r\n{\r\n    public Oid() {}\r\n    public Oid(string value, string friendlyName) { Value = value; FriendlyName = friendlyName }\r\n    public string Value { get; set; }\r\n    public string FriendlyName { get; set; }\r\n}\r\n```\r\n\r\nThere's a bit of \"build FriendlyName for you\" logic and some other lookup routines, but that's essentially what it is.\r\n\r\nBecause the properties are mutable, things like ECCurves.NamedCurves.get_nistP256() return a new Oid instance on every call; lest static state get corrupted.\r\n\r\nThis proposal suggests changing the properties to allow \"assign-once\" semantics.  Building the property via an object initializer would still be permitted, but once the property gets a non-null value it cannot be changed.\r\n\r\nReductio ad absurdum implementation:\r\n\r\n```C#\r\npublic partial class Oid\r\n{\r\n    public string Value\r\n    {\r\n        get => _value;\r\n        set\r\n        {\r\n            if (_value != null && !_value.Equals(value))\r\n                throw new PlatformNotSupportedException(...);\r\n\r\n            _value = value;\r\n        }\r\n    }\r\n\r\n    public string FriendlyName\r\n    {\r\n        get => _friendlyName ??= LookupFriendlyName(_value);\r\n        set\r\n        {\r\n            if (_friendlyName != null && !_friendlyName.Equals(value))\r\n                throw new PlatformNotSupportedException(...);\r\n\r\n            _friendlyName = value;\r\n        }\r\n    }\r\n}\r\n```\r\n\r\nTelemetry shows very few callers of the setters, but not \"zero\".\r\n\r\n## Benefits:\r\n\r\n* We can stop making defensive copies of Oid values\r\n* We could make accelerators for well-known (frequently utilized) Oid values.\r\n  * Or libraries that want to can do so without the risk of static value corruption.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 7096,
+            "commit_id": "61463911aa284c941a6082427e9e346a43b385a2",
+            "original_commit_id": "a87ebc5b99db642fc402443065da940d7575874a",
+            "path": "src/libraries/System.Security.Cryptography.Pkcs/src/System/Security/Cryptography/Pkcs/CmsSigner.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 17,
+            "original_line": 17,
+            "side": "LEFT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "Let's put the s_defaultAlgorithm back, so it's easier to manage, but it can just use the new cached instance."
+            ]
+        },
+        {
+            "hunk_id": 7095,
+            "commit_id": "61463911aa284c941a6082427e9e346a43b385a2",
+            "original_commit_id": "a87ebc5b99db642fc402443065da940d7575874a",
+            "path": "src/libraries/System.Security.Cryptography.Encoding/src/System/Security/Cryptography/Oid.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 96,
+            "original_line": 95,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "One of\r\n\r\n```suggestion\r\n                    _hasInitializedFriendlyName = true;\r\n                }\r\n```\r\n\r\nor\r\n\r\n```suggestion\r\n                    _hasInitializedFriendlyName = _friendlyName != null;\r\n                }\r\n```",
+                "Doh, good catch. Added a test to cover this."
+            ]
+        }
+    ]
+}

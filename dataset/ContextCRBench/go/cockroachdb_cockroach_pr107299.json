@@ -1,0 +1,46 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 107299,
+    "lang": "go",
+    "pr_title": "sqlproxyccl: deflake TestDeleteTenant",
+    "pr_body": "There is a small race condition in the tenant directory cache.\r\n\r\n1. If ReportFailure is called, the tenant dir rebuilds the cache by listing the available pods.\r\n2. There is a watch attempting to push events to the cache. If an event was generated before the most recent list, the watch event can roll back cache state.\r\n\r\nThis race is okay in production because when the sql proxy tries to dial the stale pod, the dial will fail and the proxy will refresh the list again.\r\n\r\nThis change adjusts the test to work like production. If the list is stale, ReportFailure is retried to refresh the list of pods.\r\n\r\nFixes: #86077",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/107299)\n<!-- Reviewable:end -->\n",
+        "bors r+",
+        "Build failed (retrying...):\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=10999813&buildTypeId=Cockroach_BazelEssentialCi)",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=11000065&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2023-07-20T20:19:20Z",
+    "issue_context": {
+        "number": 86077,
+        "title": "ccl/sqlproxyccl/tenant: TestDeleteTenant failed",
+        "body": "ccl/sqlproxyccl/tenant.TestDeleteTenant [failed](https://teamcity.cockroachdb.com/buildConfiguration/Cockroach_Nightlies_StressBazel/6079885?buildTab=log) with [artifacts](https://teamcity.cockroachdb.com/buildConfiguration/Cockroach_Nightlies_StressBazel/6079885?buildTab=artifacts#/) on master @ [0dd438d3dc0b42543890455945a7a6b42811def1](https://github.com/cockroachdb/cockroach/commits/0dd438d3dc0b42543890455945a7a6b42811def1):\n\n\n```\n=== RUN   TestDeleteTenant\n    test_log_scope.go:162: test logs captured to: /artifacts/tmp/_tmp/a6458abb05e6ab358f897a749cce5d50/logTestDeleteTenant1748159223\n    directory_cache_test.go:506: starting tenant 50\n    directory_cache_test.go:511: tenant 50 started\n    directory_cache_test.go:320: \n        \tError Trace:\tdirectory_cache_test.go:320\n        \tError:      \tShould be empty, but was [tenant_id:50 addr:\"127.0.0.1:46875\" state:RUNNING stateTimestamp:<seconds:1660369353 nanos:353356988 > ]\n        \tTest:       \tTestDeleteTenant\n    panic.go:500: -- test log scope end --\n--- FAIL: TestDeleteTenant (1.66s)\n```\n<p>Parameters: <code>TAGS=bazel,gss</code>\n</p>\n<details><summary>Help</summary>\n<p>\n\nSee also: [How To Investigate a Go Test Failure \\(internal\\)](https://cockroachlabs.atlassian.net/l/c/HgfXfJgM)\n</p>\n</details>\n/cc @cockroachdb/sql-experience @cockroachdb/server\n<sub>\n\n[This test on roachdash](https://roachdash.crdb.dev/?filter=status:open%20t:.*TestDeleteTenant.*&sort=title+created&display=lastcommented+project) | [Improve this report!](https://github.com/cockroachdb/cockroach/tree/master/pkg/cmd/internal/issues)\n</sub>\n\n\nJira issue: CRDB-18557",
+        "comments": [
+            "I think this is a race condition within the tenantdir cache. It is a known interaction between the tenantdir's watch and list RPCs.\r\n\r\nThe kernel of the race is this:\r\n1. If ReportFailure is called, the tenant dir rebuilds the cache by listing the available pods.\r\n2. There is a watch attempting to push events to the cache. If an event was generated before the most recent list, the watch event can roll back cache state.\r\n\r\nHere are the relevant logs from the test failure:\r\n```\r\nI220813 05:42:33.353771 3564 ccl/sqlproxyccl/tenant/entry.go:236 \u22ee [-] 91  fetched IP addresses: [\u2039tenant_id:50 addr:\"127.0.0.1:46875\" state:RUNNING stateTimestamp:<seconds:1660369353 nanos:353693615 >\u203a]\r\nI220813 05:42:33.353830 3564 ccl/sqlproxyccl/tenant/entry.go:197 \u22ee [-] 92  resumed tenant {50}\r\nI220813 05:42:33.353864 3564 ccl/sqlproxyccl/tenant/entry.go:104 \u22ee [-] 93  refreshing tenant {50} pods\r\nI220813 05:42:33.354087 3564 ccl/sqlproxyccl/tenant/entry.go:236 \u22ee [-] 94  fetched IP addresses: [\u2039tenant_id:50 addr:\"127.0.0.1:46875\" state:RUNNING stateTimestamp:<seconds:1660369353 nanos:354011693 >\u203a]\r\nW220813 05:42:33.355188 4589 sql/sqlliveness/slinstance/slinstance.go:242 \u22ee [tenant=50,nsql1] 97  exiting heartbeat loop\r\nI220813 05:42:33.361736 3564 ccl/sqlproxyccl/tenant/entry.go:104 \u22ee [-] 102  refreshing tenant {50} pods\r\nI220813 05:42:33.362528 4632 ccl/sqlproxyccl/tenant/directory_cache.go:456 \u22ee [-] 103  added IP address \u2039127.0.0.1:46875\u203a with load 0.000 for tenant 50\r\nI220813 05:42:33.362580 4632 ccl/sqlproxyccl/tenant/directory_cache.go:463 \u22ee [-] 104  deleted IP address \u2039127.0.0.1:46875\u203a for tenant 50\r\n```\r\n\r\nNote the log line \"fetched IP\" indicates the pod was inserted by a list. The log line \"added IP\" indicates the pod was inserted by the watch.\r\n\r\nThis is what occurred in this test run:\r\n1. The sql server is started. The creation watch event is delayed.\r\n2. The test calls dir.ReportFailure, this refreshes the cache and the cache includes the test server.\r\n3. The test shuts down the sql server.\r\n4. The test calls dir.ReportFailure, this refreshes the cache. Since the sql server is shut down, the List returns no pods and the cache is cleared.\r\n5. The watch event for the server creation is finally delivered. This inserts the sql server into the cache.\r\n6. The test asserts the cache is empty, but in reality the cache the stale pod entry.\r\n\r\nWe could fix the test by waiting for the initial event instead of calling ReportFailure to refresh the cache. The better fix would be to rework the tenantdir cache entirely. IMO The ListPods calls are of dubious value. I think we would be better off removing the list calls and relying entirely on watches.\r\n\r\ncc: @jaylim-crl ",
+            "The race is described in a TODO\r\nhttps://github.com/cockroachdb/cockroach/blob/5d7e232ddf11d505f45815df7ada7d08e6ce26e1/pkg/ccl/sqlproxyccl/tenant/entry.go#L219-L223"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15434,
+            "commit_id": "43cc87f80d375910d8b0b6cbf0396857b6e08377",
+            "original_commit_id": "b76924e55aac24da1d3f9297fe73cf4e72b513f3",
+            "path": "pkg/ccl/sqlproxyccl/tenant/directory_cache_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 499,
+            "original_line": 499,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "I also recalled that if we wanted to fully mimic production, we should update WatchPods to stream a list of pods that the server knows about when it first gets called.",
+                "That is a case we should test, but it's a bit orthogonal to the test directory server in general. The test directory server always starts empty, so there are no watch events to propagate.",
+                "> The test directory server always starts empty\r\n\r\nThere are some tests that simulate a crash of the tenant directory server, or the Watch API closing early."
+            ]
+        }
+    ]
+}

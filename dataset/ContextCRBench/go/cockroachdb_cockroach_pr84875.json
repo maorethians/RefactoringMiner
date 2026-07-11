@@ -1,0 +1,97 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 84875,
+    "lang": "go",
+    "pr_title": "backupccl: handle range keys in BACKUP",
+    "pr_body": "Previously BACKUP would not back up range tombstones. With this patch, BACKUPs\r\nwith revision_history will backup range tombstones. Non-revision history backups\r\nare not affected by this diff because MVCCExportToSST filters all tombstones\r\nout of the backup already.\r\n\r\nSpecifically, this patch replaces the iterators used in the backup_processor\r\nwith the pebbleIterator, which has baked in range key support. This refactor\r\nintroduces a 5% regression in backup runtime, even when the backup has no range\r\nkeys, though https://github.com/cockroachdb/cockroach/issues/83051 hopes to address this gap. See details below on the\r\nbenchmark experiment.\r\n\r\nAt this point a backup with range keys is restorable, thanks to https://github.com/cockroachdb/cockroach/pull/84214. Note\r\nthat the restore codebase still touches iterators that are not range key aware.\r\nThis is not a problem because restored data does not have range keys, nor do\r\nthe empty ranges restore dumps data into. These iterators (e.g. in SSTBatcher\r\nand in CheckSSTConflicts) will be updated when https://github.com/cockroachdb/cockroach/issues/70428 gets fixed.\r\n\r\nFixes https://github.com/cockroachdb/cockroach/issues/71155\r\n\r\nRelease note: none\r\n\r\nTo benchmark this diff, the following commands were used on the following sha\r\nhttps://github.com/cockroachdb/cockroach/commit/a5ccdc3a49a73ce8791a133297e70871223f3d7e, with and without this commit, over\r\nthree trials:\r\n```\r\nroachprod create -n 5 --gce-machine-type=n2-standard-16 $CLUSTER\r\nroachprod put $CLUSTER [build] cockroach\r\n\r\nroachprod wipe $CLUSTER; roachprod start $CLUSTER;\r\nroachprod run $CLUSTER:1 -- \"./cockroach workload init bank --rows 1000000000\"\r\nroachprod sql $CLUSTER:1 -- -e \"BACKUP INTO 'gs://somebucket/michael-rangkey?AUTH=implicit'\"\r\n```\r\n\r\nThe backup on the control binary took on average 478 seconds with a stdev of 13\r\nseconds, while the backup with the treatment binary took on average 499 seconds\r\nwith stddev of 8 seconds.",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/84875)\n<!-- Reviewable:end -->\n",
+        "2 questions:\r\n- should we merge before benchmarking?\r\n- should this diff hide behind some version gate? Is there any chance of a mixed version backup finding any range tombstones?",
+        "hmmm I need to think a bit harder about potentially changing  `kvclient.GetAllRevisions`. If some other system is going to be issuing range tombstones on the descriptor table, then `kvclient.GetAllRevisions` needs to be changed. ",
+        ">should this diff hide behind some version gate? Is there any chance of a mixed version backup finding any range tombstones?\r\n\r\nWe have an `MVCCRangeTombstones` version gate, which should prevent callers from writing MVCC range tombstones until the cluster is upgraded, so I don't think we need any additional version gates.\r\n\r\nAs with all version gates, though, it's left to client discipline to check the gate, but we have some additional protection in that the Pebble database also needs to be upgraded to support range keys (in the `EnablePebbleFormatVersionRangeKeys` migration), so any premature range key writes are likely to fail anyway.\r\n\r\nAlso, on the restore path I suppose we might want to check this, to prevent anyone from taking a backup in a 22.2 cluster and then restoring into an unfinalized mixed-version cluster. We should have a test for this, to make sure we don't just silently ignore the range keys in this case, or something.\r\n\r\nWhat about restoring into a previous version, do we even support that? I hope not. :/",
+        "The restore will immediately fail if the restoring cluster is at lower mixed / finalized version of the backup! (https://github.com/cockroachdb/cockroach/pull/61737). So, given that range keys will not be written until the cluster has finalized to 22.1, I don't think further version gates are necessary in BACKUP/RESTORE.",
+        "Just updated the commit message with details on the benchmarking I did for this commit. For a backup without range keys, this diff results in a 5% regression in backup runtime performance. Unless anyone objects, I'll merge this and will rerun the benchmarks once the pebbleIterator speeds up in the next few weeks.",
+        "TFTRS!\r\n\r\nbors r=erikgrinaker",
+        "Build failed (retrying...):\n  * [GitHub CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=5875600&buildTypeId=Cockroach_UnitTests)",
+        "Build succeeded:\n  * [GitHub CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=5881004&buildTypeId=Cockroach_UnitTests)"
+    ],
+    "merged": true,
+    "created_at": "2022-07-25T13:03:30Z",
+    "issue_context": {
+        "number": 71155,
+        "title": "backup: MVCC Bulk Operations Are Missing from Backups",
+        "body": "In #70412, we will implement MVCC range deletion tombstones. Backup and restore must be extended to handle these correctly, including testing Revision ALL exports.\r\n\r\n\n\nEpic CRDB-11252\n\nJira issue: CRDB-10419",
+        "comments": [
+            "Depends on #71398. May be a noop if `Export` ends up synthesizing point deletes instead of emitting range deletes."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14711,
+            "commit_id": "d5de88df5713981a485b6fef44ac9bf569218ad3",
+            "original_commit_id": "d7b901d7d28ceb4900dd60c5c73b2180089a3e3a",
+            "path": "pkg/kv/kvclient/revision_reader.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 48,
+            "original_line": 48,
+            "side": "RIGHT",
+            "original_position": 3,
+            "position": 1,
+            "subject_type": "line",
+            "review_comments": [
+                "@erikgrinaker any thoughts on the question below?\r\n> // TODO (msbutler): would it be faster to use a PebbleMultiMemSSTIterator to scan these non\r\n\t// interleaved files all at once?",
+                "Not likely. It would have to do additional key comparisons to figure out which file to read from next, and I suspect all of the cloning in this loop is going to dominate the cost anyway. But only benchmarks and profiles will say for sure.",
+                "+1",
+                "Sweet. I'll leave as is for now."
+            ]
+        },
+        {
+            "hunk_id": 14710,
+            "commit_id": "d5de88df5713981a485b6fef44ac9bf569218ad3",
+            "original_commit_id": "d7b901d7d28ceb4900dd60c5c73b2180089a3e3a",
+            "path": "pkg/ccl/backupccl/file_sst_sink.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 368,
+            "original_line": 368,
+            "side": "RIGHT",
+            "original_position": 95,
+            "position": 98,
+            "subject_type": "line",
+            "review_comments": [
+                "@erikgrinaker would it be straightforward to create a `PutRawMVCCRangeKey` method? could speed things up.",
+                "Yeah, should be straightforward. I'll submit a PR when I get a chance.",
+                "Thanks!"
+            ]
+        },
+        {
+            "hunk_id": 14712,
+            "commit_id": "d5de88df5713981a485b6fef44ac9bf569218ad3",
+            "original_commit_id": "d7b901d7d28ceb4900dd60c5c73b2180089a3e3a",
+            "path": "pkg/ccl/backupccl/file_sst_sink.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 276,
+            "original_line": 276,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "It makes me a little sad we have to open up an iterator on this twice, and read the footer, the index, etc again just to change the iter opts.\r\n\r\nI wonder if it'd make sense to include \"OnlyPointKeys\" in the ExportResponse or something the client could use as an optimization?\r\n\r\n",
+                "We have the infrastructure in place to reconfigure an iterator, just need to expose the API for it. Want me to submit a PR?",
+                "wait is the idea to add `KeyTypes:   storage.IterNonInterleavedPointAndRangeKeys,` i.e. a single iterator will surface all point keys and then all range keys in the given span? That seems great to me.\r\n\r\nI'm not sure if ExportRequest needs to change, but I'll leave that decision to Erik.",
+                "Although I'm unsure how big a perf improvement we would get. I'm going to benchmark the current PR, as is, to understand how big of a regression there is by introducing these two iterators here. ",
+                "Nah, I think David's idea is for the `ExportResponse` to contain information about whether the SST contains point and/or range keys, and my suggestion is to export `MVCCIterator.SetOptions()` so you can do `iter.SetOptions(IterOptions{KeyTypes: IterKeyTypeRangesOnly}))`.",
+                "aha, makes sense! That seems like a worthwhile quick win -- especially for backups without revision history, which will never export range keys.",
+                "Yeah, exactly, if we somehow know we didn't export a range key, we could just skip re-opening/reconfiguring the iterator entirely.",
+                "It's possible that we're already tracking that metadata in the SST itself though. Can we get that from the SST reader @jbowens?",
+                "Whether or not the table has a range key? Yeah, there's a sstable property recording the count. We can test `reader.Properties.NumRangeKeys() > 0`"
+            ]
+        }
+    ]
+}

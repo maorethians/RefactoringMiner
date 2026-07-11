@@ -1,0 +1,368 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 78982,
+    "lang": "c",
+    "pr_title": "Bluetooth: scan: Implement non-blocking ext-adv report reassembly",
+    "pr_body": "Re-assemble the extended advertising reports into a dedicated buffer\r\npool and notify the application asynchronously.\r\n\r\nTo achieve this we:\r\n- decompose the re-assembly function into fragmented and non-frag parts\r\n- for reassembled reports: push any other info onto the reassembled buffer\r\n- for non-frag reports: pass the raw event buffer directly\r\n- put that buffer on a FIFO\r\n- trigger a (sys)work item that pulls and calls the cb\r\n\r\nThe optimization for 80% of cases is kept: Processing non-fragmented\r\nextended advertising reports will not double-copy: We add a buffer pool\r\nsimilar to `sync_evt_pool` and apply the following algo:\r\n- if report is non-frag & we have at least 1 buf available in pool\r\n  -> ref() that buffer and put it on the FIFO directly\r\n- else:\r\n  -> allocate from re-assembly pool and copy into it\r\n\r\nNote that we can only apply this optimization when we are processing the\r\nlast report in the event buffer.\r\n\r\nNote to reviewers: The diff of this commit is garbage, you're probably\r\nbetter of comparing with the previous implementation manually.\r\n\r\nSigned-off-by: Jonathan Rico <jonathan.rico@nordicsemi.no>\r\nCo-authored-by: Aleksander Wasaznik <aleksander.wasaznik@nordicsemi.no>\r\n\r\nFixes https://github.com/zephyrproject-rtos/zephyr/issues/50786\r\n",
+    "pr_comments": [
+        "There may be some funnies left in there. Do report and we will fix.",
+        "@jhedberg @Thalley \r\nThere is another issue, due to a missing half-bit in the spec:\r\n\r\nGiven that sequence:\r\n```\r\n[ Ai | Ai | Bi | Bc | Ac ]\r\n```\r\nWhere `i` is incomplete-more-data and c is `complete`. `A` and `B` are two different peers.\r\n\r\nWhat callbacks and data should we expect as a user? The current behavior (as tested by [`host_long_adv_recv`](https://github.com/jori-nordic/zephyr/blob/76d9699330a073ec11f66d7dc4bab43b3e01cb7f/tests/bluetooth/host_long_adv_recv/src/main.c#L487-L488)) is that we will receive the full data for `B`. BUT we also receive `A`, with the beginning truncated.\r\n\r\nDo we ask for a new spec? <sup><sub>with a new status `START` using up the last half-bit</sub></sup>",
+        "> @jhedberg @Thalley There is another issue, due to a missing half-bit in the spec:\r\n> \r\n> Given that sequence:\r\n> \r\n> ```\r\n> [ Ai | Ai | Bi | Bc | Ac ]\r\n> ```\r\n> \r\n> Where `i` is incomplete-more-data and c is `complete`. `A` and `B` are two different peers.\r\n> \r\n> What callbacks and data should we expect as a user? The current behavior (as tested by [`host_long_adv_recv`](https://github.com/jori-nordic/zephyr/blob/76d9699330a073ec11f66d7dc4bab43b3e01cb7f/tests/bluetooth/host_long_adv_recv/src/main.c#L487-L488)) is that we will receive the full data for `B`. BUT we also receive `A`, with the beginning truncated.\r\n> \r\n> Do we ask for a new spec? with a new status `START` using up the last half-bit\r\n\r\nThrowback: https://github.com/zephyrproject-rtos/zephyr/pull/39352#issuecomment-942103833\r\n\r\nYes, the spec is broken. There is no way to know if you lost the beginning of the adv report. We have to rely on the controller not interleaving fragmented reports. We tried raising an errata last time and it didnt go anywhere.",
+        "https://bluetooth.atlassian.net/jira/software/c/projects/ES/issues/ES-17839\r\n\r\nThe suggested solution is to keep a list of advertiser address and data status. Completely ignoring that this data needs to be stored for an unbounded number of advertisers, and that one advertiser may have multiple sets and anonymous advertising exists.",
+        "> https://bluetooth.atlassian.net/jira/software/c/projects/ES/issues/ES-17839\r\n> \r\n> The suggested solution is to keep a list of advertiser address and data status. Completely ignoring that this data needs to be stored for an unbounded number of advertisers, and that one advertiser may have multiple sets and anonymous advertising exists.\r\n\r\nIndeed, broken spec. Nothing much we can do about that. \r\n\r\nWe can only do best effort and keep incomplete advertiser data for a specific amount of time before discarding it",
+        "@alwa-nordic do you intend to pick up the work here, or is @jori-nordic / @narvalotech still going to work on it?",
+        "I will pick up the work.",
+        "This pull request has been marked as stale because it has been open (more than) 60 days with no activity. Remove the stale label or add a comment saying that you would like to have the label removed otherwise this pull request will automatically be closed in 14 days. Note, that you can always re-open a closed pull request at any time."
+    ],
+    "merged": false,
+    "created_at": "2024-09-27T12:32:27Z",
+    "issue_context": {
+        "number": 50786,
+        "title": "Bluetooth: Host: Extended advertising reports may block the host",
+        "body": "**Is your enhancement proposal related to a problem? Please describe.**\r\nIn the case that we are doing scanning in a very busy environment (e.g. hundreds of extended advertising reports per second), then the host will receive so many events that it may effectively block the host from working, if it receives more reports than it can handle. Many reports may cause the events to be queued, and thus calling an HCI command (e.g. `bt_le_scan_stop()`) will timeout waiting for the return event. \r\n\r\nThis is only an issue for extended advertising reports (BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT) as legacy reports (BT_HCI_EVT_LE_ADVERTISING_REPORT) are usually marked as discardable, e.g. by\r\n```c\r\n\t\tif (rx.evt.evt == BT_HCI_EVT_LE_META_EVENT &&\r\n\t\t    (rx.hdr[sizeof(*hdr)] == BT_HCI_EVT_LE_ADVERTISING_REPORT)) {\r\n\t\t\tBT_DBG(\"Marking adv report as discardable\");\r\n\t\t\trx.discardable = true;\r\n\t\t}\r\n```\r\n\r\nDue to the reassembly requirements of extended advertising, we cannot just discard all extended reports (we could potentially discard reports with the status `BT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS_COMPLETE`).  We could only discard the ones marked as legacy or complete. This is because if we did, the reassembler would run out of sync.\r\n\r\nThis is basically a performance issue, and thus not marked as a bug. \r\n\r\n**Describe the solution you'd like**\r\nIdeally we'd find some way of discard extended advertising reports, so that we can just discard them and keep the number of events queued small, thus eliminating the issue with HCI command events. \r\n\r\n**Describe alternatives you've considered**\r\nA small work around is discard all advertising reports once `bt_le_scan_set_enable(BT_HCI_LE_SCAN_DISABLE);` has been called. It is safe to assume that the upper layers do not care about any queued reports once this has been called, and that may help to clear the queued reports. \r\n\r\n**Additional context**\r\nThis was found doing UPF and was happening often as extended advertising was used extensively. The issue appeared using the nRF5340. \r\n",
+        "comments": [
+            "@rugeGerritsen This is the host issued I mentioned at the UPF when receiving many scan reports. ",
+            "@Thalley, thanks for creating this issue. Unfortunately, I think there is no way we can know what extended advertising reports we can discard, and that is also true for reports with data status set to `BT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS_COMPLETE`. The problem is that we don't know if such a report is both first and last or only last.\n\nExample: We receive advertising reports from one advertiser. It generates three sets of reports, A, B, and C. Each of the sets contain three partial reports (A1, A2, A3, B1, ...). \n\nLet's now say that we receive them all in order. In that case A3, B3 and C3 will have its data status set to `BT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS_COMPLETE`.\n\nDiscarding A3 will result in invalid reassembly as it will concatenate A and B.\n\nI believe that this is an issue in the spec. It restricts the architecture of the system to have a host that polls for events rather than a controller pushing events. This is especially an issue for systems where the controller and host are not running on the same core or device.\n\n\n\n\n",
+            "If we discard any An we must discard all previously reassembled reports from A (A1, ... , A(n-1)) and keep discarding until we get a report from A with `data_status==complete`. However, to do this we sort of have to do the reassembly anyway. The current implementation should not reassemble reports from different advertisers, but we will run into [this warning](https://github.com/zephyrproject-rtos/zephyr/blob/1c953834d671a0cd28fc46be24e6814993ec4159/subsys/bluetooth/host/scan.c#L625), and future reports will be incomplete.",
+            "> This is basically a performance issue, and thus not marked as a bug.\r\n\r\nI think we can upgrade this to a bug because it sounds quite serious. The trigger is external (other devices advertising a lot) and it results in a unresponsive device.",
+            "> > This is basically a performance issue, and thus not marked as a bug.\r\n> \r\n> I think we can upgrade this to a bug because it sounds quite serious. The trigger is external (other devices advertising a lot) and it results in a unresponsive device.\r\n\r\nThat is a good point. Basically it allows other devices to DoS the Zephyr host. ",
+            "@Thalley I had a quick pass through the code and don't really understand how the queued events would block the host.\r\n\r\n`bt_recv` has a check for `BT_HCI_EVT_FLAG_RECV_PRIO` and for command complete/status, that flag will be set, and thus the event will be processed in-place rather than placed in the queue (with `rx_queue_put(buf)`).\r\n\r\nOr is that an issue of the (app core) CPU just being overloaded?\r\n\r\nWhat I think is that the behavior you saw was caused by the RPMsg driver effectively halting the IPC (for 10 full seconds) when it didn't get a buffer for the (non-discardable) ext adv report.\r\nSee [this particular line](https://github.com/zephyrproject-rtos/zephyr/blob/0ba7505bc81c7fed0be7d9bbf129894060f54bc2/drivers/bluetooth/hci/rpmsg.c#L93). That means that the command complete/status was being blocked _in the controller_ rather than the host.",
+            "I will try to implement a simple mitigation: only accept partial ext adv reports if they're from the advertiser being re-assembled. Any other partial ext adv reports will get discarded immediately (i.e. not put on the `discarded` pool). \r\n\r\nIt's not perfect, but I think rubin is right, this is a spec failure, so that's pretty much the only thing we can do in the host without adding yet another buffer pool.",
+            "> I will try to implement a simple mitigation: only accept partial ext adv reports if they're from the advertiser being re-assembled. Any other partial ext adv reports will get discarded immediately (i.e. not put on the discarded pool).\r\n\r\nThis can lead to the start of adv reports missing, making the adv data fields unparsable.",
+            "> > I will try to implement a simple mitigation: only accept partial ext adv reports if they're from the advertiser being re-assembled. Any other partial ext adv reports will get discarded immediately (i.e. not put on the discarded pool).\r\n> \r\n> This can lead to the start of adv reports missing, making the adv data fields unparsable.\r\n\r\nHow so, in my mind if you only ever have one that re-assembled, then it should be fine? The other partial adv reports will get discarded.",
+            "> > > I will try to implement a simple mitigation: only accept partial ext adv reports if they're from the advertiser being re-assembled. Any other partial ext adv reports will get discarded immediately (i.e. not put on the discarded pool).\r\n> > \r\n> > \r\n> > This can lead to the start of adv reports missing, making the adv data fields unparsable.\r\n> \r\n> How so, in my mind if you only ever have one that re-assembled, then it should be fine? The other partial adv reports will get discarded.\r\n\r\nDo we still discard if we are not currently reassembling anything? That was the case I was thinking of. Interleaving of incomplete adv reports is already not supported (and not needed for sdc, not sure about zll).",
+            "We won't discard if we are not reassembling anything no.\r\nI will also try first w/ the discrimination done on the first report of the event. \r\n\r\nLater, I'll iterate on the reports in the event, discarding the ones I don't care about, effectively re-writing it. This will necessitate a scratch buffer to do so.\r\n\r\nedit: yeah most of this is based on the fact that we already don't support interleaved reports.",
+            "> What I think is that the behavior you saw was caused by the RPMsg driver effectively halting the IPC (for 10 full seconds) when it didn't get a buffer for the (non-discardable) ext adv report. See [this particular line](https://github.com/zephyrproject-rtos/zephyr/blob/0ba7505bc81c7fed0be7d9bbf129894060f54bc2/drivers/bluetooth/hci/rpmsg.c#L93). That means that the command complete/status was being blocked _in the controller_ rather than the host.\r\n\r\nI've considered the RPMsg part to be the culprit here as well. I am unsure whether this issue would/could appear on e.g. the nRF52840, as I've only tested it with the nRF5340 which has this RPMsg layer between the controller and the host. \r\n\r\nIf the issue is indeed from the controller side (which in my particular case, is not Zephyr), then we may be powerless to fix this issue. ",
+            "@Thalley so it's not really controller, but rather the message is stuck on the network core because we are stalling the IPC RX endpoint (in the app core). The stall happens because we are doing a blocking wait for event buffers, in a loop.\r\n\r\nSo I think we can definitely work around it (in the app core/host hci driver), which am trying right now. The w/a might be quite involved though, see the discussion I had this morning with herman above.",
+            "@Thalley so I have a workaround prototype but I'm a bit unable to reproduce the original issue of the \"host\" locking up.\r\n\r\nWould you have a specific configuration or sample where you originally saw that? If you're using a custom network core image, that would also be helpful.\r\n\r\nFor reference, I'm using 5 52840 DKs each programmed with the `multiple_broadcaster` sample, with 500B adv data and 10 SIDs, so I'd think that it'd be enough noise to trigger the behavior, but it doesn't, I'm still able to stop advertising in the nRF5340's shell. edit: without the workaround, I mean I can stop the scanner without needing the w/a.",
+            "> @Thalley so I have a workaround prototype but I'm a bit unable to reproduce the original issue of the \"host\" locking up.\r\n> \r\n> Would you have a specific configuration or sample where you originally saw that? If you're using a custom network core image, that would also be helpful.\r\n\r\nI am actually at a UPF right now, where we have even more noise (more advertisers) than last time where this issue was seen, but I have not seen this issue a single time the entire week. \r\n\r\nI am not quite sure what changed, but I cannot reproduce anymore either. ",
+            "Then I'll just note down the WIP branch with the in-progress workaround (https://github.com/jori-nordic/zephyr/commits/ext-adv-debug) and close this issue as unreproducible.",
+            "Seen again at the UPF by @Thalley on the nRF53 platform (uses the IPC driver).",
+            "This issue has been marked as stale because it has been open (more than) 60 days with no activity. Remove the stale label or add a comment saying that you would like to have the label removed otherwise this issue will automatically be closed in 14 days. Note, that you can always re-open a closed issue at any time.",
+            "@jori-nordic @alwa-nordic @jhedberg I guess this will be fixed with the upcoming changes? ",
+            "> I guess this will be fixed with the upcoming changes?\r\n\r\nI have rough sketch for a fix. The roadmap is:\r\n\r\n - Handle BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT in prio\r\n   - Create a pool of `ext_scan_buf`.\r\n   - Update `bt_hci_le_adv_ext_report` to:\r\n     - Always copy data into `ext_scan_buf`, even if report is complete.\r\n     - Ignore new reports if pool is full.\r\n     - Put completed reports on fifo and wait on that fifo in the bt recv thread.\r\n     - net_buf_unref the hci buffer.\r\n     - Invoke the callbacks from the bt recv thread.\r\n   - Run BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT in prio\r\n - Update driver to allocate BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT from `sync_evt_pool` K_WAIT_FOREVER.\r\n\r\nDoes this look like it would solve the problem?\r\n\r\nOnce this is completed, `bt_hci_le_adv_ext_report` can be extended to keep statistics of dropped packets. And we could add an new type of isr-safe adv report callback that can be given complete reports even if the reassembly pool is full.",
+            "> Does this look like it would solve the problem?\r\n\r\nAssuming that \r\n> Ignore new reports if pool is full.\r\n\r\nDoes not discard partially received reports, then yes :) i.e. we have if received the first part of a report, we cannot discard any future ones for that one.  ",
+            "Related to https://github.com/zephyrproject-rtos/zephyr/pull/75011",
+            "Bluetooth WG:\r\n\r\n- @alwa-nordic suggest treating all advertising report synchronously (i.e. as priority events) to avoid ever having to drop packets in the driver\r\n- Conversation veers towards a potential redesign of the HCI layer to avoid allocations in the driver\r\n- A stopgap solution would be to take the code in #75011 and put it in a library in subsys/bluetooth/host, so that at leas the code is common for all drivers: this seems to be the favored approach",
+            "To reproduce:\r\nCheck out https://github.com/zephyrproject-rtos/zephyr/pull/78550\r\n\r\n```bash\r\ncd zephyr/tests/bsim/bluetooth/host/scan/slow\r\n./compile.sh && ./test_scripts/run.sh\r\n```",
+            "This issue has been marked as stale because it has been open (more than) 60 days with no activity. Remove the stale label or add a comment saying that you would like to have the label removed otherwise this issue will automatically be closed in 14 days. Note, that you can always re-open a closed issue at any time.",
+            "This issue has been marked as stale because it has been open (more than) 60 days with no activity. Remove the stale label or add a comment saying that you would like to have the label removed otherwise this issue will automatically be closed in 14 days. Note, that you can always re-open a closed issue at any time.",
+            "This issue has been marked as stale because it has been open (more than) 60 days with no activity. Remove the stale label or add a comment saying that you would like to have the label removed otherwise this issue will automatically be closed in 14 days. Note, that you can always re-open a closed issue at any time."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 26460,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/buf.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 106,
+            "original_line": 106,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "Is `2` intentionally hardcoded here? Is it limited to `2` for some reason? "
+            ]
+        },
+        {
+            "hunk_id": 26453,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/hci_core.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2938,
+            "original_line": 2938,
+            "side": "RIGHT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "I've never seen the `static` keyword used in an array size designator like that. What kind of sorcery is this?",
+                "And more importantly, which C standard is this from, since there's a risk that it may introduce some compatibility issues (see https://docs.zephyrproject.org/latest/develop/languages/c/index.html#language-standards)",
+                "@alwa-nordic is the C language lawyer lol.\r\n\r\nanother nugget was we had `while (num_reports --> 0)`. Which is also valid \ud83d\ude43",
+                "Looks like it's from C11, so we should be fine there: https://stackoverflow.com/questions/3430315/what-is-the-purpose-of-static-keyword-in-array-parameter-of-function-like-char",
+                "https://hamberg.no/erlend/posts/2013-02-18-static-array-indices.html :) ",
+                "> @alwa-nordic is the C language lawyer lol.\r\n> \r\n> another nugget was we had `while (num_reports --> 0)`. Which is also valid \ud83d\ude43\r\n\r\nperfectly valid code: `value += (value = value == value --> value <-- value), value++;` I see myself out now",
+                "From https://stackoverflow.com/questions/3430315/what-is-the-purpose-of-static-keyword-in-array-parameter-of-function-like-char :\r\n\r\n> The first declaration tells the compiler that someArray is at least 100 elements long. This can be used for optimizations. For example, it also means that someArray is never NULL.\r\n\r\nDoes that mean that if the function is called with `[2]` or `NULL` that it gives a compiler error/warning? "
+            ]
+        },
+        {
+            "hunk_id": 26454,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "include/zephyr/bluetooth/buf.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 164,
+            "original_line": 164,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "I suppose we'd want to deprecate `bt_buf_get_evt()` as well? That said, you'd need to update all upstream HCI drivers first, I suppose.",
+                "yes. I made this to allow a soft-migration. Now that I think of it, I should update `bt_buf_can_steal_ext_adv_report_buf` to take `buf` and double-check the pool too. Because it won't work if the driver uses a different pool.",
+                "fixed. Found (and fixed) a bug in the process, yay.",
+                "> yes. I made this to allow a soft-migration.\r\n\r\nI assume that it's planned that @alwa-nordic will take over and finalize this? \r\n\r\nIf not, we should create a GH issue for it",
+                "@alwa-nordic will take over, that is the plan."
+            ]
+        },
+        {
+            "hunk_id": 26468,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/scan.c",
+            "start_line": 1024,
+            "original_start_line": 1024,
+            "start_side": "RIGHT",
+            "line": 1025,
+            "original_line": 1025,
+            "side": "RIGHT",
+            "original_position": 445,
+            "position": 445,
+            "subject_type": "line",
+            "review_comments": [
+                "> Host wants to be like controller when grow up.\r\n\r\nCan you elaborate on what that means? ",
+                "Hey, I'll comment with my personal account :)\r\n\r\n@alwa-nordic should rephrase it. Basically, it means that the host should not have a surprising behavior: if the spec has a guideline for the controller, the host should also (unless otherwise stated) try to follow it.\r\n\r\nHere the guideline for the LL is that it should use the RSSI from the latest AUX packet received for enqueuing the HCI ext-adv-report event. In the host we translate that to \"use the RSSI value from the last ext-adv-report fragment in the chain when you notify the application\".\r\nI hope that makes sense. ",
+                "Ah, that makes sense. "
+            ]
+        },
+        {
+            "hunk_id": 26458,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/controller/hci/hci_driver.c",
+            "start_line": 436,
+            "original_start_line": 436,
+            "start_side": "RIGHT",
+            "line": 454,
+            "original_line": 454,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif IS_ENABLED((CONFIG_BT_OBSERVER) && IS_ENABLED(CONFIG_BT_EXT_ADV)) {\r\n\t\tswitch (node_rx->hdr.type) {\r\n\t\tcase NODE_RX_TYPE_EXT_1M_REPORT:\r\n\t\tcase NODE_RX_TYPE_EXT_2M_REPORT:\r\n\t\tcase NODE_RX_TYPE_EXT_CODED_REPORT:\r\n\t\t\t*evt = BT_HCI_EVT_LE_META_EVENT;\r\n\t\t\t*meta = BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT;\r\n\t\t\treturn true;\r\n\t\tcase NODE_RX_TYPE_EXT_SCAN_TERMINATE:\r\n\t\t\t*evt = BT_HCI_EVT_LE_META_EVENT;\r\n\t\t\t*meta = BT_HCI_EVT_LE_SCAN_TIMEOUT;\r\n\t\t\treturn true;\r\n\t\tdefault:\r\n\t\t\treturn false;\r\n\t\t}\r\n\telse {\r\n\t\treturn false;\r\n\t}\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 26456,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "drivers/bluetooth/hci/h4.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 210,
+            "original_line": 210,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Do we have any define for the offset instead of the magic number `3`?"
+            ]
+        },
+        {
+            "hunk_id": 26461,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/buf.c",
+            "start_line": 146,
+            "original_start_line": 146,
+            "start_side": "RIGHT",
+            "line": 155,
+            "original_line": 155,
+            "side": "RIGHT",
+            "original_position": 74,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\t\t} else {\r\n\t\t\tbool is_meta = evt == BT_HCI_EVT_LE_META_EVENT;\r\n\t\t\r\n\t\t\tif (is_meta) {\r\n\t\t\t\t/* For now we use the sync pool only for ext adv\r\n\t\t\t\t * reports. They cannot be marked as discardable thanks\r\n\t\t\t\t * to the geniuses in SIG that decided to save space and\r\n\t\t\t\t * only use two bits for reassembly status.\r\n\t\t\t\t */\r\n\t\t\t\tbreak;\r\n\t\t\t}\r\n```\r\n\r\nMinor optimization; we don't need the `is_meta` variable if `is_ext_adv == true`"
+            ]
+        },
+        {
+            "hunk_id": 26463,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/hci_core.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2955,
+            "original_line": 2955,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "Ditto: Do we have some defined offsets we can use instead of magic indexes? ",
+                "@alwa-nordic can do the needful. The drivers do this all the time however."
+            ]
+        },
+        {
+            "hunk_id": 26465,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/scan.c",
+            "start_line": 1021,
+            "original_start_line": 1019,
+            "start_side": "RIGHT",
+            "line": 1023,
+            "original_line": 1023,
+            "side": "RIGHT",
+            "original_position": 441,
+            "position": 443,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\r\n\t\tif (complete) {\r\n```",
+                "I think we do need the `!discarding`. Else we will enqueue `r->report` which is `NULL` when we are discarding. We can of course rework the logic to have this condition if we really want to.",
+                "My point here was that we already have a `!discarding` clause and the `complete` check could be moved into the existing `!discarding` check so we don't have to check that twice",
+                "I was reading your comment from vscode and it butchered the suggestion, sorry about that.\r\nI tend to favor less indentation if possible but won't maintain this code. So it's up to @alwa-nordic and @jhedberg to decide.",
+                "@jori-nordic @Thalley I'm also in general in favor of less indentation, either through playing around with conditions and function return locations (or goto labels), or by refactoring parts of the code to helper functions.",
+                "If we can assume that the compiler can optimize it so that\r\n\r\n```c\r\nif (foo) {\r\n   bar();\r\n}\r\n\r\nif (foo && zoo) {\r\n   zar();\r\n}\r\n```\r\n\r\nGenerates the same binary as \r\n\r\n```c\r\nif (foo) {\r\n    bar();\r\n    \r\n    if (zoo) {\r\n        zar();\r\n    }\r\n}\r\n```\r\n\r\nThen I'm absolutely fine with it :) If `foo` needs to be evaluated twice for the sake of readability, then we are effectively saying that performance is less important than readability, which can be a slippery slope in some cases :) "
+            ]
+        },
+        {
+            "hunk_id": 26455,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/buf.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 121,
+            "original_line": 121,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "This almost begs for a proper net_buf_pool API to test for \"is it empty?\". That said, it's inherently racy in premptible contexts, so we might not want to give people such a foot gun.",
+                "yep. Ideally `net_buf` would init all buffers on boot and place them in the `free` LIFO.",
+                "Sure, though that's a bit of a separate issue. Even with everything in the LIFO it's still racy to first check and then try to allocate (or make any other decisions based on the pool status)"
+            ]
+        },
+        {
+            "hunk_id": 26459,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/buf.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 124,
+            "original_line": 124,
+            "side": "RIGHT",
+            "original_position": 43,
+            "position": 43,
+            "subject_type": "line",
+            "review_comments": [
+                "All uses of `bt_buf_get_evt_but_better` is called with `K_FOREVER`; do we need the timeout argument?",
+                "Not all users. Eg. `ipc.c` uses `SECONDS(60)`.\r\nSome other `drivers/bluetooth/hci` do this too. Btw, we should probably update them too in a future PR."
+            ]
+        },
+        {
+            "hunk_id": 26457,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "drivers/bluetooth/hci/ipc.c",
+            "start_line": 54,
+            "original_start_line": 54,
+            "start_side": "RIGHT",
+            "line": 56,
+            "original_line": 56,
+            "side": "RIGHT",
+            "original_position": 75,
+            "position": 75,
+            "subject_type": "line",
+            "review_comments": [
+                "What caused the increase from 10 to 60 seconds? \r\n\r\nDoes it improve anything, or will it just leave users guessing why stuff stopped working for longer? ",
+                "In that case, it's very likely a deadlock happened so improvements are moot. I increased to 60 in order to have `HCI_CMD_TIMEOUT` trigger before we start dropping data here.\r\n"
+            ]
+        },
+        {
+            "hunk_id": 26464,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/scan.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 889,
+            "original_line": 889,
+            "side": "RIGHT",
+            "original_position": 200,
+            "position": 205,
+            "subject_type": "line",
+            "review_comments": [
+                "Should this be configurable? ",
+                "I guess so. Next PR?",
+                "That would be OK for, but preferably in this one"
+            ]
+        },
+        {
+            "hunk_id": 26466,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/scan.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 917,
+            "original_line": 917,
+            "side": "RIGHT",
+            "original_position": 249,
+            "position": 254,
+            "subject_type": "line",
+            "review_comments": [
+                "If asserts are disabled this is a no-op, right?\r\n\r\nNot sure if the function name lives up to the implementation",
+                "Yes we've had `__ASSERT()`. But what about second `BT_ASSERT()`?\nBT_ASSERT is `default y` and decoupled from `CONFIG_ASSERT`. You have to go out of your way to disable it, the vast majority of users don't.\n\nThe function name doesn't live up to the impl, only if people deliberately shoot themselves in the foot, no."
+            ]
+        },
+        {
+            "hunk_id": 26462,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/hci_core.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 2940,
+            "original_line": 2940,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "Ditto: Do we have some defined offsets we can use instead of magic indexes? "
+            ]
+        },
+        {
+            "hunk_id": 26467,
+            "commit_id": "db675f5d86d81a92faeca9140800b2f82213bd5c",
+            "original_commit_id": "8fda052826de630fc8a973325675759234a01fef",
+            "path": "subsys/bluetooth/host/scan.c",
+            "start_line": 945,
+            "original_start_line": 945,
+            "start_side": "RIGHT",
+            "line": 973,
+            "original_line": 973,
+            "side": "RIGHT",
+            "original_position": 342,
+            "position": 342,
+            "subject_type": "line",
+            "review_comments": [
+                "`status_to_str` is called with `data_status` which has the return value of `BT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS`. \r\n\r\nHowever the values returned by `BT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS` are not the same values as `status_to_str` matches on. \r\n\r\n`BT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS` should return one of the following: \r\n\r\n```c\r\nBT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS_COMPLETE\r\nBT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS_PARTIAL\r\nBT_HCI_LE_ADV_EVT_TYPE_DATA_STATUS_INCOMPLETE\r\n```\r\n\r\n"
+            ]
+        }
+    ]
+}

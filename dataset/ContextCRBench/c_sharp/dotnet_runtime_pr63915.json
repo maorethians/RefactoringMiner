@@ -1,0 +1,83 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 63915,
+    "lang": "c_sharp",
+    "pr_title": "Moved AssemblyName helpers to managed (part 2)",
+    "pr_body": "Continuation of https://github.com/dotnet/runtime/pull/62866\r\nMoving `AssemblyNameNative::GetFileInformation` to managed\r\n\r\nFixes: https://github.com/dotnet/runtime/issues/28153\r\nFixes: https://github.com/dotnet/runtime/issues/34492",
+    "pr_comments": [
+        "Tagging subscribers to this area: @dotnet/area-system-reflection\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nContinuation of https://github.com/dotnet/runtime/pull/62866\r\n\r\nMoving `AssemblyNameNative::GetFileInformation` to managed\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>VSadov</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>VSadov</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Reflection`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "You may want to look into fixing https://github.com/dotnet/runtime/issues/28153 as part of this.",
+        "Re: #28153 I did not know about the issue. I assumed it keeps `null` culture as in the file on purpose, since metadata reader is fairly low-level API. \r\nYes, this can be fixed. Hopefully it will not break too many things.",
+        "Rough measurements show that managed implementation is ~10% slower than native. \r\nThat is measured on fetching `AssemblyName` from `System.Linq.Expressions.dll`, which is among the largest assemblies in netcore app. Throughput for other assemblies may vary.\r\n\r\n10% slower is not too bad considering other benefits, but I wonder if we can do better.\r\n\r\nMost of the time is spent in various IO calls. The native counterpart does file mapping while managed uses file stream.\r\nPerhaps using file-mapping on the managed side, if possible, will improve perf.",
+        "Using memory-mapped file introduced additional complexity, but did not move the needle on perf. \r\n\r\nHowever the perf of stream-based approach can be improved by passing `PEStreamOptions.PrefetchMetadata` to `PEReader`. With that the managed implementation gets faster than native:\r\n\r\n- **about 5% faster than the native counterpart** on a large-ish `System.Linq.Expressions.dll` (3758KB)\r\n- **about 10% faster than the native counterpart** on a small `System.Runtime.dll` (32KB) \r\n\r\n",
+        "> However the perf of stream-based approach can be improved by passing PEStreamOptions.PrefetchMetadata to PEReader\r\n\r\nUsing `PrefetchMetadata` does not sound right. It will read the whole metadata block when we really only a few tiny pieces from it. It would expect it to be wasteful on large assemblies.\r\n\r\n> about 5% faster than the native counterpart on a large-ish System.Linq.Expressions.dll\r\n\r\nHave you tried this with cold cache when the bytes have to be actually read from disk or network?",
+        "It looks like the metadata stream is being read all-at-once, regardless which approach is chosen. \r\nEverything goes through `GetMetadataReader(this PEReader peReader,...`, which calls `peReader.GetMetadata()` and constructs a reader around the entire in-memory block of metadata. \r\n\r\nThe `PrefetchMetadata` option mostly just forces `_lazyPEHeaders` and `_lazyMetadataBlock` to initialize eagerly. It also can release some resources early since we are not supposed to read anything except what is already captured.\r\n\r\n`System.Linq.Expressions.dll` is one of the largest dlls in netcoreapp and its metadata block is ~323KB. \r\nIt is a nontrivial size, but is not overly huge. Most other assemblies will have smaller metadata. \r\nSince most metadata users will use more than just the assembly name, I can see how reading and caching the whole block is a reasonable design choice for metadata reader. \r\n\r\nAnyways, it looks like we will be reading the entire metadata either way and the variant with prefetching does it faster.",
+        "> Most other assemblies will have smaller metadata.\r\n\r\nYes, I agree that most assemblies are small. But it is not unusual to see assemblies in 10s MBs range (typically with auto-generated code). I would expect that assemblies like that will see very large regression if the whole metadata section is read.\r\n\r\nThe AOT compilers use this memory mapping code that server us well so far: https://github.com/dotnet/runtime/blob/649e14bcf3475b76b6404525b7f31705c5e8c992/src/coreclr/tools/Common/Compiler/CompilerTypeSystemContext.cs#L150-L183 . I think we should do the same here.",
+        "I have tried exactly that code (\"Create stream because ...\" is a familiar quirk). I think we use this pattern in more than one place.\r\n \r\nIt was noticeable slower for the purpose here. I believe it is because `peReader.GetMetadata()` would still read the entire metadata block even if PEReader is backed by a mapped view.",
+        "> I believe it is because peReader.GetMetadata() would still read the entire metadata block even if PEReader is backed by a mapped view.\r\n\r\nI do not think so. The mapped view goes through `ExternalMemoryBlockProvider` that does not copy any data around. It is just passing pointers into the memory mapped view.",
+        "> I do not think so. The mapped view goes through ExternalMemoryBlockProvider that does not copy any data around. It is just passing pointers into the memory mapped view.\r\n\r\nRight. I stepped through the actual implementation when it is based on memory mapped file and indeed it does not read entire metadata. There is a good deal of complexity, compared to native implementation, but it seems reasonable for a more general framework vs. more specialized implementation. All these finally/Dispose do add up a little according to profiler.\r\n\r\nWhat really was out of place is the cost of `Flush` upon closing the view. It is not huge but still considerable. Why would we even do `Flush` when the view is read-only?\r\nI have made that `Flush` conditional and managed implementation with memory mapped file improved enough that it is now ahead of native. ",
+        "As I tried to rebase the changes onto recent main, I found that the 'Flush' problem was just recently fixed - in https://github.com/dotnet/runtime/pull/63794",
+        "Here is my microbenchmark:\r\n```cs\r\nusing System.Reflection;\r\nusing System.Diagnostics;\r\n\r\nConsole.WriteLine(AssemblyName.GetAssemblyName(@\"C:\\Users\\vs\\source\\repos\\ConsoleApp6\\ConsoleApp6\\bin\\Release\\net6.0\\win-x64\\publish\\System.Linq.Expressions.dll\").FullName);\r\n\r\nfor (int j = 0; j < 10; j++)\r\n{\r\n\r\n    Stopwatch sw = Stopwatch.StartNew();\r\n    for (int i = 0; i < 10000; i++)\r\n    {\r\n        AssemblyName.GetAssemblyName(@\"C:\\Users\\vs\\source\\repos\\ConsoleApp6\\ConsoleApp6\\bin\\Release\\net6.0\\win-x64\\publish\\System.Linq.Expressions.dll\");\r\n    }\r\n\r\n    sw.Stop();\r\n    System.Console.WriteLine(sw.ElapsedMilliseconds);\r\n}\r\n```\r\n\r\nNative implementation:\r\n```\r\nSystem.Linq.Expressions, Version=7.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a\r\n551\r\n545\r\n546\r\n546\r\n544\r\n544\r\n544\r\n545\r\n544\r\n545\r\n```\r\n\r\nThis PR:\r\n```\r\nSystem.Linq.Expressions, Version=7.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a\r\n572\r\n512\r\n515\r\n518\r\n515\r\n515\r\n515\r\n518\r\n517\r\n516\r\n```\r\n\r\nThere is a good deal of noise and modality to this scenario (probably depends on where the file lands in the memory). I have run this a few times and picked the best results.\r\n\r\nIt looks like the managed implementation is slightly ahead of native. ",
+        "> Can we just pass in buffer size of 1?\r\n\r\nInteresting. I am not sure it is used for mapped IO. I do not recall the native implementation setting anything like this, but it is worth trying.",
+        "It is internal FileStream buffer size. If you pass more than 1, it creates extra buffering goo:\r\n\r\nhttps://github.com/dotnet/runtime/blob/3de620787ab3962dcb89664a691cf917653d5bd2/src/libraries/System.Private.CoreLib/src/System/IO/Strategies/FileStreamHelpers.cs#L31",
+        "I think all planned changes are in, so please take a look. Thanks!!",
+        "The mono changes look ok.\r\n",
+        "Timeouts in cryptography tests is a known machine-specific issue. \r\n\r\n```\r\nSystem.Security.Cryptography.Cng.Tests\r\nSystem.Security.Cryptography.Tests\r\n```",
+        "Thanks everyone!!  \"Moving `AssemblyName` helpers to managed\" turned up quite a journey!!",
+        "Marked this as breaking since this move caused behavior differences in the moved APIs.  https://github.com/dotnet/runtime/issues/77697",
+        "This was not intentional breaking change."
+    ],
+    "merged": true,
+    "created_at": "2022-01-26T02:15:01Z",
+    "issue_context": {
+        "number": 34492,
+        "title": "[mono] Test failed on windows: System.Reflection.Tests.AssemblyNameTests.GetAssemblyName_LockedFile",
+        "body": "`System.Reflection.Tests.AssemblyNameTests.GetAssemblyName_LockedFile` is disabled in Mono's CoreFX.issues_windows.rsp file and after enabling it still fails locally with the following output:\r\n\r\n```\r\nSystem.Reflection.Tests.AssemblyNameTests.GetAssemblyName_LockedFile [FAIL]\r\nAssert.Throws() Failure\r\nExpected: typeof(System.IO.FileLoadException)\r\nActual:   typeof(System.IO.FileNotFoundException): Could not load file or assembly '_\\AppData\\Local\\Temp\\tmpA90A.tmp' or one of its dependencies.\r\n---- System.IO.FileNotFoundException : Could not load file or assembly '_\\AppData\\Local\\Temp\\tmpA90A.tmp' or one of its dependencies.\r\nStack Trace:\r\n    _\\src\\mono\\netcore\\System.Private.CoreLib\\src\\System\\Reflection\\AssemblyName.Mono.cs(129,0): at System.Reflection.AssemblyName.GetFileInformationCore(String assemblyFile)\r\n    _\\src\\libraries\\System.Private.CoreLib\\src\\System\\Reflection\\AssemblyName.cs(148,0): at System.Reflection.AssemblyName.GetAssemblyName(String assemblyFile)\r\n    _\\src\\libraries\\System.Reflection\\tests\\AssemblyNameTests.cs(255,0): at System.Reflection.Tests.AssemblyNameTests.<>c__DisplayClass23_0.<GetAssemblyName_LockedFile>b__0()\r\n    ----- Inner Stack Trace -----\r\n    _\\src\\mono\\netcore\\System.Private.CoreLib\\src\\System\\Reflection\\AssemblyName.Mono.cs(129,0): at System.Reflection.AssemblyName.GetFileInformationCore(String assemblyFile)\r\n    _\\src\\libraries\\System.Private.CoreLib\\src\\System\\Reflection\\AssemblyName.cs(148,0): at System.Reflection.AssemblyName.GetAssemblyName(String assemblyFile)\r\n    _\\src\\libraries\\System.Reflection\\tests\\AssemblyNameTests.cs(255,0): at System.Reflection.Tests.AssemblyNameTests.<>c__DisplayClass23_0.<GetAssemblyName_LockedFile>b__0()\r\n```\r\nThis test will be marked with `ActiveIssue` in https://github.com/dotnet/runtime/pull/32592.",
+        "comments": [
+            "This looks like an exception difference in mono runtime when attempting to read AssemblyName from a locked file.",
+            "Tagging @CoffeeFlux as an [area owner](https://github.com/dotnet/runtime/blob/master/docs/area-owners.md)",
+            "https://github.com/dotnet/runtime/blob/5c2ee148ab63dc8b6a751cd6535a4e3d58f441ef/src/mono/mono/metadata/icall.c#L6073"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 8505,
+            "commit_id": "f07d4f8db15926b35588d717b19c71fe7408b9d3",
+            "original_commit_id": "518548b96b3369ceb3c54dd62e6cf55e2c5a4ce3",
+            "path": "src/libraries/System.Reflection.Metadata/src/System/Reflection/Metadata/MetadataReader.netstandard.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 84,
+            "original_line": 70,
+            "side": "RIGHT",
+            "original_position": 51,
+            "position": 65,
+            "subject_type": "line",
+            "review_comments": [
+                "Should the catch be after the Dispose so that the file is closed while the exception is thrown? (Matches the behavior of the current unmanaged impl.)",
+                "I think the end result will be the same, but it does seem cleaner to dispose first.\r\n\r\nI had more concerns about what happens if one of the `Dispose` may throw, but we use this pattern in few more places, so I assume it is ok."
+            ]
+        },
+        {
+            "hunk_id": 8506,
+            "commit_id": "f07d4f8db15926b35588d717b19c71fe7408b9d3",
+            "original_commit_id": "518548b96b3369ceb3c54dd62e6cf55e2c5a4ce3",
+            "path": "src/libraries/System.Reflection.Metadata/src/System/Reflection/Metadata/MetadataReader.netstandard.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 45,
+            "original_line": 45,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "I am surprised that the linker does not trim this and all tests work.",
+                "We will make it public as soon as https://github.com/dotnet/runtime/issues/63960 is approved.",
+                "I belive that's because there is IVT in this assembly"
+            ]
+        }
+    ]
+}

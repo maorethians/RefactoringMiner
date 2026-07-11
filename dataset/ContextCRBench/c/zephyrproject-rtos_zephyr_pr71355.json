@@ -1,0 +1,51 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 71355,
+    "lang": "c",
+    "pr_title": "Fix hard-coded byte alignment in linker scripts",
+    "pr_body": "Most instances of the ITERABLE_SECTION_xxx() macros used a hard-coded value of 4 for the sub-alignment. As that has the potential to cause issues with 64-bit platforms that should use 8 instead, those cases now use the new macro Z_LINK_ITERABLE_SUBALIGN instead as it is defined as 4 for 32-bit platforms and 8 for 64-bit platforms.\r\n\r\nFixes #69859",
+    "pr_comments": [
+        "`conn_mgr` changes LGTM as long as tests pass. I am neutral between the KConfig and the C Macro approach.\r\n\r\nPart of me wonders if we should look into removing the argument, or providing versions of the API that don't need the argument, but that _**would**_ be a breaking API change, so probably better not to do that for now. (Not to mention the singular iterable section in Zephyr (that I could find) that uses an align other than 4, `zbus_channel_observation_mask`)\r\n\r\n```c\r\nITERABLE_SECTION_RAM(zbus_channel_observation_mask, 1)\r\n```",
+        "Still LGTM, not approving so that others get a chance to review",
+        "> Still LGTM, not approving so that others get a chance to review\r\n\r\nI think the CI failures should be looked at and get fixed too.",
+        "Looking into those CI failures ...",
+        "Adding the DNM tag to ensure that no one merges this (yet). There is something weird going on with many of the logging tests on 64-bit platforms with this change set. I am trying to track down the cause.",
+        "> Adding the DNM tag to ensure that no one merges this (yet). There is something weird going on with many of the logging tests on 64-bit platforms with this change set. I am trying to track down the cause.\r\n\r\nNot sure if this is for the logging tests only, `tests/misc/iterable_sections` also fails on `native_sim/native/64` but not on `native_sim`.\r\nMy guess would be that there is some mismatch in where padding is added in the linker vs compiler. I had similar issues when trying to put `__packed` structs in linker sections.",
+        "Upon closer inspection, the issue is actually in the `TYPE_SECTION_FOREACH` iterator, as it doesn't know about the struct alignment.",
+        "Yesterday, I too observed that the iterable_sections test was failing, and that was related to the TYPE_SECTION_FOREACH macro.  In that case, the structure being put into the iterable section contained only an 'int' (4 bytes).  Consequently, the `iterator++` line in that macro only incremented the iterator pointer by 4 bytes instead of the 8 required by the linker alignment on 64-bit platforms.\r\n\r\nIt could be that there is something similar at play with the failing logging tests on 64-bit platforms. However, near as I can tell, all other structures being placed into iterable sections contain a pointer. I mention that because my expectation is that that ought to force the compiler to align those structures to 8-byte boundaries, which would be in sync with what the linker is trying to do with SUBALIGN.\r\n\r\nI'll continue to dig.",
+        "Maybe we can add the alignment at the end of the struct area:\r\n\r\n```c\r\n#define ITERABLE_SECTION_ROM(struct_type, subalign) \\\r\n\tSECTION_PROLOGUE(struct_type##_area,,SUBALIGN(subalign)) \\\r\n\t{ \\\r\n\t\tZ_LINK_ITERABLE(struct_type); \\\r\n\t\tLONG(subalign); \\\r\n\t} GROUP_ROM_LINK_IN(RAMABLE_REGION, ROMABLE_REGION)\r\n```\r\nWhich then can be accessed using the `_list_end` address, and compute the iterator increments based on the size and alignment?",
+        "I may be mistaken, but I can imagine stuffing a long in there could add some bloat to the image.\r\n\r\nI had thought we could try to say that any structure going into an iterable section must use the same alignment as the linker for it (and we could add __align(x) to the structure's properties). However that might be too intrusive.\r\n\r\nYesterday evening, I also came across some iterable section stuff in the cmake scripts that I have yet to go through (see zephyr_iterable_section)",
+        "There was a discrepancy between linker and compiler alignment for two of the structures in the previously observed failing CI tests. On 64-bit platforms, the linker was using 8-byte alignment, but the compiler was using 4-byte alignment. Consequently, when the TYPE_SECTION_FOREACH() was used, its iterator pointer was not pointing at the correct address when it was advanced to the next element.\r\n\r\nThis updated patch set should fix that by forcing the size of those two structures to be mulitples of 8 bytes, thereby disallowing any padding between successive instances of the structures within the relevant iterable sections."
+    ],
+    "merged": true,
+    "created_at": "2024-04-10T17:16:22Z",
+    "issue_context": {
+        "number": 69859,
+        "title": "Hard-coded 4-byte alignment in linker script overrides 8-byte alignment for 64-bit platforms",
+        "body": "**Description**\r\n\r\nNow there are hard-coded **4** `SUBALIGN` attribute for sections in almost all linker scripts. F.e: there is the following code in the `include/zephyr/linker/common-ram.ld`:\r\n\r\n```\r\n...\r\n\tITERABLE_SECTION_RAM_GC_ALLOWED(k_queue, 4)\r\n\tITERABLE_SECTION_RAM_GC_ALLOWED(k_fifo, 4)\r\n\tITERABLE_SECTION_RAM_GC_ALLOWED(k_lifo, 4)\r\n...\r\n``` \r\n during the build it provides something like that in generated `linker.cmd` \r\n```\r\n...\r\n k_queue_area : SUBALIGN(4) { _k_queue_list_start = .; *(SORT_BY_NAME(._k_queue.static.*)); _k_queue_list_end = .; } > RAM\r\n k_fifo_area : SUBALIGN(4) { _k_fifo_list_start = .; *(SORT_BY_NAME(._k_fifo.static.*)); _k_fifo_list_end = .; } > RAM\r\n k_lifo_area : SUBALIGN(4) { _k_lifo_list_start = .; *(SORT_BY_NAME(._k_lifo.static.*)); _k_lifo_list_end = .; } > RAM\r\n...\r\n```  \r\n\r\nThere is the recent change in behaviour of ld linker with `SUBALIGN` attribute (see the patch https://github.com/bminor/binutils-gdb/commit/60856b5cdafc520538688258a8ce4ae8be2a8477), that may introduce some issues with building of zephyr-based applications for 64-bit platforms.\r\n\r\nFor example, let's try to build the following application for some RISC-V 64 bit platform  with `ld` of **prior vesrion**\r\n```\r\n#include <zephyr/kernel.h>\r\n#include <zephyr/console/console.h>\r\n#include <string.h>\r\n#include <stdio.h>\r\n\r\nint main(void)\r\n{\r\n\tconsole_getline_init();\r\n\r\n\tprintk(\"Success to invoke console_getline_init\");\r\n\r\n\treturn 0;\r\n}\r\n```\r\n\r\n```\r\n$ export CROSS_COMPILE=${PATH_TO_RISCV_TOOLCHAIN}/riscv-gcc/bin/riscv64-unknown-elf-\r\n$ export ZEPHYR_TOOLCHAIN_VARIANT=cross-compile\r\n$ west build -p -b rv64-platform samples/arch/test\r\n$ ${PATH_TO_RISCV_TOOLCHAIN}/riscv-gcc/bin/riscv64-unknown-elf-objdump -h build/zephyr/zephyr.elf | grep k_fifo\r\n 13 k_fifo_area   00000060  000000000000cce8  000000000000cce8  00005fa0  2**3\r\n```\r\n\r\nWe can see that the symbol `k_fifo_area` aligned by 8 despite an attribute `SUBALIGN(4)`. \r\n\r\nWith **new** version of `ld` it will be different \r\n\r\n```\r\n$ ${PATH_TO_RISCV_TOOLCHAIN}/riscv-gcc/bin/riscv64-unknown-elf-objdump -h build/zephyr/zephyr.elf | grep k_fifo\r\n 13 k_fifo_area   00000060  000000000000cce4  000000000000cce4  00005f9c  2**2\r\n```\r\n\r\nWe can see that the symbol `k_fifo_area` aligned by 4. Moreover, its fixed address is `0xcce4`\r\n\r\nThe compiler doesn't know about these alignment tricks, so with this symbol it's able to generate an instruction with 8-bytes alignment requirement. In this example it generates the instruction `amoadd.d.aq a0,a4,(a5)` that causes trap. So, test fails. ",
+        "comments": [
+            "Hi @vbe-sc! We appreciate you submitting your first issue for our open-source project. \ud83c\udf1f\n\nEven though I'm a bot, I can assure you that the whole community is genuinely grateful for your time and effort. \ud83e\udd16\ud83d\udc99"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 29176,
+            "commit_id": "13c7b8b0d838d9a58edf50b283fbdfc8bb98155d",
+            "original_commit_id": "5841c11cae6a569678a9533e2b96b51ec140008a",
+            "path": "include/zephyr/linker/iterable_sections.h",
+            "start_line": 35,
+            "original_start_line": 35,
+            "start_side": "RIGHT",
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Alternatively a `kconfig` symbol could be created directly\r\n\r\n```\r\nconfig ITERABLE_SECTION_SUBALIGN\r\n\tint\r\n\tdefault 8 if 64BIT\r\n\tdefault 4\r\n```",
+                "See #72373 "
+            ]
+        }
+    ]
+}

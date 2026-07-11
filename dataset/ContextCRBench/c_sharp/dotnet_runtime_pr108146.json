@@ -1,0 +1,51 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 108146,
+    "lang": "c_sharp",
+    "pr_title": "Implement `Process.Threads` through PSS APIs for Win >=10",
+    "pr_body": "Close #99906\r\n\r\nTBD",
+    "pr_comments": [],
+    "merged": false,
+    "created_at": "2024-09-24T13:49:54Z",
+    "issue_context": {
+        "number": 99906,
+        "title": "Consider using process snapshotting APIs for System.Diagnostics.Process",
+        "body": "We've been using `Process.GetCurrentProcess()` to retrieve information about the current process, such as the total number of threads. We've seen evidence that, on Windows, calling `process.Threads` could take tens of milliseconds for some customers, and even on my machine it consistently takes more than 3 milliseconds.\r\nUnder the hood, it relies on `NtQuerySystemInformation` which actually captures information for all the processes on the machine, and then cherry-picks the information for the current process. Windows 8.1 has introduced process snapshotting APIs which can be used to retrieve this kind of information in a much cheaper way.\r\n\r\nI've done a quick prototype where I compare the speed of `NtQuerySystemInformation` vs `PssCaptureSnapshot`/`PssWalkSnapshot` and the results are very encouraging:\r\n\r\n| Method                   | Mean        | Error     | StdDev     |\r\n|------------------------- |------------:|----------:|-----------:|\r\n| PssWalkSnapshot          |   102.19 us |  3.360 us |   9.747 us |\r\n| NtQuerySystemInformation | 3,100.48 us | 60.486 us | 105.937 us |\r\n\r\nMy prototype only retrieves the id of each thread of the process, but it looks like all the information required to populate the .NET `ProcessThread` class is in there.\r\n\r\nWould it be worth pursuing further?\r\n",
+        "comments": [
+            "> Would it be worth pursuing further?\r\n\r\nSure. We might not be able to drop the existing implementation in order to keep older versions of Windows working, but if can produce the same results on newer versions more efficiently, and if there aren't other caveats (e.g. you must be an administrator), sounds like a good thing to experiment with.",
+            "> keep older versions of Windows working\r\n\r\nAren't older versions of Windows (below Windows 8.1) out of support? ",
+            "Even when OSes are out of support, we try to avoid breaking existing features. ",
+            "> Even when OSes are out of support, we try to avoid breaking existing features.\r\n\r\nWorth noting that [.NET 8 still supports Windows Server 2012](https://github.com/dotnet/core/blob/main/release-notes/8.0/supported-os.md) which corresponds to Windows 8 (not 8.1) API wise and so lacks APIs like `PssCaptureSnapshot`.",
+            "@kevingosse I'm moving this into the Future milestone, but if you're planning to submit a pull request for this, we will commit to reviewing it. I'll mark the issue as https://github.com/dotnet/runtime/labels/help%20wanted.",
+            "I started implementing it, but `PssCaptureSnapshot` throws an access violation when I try to collect handles. I initially thought that maybe I got my p/invoke wrong, but I still have the issue with this simple C++ code:\r\n\r\nhttps://gist.github.com/kevingosse/5dc76124ca986a41f1e8719c77b7987a\r\n\r\n@stephentoub This looks like a bug in the PssCaptureSnapshot API. Do you have a contact at Microsoft that I could report this to? Now that Microsoft Connect is gone, I don't know what channel we're supposed to use.\r\n\r\n\r\n",
+            "I dont get an access violation, works fine on my system (Windows 11 64bit)\r\n\r\n<details>\r\n  <summary>Code</summary>\r\n  \r\n \r\n  ```C#\r\n[Flags]\r\nprivate enum PSS_CAPTURE_FLAGS : uint\r\n{\r\n\tPSS_CAPTURE_HANDLES = 0x00000004,\r\n}\r\n\r\nprivate enum PSS_QUERY_INFORMATION_CLASS\r\n{\r\n\tPSS_QUERY_HANDLE_INFORMATION = 4,\r\n}\r\n\r\n[DllImport(\"kernel32.dll\")]\r\nprivate static extern int PssCaptureSnapshot(IntPtr processHandle, PSS_CAPTURE_FLAGS captureFlags, int threadContextFlags, out IntPtr snapshotHandle);\r\n\r\n[DllImport(\"kernel32.dll\")]\r\nprivate static extern unsafe int PssQuerySnapshot(IntPtr snapshotHandle, PSS_QUERY_INFORMATION_CLASS informationClass, void* buffer, int bufferLength);\r\n\r\n[StructLayout(LayoutKind.Sequential)]\r\npublic struct PSS_HANDLE_INFORMATION\r\n{\r\n\tpublic uint HandlesCaptured;\r\n}\r\n\r\nstatic unsafe async Task Main(string[] args)\r\n{\r\n\tvar result = PssCaptureSnapshot(Process.GetCurrentProcess().Handle, PSS_CAPTURE_FLAGS.PSS_CAPTURE_HANDLES, 0, out var snapshotHandle);\r\n\t\r\n\tif (result != 0)\r\n\t{\r\n\t\tthrow new Win32Exception(result);\r\n\t}\r\n   \r\n\tPSS_HANDLE_INFORMATION handleInformation = default;\r\n\r\n\tresult = PssQuerySnapshot(snapshotHandle, PSS_QUERY_INFORMATION_CLASS.PSS_QUERY_HANDLE_INFORMATION, &handleInformation, Marshal.SizeOf<PSS_HANDLE_INFORMATION>());\r\n\t\r\n\tif (result != 0)\r\n\t{\r\n\t\tthrow new Win32Exception(result);\r\n\t}\r\n\tvar handleCount = handleInformation.HandlesCaptured;\r\n\r\n\tConsole.WriteLine(handleCount);\r\n}\r\n  ```\r\n  \r\n</details>",
+            "The problem is `PssCaptureSnapshot` doesn't include information for `ProcessThread.ThreadState` & `ProcessThread.WaitReason`. Although rarely used, these two properties requires either:\r\n* Introduce a new Windows-only API that fills `Process.Threads` without the two properties; \r\n* When the two properties are accessed, re-enumerate threads using the original way.\r\n    * The workaround is very slow and error-prone, as `NtQuerySystemInformation` is the only documented way to retrieve the values.\r\n* <del>Use undocumented `NtQueryInformationThread`+`ThreadSystemThreadInformation` (THREADINFOCLASS = 0x28)</del>\r\n\r\nBesides, this may be a behavior breaking change since the two values are lazy-evaluated, rather than when `Process.Threads` is initialized as of now.",
+            "> Use undocumented NtQueryInformationThread+ThreadSystemThreadInformation\r\n\r\nWe may also explore what it would take to have this API documented. It would need to be handled by System.Diagnostic.Process area maintainers.",
+            "> We may also explore what it would take to have this API documented.\r\n\r\nI suppose that needs to be evaluated by the Windows team?",
+            "> I suppose that needs to be evaluated by the Windows team?\r\n\r\nRight.",
+            "> * Use undocumented `NtQueryInformationThread`\r\n\r\nAt least this one is documented and the documentation strongly advises to not use this API as it might change or become unavailable in future versions of Windows. ",
+            "> At least this one is documented and the documentation strongly advises to not use this API as it might change or become unavailable in future versions of Windows.\r\n\r\nI'm not quite worried about that. The current approach utilizes `NtQuerySystemInformation` which is also advised not to use."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 5758,
+            "commit_id": "98a3a7328b78abad372913207fbc8e917c07ccd0",
+            "original_commit_id": "b5833d2cd22f474485f74696609f6a6c3617cd15",
+            "path": "src/libraries/System.Diagnostics.Process/src/System/Diagnostics/ProcessThread.Windows.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 200,
+            "original_line": 200,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "It is not ok to use undocumented Windows APIs in this repo (both technical and legal reasons). ",
+                "> It is not ok to use undocumented Windows APIs in this repo (both technical and legal reasons).\r\n\r\nno problem \ud83d\ude01"
+            ]
+        }
+    ]
+}

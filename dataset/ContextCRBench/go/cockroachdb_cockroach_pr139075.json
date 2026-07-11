@@ -1,0 +1,147 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 139075,
+    "lang": "go",
+    "pr_title": "roachtest: mark polled VM preemptions as non reportable",
+    "pr_body": "Previously, polled VM preemptions would simply cancel the test, as post test processing would recheck for preemptions again. However, we've seen some cases in AWS where the post test check returns no preemptions despite the polling returning preemptions.\r\n\r\nThis may be just be the AWS check being eventually consistent, so we want to avoid posting if either check finds preemptions.\r\n\r\n----\r\n\r\nThe second change resets failures in the case of a vm preemption, in case a timeout occurred which normally takes precedence over all other failures. While a timeout suggests that something should be fixed with the test (usually respecting the test context cancellation), we see that in practice, engineers tend to close the issue without investigating as soon as they see the preemption.\r\n\r\nThis also removes the potential duplicate vm_preemption failure that may have been added by the preemption polling.\r\n\r\nFixes: https://github.com/cockroachdb/cockroach/issues/139004\r\nFixes: https://github.com/cockroachdb/cockroach/issues/139931\r\nRelease note: none\r\nEpic: none",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/139075)\n<!-- Reviewable:end -->\n",
+        "On the fence on the second commit. One one hand there have been two cases where teams fix their tests, but in general it appears [most engineers just close out the issue](https://github.com/cockroachdb/cockroach/issues?q=is%3Aissue%20state%3Aclosed%20%22VMs%20preempted%20during%20the%20test%20run%3A%22). Arguable how much value is even gained from fixing said tests anyway (saving money from not having the vms hang?).",
+        "Yup, `stress` didn't fail but `race` did. Interestingly, the failure being added by the preemption polling races with the post test assertion check replacing the logger. This isn't specific to preemption polling, I can repro this by just running:\r\n\r\n```\r\n\t\tmockTest.Run = func(ctx context.Context, t test.Test, c cluster.Cluster) {\r\n\t\t\tt.Error(\"test failed\")\r\n\t\t}\r\n\t\tmockTest.Timeout = 1 * time.Nanosecond\r\n```\r\n\r\nSo this is a possible data race we could see in actual roachtests if it times out. From what I can tell, the only impact is that we might lose the failure being logged to `test.log`, which is not a huge deal since the test timed out which is most likely the real failure anyway.\r\n\r\nFor these unit tests, I just made sure the above race doesn't happen since it doesn't affect what it's testing. Not sure if we want to add a real fix for the data race though.",
+        ">  Interestingly, the failure being added by the preemption polling races with the post test assertion check replacing the logger.\r\n\r\nNot entirely following... I thought `addFailure` was thread-safe. Can you post the report from the data race, i.e., the racing goroutine stacks.",
+        "Sure, here's a simple repro of what I'm seeing:\r\n\r\n```\r\nfunc TestRunnerTestTimeoutRace(t *testing.T) {\r\n\tctx := context.Background()\r\n\tstopper := stop.NewStopper()\r\n\tdefer stopper.Stop(ctx)\r\n\tcr := newClusterRegistry()\r\n\trunner := newUnitTestRunner(cr, stopper)\r\n\r\n\tvar buf syncedBuffer\r\n\tcopt := defaultClusterOpt()\r\n\tlopt := defaultLoggingOpt(&buf)\r\n\ttest := registry.TestSpec{\r\n\t\tName:             `timeout`,\r\n\t\tOwner:            OwnerUnitTest,\r\n\t\tTimeout:          1 * time.Millisecond,\r\n\t\tCluster:          spec.MakeClusterSpec(0),\r\n\t\tCompatibleClouds: registry.AllExceptAWS,\r\n\t\tSuites:           registry.Suites(registry.Nightly),\r\n\t\tCockroachBinary:  registry.StandardCockroach,\r\n\t\tRun: func(ctx context.Context, t test.Test, c cluster.Cluster) {\r\n\t\t\tt.Error(\"test failed\")\r\n\t\t},\r\n\t}\r\n\t_ = runner.Run(ctx, []registry.TestSpec{test}, 1, /* count */\r\n\t\tdefaultParallelism, copt, testOpts{}, lopt)\r\n}\r\n```\r\n\r\nRunning `./dev test pkg/cmd/roachtest -f TestRunnerTestTimeoutRace --stress --race` hits:\r\n\r\n```\r\n==================\r\nWARNING: DATA RACE\r\nRead at 0x00c004b9e888 by goroutine 40:\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testImpl).L()\r\n      pkg/cmd/roachtest/test_impl.go:262 +0x520\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testImpl).addFailure()\r\n      pkg/cmd/roachtest/test_impl.go:470 +0x530\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testImpl).addFailureAndCancel()\r\n      pkg/cmd/roachtest/test_impl.go:441 +0x5c\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testImpl).Error()\r\n      pkg/cmd/roachtest/test_impl.go:432 +0x4c\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.TestRunnerTestTimeoutRace.func1()\r\n      pkg/cmd/roachtest/test_test.go:381 +0x88\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).runTest.func2()\r\n      pkg/cmd/roachtest/test_runner.go:1315 +0x168\r\n\r\nPrevious write at 0x00c004b9e888 by goroutine 39:\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testImpl).ReplaceL()\r\n      pkg/cmd/roachtest/test_impl.go:268 +0x1d0\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).runTest.func4()\r\n      pkg/cmd/roachtest/test_runner.go:1380 +0x1cc\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).runTest()\r\n      pkg/cmd/roachtest/test_runner.go:1402 +0x14d8\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).runWorker()\r\n      pkg/cmd/roachtest/test_runner.go:937 +0x2b6c\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).Run.func1()\r\n      pkg/cmd/roachtest/test_runner.go:389 +0x3b4\r\n  github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx.func2()\r\n      pkg/util/stop/stopper.go:500 +0x214\r\n  github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx.gowrap1()\r\n      pkg/util/stop/stopper.go:501 +0x54\r\n\r\nGoroutine 40 (running) created at:\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).runTest()\r\n      pkg/cmd/roachtest/test_runner.go:1296 +0xba8\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).runWorker()\r\n      pkg/cmd/roachtest/test_runner.go:937 +0x2b6c\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).Run.func1()\r\n      pkg/cmd/roachtest/test_runner.go:389 +0x3b4\r\n  github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx.func2()\r\n      pkg/util/stop/stopper.go:500 +0x214\r\n  github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx.gowrap1()\r\n      pkg/util/stop/stopper.go:501 +0x54\r\n\r\nGoroutine 39 (running) created at:\r\n  github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTaskEx()\r\n      pkg/util/stop/stopper.go:489 +0x52c\r\n  github.com/cockroachdb/cockroach/pkg/util/stop.(*Stopper).RunAsyncTask()\r\n      pkg/util/stop/stopper.go:360 +0xfd4\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.(*testRunner).Run()\r\n      pkg/cmd/roachtest/test_runner.go:378 +0xcc4\r\n  github.com/cockroachdb/cockroach/pkg/cmd/roachtest.TestRunnerTestTimeoutRace()\r\n      pkg/cmd/roachtest/test_test.go:384 +0x5e4\r\n  testing.tRunner()\r\n      GOROOT/src/testing/testing.go:1689 +0x180\r\n  testing.(*T).Run.gowrap1()\r\n      GOROOT/src/testing/testing.go:1742 +0x40\r\n==================\r\n```\r\n\r\nSo the `failures` struct in `addFailure` is thread safe, but the logger it uses here: \r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/1de6c82abe9e266af65bcd9428548aad8d9abd33/pkg/cmd/roachtest/test_impl.go#L349\r\n\r\nisn't because we replace the logger after the test is done:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/3c64af25d55d8ce568e5d9735ee74a87b9d3c32e/pkg/cmd/roachtest/test_runner.go#L1090-L1098\r\n\r\nNote the comment: `We still want to run the post-test assertions even if the test timed out` along with the fact that on test timeouts we purposely don't cancel the test context and let the test keep running.\r\n\r\nSo my understanding is that the following ordering can happen:\r\n\r\n1. The test times out and the test runner stops blocking.\r\n2. The test runner starts post tests assertion checks, replacing the logger.\r\n3. The test itself runs `t.Error(\"test failed\")` which eventually calls `t.L().Printf`. This races with the above.\r\n\r\n----\r\n\r\nThe original test was hitting the same race w/ the same stack trace, it was just the polling preemption adding the failure instead of the test itself.",
+        "> The test times out and the test runner stops blocking.\r\nThe test runner starts post tests assertion checks, replacing the logger.\r\nThe test itself runs t.Error(\"test failed\") which eventually calls t.L().Printf. This races with the above.\r\n\r\nYep. That's a perfectly plausible scenario. We should fix it; e.g., changing the type of `testImpl.L` to `atomic.Pointer`.",
+        "> We should fix it; e.g., changing the type of testImpl.L to atomic.Pointer\r\n\r\nSGTM, will put it out as a followup PR.",
+        "TFTR!\r\n\r\nbors r=srosenberg",
+        "Build succeeded:\n  * [examples_orms](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801990052)\n  * [windows_build](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801993645)\n  * [linux_arm64_build](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801991225)\n  * [macos_amd64_build](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801992471)\n  * [acceptance](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801988170)\n  * [local_roachtest_fips](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801991969)\n  * [docker_image_amd64](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801988693)\n  * [unit_tests](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801993227)\n  * [linux_amd64_build](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801990530)\n  * [local_roachtest](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801991613)\n  * [macos_arm64_build](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801992855)\n  * [check_generated_code](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801989088)\n  * [linux_amd64_fips_build](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801990862)\n  * [lint](https://github.com/cockroachdb/cockroach/actions/runs/13184113717/job/36801989631)",
+        "blathers backport 25.1.0-rc",
+        "Based on the specified backports for this PR, I applied new labels to the following linked issue(s). Please adjust the labels as needed to match the branches actually affected by the issue(s), including adding any known older branches.\n\n----\n\nIssue #139004: branch-release-25.1.0-rc.\n\n----\n\nIssue #139931: branch-release-25.1.0-rc.\n\n----\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>"
+    ],
+    "merged": true,
+    "created_at": "2025-01-28T16:53:07Z",
+    "issue_context": {
+        "number": 139004,
+        "title": "roachtest: kv0/enc=false/nodes=1/mt-shared-process failed",
+        "body": "roachtest.kv0/enc=false/nodes=1/mt-shared-process [failed](https://teamcity.cockroachdb.com/buildConfiguration/Cockroach_Nightlies_RoachtestNightlyAwsBazel/18490643?buildTab=log) with [artifacts](https://teamcity.cockroachdb.com/buildConfiguration/Cockroach_Nightlies_RoachtestNightlyAwsBazel/18490643?buildTab=artifacts#/kv0/enc=false/nodes=1/mt-shared-process) on release-24.3 @ [ef0e25554c256e3c014d1588a526f96258f91e95](https://github.com/cockroachdb/cockroach/commits/ef0e25554c256e3c014d1588a526f96258f91e95):\n\n\n```\n(test_runner.go:2128).func1: monitorForPreemptedVMs: Preempted VMs detected: [{i-07c3c8b4213937215 0001-01-01 00:00:00 +0000 UTC}]\n(cluster.go:2455).Run: context canceled\n(monitor.go:149).Wait: monitor failure: monitor user task failed: t.Fatal() was called\ntest artifacts and logs in: /artifacts/kv0/enc=false/nodes=1/mt-shared-process/cpu_arch=arm64/run_1\n```\n\nParameters:\n - <code>arch=arm64</code>\n - <code>cloud=aws</code>\n - <code>coverageBuild=false</code>\n - <code>cpu=8</code>\n - <code>encrypted=false</code>\n - <code>fs=ext4</code>\n - <code>localSSD=true</code>\n - <code>runtimeAssertionsBuild=false</code>\n - <code>ssd=0</code>\n<details><summary>Help</summary>\n<p>\n\n\nSee: [roachtest README](https://github.com/cockroachdb/cockroach/blob/master/pkg/cmd/roachtest/README.md)\n\n\n\nSee: [How To Investigate \\(internal\\)](https://cockroachlabs.atlassian.net/l/c/SSSBr8c7)\n\n_Grafana is not yet available for aws clusters_</p>\n</details>\n/cc @cockroachdb/test-eng\n<sub>\n\n[This test on roachdash](https://roachdash.crdb.dev/?filter=status:open%20t:.*kv0/enc=false/nodes=1/mt-shared-process.*&sort=title+created&display=lastcommented+project) | [Improve this report!](https://github.com/cockroachdb/cockroach/tree/master/pkg/cmd/bazci/githubpost/issues)\n\n</sub>\n\n\nJira issue: CRDB-46461",
+        "comments": [
+            "Looks like vm preemption monitoring kicked in and cancelled the test, but when it went to do the final check for preempted VMs, it didn't find any, thus skipping the preemption error handling. \n\nFound [another example of this happening](https://github.com/cockroachdb/cockroach/issues/136193#issuecomment-2505536149), noting that it's also aws. Seems mildly concerning we can get failures due to preemptions but aws just fails to report them fast enough.",
+            "> but when it went to do the final check for preempted VMs, it didn't find any, thus skipping the preemption error handling.\n\nThat's part of the issue, right? Once a preemption has been detected, the fact remains. So, the final check can't erase previous facts; its job is to essentially add a new one; i.e., in case the monitor misses, the final check has one more chance.",
+            ">That's part of the issue, right? Once a preemption has been detected, the fact remains.\n\nYeah for sure, I'm looking into if we can mark the first check as a `vmPreemptionError` so it's for sure not reported. Side effect is that we will get two errors that both say `vm_preemption`, and I'm not sure if that will impact the snowflake data.",
+            "Based on the specified backports for linked PR #139075, I applied the following new label(s) to this issue: branch-release-25.1.0-rc. Please adjust the labels as needed to match the branches actually affected by this issue, including adding any known older branches.\n\n<sub>:owl: Hoot! I am a [Blathers](https://github.com/apps/blathers-crl), a bot for [CockroachDB](https://github.com/cockroachdb). My owner is [dev-inf](https://github.com/orgs/cockroachdb/teams/dev-inf).</sub>"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 16054,
+            "commit_id": "031e0558ec83dd8ece8f7cee4c337053ead9b7fa",
+            "original_commit_id": "0b98fd738b223213b2c43d902b9f39ff47a6618c",
+            "path": "pkg/cmd/roachtest/test_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 828,
+            "original_line": 828,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "Same as above...  timeout may never occur under `--stress`.",
+                "Lowered the timeout to 10 ms, we have another unit test that uses that time and seems to be doing fine, so hopefully it should be for this as well. Stressed 3000 times with no flakes."
+            ]
+        },
+        {
+            "hunk_id": 14470,
+            "commit_id": "031e0558ec83dd8ece8f7cee4c337053ead9b7fa",
+            "original_commit_id": "0b98fd738b223213b2c43d902b9f39ff47a6618c",
+            "path": "pkg/cmd/roachtest/test_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 791,
+            "original_line": 791,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "Good. This removes the clock, and the corresponding \"flakiness\", from the equation."
+            ]
+        },
+        {
+            "hunk_id": 14469,
+            "commit_id": "031e0558ec83dd8ece8f7cee4c337053ead9b7fa",
+            "original_commit_id": "0b98fd738b223213b2c43d902b9f39ff47a6618c",
+            "path": "pkg/cmd/roachtest/test_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 828,
+            "original_line": 828,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "Same as above...  timeout may never occur under `--stress`.",
+                "Lowered the timeout to 10 ms, we have another unit test that uses that time and seems to be doing fine, so hopefully it should be for this as well. Stressed 3000 times with no flakes."
+            ]
+        },
+        {
+            "hunk_id": 16055,
+            "commit_id": "031e0558ec83dd8ece8f7cee4c337053ead9b7fa",
+            "original_commit_id": "0b98fd738b223213b2c43d902b9f39ff47a6618c",
+            "path": "pkg/cmd/roachtest/test_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 791,
+            "original_line": 791,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "Good. This removes the clock, and the corresponding \"flakiness\", from the equation."
+            ]
+        },
+        {
+            "hunk_id": 14471,
+            "commit_id": "031e0558ec83dd8ece8f7cee4c337053ead9b7fa",
+            "original_commit_id": "0b98fd738b223213b2c43d902b9f39ff47a6618c",
+            "path": "pkg/cmd/roachtest/test_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 824,
+            "original_line": 824,
+            "side": "RIGHT",
+            "original_position": 50,
+            "position": 58,
+            "subject_type": "line",
+            "review_comments": [
+                "We should add an explainer since it's not immediately clear as to what's expected to happen. We expect that the context will be cancelled only when `Timeout` expires, at which point the test would normally be marked as failed. However, due to injected preemption, the test isn't marked as failed. Thus, `runner.Run` is expected not to return `errTestsFailed`, or any other error.",
+                "Done."
+            ]
+        },
+        {
+            "hunk_id": 16056,
+            "commit_id": "031e0558ec83dd8ece8f7cee4c337053ead9b7fa",
+            "original_commit_id": "0b98fd738b223213b2c43d902b9f39ff47a6618c",
+            "path": "pkg/cmd/roachtest/test_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 824,
+            "original_line": 824,
+            "side": "RIGHT",
+            "original_position": 50,
+            "position": 58,
+            "subject_type": "line",
+            "review_comments": [
+                "We should add an explainer since it's not immediately clear as to what's expected to happen. We expect that the context will be cancelled only when `Timeout` expires, at which point the test would normally be marked as failed. However, due to injected preemption, the test isn't marked as failed. Thus, `runner.Run` is expected not to return `errTestsFailed`, or any other error.",
+                "Done."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,149 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 10306,
+    "lang": "c",
+    "pr_title": "XREADGROUP: Unblock client if stream is deleted",
+    "pr_body": "Fix #6887\r\nDeleting a stream while a client is blocked XREADGROUP should unblock the client.\r\n\r\nThe idea is that if a client is blocked via XREADGROUP is different from\r\nany other blocking type in the sense that it depends on the existence of both\r\nthe key and the group. Even if the key is deleted and then revived with XADD\r\nit won't help any clients blocked on XREADGROUP because the group no longer\r\nexist, so they would fail with -NOGROUP anyway.\r\nThe conclusion is that it's better to unblock these clients (with error) upon\r\nthe deletion of the key, rather than waiting for the first XADD. \r\n\r\nOther changes:\r\n1. Slightly optimize all `serveClientsBlockedOn*` functions by checking `server.blocked_clients_by_type`\r\n2. All `serveClientsBlockedOn*` functions now use a list iterator rather than looking at `listFirst`, relying on `unblockClient` to delete the head of the list. Before this commit, only `serveClientsBlockedOnStreams` used to work like that.\r\n3. bugfix: CLIENT UNBLOCK ERROR should work even if the command doesn't have a timeout_callback (only relevant to module commands)",
+    "pr_comments": [
+        "@yossigo there was an argument that maybe this problem isn't worth the complexity of fixing it, and maybe we should just document that it's a known limitation.\r\nthe reason is that applications could simply avoid deleting stream keys while they have a blocked cgroup client.\r\n\r\npersonally, looking at the fix, i'm not sure the complexity is that high, so i'm willing to take it, even if just so that we know we don't have an awkward edge case unresolved in the code.\r\n\r\nplease take a quick sim through the changes and say what you think.",
+        "@soloestoy maybe you wanna take a quick look to see if you can spot something we missed?",
+        "I didn't read the code, but seems you didn't handle `XGROUP DESTROY` and `XGROUP DELCONSUMER `, not sure if it's needed.\r\n\r\nignore above, you already fixed it in another PR #6905",
+        "@soloestoy `serveClientsBlockedOnStreamKey` creates the consumer if it doesn't exist (not sure if by design, but that's the way it is)\r\nso even if the blocked consumer is deleted, the XADD that should have awakened that consumer will re-create it as a side effect (and it will unblock the client)\r\n\r\nc1:\r\n```\r\n127.0.0.1:6379> XGROUP CREATE x g $ MKSTREAM\r\nOK\r\n127.0.0.1:6379> XREADGROUP group g Alice block 0 streams x >\r\n\r\n```\r\n\r\nc2:\r\n```\r\n127.0.0.1:6379> XGROUP DELCONSUMER x g Alice\r\n(integer) 0\r\n127.0.0.1:6379> XADD x * f v\r\n\"1646214278403-0\"\r\n127.0.0.1:6379> \r\n```\r\n\r\nc1:\r\n```\r\n127.0.0.1:6379> XREADGROUP group g Alice block 0 streams x >\r\n1) 1) \"x\"\r\n   2) 1) 1) \"1646214278403-0\"\r\n         2) 1) \"f\"\r\n            2) \"v\"\r\n(33.97s)\r\n127.0.0.1:6379> \r\n```"
+    ],
+    "merged": true,
+    "created_at": "2022-02-17T14:08:31Z",
+    "issue_context": {
+        "number": 6887,
+        "title": "Deleting a stream while blocking with XREADGROUP",
+        "body": "scenario: client A is blocking on a stream with XREADGROUP:\r\n```\r\n127.0.0.1:6379> XADD x * f v\r\n\"1581590417017-0\"\r\n127.0.0.1:6379> XGROUP create x grp $\r\nOK\r\n127.0.0.1:6379> XREADGROUP group grp con block 0 streams x >\r\n\r\n```\r\n\r\nafter client A is blocked, client B deletes the stream:\r\n```\r\n127.0.0.1:6379> DEL x\r\n(integer) 1\r\n127.0.0.1:6379> \r\n```\r\n\r\ni would expect that in that very moment client A will be unblocked with `NOGROUP the consumer group this client was blocked on no longer exists` (because that DEL deleted the stream along with all the groups it had) but it remains blocked. the only way to unblock it is to revive the stream:\r\n\r\nclient B:\r\n```\r\n127.0.0.1:6379> XADD x * f v\r\n\"1581590682436-0\"\r\n127.0.0.1:6379> \r\n```\r\n\r\nclient A:\r\n```\r\n127.0.0.1:6379> XREADGROUP group grp con block 0 streams x >\r\n(error) NOGROUP the consumer group this client was blocked on no longer exists\r\n(219.57s)\r\n127.0.0.1:6379> \r\n```\r\n\r\ni'm not sure if this is by design (maybe we don't want to `signalKeyAsReady` when a stream is deleted? a bit counter-intuitive) or a bug (current behavior does seem a bit weird)",
+        "comments": [
+            "@antirez any input on this one?",
+            "Another weird practicality thing here, is that it's not possible to know which message kicked you out of your blocking state, so you have no idea what message should actually be where you start if you recreate your consumer group... leading to a missed message. If the error contained the id of the message that unblocked us, we could use that to correctly restart without losing messages. As it is, I don't see any way to do avoid that without potentially reprocessing messages.",
+            "I think this is a bug...\r\ni see when we delete a group (XGROUP destroy), we will call `signalKeyAsReady`.\r\n\r\nso maybe we can call `signalKeyAsReady` too when we delete a stream.\r\nbut another problem is that in `handleClientsBlockedOnKeys`, we will call `lookupKeyReadWithFlags`,\r\nand we are not able `lookup` the key since we DEL the key in DELCOMMAND.",
+            "i suppose that in this case we should unblock the client with \"-UNBLOCKED key was deleted\"",
+            "there are also some weird cases like (doesn't matter):\r\n```\r\nclient1: brpop key 0\r\nclient2: set key value ... etc\r\n```\r\n\r\ni suppose stream can have groups, make it different.\r\nit feel like we will need to touch a lot of codes to \"fix\" it",
+            "I've started working on this issue and I'm having second thoughts...\r\nlet's assume call `signalModifiedKey` whenever we delete a stream. imagine this scenario:\r\n**stream does not exist**\r\nc1:\r\n```\r\nXREAD block 0 streams x $\r\n```\r\nc2:\r\n```\r\nMULTI\r\nXADD x * f v\r\nDEL x\r\nEXEC\r\n```\r\nin this case, c1 will be unblocked with `-UNBLOCKED key was deleted` but if we apply the same scenario while using a list or a set, the client will remain blocked (seems to be by design, see `test \"$pop, LPUSH + DEL should not awake blocked client\"`)\r\n\r\nit makes me think that maybe we should consider this issue as a known limitation, for which there's a workaround:\r\nin the top comment, if client B didn't use:\r\n```\r\n127.0.0.1:6379> XADD x * f v\r\n\"1581590682436-0\"\r\n```\r\nbut rather:\r\n```\r\n127.0.0.1:6379> XGROUP create x grp $ MKSTREAM\r\nOK\r\n127.0.0.1:6379> XADD x * f v\r\n\"1581590682436-0\"\r\n```\r\n\r\nthen client A would have been unblocked as expected:\r\n```\r\n127.0.0.1:6379> XREADGROUP group grp con block 0 streams x >\r\n1) 1) \"x\"\r\n   2) 1) 1) \"1581590682436-0\"\r\n         2) 1) \"f\"\r\n            2) \"v\"\r\n```",
+            "@itamarhaber @yossigo thoughts?",
+            "IMO a DEL should unblock any XREADGROUPs, per the top comment, and I can't imagine someone trying to \"unblock\" a consumer by recreating the stream.\r\nConversely, I don't think XREADs should be unblocked due to DELs.",
+            "@itamarhaber implemented your approach in #10306, please review"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48858,
+            "commit_id": "62fff84639c948ad2a6d668ebadee61b0982a84a",
+            "original_commit_id": "e8c5b66ed2aaf40bec345ff5aca90721fb707d30",
+            "path": "src/blocked.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 598,
+            "original_line": 584,
+            "side": "RIGHT",
+            "original_position": 156,
+            "position": 162,
+            "subject_type": "line",
+            "review_comments": [
+                "we'll need to update this with the changes in #10309 (whichever one is merged first)"
+            ]
+        },
+        {
+            "hunk_id": 48857,
+            "commit_id": "62fff84639c948ad2a6d668ebadee61b0982a84a",
+            "original_commit_id": "e8c5b66ed2aaf40bec345ff5aca90721fb707d30",
+            "path": "src/db.c",
+            "start_line": 225,
+            "original_start_line": 225,
+            "start_side": "RIGHT",
+            "line": 226,
+            "original_line": 226,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "what about FLUSHDB / SWAPDB / emptyDbStructure / swapMainDbWithTempDb ?"
+            ]
+        },
+        {
+            "hunk_id": 48859,
+            "commit_id": "62fff84639c948ad2a6d668ebadee61b0982a84a",
+            "original_commit_id": "e8c5b66ed2aaf40bec345ff5aca90721fb707d30",
+            "path": "src/blocked.c",
+            "start_line": 682,
+            "original_start_line": 658,
+            "start_side": "RIGHT",
+            "line": 683,
+            "original_line": 659,
+            "side": "RIGHT",
+            "original_position": 169,
+            "position": 199,
+            "subject_type": "line",
+            "review_comments": [
+                "what if the key was deleted, but then added as a new type before we got here (i.e. `dbOverwrite`), in that case `o!=NULL` and we need to handle it in the above case too.\r\n\r\nlet's add a test for this case"
+            ]
+        },
+        {
+            "hunk_id": 48856,
+            "commit_id": "62fff84639c948ad2a6d668ebadee61b0982a84a",
+            "original_commit_id": "e8c5b66ed2aaf40bec345ff5aca90721fb707d30",
+            "path": "src/blocked.c",
+            "start_line": 540,
+            "original_start_line": 533,
+            "start_side": "LEFT",
+            "line": 545,
+            "original_line": 545,
+            "side": "LEFT",
+            "original_position": 112,
+            "position": 112,
+            "subject_type": "line",
+            "review_comments": [
+                "same here, the rotate has some justification comment as if it's important to rotate it for the next time we get to this function (where in fact the use of `listFirst` makes anything else a dead end.",
+                "same as above"
+            ]
+        },
+        {
+            "hunk_id": 48860,
+            "commit_id": "62fff84639c948ad2a6d668ebadee61b0982a84a",
+            "original_commit_id": "e8c5b66ed2aaf40bec345ff5aca90721fb707d30",
+            "path": "src/db.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1354,
+            "original_line": 1354,
+            "side": "RIGHT",
+            "original_position": 65,
+            "position": 65,
+            "subject_type": "line",
+            "review_comments": [
+                "I think we don't need to check if the deleted stream is replaced with no-stream object:\r\n\r\n1. if the new object is not stream, it means the original key is overwritten, should awaken the blocked client.\r\n2. if the new object is stream, it may not have the specific group, should also awaken the blocked client to check if it needs to reply an `-NOGROUP` error.",
+                "1. not necessarily. if the new type of the key isn't list/zset/stream/module, no one will call `signalKeyAsReady` and the client will remain blocked.\r\n2. this statement is correct (but it's not related to this function, which only checks if the new key is not a stream)",
+                "I mean if the current stream is replaced with another db's stream, and the new stream doesn't have the original stream's group, we should also wake up the client in case it blocked forever.\r\n\r\nno matter what new type it is we all need to call `signalKeyAsReady`, so we don't need to check the replaced_with dict.",
+                "because the `SWAPDB` command on a stream key is like a transaction:\r\n```\r\nMULTI\r\nDEL stream\r\nXADD stream ...\r\nEXEC\r\n```",
+                "OK, I forgot you call `scanDatabaseForReadyKeys` after db swapped, I get your point now."
+            ]
+        },
+        {
+            "hunk_id": 48855,
+            "commit_id": "62fff84639c948ad2a6d668ebadee61b0982a84a",
+            "original_commit_id": "e8c5b66ed2aaf40bec345ff5aca90721fb707d30",
+            "path": "src/blocked.c",
+            "start_line": 303,
+            "original_start_line": 301,
+            "start_side": "LEFT",
+            "line": 307,
+            "original_line": 307,
+            "side": "LEFT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "i see this was added in 2cacdcd6f8ee0af32618ceff2d303acaa61645ab\r\nnot sure what was the purpose of that.\r\nis it just because the `continue` that existed before was silly (due to the use of `listFirst`), or maybe there was another concern?",
+                "@oranagra i'm not sure how to address this comment... yes, I believe all these loops that use listFirst are a relic from the past and that was a copy-paste mistake that affected most of these functions... i don't think there's any proper justification  to loop on the list like that",
+                "ok. just wanted to raise a discussion around that.\r\nmaybe it should be mentioned in the commit comment.",
+                "AFAICT in the past, there was only the function for list keys, which always serves a client (if the key was signaled as ready). so in that case, you could do a listFirst..popHead iteration\r\n\r\nand after streams were added, that wasn't the case anymore, so instead of using listNext, they used listRotate"
+            ]
+        }
+    ]
+}

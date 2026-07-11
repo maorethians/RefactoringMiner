@@ -1,0 +1,43 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 57486,
+    "lang": "c",
+    "pr_title": "arch/xtensa: Fix nested interrupt entry",
+    "pr_body": "The \"cross stack call\" mechanism has intermediate states where the stack frames are not valid for our own interrupt entry code, which causes corruption if an interrupt races at exactly the right time. Leave interrupts masked until just before the call.\r\n\r\nThe fix is midly complicated by the fact that we RELY on nested window exception frames to spill registers from the interruptee, so have to do the masking with PS.INTLEVEL, which requires a register to save its contents, which we don't have since everything needs to happen in one 4-register window.  But thankfully our Zephyr-reserved EPS register is guaranteed to be available through this process.\r\n\r\nFixes #57009",
+    "pr_comments": [
+        "Proposed fix for #57009 \r\n\r\nThis is working for me in the \"seems correct by construction and appears not to break anything\" sense.  But what I don't have yet is a stress rig to do lots of nested calls with arbitrary timing to validate that it actually fixes the bug.  Please test."
+    ],
+    "merged": true,
+    "created_at": "2023-05-03T22:26:51Z",
+    "issue_context": {
+        "number": 57009,
+        "title": "xtensa: nested interrupts not be working correctly",
+        "body": "I am observing weird exceptions during windows underflow/overflow and sometimes weird memory access (e.g. 0xffff0000). This all goes away when I mask all interrupt in `EXCINT_HANDLER`. Upon closer inspection into the interrupt handling code, it seems like the stashed registers may be overwritten from earlier interrupts:\r\n\r\n1. First level 1 interrupt comes it. The IRQ BSA is stored in the thread stack and inside `EXCINT_HANDLER`, `CROSS_STACK_CALL` would change the stack pointer to the interrupt stack.\r\n2. During handling of the first level 1 interrupt, a higher priority interrupt can fired and we will handle the second interrupt. This is due to `PS.EXCM` being cleared and `PS.INTLEVEL` being set to 1 at https://github.com/zephyrproject-rtos/zephyr/blob/a1d21ca69bf471b06ebaad6ce2ec74a9b32724ef/arch/xtensa/include/xtensa-asm2-s.h#L321-L339\r\n3. The code goes on to `CROSS_STACK_CALL` to switch stack from the thread stack to the interrupt stack. At https://github.com/zephyrproject-rtos/zephyr/blob/a1d21ca69bf471b06ebaad6ce2ec74a9b32724ef/arch/xtensa/include/xtensa-asm2-s.h#L255-L258, the stack pointer is moved back to the beginning of first IRQ BSA.\r\n4. If a higher priority interrupt comes in at the same time, the new IRQ BSA is being created, overwriting the first IRQ BSA created in step 1. This is due to stack pointer being moved back to the before the first IRQ BSA.\r\n5. When we finish processing the second interrupt, it goes back to continue handling the first interrupt but with the wrong context.\r\n\r\nNote that the issue happens when there are quite a bit of level 1 interrupts being serviced, interleaving with level 2 interrupts.\r\n\r\n@andyross Any thoughts?",
+        "comments": [
+            "Nice catch.  Yeah, this looks wrong to me too.  The interrupt unmask step clearly needs to happen after we're done messing with the SP, it seems pretty clear I just did it wrong the first time.  I don't see anything that's interrupt sensitive[1] until the jump to the user code inside CROSS_STACK_CALL, so it seems like we should just be able to move it there, maybe with some refactoring.\r\n\r\nI'm stuck in Taiwan this week without a development rig.  I'll try to have something by the beginning of next week, though maybe I can propose something you can test earlier.  Or maybe you'll just beat me to it. :)\r\n\r\n[1] With the one exception of register spill exceptions!  If we touch A4-A15, it's possible those will cause a window exception, which won't work if it's been masked (that one is a PS.EXCM mask, INTLVL isn't involved I don't think?).   I'm about 92% certain that all the assembly is written to A0-A3 only, but if there is a goof somewhere it would have worked previously where it won't now.  Needs an audit.",
+            "Been playing with this today.  It's distressingly subtle.  We need interrupts/exceptions globally masked while mucking with the stack pointer, EXCEPT for window exceptions, which have to be able to happen as we set up the cross stack call to spill the caller registers, so we can't just move the EXCM unmask until later.  It has to be done with an INTLEVEL set to the highest level, but doing that requires an extra scratch register (to save the current/correct interrupt level) which I don't have since everything here needs to run in one 4-register frame. \r\n\r\nSo I'm currently playing with reusing a spare word in the stack frame as swap space, which seems like it should work.  I've gotten it wrong about seven times now, shouldn't be more than a dozen more mistakes in there.  (Alternatively I could unwrap the macro expansion -- so the code knows which interrupt level it's handling and can express it as a constant.  This would probably be easier but has a fairly severe code size impact).\r\n\r\nStill working basically.  The right bit of insight will land eventually.  But really the problem is simple to understand at its core.",
+            "Plausible fix up, please review.  Finally woke up this morning remembering that the EPS* registers are already identified via the zsr mechanism, guaranteed not to be used until interrupt exit, and that I can roll the use of A0 as a scratch into the existing EXCM masking code.  So... it's actually like only 5 instructions different.  Not bad at all, just took me a week of remembering how this works to see it.\r\n\r\nAlso @dcpleung if you have a rig that can exercise via blasting syscall traps or whatever, we should probably turn that into a test.   The irq_offload() mechanism is what we use for testing nested frames on xtensa, but that only works synchronously.  And the nested test in tests/kernel/interrupt is ARM/ARC only currently (and due to the inflexible xtensa interrupt structure is going to require some work to make portable -- maybe we could add code to the gen_zsr.py script to do the detection)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 26882,
+            "commit_id": "eb22a633cccf50694bebfc5e82d43bbbf869b603",
+            "original_commit_id": "7abcfc4e4cc652659a0c812c7088c7aaab41fd68",
+            "path": "arch/xtensa/include/xtensa-asm2-s.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 349,
+            "original_line": 349,
+            "side": "RIGHT",
+            "original_position": 60,
+            "position": 60,
+            "subject_type": "line",
+            "review_comments": [
+                "`XCHAL_NMILEVEL` ?",
+                "In theory it shouldn't matter.  In practice NMILEVEL is set in a core-isa.h header and could be wrong if we mess up the toolchain setup.\r\n\r\nFWIW, by my read the ISA spec is pretty clear that INTLEVEL can have any value from 0 to 15.  It's the inbound interrupts that might be implemented only at certain levels."
+            ]
+        }
+    ]
+}

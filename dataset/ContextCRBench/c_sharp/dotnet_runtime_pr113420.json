@@ -1,0 +1,68 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 113420,
+    "lang": "c_sharp",
+    "pr_title": "Allow null key parameters for public keys and certificates.",
+    "pr_body": "If an X.509 certificate or PublicKey contained a subject public key info that lacked key parameters entirely, this would be represented as an empty array. A number of places incorrectly handled empty key parameters, and assumed key parameters would always be supplied. This changes the key parameters to be nullable, and return null instead. The places that were incorrectly handling missing parameters now correctly handle \"null\".\r\n\r\nFixes #110715 ",
+    "pr_comments": [
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\n    This serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "Note regarding the `new-api-needs-documentation` label:\r\n\r\n    This serves as a reminder for when your PR is modifying a ref *.cs file and adding/modifying public APIs, please make sure the API implementation in the src *.cs file is documented with triple slash comments, so the PR reviewers can sign off that change.",
+        "Will do the breaking change doc in a bit.",
+        "https://github.com/dotnet/docs/issues/45325"
+    ],
+    "merged": true,
+    "created_at": "2025-03-12T18:06:21Z",
+    "issue_context": {
+        "number": 110715,
+        "title": "PublicKey.ExportSubjectPublicKeyInfo() fails when parameters are absent",
+        "body": "### Description\n\nWith post-quantum cryptography, new algorithms are popping up; e.g., XMSS, an asymmetric signing algorithm.\n\nhttps://datatracker.ietf.org/doc/draft-ietf-lamps-x509-shbs/ defines the SubjectPublicKeyInfo format for this algorithm (registered at IANA with OID 1.3.6.1.5.5.7.6.34). Paragraph 5.2 specifies: \"PARAMS ARE absent\". This is allowed, see https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2.\n\nNote that e.g. RSA specifies PARAMS are NULL (i.e., not absent, but the ASN.1 encoding for NULL).\n\nThe example certificate https://www.ietf.org/archive/id/draft-ietf-lamps-x509-shbs-13.html#name-xmss-x509-v3-certificate-ex parses fine (e.g., using X509CertificateLoader). The PublicKey property is also accessible, including its raw data. The certificate can also be re-exported with `X509Certificate2.ExportCertificatePem()`, but the public key alone cannot using `X509Certificate2.PublicKey.ExportSubjectPublicKeyInfo()`, which gives:\n\n```\n  Stack Trace:\u2009\n    AsnWriter.WriteEncodedValue(ReadOnlySpan`1 value)\n    AlgorithmIdentifierAsn.Encode(AsnWriter writer, Asn1Tag tag)\n    --- End of inner exception stack trace ---\n    AlgorithmIdentifierAsn.Encode(AsnWriter writer, Asn1Tag tag)\n    SubjectPublicKeyInfoAsn.Encode(AsnWriter writer, Asn1Tag tag)\n    PublicKey.EncodeSubjectPublicKeyInfo()\n    PublicKey.ExportSubjectPublicKeyInfo()\n```\n\n\n### Reproduction Steps\n\nUsing the PEM certificate from https://www.ietf.org/archive/id/draft-ietf-lamps-x509-shbs-13.html#name-xmss-x509-v3-certificate-ex:\n\n```\nusing var certificate = X509CertificateLoader.LoadCertificate(pem);\n_ = certificate.PublicKey.ExportSubjectPublicKeyInfo();\n```\n\n### Expected behavior\n\nA valid ASN.1 DER encoding of the public key is returned.\n\n### Actual behavior\n\nSystem.Security.Cryptography.CryptographicException: ASN1 corrupted data. ---> System.ArgumentException: The input to WriteEncodedValue must represent a single encoded value with no trailing data. (Parameter 'value')\n\n### Regression?\n\n_No response_\n\n### Known Workarounds\n\nImplement a custom ASN.1 exporter, using the `Oid.Value` and `EncodedKeyValue.RawData` (and parameters must be absent).\n\n### Configuration\n\n.NET 9\nWindows 10\nx64\n\n### Other information\n\nThe code seems to allow for nullable parameters, but instead the parameters are set (incorrectly) to an empty Span: https://github.com/dotnet/runtime/blob/3aa1ec5bb1f50f0a1bed9cfcac8734f742bcf24b/src/libraries/Common/src/System/Security/Cryptography/Asn1/AlgorithmIdentifierAsn.xml.cs#L35-L45",
+        "comments": [
+            "Tagging subscribers to this area: @dotnet/area-system-security, @bartonjs, @vcsjones\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<!-- Policy app identification https://img.shields.io/static/v1?label=PullRequestIssueManagement. -->",
+            "Looks like the constructor (https://github.com/dotnet/runtime/issues/110715) requires parameter data (not nullable). So the absent parameters from the XMSS SubjectPublicKeyInfo are defaulted to an empty `AsnEncodedData`, which in turns fails to encode again upon export. I think the problem is that the parameters aren't nullable, which they should be according to the \"OPTIONAL\" in https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2.",
+            "This is a bit weird because the way `AsnEncodedData` and `PublicKey` work we don't have a good way to represent no parameters, rather its an empty array.\n\nIf all we want to do is fix `EncodeSubjectPublicKeyInfo`, then it would look something like this:\n\n```C#\ninternal AsnWriter EncodeSubjectPublicKeyInfo()\n{\n    SubjectPublicKeyInfoAsn spki = new SubjectPublicKeyInfoAsn\n    {\n        Algorithm = new AlgorithmIdentifierAsn\n        {\n            Algorithm = _oid.Value ?? string.Empty,\n\n            // Normalize an empty parameter value to null so that the serializer doesn't try to write empty.\n            Parameters = EncodedParameters.RawData switch\n            {\n                [] or null => default(ReadOnlyMemory<byte>?),\n                byte[] data => data\n            }\n        },\n        SubjectPublicKey = EncodedKeyValue.RawData,\n    };\n\n    AsnWriter writer = new AsnWriter(AsnEncodingRules.DER);\n    spki.Encode(writer);\n    return writer;\n}\n```\n\nBut we actually have the same bug here:\n\nhttps://github.com/dotnet/runtime/blob/b33f75519ea498df81b38fab75c4813b03c9a3e3/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/X509Certificates/CertificateRequest.cs#L841\n\nWhich can be reproduced with\n\n```C#\nusing System.Security.Cryptography;\nusing System.Security.Cryptography.X509Certificates;\n\nusing ECDsa ec = ECDsa.Create(ECCurve.NamedCurves.nistP256);\nCertificateRequest rootReq = new CertificateRequest(\"CN=root\", ec, HashAlgorithmName.SHA256);\nrootReq.CertificateExtensions.Add(X509BasicConstraintsExtension.CreateForCertificateAuthority());\n\nusing X509Certificate2 root = rootReq.CreateSelfSigned(DateTimeOffset.Now, DateTimeOffset.Now.AddYears(1));\n\nX509SignatureGenerator gen = X509SignatureGenerator.CreateForECDsa(ec);\nPublicKey key = new PublicKey(new Oid(\"1.2.3.4\"), new AsnEncodedData([]), new AsnEncodedData([1, 2, 3, 4]));\nCertificateRequest req = new(new X500DistinguishedName(\"CN=test\"), key, HashAlgorithmName.SHA256);\n\nX509Certificate c = req.Create(\n    root.SubjectName,\n    gen,\n    DateTimeOffset.Now.AddDays(1),\n    DateTimeOffset.Now.AddDays(2),\n    RandomNumberGenerator.GetBytes(9));\n```\n\n\nSo we have two options here.\n\n1. We can normalize empty arrays to `null`. This is \"fine\" because empty is not a legal ASN.1 encoding. ASN.1 things can be empty, but they have empty encodings (like an empty SEQUENCE is 0x30, 0x00). This is a truly empty array.\n\n    The downside to this is that any time someone interacts with PublicKey.EncodedParameters, checking for `null` to mean no parameters in the AlgorithmIdentifier is not the right thing to do. We have already missed this in at least two places, likely because there hasn't been a strong use case for no parameters until now.\n\n    The upside is that the changes are relatively simple.\n \n2. We change `PublicKey.EncodedParameters` and its associated constructor input to be nullable, and permit `null`. We have a type system and null, and use real nulls. The certificate PALs would need to be adjusted to return a real null instead of an empty array.\n\n    The downside to this is that is a breaking change and it is more work. The latter I am not really worried about.\n\n    The upside is that we use the type system to actually convey when no values are expected instead of empty array sentinels.",
+            "> We change PublicKey.EncodedParameters and its associated constructor input to be nullable, and permit null.\n\nI gave this a quick go and it did point out that we have a number of places where we expose the algorithm parameters, and if we wanted to make them nullable, the API diff would be\n\n```diff\nnamespace System.Security.Cryptography.X509Certificates;\n\npublic sealed partial class PublicKey\n{\n-    public PublicKey(Oid oid, AsnEncodedData parameters, AsnEncodedData keyValue);\n+    public PublicKey(Oid oid, AsnEncodedData? parameters, AsnEncodedData keyValue);\n\n-    public AsnEncodedData EncodedParameters { get; }\n+    public AsnEncodedData? EncodedParameters { get; }\n}\n\npublic partial class X509Certificate\n{\n-    public virtual byte[] GetKeyAlgorithmParameters();\n+    public virtual byte[]? GetKeyAlgorithmParameters();\n\n-    public virtual string GetKeyAlgorithmParametersString();\n+    public virtual string? GetKeyAlgorithmParametersString();\n}\n```\n\nSo the scope of the breaking change is bigger than just `PublicKey`, if we decided that \"`null` is the way we want to represent no parameters\".\n\nThat is making me lean more toward using the empty array as we were, and fixing places where we need to check for empty arrays.\n\nThat said, using a nullable and a type system did help me uncover more places where we are not handling the empty algorithm identifier parameters correctly, like \n\nhttps://github.com/dotnet/runtime/blob/d108be1917222891d3a41ac798441a248a046989/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/X509Certificates/Pkcs10CertificationRequestInfo.cs#L55\n\nI think using nullable is still the \"right\" thing to do if it were a do-over, but I am not sure now given the scope of the nullability changes that need to be made.",
+            "The discussion with some other members of API Review was that if there is \"significant\" value in returning `null` (vs `Array.Empty<byte>()`), then we should go ahead and let null be null.\n\nGiven that we show the full ASN encoding, there's no ambiguity between the two, because \"omitted\" is empty (or null) and \"NULL\" is `[0x05, 0x00]` (and `OCTET STRING \"\"` is `[0x04, 0x00]`), which makes it \"minor\".  However, in chatting with @vcsjones, he feels that it's \"significant\" because \"using a nullable and a type system did help me uncover more places where we are not handling the empty algorithm identifier parameters correctly\".\n\nGiven that a) the nullability annotation reflecting the possibility of null helped find bugs, and b) there are basically no direct callers of this API; let's consider it \"significant to the few callers\" and take the breaking change."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3154,
+            "commit_id": "db7042359feea0db1bff2497d409fc50742c7cb9",
+            "original_commit_id": "82c916f423fdbb3bc7a2425a253f961363078f8b",
+            "path": "src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/X509Certificates/OpenSslX509Encoder.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 178,
+            "original_line": 178,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 30,
+            "subject_type": "line",
+            "review_comments": [
+                "Aren't DSS-Parms always required?",
+                "Or is this because of the weird thing where they're allowed to come from somewhere else in the certificate?",
+                "Yeah. My thought was \"let the platform do what the platform is going to do in the absence of correct DSA/DSS parameters\""
+            ]
+        },
+        {
+            "hunk_id": 3153,
+            "commit_id": "db7042359feea0db1bff2497d409fc50742c7cb9",
+            "original_commit_id": "82c916f423fdbb3bc7a2425a253f961363078f8b",
+            "path": "src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/X509Certificates/X509Certificate.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 535,
+            "original_line": 535,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "If _lazyKeyAlgorithmParameters is null, calling CloneByteArray() will throw a NullReferenceException. Replace the call with a null-conditional version (e.g. _lazyKeyAlgorithmParameters?.CloneByteArray()) and return null when appropriate.\n```suggestion\n            return _lazyKeyAlgorithmParameters?.CloneByteArray();\n```",
+                "> If _lazyKeyAlgorithmParameters is null, calling CloneByteArray() will throw a NullReferenceException\r\n\r\nit will not. It's an extension method that handles null.\r\n\r\nhttps://github.com/dotnet/runtime/blob/82c916f423fdbb3bc7a2425a253f961363078f8b/src/libraries/Common/src/System/Security/Cryptography/Helpers.cs#L54-L63"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,62 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 11084,
+    "lang": "c",
+    "pr_title": "bugfix:del keys in slot replicate to replica, and trigger other invalidations",
+    "pr_body": "Bugfix:\r\nwith the scenario if we force assigned a slot to other master,  old master will lose the slot ownership, then old master will call the function delKeysInSlot() to delete all keys which in the slot. These delete operations should replicate to replicas, avoid the data divergence issue in master and replicas.\r\n\r\nAdditionally, in this case, we now call:\r\n* signalModifiedKey (to invalidate WATCH)\r\n* moduleNotifyKeyspaceEvent (key space notification for modules)\r\n* dirty++ (to signal that the persistence file may be outdated)\r\n\r\nFixes #10967\r\n\r\n> Release notes: Fix a bug where nodes in a cluster may not replicate or handle internal events for keys deleted when another node in the cluster claimed a slot.",
+    "pr_comments": [
+        "Close https://github.com/redis/redis/issues/10967",
+        "So the master in this case will replicate a single `CLUSTER SLOTFLUSH` command (rather than a ton of DEL commands) to the replica, but what about an AOF file? i suppose that's currently also broken, and will be solved by the same new command?\r\n\r\nbesides that, all the other missing DEL related actions are still needed (on both the master and replica).\r\ni.e. `notifyKeyspaceEvent`, `signalModifiedKey`, `dirty++`.",
+        "thanks for your advise @judeng @madolson @oranagra @MeirShpilraien \r\nI have already update this pr with 'signalModifiedKey, dirty++'\r\n\r\n@oranagra clusterCommand is \u201cCMD_ADMIN\u201d command , so i think \"CLUSTER SLOTFLUSH\" maybe not better replicate to the replica",
+        "@weim0000 i think we're still missing notifyKeyspaceEvent.\r\n\r\nRegarding CLUSTER being an admin command, i don't see a problem with that.\r\ni do think it's better to send one command down the line rather than a flood of DEL commands.\r\n\r\nBut more importantly, i agree with @madolson that it's better that the slot ownership changes are better be properly sequenced on the data stream rather than relying on the cluster bus alone.\r\n@madolson i imagine such a thing is a much bigger task with some chance for issues from race conditions.\r\nhow do you suggest proceeding? fix the local bugs (keyspace notifications, dirty, watch... which happen on the master too) in one PR while we're planning the bigger change elsewhere? or also propagate deletions in some way here and live with the odd state (arguably an improvement over what we have now)? ",
+        "> i do think it's better to send one command down the line rather than a flood of DEL commands.\r\n\r\n@oranagra There is a scenario where the master node of the cluster has a replica in standalone mode,and it is strange to execute the `cluster slotflush` command on this `standalone` replica. DEL command is a more general solution IMO\r\n",
+        "> i think we're still missing notifyKeyspaceEvent.\r\n\r\nI doubt if there really is a need to notify the keyspace events to users here, these keys already belong to **dirty data** that the user cannot access\r\n",
+        "> @oranagra There is a scenario where the master node of the cluster has a replica in standalone mode,and it is strange to execute the `cluster slotflush` command on this `standalone` replica. DEL command is a more general solution IMO\r\n\r\ni don't think it's a viable configuration, for a cluster node to have a replica in standalone more.\r\nmaybe there is a scenario where some tool is used to replicate the data from that node where the replica is not a redis-server.\r\ne.g. it could be something like `redis-cli --slave` or a [redis-rdb-cli](https://github.com/leonchen83/redis-rdb-cli), and you're right that such a command could break it, but arguably DELs are much worse.\r\ni.e. imagine someone with 3 cluster nodes, and a tool that replicates or migrates the data from these nodes to a target that's a standalone redis, getting these DELs from one node would delete the keys from the target.\r\nso a logical command that says these keys moved would be better than a DEL that's indistinguishable from a normal DEL.\r\ni'm not sure we wanna consider this case, just stating it since you raised it.\r\n\r\n> I doubt if there really is a need to notify the keyspace events to users here, these keys already belong to dirty data that the user cannot access\r\n\r\nI agree, sending keyspace notification about deletions will cause a similar damage as i mentioned above (the keys were not really deleted from the database, just moved), but i do think modules need to know these keys are no longer locally available, so i think we should send some keyspace notification just to modules.",
+        "> @madolson i imagine such a thing is a much bigger task with some chance for issues from race conditions.\r\n\r\nYes, I don't think we should address the wider issue here, there is another issue https://github.com/redis/redis/pull/10517 which aims to address a bunch of these items, I would prefer us address it there. Any type of complex change would also be unwise to backport. Therefor, I think the current outlined approach is acceptable for now, since it's solving the data divergence issue. We can safely backport it to 7.0 and earlier, and we can continue on the long term approach.",
+        "thanks for your advise @judeng @madolson @oranagra \r\nI have already update this pr with 'moduleNotifyKeyspaceEvent'\r\n\r\n> Therefor, I think the current outlined approach is acceptable for now, since it's solving the data divergence issue. We can safely backport it to 7.0 and earlier, and we can continue on the long term approach.\r\n\r\ni agree\r\n",
+        "@weim0000 Cool, change looks gtm. Would you be comfortable adding a test around this case? Want to avoid future regressions here, since we clearly weren't testing for it.",
+        "thanks @madolson  i have added a test for this case, and update cluster.c with 'call propagatePendingCommands();'.\r\nplease review, thanks",
+        "thanks @enjoy-binbin  i have already update the test",
+        "thanks @oranagra \r\ni have already resolve all the conversations",
+        "@weim0000 I moved the test to the new framework, so now the tests will run as part of CI. Also kicked off a full test run here: https://github.com/redis/redis/actions/runs/2897153567.",
+        "@weim0000 thank you.\r\nthis is ready for merge IMO, can you please update the top comment with the scenario in which it happens, and the implications of the bug / changes.\r\nthis will serve as a commit command and for the purpose of release notes.",
+        "@oranagra OK, thanks. \r\n"
+    ],
+    "merged": true,
+    "created_at": "2022-08-18T10:39:50Z",
+    "issue_context": {
+        "number": 10967,
+        "title": "[BUG] delete keys operation not replicate to slave when 'remove all the keys from the slots we lost'",
+        "body": "**Describe the bug**\r\n\r\nwe received an update message which removed ownership for certain slots we still have keys about, we need to remove all the keys from the slots we lost, **but these delete keys operation not replicate to replica**\r\n\r\n**To reproduce**\r\nhttps://github.com/redis/redis/blob/unstable/src/cluster.c#L1953\r\nhttps://github.com/redis/redis/blob/unstable/src/cluster.c#L6981\r\n```\r\n/* Remove all the keys in the specified hash slot.\r\n * The number of removed items is returned. */\r\nunsigned int delKeysInSlot(unsigned int hashslot) {\r\n    unsigned int j = 0;\r\n    dictEntry *de = (*server.db->slots_to_keys).by_slot[hashslot].head;\r\n    while (de != NULL) {\r\n        sds sdskey = dictGetKey(de);\r\n        de = dictEntryNextInSlot(de);\r\n        robj *key = createStringObject(sdskey, sdslen(sdskey));\r\n        dbDelete(&server.db[0], key);\r\n        decrRefCount(key);\r\n        j++;\r\n    }\r\n    return j;\r\n}\r\n\r\n```\r\nafter exec 'dbDelete(&server.db[0], key)', I think we should replicate 'del key' to replica,  am i right? @oranagra @judeng \r\n\r\n**Expected behavior**\r\n\r\n\r\n```\r\n/* Remove all the keys in the specified hash slot.\r\n * The number of removed items is returned. */\r\nunsigned int delKeysInSlot(unsigned int hashslot) {\r\n    unsigned int j = 0;\r\n    dictEntry *de = (*server.db->slots_to_keys).by_slot[hashslot].head;\r\n    while (de != NULL) {\r\n        sds sdskey = dictGetKey(de);\r\n        de = dictEntryNextInSlot(de);\r\n        robj *key = createStringObject(sdskey, sdslen(sdskey));\r\n        dbDelete(&server.db[0], key);\r\n\r\n        /******\r\n        propagateDeletion(&server.db[0], key, server.lazyfree_lazy_server_del);\r\n        ******/\r\n\r\n        decrRefCount(key);\r\n        j++;\r\n    }\r\n    return j;\r\n}\r\n```\r\n\r\n\r\n",
+        "comments": [
+            "@weim0000 have you really reproduced this? can you share the reproduction scenario? or is it just a theoretical issue from reviewing the code.\r\n@madolson please take a look.",
+            "@oranagra thanks ,  I reproduced this:\r\n\r\nI create a test cluster:\r\n127.0.0.1:6001(master)<-127.0.0.1:6004(replica)\r\n127.0.0.1:6002(master)<-127.0.0.1:6005(replica)\r\n127.0.0.1:6003(master)<-127.0.0.1:6006(replica)\r\n\r\nslot 3498 assinged to 127.0.0.1:6001:\r\n127.0.0.1:6001> cluster countkeysinslot 3498\r\n(integer) 7\r\n\r\nthen I force assinged 3498 to 127.0.0.1:6002:\r\n127.0.0.1:6002> cluster setslot 3498 node 579ae52c8ca288cdd8545bb57c7ace0e97e8f4f5\r\nOK\r\n127.0.0.1:6002> cluster countkeysinslot 3498\r\n(integer) 0\r\n\r\nthen 127.0.0.1:6001 loss slot 3498, and delete all keys in slot(3498):\r\n127.0.0.1:6001> cluster countkeysinslot 3498\r\n(integer) 0\r\n\r\nthen I access 127.0.0.1:6004,  It's a replica of 127.0.0.1:6001,   but  127.0.0.1:6004 always have some keys in slot 3498:\r\n**127.0.0.1:6004> cluster countkeysinslot 3498\r\n(integer) 7**\r\n\r\nso I think 127.0.0.1:6001 not replicate some delete keys operation to replica(127.0.0.1:6004)",
+            "I'm not sure that the correct behavior is to replicate the deletes, but the replicas should be purging the keys from slots that are no longer owned from their masters. We should probably address some of this here: https://github.com/redis/redis/pull/10517."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48839,
+            "commit_id": "200b73a7ed7aab00fc42b34b57799c4df40e4dd1",
+            "original_commit_id": "3a16ad30b7a7918f036b23c6f5cf079c04baab05",
+            "path": "src/cluster.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 7067,
+            "original_line": 7066,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 7,
+            "subject_type": "line",
+            "review_comments": [
+                "considering the fresh topic of #10969, we should put the key-space notification after the deletion and propagation..",
+                "@oranagra what is the reason we eventually did not put after the del notification?",
+                "i'm not sure.\r\nmaybe after we reverted the changes in 10969 we concluded the only thing that matters is that it's after the actual deletion, and the order with propagation doesn't matter (since KSN should only do read-only actions)?\r\ni can't seem to be able to find any written message about that.\r\n@weim0000 do you recall anything?",
+                "https://github.com/redis/redis/pull/11084#issuecomment-1208292059\r\n@oranagra is this \uff1f",
+                "and https://github.com/redis/redis/pull/11084#issuecomment-1209433976\r\n\r\n> I agree, sending keyspace notification about deletions will cause a similar damage as i mentioned above (the keys were not really deleted from the database, just moved), but i do think modules need to know these keys are no longer locally available, so i think we should send some keyspace notification just to modules.",
+                "these comments just say that it may be wrong to issue keyspace notification to clients, but we do want to send a notification to modules.\r\n\r\nthe question @MeirShpilraien asks is why we didn't put the call to `moduleNotifyKeyspaceEvent` before `propagatePendingCommands`.\r\ni guess we just forgot.\r\n\r\nanyway, Meir is fixing that in #11199"
+            ]
+        }
+    ]
+}

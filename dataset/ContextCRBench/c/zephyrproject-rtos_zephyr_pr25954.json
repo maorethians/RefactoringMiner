@@ -1,0 +1,154 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 25954,
+    "lang": "c",
+    "pr_title": "Bluetooth: Fix RX thread deadlock",
+    "pr_body": "Fix host RX thread being deadlocked. The deadlock occurs because the\r\nRX thread is stuck waiting in conn_tx_alloc with K_FOREVER but if the\r\nconnection is disconnected only the RX thread can unblock it in the\r\nhandling of the disconnect event.\r\n\r\nFixes this deadlock by splitting the processing of the\r\ndisconnected event into two parts.\r\nThe part needed to unblock the RX is to release resources held by\r\nunack'ed TX packets and mark the connection state as not connected\r\nanymore.\r\nThe RX thread waiting for free_tx fifo and the TX thread waiting for\r\nthe bt_dev.le.pkts semaphore will both check the connected state after\r\nhaving acquired them and will abort if disconnected.\r\nThe rest of the processing will be handled at normal RX thread\r\npriority like normal.\r\n\r\nThe HCI drivers need to be updated to deliver the disconnected event\r\nfrom both priority and normal RX context.\r\n\r\nAlso fix an issue with the advertiser not resuming connectable\r\nadvertiser if the last bt_conn_unref happens from something other\r\nthan the disconnected callback.\r\nIn this case this last bt_conn_unref was from gatt.c notify_cb called\r\nfrom application main thread.\r\n\r\n\r\nFixes: #23364\r\nFixes: #26467",
+    "pr_comments": [
+        "**All checks passed.**\n\n\n\n*Tip: The bot edits this comment instead of posting a new one, so you can check the comment's history to see earlier messages.*",
+        "@erwango @cvinayak @thoh-ot @alexandru-porosanu-nxp could you please test this with your respective Bluetooth platforms please? At the very least connection and disconnection multiple times, ideally with ongoing traffic.",
+        "> @erwango @cvinayak @thoh-ot @alexandru-porosanu-nxp could you please test this with your respective Bluetooth platforms please? At the very least connection and disconnection multiple times, ideally with ongoing traffic.\r\n\r\nYep, I can do that; I'm thinking of using peripheral_hr (VEGA) & central_hr (NRF) and hack one of them to disconnect and reconnect at about 5-10s interval. If you have a better scenario in mind, let me know and I'll try to figure out how to do it...",
+        "Testing on nucleo_wb55rg, I face an issue on disconnect (while HRM notifications are on)\r\n`[00:00:24.124,000] <wrn> bt_hci_core: Unhandled event 0x00 len 2: 0813  `\r\nThen, impossible to reconnect.\r\nWorks fine on master (fae5d96618632458e15c5c33dd81bb860126ad1b)\r\n\r\nEDIT: I'm seeing the same behavior with disco_l475_iot1 (different BT controller, different HCI driver)",
+        "> Testing on nucleo_wb55rg, I face an issue on disconnect (while HRM notifications are on)\r\n> `[00:00:24.124,000] <wrn> bt_hci_core: Unhandled event 0x00 len 2: 0813 `\r\n> Then, impossible to reconnect.\r\n> Works fine on master ([fae5d96](https://github.com/zephyrproject-rtos/zephyr/commit/fae5d96618632458e15c5c33dd81bb860126ad1b))\r\n> \r\n> EDIT: I'm seeing the same behavior with disco_l475_iot1 (different BT controller, different HCI driver)\r\n\r\nThanks @erwango. Yes the HCI driver shouldn't matter. It is because the bt_recv_prio is doing net_buf_mem_pull on the buf, the state needs to be saved and restored.\r\nIt doesn't happen in the hci_driver.c because it doesn't re-use the buf.\r\n\r\nPushed a fix for this issue.",
+        "> > Testing on nucleo_wb55rg, I face an issue on disconnect (while HRM notifications are on)\r\n> > `[00:00:24.124,000] <wrn> bt_hci_core: Unhandled event 0x00 len 2: 0813 `\r\n> > Then, impossible to reconnect.\r\n> > Works fine on master ([fae5d96](https://github.com/zephyrproject-rtos/zephyr/commit/fae5d96618632458e15c5c33dd81bb860126ad1b))\r\n> > EDIT: I'm seeing the same behavior with disco_l475_iot1 (different BT controller, different HCI driver)\r\n> \r\n> Thanks @erwango. Yes the HCI driver shouldn't matter. It is because the bt_recv_prio is doing net_buf_mem_pull on the buf, the state needs to be saved and restored.\r\n> It doesn't happen in the hci_driver.c because it doesn't re-use the buf.\r\n> \r\n> Pushed a fix for this issue.\r\n\r\nOk, I'm not able to reproduce anymore.\r\nI've tried to test more and it's working so far. 2 times, I had trouble to restart HRM notifications, but second request went through (not sure this is related of even a zephyr issue).",
+        "> > @erwango @cvinayak @thoh-ot @alexandru-porosanu-nxp could you please test this with your respective Bluetooth platforms please? At the very least connection and disconnection multiple times, ideally with ongoing traffic.\r\n> \r\n> Yep, I can do that; I'm thinking of using peripheral_hr (VEGA) & central_hr (NRF) and hack one of them to disconnect and reconnect at about 5-10s interval. If you have a better scenario in mind, let me know and I'll try to figure out how to do it...\r\n\r\nI changed the scenario a bit and did about 10 connect/disconnect with NXP IoT toolbox to the VEGA board running peripheral_hr. So far, no issues. ",
+        "In general this does seem like the right way to solve the issue. However, could we consider some other name for the new bt_conn state? \"Priority' is appropriate for a thread or context, but not a state IMO. Something like PRE_DISCONNECT, or DISCONNECT_1 and DISCONNECT_2 would make more sense to me.",
+        "I think I'd also like to generalise this more. I didn't look through the driver changes, but you can't e.g. assume that the host won't change the parsing state of the net_buf, so net_buf_simple_save/restore may need to be used on the driver side.\r\n\r\nThat said, I don't think it's particularly clean to have the driver have to deal with this. The two-stage processing details would really be best to be left to the host. However, this will require even more redesign of the HCI driver interface. What we would need is a for the host to inject net_bufs to the \"root\" of the RX threaad. That way you could always feed the disconnect through bt_recv_prio() to the host, and the host would then re-inject it to itself through the RX thread. Another use case that might benefit from this is the ECDH emulation that hci_ecc.c does, i.e. it might make sense to have it feed the HCI events through the RX thread instead of its own.",
+        "> That said, I don't think it's particularly clean to have the driver have to deal with this. The two-stage processing details would really be best to be left to the host. However, this will require even more redesign of the HCI driver interface. What we would need is a for the host to inject net_bufs to the \"root\" of the RX threaad.\r\n\r\nI was considering this, but this is complicated by the BT_RECV_IS_RX_THREAD option. All the drivers that don't select this one has the same handling for bt_recv and bt_recv_prio. We could move the processing of this to bt_recv in that case.\r\nThe drivers that select this option is the zephyr controller and the H4. Maybe we could remove this option from H4 to further simplify it. \r\n",
+        "@jhedberg @carlescufi Pushed a commit with suggestion for moving the bt_recv/bt_recv_prio handling to the Host when BT_RECV_IS_RX_THREAD is not defined.\r\nIf we agree to do this I can rebase it properly. Not exactly sure what should be done when this option is defined. The HCI driver is the one with the most complicated bt_recv/bt_recv_prio handling.",
+        "CC: @rugeGerritsen This affects the nRF BLE Controller.",
+        "> In general this does seem like the right way to solve the issue. However, could we consider some other name for the new bt_conn state? \"Priority' is appropriate for a thread or context, but not a state IMO. Something like PRE_DISCONNECT, or DISCONNECT_1 and DISCONNECT_2 would make more sense to me.\r\n\r\nI've been trying to come up with sensible names, it's not easy.\r\nI would prefer to leave DISCONNECTED state name as is, since this is also the initial state.\r\nThe _1 and _2 versions I'm not sure if you meant for what is now DISCONNECTED_PRIO, and DISCONNECTED, or DISCONNECT, and DISCONNECTED_PRIO\r\n\r\nBest I could come up with:\r\n`BT_CONN_DISCONNECT_CMD` (HCI disconnect command has been sent)\r\n`BT_CONN_DISCONNECT_EVT`  (HCI disconnect complete event has been received).\r\n`BT_CONN_DISCONNECTED`\r\nor possibly:\r\n`BT_CONN_DISCONNECT_SENT`\r\n`BT_CONN_DISCONNECT_RCVD`\r\n`BT_CONN_DISCONNECTED`\r\n\r\n@carlescufi @jhedberg Thoughts?\r\n\r\nEDIT:\r\nAlso this, but is not very clear:\r\n`BT_CONN_DISCONNECT` -> `BT_CONN_DISCONNECTING` -> `BT_CONN_DISCONNECTED`",
+        "@jhedberg \r\n\r\n>I think I'd also like to generalise this more. I didn't look through the driver changes, but you can't e.g. assume that the host won't change the parsing state of the net_buf, so net_buf_simple_save/restore may need to be used on the driver side.\r\n\r\nI think that in the case of an event that is **both** prio and normal we could guarantee that the host will leave it untouched.\r\n\r\n>That said, I don't think it's particularly clean to have the driver have to deal with this. The two-stage processing details would really be best to be left to the host. \r\n\r\nIn an ideal world, I completely agree. But the problem is the combined builds and the h4 driver, where the driver and stack are already tightly coupled by the fact that `CONFIG_BT_RECV_IS_RX_THREAD=y`\r\n\r\n>That way you could always feed the disconnect through bt_recv_prio() to the host, and the host would then re-inject it to itself through the RX thread\r\n\r\nThat won't work in the combined build. You would be reordering data and events, because at the point you receive the disconnected event through `bt_recv_prio()` there might well be data and other events that are queued inside `hci_driver.c` in non-net_buf format yet, and that haven't been processed into the queue that ends up creating the sequence of calls to `bt_recv()`.",
+        "~I just realized, for the drivers where `CONFIG_BT_RECV_IS_RX_THREAD=n`, this breaks the priority handling of num complete (and now disconnect), which is still required. If those drivers just call `bt_recv()` and the RX thread is blocked then posting it to the rx queue won't help. You still need to be able to execute the processing of the event from another context, which in this case is whoever calls `bt_recv_prio()`.~\r\nEDIT: Sorry, ignore this. I see that you are doing that inside `bt_recv()`, not sure why I got confused.",
+        "> @joerchan\r\n> My preference would be to unify the \"disconnection in progress\" state into a single one:\r\n> \r\n> * `BT_CONN_DISCONNECTING`: Applies to both having called `bt_hci_disconnect` or having recieved the first disconnect event through `bt_recv_prio`\r\n> * `BT_CONN_DISCONNECTED`: Final disconnection complete processed\r\n> \r\n> if that is not possible then I would suggest:\r\n> \r\n> * `BT_CONN_DISCONNECTING_LOC` (or `BT_CONN_DISC_LOCAL`): Applies to having called `bt_hci_disconnect`\r\n> * `BT_CONN_DISCONNECTING_REM` (or `BT_CONN_DISC_REMOTE`): Applies to having recieved the first disconnect event through `bt_recv_prio`\r\n> * `BT_CONN_DISCONNECTED`: Final disconnection complete processed\r\n\r\nThe reason why I added a new state instead of re-using `BT_CONN_DISCONNECT` state is that that would introduce a no state change in `bt_conn_set_state` since the event is generated when initiating locally as well.\r\nUsing remote/local might be confusing since it might be related to who initiated the disconnect (hci status codes: `BT_HCI_ERR_REMOTE_USER_TERM_CONN` and  `BT_HCI_ERR_LOCALHOST_TERM_CONN`). So I think using cmd/evt or sent/rcvd would be better.",
+        "@carlescufi @jhedberg Updated according to what we agreed on. The use of flags didn't turn out as clean as I would have wanted it, but maybe it is good enough.",
+        "The ADV resume commit f24c38c306 (in local 2.2.1 backport version) fixes our ADV race condition, +1 from me.",
+        "> The ADV resume commit [f24c38c](https://github.com/zephyrproject-rtos/zephyr/commit/f24c38c3069c1202641902fc9de8a71ce5752977) (in local 2.2.1 backport version) fixes our ADV race condition, +1 from me.\r\n\r\nGreat. I have created a separate bug-report in case others run into the issue, they can then see that it has been fixed."
+    ],
+    "merged": true,
+    "created_at": "2020-06-19T14:23:51Z",
+    "issue_context": {
+        "number": 26467,
+        "title": "Bluetooth: Race-condition on persistent connectable advertiser",
+        "body": "**Describe the bug**\r\nRace-condition in persistent connectable advertiser, the advertiser will not resuming connectable advertiser if the last bt_conn_unref happens from something other than the disconnected callback.\r\nAn example of this happening is when the disconnect happens while application is calling bt_gatt_notify.\r\nThe  last bt_conn_unref can then be from gatt.c notify_cb called from application main thread.\r\n\r\n**To Reproduce**\r\nIssue was discovered while fixing https://github.com/zephyrproject-rtos/zephyr/issues/2336\r\n\r\nFrom @cvinayak:\r\nhttps://github.com/cvinayak/zephyr/commit/0b01ebdd559c009416458c583f122647d98d2bd1\r\n\r\nAbove branch will make it easy to reproduce (its a branch with the patch in the issue description applied).\r\n\r\nSteps to reproduce (timing related):\r\n1. build and flash the peripheral sample from the branch.\r\n2. build and flash a vanilla central_hr sample in another board.\r\n3. When central_hr connects and peripheral sample prints out `Connected: <bdaddr>`, reset the central_hr board to cause linkloss (linkloss needs to occur during service discovery).\r\n4. peripheral sample will get stuck in conn_tx_alloc function in host/conn.c \r\n\r\nReproducible in latest master too (62b985409e):\r\nhttps://github.com/cvinayak/zephyr/commit/55153bed706b662018e5a07e20a7e26d4f6ed463\r\n\r\nWith the bug-fix for the deadlock in place the connectable advertiser was not restarting advertising after disconnect.\r\n\r\n**Expected behavior**\r\nIf there are connection objects available the connectable advertiser should be advertising.\r\n\r\n**Impact**\r\nAdvertiser not active when it should be.\r\n\r\n**Workaround**\r\nStop and start the advertiser again, or use OPT_ONE_TIME and handle in application manually.\r\n\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 27838,
+            "commit_id": "938df2953aaed08c6606592e716692256892b604",
+            "original_commit_id": "f42cddf0830c527aaea7bd8eb645fceee23276ea",
+            "path": "subsys/bluetooth/host/conn_internal.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 10,
+            "original_line": 10,
+            "side": "RIGHT",
+            "original_position": 2,
+            "position": 2,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this packed by the way?",
+                "I think it is to make it an uint8_t instead of a uint32_t in the bt_conn definition, since it is declared as bt_conn_state_t state;\r\nBut not sure that is the original thought behind this."
+            ]
+        },
+        {
+            "hunk_id": 27839,
+            "commit_id": "938df2953aaed08c6606592e716692256892b604",
+            "original_commit_id": "f42cddf0830c527aaea7bd8eb645fceee23276ea",
+            "path": "subsys/bluetooth/host/hci_core.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 6429,
+            "original_line": 6429,
+            "side": "RIGHT",
+            "original_position": 132,
+            "position": 135,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this safe after the `net_buf` has been processed by `hci_event_prio`? i.e. has its internal state not been modified?",
+                "It should be, because `hci_event_prio` will save the state and restore it before returning."
+            ]
+        },
+        {
+            "hunk_id": 27409,
+            "commit_id": "938df2953aaed08c6606592e716692256892b604",
+            "original_commit_id": "f42cddf0830c527aaea7bd8eb645fceee23276ea",
+            "path": "subsys/bluetooth/host/conn_internal.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 10,
+            "original_line": 10,
+            "side": "RIGHT",
+            "original_position": 2,
+            "position": 2,
+            "subject_type": "line",
+            "review_comments": [
+                "Why is this packed by the way?",
+                "I think it is to make it an uint8_t instead of a uint32_t in the bt_conn definition, since it is declared as bt_conn_state_t state;\r\nBut not sure that is the original thought behind this."
+            ]
+        },
+        {
+            "hunk_id": 27408,
+            "commit_id": "938df2953aaed08c6606592e716692256892b604",
+            "original_commit_id": "f42cddf0830c527aaea7bd8eb645fceee23276ea",
+            "path": "subsys/bluetooth/host/conn_internal.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 216,
+            "original_line": 216,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\nstatic inline bool bt_conn_is_handle_valid(u8_t state)\r\n```",
+                "The fact that the state is used to determine if the handle has been assigned should remain hidden IMO. I prefer to give conn as the argument.",
+                "Agreed"
+            ]
+        },
+        {
+            "hunk_id": 27410,
+            "commit_id": "938df2953aaed08c6606592e716692256892b604",
+            "original_commit_id": "f42cddf0830c527aaea7bd8eb645fceee23276ea",
+            "path": "subsys/bluetooth/host/hci_core.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 6429,
+            "original_line": 6429,
+            "side": "RIGHT",
+            "original_position": 132,
+            "position": 135,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this safe after the `net_buf` has been processed by `hci_event_prio`? i.e. has its internal state not been modified?",
+                "It should be, because `hci_event_prio` will save the state and restore it before returning."
+            ]
+        },
+        {
+            "hunk_id": 27837,
+            "commit_id": "938df2953aaed08c6606592e716692256892b604",
+            "original_commit_id": "f42cddf0830c527aaea7bd8eb645fceee23276ea",
+            "path": "subsys/bluetooth/host/conn_internal.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 216,
+            "original_line": 216,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\nstatic inline bool bt_conn_is_handle_valid(u8_t state)\r\n```",
+                "The fact that the state is used to determine if the handle has been assigned should remain hidden IMO. I prefer to give conn as the argument.",
+                "Agreed"
+            ]
+        }
+    ]
+}

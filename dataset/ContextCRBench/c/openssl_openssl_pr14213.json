@@ -1,0 +1,112 @@
+{
+    "repo": "openssl/openssl",
+    "pr_number": 14213,
+    "lang": "c",
+    "pr_title": "Duplicate the file and func error strings",
+    "pr_body": "Errors raised from a provider that is subsequently unloaded from memory may have references to strings representing the file and function that are no longer present because the provider is no longer in memory. This can cause crashes. To avoid this we duplicate the file and func strings.\r\n\r\nI believe this is the most likely cause of the failures described in #13623. However, I've been unable to replicate that particular failure.\r\n\r\nFixes #13623",
+    "pr_comments": [
+        "> Using fixed sized buffers in the `ERR_STATE` structure and a `strcpy(3)` copy would be safest.\r\n\r\nI've voice the same concern.  However, it was pointed out to me that the worst that will happen is that those fields will end up being NULL, which is acceptable in so far that we already know how to handle that.\r\n\r\nA different concern, which I believe is what lead to this change, is that `ERR_STATE` is a public structure, and we can't know what that has allowed others to do.  Changing the pointers to arrays may end up breaking external code unnecessarily.  The answer would of course be to make `ERR_STATE` opaque, but that may also be a breaking change not fit for 3.0.",
+        "> Using fixed sized buffers in the ERR_STATE structure and a strcpy(3) copy would be safest.\r\n\r\nI considered this option but rejected it on the basis that it could potentially use quite a bit of memory. E.g. how big should the buffer for file name be, and the function name? Let's arbitrarily say 80 characters each. So that's 160 bytes per error entry. `ERR_NUM_ERRORS` is 16 - so that 2.5k for a single ERR_STATE. We have one of those per thread. How many threads might be reasonable? I could easily see applications running 50 threads so that's 128k of error buffer.\r\n\r\nBy contrast (as @levitte pointed out), the worst that can happen by dynamically allocating is that the allocation fails and the file and function pointers end up being NULL. Since this is debugging information only - that's no big deal. If allocation fails then probably the reason for the original error was a memory allocation failure. Such failures tend to be fairly random anyway and not having the file/function pointers may not be that useful anyway.\r\n",
+        "In C, the most common source of errors is pointer problems, and these days most platforms won't run out of memory. You might get NULL back, but you're also just as likely to get back a bad pointer that will crash when free'd or end up pointing to someplace wrong and overwriting other data.  You need to worry about more than just \"malloc will fail\"",
+        "> In C, the most common source of errors is pointer problems, and these days most platforms won't run out of memory. You might get NULL back, but you're also just as likely to get back a bad pointer that will crash when free'd or end up pointing to someplace wrong and overwriting other data. You need to worry about more than just \"malloc will fail\"\r\n\r\n@richsalz Which platform returns bogus pointers from malloc() in out of memory condition? I'd like to see that crazy thing. There are platforms that overallocate and basically never return NULL and your process might be killed when it tries to actually access all the allocated data because there is not enough physical memory (and swap) to map the virtual memory. But the pointer is _correct_ in the sense it will not point to any existing data and you can certainly do free(malloc()).\r\n",
+        "> @richsalz Which platform returns bogus pointers from malloc() in out of memory condition?\r\n\r\nMy comment wasn't clear enough, sorry.  I meant if somewhere else there is a pointer overrun or other error, malloc will return bogus info.\r\n",
+        "I had a different idea on how to solve the crasher without malloc - on DSO unload we would simply clear all the func/filename pointers from the error stack. But that would break if there were multiple threads in play.",
+        "I've seen worse than NULL pointers happen previously.  At least we're not raising an error when the malloc fails -- that's unhelpful recursion.  @richsalz points out corrupted memory can result in all manner of badness from malloc.\r\n\r\nI don't think that the amount of memory used is a major issue.  Lots of threads means lots of memory regardless of our 2.5k per overhead.  E.g. how big is the stack for each going to be?\r\n\r\nI also think the 2.5k is generous: file and function names aren't generally that long (okay C++ mangling) but that's another story.",
+        "I think which approach is taken warrants an OTC discussion, hence the hold.\r\n\r\nIf we're going to allow allocations in the error code, we might want to also consider switching to using a safe stack instead of having a fixed block.\r\n\r\n",
+        "BTW, the AppVeyor failure seems relevant.",
+        "24 hours has passed since 'approval: done' was set, but as this PR has been updated in that time the label 'approval: ready to merge' is not being automatically set.  Please review the updates and set the label manually.",
+        "> BTW, the AppVeyor failure seems relevant.\r\n\r\nIt is.  Fortunately, it's just a matter of including e_os.h in test/p_test.c",
+        "I pushed a fixup to address the appveyor failure.",
+        "> buffer for file name be, and the function name? Let's arbitrarily say 80 characters each.\r\n\r\nWouldn't truncated names much less than 80, be better than no names?\r\nAllocations in the error handler sounds like a bad idea.",
+        "> Wouldn't truncated names much less than 80, be better than no names?\r\n\r\nThat's actually a good point.  I assume that you mean that *the beginning* of the name is dropped, rather than the end, right?  We could even do a cheap variant of what git show --stat does (cheap in so far that we probably shouldn't try so hard to find the directory delimiters, but rather do a crude print of an ellipsis followed by the last 77 character bytes of the filename without looking any deeper):\r\n\r\n``` console\r\n$ git show --stat 576892d78f80cf9a169e7f766319c843e430f378\r\n...\r\n crypto/asn1/d2i_pr.c                               | 100 +++++++++++----------\r\n include/crypto/evp.h                               |   4 +\r\n .../implementations/encode_decode/decode_der2key.c |   5 +-\r\n .../implementations/encode_decode/encode_key2any.c |  24 ++++-\r\n test/evp_extra_test2.c                             |  84 ++++++++++++++++-\r\n 5 files changed, 162 insertions(+), 55 deletions(-)\r\n```\r\n\r\nEDIT: we may want to watch for UTF-8 character boundaries, though...  er, so maybe this isn't a brilliant idea after all (rabbit hole warning)",
+        "If we actually looked up the path delimiter (which might be a little bit complicated due to it being platform specific but otherwise not hard) we might be able to avoid watching for UTF-8 character boundaries explicitly. Then there is of course the case where the path delimiter is not found within the last 77 characters but that would require something being seriously botched somewhere so just crudely truncating at 77 characters without checking the UTF-8 boundaries should be fine or alternatively putting something like `\"<path garbled>\"` there instead should work as well. And for function names - they are hopefully ASCII only anyway.",
+        "Amend PR to convert `\"\"` to `NULL`.",
+        "Fixup pushed addressing the \"\" handling. Please take another look.",
+        "> ... the case where the path delimiter is not found within the last 77 characters\r\n\r\nIf we have file names that are that long, we seriously need to review our file naming :wink:",
+        "It's not just our file names.  Providers aren't under our control.",
+        "> ... so just crudely truncating at 77 characters without checking the UTF-8 boundaries should be fine...\r\n\r\n\"fine\" is a matter of definition.  We can choose not to care!  As long as that's \"fine\", we will occasionally have to deal with [ahem] \"interesting\" file names.\r\n\r\n``` C\r\n$ echo \"\u03c3\u03cd\u03bd\u03b8\u03b7\u03bc\u03b1 \u03b3\u03bd\u03ce\u03c1\u03b9\u03c3\u03bc\u03b1\" | xxd -s 18 -o -18 | xxd -r\r\n\u00bd\u03ce\u03c1\u03b9\u03c3\u03bc\u03b1\r\n```",
+        "New fixup pushed addressing feedback from @t8m. Please reconfirm.",
+        "24 hours has passed since 'approval: done' was set, but as this PR has been updated in that time the label 'approval: ready to merge' is not being automatically set.  Please review the updates and set the label manually.",
+        "Pushed. Thanks."
+    ],
+    "merged": false,
+    "created_at": "2021-02-17T13:03:08Z",
+    "issue_context": {
+        "number": 13623,
+        "title": "Tests crash on Win7 x64 when building 32-bit on MSVC 2019",
+        "body": "<!--\r\nThank you for your bug report. If this is your first one,\r\nplease take the time to read the following lines before posting it.\r\n\r\nNOTE:\r\n\r\n    If you're asking about how to use OpenSSL, this isn't the right \r\n    forum.  Please see our User Support resources:\r\n    https://github.com/openssl/openssl/blob/master/SUPPORT.md\r\n\r\nPlease remember to tell us in what OpenSSL version you found the issue.\r\n\r\nFor build issues:\r\n\r\n    If this is a build issue, please include the configuration output\r\n    as well as a log of all errors.  Don't forget to include the exact\r\n    commands you typed.\r\n\r\n    With OpenSSL before 1.1.1, the configuration output comes from the\r\n    configuration command.  With OpenSSL 1.1.1 and on, it's the output\r\n    of `perl configdata.pm --dump`\r\n\r\nFor other issues:\r\n\r\n    If it isn't a build issue, example code or commands to reproduce\r\n    the issue is highly appreciated.\r\n    Also, please remember to tell us if you worked with your own\r\n    OpenSSL build or if it is system provided.\r\n\r\nPlease remember to put ``` lines before and after any commands plus\r\noutput and code, like this:\r\n\r\n    ```\r\n    $ echo output output output\r\n    output output output\r\n    ```\r\n\r\n    ```\r\n    #include <stdio.h>\r\n    \r\n    int main() {\r\n        int foo = 1;\r\n        printf(\"%d\\n\", foo);\r\n    }\r\n    ```\r\n-->\r\n\r\nI've been trying to build OpenSSL for Windows. The library managed to build successfully, but the tests are failing with OpenSSL outright crashing.\r\n\r\nOperating System: Windows 7 Professional 64-bit\r\nCompiler: Microsoft Visual Studio 2019 (Community version)\r\nThe instructions I followed: https://stackoverflow.com/a/45495686\r\nNote: I am running Windows on a VMWare virtual machine, in case that info is important.\r\n\r\nSteps I performed:\r\n\r\n1. I cloned the repository from:\r\n```\r\ngit clone git://git.openssl.org/openssl.git\r\n```\r\n2. I installed Strawberry Perl from http://strawberryperl.com/. Output of perl -v:\r\n```\r\nC:\\Users\\Test>perl -v\r\n\r\nThis is perl 5, version 32, subversion 0 (v5.32.0) built for MSWin32-x64-multi-thread\r\n\r\nCopyright 1987-2020, Larry Wall\r\n```\r\n3. I installed NASM from https://www.nasm.us/pub/nasm/releasebuilds/2.15/win32/ and added it to my PATH.\r\n\r\n4. I opened the VS developer command prompt ran the following command on the openssl folder:\r\n```\r\nperl Configure debug-VC-WIN32 \r\n```\r\n5. I ran nmake to build the library:\r\n```\r\nnmake\r\n```\r\n6. I ran the test suite as non-admin.\r\n```\r\nnmake test\r\n```\r\n7. The test suite crashed at:\r\n```03-test_fipsinstall.t.......9/?```\r\nWhen opening the debugger the stack trace is:\r\n```\r\n>\tlibcrypto-3.dll!OPENSSL_strnlen(const char * str, unsigned int maxlen) Line 67\tC\r\n \tlibcrypto-3.dll!fmtstr(char * * sbuffer, char * * buffer, unsigned int * currlen, unsigned int * maxlen, const char * value, int flags, int min, int max) Line 376\tC\r\n \tlibcrypto-3.dll!_dopr(char * * sbuffer, char * * buffer, unsigned int * maxlen, unsigned int * retlen, int * truncated, const char * format, char * args) Line 308\tC\r\n \tlibcrypto-3.dll!BIO_vsnprintf(char * buf, unsigned int n, const char * format, char * args) Line 921\tC\r\n \tlibcrypto-3.dll!BIO_snprintf(char * buf, unsigned int n, const char * format, ...) Line 910\tC\r\n \tlibcrypto-3.dll!ERR_print_errors_cb(int(*)(const char *, unsigned int, void *) cb, void * u) Line 60\tC\r\n \tlibcrypto-3.dll!ERR_print_errors(bio_st * bp) Line 193\tC\r\n \topenssl.exe!fipsinstall_main(int argc, char * * argv) Line 510\tC\r\n \topenssl.exe!do_cmd(lhash_st_FUNCTION * prog, int argc, char * * argv) Line 406\tC\r\n \topenssl.exe!main(int argc, char * * argv) Line 287\tC\r\n \t[External Code]\t\r\n \tkernel32.dll![Frames below may be incorrect and/or missing, no symbols loaded for kernel32.dll]\tUnknown\r\n```\r\n\r\nThe crash points to OPENSSL_strnlen but that is not the problem. The problem seems to be that a corrupted char * pointer is passed to OPENSSL_strnlen and upon using it, the application crashes.\r\n\r\nI probed further at the problem and the string being passed to OPENSSL_strnlen seems to come from line 26 of err_prn.c under the function ERR_print_errors_cb (which has 3 const char * variables declared). Specifically, the *file and *func strings are unreadable, whereas *data is set to an empty string. The debugger is suggesting that the strings returned from ERR_get_error_all in line 29 are improper, causing the crash. I don't understand the code enough to dig deeper though.\r\n\r\nThis is either a bug in OpenSSL or I miscompiled the library. Any pointers would be appreciated. Thanks.",
+        "comments": [
+            "I have a theory (possibly incorrect) about what is happening here.\r\n\r\nThis occurs in the fipsinstall app. That app has a function `load_fips_prov_and_run_self_test` which loads the FIPS provider and then immediately unloads it again. So the dll will go loaded into memory, `OSSL_provider_init` will get called, and then the dll will get unloaded again.\r\n\r\nIf `OSSL_provider_init` raises any errors then it will end up calling the `ERR_set_debug` function via the upcalls to core. But the `file` and `func` strings will be read only strings in the fips.dll.\r\n\r\n By the time we get to printing the error stack out fips.dll has been unloaded, and therefore these strings are no longer valid - hence the crash.\r\n\r\nPing @levitte.\r\n\r\nThoughts? Does this make sense?",
+            "Nice deduction, @mattcaswell !  It would seem to mean that any text string pushed on the error stack from a module must be copied because it doesn't seem reasonable to require modules to remain loaded for whenever someone might print an error stack.  (In other words, this seems like a bug to fix even if it's not the cause of the crash)",
+            "Yes, it makes perfect sense.\r\n\r\nPlease be careful, though, not to do the usual duplicate to heap.  The ERR module needs to be careful with this, so reporting an error doesn't cause a memory allocation error.  We do use buffer arrays for other strings, please do so with this as well.",
+            "Although I've not been able to replicate this, I think the most likely cause is due to the issue fixed by #14213."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 42918,
+            "commit_id": "0a11a383cc73a8b4b9d37fa8b2885bbdee2b0430",
+            "original_commit_id": "3a962b2093a6226daa26e4d1855d4eb9f2e5035b",
+            "path": "test/p_test.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 183,
+            "original_line": 178,
+            "side": "RIGHT",
+            "original_position": 99,
+            "position": 106,
+            "subject_type": "line",
+            "review_comments": [
+                "The provider shouldn't have to do that in light of the call ending up in `err_set_debug`, *which takes another dynamically allocated copy of those strings*.",
+                "> The provider shouldn't have to do that in light of the call ending up in err_set_debug, which takes another dynamically allocated copy of those strings.\r\n\r\nThat is the point of the test. I explicitly want to ensure that the strings that we pass to `p_set_error` are not valid and will cause asan errors once the provider is torn down if anything attempts to use them after that point. Before the changes introduced by this PR in err.c, this test will fail because the provider teardown function deallocates these strings hence leading to a use-after-free detected by asan when the error stack is printed.",
+                "Are you telling me that if you don't strdup here, there will be an asan error?  I'm not sure I understand your explanation...",
+                "> Are you telling me that if you don't strdup here, there will be an asan error?\r\n\r\nNo. The objective of adding a test is so that it will fail before the fix is applied, and pass afterwards. I'm telling you that without doing this there *won't* be an asan error *before* the fix is applied and therefore the test won't fail. By using strdup and freeing the memory in the teardown, you get a use-after-free detected by asan in this test if you don't also apply the fix.",
+                "Thanks for the explanation.  What you describe is something I don't get to see, since this PR contains the test AND the fix,  So when viewing this PR as a whole, I only see that you're allocating the same string twice; 1) at this spot, and 2) when `err_set_debug()` gets called just a few lines down (as part of this function).",
+                ">  What you describe is something I don't get to see, since this PR contains the test AND the fix\r\n\r\nYes, that is generally the case with all of our fixes. We tend to always add the fix and the test at the same time. Nonetheless I did run the test locally without my fix to ensure that it did fail.",
+                "Sure, but to complete this PR, I would say that these allocations should be removed.  Or am I still misunderstanding something?",
+                "> Sure, but to complete this PR, I would say that these allocations should be removed. Or am I still misunderstanding something?\r\n\r\nI am clearly not explaining myself very well. These are essential to the test. We have the test here so that (for example) if someone at some point in the future fails to understand the reason for the allocations in `err_set_debug` and changes it back to just store a pointer. If that were to occur then we *want* the test to fail. If I remove the allocations then that won't happen!\r\n\r\nBy allocating them and deallocating them we control very precisely the lifetime of the strings. If someone attempts to use those strings after they've been deallocated then asan will complain loudly about it. *That* is what I am testing - that no one attempts to use the strings owned by the provider *after* the provider has been torn down.",
+                "> if someone at some point in the future fails to understand the reason for the allocations in `err_set_debug` and changes it back to just store a pointer.\r\n\r\nYou know, there's a very simple way to try to prevent that:  *add a comment in err_set_debug*.  As a matter of fact, I urge you to do so.",
+                "I can certainly do that - but that doesn't remove the need for these allocations here.",
+                "Upon re-reading the comment here, part of my confusion is that it doesn't tell the story, it doesn't connect the dots.  I would like to see it expanded to explain that this is in apprehension that libcrypto (err_set_debug) might forget to allocate its own copies.  Had I read something like that, I would have understood the idea.\r\n\r\nIt might be worth pointing out that we expect the printout of the errors to happen after provider teardown, thus pointing out the actual reason why we may run into problems.",
+                "Ok. I expanded the comment out to try and explain this better."
+            ]
+        },
+        {
+            "hunk_id": 42919,
+            "commit_id": "0a11a383cc73a8b4b9d37fa8b2885bbdee2b0430",
+            "original_commit_id": "3a962b2093a6226daa26e4d1855d4eb9f2e5035b",
+            "path": "test/p_test.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 181,
+            "original_line": 180,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 104,
+            "subject_type": "line",
+            "review_comments": [
+                "Yes, thank you, this is much better"
+            ]
+        },
+        {
+            "hunk_id": 42920,
+            "commit_id": "0a11a383cc73a8b4b9d37fa8b2885bbdee2b0430",
+            "original_commit_id": "3a962b2093a6226daa26e4d1855d4eb9f2e5035b",
+            "path": "crypto/err/err_local.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 54,
+            "original_line": 54,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Yes, thank you"
+            ]
+        }
+    ]
+}

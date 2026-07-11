@@ -1,0 +1,239 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 62782,
+    "lang": "c",
+    "pr_title": "Bluetooth: Host: Fix GATT Long Read for EATT",
+    "pr_body": "When EATT is established, the value returned from `bt_att_get_mtu` is not useful to determine the ATT_MTU that applies to an ATT response. This is because `bt_att_get_mtu` may return the value for a different bearer than the request is serviced on.\r\n\r\nA second, related issue is that it's not correct to use the current ATT_MTU of a bearer as the ATT_MTU for a response. That's because it may have changed in-between sending the request and receiving the response. The ATT_MTU applicable for the response is the ATT_MTU of the request (as it was when it was sent).\r\n\r\nTo fix both of issues, the params struct for the GATT read operation is given a new field that will record the ATT_MTU that applies to this ATT operation. This value is then used to determine if the GATT long read operation is concluded.\r\n\r\nThe ATT_MTU is recorded from the correct ATT bearer at the moment the ATT request is put on the connection TX queue. Putting the request on the connection TX queue serves to sequence the ATT request TX with any MTU change RSP. This works both for sufficient for UATT, which sends the MTU exchange on the same L2CAP channels, and necessary for EATT, which sends the MTU exchange on the L2CAP control channels.\r\n\r\nFixes: https://github.com/zephyrproject-rtos/zephyr/issues/61741\r\n\r\nFor reference, Core 5.4 3 F 3.4.2.2 fig 3.1 follows. It illustrates how a bearer's ATT_MTU propagates to requests/responses.\r\n![image](https://github.com/zephyrproject-rtos/zephyr/assets/48479610/a8049e18-3e8f-44ad-9012-99551a0508e5)",
+    "pr_comments": [
+        "For additional verification of this, please also add `CONFIG_BT_EATT=y` to https://github.com/zephyrproject-rtos/zephyr/blob/main/tests/bsim/bluetooth/audio/prj.conf",
+        "@alwa-nordic What is the reason why you didn't enable EATT in the LE Audio tests? Is it then failing on the write long (since this is only fixing read long)? ",
+        "> @alwa-nordic What is the reason why you didn't enable EATT in the LE Audio tests? Is it then failing on the write long (since this is only fixing read long)?\r\n\r\nI need to get the tests to pass on CI without the LE audio EATT in the first place :). For some reason the test I added in this PR is hanging in CI even though it works perfectly for me locally.\r\n\r\nI will try the LE Audio EATT for you after that works. But I don't have any high hopes on this being a silver bullet for whatever EATT problems that affect LE audio. This PR is indeed only affecting the long read API.\r\n\r\nIs there maybe a discussion or list of EATT problems that have been observed with LE Audio?",
+        "> Is there maybe a discussion or list of EATT problems that have been observed with LE Audio?\r\n\r\nNo, but I can work towards creating additional issue after this gets merged, to see what might still be missing/causing issues. It's of course also not impossible that the the LE Audio stack needs to do more to properly use EATT",
+        "@Thalley I am aware of your feedback on https://github.com/zephyrproject-rtos/zephyr/pull/61170 that also applies here. Like you suggest, I would like to make a test code lib to remove the duplication. I also think that moment will be a good time to fix all the stylistic issues in the code that goes in that lib. I will create an issue on this.",
+        "@Thalley FYI, the Audio tests failed with EATT enabled: https://github.com/zephyrproject-rtos/zephyr/pull/63864",
+        "> @Thalley FYI, the Audio tests failed with EATT enabled: #63864\r\n\r\nSeems related to TX: \r\n```\r\nd_00: @00:00:03.650269  [00:00:03.650,268] <dbg> bt_bap_unicast_client: bt_bap_unicast_client_ep_send: conn 0x8422680 ep 0x8458768 buf 0x84590a8 len 138\r\nd_00: @00:00:03.739755  [00:00:03.739,746] <err> bt_gatt: gatt_prepare_write_rsp: Incorrect offset or data in response, canceling write\r\n```\r\n\r\nAttempting to write 138 octets with MTU of 65 (i.e. 3 writes)\r\n\r\nBut thanks for testing",
+        "Didn't finish my review, but will continue tomorrow if this hasn't been merged by then :) ",
+        "@alwa-nordic While some of my comments have been related to code formatting, the fact is that the current coding guidelines are not granular enough to provide precise expectations, and none of those formatting comments are blockers for this PR :) So please do not spend too much time on them, and focus on the non-format comments instead"
+    ],
+    "merged": true,
+    "created_at": "2023-10-12T15:44:09Z",
+    "issue_context": {
+        "number": 61741,
+        "title": "EATT does not play well with MTU values",
+        "body": "**Brief**\r\nThe bt_att_get_mtu api uses the maximum mtu when given multiple channels. This is not compatible with having credit based and non-credit based channels.\r\n\r\n**Elaborate extensively:**\r\nWe have a scenario where we start up by forming an ATT and then proceed to form an EATT.\r\n\r\nThe net result of this procedure is that we get an extra NULL frame whenever we get a callback from gatt_read_rsp.\r\n\r\nWe do the following:\r\n1) We establish a Maximum Payload Size (MPS) of 247. \r\n2) We negotiate an MTU for our ATT with a value of 247.\r\n3) We establish an EATT with the same MPS. This gives an MTU of 245 to leave space for the SDU size.\r\n4) On the EATT we attempt to read a characteristic of size 512.\r\n\r\n*What should have happened:*\r\nIn the function gatt_read_rsp, our callback function is called by the call\r\n\r\nif (params->func(conn, 0, params, pdu, length) == BT_GATT_ITER_STOP)\r\n\r\nOur callback determines that the packet has not ended and transmits a BT_GATT_ITER_CONTINUE\r\n\r\nWe have a condition in the next line to determine if we have ended.\r\n\r\nif (length < bt_att_get_mtu(conn) - 1)) {\r\n\r\nThis decides by not triggering that we have used a full MTU length and therefore starts a blob read request for the remainder of the packet.\r\n\r\nWe read a second chunk with the same path.\r\n\r\nAnd finally we read 24 bytes, which is less than 244, wherefore the end condition is triggered, a NULL packet is sent to the callback, and we can end the reading.\r\n\r\n* What actually happens: *\r\nThe bt_att_get_mtu now iterates through the available channels and picks the maximum MTU, which is a maximum of the 247 of the ATT and the 245 of the EATT. Therefore the comparison now becomes \r\n\r\nif ([244] < [247] - 1)) {\r\n\r\nwhich will always trigger, even if the packet is full, effectively making the code below it dead.\r\n\r\n** Suggestion: **\r\nSince the MTU can be different from channel to channel and this is a scenario where we should be using the MTU of a specific channel, it would seem to make sense to have an API equivalent to bt_att_get_mtu, but for channels rather than connections.",
+        "comments": [
+            "Bluetooth WG summary:\r\n\r\n- Document properly how to use `bt_gatt_read()` to select between regular and blob/long reads\r\n- Fix the MTU check for EATT in `att_internal.h` (in `att_chan` we will add a `req_mtu`) and then use that in `att.c` in `gatt_read_rsp`. Also figure out how to provide the EATT channel to `gatt_read_rsp`.",
+            "@daee-demant Have a look at the draft PR I posted. It does not introduce new API, but I believe it fixes the inefficiency you document here. If you have a good idea for an API, I welcome a sketch.",
+            "Apologies, I've been on vacation for the last 3 weeks. Yes, I think it looks like a well thought out solution."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 27923,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/testlib/att_read.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 109,
+            "original_line": 109,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 109,
+            "subject_type": "line",
+            "review_comments": [
+                "Why are you using ASSERT (that can be disabled via Kconfig) rather than failing the tests via the BSIM API? ",
+                "This is an actual programmer's assertion. It's just for show actually since `att_err` is unsigned, so this assert can never fire. (The assert is still useful in case somebody changes the type.)\r\n\r\nI also avoid bsim as a dependency for testlib modules that don't need it. This module should run perfectly fine on hardware.",
+                "Alright, but if you want to rely on `__ASSERT` for test validation, then you may want to consider a `BUILD_ASSERT` to ensure that the test isn't run without ASSERT enabled.",
+                "Can I consider this conversation resolved?",
+                "I'd still prefer either failing with the BSIM API, or ensure that ASSERT is enabled. \r\n\r\nHaving a test library that can run without reporting errors is a bit odd IMO. \r\n\r\nBut since this is a corner case (i.e. someone will have to disable asserts for this to be a problem) I guess it's fine. "
+            ]
+        },
+        {
+            "hunk_id": 27926,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/testlib/adv.c",
+            "start_line": 62,
+            "original_start_line": 62,
+            "start_side": "RIGHT",
+            "line": 69,
+            "original_line": 69,
+            "side": "RIGHT",
+            "original_position": 69,
+            "position": 69,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't this silently fail? ",
+                "I don't understand what you are referring to.",
+                "If `api_err = bt_le_ext_adv_create(&param, &cb, &adv);` results in `api_err != 0` then it will just skip these lines and advertising will never start and the function will just return, with no logging or anything to indicate that the advertisements have not started. ",
+                "It returns `api_err` in that case. This is why I use EXPECT_ZERO on the return value. ?"
+            ]
+        },
+        {
+            "hunk_id": 27927,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/testlib/att_read.c",
+            "start_line": 259,
+            "original_start_line": 259,
+            "start_side": "RIGHT",
+            "line": 260,
+            "original_line": 260,
+            "side": "RIGHT",
+            "original_position": 260,
+            "position": 260,
+            "subject_type": "line",
+            "review_comments": [
+                "This is effectively the same as `__ASSERT_NO_MSG(start_handle != 0)` given the type of `start_handle`\r\n\r\nDitto for `end_handle` below",
+                "True. I was thinking about you when I wrote this. Usually you NAK PRs when people don't use symbolic constants this this stuff.",
+                "Hah, good point :D We don't have a BT_ATT_INVALID_ATTRIBUTE_HANDLE or anything like that, so with that in mind, this is fine :) "
+            ]
+        },
+        {
+            "hunk_id": 27925,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/main.c",
+            "start_line": 177,
+            "original_start_line": 166,
+            "start_side": "RIGHT",
+            "line": 178,
+            "original_line": 178,
+            "side": "RIGHT",
+            "original_position": 167,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\t\t}\r\n\t\t\r\n\t\tLOG_INF(\"Verified %u reads\", read_count);\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 27924,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/main.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 143,
+            "original_line": 143,
+            "side": "RIGHT",
+            "original_position": 133,
+            "position": 143,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this intended to be a no-op for the peripheral? Wouldn't it make sense to log an error or warning, or even ASSERT if this is called as the peripheral? ",
+                "This is not an abstraction. It's just a snippet to avoid duplication in `the_test`. It is intended to be called as-if it can be copy-pasted in `the_test`. We could easily imagine that the peripheral has instructions here. E.g. I could add synchronization with the code in `read_mtu_validation_chrc` and 'expect' to verify that the server code runs. I don't intend to do that because it's not needed.",
+                "Alright. \r\n\r\nI'm generally not in favor of having functions that are \r\n```\r\nvoid foo(bool b)\r\n{\r\n    if (b) {\r\n        /* do stuff */ \r\n    } else {\r\n        /* do other stuff */\r\n    }\r\n```\r\n\r\nand especially not when `b` is a const boolean (e.g. `bool central = (get_device_nbr() == 0);`), and IMO function like that should always be split into two. \r\n\r\nBut it's not a blocker. ",
+                "I don't mean to argue. It would be nice if we had a collaborative session at some point and explore the variants.\r\n\r\nI will leave some friendly rhetorical points I hope give some perspectives to consider. I reserve my right to change my mind because I'm not 100% correct all of the time :P.\r\n\r\n - Are you thinking of the 'flag argument' code rot? I think flag arguments arise from adding (features/code) to code with premature abstractions. This is not an abstraction. And it's new code, so it cannot have code rot.\r\n - There is intention behind this. The code is written to exploit what's available in C and the rest of the tech stack to express the problem at hand. Isn't `if (central) { do_something() }` isomorphic to `central.do_something()`? I don't think most people would scoff at the second code.\r\n - Does it really matter whether a value is known at compile time?\r\n - It's more consistent and removes a layer of context to have `the_test` and `test_long_read` both display a `if (central)`. Isn't more explicit better?\r\n - When I say it's \"not an abstraction\", I originally wanted to write \"not a function\" to make it even more punchy. It's just a named section of code meant to be used in only one place. The rules for good abstractions do not apply because I do not want to make an abstraction. I don't want to sit down and design and document semantics for this function.",
+                "It's mostly a personal preference, rather than a technical improvement; it is, however, related to code rot/smell. It has been a topic for debate for as long as programming has existed :D \r\n\r\nAs mentioned, it's not a huge deal, but I would like to provide some example in Zephyr where we've chosen not to provide a bool flag to function, but rather implemented two functions:\r\n\r\n```c\r\nint bt_le_per_adv_start(struct bt_le_ext_adv *adv);\r\nint bt_le_per_adv_stop(struct bt_le_ext_adv *adv);\r\n\r\nvoid hw_counter_start(void);\r\nvoid hw_counter_stop(void);\r\n\r\nint dw_dma_start(const struct device *dev, uint32_t channel);\r\nint dw_dma_stop(const struct device *dev, uint32_t channel);\r\n\r\nint can_mcan_start(const struct device *dev);\r\nint can_mcan_stop(const struct device *dev);\r\n\r\nvoid net_dhcpv4_start(struct net_if *iface);\r\nvoid net_dhcpv4_stop(struct net_if *iface);\r\n\r\nvoid arch_timing_start(void);\r\nvoid arch_timing_stop(void);\r\n\r\nint modbus_init_server(const int iface, struct modbus_iface_param param);\r\nint modbus_init_client(const int iface, struct modbus_iface_param param);\r\n```\r\n\r\nAnd they are just a few of the public API functions that implements on/off, start/stop, true/false, boolean roles, etc, so it's not uncommon split boolean behavior into separate functions in Zephyr. \r\n\r\nThat being said, I'm sure I could around the same amount of functions that take a bool argument as this does, which is why I am fine with it going in, as long as it has been considered that it could be split. \r\n\r\n"
+            ]
+        },
+        {
+            "hunk_id": 27922,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/main.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 74,
+            "side": "RIGHT",
+            "original_position": 66,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tmemset(buf, 0, buf_len);\r\n```",
+                "I don't think it makes any practical difference, right? Semantically I'm preparing a `read_len` number of bytes response.",
+                "True, but the code does not match the comment: `/* Fill the read buffer with zero. */`. ",
+                "Fixed"
+            ]
+        },
+        {
+            "hunk_id": 27921,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/main.c",
+            "start_line": 34,
+            "original_start_line": 28,
+            "start_side": "RIGHT",
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 39,
+            "subject_type": "line",
+            "review_comments": [
+                "Minor: Consider formatting these with 2 x 8 bytes instead of 1 x 11 + 1 x 5",
+                "It's how clang-format does it. It might do something different if I insert a comment after the 8th byte. I could try but I imagine people won't like the comment.",
+                "Nah, I've tried to make clang-format make this pretty as well, but can't :D I usually do some manual formatting afterwards to make it better (as clang-format is by no means perfect). \r\n\r\nIt's ok as is"
+            ]
+        },
+        {
+            "hunk_id": 27920,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "include/zephyr/bluetooth/gatt.h",
+            "start_line": 1575,
+            "original_start_line": 1575,
+            "start_side": "RIGHT",
+            "line": 1576,
+            "original_line": 1576,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "With this approach, won't we need to add `_att_mtu` to all GATT requests? So will effectively need to be added to write and discover parameters as well? And maybe notification and indication parameters? \r\n\r\nThis may be the best place for the read fix, but it does not seem like a very scalable or general solution. ",
+                "I'm not currently planing on adding this to any other request type. So YAGNI?\r\n\r\nBut I also realized that it's a bit hacky, so I marked it 'internal' so we have the option of changing it later.\r\n\r\nImplementing it like this is very surgical, giving a small simple diff. Any other way will be more complicated.",
+                "> I'm not currently planing on adding this to any other request type. So YAGNI?\r\n\r\nYou write in a comment: \r\n```\r\n\t/* Otherwise: This request type does not have an `_att_mtu`\r\n\t * params field or any other method to get this value, so we can\r\n\t * just drop it here. Feel free to add this capability to other\r\n\t * request types if needed.\r\n\t */\r\n```\r\n\r\nTo fix long writes for EATT, won't we need this `_att_mtu` for those other requests? \r\n\r\nAs per your own test, https://github.com/zephyrproject-rtos/zephyr/pull/63864, EATT clearly need a similar fix for writes. \r\n\r\n> But I also realized that it's a bit hacky, so I marked it 'internal' so we have the option of changing it later.\r\n\r\nDo we actually document this anywhere? Can we add and remove fields in public structs that are prefixed with `_` as we want, without needing to go through the proper API lifecycle? ",
+                "> To fix long writes for EATT, won't we need this _att_mtu for those other requests?\r\n\r\nThe long write procedure (Core 5.4 3.G.4.9.4) has an explicit EOF/commit. It does not rely on the ATT_MTU for determining this. So we will not need it to fix long writes.\r\n\r\n> Do we actually document this anywhere? Can we add and remove fields in public structs that are prefixed with `_` as we want, without needing to go through the proper API lifecycle?\r\n\r\nI think the word 'Internal' is clear enough. Our users are not stupid. They may be tempted to use this, but they will understand that this is not stable API and can't blame us for changing it.\r\n",
+                "> but they will understand that this is not stable API and can't blame us for changing it.\r\n\r\nBut have we either documented that the `_` prefix means internal? \r\n\r\n>  It does not rely on the ATT_MTU for determining this. So we will not need it to fix long writes.\r\n\r\nWhat is _this_ in this context? We need to know the ATT_MTU to determine how many prepare writes to send. \r\n",
+                "> > but they will understand that this is not stable API and can't blame us for changing it.\r\n> \r\n> But have we either documented that the `_` prefix means internal?\r\n\r\nNot that I know of.\r\n\r\n> > It does not rely on the ATT_MTU for determining this. So we will not need it to fix long writes.\r\n> \r\n> What is _this_ in this context? We need to know the ATT_MTU to determine how many prepare writes to send.\r\n\r\n'this': Locating the EOF. Which ATT_MTU are you referring to? Can we focus on fixing long reads in this PR?",
+                "> Which ATT_MTU are you referring to?\r\n\r\nThere is only 1 ATT_MTU ;) The MTU for the EATT bearers will of course also matter if they are being used. \r\n\r\n> Can we focus on fixing long reads in this PR?\r\n\r\nMy concern is that if we have the exact same issue for writes or discovery (which I believe we do), then a general solution for ATT would be better than a solution specifically for read requests, especially if this means modifying the public API which may be difficult to revert. \r\n\r\nOf course if we claim that values prefixed with `_` should not be considered as part of the public API, and can be added/removed at will, then we can move forward with this change and potentially modify it later if need be. ",
+                "Can I consider this conversation resolved?"
+            ]
+        },
+        {
+            "hunk_id": 27919,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "subsys/bluetooth/host/gatt.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 6292,
+            "original_line": 6292,
+            "side": "RIGHT",
+            "original_position": 32,
+            "position": 33,
+            "subject_type": "line",
+            "review_comments": [
+                "do we need an `__ASSERT_NO_MSG(params)` here?",
+                "Added."
+            ]
+        },
+        {
+            "hunk_id": 27928,
+            "commit_id": "b7d113d2fa3edd1bb581d84440f0e64fcd3bd25e",
+            "original_commit_id": "75860cd49a7cb41bd4cc1dff23cd1574ab438046",
+            "path": "tests/bsim/bluetooth/host/att/long_read/main.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 119,
+            "original_line": 119,
+            "side": "RIGHT",
+            "original_position": 119,
+            "position": 119,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\tif (get_device_nbr() == CENTRAL_DEVICE_NBR) {\r\n```",
+                "This is not the intent of the code. It's not selecting the 'the central'. It's selecting 'device 0'."
+            ]
+        }
+    ]
+}

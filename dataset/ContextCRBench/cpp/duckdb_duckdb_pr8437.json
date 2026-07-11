@@ -1,0 +1,145 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 8437,
+    "lang": "cpp",
+    "pr_title": "General ART improvements and memory pressure reduction",
+    "pr_body": "This PR combines several changes to the ART and mainly focuses on reducing its memory pressure during index creation (`CREATE INDEX`). Combining these changes significantly improves ART creation performance and its memory footprint.\r\n\r\n## Memory pressure reduction\r\n\r\n### Disable sorting for `VARCHAR` and compound keys\r\n\r\nBefore this PR, we always add a sorting operator to the pipeline preceding the index creation operator. Especially for `VARCHAR` keys and compound keys, this sorting operation significantly blew up the memory. \r\n\r\nNow, we check the key types during plan creation. If we detect a `VARCHAR` or compound key type, we adjust the pipeline accordingly, i.e., we do not add that sorting operator.\r\n\r\nThis change has implications for the execution of the create index operator, which previously expected its incoming data to be sorted. We now have to distinguish between the sorted and not sorted cases and only execute the old (faster) `Sink` implementation on sorted data. This is still desirable since the regression in performance is negligible, and the memory pressure decreases significantly. For not sorted data, we now insert the keys key-at-a-time into the thread-local ART of a sink.\r\n\r\n### ARTs can now share their memory\r\n\r\nEach thread has its local ART. We build a chunk-sized ART with an efficient construction strategy that does not require iterating all keys for every incoming chunk of sorted data. We then merge that chunk-sized ART into the thread-local ART. This merging step is very efficient since all operations are on sorted data.\r\n\r\nBefore this PR, the chunk-sized ART would allocate its own memory, which would then get appended to the thread-local ART's memory. This significantly blows up the memory, as we preallocate blocks of 256KB.\r\n\r\nThis PR allows ARTs to share their memory. Consequently, the thread-local ART can now share its memory with the chunk-sized ART, decreasing memory pressure. \r\n\r\n## Performance improvements\r\n\r\nTree structures such as the ART make it tempting to use recursion for simplicity. For specific scenarios, such as many duplicate keys, or very long prefixes, using recursion for some functions can become problematic. The recursion depth incurs significant overhead in function calls.\r\n\r\nTherefore, this PR changes some function implementations from recursive to iterative ones (for `Leaf` and `Prefix`).\r\n- Changed functions: `Free`, `Vacuum`, `Deserialize`, `Serialize`\r\n\r\n## Benchmarks\r\n\r\nI also want to show some benchmark numbers, to highlight the positive effect of the reduction in memory pressure on performance. All the benchmarks can be found in `benchmark/micro/index/create/`.\r\n\r\n| Benchmark      | info | master branch | PR |\r\n| ----------- | ----------- | ----------- | ----------- |\r\n| create_art_varchar.benchmark | 28.8M `VARCHAR`, 7.2M distinct, 8GB memory limit | time-out, oom | 11.39 |\r\n| create_art.benchmark | 10M `INT64`, 2.5M distinct | 0.56 | 0.22 |\r\n| create_art_varchar_long.benchmark | 10M long `VARCHAR` | 0.23 | 0.19 |\r\n| create_art_varchar_short.benchmark | 10M short `VARCHAR` | 0.15 | 0.13 |\r\n| create_art_random.benchmark | 10M `INT`, approx. 1M distinct | 0.51 | 0.18 |\r\n| create_art_duplicates.benchmark | 10M `INT`, approx. 100 distinct | bus error | 0.20 |\r\n\r\n## Other improvements\r\n\r\n- added a benchmark on `VARCHAR` index creation with a memory limit to detect regression on the memory consumption\r\n- fixed ART benchmarks for `DELETE` and `INSERT` operations\r\n- move `Vacuum` to the `Finalize` step of the index creation operation. This is now possible because the thread-local ARTs share their memory.\r\n\r\nThis PR also closes the following issues.\r\n- Close #8066\r\n- Close #7760\r\n- Close #7406",
+    "pr_comments": [
+        "Thanks! LGTM"
+    ],
+    "merged": true,
+    "created_at": "2023-08-02T11:16:55Z",
+    "issue_context": {
+        "number": 7760,
+        "title": "CREATE INDEX ends in out of memory error",
+        "body": "### What happens?\n\nI've updated to the 0.8 version: Now I cannot create an index without an error:\r\nCREATE INDEX i ON table (column)\r\nError: rapi_execute: Failed to run query\r\nError: Out of Memory Error: failed to allocate data of size 262KB (13.4GB/13.4GB used)\r\n\r\nI am working within R, but the error also occurs when I use the console. In the 0.7.1 verison everything works.\r\n\r\nI have tried PRAGMA memory_limit='32GB', but that results in the same error:\r\nError: rapi_execute: Failed to run query\r\nError: Out of Memory Error: failed to allocate data of size 262KB (31.9GB/32.0GB used)\n\n### To Reproduce\n\nCREATE INDEX i ON table (column)\n\n### OS:\n\nWIN 11\n\n### DuckDB Version:\n\n0.8\n\n### DuckDB Client:\n\nR / Console\n\n### Full Name:\n\nErdmann\n\n### Affiliation:\n\nviadee\n\n### Have you tried this on the latest `master` branch?\n\n- [X] I agree\n\n### Have you tried the steps to reproduce? Do they include all relevant data and configuration? Does the issue you report still appear there?\n\n- [X] I agree",
+        "comments": [
+            "the size and the structure of your table?",
+            "Size: ~86kk x 31, 30 varchar (also includes column to be indexed) and 1 timestamp.\r\n\r\ntable:\r\ntable_schema: main\r\ntable_type: BASE TABLE\r\nis_typed: no\r\n\r\ncolumns:\r\npk: all false\r\n\r\nLet me know if you need any more information.\r\n",
+            "86kk means 86000000 rows?",
+            "you can replace 10 with 86000000 to test\r\n```\r\nD create table t31 as select now()+interval(i)second c,j,i::varchar c1 from range(10)t(i),range(30)s(j);\r\nD from t31;\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502             c              \u2502   j   \u2502   c1    \u2502\r\n\u2502  timestamp with time zone  \u2502 int64 \u2502 varchar \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     0 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     1 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     2 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     3 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     4 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     5 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     6 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     7 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     8 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502     9 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    10 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    11 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    12 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    13 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    14 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    15 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    16 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    17 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    18 \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:21.364+00 \u2502    19 \u2502 0       \u2502\r\n\u2502             \u00b7              \u2502     \u00b7 \u2502 \u00b7       \u2502\r\n\u2502             \u00b7              \u2502     \u00b7 \u2502 \u00b7       \u2502\r\n\u2502             \u00b7              \u2502     \u00b7 \u2502 \u00b7       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    10 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    11 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    12 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    13 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    14 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    15 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    16 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    17 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    18 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    19 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    20 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    21 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    22 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    23 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    24 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    25 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    26 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    27 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    28 \u2502 9       \u2502\r\n\u2502 2023-06-01 12:03:30.364+00 \u2502    29 \u2502 9       \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 300 rows (40 shown)                3 columns \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\nD create table z as pivot t31 on j using min(c1);\r\nD from z;\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502          c           \u2502    0    \u2502    1    \u2502   10    \u2502   11    \u2502 \u2026 \u2502    4    \u2502    5    \u2502    6    \u2502    7    \u2502    8    \u2502    9    \u2502\r\n\u2502 timestamp with tim\u2026  \u2502 varchar \u2502 varchar \u2502 varchar \u2502 varchar \u2502   \u2502 varchar \u2502 varchar \u2502 varchar \u2502 varchar \u2502 varchar \u2502 varchar \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 0       \u2502 0       \u2502 0       \u2502 0       \u2502 \u2026 \u2502 0       \u2502 0       \u2502 0       \u2502 0       \u2502 0       \u2502 0       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 1       \u2502 1       \u2502 1       \u2502 1       \u2502 \u2026 \u2502 1       \u2502 1       \u2502 1       \u2502 1       \u2502 1       \u2502 1       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 2       \u2502 2       \u2502 2       \u2502 2       \u2502 \u2026 \u2502 2       \u2502 2       \u2502 2       \u2502 2       \u2502 2       \u2502 2       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 3       \u2502 3       \u2502 3       \u2502 3       \u2502 \u2026 \u2502 3       \u2502 3       \u2502 3       \u2502 3       \u2502 3       \u2502 3       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 4       \u2502 4       \u2502 4       \u2502 4       \u2502 \u2026 \u2502 4       \u2502 4       \u2502 4       \u2502 4       \u2502 4       \u2502 4       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 5       \u2502 5       \u2502 5       \u2502 5       \u2502 \u2026 \u2502 5       \u2502 5       \u2502 5       \u2502 5       \u2502 5       \u2502 5       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 6       \u2502 6       \u2502 6       \u2502 6       \u2502 \u2026 \u2502 6       \u2502 6       \u2502 6       \u2502 6       \u2502 6       \u2502 6       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 7       \u2502 7       \u2502 7       \u2502 7       \u2502 \u2026 \u2502 7       \u2502 7       \u2502 7       \u2502 7       \u2502 7       \u2502 7       \u2502\r\n\u2502 2023-06-01 12:03:2\u2026  \u2502 8       \u2502 8       \u2502 8       \u2502 8       \u2502 \u2026 \u2502 8       \u2502 8       \u2502 8       \u2502 8       \u2502 8       \u2502 8       \u2502\r\n\u2502 2023-06-01 12:03:3\u2026  \u2502 9       \u2502 9       \u2502 9       \u2502 9       \u2502 \u2026 \u2502 9       \u2502 9       \u2502 9       \u2502 9       \u2502 9       \u2502 9       \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 10 rows                                                                                                31 columns (11 shown) \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\nD create index on z(\"0\");\r\nError: Not implemented Error: Index without a name not supported yet!\r\nD create index idx on z(\"0\");\r\nD\r\n```",
+            "There are a few known performance issues in some parts of the index code, and this issue is probably related. I almost have a PR up to fix that, I'll ping you once it is merged into master. Would be great if you could double-check then. :)",
+            "Double check: indexing on 10 rows works (e.g. your example). Creating the example table is also not possible for me, as for 86kk rows duckdb crashes on my pc.\r\nSo it is indeed a performance issue, not a general issue (or issue with my general system)",
+            "1000000 rows is ok\r\n```\r\nD create table t31 as select now()+interval(i)second c,j,i::varchar c1 from range(1e6::int)t(i),range(30)s(j);\r\n100% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f\r\nD .timer on\r\nD create table z as pivot t31 on j using min(c1);\r\n100% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f\r\nRun Time (s): real 23.050 user 129.590031 sys 43.259077\r\nD create index idx on z(\"0\");\r\nRun Time (s): real 0.532 user 2.121614 sys 0.873606\r\n```",
+            "1e7 rows failed in memory db\r\n```\r\nD create table t31 as select now()+interval(i)second c,j,i::varchar c1 from range(1e7::int)t(i),range(30)s(j);\r\n100% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f\r\nRun Time (s): real 85.844 user 82.462129 sys 3.354021\r\nD create table z as pivot t31 on j using min(c1);\r\n 28% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258a                                           \u258f Run Time (s): real 82.450 user 227.465058 sys 95.503812\r\nError: Out of Memory Error: could not allocate block of size 262KB (26.8GB/26.8GB used)\r\nDatabase is launched in in-memory mode and no temporary directory is specified.\r\nUnused blocks cannot be offloaded to disk.\r\n\r\nLaunch the database with a persistent storage back-end\r\nOr set PRAGMA temp_directory='/path/to/tmp.tmp'\r\n```",
+            "use list+select to make the example table\r\n```\r\nD create table z1 as select c,list(c1)c2 from t31 group by c;\r\n100% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f\r\nRun Time (s): real 49.633 user 241.505148 sys 154.706192\r\nD create table z2 as select c,c2[1],c2[2],c2[3],c2[4],c2[5],c2[6],c2[7],c2[8],c2[9],c2[10],c2[11],c2[12],c2[13],c2[14],c2[15],c2[16],c2[17],\r\n19],c2[20],c2[21],c2[22],c2[23],c2[24],c2[25],c2[26],c2[27],c2[28],c2[29],c2[30] from z1;\r\n100% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f\r\nRun Time (s): real 6.776 user 40.497860 sys 37.143838\r\nD\r\nD create index idx on z2(\"c2[1]\");\r\n100% \u2595\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f\r\nRun Time (s): real 9.381 user 26.613771 sys 28.173781\r\nD select count(*) from z2;\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502 count_star() \u2502\r\n\u2502    int64     \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502     10000000 \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\nRun Time (s): real 0.152 user 0.000000 sys 0.015600\r\n```",
+            "@FabianErdm, we just merged a PR to decrease the memory pressure of the ART. Maybe you can check again? If you decrease the number of threads (`PRAGMA threads = 4`), then you also decrease the memory pressure of `CREATE INDEX`, but index creation takes longer (threads blow up the memory consumption only during the creation).\r\n\r\nIf you still run out of memory, please send me the following information, then I can benchmark this and possibly adjust the code.\r\n- DB size before index creation (`PRAGMA database_size`)\r\n- Number of distinct values of the indexed column (it is `VARCHAR`, yes?)\r\n- Average length or (better) total byte count of the values in that column\r\n- Number of available threads on your system\r\n",
+            "Version: v0.8.1-dev327 57912b60a6\r\n\r\ndatabase_size:\r\n database_size \u2502 block_size \u2502 total_blocks \u2502 used_blocks \u2502 free_blocks \u2502 wal_size \u2502 memory_usage \u2502 memory_limit \u2502\r\n        2.9GB      \u2502     262144 \u2502        11295 \u2502       11295 \u2502           0       \u2502 0 bytes  \u2502 262KB               \u2502 13.4GB\r\n\r\nSame error: 0% ?                                                            ? Error: Out of Memory Error: failed to allocate data of size 262KB (13.4GB/13.4GB used)\r\n\r\nI have tried without specifying threads, threads = 4, 1, 8. Number of available threads is 8.\r\n\r\n7200000 unique values out of 86000000 total rows in the column to be indexed. Column contains VARCHAR, each of length 10. \r\nAs mentioned above: Table consists of 30 VARCHAR columns, 1 column as DATE (total 31 columns).",
+            "Besides #8112, I am also working on decreasing the memory pressure of the ART during index creation (not the size that it takes up once created). I am leaving this comment to double-check once both PRs are on master.",
+            "is this fixed in latest master?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23542,
+            "commit_id": "b718834b8339c4e6caab2d430b8bfd070a11bf05",
+            "original_commit_id": "d34a26b2c08b771b8c286b6de273ab0add85051e",
+            "path": "src/execution/index/art/art.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "The allocators_ptr seems to be set to `nullptr` in a bunch of places, maybe have it as a default value?"
+            ]
+        },
+        {
+            "hunk_id": 23576,
+            "commit_id": "b718834b8339c4e6caab2d430b8bfd070a11bf05",
+            "original_commit_id": "d34a26b2c08b771b8c286b6de273ab0add85051e",
+            "path": "src/execution/physical_plan/plan_create_index.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe this should also be disabled for lists/structs (although not sure if we support indexes on those in the first place?)",
+                "We don't support it in nested types.\r\n(https://github.com/duckdb/duckdb/blob/525b948821318b9b7701256b199fd0f0a84c40ef/src/execution/index/art/art.cpp#L63)"
+            ]
+        },
+        {
+            "hunk_id": 23541,
+            "commit_id": "b718834b8339c4e6caab2d430b8bfd070a11bf05",
+            "original_commit_id": "d34a26b2c08b771b8c286b6de273ab0add85051e",
+            "path": "src/execution/physical_plan/plan_create_index.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe this should also be disabled for lists/structs (although not sure if we support indexes on those in the first place?)",
+                "We don't support it in nested types.\r\n(https://github.com/duckdb/duckdb/blob/525b948821318b9b7701256b199fd0f0a84c40ef/src/execution/index/art/art.cpp#L63)"
+            ]
+        },
+        {
+            "hunk_id": 23679,
+            "commit_id": "b718834b8339c4e6caab2d430b8bfd070a11bf05",
+            "original_commit_id": "d34a26b2c08b771b8c286b6de273ab0add85051e",
+            "path": "src/execution/index/art/art.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "The allocators_ptr seems to be set to `nullptr` in a bunch of places, maybe have it as a default value?"
+            ]
+        },
+        {
+            "hunk_id": 23678,
+            "commit_id": "b718834b8339c4e6caab2d430b8bfd070a11bf05",
+            "original_commit_id": "d34a26b2c08b771b8c286b6de273ab0add85051e",
+            "path": "src/execution/physical_plan/plan_create_index.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 77,
+            "original_line": 77,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "Maybe this should also be disabled for lists/structs (although not sure if we support indexes on those in the first place?)",
+                "We don't support it in nested types.\r\n(https://github.com/duckdb/duckdb/blob/525b948821318b9b7701256b199fd0f0a84c40ef/src/execution/index/art/art.cpp#L63)"
+            ]
+        },
+        {
+            "hunk_id": 23577,
+            "commit_id": "b718834b8339c4e6caab2d430b8bfd070a11bf05",
+            "original_commit_id": "d34a26b2c08b771b8c286b6de273ab0add85051e",
+            "path": "src/execution/index/art/art.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 36,
+            "original_line": 36,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "The allocators_ptr seems to be set to `nullptr` in a bunch of places, maybe have it as a default value?"
+            ]
+        }
+    ]
+}

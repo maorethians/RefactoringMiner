@@ -1,0 +1,101 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 81070,
+    "lang": "c_sharp",
+    "pr_title": "Fix TarWriter.TarEntry exception when adding file whose Unix group owner does not exist in the system",
+    "pr_body": "Fixes https://github.com/dotnet/runtime/issues/81047\r\nAddresses https://github.com/dotnet/sdk-container-builds/issues/246\r\n\r\nUsers in MacOSX ARM are seeing an exception show up when executing `dotnet publish`. The exception shows up when the test container is created and the `TarWriterWriteEntry(fileName, entryName)` is called. The method is throwing when attempting to add a file whose Unix group doesn't exist in the current machine.\r\n\r\nThe root cause is that when we call the native method that retrieves a groupName using a groupId, the P/Invoke that wraps it throws an exception if the returned string is null.\r\n\r\n`WriteEntry` should be able to continue writing the rest of the entry with an empty groupName if such group is not found in the current system using the groupId. In this case, the groupName field should simply be an empty string.\r\n\r\nAdded a couple of tests that create a randomly named group, create a file in disk, assigns the group as owner of the file, then deletes the group, then adds the file as an entry to the archive.\r\n\r\nI deleted a method that was not used anywhere but in a test file. For future reference, if we need to bring it back, it should also add a new resource string with a more useful error message for when the errno is 0 and the string is null:\r\n\r\nThis affects users from .NET 7, so we will need to backport it.\r\n\r\n<details>\r\n\r\n```cs\r\n        /// <summary>\r\n        /// Gets the group name associated to the specified group ID.\r\n        /// </summary>\r\n        /// <param name=\"gid\">The group ID.</param>\r\n        /// <returns>On success, return a string with the group name. On failure, throws an IOException.</returns>\r\n        internal static string GetGroupName(uint gid)\r\n        {\r\n            string? groupName = GetGroupNameInternal(gid);\r\n            ErrorInfo error = GetLastErrorInfo();\r\n            if (groupName == null && error.RawErrno == 0)\r\n            {\r\n                throw new IOException(SR.Format(SR.IO_GroupNotFound, gid));\r\n            }\r\n            else\r\n            {\r\n                throw GetIOException(error);\r\n            }\r\n        }\r\n```\r\n</details>\r\n\r\ncc @baronfel @rainersigwald ",
+    "pr_comments": [
+        "CI failures are all unrelated:\r\n\r\n- `Libraries Test Run release coreclr windows x86 Release` and `Libraries Test Run release coreclr windows x64 Debug`\r\n  - All seem to be networking infra problems with the exception message: `No hay m\u00e1s extremos disponibles desde el asignador de extremos.` which translates to `There are no more endpoints available in the endpoint mapper`.\r\n  - I see one issue open tracking that failure, but it's a bit old: https://github.com/dotnet/runtime/issues/74838\r\n    - The affected tests are in cryptography and networking.\r\n\r\n- `Libraries Test Run release mono linux arm64 Debug`\r\n  - At least 3 Generator Roslyn tests failing with this known issue: https://github.com/dotnet/runtime/issues/81123\r\n    - Microsoft.Extensions.Logging.Generators.Roslyn3.11.Tests\r\n    - System.Text.Json.SourceGeneration.Roslyn4.4.Tests\r\n    - Microsoft.Extensions.Logging.Generators.Roslyn4.0.Tests\r\n",
+        "/backport to release/7.0",
+        "Started backporting to release/7.0: https://github.com/dotnet/runtime/actions/runs/4001696599"
+    ],
+    "merged": true,
+    "created_at": "2023-01-24T05:24:43Z",
+    "issue_context": {
+        "number": 81047,
+        "title": "Erroneous `IOException` in `TarWriter.WriteEntry` on MacOS",
+        "body": "### Description\n\ndotnet/sdk-container-builds#246\r\n\r\nThe new `dotnet publish` container support crashes on MacOS. This appears due to an error in `TarWriter.WriteEntry`.\r\n\r\nSpecifically, [the stack trace points to this line](https://github.com/dotnet/runtime/blob/0ca364767715fee7bc9d0273eec4f30a3c6cc8f0/src/libraries/System.Formats.Tar/src/System/Formats/Tar/TarWriter.Unix.cs#LL85C5-L85C5), but the behavior any deeper than that is pretty opaque to me.\r\n\r\nI've written a simple `dotnet new console` app that repros the behavior; here is the stack trace output from running it:\r\n\r\n```\r\nUnhandled exception. System.IO.IOException: No such file or directory\r\n   at Interop.Sys.GetGroupName(UInt32 gid)\r\n   at System.Formats.Tar.TarWriter.ConstructEntryForWriting(String fullPath, String entryName, FileOptions fileOptions)\r\n   at System.Formats.Tar.TarWriter.WriteEntry(String fileName, String entryName)\r\n   at Program.<Main>$(String[] args) in /Users/jcarpenter/projects/personal/tar-bug/Program.cs:line 18\r\n```\r\n\n\n### Reproduction Steps\n\nOn a Mac, in a new empty directory:\r\n\r\n1. `dotnet new`\r\n2. Create a file named `example-file.txt`:\r\n\r\n```\r\necho 'Plain text file to be included in a tar.' > example-file.txt\r\n```\r\n\r\n4. Replace `Program.cs` with:\r\n\r\n```csharp\r\nusing System.Formats.Tar;\r\nusing System.IO.Compression;\r\n\r\nFile.Delete(\"example-output.tar\");\r\nusing var writeStream = File.Create(\"example-output.tar\");\r\n\r\n// Initialization roughly corresponds to crashing scenario in Microsoft.NET.Build.Containers/Layers.cs:\r\n// https://github.com/dotnet/sdk-container-builds/blob/86ad14026fc68bb8967e662f49ffb3c105050bca/Microsoft.NET.Build.Containers/Layer.cs#L47\r\nusing var compressionStream = new GZipStream(writeStream, CompressionMode.Compress, leaveOpen: true);\r\nusing var tarWriter = new TarWriter(compressionStream, TarEntryFormat.Gnu, leaveOpen: true);\r\n\r\n// On MacOS, we're able to write to the tar by explicitly creating a GnuTarEntry instance\r\nvar workingEntry = new GnuTarEntry(TarEntryType.RegularFile, \"working/example-file.txt\");\r\nworkingEntry.DataStream = File.OpenRead(\"example-file.txt\");\r\ntarWriter.WriteEntry(workingEntry); // works!\r\n\r\n// On MacOS, this crashes with an erroneous System.IO.IOException: No such file or directory\r\ntarWriter.WriteEntry(\"example-file.txt\", \"broken/example-file.txt\"); // crashes\r\n\r\n```\r\n\r\n5. `dotnet run`\n\n### Expected behavior\n\nA tar should be created with entries for `working/example-file.txt` and `broken/example-file.text`.\n\n### Actual behavior\n\nInstead, the program crashes when calling [the `WriteEntry` overload that takes two strings](https://learn.microsoft.com/en-us/DOTNET/api/system.formats.tar.tarwriter.writeentry?view=net-7.0#system-formats-tar-tarwriter-writeentry(system-string-system-string)) (line 18 in the minimal repro).\r\n\r\nIf you comment out the offending line, the program produces a tar successfully.\n\n### Regression?\n\n_No response_\n\n### Known Workarounds\n\nOne workaround (that I haven't confirmed myself, but assume _must_ work) is to run this on Windows instead.\r\n\r\nAnother workaround is to avoid the crashing overload of `WriteEntry` and instead always explicitly create `TarEntry` instances. However, there is a lot of convenience baked into the crashing overload; so this workaround represents a higher implementation burden for creating the various types of TarEntries appropriately.\n\n### Configuration\n\n```\r\n\u00bb dotnet --info\r\n.NET SDK:\r\n Version:   7.0.101\r\n Commit:    bb24aafa11\r\n\r\nRuntime Environment:\r\n OS Name:     Mac OS X\r\n OS Version:  13.1\r\n OS Platform: Darwin\r\n RID:         osx.13-x64\r\n Base Path:   /usr/local/share/dotnet/sdk/7.0.101/\r\n\r\nHost:\r\n  Version:      7.0.1\r\n  Architecture: x64\r\n  Commit:       97203d38ba\r\n\r\n[installed, etc. truncated]\r\n```\n\n### Other information\n\n_No response_",
+        "comments": [
+            "From the discussion in https://github.com/dotnet/sdk-container-builds/issues/246, the entry should be created even if the P/Invoke fails to retrieve the groupname using the provided groupid. Currently we are throwing an exception in such case, preventing the process to finish creating the tar.\r\n\r\nI'll work on a fix soon."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 4300,
+            "commit_id": "9e601ef140901c69061b301ac5bc304860dc2dbb",
+            "original_commit_id": "45f5f16cd73b0f6ad5cb153f45cf40fbd2612a11",
+            "path": "src/libraries/Common/src/Interop/Unix/System.Native/Interop.GetGroupName.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 21,
+            "original_line": 20,
+            "side": "RIGHT",
+            "original_position": 17,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "s/gets/get",
+                "Shouldn't it be \"gets\"?:\r\n\r\n> \"When this method returns true, [_this method_] gets the value...\""
+            ]
+        },
+        {
+            "hunk_id": 4301,
+            "commit_id": "9e601ef140901c69061b301ac5bc304860dc2dbb",
+            "original_commit_id": "45f5f16cd73b0f6ad5cb153f45cf40fbd2612a11",
+            "path": "src/libraries/System.Formats.Tar/tests/TarWriter/TarWriter.WriteEntryAsync.File.Tests.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 191,
+            "original_line": 183,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 43,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n                    Assert.Equal(groupId, entry.Gid);\r\n                    Assert.Null(reader.GetNextEntry());\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 4302,
+            "commit_id": "9e601ef140901c69061b301ac5bc304860dc2dbb",
+            "original_commit_id": "45f5f16cd73b0f6ad5cb153f45cf40fbd2612a11",
+            "path": "src/libraries/System.Formats.Tar/tests/TarWriter/TarWriter.WriteEntryAsync.File.Tests.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 190,
+            "original_line": 182,
+            "side": "RIGHT",
+            "original_position": 34,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "> the groupName field should simply be an empty string.\r\n\r\nIs this what other tar tools do? I wonder if one of them chooses to write the groupName regardless of being non-existent.",
+                "> Is this what other tar tools do?\r\n\r\nYes. Here's an example:\r\n\r\n```\r\n~/tartest $ touch file.txt\r\n\r\n~/tartest $ ls -l file.txt\r\n-rw-r--r-- 1 carlos carlos     0 Jan 24 10:50 file.txt\r\n\r\n~/tartest $ sudo groupadd deleteme\r\n\r\n~/tartest $ getent group deleteme\r\ndeleteme:x:3581:\r\n\r\n~/tartest $ sudo chgrp deleteme file.txt\r\n\r\n~/tartest $ ls -l file.txt\r\n-rw-r--r-- 1 carlos deleteme     0 Jan 24 10:50 file.txt\r\n\r\n~/tartest $ sudo groupdel deleteme\r\n\r\n~/tartest $ ls -l file.txt\r\n-rw-r--r-- 1 carlos   3581     0 Jan 24 10:50 file.txt\r\n\r\n~/tartest $ tar cvf group.tar file.txt\r\nfile.txt\r\n```\r\n\r\nThen when inspecting the archive, you can see the gname field (yellow) is empty:\r\n\r\n![image](https://user-images.githubusercontent.com/1175054/214384732-de24345c-8ed9-4e63-b3a0-8cafd38cdd66.png)\r\n\r\n> I wonder if one of them chooses to write the groupName regardless of being non-existent.\r\n\r\nBut if the groupname is not known, we cannot write one, and we shouldn't be writing anything else, or we would be tampering with the original data we are archiving.\r\n\r\nWe only know the gid (it's in its own field in the header). We tried but failed to retrieve the groupname associated to that gid, because it does not exist in the current system, so we can just leave it empty.\r\n",
+                "Thanks for checking. Does that apply for the other POSIX formats we support? \r\n`tar cvf --format=ustar group.tar file.txt`\r\n`tar cvf --format=gnu group.tar file.txt`\r\n\r\nFor the case where you manually build a PosixTarEntry and set [GroupName](https://learn.microsoft.com/dotnet/api/system.formats.tar.posixtarentry.groupname), do we write the value even if it doesn't exist?",
+                "> Does that apply for the other POSIX formats we support?\r\n\r\nYes. Confirmed, exact same behavior with gnu and ustar: The groupname field is left empty.\r\n\r\n\r\n\r\n> For the case where you manually build a PosixTarEntry and set GroupName, do we write the value even if it doesn't exist?\r\n\r\nThat case is not affected by this bug because whatever value you set to that property is the value that ends up written in the archive. It does not get validated against the groups available in the current OS."
+            ]
+        },
+        {
+            "hunk_id": 4303,
+            "commit_id": "9e601ef140901c69061b301ac5bc304860dc2dbb",
+            "original_commit_id": "45f5f16cd73b0f6ad5cb153f45cf40fbd2612a11",
+            "path": "src/libraries/System.Formats.Tar/tests/TarWriter/TarWriter.File.Base.Unix.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 87,
+            "original_line": 87,
+            "side": "RIGHT",
+            "original_position": 53,
+            "position": 53,
+            "subject_type": "line",
+            "review_comments": [
+                "this is using the pattern that is prone to a famous deadlock\r\nhttps://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.standardoutput?view=net-7.0#remarks\r\n\r\nit will only occur if there is a sufficiently large amount of output, so this could well be fine here, but just FYI that this is not a good pattern to use in general.",
+                "Fixed. Better late than never: https://github.com/dotnet/runtime/pull/83126"
+            ]
+        }
+    ]
+}

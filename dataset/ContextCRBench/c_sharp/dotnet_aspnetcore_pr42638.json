@@ -1,0 +1,205 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 42638,
+    "lang": "c_sharp",
+    "pr_title": "Allow cancellation of navigation events in Blazor",
+    "pr_body": "# Allow cancellation of navigation events in Blazor\r\n\r\nIntroduces new APIs that enable the cancellation of internal and external navigation events.\r\n\r\n## API Overview\r\n\r\nNew `NavigationManager` APIs can be used to add and remove handlers that may asynchronously cancel internal navigations:\r\n\r\n```csharp\r\npublic abstract class NavigationManager\r\n{\r\n    public void AddLocationChangingHandler(Func<LocationChangingContext, ValueTask> locationChangingHandler);\r\n    public bool RemoveLocationChangingHandler(Func<LocationChangingContext, ValueTask> locationChangingHandler);\r\n}\r\n\r\npublic class LocationChangingContext\r\n{\r\n    public string TargetLocation { get; }\r\n    public bool IsNavigationIntercepted { get; }\r\n    public CancellationToken CancellationToken { get; }\r\n    public void PreventNavigation();\r\n}\r\n```\r\n\r\nThe `<NavigationLock />` component wraps these APIs so this functionality can easily be added to a Blazor component:\r\n\r\n```razor\r\n<NavigationLock OnBeforeInternalNavigation=\"OnBeforeInternalNavigation\" ConfirmExternalNavigation=\"true|false\" />\r\n\r\n@code {\r\n    private void OnBeforeInternalNavigation(LocationChangingContext context)\r\n    {\r\n        // ...\r\n    }\r\n}\r\n```\r\n\r\nWhen `ConfirmExternalNavigation` is `true`, the browser's built-in confirmation dialog prompts the user if they would like to continue before performing an external navigation.\r\n\r\n## Important behavioral considerations\r\n\r\nSince internal navigations can be canceled asynchronously, it's possible that multiple overlapping navigations may occur. These might include cases where the user is rapidly clicking the back button on a page or clicking multiple links before a decision about whether to permit the navigation is made. Following is a summary of how this asynchrony is handled:\r\n\r\n* If there are any \"location changing\" handlers registered, all navigations are initially reverted, then replayed if the navigation does not get canceled.\r\n* If overlapping navigation requests are made, the latest request always cancels earlier requests. This means:\r\n  * The app may treat multiple back/forward button clicks as a single click.\r\n  * If the user clicks multiple links before the navigation completes, the most recently clicked link will be navigated to.\r\n\r\nIt's also important to note that the `<NavigationLock />` component only takes effect after being rendered (just like any other Blazor component). Practically, this means it's possible that the user may quickly navigate past a page that was supposed to intercept the navigation, but it didn't because the user navigated away before the component had a chance to render.\r\n\r\nSome other details to be aware of:\r\n* Programmatically-initiated navigations (e.g. `NavigationManager.NavigateTo()`) will also invoke the \"location changing\" handlers.\r\n* The navigation behavior for existing apps does not change if these features are not used.\r\n\r\nFixes #14962",
+    "pr_comments": [
+        "```cs\r\npublic CancellationToken CancellationToken { get; }\r\npublic bool IsCanceled { get; }\r\npublic void Cancel();\r\n```\r\n\r\nThis triplet could be confusing, because we're using the word \"cancel\" to mean two different things (if I'm following correctly). The `CancellationToken` tells you if this `OnLocationChanging` call has been cancelled, whereas `Cancel`/`IsCanceled` are about the navigation itself being cancelled.\r\n\r\nI'd suggest we disambiguate by not using the phrase \"cancel\" about the navigation itself, and saying something like \"PreventNavigation\" instead, e.g.:\r\n\r\n```cs\r\npublic CancellationToken CancellationToken { get; }\r\npublic void PreventNavigation();\r\npublic bool IsNavigationPrevented { get; }\r\n```",
+        "Also to be honest, I'm not sure what is the use case for `IsNavigationPrevented`. It seems like the objective might be to do with orchestrating across multiple handlers, but given asynchrony, it doesn't quite cover it because even if you check once, another handler might then prevent navigation later.\r\n\r\nWhat if instead, there was just `PreventNavigation` and `CancellationToken`, and the act of calling `PreventNavigation` would also cause the cancellation token to fire? In that case, other handlers would be notified that their opinion is no longer relevant since we're going to prevent navigation regardless, so they can stop doing work if they want to.\r\n\r\nI'm not 100% sure how usable this would end up being (whether there are any cases where people would have to suppress a TaskCancelledException) but on the surface it seems like it might be a valid and simple pattern.",
+        "More API thoughts:\r\n\r\n>     public string Location { get; }\r\n\r\nI'm guessing this is the destination location, not the current location, but just to be clear maybe rename to `DestinationUrl` or `TargetUrl` or similar (and I'd suggest \"Url\" over \"location\" since it matches the \"Url\" terminology on NavigationManager).\r\n\r\n**UPDATE** I now realise that `LocationChangedEventArgs` already has a property called `Location` to refer to the destination. It's marginally less ambiguous in that case since the navigation has already happened so you don't have the current/destination distinction, but I agree with keeping consistent with that since it's the closest other API in the framework. So how about `DestinationLocation` or `TargetLocation`?\r\n\r\n>    public bool ForceLoad { get; }\r\n\r\nDo we need this info? If it's a client-originated navigation (`Blazor.navigateTo(...)`), I don't think the flag could ever be true, because if it was we'd have bypassed the navigation system anyway. So I think this can only be true for server-originated navigations, which might be a confusing subtlety. I'm not sure there are many cases where a developer needs this info to decide whether to allow the navigation to continue. If you have a concrete example then great, otherwise maybe we drop this flag (to avoid the subtlety mentioned above) and only add it later if a clear use case arises.",
+        "@MackinnonBuck @SteveSandersonMS Do we want to have this go through an API review?",
+        "@halter73 Yes, we'll want to do an API review for this.",
+        "Thanks for the detailed feedback, @javiercn!\r\n\r\nI'll continue adding more tests. Regarding this specific feedback:\r\n\r\n> For example, it will be good to have tests that validate the behavior when there is a long running handler and we trigger multiple navigations from the client, and similar tests.\r\n\r\nI believe the `NavigationLock_OverlappingNavigationsCancelExistingNavigations_xyz` tests handle this case, but let me know if you had something else in mind.\r\n\r\n---\r\n\r\nSome thoughts about the remaining feedback:\r\n\r\n> I think it is easier to spot that you need to return a value than dig through the context to find and call `Prevent()`\r\n\r\nI guess my concerns for having a `bool` return value to indicate cancellations were:\r\n1. It might not be obvious what `bool` value corresponds to which behavior. i.e., does a return value of `true` mean \"yes, continue the navigation\" or \"yes, cancel the navigation\"?\r\n2. I've seen other C# UI frameworks handle cancellation via some `Cancel` or `Handled` property, which is a similar pattern to having a `PreventNavigation()` method (e.g. [WinForms](https://docs.microsoft.com/en-us/dotnet/api/system.windows.forms.form.formclosing?view=windowsdesktop-6.0), [WPF](https://docs.microsoft.com/en-us/dotnet/api/system.windows.window.closing?view=windowsdesktop-6.0), [UWP](https://docs.microsoft.com/en-us/uwp/api/windows.ui.core.preview.systemnavigationcloserequestedprevieweventargs?view=winrt-22621)). However, this design might have been chosen just because returning values from event handlers isn't really a thing. \r\n\r\nI wonder if instead of returning a `bool`, we could return some `LocationChangingResult` enum, where you could either return `LocationChangingResult.ContinueNavigation` or `LocationChangingResult.CancelNavigation`? That might clear up the meaning of the return value (but obviously at the cost of introducing new APIs and being a bit more verbose).\r\n\r\n> The CancellationToken should probably be a parameter on the callback instead of a property in the context (it is most common to find it like that in .NET APIs)\r\n\r\n~~Agreed, this sounds good to me.~~\r\n\r\n**UPDATE:** Actually, the unfortunate thing about having more than two arguments in the location changing handler is that `EventCallback<TValue>` only allows for a single parameter. So we would have to re-wrap the `LocationChangingContext` and `CancellationToken` into a single object before so it can be passed to the `OnBeforeInternalNavigation` event callback when using the `<NavigationLock/>` component. And since using `<NavigationLock/>` is arguably the primary way people are going to implement location changing handlers, I think it's probably best to leave `CancellationToken` as a property on `LocationChangingContext`.",
+        "@javiercn I've addressed some of your feedback around cancellation and added some unit tests (with a few more still remaining).\r\n\r\n/cc @SteveSandersonMS in case you have any thoughts about the recent modifications.",
+        "> UPDATE: Actually, the unfortunate thing about having more than two arguments in the location changing handler is that EventCallback<TValue> only allows for a single parameter. So we would have to re-wrap the LocationChangingContext and CancellationToken into a single object before so it can be passed to the OnBeforeInternalNavigation event callback when using the <NavigationLock/> component. And since using <NavigationLock/> is arguably the primary way people are going to implement location changing handlers, I think it's probably best to leave CancellationToken as a property on LocationChangingContext\r\n\r\nI think I get what you are saying and that's a valid reason to keep the cancellation token in the same place.",
+        "> /cc @SteveSandersonMS in case you have any thoughts about the recent modifications.\r\n\r\nIt looks great to me. Reading through the comments, it seems like this has been worked out in great detail now. Thanks also to @javiercn for the quality feedback.",
+        "I'm going to merge this now - I will address any further feedback in a follow-up PR along with the API review feedback.\r\n\r\nThank you @SteveSandersonMS and @javiercn for your detailed feedback and collaboration on this!"
+    ],
+    "merged": true,
+    "created_at": "2022-07-14T13:33:12Z",
+    "issue_context": {
+        "number": 14962,
+        "title": "Expose location changing event for NavigationManger",
+        "body": "The NavigationManager exposes\r\n\r\n`LocationChanged | An event that fires when the navigation location has changed.`\r\n\r\nbut it does not expose a `LocationChanging `event.\r\n\r\nSuch an event that occurs **before navigation takes place** is very useful because it allows the previous view to prepare for its deactivation, for example, to display a warning, cancel navigation or silently save changes. \r\n\r\nCan you provide such a feature or is there already another way to achieve the above? \r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 13442,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Web/src/Routing/NavigationLock.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 41,
+            "original_line": 38,
+            "side": "RIGHT",
+            "original_position": 38,
+            "position": 41,
+            "subject_type": "line",
+            "review_comments": [
+                "Having a private interface implementation is fine as far as I'm aware, but I'm not aware of any advantage of that here vs a normal implementation. I'd be interested to know if there's a need for it!",
+                "The only reason I did this was to avoid adding these methods to the public API. Do you think that's a valid concern or is it fine to change it?",
+                "In most cases for equivalent components we did regular interface implementations (e.g., `RouteView`). However I don't know of any reason why it would be a problem to do it like you have. Either way is fine with me.",
+                "I would follow the established pattern unless there is an explicit concrete benefit of using an alternative."
+            ]
+        },
+        {
+            "hunk_id": 13443,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Web/src/Routing/NavigationLock.cs",
+            "start_line": 80,
+            "original_start_line": 80,
+            "start_side": "RIGHT",
+            "line": 84,
+            "original_line": 84,
+            "side": "RIGHT",
+            "original_position": 84,
+            "position": 84,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n    ValueTask IAsyncDisposable.DisposeAsync()\r\n    {\r\n        NavigationManager.RemoveLocationChangingHandler(OnLocationChanging);\r\n        return JSRuntime.InvokeVoidAsync(NavigationLockInterop.DisableNavigationPrompt, _id);\r\n    }\r\n```",
+                "Is this better for performance reasons? I've formed a habit of avoiding directly returning tasks for the reasons [outlined here](https://github.com/davidfowl/AspNetCoreDiagnosticScenarios/blob/master/AsyncGuidance.md#prefer-asyncawait-over-directly-returning-task) (although it looks like some of those reasons don't apply to this case).",
+                "We normally avoid `async/await` when awaiting the task is the last thing we do. But points for having read the async guidance from @davidfowl \ud83d\ude04."
+            ]
+        },
+        {
+            "hunk_id": 13445,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Components/test/NavigationManagerTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 346,
+            "original_line": 344,
+            "side": "RIGHT",
+            "original_position": 148,
+            "position": 150,
+            "subject_type": "line",
+            "review_comments": [
+                "Order is significant here, so it might be interesting to have another test that captures the fact that if a handler responds synchronously, other handlers don't get invoked, so maybe you could modify this test to have the handler \"in the middle\" prevent the navigation synchronously and assert the last one is not invoked (and the first invoked but canceled)."
+            ]
+        },
+        {
+            "hunk_id": 13448,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Components/src/Routing/LocationChangingContext.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 11,
+            "original_line": 11,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "One thing to consider here, is how would people write unit tests for this. Does this type need to be \"constructible\" by people in unit tests?",
+                "I believe this discussion was had [here](https://github.com/dotnet/aspnetcore/pull/42638#discussion_r923501645). The conclusion seems to be that it's fine if this stays `internal`, at least for the bUnit case."
+            ]
+        },
+        {
+            "hunk_id": 13447,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Components/src/Routing/LocationChangingContext.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 40,
+            "original_line": 40,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 40,
+            "subject_type": "line",
+            "review_comments": [
+                "I think we should consider passing the cancellation token as a separate argument to the handler, there is no relationship between the cancellation token and the rest of the data in this class.\r\n\r\nIn addition to that, it is \"interesting\" that this class looks \"identical\" to `LocationChangedEventArgs` except for the CancellationToken in this one (and the method to prevent the navigation). \r\n\r\nI am not suggesting that we \"reuse\" the same class, but an indicator that the cancellation token should probably not be here.\r\n\r\n",
+                "@javiercn The challenge with having the `CancellationToken` as its own argument in the callback is that `EventCallback<TValue>` only allows there to be a single parameter, so if you define a location changing handler using `<NavigationLock OnBeforeInternalNavigation=\"Foo\" />`, then `Foo()` can only accept a single argument (the `LocationChangingContext`). So the only option in that case is to leave the `CancellationToken` as a property on `LocationChangingContext`.\r\n\r\nI guess one way we could make this work is that we have a separate `LocationChangingEventArgs` whose two properties are the `LocationChangingContext` and the `CancellationToken`. So, if you add a location changing handler using the `NavigationManager` API, your callback will still have a separate argument for the `CancellationToken`. I'm not sure how I feel about having to do `args.Context.PreventNavigation()` rather than just `context.PreventNavigation()` though.\r\n\r\nThoughts?",
+                "And, the limitations of `EventCallback<TValue>` are also a reason why having a `PreventNavigation()` method could be preferred over relying on a return value from the handler (since event callbacks cannot return anything other than a `Task`)."
+            ]
+        },
+        {
+            "hunk_id": 13446,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Components/test/NavigationManagerTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 9,
+            "original_line": 9,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "Tests look great and thorough; I would suggest adding a couple of additional tests where the handler throws an exception both synchronously and asynchronously to capture that behavior, since it is something that will likely happen on users apps.",
+                "Just added some tests that do this"
+            ]
+        },
+        {
+            "hunk_id": 13441,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHost.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 152,
+            "original_line": 152,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "I'm not a fan of having to do it this way, but it seemed like one of the only options given the `WebAssemblyNavigationManager` instance is a static singleton unassociated with DI. I'm definitely open to alternative mechanisms for logging exceptions thrown in \"location changing\" events.",
+                "I don't remember why it is done this way, maybe we could change it to be created from DI and that way it only needs to get injected in the constructor."
+            ]
+        },
+        {
+            "hunk_id": 13449,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Server/src/Circuits/RemoteNavigationManager.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 114,
+            "original_line": 111,
+            "side": "RIGHT",
+            "original_position": 32,
+            "position": 60,
+            "subject_type": "line",
+            "review_comments": [
+                "What happens when a handler throws in this scenario compared to when the navigation is started from JS?",
+                "At the time you wrote this comment, it would log an error but not tear down the circuit. I've since changed that behavior so that it tears down the circuit for programmatically initiated navigations like it does for JS-initiated navigations."
+            ]
+        },
+        {
+            "hunk_id": 13444,
+            "commit_id": "d1558107b97d2471e9a0aa5d008b511ead908fa7",
+            "original_commit_id": "e6dd3946f1f14e4182c70ac532dda10dd0f25f4b",
+            "path": "src/Components/Components/test/NavigationManagerTest.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 638,
+            "original_line": 545,
+            "side": "RIGHT",
+            "original_position": 349,
+            "position": 442,
+            "subject_type": "line",
+            "review_comments": [
+                "You can do this with a TaskCompletionSource too.\r\n\r\n```\r\nvar tcs = new TaskCompletionSource();\r\nct.Register(() => tcs.SetCanceled());\r\n```\r\n\r\nand inside this method you do await tcs.Task;",
+                "I think the problem is that if the `CancellationToken` gets canceled before the location changing callback executes, then the TCS will never get canceled (and this actually happens in the test because the overlapping navigations are fired off synchronously). Do you think it's fine to leave as-is?",
+                "Doesn't it work if you do `context.CancellationToken.ThrowIfCancelled()` before registering the cancellation?",
+                "That said, I am somewhat ok leaving it as it is."
+            ]
+        }
+    ]
+}

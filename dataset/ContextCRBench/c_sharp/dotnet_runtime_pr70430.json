@@ -1,0 +1,147 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 70430,
+    "lang": "c_sharp",
+    "pr_title": "JsonSerializer.DeserializeAsyncEnumerable should not wait until buffer is filled.",
+    "pr_body": "From https://github.com/dotnet/runtime/issues/70107#issuecomment-1148808314. The current implementation of the [internal `ReadFromStreamAsync` method](https://github.com/dotnet/runtime/blob/da79dc611cba819dce6da3966dc4c7503524fa18/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.Stream.cs#L525-L560) will keep reading from the stream until either the internal buffer is filled or the stream EOF's, which is intended as a performance optimization to avoid redundant deserialization calls. While this makes sense in the case of `DeserializeAsync`, it can impact liveness when deserializing IAsyncEnumerable sequences in examples such as the one seen in #70107.\r\n\r\nThis PR changes the behavior of stream reading specifically in `DeserializeAsyncEnumerable` such that the deserializer is invoked as soon as the first `Stream.ReadAsync` operation returns. Moreover it makes a few more changes:\r\n\r\n* Encapsulate the buffer management logic behind the `ReadBufferState` struct.\r\n* Avoid allocating a new JsonTypeInfo instance on every IAsyncEnumerator initialization.\r\n\r\nFix #70107.",
+    "pr_comments": [
+        "Tagging subscribers to this area: @dotnet/area-system-text-json, @gregsdennis\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nFrom https://github.com/dotnet/runtime/issues/70107#issuecomment-1148808314. The current implementation of the [internal `ReadFromStreamAsync` method](https://github.com/dotnet/runtime/blob/da79dc611cba819dce6da3966dc4c7503524fa18/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.Stream.cs#L525-L560) will keep reading from the stream until either the internal buffer is filled or the stream EOF's, which is intended as a performance optimization to avoid redundant deserialization calls. While this makes sense in the case of `DeserializeAsync`, it can impact liveness when deserializing IAsyncEnumerable sequences in examples such as the one seen in #70107.\r\n\r\nThis PR changes the behavior of stream reading specifically in `DeserializeAsyncEnumerable` such that the deserializer is invoked as soon as the first `Stream.ReadAsync` operation returns. Moreover it makes a few more changes:\r\n\r\n* Encapsulate the buffer management logic behind the `ReadBufferState` struct.\r\n* Avoid allocating a new JsonTypeInfo instance on every IAsyncEnumerator initialization.\r\n\r\nFix #70107.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>eiriktsarpalis</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Text.Json`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>"
+    ],
+    "merged": true,
+    "created_at": "2022-06-10T09:34:21Z",
+    "issue_context": {
+        "number": 70107,
+        "title": "[System.Text.Json] DeserializeAsyncEnumerable is delayed emitting objects when writing asynchronously to stream",
+        "body": "### Description\r\n\r\nWhen invoking `DeserializeAsyncEnumerable` on a `utf8Json` content stream, and the stream writer has not finished yet, the `IAsyncEnumerable` is emitted with the first element only after the second element is written to the stream. The second will be emitted after the third is written, and this goes on. Consequently, the last message in the array will not be emitted unless the stream is closed, although it contains the necessary data to deserialize the object.\r\n\r\n### Reproduction Steps\r\n\r\nCsproj:\r\n\r\n```\r\n<Project Sdk=\"Microsoft.NET.Sdk\">\r\n    <PropertyGroup>\r\n        <OutputType>Exe</OutputType>\r\n        <TargetFramework>net6.0</TargetFramework>\r\n        <ImplicitUsings>enable</ImplicitUsings>\r\n        <Nullable>enable</Nullable>\r\n    </PropertyGroup>\r\n    <ItemGroup>\r\n        <PackageReference Include=\"Nerdbank.Streams\" Version=\"[2.8.57]\" />\r\n    </ItemGroup>\r\n</Project>\r\n```\r\n\r\nCode:\r\n\r\n```\r\nnamespace DeserializeAsyncEnumerable.Test;\r\n\r\nusing Nerdbank.Streams;\r\nusing System;\r\nusing System.Diagnostics;\r\nusing System.Text.Json;\r\nusing System.Threading.Tasks;\r\n\r\npublic class Program\r\n{\r\n    public static async Task Main(string[] args)\r\n    {\r\n        var testStream = new SimplexStream();\r\n        _ = WriteJsonElementsPeriodicallyToStreamAsync(testStream);\r\n\r\n        var deserializationOptions = new JsonSerializerOptions { DefaultBufferSize = 64 };\r\n        var testElements = JsonSerializer.DeserializeAsyncEnumerable<Test>(testStream, deserializationOptions);\r\n\r\n        var actualCount = 1;\r\n        var stopwatch = Stopwatch.StartNew();\r\n        await foreach (var testElement in testElements)\r\n        {\r\n            Console.WriteLine($\"[{actualCount}][Time elapsed: \" + stopwatch.Elapsed.TotalSeconds + \"; Data: \" + testElement?.Data + \"]\");\r\n            actualCount += 1;\r\n        }\r\n    }\r\n\r\n    private static async Task WriteJsonElementsPeriodicallyToStreamAsync(SimplexStream testStream)\r\n    {\r\n        var streamWriter = new StreamWriter(testStream) { AutoFlush = true };\r\n\r\n        var count = 1;\r\n        var maxElements = 10;\r\n        var delayInSeconds = 2;\r\n\r\n        await streamWriter.WriteAsync($\"[{{\\\"Data\\\":\\\"This will be printed after ~{delayInSeconds * count} seconds; Expected: {delayInSeconds * (count - 1)}\\\"}}\");\r\n        count += 1;\r\n\r\n        while (count <= maxElements)\r\n        {\r\n            await Task.Delay(TimeSpan.FromSeconds(delayInSeconds));\r\n\r\n            await streamWriter.WriteAsync($\",{{\\\"Data\\\":\\\"This will be printed after ~{delayInSeconds * count} seconds; Expected: {delayInSeconds * (count - 1)}\\\"}}\");\r\n            count += 1;\r\n        }\r\n\r\n        await streamWriter.WriteAsync($\"]\");\r\n\r\n        var preventFromLastMessageToBeEmitted = true;\r\n        if (!preventFromLastMessageToBeEmitted)\r\n        {\r\n            testStream.CompleteWriting();\r\n        }\r\n    }\r\n\r\n    private class Test\r\n    {\r\n        public string? Data { get; init; }\r\n    }\r\n}\r\n```\r\n\r\n\r\n\r\n### Expected behavior\r\n\r\nWhen writing the first JSON element (as string) to the stream, the `IAsyncEnumerable` will receive its first deserialized element in the enumeration, unblocking the enumeration.\r\n\r\n### Actual behavior\r\n\r\nWhen writing the first JSON element (as string) to the stream, the `IAsyncEnumerable` is yet to receive the first deserialized element. The first deserialized element will only be received after the second JSON element (as string) will be written to the stream. Consequently, the last message in the array will not be emitted unless the stream is closed, although it contains the necessary data to deserialize the object.\r\n\r\n### Regression?\r\n\r\n_No response_\r\n\r\n### Known Workarounds\r\n\r\nAs a workaround in my particular case, I am using Newtonsoft.Json's JsonTextReader.ReadAsync to asynchronously read JSON tokens from the stream, and deserializing manually to the required object. This way the code works as expected.\r\n\r\n### Configuration\r\n\r\nI am using .NET 6, Windows 11, x64\r\n\r\n### Other information\r\n\r\nThe real flow that produced this behavior is not using SimplexStream from Nerdbank.Streams, but using NetworkStream.",
+        "comments": [
+            "Tagging subscribers to this area: @dotnet/area-system-text-json, @gregsdennis\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\n### Description\n\nWhen invoking `DeserializeAsyncEnumerable` on a `utf8Json` content stream, and the stream writer has not finished yet, the `IAsyncEnumerable` is emitted with the first element only after the second element is written to the stream. The second will be emitted after the third is written, and this goes on. Consequently, the last message in the array will not be emitted unless the stream is closed, although it contains the necessary data to deserialize the object.\n\n### Reproduction Steps\n\nCsproj:\r\n\r\n```\r\n<Project Sdk=\"Microsoft.NET.Sdk\">\r\n    <PropertyGroup>\r\n        <OutputType>Exe</OutputType>\r\n        <TargetFramework>net6.0</TargetFramework>\r\n        <ImplicitUsings>enable</ImplicitUsings>\r\n        <Nullable>enable</Nullable>\r\n    </PropertyGroup>\r\n    <ItemGroup>\r\n        <PackageReference Include=\"Nerdbank.Streams\" Version=\"[2.8.57]\" />\r\n    </ItemGroup>\r\n</Project>\r\n```\r\n\r\nCode:\r\n\r\n```\r\nnamespace DeserializeAsyncEnumerable.Test;\r\n\r\nusing Nerdbank.Streams;\r\nusing System;\r\nusing System.Diagnostics;\r\nusing System.Text.Json;\r\nusing System.Threading.Tasks;\r\n\r\npublic class Program\r\n{\r\n    public static async Task Main(string[] args)\r\n    {\r\n        var testStream = new SimplexStream();\r\n        _ = WriteJsonElementsPeriodicallyToStreamAsync(testStream);\r\n\r\n        var deserializationOptions = new JsonSerializerOptions { DefaultBufferSize = 64 };\r\n        var testElements = JsonSerializer.DeserializeAsyncEnumerable<Test>(testStream, deserializationOptions);\r\n\r\n        var actualCount = 1;\r\n        var stopwatch = Stopwatch.StartNew();\r\n        await foreach (var testElement in testElements)\r\n        {\r\n            Console.WriteLine($\"[{actualCount}][Time elapsed: \" + stopwatch.Elapsed.TotalSeconds + \"; Data: \" + testElement?.Data + \"]\");\r\n            actualCount += 1;\r\n        }\r\n    }\r\n\r\n    private static async Task WriteJsonElementsPeriodicallyToStreamAsync(SimplexStream testStream)\r\n    {\r\n        var streamWriter = new StreamWriter(testStream) { AutoFlush = true };\r\n\r\n        var count = 1;\r\n        var maxElements = 10;\r\n        var delayInSeconds = 2;\r\n\r\n        await streamWriter.WriteAsync($\"[{{\\\"Data\\\":\\\"This will be printed after ~{delayInSeconds * count} seconds; Expected: {delayInSeconds * (count - 1)}\\\"}}\");\r\n        count += 1;\r\n\r\n        while (count <= maxElements)\r\n        {\r\n            await Task.Delay(TimeSpan.FromSeconds(delayInSeconds));\r\n\r\n            await streamWriter.WriteAsync($\",{{\\\"Data\\\":\\\"This will be printed after ~{delayInSeconds * count} seconds; Expected: {delayInSeconds * (count - 1)}\\\"}}\");\r\n            count += 1;\r\n        }\r\n\r\n        await streamWriter.WriteAsync($\"]\");\r\n\r\n        var preventFromLastMessageToBeEmitted = true;\r\n        if (!preventFromLastMessageToBeEmitted)\r\n        {\r\n            testStream.CompleteWriting();\r\n        }\r\n    }\r\n\r\n    private class Test\r\n    {\r\n        public string? Data { get; init; }\r\n    }\r\n}\r\n```\r\n\r\n\n\n### Expected behavior\n\nWhen writing the first JSON element (as string) to the stream, the `IAsyncEnumerable` will receive its first deserialized element in the enumeration, unblocking the enumeration.\n\n### Actual behavior\n\nWhen writing the first JSON element (as string) to the stream, the `IAsyncEnumerable` is yet to receive the first deserialized element. The first deserialized element will only be received after the second JSON element (as string) will be written to the stream. Consequently, the last message in the array will not be emitted unless the stream is closed, although it contains the necessary data to deserialize the object.\n\n### Regression?\n\n_No response_\n\n### Known Workarounds\n\nAs a workaround in my particular case, I am using Newtonsoft.Json's JsonTextReader.ReadAsync to asynchronously read JSON tokens from the stream, and deserializing manually to the required object. This way the code works as expected.\n\n### Configuration\n\nI am using .NET 6, Windows 11, x64\n\n### Other information\n\n_No response_\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>ohadvano</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Text.Json`, `untriaged`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+            "The root cause of this behavior is the current implementation of the [internal `ReadFromStreamAsync` method](https://github.com/dotnet/runtime/blob/da79dc611cba819dce6da3966dc4c7503524fa18/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.Stream.cs#L525-L560). The method will keep reading from the stream until either the internal buffer is filled or the stream EOF's: this was intended as a performance optimization to avoid redundant partial deserialization passes, but it is clear that it could impact liveness specifically for the case of `DeserializeAsyncEnumerable`.\r\n\r\nWe could try tweaking this method slightly specifically for `DeserializeAsyncMethod`, possibly trading off deserialization performance for decreased delays in element reads."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3510,
+            "commit_id": "df6445cdba8e0cc6b7eb1d6cea5d76fdbd0b29c0",
+            "original_commit_id": "c6a4b620681e7120ee9b59bfee351d565bb5eefa",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/ReadBufferState.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 89,
+            "original_line": 89,
+            "side": "RIGHT",
+            "original_position": 98,
+            "position": 98,
+            "subject_type": "line",
+            "review_comments": [
+                "I think this variable is mis-named. I'd rename it to something like \"_endOfInput\"",
+                "(i.e. first block can also be the last one but you don't know until you're done reading)",
+                "It denotes that we've read the final chunk of UTF-8 data to be fed into the deserializer. The deserializer itself accesses the `IsFinalBlock` property to determine if it has finished. The name predates this change and I think it's appropriate."
+            ]
+        },
+        {
+            "hunk_id": 3507,
+            "commit_id": "df6445cdba8e0cc6b7eb1d6cea5d76fdbd0b29c0",
+            "original_commit_id": "c6a4b620681e7120ee9b59bfee351d565bb5eefa",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/ReadBufferState.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 45,
+            "original_line": 45,
+            "side": "RIGHT",
+            "original_position": 54,
+            "position": 54,
+            "subject_type": "line",
+            "review_comments": [
+                "Why not just make this method static?",
+                "It can be, but wrote it like this for symmetry with the sync variant. It doesn't change the amount of copying needed in any case."
+            ]
+        },
+        {
+            "hunk_id": 3506,
+            "commit_id": "df6445cdba8e0cc6b7eb1d6cea5d76fdbd0b29c0",
+            "original_commit_id": "c6a4b620681e7120ee9b59bfee351d565bb5eefa",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializer.Read.Stream.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 438,
+            "original_line": 438,
+            "side": "RIGHT",
+            "original_position": 74,
+            "position": 74,
+            "subject_type": "line",
+            "review_comments": [
+                "Can this use the new Stream.ReadAtLeastAsync method when targeting .NET 7 and fillBuffer is true?  And if fillBuffer is false, why even call this method rather than just calling ReadAsync directly?",
+                "> Can this use the new Stream.ReadAtLeastAsync method when targeting .NET 7 and fillBuffer is true?\r\n\r\nIt could, but we still need to polyfill for all the other TFMs. Does it make a difference perf-wise?\r\n\r\n> And if fillBuffer is false, why even call this method rather than just calling ReadAsync directly?\r\n\r\nThe method does a bit of added bookkeeping like skipping BOM bytes and tracking the maximum watermark in the rented buffers.",
+                "> Does it make a difference perf-wise?\r\n\r\nNo. It'd just be nice to use the built-in functionality where it exists. We could implement the same method as an extension polyfill for downlevel.",
+                "> The method does a bit of added bookkeeping like skipping BOM bytes and tracking the maximum watermark in the rented buffers.\r\n\r\nBut it's also more expensive: if the stream.ReadAsync call completes asynchronously, it'll force this extra level of async method to suspend and allocate. ",
+                "> > Does it make a difference perf-wise?\r\n> \r\n> No. It'd just be nice to use the built-in functionality where it exists. We could implement the same method as an extension polyfill for downlevel.\r\n\r\nI gave it a shot, but honestly I don't feel like it's improving the codebase. Netstandard2.0 doesn't have `Stream.ReadAsync` overloads that accept `Memory<T>` so you can't really polyfill the exact `ReadAtLeastAsync` method signature (`ArraySegment<byte>` seeming like the next best thing), so it all becomes messier than necessary. "
+            ]
+        },
+        {
+            "hunk_id": 3511,
+            "commit_id": "df6445cdba8e0cc6b7eb1d6cea5d76fdbd0b29c0",
+            "original_commit_id": "c6a4b620681e7120ee9b59bfee351d565bb5eefa",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/ReadBufferState.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 53,
+            "original_line": 53,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 62,
+            "subject_type": "line",
+            "review_comments": [
+                "isn't it better to keep count/length in the locals in the loop and then assign them back once you're done?",
+                "Ultimately this will compile into an async state machine so any locals will be represented using fields in the SM struct."
+            ]
+        },
+        {
+            "hunk_id": 3509,
+            "commit_id": "df6445cdba8e0cc6b7eb1d6cea5d76fdbd0b29c0",
+            "original_commit_id": "c6a4b620681e7120ee9b59bfee351d565bb5eefa",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/ReadBufferState.cs",
+            "start_line": 163,
+            "original_start_line": 163,
+            "start_side": "RIGHT",
+            "line": 166,
+            "original_line": 166,
+            "side": "RIGHT",
+            "original_position": 178,
+            "position": 178,
+            "subject_type": "line",
+            "review_comments": [
+                "considering you return the copy of this buffer state in some of the methods is it safe to do it like this? Should you add some guarding against double free?",
+                "I'm seeing you always assign back the copy of the struct, please make sure to at least add comment on the method returning copy and the class itself. Alternative perhaps some `#if DEBUG` with extra code protecting us against this pattern (i.e. wrap buffer in ref type, set it to null on Dispose and check with Debug.Assert)",
+                "> considering you return the copy of this buffer state in some of the methods is it safe to do it like this? Should you add some guarding against double free?\r\n\r\nYes, assuming you somehow end up disposing two copies of the same struct then that is a possibility, but we're not doing this in the handful of methods that creates the struct. \r\n\r\n> perhaps some #if DEBUG extra code protecting us against this pattern (i.e. wrap buffer in ref type, set it to null on Dispose and check with Debug.Assert)\r\n\r\nCan you give an example? Not sure I understand. FWIW this is not new code, I'm just moving existing logic to the struct.",
+                "```csharp\r\nReadBufferState a = ...;\r\nReadBufferState b = a;\r\na.Dispose();\r\nb.Dispose(); // double free or usage after dispose if we don't dispose and continue using\r\n```",
+                "I understand the condition, my question is what assert could guard against such a potential scenario.",
+                "in the struct you could potentially add nested class like this (under `#if DEBUG`):\r\n\r\n```csharp\r\nprivate class BufferRef\r\n{\r\n  public byte[]? Buffer;\r\n}\r\n```\r\n\r\nand then add field in the struct:\r\n\r\n```csharp\r\nBufferRef _myBuffer = new BufferRef(); // assign _buffer to _myBuffer.Buffer;\r\n```\r\n\r\nthen if struct gets copied then ref gets copied as well but underlying field will be shared. Then in the Dispose you could clear that field and check if it's not null.",
+                "as per discussion offline, better to do this for all similar structs in separate PR in order to potentially find potential memory corruption bug"
+            ]
+        },
+        {
+            "hunk_id": 3508,
+            "commit_id": "df6445cdba8e0cc6b7eb1d6cea5d76fdbd0b29c0",
+            "original_commit_id": "c6a4b620681e7120ee9b59bfee351d565bb5eefa",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/ReadBufferState.cs",
+            "start_line": 146,
+            "original_start_line": 146,
+            "start_side": "RIGHT",
+            "line": 157,
+            "original_line": 157,
+            "side": "RIGHT",
+            "original_position": 166,
+            "position": 166,
+            "subject_type": "line",
+            "review_comments": [
+                "rather than keeping variable and special code, would it make sense to simply handle this separately (i.e. separate call in the beginning)",
+                "Not sure I follow, this handling needs to happen after the first read.",
+                "I was thinking about separate read but I don't really have strong preference or data telling if one way or the other is faster"
+            ]
+        }
+    ]
+}

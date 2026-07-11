@@ -1,0 +1,45 @@
+{
+    "repo": "openssl/openssl",
+    "pr_number": 26252,
+    "lang": "c",
+    "pr_title": "fix read out of buffer bounds when dealing with BIO_ADDR",
+    "pr_body": "This issue was discoevered while I was testing SSL_new_from_listener() using a newly created unit test. It has turned out the QUIC stack at few places contain pattern as follows:\r\n\tfoo(QUIC_WHATEVER *q, BIO_ADDR *a)\r\n\t{\r\n\t   q->a = *a;\r\n\t}\r\n\r\nThe problem is that derefencning a that way is risky. If the address `a` comes from BIO_lookup_ex() it may actually be shorter than sizeof(BIO_ADDR). Using BIO_ADDR_copy() is the right thing to do here.\r\n\r\nFixes: #26241\r\n",
+    "pr_comments": [
+        "Hmm... and the CI is relevant. Not sure why the trace is now different on Linux vs Windows. This should be investigated.",
+        "New version reverts the changes to `ssltraceref.txt`, because they were wrong. The test failure we've seen was caused by false positive mismatch in `ossl_qtx_write_pkt()` here:\r\n```\r\n 816     was_coalescing = (qtx->cons != NULL && qtx->cons->data_len > 0);\r\n 817     if (was_coalescing)\r\n 818         if (!addr_eq(&qtx->cons->peer, pkt->peer)\r\n 819             || !addr_eq(&qtx->cons->local, pkt->local)) {\r\n 820             /* Must stop coalescing if addresses have changed */\r\n 821             ossl_qtx_finish_dgram(qtx);\r\n 822             was_coalescing = 0;\r\n 823         }\r\n```\r\nThe false-positive mismatch in `addr_eq()` was caused by `BIO_ADD_copy()` which copies just correct amount of bytes which represent address. it left all remaining bytes in destination buffer (of `BIO_ADDR` type) uninitialized.\r\n\r\nadding a `memset()` to `BIO_ADDR_make()` makes the destination address buffer safe for `addr_eq()`. Another option is to make `addr_eq()` smarter so it won't rely on `memcmp()`.  ",
+        "This PR is in a state where it requires action by @openssl/committers but the last update was 30 days ago",
+        "This pull request is ready to merge",
+        "Squashed and merged to the master, 3.4, 3.3 and 3.2 branches. Thank you."
+    ],
+    "merged": false,
+    "created_at": "2024-12-23T16:20:04Z",
+    "issue_context": {
+        "number": 26241,
+        "title": " SSL_set1_initial_peer_addr(SSL *s, const BIO_ADDR *addr) may read outside of buffer",
+        "body": "The code snippet below is incorrect because it may read more than what's actually available in buffer which holds address.\r\n```\r\n239\r\n240             if (!BIO_lookup_ex(dst_host, dst_port_str, BIO_LOOKUP_CLIENT,\r\n241                                AF_INET, SOCK_DGRAM, 0, &bai)) {\r\n242                 fprintf(stderr, \"[ Server ] BIO_lookup_ex(%s, %s) error (%s)\\n\",\r\n243                         dst_host, dst_port_str,\r\n244                         ERR_reason_error_string(ERR_get_error()));\r\n245                 goto done;\r\n246             }\r\n247\r\n248             if (!SSL_set1_initial_peer_addr(ssl_qconn, BIO_ADDRINFO_address(bai))) {\r\n249                 fprintf(stderr, \"[ Server ] SSL_new_from_listener error (%s)\\n\",\r\n250                         ERR_reason_error_string(ERR_get_error()));\r\n251                 goto done;\r\n252             }\r\n253\r\n```\r\nat line 253 we call `BIO_lookup_ex()` which is a wrapper around `getaddrinfo()` in libc. The returns sets `bai` which is openssl's wrapper of libc's `struct addrinfo` it looks like this:\r\n```\r\n     struct addrinfo {\r\n             int ai_flags;           /* input flags */\r\n             int ai_family;          /* address family for socket */\r\n             int ai_socktype;        /* socket type */\r\n             int ai_protocol;        /* protocol for socket */\r\n             socklen_t ai_addrlen;   /* length of socket-address */\r\n             struct sockaddr *ai_addr; /* socket-address for socket */\r\n             char *ai_canonname;     /* canonical name for service location */\r\n             struct addrinfo *ai_next; /* pointer to next in list */\r\n     };\r\n```\r\nat line 248 we use `BIO_ADDRINFO_address()` which dereferences bai and gives `ai_addr` member. However this is too optimistic for `ossl_quic_conn_set_initial_peer_add()` (a workhorse for `SSL_set1_initial_peer_addr()`): \r\n```\r\n1243 int ossl_quic_conn_set_initial_peer_addr(SSL *s,\r\n1244                                          const BIO_ADDR *peer_addr)\r\n1245 {\r\n1246     QCTX ctx;\r\n1247\r\n1248     if (!expect_quic_cs(s, &ctx))\r\n1249         return 0;\r\n1250\r\n1251     if (ctx.qc->started)\r\n1252         return QUIC_RAISE_NON_NORMAL_ERROR(&ctx, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED,\r\n1253                                        NULL);\r\n1254\r\n1255     if (peer_addr == NULL) {\r\n1256         BIO_ADDR_clear(&ctx.qc->init_peer_addr);\r\n1257         return 1;\r\n1258     }\r\n1259\r\n1260     ctx.qc->init_peer_addr = *peer_addr;\r\n1261     return 1;\r\n1262 }\r\n```\r\nThe problem is `BIO_ADDR` is defined as union:\r\n```\r\n18 union bio_addr_st {\r\n 19     struct sockaddr sa;\r\n 20 #  if OPENSSL_USE_IPV6\r\n 21     struct sockaddr_in6 s_in6;\r\n 22 #  endif\r\n 23     struct sockaddr_in s_in;\r\n 24 #  ifndef OPENSSL_NO_UNIX_SOCK\r\n 25     struct sockaddr_un s_un;\r\n 26 #  endif\r\n 27 };\r\n```\r\nand there is no guarantee ai->ai_addrlen is always equal to sizeof(BIO_ADDR). I believe in the most common situations this is actually less than that, so line 1260 reads past `peer_addr` buffer.\r\n\r\nthere are two options to fix it:\r\n  - let `SSL_set1_initial_peer_addr()` to accept `BIO_ADDRINFO`\r\n  - or add size_t/socklen_t argument so `ossl_quic_conn_set_initial_peer_addr()` know how much memory to copy.",
+        "comments": [
+            "there should be third option to fix it: we can let `BIO_lookup_ex()` to fix result obtained from `getsockaddr()`. the idea is to reallocate `ai_addr` member so its size will match `BIO_ADDR`.",
+            "This is just a bug in ossl_quic_conn_set_initial_peer_addr(). It should never dereference peer_addr like this and instead use BIO_ADDR_copy().\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 43408,
+            "commit_id": "b76496dcb3d6ad684b23cc81d590c119d56e7dbe",
+            "original_commit_id": "b85e6f534906f0bf9114386d227e481d2336a0ff",
+            "path": "ssl/quic/quic_channel.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 493,
+            "original_line": 493,
+            "side": "LEFT",
+            "original_position": 15,
+            "position": 15,
+            "subject_type": "line",
+            "review_comments": [
+                "Why do we lose this line in this case?"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,79 @@
+{
+    "repo": "cli/cli",
+    "pr_number": 10009,
+    "lang": "go",
+    "pr_title": "Use safepaths for run download",
+    "pr_body": "## Description\r\n\r\nFixes #10007 \r\n\r\n### Implementation\r\n\r\nAs described in https://github.com/cli/cli/issues/10007#issuecomment-2517653620, the issue at hand is that when a specific artifact is targeted, `gh` will unpack it in the directory specified by `--dir`. If unspecified, it defaults to the current dir `.`. Therefore, we were checking whether `.` descended from `.` and determined that it did not, incorrectly reporting a file traversal.\r\n\r\nIn my opinion, it's **extremely** challenging to reason about all the combinations of relative paths that could be provided (just look at [these tests](https://github.com/cli/cli/compare/trunk...wm%2Fsafepaths?body=&expand=1&title=Use+safepaths+for+run+download#diff-6225ebdad7e6af5d2caa9dece1982922e07b07f960b23066f2ffec2cd4287093L27-L212). I think it's better for us to work with absolute paths where possible.\r\n\r\nI've previously proposed canonicalization of paths (also resolving symlinks) but for the moment enforcing absolute paths seems sufficient. We rely on a new type `safepaths.Absolute` that can be joined with elements to create new absolute paths, or will error if the new path would result in a traversal.\r\n\r\n### Testing\r\n\r\nI added a new acceptance test that asserts correct traversal failure.\r\n\r\nI update the previous acceptance test to cover a few more cases, one of which is the same as #10007. If this test is run against `trunk`, it will fail.",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2024-12-04T20:32:57Z",
+    "issue_context": {
+        "number": 10007,
+        "title": "Artifact download path traversal check fails on valid path",
+        "body": "### Describe the bug\r\n\r\nhttps://github.com/cli/cli/commit/8da27d2c8ac8b781cf34a5e04ed57cfe4b68fa55 introduced a path traversal check for artifact downloads in v2.63.1.\r\n\r\nThis traversal check appears to be hitting a false positive with `.thing.output.json`\r\n\r\nSingle file upload, followed by attempt to download fails with path traversal error. Not sure of the cause, perhaps two dots in the filename without being together, or the filename beginning with a dot?\r\n\r\nExpected fails:\r\n`../foo`\r\n`./../foo`\r\n`foo/../bar`\r\n`foo/bar/..`\r\n\r\nExpected successes:\r\n`foo..bar`\r\n`foo.bar.baz`\r\n`.foo`\r\n`foo/.bar`\r\n`.foo/.bar`\r\n\r\n### Steps to reproduce the behavior\r\n\r\nUsing act to emulate GH Actions.\r\n\r\n**NOTE**:\r\n\r\n**Artifact name**: `thing.output.json`\r\n**File name in the artifact**: `.thing.output.json`\r\n\r\n```yaml\r\n      - name: 'Upload Outputs'\r\n        uses: 'actions/upload-artifact@v4'\r\n        with:\r\n          name: 'thing.output.json'\r\n          path: 'path/to/.thing.output.json'\r\n```\r\n\r\n```yaml\r\n      - name: 'Download'\r\n        shell: 'bash'\r\n        env:\r\n          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'\r\n        run: |\r\n          set -x;\r\n          ~/.local/opt/gh-v2.63.1/bin/gh run download -n thing.output.json --repo my/repo;\r\n```\r\n\r\nResult:\r\n\r\n```\r\n| + /root/.local/opt/gh-v2.63.1/bin/gh run download -n thing.output.json --repo my/repo\r\nerror downloading thing.output.json: would result in path traversal\r\n```\r\n\r\nWorkaround:\r\n\r\nPass the -D option to specify a path to download to:\r\n\r\n```yaml\r\n      - name: 'Download'\r\n        shell: 'bash'\r\n        env:\r\n          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'\r\n        run: |\r\n          set -x;\r\n          mkdir foo;\r\n          ~/.local/opt/gh-v2.63.1/bin/gh run download -n thing.output.json --repo my/repo -D foo;\r\n```\r\n\r\nNo longer errors.\r\n\r\n### Expected vs actual behavior\r\n\r\nExpected: A single file called `.thing.output.json` in an artifact should successfully download to the local directory with no directory specified.\r\n\r\nActual: Artifact download fails due to false-positive detection of directory traversal.\r\n\r\n### Logs\r\n\r\n```\r\n| {\r\n|   \"total_count\": 26,\r\n|   \"artifacts\": [\r\n|     {\r\n|       \"id\": <redacted>,\r\n|       \"node_id\": \"<redacted>\",\r\n|       \"name\": \"thing.output.json\",\r\n|       \"size_in_bytes\": 1706,\r\n|       \"url\": \"https://api.github.com/repos/<redacted>/<redacted>/actions/artifacts/<redacted>\",\r\n|       \"archive_download_url\": \"https://api.github.com/repos/<redacted>/<redacted>/actions/artifacts/<redacted>/zip\",\r\n|       \"expired\": false,\r\n|       \"created_at\": \"2024-12-04T10:50:55Z\",\r\n|       \"updated_at\": \"2024-12-04T10:50:55Z\",\r\n|       \"expires_at\": \"2024-12-11T10:50:55Z\",\r\n|       \"workflow_run\": {\r\n|         \"id\": <redacted>,\r\n|         \"repository_id\": <redacted>,\r\n|         \"head_repository_id\": <redacted>,\r\n|         \"head_branch\": \"<redacted>\",\r\n|         \"head_sha\": \"<redacted>\"\r\n|       }\r\n|     },\r\n.....\r\nerror downloading thing.output.json: would result in path traversal\r\n```\r\n",
+        "comments": [
+            "@Zordrak : Sincerely, thank you for following up on this and apologies for the disruption! \ud83d\ude47 Let's see what's going on and get this addressed. \ud83d\udc40  _Going to replicate this in our tests and step through with the debugger to see what's going on._\n\n### Update\n\nWe have been delving into the code base and believe we understand what's going on here, working on a hotfix to address this.  Let me elaborate on 1) why this is happening and the thought process going into the original bug bounty security advisory, and 2) the general direction the fix is going to take.\n\n#### Why this is happening\n\nhttps://github.com/cli/cli/security/advisories/GHSA-2m9h-r57g-45pj motivated changes in how `gh run download` dealt with GitHub Actions workflow artifacts causing a path traversal exploit. This isn't the first time that a path traversal exploit has been dealt with resulting in somewhat complicated logic as the artifact name is used to determine where it is download.\n\nThe problem lies in how we're trying to resolve different paths and detecting if path traversal is happening:\n\nhttps://github.com/cli/cli/blob/179f0c479e955581b947b40d1e1cc3af3b2308c0/pkg/cmd/run/download/zip.go#L73-L95\n\nThis is erring because downloading a single artifact by name makes the code think its trying to download `.` or `..` artifact when it isn't the case.\n\n#### Working on a hotfix\n\nOne of the challenges with thoroughly fixing this requires a more substantial change to how paths are handled in `gh` to canonicalize paths into their absolute realpaths.  During the initial fix, we wrestled with the complexities involved and how substantially to fix this.\n\nAll of that said, a fix is under development and should be released soon. \ud83d\ude47 ",
+            "Dggt\r\n\r\nV\u00e0o 21:51, Th 4, 4 thg 12, 2024 Andy Feller ***@***.***> \u0111\u00e3\r\nvi\u1ebft:\r\n\r\n> @Zordrak <https://github.com/Zordrak> : Sincerely, thank you for\r\n> following up on this and apologies for the disruption! \ud83d\ude47 Let's see what's\r\n> going on and get this addressed. \ud83d\udc40 *Going to replicate this in our tests\r\n> and step through with the debugger to see what's going on.*\r\n>\r\n> \u2014\r\n> Reply to this email directly, view it on GitHub\r\n> <https://github.com/cli/cli/issues/10007#issuecomment-2517653620>, or\r\n> unsubscribe\r\n> <https://github.com/notifications/unsubscribe-auth/A6IK2FBOM73WRNXCV3UJODL2D4JINAVCNFSM6AAAAABTAKOQE6VHI2DSMVQWIX3LMV43OSLTON2WKQ3PNVWWK3TUHMZDKMJXGY2TGNRSGA>\r\n> .\r\n> You are receiving this because you are subscribed to this thread.Message\r\n> ID: ***@***.***>\r\n>\r\n",
+            "@Zordrak : **Would you be willing to build and verify https://github.com/cli/cli/pull/10009 changes address this issue for you?**\n\nThough the PR seems solid, we always appreciate confirmation from bug reporters that bugs are fixed.  Beyond that, we're trying to understand once merged and released before it is picked up by [`actions/runner-images`](https://github.com/actions/runner-images), which [installs the latest release](https://github.com/search?q=repo%3Aactions%2Frunner-images%20install-github-cli&type=code) for GitHub-hosted runners."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 33606,
+            "commit_id": "9bd8f097746ccb41d652ef41901f232ec38c8e0e",
+            "original_commit_id": "179f0c479e955581b947b40d1e1cc3af3b2308c0",
+            "path": "internal/safepaths/absolute.go",
+            "start_line": 15,
+            "original_start_line": 15,
+            "start_side": "RIGHT",
+            "line": 24,
+            "original_line": 24,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "I wonder if it is easier to understand and being more idiomatic to rename this `NewAbsolute`; it doesn't have to change but it came to mind.",
+                "I'm open to it but I have a strong preference for `Parse` for [reasons](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/).\r\n\r\nIf you feel strongly, I'm happy for you to make the change, I agree it may be more idiomatic.",
+                "Nope, doesn't have to change"
+            ]
+        },
+        {
+            "hunk_id": 33608,
+            "commit_id": "9bd8f097746ccb41d652ef41901f232ec38c8e0e",
+            "original_commit_id": "179f0c479e955581b947b40d1e1cc3af3b2308c0",
+            "path": "pkg/cmd/run/download/http_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 75,
+            "original_line": 75,
+            "side": "RIGHT",
+            "original_position": 24,
+            "position": 24,
+            "subject_type": "line",
+            "review_comments": [
+                "Assuming this is just aesthetic reasons",
+                "Pure vibes."
+            ]
+        },
+        {
+            "hunk_id": 33607,
+            "commit_id": "9bd8f097746ccb41d652ef41901f232ec38c8e0e",
+            "original_commit_id": "179f0c479e955581b947b40d1e1cc3af3b2308c0",
+            "path": "internal/safepaths/absolute_test.go",
+            "start_line": 54,
+            "original_start_line": 54,
+            "start_side": "RIGHT",
+            "line": 65,
+            "original_line": 65,
+            "side": "RIGHT",
+            "original_position": 65,
+            "position": 65,
+            "subject_type": "line",
+            "review_comments": [
+                "\ud83d\ude48 that autoformatting"
+            ]
+        }
+    ]
+}

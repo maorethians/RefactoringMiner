@@ -1,0 +1,165 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 65273,
+    "lang": "c_sharp",
+    "pr_title": "Improve regex optimizations around repetitions of the same character",
+    "pr_body": "- For concatenations, we currently do two passes over its nodes: one that coalesces adjacent characters into strings, and one that coalesces adjacent loops.  This swaps the order so that we first coalesce adjacent loops.  We want to coalesce loops first so that we prioritize associating a One with an adjacent loop rather than with an adjacent string.  This is primarily beneficial later on for auto-atomicity.  Consider `a+ab` composed of a loop, a One 'a', and a One 'b'.  We're either going to make that into a loop `a{2,}` followed by `b` or into a loop `a+` followed by the multi `ab`.  We want to do the former, as then when we apply auto-atomicity to the `a{2,}`, we'll see that it's followed by something non-overlapping ('b'), and make the loop atomic.  In constrast, if we joined the `a` and `b`, then auto-atomicity for the `a+` would see it's followed by an `a` and it wouldn't be upgraded.\r\n- Currently, the adjacent loop coalescing logic joins two individual One nodes with the same Ch value into a repeater.  That's actually a deoptimization, so this stops doing so.  We'd rather have `aa` be evaluated as a Multi of two characters rather than as an `a{2}` repeater, as we're able to apply better optimizations with multis, e.g. taking advantage of StartsWith for matching.\r\n- Also in the adjacent loop logic, we're already checking for a loop followed by a one but we're not checking for a loop followed by a multi.  For the same auto-atomicity benefits discussed earlier, we want to shift any adjacent text from a multi following a loop back into the loop, as it makes it more likely we'll then be able to upgrade that loop to atomic. (We could also add logic for a multi followed by a loop, but the benefits there are less obvious.)\r\n- When creating repeaters, we're actually better off creating multis, for the same reasons outlined earlier.  But we don't want to create massive strings in the super rare case where large repeaters for single chars are used, so we only do so up to a limit.\r\n- When emitting generated code for a One repeater, which might be used to implement the required portion of other loops, emit it as a multi match for short enough repetitions.\r\n\r\nFixes https://github.com/dotnet/runtime/issues/64991",
+    "pr_comments": [
+        "Tagging subscribers to this area: @dotnet/area-system-text-regularexpressions\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\n- For concatenations, we currently do two passes over its nodes: one that coalesces adjacent characters into strings, and one that coalesces adjacent loops.  This swaps the order so that we first coalesce adjacent loops.  We want to coalesce loops first so that we prioritize associating a One with an adjacent loop rather than with an adjacent string.  This is primarily beneficial later on for auto-atomicity.  Consider `a+ab` composed of a loop, a One 'a', and a One 'b'.  We're either going to make that into a loop `a{2,}` followed by `b` or into a loop `a+` followed by the multi `ab`.  We want to do the former, as then when we apply auto-atomicity to the `a{2,}`, we'll see that it's followed by something non-overlapping ('b'), and make the loop atomic.  In constrast, if we joined the `a` and `b`, then auto-atomicity for the `a+` would see it's followed by an `a` and it wouldn't be upgraded.\r\n- Currently, the adjacent loop coalescing logic joins two individual One nodes with the same Ch value into a repeater.  That's actually a deoptimization, so this stops doing so.  We'd rather have `aa` be evaluated as a Multi of two characters rather than as an `a{2}` repeater, as we're able to apply better optimizations with multis, e.g. taking advantage of StartsWith for matching.\r\n- Also in the adjacent loop logic, we're already checking for a loop followed by a one but we're not checking for a loop followed by a multi.  For the same auto-atomicity benefits discussed earlier, we want to shift any adjacent text from a multi following a loop back into the loop, as it makes it more likely we'll then be able to upgrade that loop to atomic. (We could also add logic for a multi followed by a loop, but the benefits there are less obvious.)\r\n- When creating repeaters, we're actually better off creating multis, for the same reasons outlined earlier.  But we don't want to create massive strings in the super rare case where large repeaters for single chars are used, so we only do so up to a limit.\r\n- When emitting generated code for a One repeater, which might be used to implement the required portion of other loops, emit it as a multi match for short enough repetitions.\r\n\r\nFixes https://github.com/dotnet/runtime/issues/64991\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>stephentoub</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Text.RegularExpressions`, `tenet-performance`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>7.0.0</td>\n  </tr>\n</table>\n</details>"
+    ],
+    "merged": true,
+    "created_at": "2022-02-14T02:38:17Z",
+    "issue_context": {
+        "number": 64991,
+        "title": "Some regex optimizations are conflicting with each other",
+        "body": "Consider the expression `a+b`.  The regex optimizer recognizes this as the equivalent of:\r\n```\r\n                // \u25cb Match 'a' atomically at least once.\r\n                // \u25cb Match 'b'.\r\n```\r\nbut the expression `aaa+b` is recognized as the equivalent of:\r\n```\r\n                // \u25cb Match the string \"aa\".\r\n                // \u25cb Match 'a' atomically at least once.\r\n                // \u25cb Match 'b'.\r\n```\r\nIt'd be nice if instead this were recognized as `a{3,}b`.  However, the bigger issue comes when the pattern is slightly rearranged, to instead be `a+aab`.  With that, we get:\r\n```\r\n                // \u25cb Match 'a' greedily at least once.\r\n                // \u25cb Advance the next matching position.\r\n                // \u25cb Match the string \"aab\".\r\n```\r\nThe problem here is the \"atomically\" vs \"greedily\".  Because the optimizer combined the \"aab\" into a _multi_ and only then tried the auto-atomicity, we end up with it not being able to make `a+` atomic because it sees it's followed by an `a`.  And the difference between an atomic loop and a greedy loop is significant when it comes to backtracking and code generation.\r\n\r\nThis is something a developer can avoid by just writing `a{3,}b` in the first place, as that will produce the desired:\r\n```\r\n                // \u25cb Match 'a' atomically at least 3 times.\r\n                // \u25cb Match 'b'.\r\n```\r\nbut it'd be nice if the system didn't fight with itself in this manner.",
+        "comments": [
+            "Tagging subscribers to this area: @dotnet/area-system-text-regularexpressions\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nConsider the expression `a+b`.  The regex optimizer recognizes this as the equivalent of:\r\n```\r\n                // \u25cb Match 'a' atomically at least once.\r\n                // \u25cb Match 'b'.\r\n```\r\nbut the expression `aaa+b` is recognized as the equivalent of:\r\n```\r\n                // \u25cb Match the string \"aa\".\r\n                // \u25cb Match 'a' atomically at least once.\r\n                // \u25cb Match 'b'.\r\n```\r\nIt'd be nice if instead this were recognized as `a{3,}b`.  However, the bigger issue comes when the pattern is slightly rearranged, to instead be `a+aab`.  With that, we get:\r\n```\r\n                // \u25cb Match 'a' greedily at least once.\r\n                // \u25cb Advance the next matching position.\r\n                // \u25cb Match the string \"aab\".\r\n```\r\nThe problem here is the \"atomically\" vs \"greedily\".  Because the optimizer combined the \"aab\" into a _multi_ and only then tried the auto-atomicity, we end up with it not being able to make `a+` atomic because it sees it's followed by an `a`.  And the difference between an atomic loop and a greedy loop is significant when it comes to backtracking and code generation.\r\n\r\nThis is something a developer can avoid by just writing `a{3,}b` in the first place, as that will produce the desired:\r\n```\r\n                // \u25cb Match 'a' atomically at least 3 times.\r\n                // \u25cb Match 'b'.\r\n```\r\nbut it'd be nice if the system didn't fight with itself in this manner.\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>stephentoub</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-System.Text.RegularExpressions`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>7.0.0</td>\n  </tr>\n</table>\n</details>",
+            "An easy solution to this might be to just swap the order of these calls:\r\nhttps://github.com/dotnet/runtime/blob/b305a17692ca7022835fac3773ec9b7a6b121fbe/src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexNode.cs#L1456-L1461\r\nHowever, we likely also want to be careful to avoid turning an expression like:\r\n```C#\r\nhello\r\n```\r\ninto\r\n```C#\r\nhel{2}o\r\n```\r\nas that's likely to be evaluated a tad bit more slowly.",
+            "> as that's likely to be evaluated a tad bit more slowly\r\n\r\nCome to think of it, I can't think of any scenario where turning cccc into c{4} is valuable from an execution performance perspective. It might make the expression shorter visibly, but it results in more nodes, and means we lose out on the vectorized comparisons we get with strings (unless we later also treat One repeaters specially). I think the right answer then is to just delete that \"optimizaton\" (just for One... it's still valuable for Notone and Set), or even invert it to reduce such a repeater to a Multi. "
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 3092,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexNode.cs",
+            "start_line": 1690,
+            "original_start_line": 1689,
+            "start_side": "RIGHT",
+            "line": 1693,
+            "original_line": 1693,
+            "side": "RIGHT",
+            "original_position": 108,
+            "position": 116,
+            "subject_type": "line",
+            "review_comments": [
+                "could you clarify \"those characters could end up matching more slowly as part of loop matching.\" ?",
+                "A loop gets emitted as iterating one char at a time, along with extra tracking boilerplate, whereas a string gets emitted as an unrolled/vectorized comparison of the string.  Consider the pattern `aaaaa{10,}\\w`.  That gets emitted today as:\r\n```C#\r\n                    // Match the string \"aaaa\".\r\n                    {\r\n                        byteSpan = global::System.Runtime.InteropServices.MemoryMarshal.AsBytes(slice);\r\n                        if ((uint)slice.Length < 4 ||\r\n                            global::System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(byteSpan) != 0x61006100610061ul)\r\n                        {\r\n                            goto NoMatch;\r\n                        }\r\n                    }\r\n                    \r\n                    // Match 'a' greedily at least 10 times.\r\n                    //{\r\n                        pos += 4;\r\n                        slice = slice.Slice(4);\r\n                        charloop_starting_pos = pos;\r\n                        \r\n                        int iteration = 0;\r\n                        while ((uint)iteration < (uint)slice.Length && slice[iteration] == 'a')\r\n                        {\r\n                            iteration++;\r\n                        }\r\n                        \r\n                        if (iteration < 10)\r\n                        {\r\n                            goto NoMatch;\r\n                        }\r\n                        \r\n                        slice = slice.Slice(iteration);\r\n                        pos += iteration;\r\n                        \r\n                        charloop_ending_pos = pos;\r\n                        charloop_starting_pos += 10;\r\n                        goto CharLoopEnd;\r\n                        \r\n                        CharLoopBacktrack:\r\n                        StackPop2(base.runstack, ref stackpos, out charloop_ending_pos, out charloop_starting_pos);\r\n                        \r\n                        if (charloop_starting_pos >= charloop_ending_pos)\r\n                        {\r\n                            goto NoMatch;\r\n                        }\r\n                        pos = --charloop_ending_pos;\r\n                        slice = inputSpan.Slice(pos, end - pos);\r\n                        \r\n                        CharLoopEnd:\r\n                        StackPush2(ref base.runstack!, ref stackpos, charloop_starting_pos, charloop_ending_pos);\r\n                    //}\r\n                    \r\n                    // Match a word character.\r\n                    {\r\n                        if (slice.IsEmpty || !IsWordChar(slice[0]))\r\n                        {\r\n                            goto CharLoopBacktrack;\r\n                        }\r\n                    }\r\n```\r\nThe comparison of the first four `a`s happens in a single read/comparison.  If the string were instead coalesced into the loop and it were emitted as `a{14,}\\w`, each of those four characters would then be iterated once by one rather than compared in bulk.  So we'd essentially be paying more per character to compare them as part of the repeater rather than as part of the string.  It doesn't seem to be a very measurable difference, which is also why I didn't bother to do the opposite either and try to separate out the min iterations into a multi that comes before it.  These situations also aren't very common.  I think it's worth it for the case I added of a loop followed by a multi, as the impact of removing the backtracking can be huge, but they don't show up very often (there's only 26 patterns in the whole corpus that contain a Oneloop with a lower bound > 1 and an upper bound greater than the lower bound), so the difference in the comparison cost isn't all that much of a motivation."
+            ]
+        },
+        {
+            "hunk_id": 3088,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/tests/RegexReductionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 479,
+            "original_line": 479,
+            "side": "LEFT",
+            "original_position": 21,
+            "position": 21,
+            "subject_type": "line",
+            "review_comments": [
+                "(Unrelated to this change) In these test methods, is there a reason why we chose not to use `Assert.Equal/NotEqual(result1, result2)` instead of manual `throw`?",
+                "I'm sure there was at the time.  At present I can't explain it :)",
+                "Oh, I remember why.  The built-in Assert.{Not}Equals trims the inputs to just show the first location that didn't match, plus a few characters around that.  That's actively harmful for debugging failures here."
+            ]
+        },
+        {
+            "hunk_id": 3089,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/tests/RegexReductionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 127,
+            "original_line": 127,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "would this also reduce the same as `(?>aaa)a*b`",
+                "No:\r\nhttps://github.com/dotnet/runtime/pull/65273/files#diff-69d0a75aaf0674d30e057b6ac1d37203ee4757db089bac19f32a1d31d52a10c9R1689-R1692"
+            ]
+        },
+        {
+            "hunk_id": 3094,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexNode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1647,
+            "original_line": 1647,
+            "side": "RIGHT",
+            "original_position": 62,
+            "position": 70,
+            "subject_type": "line",
+            "review_comments": [
+                "Should this optimization also happen when nextNode.Kind == One and the character matches?",
+                "Do you mean like https://github.com/dotnet/runtime/pull/65273/files/209eef017459fe2f2c6a697b62d4d2d31ef8c76a#diff-69d0a75aaf0674d30e057b6ac1d37203ee4757db089bac19f32a1d31d52a10c9R1629-R1630 ?",
+                "oh, I missed that, yeah that is what I meant."
+            ]
+        },
+        {
+            "hunk_id": 3093,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexNode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1476,
+            "original_line": 1476,
+            "side": "RIGHT",
+            "original_position": 51,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "NIT: Don't reset CI for this, but it would be nice if we also add to these comments a concrete example, like: `a+ab` => `(?>a{2,})b`",
+                "There are examples in the XML comments on the methods being called."
+            ]
+        },
+        {
+            "hunk_id": 3091,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/src/System/Text/RegularExpressions/RegexNode.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 18,
+            "original_line": 18,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "How did you come up with this - entirely arbitrarily? \ud83d\ude1b ",
+                "> entirely arbitrarily?\r\n\r\nSomewhat arbitrary.  In our corpus of regexes, the largest single-char repeater has a length of 23.  I chose something significantly larger than that while still being a reasonable length for a string to create."
+            ]
+        },
+        {
+            "hunk_id": 3090,
+            "commit_id": "3cc56526ff5a7612d4e5a0c7b59ff81797a8b9d4",
+            "original_commit_id": "ec965b53f98c8ab12b283ab5d4112c605f488496",
+            "path": "src/libraries/System.Text.RegularExpressions/tests/RegexReductionTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 129,
+            "original_line": 129,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 6,
+            "subject_type": "line",
+            "review_comments": [
+                "This test only verifies that they both reduce the same. Your change avoids reducing `aaa` into `a{3}` but this is only testing that they're equivalent. Is that useful ? -- I imagine 1000 tests would fail if it wasn't true.",
+                "> Your change avoids reducing aaa into a{3} but this is only testing that they're equivalent\r\n\r\nThis is testing that they reduce to the same thing, i.e. that the node trees they produce are identical.  That's not the same as their having the same execution semantics.",
+                "Right, but it would pass whether the node tree produced had a loop or had a multi. And this change is designed to ensure it ends up as the right one. Both trees will also produce the same results for the user. The test is obviously worth having -- just wondering aloud about whether we need a new kind of test that verifies some aspect of the node tree.",
+                "> Right, but it would pass whether the node tree produced had a loop or had a multi\r\n\r\nYes, it's not verifying the direction it takes, just that they reduce to the same thing.  If that's what you were saying, I'm not sure what you meant about \"I imagine 1000 tests would fail if it wasn't true\".",
+                "Sorry, my communication is poor. I figure there's 3 aspects\r\n\r\n* does expression X1 reduce to the same node tree as expression X2 -- these tests.\r\n* is that node tree structured as ABC, or have property D \r\n* does expression X functionally behave as expected --- this is what we have 1000's of tests for.\r\n\r\nI'm wondering whether, if I reversed this PR so that multi was collapsed into a loop or whatnot, we'd see test failures, because we do'nt have the 2nd category",
+                "Eg., if the node tree was serialized into a descriptive string (debug only) then a test could verify that expression X formed serialized node tree S.",
+                "These expressions behave identically and reduce to the same thing; the only thing that would be different based on which direction they reduced would be their execution performance.  We do not currently have tests that validate the tree it exactly the set of nodes we expect it to be, just these that validate two expressions parse into the same exact tree.",
+                "right, agreed."
+            ]
+        }
+    ]
+}

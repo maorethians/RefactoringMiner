@@ -1,0 +1,369 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 73799,
+    "lang": "c",
+    "pr_title": "posix: add support for mmap, memlock, shared memory, and mprotect",
+    "pr_body": "* add support for `_POSIX_MAPPED_FILES`\r\n* add support for `_POSIX_MEMLOCK_RANGE`\r\n* add support for `_POSIX_MEMLOCK` (currently unimplemented / fails with `ENOSYS`)\r\n* add support for `_POSIX_SHARED_MEMORY_OBJECTS`\r\n* add support for `_POSIX_MEMORY_PROTECTION` (currently unimplemented / fails with `ENOSYS`)\r\n\r\n**Shared Memory Objects and Memory-Mapped Files**\r\n\r\nOn systems that support mapping anonymous memory (i.e. have an MMU and lots of RAM), shared memory objects are implemented using `k_mem_map()` and friends (i.e. a shared memory object is comprised of a number of blocks of virtual memory that are `CONFIG_MMU_PAGE_SIZE` in size). On systems that do not have an MMU, shared memory objects are implemented with heap allocation.\r\n\r\nNote: it is up to the particular vtable implementor, to support the `ZFD_IOCTL_MMAP` operation. However, there would still need to be some integration with `msync()` in order to synchronize writes to e.g. a regular file. From that perspective, shared memory objects were an easy prototyping option.\r\n\r\nA potential future improvement on shared memory objects would be to support a separate `ioctl()` to attach statically allocated memory.\r\n\r\n**z_finalize_typed_fd()**\r\n\r\nA particular change to highlight in this case though, is adding a `mode` field to `struct fd_entry`, which allows fdtable code to identify which subsystem or API a file descriptor belongs to, and to react accordingly. The `z_finalize_typed_fd()` function allows us to differentiate between fifo, char device, message queue, directory, semaphore, block device, shared memory, regular file, symbolic link, and socket.\r\n\r\nIn fact, the same 32-bit `mode` field _should_ also have the file access mode tied to it, rather than the physical file (which is currently the case now for the FS subsystem, and should be considered a bug). It's trivial to consider a case where one file descriptor is used for writing to a file and another file descriptor is used for reading from a file. Both file descriptors point to the same physical file, but each has different access modes and offsets (addressed below).\r\n\r\n**Per-file Offsets**\r\n\r\nAnother similar adjustment to `struct fd_entry` is to have a per-fd (per `FILE*`) offset, which is just consistent with the C/C++, POSIX (all?) programming models of \"files\".\r\n\r\nA few drive-by fixes aside from that, shuffling things between zvfs, posix, and fs, as-needed.\r\n\r\n[Doc Preview](https://builds.zephyrproject.io/zephyr/pr/73799/docs/services/portability/posix/index.html)\r\n\r\nFixes #59950\r\nFixes #59951\r\nFixes #59952\r\nFixes #59953",
+    "pr_comments": [
+        "Some platforms seem to have `CONFIG_MMU` but do not implement `arch_mem_map()` or `arch_mem_unmap()`, so there may be a couple of exclusions in `tests/posix/shm/testcase.yaml`",
+        "Here's the worst offenders I've encountered.\n\nIn `munmap()` you shouldn't call `arch_page_phys_get()` as this will\nreturn -EFAULT if the first page is paged out. Should call `k_mem_unmap()`\ndirectly.\n\nSide note: I think `k_mem_unmap()` should return an error code instead of\nvoid. May always be 0 for now but the prototype should be ready.\n\n`shm_mmap()` looks interesting. This:\n\n- `arch_page_phys_get(shm->mem, &phys)`\n\nfollowed by:\n\n- `*virt = k_mem_phys_map(phys + off, ROUND_UP(len, _page_size), K_MEM_PERM_RW)`\n\nis going to produce very surprizing results with demand paging indeed.\nFirst, because you use `k_mem_phys_map()` you are bypassing the very tiny\nprotection against having a physical page mapped twice. It is kinda OK only\nwith pinned memory which is another way to say that demand paging doesn't\nsupport it.\n\nIn your case, what would happen is that you get a second mapping at a \ndifferent virtual address but one that is not tracked by the physical page \nframe management code. So if memory pressure increases and `shm->mem` is not\naccessed _irrespective_ of how often that second virtual mapping is used then\nthe `shm->mem` virtual address will be a prime candidate to be paged out.\nAnd when that happens, the underlying physical page will be recycled for\nsome other content accessible through some other virtual address that now\nwill also be visible through the mapping you created with that\n`k_mem_phys_map()`, and such content no longer having anything to do with \nthe initial `shm->mem` content. And yet, if `shm->mem` is accessed again,\nit is unlikely that its content will be paged back into the same physical\npage.\n\nIn short, this is no good!  ;-)\n\nNow... why do you need a second mapping? Zephyr uses a flat address space\nmodel shared by all threads. Just return `shm->mem` from shm_mmap()`, turn\n`shm_unmmap()` into a no-op and be done with it.\n\nEventually it would make sense to leverage memory domains if this is going\nto be used in user space so that a shared memory block is part of the same \nmemory protection domain.\n\n\n",
+        "- [x] remove unneeded headers from `mlock.c` (requested by @ycsin)\r\n- [x] add a compatible `MAP_ANONYMOUS` to force an anonymous mapping in `mmap.c` (requested by @andyross)\r\n- [ ] attempted to call `k_mem_unmap()` directly in `mmap.c`, but that triggers an assert in `mmu.c`, so kept it for now\r\n- [x] use `shm->mem` for all file descriptors and 1 virtual mapping shared among file descriptors (request by @npitre)\r\n\r\n@npitre - PTAL \ud83d\ude4f \r\n\r\nping @andyross @ycsin @dkalowsk @vaishnavachath for refresh +1 \ud83d\ude4f ",
+        "In `shm_obj_remove()` you do:\n\n```\n                if (arch_page_phys_get(shm->mem, &phys) == 0) {\n                        k_mem_unmap(shm->mem, ROUND_UP(shm->size, _page_size));\n                }\n```\n\nI'd suggest removing that `arch_page_phys_get()`. It isn't useful there.\n`k_mem_unmap()` should cope regardless.\n\nAnd if the start address is paged out then `arch_page_phys_get()` will return\nan error even if `k_mem_unmap()` still can unmap it (once #74044 is applied\nthat is).\n\n",
+        "> I'd suggest removing that `arch_page_phys_get()`. It isn't useful there. `k_mem_unmap()` should cope regardless.\r\n\r\n@npitre - Fixed!\r\n\r\n> And if the start address is paged out then `arch_page_phys_get()` will return an error even if `k_mem_unmap()` still can unmap it (once #74044 is applied that is).\r\n\r\nI rebased on your PR \ud83d\ude0e \ud83e\ude81 , and then I quickly rebased on `main` again because there were merge conflicts and 200 files changed \ud83e\udd23 ",
+        "And then I rebased again on `main`! \ud83d\ude05 ",
+        "> > I'd suggest removing that `arch_page_phys_get()`. It isn't useful there.\n> > `k_mem_unmap()` should cope regardless.\n> \n> Fixed!\n\nI do see my `k_mem_unmap()` changes ... but the `arch_page_phys_get()` call\nis still there.\n",
+        "> > > I'd suggest removing that `arch_page_phys_get()`. It isn't useful there.\r\n> > > `k_mem_unmap()` should cope regardless.\r\n> > \r\n> > \r\n> > Fixed!\r\n> \r\n> I do see my `k_mem_unmap()` changes ... but the `arch_page_phys_get()` call is still there.\r\n\r\n@npitre - There seems to be some unwanted side-effects on rebase. I wonder if I could maybe just go back to the previous version that did the questionable check that was passing CI. Maybe the last concern of yours can be addressed in a bugfix?",
+        "> @npitre - There seems to be some unwanted side-effects on rebase.\n> I wonder if I could maybe just go back to the previous version that\n> did the questionable check that was passing CI. Maybe the last concern\n> of yours can be addressed in a bugfix?\n\nFair enough.\n",
+        "> Fair enough.\r\n\r\n@npitre - rebased with your change now that it's in `main`.\r\n\r\nI needed to drop the assert in `k_mem_unmap_phys_guard()`, otherwise it would complain / die.\r\n\r\nI think that's how you were saying `k_mem_unmap()` should behave anyway though, and from my perspective, I think we should be able to call `k_mem_unmap()` with a virtual address that might not be mapped, and it should return quietly \r\n\r\nWorks on my desk \ud83e\udd37\u200d\u2642\ufe0f\r\n\r\nIf you're OK with that, please add a +1\r\n\r\n```shell\r\ntwister -p qemu_x86 -T tests/kernel\r\n...\r\nTotal complete:  190/ 190  100%  skipped:   71, failed:    0, error:    0\r\n```\r\n\r\n```shell\r\nwest build -p auto -b qemu_x86 -t run tests/posix/shm\r\n...\r\n PROJECT EXECUTION SUCCESSFUL\r\n```\r\n\r\nAssuming CI is green, re-ping @ycsin @vaishnavachath @dkalowsk @andyross for refresh + 1",
+        "need @dcpleung review for kernel/mmu.c  change",
+        "> z_finalize_typed_fd()\r\n\r\n@cfriedt  \r\ndang, we still have those z_ prefixed public APIs, we should have addressed those long time ago :(\r\nAny chance you can address this in a followup PR after this get merged?",
+        "> I needed to drop the assert in `k_mem_unmap_phys_guard()`, otherwise it\n> would complain / die.\n> \n> I think that's how you were saying `k_mem_unmap()` should behave anyway\n> though, and from my perspective, I think we should be able to call\n> `k_mem_unmap()` with a virtual address that might not be mapped, and it \n> should return quietly\ud83e\udd37\n\nWell... In _theory_ you are not supposed to unmap() the same memory twice.\nSo if that assertion still triggered then _you_ have a bug somewhere. ;-)\n\nGranted, this is no reason for killing the system in production.\nThat's why assertions are then disabled. But it would be a good thing if\nyou found why you are calling unmap twice and then reinstating the\nassertion.\n\nMy earlier comments were made in the context of demand paging where\n`arch_page_phys_get()` may not be relied upon. But even then, it is not\nOK to use it to dodge the assertion on a double unmap.\n",
+        "> > z_finalize_typed_fd()\n> \n> @cfriedt  \n> dang, we still have those z_ prefixed public APIs, we should have addressed those long time ago :(\n> Any chance you can address this in a followup PR after this get merged?\n\n@nashif  - Sure - I was planning on using zvfs, but would you prefer k?",
+        "> you found why you are calling unmap twice \n\nI am calling unmap twice because you said I should not check first to see if the region is mapped. Previously I had a call to see if the region was mapped.\n\nAside from that, it would duplicate a lot of effort to keep track of all mapped pages in a second location not really part of the kernel or arch.",
+        "> it is not\n> OK to use it to dodge the assertion on a double unmap.\n\nBut it is ok to for any random bit of code to crash the system by calling k_mem_unmap() with a garbage argument? That seems like an obvious gap in testing.\n\nIt's not the user's responsibility to manage system resources, it's the kernel's responsibility.\n\n",
+        "Another issue is that your change will make the function to bail out in the middle of the for loop, leaving already mapped memory after the failing one possibly forever mapped, and never released. A more appropriate place to bail would be where the guard pages are checked. Moreover, the callers actually have to make sure they are unmapping with the same parameters when the region is mapped.\r\n\r\nFor you to actually hit that assert, you have to pass the two checks for the guard pages first. That means something is horribly wrong for a page in middle of that region to be unmapped. Another reason might be that you are unmapping across multiple virtual regions at the same time. So the boundary guard pages checks would pass, but when you are looping through the pages, you encounter the guard pages in between. For example, region A and region B with guard pages G: `GAAAGGBBBG`. You trying to unmap the whole thing which means the assert would be raised on the middle `GG` guard pages.\r\n\r\nAlso, this is a very low level API, not to mention being a kernel internal one, one must exercise extreme caution when using it (and also the corresponding mapping function). If garbage arguments are passed to these functions, it is either a coding error, or that memory has been corrupted (e.g. stack overflow, or incorrect pointer de-reference, or cosmic rays). So bailing would be a wise choice in the later case, as correct operations of the whole system can no longer be guaranteed.",
+        "> Another issue is that your change ...\r\n\r\nI'm fine dropping the mmu change, but please just understand this is how I was told to use the function call. It is broken for the particular use case I was told to use it for. I realize that it is low level / not extremely frequently used code, etc, so I knew that there would be rough edges. This is why I've marked mmap as experimental.\r\n\r\nI'll revert back to check first using the `arch_` function, since there seems to be no way to otherwise unmap memory using the POSIX model without crashing the system (the POSIX model being that pages can be mapped to more than one virtual memory address, and the kernel doesn't panic when it's told to unmap an invalid address).",
+        "* switched back to checking if a page is mapped via `arch_page_phys_get()` prior to calling `k_mem_unmap()` due to lack of a better alternative\r\n\r\nStill working on my desk\r\n```shell\r\ntwister -T tests/posix/shm/\r\n...\r\nINFO    - Total complete:   40/  40  100%  skipped:   15, failed:    0, error:    0\r\n```",
+        "re-ping @andyross @vaishnavachath @ycsin @dkalowsk ",
+        "> It's not the user's responsibility to manage system resources, it's the\n> kernel's responsibility.\n\nSorry, but the POSIX layer you're creating (and that's highly appreciated\nby the way) is _not_ user code. You are managing many different resources\nalready on behalf of code calling the POSIX interface. That code is the user\nnot the interface.\n\nKnowing how many times a particular object has been mapped and unmapped is \nthe POSIX layer's responsibility, just like the refcounting you already do\nelsewhere between `malloc()` and `free()`. You wouldn't free the same memory\ntwice, right? And you're not calling into the low-level heap allocator to test\nif a particular address is still allocated before calling `free()` either.\nThe assertion in `k_mem_unmap()` is there to catch the equivalent of a\ndouble-free, which is a bug and why it shouldn't be removed.\n\nSo it should be no different with `k_mem_map()` and `k_mem_unmap()`.\nThe first caller to increment the refcount does the map, subsequent callers \nonly increment the refcount and get the same already mapped address, and the\nlast to decrement the count to 0 does the unmap.\n\nAm I missing something that would prevents such implementation?\n\n",
+        "> > > z_finalize_typed_fd()\r\n> > \r\n> > \r\n> > @cfriedt\r\n> > dang, we still have those z_ prefixed public APIs, we should have addressed those long time ago :(\r\n> > Any chance you can address this in a followup PR after this get merged?\r\n> \r\n> @nashif - Sure - I was planning on using zvfs, but would you prefer k?\r\n\r\nNo `k_`, Ideally this should be the new prefix we discussed in the f2f (https://github.com/zephyrproject-rtos/zephyr/issues/64627).\r\n\r\nLet me open a bug about this and bring the prefix discussion back so we can do something about it.",
+        "> No `k_`, Ideally this should be the new prefix we discussed in the f2f (#64627).\r\n> \r\n> Let me open a bug about this and bring the prefix discussion back so we can do something about it.\r\n\r\nactually you can use zvfs which is being used already, better than z_ for sure.",
+        "> > > > z_finalize_typed_fd()\r\n> > > \r\n> > > \r\n> > > @cfriedt\r\n> > > dang, we still have those z_ prefixed public APIs, we should have addressed those long time ago :(\r\n> > > Any chance you can address this in a followup PR after this get merged?\r\n> > \r\n> > \r\n> > @nashif - Sure - I was planning on using zvfs, but would you prefer k?\r\n> \r\n> No `k_`, Ideally this should be the new prefix we discussed in the f2f (#64627).\r\n> \r\n> Let me open a bug about this and bring the prefix discussion back so we can do something about it.\r\n\r\n@nashif - I think a `k_` prefix is fine for things like `z_finalize_fd()`, etc, but for consistency, that should likely just be a wrapper around a `zvfs_` prefixed function (mutual dependency library of net, fs, posix, libc, etc, where common socket / fs / fd stuff was heading since 2022, #51211). There will be a fair number of `zvfs_` prefixed functions, so I wouldn't necessarily want to flood the `k_` namespace with them.",
+        "> I think a `k_` prefix is fine for things like `z_finalize_fd()`\r\n\r\n`k_` should be reserved for kernel/ stuff only, let not mix things up.",
+        "> Am I missing something that would prevents such implementation?\n\nOf course I am. `munmap()` doesn't pass a fd or any identifier other than\nthe actual address and length.\n\nBut you have another problem here. `k_mem_map_phys_bare()` should be paired\nonly with `k_mem_unmap_phys_bare()` otherwise bad things will happen.\nI'd suggest you use `k_mem_map_phys_guard()` here instead, as it is\nmuch closer to be compatible with `k_mem_unmap()` aka\n`k_mem_unmap_phys_guard()`.\n\nAnd yet `k_mem_unmap_phys_guard()` wants to know if this is about anonymous\nmem or not which can probably be determined programmatically (whether there\nis a corresponding page frame or backing store entry for it) but that is not\nimplemented now.\n\nSo to say that `MAP_FIXED` is not implementable at the moment due to those\ndetails and it might make sense to simply return `ENOTSUP` for the time being.\n"
+    ],
+    "merged": true,
+    "created_at": "2024-06-11T14:15:38Z",
+    "issue_context": {
+        "number": 59953,
+        "title": "posix: implement `shm_unlink()`",
+        "body": "There are currently 20 missing POSIX functions with trivial implementations, `shm_unlink()` is one of them.\r\n\r\n> shm_unlink - remove a shared memory object (REALTIME)\r\n> \r\n> The shm_unlink() function shall remove the name of the shared memory object named by the string pointed to by name.\r\n> \r\n> If one or more references to the shared memory object exist when the object is unlinked, the name shall be removed before shm_unlink() returns, but the removal of the memory object contents shall be postponed until all open and map references to the shared memory object have been removed.\r\n> \r\n> Even if the object continues to exist after the last shm_unlink(), reuse of the name shall subsequently cause [shm_open()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/shm_open.html) to behave as if no shared memory object of this name exists (that is, [shm_open()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/shm_open.html) will fail if O_CREAT is not set, or will create a new shared memory object if O_CREAT is set).\r\n\r\nSee https://pubs.opengroup.org/onlinepubs/9699919799/functions/shm_unlink.html\r\n\r\nSee RFC #51211 for more info.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 29138,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 66,
+            "original_line": 66,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "Driving by, haven't had time for a full review but this all looks pretty straightforward:\r\n\r\nIs MAP_ANON/MAP_ANONYMOUS not part of POSIX?  You probably want that here for portability, since that's the primary mechanism in linux.  Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.",
+                "> Driving by, haven't had time for a full review but this all looks pretty straightforward:\n> \n> Is MAP_ANON/MAP_ANONYMOUS not part of POSIX? \n\nIt is (maybe) surprisingly not POSIX.\n\n> You probably want that here for portability, since that's the primary mechanism in linux. \n\nProbably, yeah.\n\n> Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.\n\nI was thinking something along the line of forcing the fd argument to -1 if the `MAP_ANONYMOUS` flag is present. That should work, right?\n\nSince this PR is already holding up quite a few more, would it be acceptable to submit that change as a follow up, @andyross?\n\n",
+                "Oh sure; it was just a note. I try to be pretty clear with my -1's. :)",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 29136,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/os/fdtable.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 400,
+            "original_line": 400,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "this change looks like a rebase issue",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 27147,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/os/fdtable.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 400,
+            "original_line": 400,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "this change looks like a rebase issue",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 26197,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/os/fdtable.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 400,
+            "original_line": 400,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "this change looks like a rebase issue",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 27843,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/os/fdtable.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 400,
+            "original_line": 400,
+            "side": "RIGHT",
+            "original_position": 7,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "this change looks like a rebase issue",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 27844,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "so this will just pass silently? should we return -1 (& ENOSYS) instead?",
+                "Currently, it doesn't seem that there is a generic API to flush anonymously mapped pages. Also from what I understand, the memories used in this implementation so far use synchronized writes. I could double-check that though.\n\nEventually, when mapping regular files is implemented by the fs subsystem, there will need to be an ISR to catch writes, and those might also be buffered, but that's a future problem.\n\nOtherwise, it may be useful to integrate the cache API eventually, but it's probably also premature at this point.\n\nhttps://docs.zephyrproject.org/latest/hardware/cache/index.html",
+                "Yeah, actually, so `k_mem_map_impl()` does not support explicit caching flags, so all writes will be synchronous. There is no need to fail, since doing nothing still has the expected result.\r\n\r\nhttps://github.com/zephyrproject-rtos/zephyr/blob/453ab8a9a356acf475a965a777a370795effa255/kernel/mmu.c#L581"
+            ]
+        },
+        {
+            "hunk_id": 27150,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "include/zephyr/sys/fdtable.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "I have a little concern about the unions here resulting in some difficult to find bugs for future implementers. I guess the other option would be to have these separate, but that would take additional space, but is that a lot?",
+                "Pushing an extra, unused, argument onto the stack and popping it back off shouldn't be too much of a concern I would think. But up to 16 extra (unneeded / unused) bytes per file descriptor might be a lot of wasted space, especially given that most seekable file types should eventually adopt the `_offset()` variants, and the two functions are otherwise identical.\r\n\r\nIt should be noted as well, that offsets do not apply to sockets, pipes, etc, just regular files and memory, and right now regular files don't even support per-fd offsets, just memory \ud83d\ude05 \n\nThat's technically a bug, as well, so can be fixed post feature freeze.",
+                "I guess I was more concerned with the subtle semantic difference. If the implementation is an offset, but the caller is expecting without, that offset argument will be read as garbage.",
+                "Interestingly, `lseek()` must be able to set the file descriptor offset to an arbitrary value. Kind of mind boggling.\n\n> The lseek() function shall allow the file offset to be set beyond the end of the existing data in the file.\n\nhttps://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html\n\nConsequently, read and write implementations must be able to decide if an offset is valid or invalid and react accordingly.\n\nSo they should be able to handle garbage.\n"
+            ]
+        },
+        {
+            "hunk_id": 29137,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "so this will just pass silently? should we return -1 (& ENOSYS) instead?",
+                "Currently, it doesn't seem that there is a generic API to flush anonymously mapped pages. Also from what I understand, the memories used in this implementation so far use synchronized writes. I could double-check that though.\n\nEventually, when mapping regular files is implemented by the fs subsystem, there will need to be an ISR to catch writes, and those might also be buffered, but that's a future problem.\n\nOtherwise, it may be useful to integrate the cache API eventually, but it's probably also premature at this point.\n\nhttps://docs.zephyrproject.org/latest/hardware/cache/index.html",
+                "Yeah, actually, so `k_mem_map_impl()` does not support explicit caching flags, so all writes will be synchronous. There is no need to fail, since doing nothing still has the expected result.\r\n\r\nhttps://github.com/zephyrproject-rtos/zephyr/blob/453ab8a9a356acf475a965a777a370795effa255/kernel/mmu.c#L581"
+            ]
+        },
+        {
+            "hunk_id": 26200,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "include/zephyr/sys/fdtable.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "I have a little concern about the unions here resulting in some difficult to find bugs for future implementers. I guess the other option would be to have these separate, but that would take additional space, but is that a lot?",
+                "Pushing an extra, unused, argument onto the stack and popping it back off shouldn't be too much of a concern I would think. But up to 16 extra (unneeded / unused) bytes per file descriptor might be a lot of wasted space, especially given that most seekable file types should eventually adopt the `_offset()` variants, and the two functions are otherwise identical.\r\n\r\nIt should be noted as well, that offsets do not apply to sockets, pipes, etc, just regular files and memory, and right now regular files don't even support per-fd offsets, just memory \ud83d\ude05 \n\nThat's technically a bug, as well, so can be fixed post feature freeze.",
+                "I guess I was more concerned with the subtle semantic difference. If the implementation is an offset, but the caller is expecting without, that offset argument will be read as garbage.",
+                "Interestingly, `lseek()` must be able to set the file descriptor offset to an arbitrary value. Kind of mind boggling.\n\n> The lseek() function shall allow the file offset to be set beyond the end of the existing data in the file.\n\nhttps://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html\n\nConsequently, read and write implementations must be able to decide if an offset is valid or invalid and react accordingly.\n\nSo they should be able to handle garbage.\n"
+            ]
+        },
+        {
+            "hunk_id": 27148,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "so this will just pass silently? should we return -1 (& ENOSYS) instead?",
+                "Currently, it doesn't seem that there is a generic API to flush anonymously mapped pages. Also from what I understand, the memories used in this implementation so far use synchronized writes. I could double-check that though.\n\nEventually, when mapping regular files is implemented by the fs subsystem, there will need to be an ISR to catch writes, and those might also be buffered, but that's a future problem.\n\nOtherwise, it may be useful to integrate the cache API eventually, but it's probably also premature at this point.\n\nhttps://docs.zephyrproject.org/latest/hardware/cache/index.html",
+                "Yeah, actually, so `k_mem_map_impl()` does not support explicit caching flags, so all writes will be synchronous. There is no need to fail, since doing nothing still has the expected result.\r\n\r\nhttps://github.com/zephyrproject-rtos/zephyr/blob/453ab8a9a356acf475a965a777a370795effa255/kernel/mmu.c#L581"
+            ]
+        },
+        {
+            "hunk_id": 26199,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 66,
+            "original_line": 66,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "Driving by, haven't had time for a full review but this all looks pretty straightforward:\r\n\r\nIs MAP_ANON/MAP_ANONYMOUS not part of POSIX?  You probably want that here for portability, since that's the primary mechanism in linux.  Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.",
+                "> Driving by, haven't had time for a full review but this all looks pretty straightforward:\n> \n> Is MAP_ANON/MAP_ANONYMOUS not part of POSIX? \n\nIt is (maybe) surprisingly not POSIX.\n\n> You probably want that here for portability, since that's the primary mechanism in linux. \n\nProbably, yeah.\n\n> Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.\n\nI was thinking something along the line of forcing the fd argument to -1 if the `MAP_ANONYMOUS` flag is present. That should work, right?\n\nSince this PR is already holding up quite a few more, would it be acceptable to submit that change as a follow up, @andyross?\n\n",
+                "Oh sure; it was just a note. I try to be pretty clear with my -1's. :)",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 27845,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 66,
+            "original_line": 66,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "Driving by, haven't had time for a full review but this all looks pretty straightforward:\r\n\r\nIs MAP_ANON/MAP_ANONYMOUS not part of POSIX?  You probably want that here for portability, since that's the primary mechanism in linux.  Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.",
+                "> Driving by, haven't had time for a full review but this all looks pretty straightforward:\n> \n> Is MAP_ANON/MAP_ANONYMOUS not part of POSIX? \n\nIt is (maybe) surprisingly not POSIX.\n\n> You probably want that here for portability, since that's the primary mechanism in linux. \n\nProbably, yeah.\n\n> Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.\n\nI was thinking something along the line of forcing the fd argument to -1 if the `MAP_ANONYMOUS` flag is present. That should work, right?\n\nSince this PR is already holding up quite a few more, would it be acceptable to submit that change as a follow up, @andyross?\n\n",
+                "Oh sure; it was just a note. I try to be pretty clear with my -1's. :)",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 27846,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "include/zephyr/sys/fdtable.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "I have a little concern about the unions here resulting in some difficult to find bugs for future implementers. I guess the other option would be to have these separate, but that would take additional space, but is that a lot?",
+                "Pushing an extra, unused, argument onto the stack and popping it back off shouldn't be too much of a concern I would think. But up to 16 extra (unneeded / unused) bytes per file descriptor might be a lot of wasted space, especially given that most seekable file types should eventually adopt the `_offset()` variants, and the two functions are otherwise identical.\r\n\r\nIt should be noted as well, that offsets do not apply to sockets, pipes, etc, just regular files and memory, and right now regular files don't even support per-fd offsets, just memory \ud83d\ude05 \n\nThat's technically a bug, as well, so can be fixed post feature freeze.",
+                "I guess I was more concerned with the subtle semantic difference. If the implementation is an offset, but the caller is expecting without, that offset argument will be read as garbage.",
+                "Interestingly, `lseek()` must be able to set the file descriptor offset to an arbitrary value. Kind of mind boggling.\n\n> The lseek() function shall allow the file offset to be set beyond the end of the existing data in the file.\n\nhttps://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html\n\nConsequently, read and write implementations must be able to decide if an offset is valid or invalid and react accordingly.\n\nSo they should be able to handle garbage.\n"
+            ]
+        },
+        {
+            "hunk_id": 27149,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 66,
+            "original_line": 66,
+            "side": "RIGHT",
+            "original_position": 58,
+            "position": 66,
+            "subject_type": "line",
+            "review_comments": [
+                "Driving by, haven't had time for a full review but this all looks pretty straightforward:\r\n\r\nIs MAP_ANON/MAP_ANONYMOUS not part of POSIX?  You probably want that here for portability, since that's the primary mechanism in linux.  Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.",
+                "> Driving by, haven't had time for a full review but this all looks pretty straightforward:\n> \n> Is MAP_ANON/MAP_ANONYMOUS not part of POSIX? \n\nIt is (maybe) surprisingly not POSIX.\n\n> You probably want that here for portability, since that's the primary mechanism in linux. \n\nProbably, yeah.\n\n> Linux will ignore the fd argument if it's set (it doesn't have to be -1).  This code will use the fd only, meaning that Linux code that gets ported to it (i.e. drops the MAP_ANONYMOUS flag) and forgets to pass -1 in the fd argument (because it was never needed) is going to misbehave.\n\nI was thinking something along the line of forcing the fd argument to -1 if the `MAP_ANONYMOUS` flag is present. That should work, right?\n\nSince this PR is already holding up quite a few more, would it be acceptable to submit that change as a follow up, @andyross?\n\n",
+                "Oh sure; it was just a note. I try to be pretty clear with my -1's. :)",
+                "Fixed!"
+            ]
+        },
+        {
+            "hunk_id": 29139,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "include/zephyr/sys/fdtable.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 28,
+            "position": 28,
+            "subject_type": "line",
+            "review_comments": [
+                "I have a little concern about the unions here resulting in some difficult to find bugs for future implementers. I guess the other option would be to have these separate, but that would take additional space, but is that a lot?",
+                "Pushing an extra, unused, argument onto the stack and popping it back off shouldn't be too much of a concern I would think. But up to 16 extra (unneeded / unused) bytes per file descriptor might be a lot of wasted space, especially given that most seekable file types should eventually adopt the `_offset()` variants, and the two functions are otherwise identical.\r\n\r\nIt should be noted as well, that offsets do not apply to sockets, pipes, etc, just regular files and memory, and right now regular files don't even support per-fd offsets, just memory \ud83d\ude05 \n\nThat's technically a bug, as well, so can be fixed post feature freeze.",
+                "I guess I was more concerned with the subtle semantic difference. If the implementation is an offset, but the caller is expecting without, that offset argument will be read as garbage.",
+                "Interestingly, `lseek()` must be able to set the file descriptor offset to an arbitrary value. Kind of mind boggling.\n\n> The lseek() function shall allow the file offset to be set beyond the end of the existing data in the file.\n\nhttps://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html\n\nConsequently, read and write implementations must be able to decide if an offset is valid or invalid and react accordingly.\n\nSo they should be able to handle garbage.\n"
+            ]
+        },
+        {
+            "hunk_id": 26198,
+            "commit_id": "275de80fdf596ab658b5d67a7364bd9af8c9fc4d",
+            "original_commit_id": "c98760df44b0bceabc49fce16fb7cca48dcab642",
+            "path": "lib/posix/options/mmap.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 105,
+            "original_line": 105,
+            "side": "RIGHT",
+            "original_position": 92,
+            "position": 105,
+            "subject_type": "line",
+            "review_comments": [
+                "so this will just pass silently? should we return -1 (& ENOSYS) instead?",
+                "Currently, it doesn't seem that there is a generic API to flush anonymously mapped pages. Also from what I understand, the memories used in this implementation so far use synchronized writes. I could double-check that though.\n\nEventually, when mapping regular files is implemented by the fs subsystem, there will need to be an ISR to catch writes, and those might also be buffered, but that's a future problem.\n\nOtherwise, it may be useful to integrate the cache API eventually, but it's probably also premature at this point.\n\nhttps://docs.zephyrproject.org/latest/hardware/cache/index.html",
+                "Yeah, actually, so `k_mem_map_impl()` does not support explicit caching flags, so all writes will be synchronous. There is no need to fail, since doing nothing still has the expected result.\r\n\r\nhttps://github.com/zephyrproject-rtos/zephyr/blob/453ab8a9a356acf475a965a777a370795effa255/kernel/mmu.c#L581"
+            ]
+        }
+    ]
+}

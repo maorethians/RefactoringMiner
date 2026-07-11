@@ -1,0 +1,45 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 13358,
+    "lang": "cpp",
+    "pr_title": "[Python UDF] Filter `NULL` values before calling the user defined function",
+    "pr_body": "This PR fixes #13138 \r\n\r\nThis only applies to UDFs that use the default null handling (default behavior).\r\n\r\nFor both `native` and `arrow` UDF types, nulls are filtered out of the input that is sent to the user defined function.\r\nOn return to DuckDB the created result is converted to a DataChunk and the rows that were filtered out are replaced with NULL in the final result.\r\n\r\nDuckDB side input:\r\n```\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502    a    \u2502\r\n\u2502 varchar \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 12      \u2502\r\n\u2502 NULL    \u2502\r\n\u2502 42      \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\n```\r\n\r\nReceived data by the UDF:\r\n```\r\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502    a    \u2502\r\n\u2502 varchar \u2502\r\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 12      \u2502\r\n\u2502 42      \u2502\r\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\n```\r\n\r\nIn this example:\r\nThe resulting row produced by the UDF at (0 indexed) row 1 will be placed at row 2 in the final result.",
+    "pr_comments": [
+        "Thanks!"
+    ],
+    "merged": true,
+    "created_at": "2024-08-09T07:53:14Z",
+    "issue_context": {
+        "number": 13138,
+        "title": "python UDF: NULLs intercepted for scalars but not columnar args",
+        "body": "### What happens?\n\nAccording to https://duckdb.org/docs/api/python/function.html#null-handling, if you pass a NULL into a python UDF, duckdb will short-circuit and immediately resolve to NULL, and won't ever call the python with None.\r\n\r\nThis short-circuiting appears to happen when the input is a scalar, but doesn't when it is a column.\r\n\r\nPS I think this short-circuiting (with a configurable override) is fantastic UX\n\n### To Reproduce\n\n```python\r\nimport duckdb\r\nfrom duckdb.typing import INTEGER\r\n\r\n\r\ndef add_one(x):\r\n    return x + 1\r\n\r\n\r\nduckdb.create_function(\"add_one\", add_one, [INTEGER], INTEGER, type=\"native\")\r\nduckdb.sql(\"SELECT add_one(1), add_one(NULL)\").fetchall()\r\n# [(2, None)]\r\nduckdb.sql(\"SELECT add_one(x) FROM (SELECT UNNEST([1, NULL]) as x)\").fetchall()\r\n# Invalid Input Error: Python exception occurred while executing the UDF: TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'\r\n```\n\n### OS:\n\nMacM1, MacOS 14.5\n\n### DuckDB Version:\n\n1.0.0\n\n### DuckDB Client:\n\npython\n\n### Full Name:\n\nNick Crews\n\n### Affiliation:\n\nShip Creek Group\n\n### What is the latest build you tested with? If possible, we recommend testing with the latest nightly build.\n\nI have tested with a stable release\n\n### Did you include all relevant data sets for reproducing the issue?\n\nYes\n\n### Did you include all code required to reproduce the issue?\n\n- [X] Yes, I have\n\n### Did you include all relevant configuration (e.g., CPU architecture, Python version, Linux distribution) to reproduce the issue?\n\n- [X] Yes, I have",
+        "comments": [
+            "I was testing the very same thing today and noticed the same thing for user defined scalar functions. It works if you explicitly pass NULL as one of the arguments but doesn't if the NULL value is passed as a column value.",
+            "Repro with C API. I used 1.0.1-dev3196 as scalar functions aren't available in v1.\r\n\r\n```c\r\nstate = duckdb_query(connection, \"CREATE TABLE big_table_1 AS SELECT (greatest(random(), 0.1) * 1000)::BIGINT i FROM range(10) t(i);\", &result);\r\nstate = duckdb_query(connection, \"Insert into big_table_1 values (NULL);\", &result);\r\n\r\nauto function = duckdb_create_scalar_function();\r\nduckdb_scalar_function_set_name(function, \"my_null_count\");\r\n\r\n// set the variable arguments\r\nauto any_type = duckdb_create_logical_type(DUCKDB_TYPE_ANY);\r\nduckdb_scalar_function_set_varargs(function, any_type);\r\nduckdb_destroy_logical_type(&any_type);\r\n\r\n// set the return type uto bigint\r\nauto return_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);\r\nduckdb_scalar_function_set_return_type(function, return_type);\r\nduckdb_destroy_logical_type(&return_type);\r\n\r\n// set up the function\r\nduckdb_scalar_function_set_function(function, CountNULLValues);\r\n\r\n// register and cleanup\r\nstate = duckdb_register_scalar_function(connection, function);\r\nduckdb_destroy_scalar_function(&function);\r\n\r\nstate = duckdb_query(connection, \"Select my_null_count(i, 42) from big_table_1\", &result);\r\n\r\nvoid CountNULLValues(duckdb_function_info, duckdb_data_chunk input, duckdb_vector output) {\r\n\r\n\t// Get the total number of rows and columns in this chunk.\r\n\tauto input_size = duckdb_data_chunk_get_size(input);\r\n\tauto column_count = duckdb_data_chunk_get_column_count(input);\r\n\r\n\t// Extract the validity masks.\r\n\tstd::vector<uint64_t*> validity_masks;\r\n\tfor (idx_t col_idx = 0; col_idx < column_count; col_idx++) {\r\n\t\tauto col = duckdb_data_chunk_get_vector(input, col_idx);\r\n\t\tauto validity_mask = duckdb_vector_get_validity(col);\r\n\t\tvalidity_masks.push_back(validity_mask);\r\n\t}\r\n\r\n\t// Execute the function.\r\n\tauto result_data = (uint64_t*)duckdb_vector_get_data(output);\r\n\tfor (idx_t row_idx = 0; row_idx < input_size; row_idx++) {\r\n\t\tidx_t null_count = 0;\r\n\t\tfor (idx_t col_idx = 0; col_idx < column_count; col_idx++) {\r\n\t\t\tif (!duckdb_validity_row_is_valid(validity_masks[col_idx], row_idx)) {\r\n\t\t\t\tnull_count++;\r\n\t\t\t}\r\n\t\t}\r\n\t\tresult_data[row_idx] = null_count;\r\n\t}\r\n}\r\n```\r\n\r\nWhen `CountNULLValues` is executed `input_size` is 11: 10 rows in the table without NULL and one row with NULL",
+            "This is expected behavior, constant NULLs can be short-circuited because we know the input is NULL, a column can contain anything, we won't know what it returns until runtime",
+            "If the custom UDF still has to handle NULL input, what's the point of short-circuiting?",
+            "The initial PR adding this: <https://github.com/duckdb/duckdb/pull/3866>\r\nThe changelist is quite small, on `main` the relevant code acting on this that I could find is this:\r\n```c++\r\n    if (bound_function.null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING) {\r\n        for (auto &child : children) {\r\n            if (child->return_type == LogicalTypeId::SQLNULL) {\r\n                return make_uniq<BoundConstantExpression>(Value(return_type_if_null));\r\n            }\r\n            if (!child->IsFoldable()) {\r\n                continue;\r\n            }\r\n            Value result;\r\n            if (!ExpressionExecutor::TryEvaluateScalar(context, *child, result)) {\r\n                continue;\r\n            }\r\n            if (result.IsNull()) {\r\n                return make_uniq<BoundConstantExpression>(Value(return_type_if_null));\r\n            }\r\n        }\r\n    }\r\n```",
+            "I see two potential benefits of short-circuiting:\r\n1. UX, the python programmer doesn't have to worry about this case.\r\n2. performance, we can avoid slow python computation in some cases\r\n\r\nIf we only short-circuit on scalars, we lose the benefit of 1. We almost entirely lose the benefit of 2 as well, since I think it is reasonable to assume that calling a UDF with a column of N elements is O(N), whereas calling with a scalar is O(1), so we are only getting a performance boost in the O(1) case, which is going to only account for a tiny fraction of a queries runtime.\r\n\r\nSo, unless we can short-circuit in the columnar case too, I think we should remove the complexity and NEVER short-circuit.\r\n\r\nThe other thing confounding this is that short-circuiting a python UDF is probably much easier than short-circuiting a pyarrow UDF. But ideally these two flavors should have the same behavior. So unless we can get consistent behavior, I think we should err on the side of usability/simplicity and never short-circuit."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23572,
+            "commit_id": "4d2e4b30486db9149b0cf1a63f6478fb60abafaa",
+            "original_commit_id": "50bb607e2b2e5728664dd18da330eda354be3b96",
+            "path": "tools/pythonpkg/src/python_udf.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 301,
+            "original_line": 260,
+            "side": "RIGHT",
+            "original_position": 131,
+            "position": 215,
+            "subject_type": "line",
+            "review_comments": [
+                "Same here - `ret` should not be `Py_None` here "
+            ]
+        }
+    ]
+}

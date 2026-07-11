@@ -1,0 +1,51 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 35279,
+    "lang": "c_sharp",
+    "pr_title": "Linux: Fix nested group resolution for RBAC claims",
+    "pr_body": "This PR fixes three issues with current RBAC claims resolution code. Every issue is fixed in a separate commit, to simplify review.\r\n\r\n----\r\nWe have been trying to set up claims resolution for our services running in docker, and it was crashing when we set [`IgnoreNestedGroups = true`](https://docs.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.authentication.negotiate.ldapsettings.ignorenestedgroups?view=aspnetcore-5.0). So I did some research, and found three issues which I managed to fix.\r\n\r\nhttps://github.com/dotnet/aspnetcore/commit/c6c45166bfffabceb6d49fb6ff4df1bbc01152b0: **Fix nested claims retrieval -- use CN instead of DN**\r\nI think this one is simple. Naturally, we should use group canonical name (CN) as a claim value. But for some reason the code used group distinguished name (DN) instead. So instead of `SomeGroup`, the claim value would be `CN=SomeGroup,DC=domain,DC=COM`, which is obviously not what we want.\r\n\r\nhttps://github.com/dotnet/aspnetcore/commit/bba75b7f89869a20770c30f796edaba16f07a990: **Keep track of already processed group to account for possible circular references**\r\nThis one fixes a particular corner case which is possible in real-world AD deployments, namely circular group references.\r\nThat is, e.g. `GroupA -> GroupB -> GroupC -> GroupA`. This is a problematic scenario for [any software working with AD](https://serverfault.com/questions/351524/what-are-the-consequences-of-an-ad-group-that-has-as-its-member-a-group-that-is).\r\nThe fix is basically to keep track of groups that we already processed.\r\nFixes https://github.com/dotnet/aspnetcore/issues/37225\r\n\r\nhttps://github.com/dotnet/aspnetcore/commit/7f72499bb428bc1828d13e14367dc3c69c05b4d7: **Escape LDAP filter arguments**\r\nThis one fixes another real-world scenario. It's possible for a group CN to include characters such as `(` or `)`, for example `Some (very) important group`. Parentheses in partucular are a part of filter syntax. When we construct the LDAP filter expression and don't escape these symbols, openldap fails with `LdapException: The search filter is invalid`. So the solution is to simply escape them according to the [relevant RFC](https://tools.ietf.org/search/rfc4515#section-3).\r\nThis one might be somewhat related to https://github.com/dotnet/runtime/issues/38609.\r\nThe caveat here is that on Windows unescaped filter is working, while on Linux it doesn't. There's likely a difference in the way underlying native libraries (Wldap32 vs openldap) operate.\r\n\r\nTODO: \r\n- [ ] Tests? Not sure where to implement them.",
+    "pr_comments": [
+        "[![CLA assistant check](https://cla.dotnetfoundation.org/pull/badge/signed)](https://cla.dotnetfoundation.org/dotnet/aspnetcore?pullRequest=35279) <br/>All CLA requirements met.",
+        "Generally we want individual issues rather than PRs first, so we can validate the scenario\r\n\r\nAs you can see with the lack of tests, this is frankly hard to test. We need a suitable ldap server configuration documented that we can reproduce, and then we run manual tests. So can you give us an idea of what setup you have, including some sample users, as well as your docker configuration and how you're authenticating and we can go from there.",
+        "Just to update, I plan on documenting the requested stuff here in 1-2 weeks.",
+        "Update on https://github.com/dotnet/aspnetcore/commit/7f72499bb428bc1828d13e14367dc3c69c05b4d7:\r\nAfter discussion at https://github.com/dotnet/runtime/issues/38609#issuecomment-897801217, I think I will draft an API proposal directly to S.DS.P, and remove this code from here.",
+        "I've filed an API proposal at https://github.com/dotnet/runtime/issues/59900",
+        "Can the recursive issue be isolated as its own PR as it's likely to get merged upstream much faster than proposed API changes?\r\n\r\n",
+        "Something worth mentioning. Kerberos tickets will come with AD group SIDs. If group names to sids mapping can be cached, LDAP queries can be avoided for a large number of requests when authentication is done via Kerberos. See [this ](https://github.com/NMica/NMica.Security/blob/3868ceab4880058fbca4b66d651a169d04757d1d/src/NMica.AspNetCore.Authentication.Spnego/Ldap/LdapRolesClaimsTransformation.cs#L66) on how this can be implemented (though in the linked code I preloaded and keep in sync all AD groups as background process so no LDAP queries are ever issued per-request, greatly speeding up request pipeline. The downside of my approach is higher memory consumption if there are a lot of AD groups that need to be cached in memory).",
+        "> Can the recursive issue be isolated as its own PR as it's likely to get merged upstream much faster than proposed API changes?\r\n\r\nYeah, I think that would be a better approach.\r\nI will do that soon.",
+        "@macsux \r\nI've cherry-picked recursion fixes to #38817",
+        "@RoadTrain Can this PR be closed now since the recursion fixes were done separately and the LDAP work is being tracked in the dotnet/runtime issue?",
+        "@adityamandaleeka Yes, I will close this PR for now."
+    ],
+    "merged": false,
+    "created_at": "2021-08-11T23:53:50Z",
+    "issue_context": {
+        "number": 37225,
+        "title": "Linux: RBAC claims resolution hangs if nested groups have circular dependencies",
+        "body": "### Describe the bug\r\nReal-world AD deployments can have groups [circularly reference](https://serverfault.com/questions/351524/what-are-the-consequences-of-an-ad-group-that-has-as-its-member-a-group-that-is) each other, e.g. `GroupA -> GroupB -> GroupC -> GroupA`.\r\nIn this case, when nested claims resolution is enabled, Linux clients will hang on recursive resolution at https://github.com/dotnet/aspnetcore/blob/main/src/Security/Authentication/Negotiate/src/Internal/LdapAdapter.cs#L123\r\n\r\n### To Reproduce\r\n\r\n1. Set up any AD server (`contoso.com` in the example).\r\n2. Add several AD groups so that they reference each other circularly, e.g. `GroupA -> GroupB -> GroupC -> GroupA`.\r\n3. Add user to any of these groups.\r\n4. Create a simple API project, set up RBAC claims resolution:\r\n```C#\r\n            services.AddAuthentication(NegotiateDefaults.AuthenticationScheme).AddNegotiate(options =>\r\n            {\r\n                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))\r\n                {\r\n                    return;\r\n                }\r\n\r\n                options.EnableLdap(settings =>\r\n                {\r\n                    settings.Domain = \"contoso.com\";\r\n                    settings.MachineAccountName = \"someuser\";\r\n                    settings.MachineAccountPassword = \"somepassword\";\r\n                });\r\n            });\r\n\r\n            services.AddAuthorization();\r\n```\r\n```C#\r\n    [ApiController]\r\n    [Route(\"api/[controller]\")]\r\n    [Authorize(Roles = \"GroupA\")]\r\n    public class SomeController : Controller\r\n    {\r\n        [HttpGet]\r\n        [Route(\"someMethod\")]\r\n        public async Task<ActionResult<int>> SomeMethod()\r\n        {\r\n            return 1;\r\n        }\r\n     }\r\n```\r\n5. Run it inside docker container `dotnet/aspnet:6.0`\r\n\r\n### Exceptions (if any)\r\nAPI call hangs, and eventually results in `StackOverflowException`.\r\n\r\n### Further technical details\r\n- ASP.NET Core 5.0, 6.0-preview5, via docker `dotnet/aspnet:6.0`\r\n- Visual Studio 2019\r\n",
+        "comments": [
+            "Proposed fix at https://github.com/dotnet/aspnetcore/commit/bba75b7f89869a20770c30f796edaba16f07a990: basically to keep track of already processed groups via `HashSet`."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 13244,
+            "commit_id": "7f72499bb428bc1828d13e14367dc3c69c05b4d7",
+            "original_commit_id": "123bd0611ac6548bc4e483f8fb6af787dd45d4f7",
+            "path": "src/Security/Authentication/Negotiate/src/Internal/LdapAdapter.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 102,
+            "original_line": 102,
+            "side": "RIGHT",
+            "original_position": 25,
+            "position": 25,
+            "subject_type": "line",
+            "review_comments": [
+                "I've moved it here from under `if` clause, but I'm actually not sure.\r\nBasically what I did was compare the results of this code in Linux vs Windows.\r\nI noticed one difference in their behaviour:\r\n1. When using `filter` below on Windows, the results include all groups, including distribution groups (email distribution lists).\r\n2. On Linux, distribution groups are not resolved.",
+                "Maybe it warrants a separate issue."
+            ]
+        }
+    ]
+}

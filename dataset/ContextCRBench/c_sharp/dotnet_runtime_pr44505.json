@@ -1,0 +1,53 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 44505,
+    "lang": "c_sharp",
+    "pr_title": "Static linking of native libs",
+    "pr_body": "Closes:https://github.com/dotnet/runtime/issues/41299\r\n\r\nStatically linking `libSystem.Globalization.Native` and `libSystem.IO.Compression.Native`/`clrcompression` and use overrider mechanism to invoke.\r\n\r\n- Added support for PInvoke overriding mechanism.  A static host or embedder can provide a callback to participate in PInvoke resolution,\r\n- At the time of PInvoke resolution, if there is an override it gets a chance to provide an implementation before normal PInvoke resolution process.\r\n- `libSystem.Globalization.Native` no longer relies on \"QCall\" mechanism. \r\nInstead there is a default/built-in override, which runs right after the host-provided one. Host-provided override has preference since it runs first.\r\n- The default overrider can be extended if we add more cases where PInvokes are backed by implementations statically linked into runtime (regardless of single-file or .dll/.so scenarios)\r\n- The signature of the overrider callback is:\r\n```c\r\nconst void* (PInvokeOverrideFn)(const char* libraryName, const char* entrypointName);\r\n```\r\nReturning `NULL` is interpreted as \"no-match\" case.\r\n- The overrider is passed to `coreclr_initialize` as a property named `PINVOKE_OVERRIDE`. The value is a pointer encoded as a hex-based string value. This is similar to `BUNDLE_PROBE`.\r\n- The implementation of an override is up to the overrider.\r\nIn this change the following scheme was used:\r\n-- Host overrider dispatches on the name of the library (text match) and defers to one of the embedded libraries, if there is a match.\r\n-- The library dispatches on the _native_ name of the Dll Import and provides a method pointer of there is a match.",
+    "pr_comments": [
+        "@VSadov Are you planning to also link `System.Security.Cryptography.Native.Openssl` statically?\r\nWe noticed a small issue - this lib is optional on macOS - it's needed only when you perform AES-GCM/CCM encryption. But it has an `__attribute__((constructor))` attribute that invokes `abort` if OpenSSL is not found. So I wonder how it will work in the static linking scenario - it shouldn't `abort` immediately if OpenSSL was not found on macOS since most of the stuff is AppleTLS-based there.",
+        "@EgorBo - I was planning to. It would be one of the last libraries I would look at. Not sure how that would work. Thanks for the heads up! ",
+        "I also noticed another `__attribute__((constructor))` function in libSystem.Security.Cryptography.Native.Apple.dylib: `InitializeAppleCryptoSslShim()`.\r\n\r\nI think we should do what we do for globalization and call these initialize functions from managed code explicitly rather than relying on the magic `__attribute__((constructor))` initialization.",
+        "Considering `__attribute__((constructor))` issues, I think perhaps linking these libraries on OSX should be a separate change. If that is possible. ",
+        "I think I have addressed all feedback here. Please take another look and let me know if I missed something. Thanks!!",
+        "Also, I wonder - how do we look at merging this PR and adding other libs as a separate change? \r\n\r\nI think adding the rest of superhost libs on this plan will be more scoped - no need to change anything for Windows, Mono, no changes in build scripts.",
+        "> Also, I wonder - how do we look at merging this PR and adding other libs as a separate change?\r\n\r\nYes, I think that is a good plan.",
+        ":-) I did not notice the formatting changes and thought this was about the include.",
+        "@janvorli - I think the last few changes address all your concerns.",
+        "`runtime (Build iOS x64 Release AllSubsets_Mono)`   seems to be failing even in a no-change PRs",
+        "I am going to merge this. Thanks to everyone who helped with this PR! \r\n"
+    ],
+    "merged": true,
+    "created_at": "2020-12-03T22:58:25Z",
+    "issue_context": {
+        "number": 41299,
+        "title": "Improving and unifying handling of native Libraries code in embedded/singlefile scenarios",
+        "body": "### Improving handling of native Libraries code in embedded/singlefile scenarios\r\n\r\nFor reasons that vary .Net libraries rely on nontrivial amount of native code. The native code is factored into a few well-known native dynamic-link libraries (.dll, .so, etc). As an example we have 4 libraries like this on Linux \u2013 \"libSystem.Native\", \"libSystem.IO.Compression.Native\", \"libSystem.Net.Security.Native\", \"libSystem.Security.Cryptography.Native.OpenSsl\". The number of libraries varies depending on platform.\r\n\r\nThis is a very simple model which has its own advantages. In particular there is no need for coreclr to have any special knowledge about these libraries.\r\n\r\nWhere this becomes inconvenient and fragile is when we want to package the native libraries differently - for example as a part of a single file host. To handle such requirement in the current implementation we produce static libraries for the native code and link that into coreclr/host. Since the native dlls are not longer around in this configuration, coreclr intercepts loading of these libraries and redirects to the containing host binary.\r\n\r\nThere is a number of issues:\r\n-\tSince coreclr and libraries are built separately, there is a possibility of a mismatch that could make them incompatible. (i.e. Debug vs. Release, different versions of libc, new/free operator mismatch ...)\r\n-\tIntercepting and redirecting the load happens in PAL layer. This is a problem when the same must be done on Windows.\r\n-\tAccessing the native methods via regular PInvokes requires that the native host re-exports the methods. That easily runs into platform or linker dependent behaviors regarding re-exporting of library functions from final executables.\r\n\r\n**Proposal:**\r\n\r\n-\tBuild native libraries as a part of CoreClr build.\r\nThe source files should still be located under Libraries partition, so that they can be shared in source form with Mono, for example.\r\n\r\n-\tThe \u201cembedded\u201d case builds native libraries as a part of coreclr binary, thus bypassing the explicit lib files.\r\n\r\n-\tThe \"embedded\" case recognizes well-known libraries as a special case of [QCall](https://github.com/dotnet/runtime/blob/master/docs/design/coreclr/botr/corelib.md#calling-from-managed-to-native-code) and dispatches calls to the embedded implementations.\r\nExample: \u201clibSystem.Native\u201d would normally be a name of the native library to load, but in \u201cembedded\u201d case, the DLLEXPORT methods of libSystem.Native would be registered in the runtime similarly to QCall and \u201clibSystem.Native\u201d would be recognized as  another QCall variety.\r\nQCall mechanism here allows us to \u201cshim\u201d the location of native methods while not changing the managed code that calls them.\r\n\r\n-\tThe QCall registration table for the native calls will be automatically generated by scanning managed libraries.\r\n\r\n\r\n**Some unresolved details:**\r\n-\tIf managed callers are built after coreclr, we would need to reconcile how to do the QCall generation before coreclr builds.\r\n-\tShould the generation of QCall entries be a part of the build (producing a temporary source file) or a dev-time step (the file is explicitly generated and stored in Git).\r\n",
+        "comments": [
+            "I couldn't figure out the best area label to add to this issue. If you have write-permissions please help me learn by adding exactly one [area label](https://github.com/dotnet/runtime/blob/master/docs/area-owners.md).",
+            "Assigning to .NET 6 milestone as this is a design proposal, not a bug fix, and I believe it's too late in the .NET 5 release cycle to introduce new feature work.",
+            "This was implemented in https://github.com/dotnet/runtime/pull/44505"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 7999,
+            "commit_id": "6c55b68d34c216845abd87fc7c4b846dc03bc603",
+            "original_commit_id": "a5d0bcf19f778ac3cc579320c64adc4cf2e5f1d7",
+            "path": "src/libraries/Common/src/Interop/Windows/Interop.Libraries.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 34,
+            "original_line": 34,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "It would be nice to rename this to `System.IO.Compression.Native` (fine to do it in separate PR).",
+                "I assume you mean renaming the actual dll ? \r\nYes, might be better to do that separately - just in case it breaks something that expects the old file name (packaging, installers, things in SDK repo..)\r\n\r\nWe can also easily embed it now, similar to System.Globalization, unless there are reasons we want it as a separate dll."
+            ]
+        }
+    ]
+}

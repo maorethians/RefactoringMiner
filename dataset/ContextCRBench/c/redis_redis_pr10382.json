@@ -1,0 +1,64 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 10382,
+    "lang": "c",
+    "pr_title": "Initialize help when using redis-cli help or redis-cli ?",
+    "pr_body": "The following usage will output an empty newline:\r\n```\r\n> redis-cli help set\r\nempty line\r\n```\r\n\r\nThe reason is that in interactive mode, we have called\r\n`cliInitHelp`, which initializes help.\r\n\r\nWhen using `redis-cli help xxx` or `redis-cli help ? xxx`,\r\nwe can't match the command due to empty `helpEntries`,\r\nso we output an empty newline.\r\n\r\nIn this commit, we will call `cliInitHelp` to init the help.\r\nNote that in this case, we need to call `cliInitHelp` (COMMAND DOCS)\r\nevery time, which i think is acceptable.\r\n\r\nSo now the output will look like:\r\n```\r\n[redis]# src/redis-cli help get\r\n\r\n  GET key\r\n  summary: Get the value of a key\r\n  since: 1.0.0\r\n  group: string\r\n\r\n[redis]#\r\n```\r\n\r\nFixes #10378\r\n\r\nThis PR also fix a redis-cli crash when using `--ldb --eval`:\r\n```\r\n[root]# src/redis-cli --ldb --eval test.lua test 1\r\nLua debugging session started, please use:\r\nquit    -- End the session.\r\nrestart -- Restart the script in debug mode again.\r\nhelp    -- Show Lua script debugging commands.\r\n\r\n* Stopped at 1, stop reason = step over\r\n-> 1   local num = redis.call('GET', KEYS[1]);\r\nredis-cli: redis-cli.c:718: cliCountCommands: Assertion\r\n`commandTable->element[i]->type == 1' failed.\r\nAborted\r\n```\r\nBecause in ldb mode, `COMMAND DOCS` or `COMMAND` will\r\nreturn an array, only with one element, and the type\r\nis `REDIS_REPLY_STATUS`, the result is `<error> Unknown\r\nRedis Lua debugger command or wrong number of arguments`.\r\n\r\nSo if we are in the ldb mode, and init the Redis HELP, we\r\nwill get the wrong response and crash the redis-cli.\r\nIn ldb mode we don't initialize HELP, help is only initialized\r\nafter the lua debugging session ends.\r\n\r\nIt was broken in #10043",
+    "pr_comments": [
+        "@oranagra sure, no problem. I also did not describe it very clearly, my bad\r\n\r\n>1. I don't like to call COMMAND DOCS when someone does a plain redis-cli set X y or any other usage of the non interactive mode, except help. I suppose this PR is ok in that respect.\r\n\r\nyes, i also dont like it. so i did check the code, we only call COMMAND DOCS when using `help xxx`\r\n```\r\nstatic int cliSendCommand(int argc, char **argv, long repeat) {\r\n    char *command = argv[0];\r\n    size_t *argvlen;\r\n    int j, output_raw;\r\n\r\n    if (!config.eval_ldb && /* In debugging mode, let's pass \"help\" to Redis. */\r\n        (!strcasecmp(command,\"help\") || !strcasecmp(command,\"?\"))) {\r\n        cliOutputHelp(--argc, ++argv);  ------------------->>> here\r\n        return REDIS_OK;\r\n    }\r\n```\r\n\r\n> 2. Please checj what happens when this is used against an old redis version (without support for DOCS)\r\n\r\nIn #10043, if `COMMAND DOCS` is not suppoert, we will generate help from help.h\r\n\r\n```\r\n[root@binblog redis]# src/redis-cli info server\r\n# Server\r\nredis_version:4.0.14\r\nredis_git_sha1:ff6db5f1\r\n...\r\n\r\n[root@binblog redis]# src/redis-cli help lmpop\r\n\r\n  LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]\r\n  summary: Pop elements from a list\r\n  since: 7.0.0\r\n  group: list\r\n\r\n[root@binblog redis]# src/redis-cli help @string\r\n\r\n  APPEND key value\r\n  summary: Append a value to a key\r\n  since: 2.0.0\r\n  ....\r\n```\r\n",
+        "what about a case where redis isn't running at all?\r\ni.e. if we can print help that's not at all coming from redis, and just use redis-cli as help, maybe we should let it do that when redis is unreachable?\r\n\r\np.s. as far as i could tell this whole feature (help from non-interactive) is not something that was recently broken.\r\nso if it complicate things, we can make compromises.",
+        "interesting idea, i made a quick commit, with this commit, we can do this:\r\n```\r\n[root@binblog redis]# src/redis-cli\r\nCould not connect to Redis at 127.0.0.1:6379: Connection refused\r\nnot connected> help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT unix-time-milliseconds|KEEPTTL] [NX|XX] [GET]\r\n  summary: Set the string value of a key\r\n  since: 1.0.0\r\n  group: string\r\n\r\nnot connected>\r\n[root@binblog redis]# src/redis-cli help lmpop\r\n\r\n  LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]\r\n  summary: Pop elements from a list\r\n  since: 7.0.0\r\n  group: list\r\n\r\n[root@binblog redis]#\r\n```\r\n\r\nNote that in this case, help won't be able to sense the connection status like (unless we do a `cliConnect` every time in `cliOutputHelp`):\r\n```\r\n[root@binblog redis]# src/redis-cli\r\nCould not connect to Redis at 127.0.0.1:6379: Connection refused\r\nnot connected> help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT \r\n\r\n-------------------------- start the server --------------\r\nnot connected> help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT \r\n\r\nnot connected> ping                ----------->> trigger a reconnect\r\nPONG\r\n127.0.0.1:6379> help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT \r\n\r\n------------------------- stop the server ---------------\r\n127.0.0.1:6379> help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT\r\n\r\n127.0.0.1:6379> ping\r\nError: Server closed the connection                -------- the new commit fix the prompt see below---------\r\n127.0.0.1:6379> help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT\r\n```",
+        "merged. thank you!"
+    ],
+    "merged": true,
+    "created_at": "2022-03-09T15:50:55Z",
+    "issue_context": {
+        "number": 10378,
+        "title": "[NEW] redis-cli HELP XYZ",
+        "body": "I was wondering why HELP doesn't appear to work when running on terminal.\r\n\r\n```\r\n> redis-cli HELP SET\r\n# empty line\r\n```\r\n\r\nI am using 7rc2.  I ran against 6.2 as well, same result. Is this something potential to include one day? I dug around prior tickets but didn't see anything about this (I suspect someone else has asked so sorry about any dup).",
+        "comments": [
+            "ohh i see, in this case, we did not init the command table, so i won't be able to match the command and print the help.\r\ni am taking a look, looks like it's easy to fix if needed\r\n```\r\n[root@binblog redis]# src/redis-cli help set\r\n\r\n  SET key value [EX seconds|PX milliseconds|EXAT unix-time-seconds|PXAT unix-time-milliseconds|KEEPTTL] [NX|XX] [GET]\r\n  summary: Set the string value of a key\r\n  since: 1.0.0\r\n  group: string\r\n\r\n\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48750,
+            "commit_id": "c7bc437b971e5c899b5afe52f1e4019db88b705e",
+            "original_commit_id": "311a757cb14c3420c7547377d250ef0a66e781d6",
+            "path": "src/redis-cli.c",
+            "start_line": 2458,
+            "original_start_line": 2417,
+            "start_side": "RIGHT",
+            "line": 2459,
+            "original_line": 2418,
+            "side": "RIGHT",
+            "original_position": 67,
+            "position": 81,
+            "subject_type": "line",
+            "review_comments": [
+                "was this a plain leak? found it with valgrind?",
+                "actually this is not a leak (or a harmless one), we will free it in the next call.\r\ni find it in https://github.com/redis/redis/pull/10382/commits/3d0b7f82b3d7b7a700ab060ef9ee91b684118e78\r\n(not sure i do it right, but it look like no harm (added the free))\r\n```\r\n        if (config.cluster_reissue_command || context == NULL ||\r\n            context->err == REDIS_ERR_IO || context->err == REDIS_ERR_EOF)         -->>\r\n        {\r\n            if (cliConnect(CC_FORCE) != REDIS_OK) {            ---- here\r\n                cliPrintContextError();\r\n                config.cluster_reissue_command = 0;\r\n                return REDIS_ERR;\r\n            }\r\n        }\r\n\r\nstatic int cliConnect(int flags) {\r\n    if (context == NULL || flags & CC_FORCE) {\r\n        if (context != NULL) {\r\n            redisFree(context);\r\n            config.dbnum = 0;\r\n            config.in_multi = 0;\r\n            cliRefreshPrompt();\r\n        }\r\n```"
+            ]
+        },
+        {
+            "hunk_id": 48751,
+            "commit_id": "c7bc437b971e5c899b5afe52f1e4019db88b705e",
+            "original_commit_id": "311a757cb14c3420c7547377d250ef0a66e781d6",
+            "path": "src/redis-cli.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 9008,
+            "original_line": 9008,
+            "side": "LEFT",
+            "original_position": 77,
+            "position": 113,
+            "subject_type": "line",
+            "review_comments": [
+                "btw, i am thinking change all the `cliConnect(0);`  to use the flag instead. \r\n```\r\n/* cliConnect() flags. */\r\n#define CC_FORCE (1<<0)         /* Re-connect if already connected. */\r\n#define CC_QUIET (1<<1)         /* Don't log connecting errors. */\r\n```",
+                "you mean add another flag named NONE or alike?\r\ni think it'll cause too many unnecessary changes.",
+                "yes and yes, no need to do it, so i did not change it at the end"
+            ]
+        }
+    ]
+}

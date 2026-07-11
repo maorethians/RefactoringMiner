@@ -1,0 +1,286 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 40914,
+    "lang": "c_sharp",
+    "pr_title": "Support polymorphic value-type converters and add validation on values returned by custom converters",
+    "pr_body": "- Support polymorphic converters that return value types (TypeToConvert == typeof(object) or an interface).\r\n  - Works for both Nullable and non-Nullable value types.\r\n- Validate the return value from converters so they don't return an incompatible object on deserialization.\r\n\r\nFixes #40878.\r\nFixes #36329 .\r\n\r\nWhen an object or interface typed custom converter gets or sets a property or field, an additional box/unbox needs to be emitted.\r\ncc @layomia  ",
+    "pr_comments": [
+        "I couldn't figure out the best area label to add to this PR. If you have write-permissions please help me learn by adding exactly one [area label](https://github.com/dotnet/runtime/blob/master/docs/area-owners.md).",
+        "@layomia Is there a chance for this to be in .net5?",
+        "@devsko yes, we definitely want a fix for this issue in 5.0. Taking a look at this PR now.",
+        "Re https://github.com/dotnet/runtime/issues/40878#issuecomment-675927731: I think the extra box & unbox is okay wrt perf since this will only be done when a interface/`typeof(object)` returning converter is used to deserialize a value-type property. I think this converter usage pattern is pretty edge case. The change is also good to prevent a regression for converter usages that worked in 3.1 e.g. https://dotnetfiddle.net/3GmeIQ.\r\n\r\n",
+        "FYI @YohDeadfall ",
+        "@layomia PTAL Hope I addressed all your feedback. ~3 of the new tests now have an `ActiveIssue` attribute because of #36329. Shall I have a look?~ \r\nI fixed all issues with `JsonConverter<object>` and nullable value-types I am aware of and added 2 more tests where the nullable properties/fields are actually null.\r\nPlease let me know when there is more I should do.",
+        "Done. \r\n\r\nI just recognized that there is no TargetFramework for testing the .NET Standard version, which means that there are no tests for `ReflectionMemberAccessor`. I created a UWP app locally for testing but I think there is no UWP test runner in CI anymore :) ",
+        "@devsko - Yes, it would be good to have CI coverage for this. I verify locally by commenting out the #ifdef in https://github.com/dotnet/runtime/blob/c35942cb6caeff4ac5d96492b580c7e46b13cef0/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializerOptions.cs#L498-L502 and just assigning `ReflectionMemberAccessor`, and then I run the tests as usual.",
+        "Very interesting. These tests should have failed always. I fixed the converter that returned wrongly typed objects.  \r\n\r\nThis demonstrates the power of generating IL without the compiler. There are no runtime type checks at all when setting a property with `ReflectionEmitMemberAccessor`. As long as our \"compile time\" type checks succeed and the setter is generated there is currently nothing that stops a custom object converter from returning incompatible typed objects. The `ReflectionMemberAccessor` on the other side does runtime check before calling the setter. That's why the test cases above failed and that's why it is slow.\r\n\r\n<details>\r\n<summary>sample code</summary>\r\n\r\n````cs\r\n        public static void Reinterpret()\r\n        {\r\n            var obj = new ObjectWrapper\r\n            {\r\n                Object = new WrittenObject\r\n                {\r\n                    Int = 123,\r\n                    String = \"Hello\",\r\n                }\r\n            };\r\n\r\n            obj = JsonSerializer.Deserialize<ObjectWrapper>(JsonSerializer.Serialize(obj));\r\n\r\n            Debug.WriteLine(obj.GetType().GetProperty(nameof(Object)).PropertyType.FullName);\r\n            // System.Text.Json.Serialization.Tests.CustomConverterTests+WrittenObject\r\n\r\n            Debug.WriteLine(obj.Object.GetType().FullName);\r\n            // System.Text.Json.Serialization.Tests.CustomConverterTests+ReadObject\r\n\r\n            Debug.WriteLine(Unsafe.As<ReadObject>(obj.Object).Double);\r\n            // 3.141592653589793\r\n\r\n            Debug.WriteLine(obj.Object.String.Length);\r\n            // An unhandled exception of type 'System.AccessViolationException' occurred in System.Text.Json.Tests.dll\r\n            // Attempted to read or write protected memory. This is often an indication that other memory is corrupt.\r\n        }\r\n\r\n        public class ReinterpretConverter : JsonConverter<object>\r\n        {\r\n            public override bool CanConvert(Type typeToConvert)\r\n                => true;\r\n\r\n            public override object Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)\r\n            {\r\n                JsonSerializer.Deserialize<WrittenObject>(ref reader, options);\r\n                return new ReadObject{ Double = Math.PI };\r\n            }\r\n\r\n            public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options)\r\n            {\r\n                JsonSerializer.Serialize<WrittenObject>(writer, (WrittenObject)value, options);\r\n            }\r\n        }\r\n\r\n        private class ObjectWrapper\r\n        {\r\n            [JsonConverter(typeof(ReinterpretConverter))]\r\n            public WrittenObject Object { get; set; }\r\n        }\r\n\r\n        private class WrittenObject\r\n        {\r\n            public string String { get; set; }\r\n            public int Int { get; set; }\r\n        }\r\n\r\n        private class ReadObject\r\n        {\r\n            public double Double { get; set; }\r\n        }\r\n```` \r\n\r\n</details>\r\n\r\nI think there should be runtime type checks when the types of the converter and the member are not identical. I'll file a new issue.\r\n",
+        "> I think there should be runtime type checks when the types of the converter and the member are not identical.\r\n\r\nFor correctness and to avoid scary exceptions (especially when thrown _after_ the call to the serializer), I agree we should add an assignability check to the gen'd methods that call the setters when (and only when) we have polymorphic converter usages i.e converter-type-to-convert != actual property type.\r\n\r\n> I'll file a new issue.\r\n\r\nAny reason not to address it in this PR?",
+        "I thought it would be a bigger task, but turns out it is a simple `Emit(OpCode.CastClass)` and some tests. I'll add the commit soon to this PR. ",
+        "I think we should create and throw a new exception type explaining that the value returned by the converter is invalid for the property type. This exception would be used in both the emit and non-emit code paths. The reasoning is clearer error output for the user, and having a consistent exception for both code paths.\r\n\r\n> a simple `Emit(OpCode.CastClass)`\r\n\r\nWill this give the same exception as the non-emit code path? - currently it throws this:\r\n\r\n```\r\nSystem.ArgumentException : Object of type 'System.Text.Json.Serialization.Tests.CustomConverterTests+ReadObject' cannot be converted to type 'System.Text.Json.Serialization.Tests.CustomConverterTests+WrittenObject'.\r\n        Stack Trace:\r\n          D:\\repos\\dotnet_runtime_4\\src\\coreclr\\src\\System.Private.CoreLib\\src\\System\\RuntimeType.CoreCLR.cs(3460,0): at System.RuntimeType.TryChangeType(Object value, Binder binder, CultureInfo culture, Boolean needsSpecialCast)\r\n          D:\\repos\\dotnet_runtime_4\\src\\coreclr\\src\\System.Private.CoreLib\\src\\System\\RuntimeType.CoreCLR.cs(3421,0): at System.RuntimeType.CheckValue(Object value, Binder binder, CultureInfo culture, BindingFlags invokeAttr)\r\n          D:\\repos\\dotnet_runtime_4\\src\\coreclr\\src\\System.Private.CoreLib\\src\\System\\Reflection\\MethodBase.CoreCLR.cs(84,0): at System.Reflection.MethodBase.CheckArguments(Object[] parameters, Binder binder, BindingFlags invokeAttr, CultureInfo culture, Signature sig)\r\n          D:\\repos\\dotnet_runtime_4\\src\\coreclr\\src\\System.Private.CoreLib\\src\\System\\Reflection\\RuntimeMethodInfo.cs(428,0): at System.Reflection.RuntimeMethodInfo.InvokeArgumentsCheck(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)\r\n          D:\\repos\\dotnet_runtime_4\\src\\coreclr\\src\\System.Private.CoreLib\\src\\System\\Reflection\\RuntimeMethodInfo.cs(386,0): at System.Reflection.RuntimeMethodInfo.Invoke(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)\r\n          D:\\repos\\dotnet_runtime_4\\src\\libraries\\System.Private.CoreLib\\src\\System\\Reflection\\MethodBase.cs(49,0): at System.Reflection.MethodBase.Invoke(Object obj, Object[] parameters)\r\n          D:\\repos\\dotnet_runtime_4\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\ReflectionMemberAccessor.cs(156,0): at System.Text.Json.Serialization.ReflectionMemberAccessor.<>c__DisplayClass7_0`1.<CreatePropertySetter>b__0(Object obj, TProperty value)\r\n          D:\\repos\\dotnet_runtime_4\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonPropertyInfoOfT.cs(233,0): at System.Text.Json.JsonPropertyInfo`1.ReadJsonAndSetMember(Object obj, ReadStack& state, Utf8JsonReader& reader)\r\n```\r\n",
+        "@devsko, `unbox.any` works as `castclass` when `T` is a reference. Therefore, just remove `IsValueType` checks as suggested and have type checks when types are not the same.",
+        "@layomia the castclass in emitted code will throw\r\n```\r\nSystem.InvalidCastException: Unable to cast object of type 'ReadObject' to type 'WrittenObject'.\r\n   at System.Runtime.CompilerServices.CastHelpers.ChkCast_Helper(Void* toTypeHnd, Object obj) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\coreclr\\src\\System.Private.CoreLib\\src\\System\\Runtime\\CompilerServices\\CastHelpers.cs:line 374\r\n   at System.Text.Json.JsonPropertyInfo`1.ReadJsonAndSetMember(Object obj, ReadStack& state, Utf8JsonReader& reader) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonPropertyInfoOfT.cs:line 233\r\n   at System.Text.Json.Serialization.Converters.ObjectDefaultConverter`1.ReadPropertyValue(Object obj, ReadStack& state, Utf8JsonReader& reader, JsonPropertyInfo jsonPropertyInfo, Boolean useExtensionProperty) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\Converters\\Object\\ObjectDefaultConverter.cs:line 377\r\n   at System.Text.Json.Serialization.Converters.ObjectDefaultConverter`1.OnTryRead(Utf8JsonReader& reader, Type typeToConvert, JsonSerializerOptions options, ReadStack& state, T& value) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\Converters\\Object\\ObjectDefaultConverter.cs:line 58\r\n   at System.Text.Json.Serialization.JsonConverter`1.TryRead(Utf8JsonReader& reader, Type typeToConvert, JsonSerializerOptions options, ReadStack& state, T& value) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonConverterOfT.cs:line 267\r\n   at System.Text.Json.Serialization.JsonConverter`1.ReadCore(Utf8JsonReader& reader, JsonSerializerOptions options, ReadStack& state) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonConverterOfT.ReadCore.cs:line 62\r\n   at System.Text.Json.JsonSerializer.ReadCore[TValue](JsonConverter jsonConverter, Utf8JsonReader& reader, JsonSerializerOptions options, ReadStack& state) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Read.Helpers.cs:line 29\r\n   at System.Text.Json.JsonSerializer.ReadCore[TValue](Utf8JsonReader& reader, Type returnType, JsonSerializerOptions options) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Read.Helpers.cs:line 21\r\n   at System.Text.Json.JsonSerializer.Deserialize[TValue](String json, Type returnType, JsonSerializerOptions options) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Read.String.cs:line 113\r\n   at System.Text.Json.JsonSerializer.Deserialize[TValue](String json, JsonSerializerOptions options) in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\src\\System\\Text\\Json\\Serialization\\JsonSerializer.Read.String.cs:line 44\r\n   at System.Text.Json.Serialization.Tests.CustomConverterTests.<>c__DisplayClass144_0.<InvalidCastFieldFails>b__0() in C:\\Users\\stefa\\source\\repos\\runtime\\src\\libraries\\System.Text.Json\\tests\\Serialization\\CustomConverterTests\\CustomConverterTests.InvalidCast.cs:line 41\r\n\r\n```\r\nSo it's a different exception. Maybe that's good enough? Catching this and throwing another exception in emitted IL would be fun :)",
+        "@YohDeadfall So castclass in both cases is okay?",
+        "When runtime and declared field or property types are not equal, then it's okay to emit `unbox.any` which in case of a value type will mean `unbox` plus `ldobj` and `castclass` in case when there is a reference type. As far as I know, the JIT compiler can optimize a cast when the object on the stack is known to be castable to `T`, so there should be no performance degradation.\r\n\r\nFrom [the documentation]:\r\n\r\n> When applied to the boxed form of a value type, the unbox.any instruction extracts the value contained within obj (of type O), and is therefore equivalent to unbox followed by ldobj.\r\n>\r\n> When applied to a reference type, the unbox.any instruction has the same effect as castclass typeTok",
+        "@layomia @YohDeadfall \r\nWith the last commit, #41146 should also be fixed. \r\n\r\nWhen converter type and property type are different (obviously they must be compatible anyway), for value types a box (getter) / unbox_any (setter) and for reference types a castclass (setter) is emitted.\r\nThe reflection based accessor works without changes but the thrown exception types when the deserialized object has the wrong type are different. \r\nThat's why currently 4 tests are failing when the `ReflectionMemberAccessor` is used locally for testing.\r\nI would be fine with the different exception types. What do you think?     ",
+        "@devsko @YohDeadfall thank you for your work on these changes.\r\n\r\nDue to the complexity and implementation considerations of the fix for https://github.com/dotnet/runtime/issues/41146, and also because of the exceptional nature of the scenario, I agree with the initial thought to address it in a separate PR. This will help reduce the risk with back-porting this PR (#40914) to [.NET 5](https://github.com/dotnet/runtime/tree/release/5.0).\r\n\r\nThis PR should be simplified to only contain the fixes and tests for #40878 and #36329. We'd appreciate a follow up PR bringing in the changes to fix #41146, which can also be considered for back-porting to .NET 5.0. Any tests in this PR written as part of the fix for #41146 can be retained and annotated with `ActiveIssue`.",
+        "Okay. Will do",
+        "@layomia I've undone all changes for #41146 and for consolidating the exception type thrown when an assignment fails. As suggested the tests for #41146 remained in this PR but are annotated with `ActiveIssue`.\r\nAll tests succeed locally for both member accessors.",
+        "@steveharter Made the changes. I added an additional test for null assignment to a non-nullable value type. I think this is important because `ReflectionEmitAccessor` will throw a NRE and `ReflectionAccessor` silently assigns default.",
+        "Test failures appear unrelated:\r\n```\r\nSystem.Net.Http.Functional.Tests.WorkItemExecution\r\nSystem.Net.Http.Functional.Tests.SocketsHttpHandlerTest_Http2.Http2_MultipleConnectionsEnabled_IdleConnectionTimeoutExpired_ConnectionRemovedAndNewCreated\r\nSystem.Net.Http.Functional.Tests.SocketsHttpHandlerTest_Http2.Http2_MultipleConnectionsEnabled_ConnectionLimitNotReached_ConcurrentRequestsSuccessfullyHandled\r\n```\r\n",
+        "/backport to release/5.0",
+        "Started backporting to release/5.0: https://github.com/dotnet/runtime/actions/runs/224488487",
+        "@layomia backporting to release/5.0 failed, the patch most likely resulted in conflicts:\n\n```shell\n$ git am --3way --ignore-whitespace --keep-non-patch changes.patch\n\nApplying: IL emit Box/Unbox in member access\nApplying: Test case for object converter\nApplying: Test case for class with primitive members and object converter\nApplying: Address feedback\nApplying: Fixed issues with JsonConverter<object>and nullable value-types\nApplying: Address feedback\nApplying: Fix test for .NETStandard version\nApplying: Fix #41146\nApplying: Accidentally commited the local test hack\nApplying: Throw JsonException when a deserialized value cannot be assigned to the property/field\nerror: sha1 information is lacking or useless (src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonSerializerOptions.Converters.cs).\nerror: could not build fake ancestor\nhint: Use 'git am --show-current-patch=diff' to see the failed patch\nPatch failed at 0010 Throw JsonException when a deserialized value cannot be assigned to the property/field\nWhen you have resolved this problem, run \"git am --continue\".\nIf you prefer to skip this patch, run \"git am --skip\" instead.\nTo restore the original branch and stop patching, run \"git am --abort\".\nError: The process '/usr/bin/git' failed with exit code 128\n```\n\nPlease backport manually!"
+    ],
+    "merged": true,
+    "created_at": "2020-08-19T16:59:13Z",
+    "issue_context": {
+        "number": 40878,
+        "title": "System.Text.Json Access Violation Exception (Attempted to read or write protected memory)",
+        "body": "### Description\r\n\r\nFirst just a quick bit of background: as I've raised in comments in #36621, I've hit a variety of `InvalidProgramException` and `AccessViolationException` while trying to bring System.Text.Json (Previews 4 through 7) to Schema.NET (https://github.com/RehanSaeed/Schema.NET/pull/100). Prior to trying System.Text.Json v5 previews, I had tried v4 which worked with my converter without this exception (though I really wanted the setting to not serialize default values which is coming in v5).\r\n\r\nJumping to now with Preview 7, I'm hitting issues with an `AccessViolationException` with the error message:\r\n\r\n> Attempted to read or write protected memory. This is often an indication that other memory is corrupt.\r\n\r\nI've created a custom solution with as little code as I reasonably could while still using a custom version of the core from Schema.NET: https://github.com/Turnerj/SchemaNet_SystemTextJson\r\n\r\n```csharp\r\npublic class CustomType : Thing, IThing\r\n{\r\n\tpublic override string Type => \"CustomType\";\r\n\r\n\t[JsonPropertyName(\"name\")]\r\n\t[JsonConverter(typeof(ValuesJsonConverter))]\r\n\tpublic OneOrMany<string> Name { get; set; }\r\n\r\n\t[JsonPropertyName(\"uri\")]\r\n\t[JsonConverter(typeof(ValuesJsonConverter))]\r\n\tpublic Values<string, Uri> Uri { get; set; }\r\n}\r\n\r\nclass Program\r\n{\r\n\tstatic void Main(string[] args)\r\n\t{\r\n\t\t// This is the JSON of the object below\r\n\t\t// {\"@context\":\"https://schema.org\",\"@type\":\"CustomType\",\"name\":\"Hello World\"}\r\n\t\tvar inputObj = new CustomType\r\n\t\t{\r\n\t\t\tName = \"Hello World\"\r\n\t\t};\r\n\r\n\t\tvar json = SchemaSerializer.SerializeObject(inputObj); // Exception occurs on serialization\r\n\r\n\t\tvar outputObj = SchemaSerializer.DeserializeObject<CustomType>(json);\r\n\t}\r\n}\r\n```\r\n\r\nThings to note:\r\n- `OneOrMany` and `Values` are both structs which will serialize to a single item or an array\r\n- `Values` is special because it can convert to and from any of the generic types specified on it\r\n- `ValuesJsonConverter` does the guts of the converting. In debugging, the `CanConvert` method is hit however `Write` is never actually being called on it.\r\n- The `ValuesJsonConverter`'s `CanConvert` is: `public override bool CanConvert(Type typeToConvert) => typeof(IValues).IsAssignableFrom(typeToConvert);`\r\n\r\n### Configuration\r\n\r\n- .NET Core 3.1\r\n- System.Text.Json 5.0.0-preview.7.20364.11\r\n- Windows 10 Home (10.0.18362 Build 18362)\r\n- I've hit this issue in CI builds on [this pull request](https://github.com/RehanSaeed/Schema.NET/pull/100) for Ubuntu, Mac and Windows \r\n\r\n### Regression?\r\n\r\nAs mentioned, I didn't have this issue with System.Text.Json v4 (likely the last minor version) though I needed v5 as I needed the \"don't serialize default values\" configuration.\r\n\r\n### Other information\r\n\r\nFull Exception\r\n> System.AccessViolationException: 'Attempted to read or write protected memory. This is often an indication that other memory is corrupt.'\r\n>    at DynamicClass.get_Name(System.Object)\r\n>    at System.Text.Json.JsonPropertyInfo`1[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]].GetMemberAndWriteJson(System.Object, System.Text.Json.WriteStack ByRef, System.Text.Json.Utf8JsonWriter)\r\n>    at System.Text.Json.Serialization.Converters.ObjectDefaultConverter`1[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]].OnTryWrite(System.Text.Json.Utf8JsonWriter, System.__Canon, System.Text.Json.JsonSerializerOptions, System.Text.Json.WriteStack ByRef)\r\n>    at System.Text.Json.Serialization.JsonConverter`1[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]].TryWrite(System.Text.Json.Utf8JsonWriter, System.__Canon ByRef, System.Text.Json.JsonSerializerOptions, System.Text.Json.WriteStack ByRef)\r\n>    at System.Text.Json.Serialization.JsonConverter`1[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]].WriteCore(System.Text.Json.Utf8JsonWriter, System.__Canon ByRef, System.Text.Json.JsonSerializerOptions, System.Text.Json.WriteStack ByRef)\r\n>    at System.Text.Json.Serialization.JsonConverter`1[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]].WriteCoreAsObject(System.Text.Json.Utf8JsonWriter, System.Object, System.Text.Json.JsonSerializerOptions, System.Text.Json.WriteStack ByRef)\r\n>    at System.Text.Json.JsonSerializer.WriteCore[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]](System.Text.Json.Serialization.JsonConverter, System.Text.Json.Utf8JsonWriter, System.__Canon ByRef, System.Text.Json.JsonSerializerOptions, System.Text.Json.WriteStack ByRef)\r\n>    at System.Text.Json.JsonSerializer.WriteCore[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]](System.Text.Json.Utf8JsonWriter, System.__Canon ByRef, System.Type, System.Text.Json.JsonSerializerOptions)\r\n>    at System.Text.Json.JsonSerializer.Serialize[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]](System.__Canon ByRef, System.Type, System.Text.Json.JsonSerializerOptions)\r\n>    at System.Text.Json.JsonSerializer.Serialize[[System.__Canon, System.Private.CoreLib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]](System.__Canon, System.Text.Json.JsonSerializerOptions)\r\n>    at Schema.NET.SchemaSerializer.SerializeObject(System.Object, System.Text.Json.JsonSerializerOptions)\r\n>    at Schema.NET.SchemaSerializer.SerializeObject(System.Object)\r\n>    at SchemaNet_SystemTextJson.Program.Main(System.String[])\r\n\r\nAdditionally, when I first went to Preview 4, while I didn't hit this exception, I did hit a CLR exception (\"Common Language Runtime detected an invalid program\").\r\n\r\nWhile this issue is happening with serialization, I have experienced similar issues with deserialization too when running CI builds of the Schema.NET PR I've linked to a few times. I'm thinking the fix for serialization might fix the deserialization issue too.",
+        "comments": [
+            "Found the stack trace (edited it into the issue) - VS didn't show it in the exception dialog but it was in the Visual Studio Debug Console - hope it helps!",
+            "With netcoreapp3.1 and net5.0 preview 8 on macOS, it throws `EntryPointNotFoundException`:\r\n\r\n```sh\r\nUnhandled exception. System.EntryPointNotFoundException: Entry point was not found.\r\n   at Schema.NET.IValues.get_Count()\r\n   at Schema.NET.ValuesJsonConverter.Write(Utf8JsonWriter writer, IValues value, JsonSerializerOptions options) in /Users/am11/projects/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson/Schema.NET/ValuesJsonConverter.cs:line 111\r\n   at System.Text.Json.Serialization.JsonConverter`1.TryWrite(Utf8JsonWriter writer, T& value, JsonSerializerOptions options, WriteStack& state)\r\n   at System.Text.Json.JsonPropertyInfo`1.GetMemberAndWriteJson(Object obj, WriteStack& state, Utf8JsonWriter writer)\r\n   at System.Text.Json.Serialization.Converters.ObjectDefaultConverter`1.OnTryWrite(Utf8JsonWriter writer, T value, JsonSerializerOptions options, WriteStack& state)\r\n   at System.Text.Json.Serialization.JsonConverter`1.TryWrite(Utf8JsonWriter writer, T& value, JsonSerializerOptions options, WriteStack& state)\r\n   at System.Text.Json.Serialization.JsonConverter`1.WriteCore(Utf8JsonWriter writer, T& value, JsonSerializerOptions options, WriteStack& state)\r\n   at System.Text.Json.Serialization.JsonConverter`1.WriteCoreAsObject(Utf8JsonWriter writer, Object value, JsonSerializerOptions options, WriteStack& state)\r\n   at System.Text.Json.JsonSerializer.WriteCore[TValue](JsonConverter jsonConverter, Utf8JsonWriter writer, TValue& value, JsonSerializerOptions options, WriteStack& state)\r\n   at System.Text.Json.JsonSerializer.WriteCore[TValue](Utf8JsonWriter writer, TValue& value, Type inputType, JsonSerializerOptions options)\r\n   at System.Text.Json.JsonSerializer.Serialize[TValue](TValue& value, Type inputType, JsonSerializerOptions options)\r\n   at System.Text.Json.JsonSerializer.Serialize[TValue](TValue value, JsonSerializerOptions options)\r\n   at Schema.NET.SchemaSerializer.SerializeObject(Object value, JsonSerializerOptions options) in /Users/am11/projects/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson/Schema.NET/SchemaSerializer.cs:line 79\r\n   at Schema.NET.SchemaSerializer.SerializeObject(Object value) in /Users/am11/projects/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson/Schema.NET/SchemaSerializer.cs:line 62\r\n   at SchemaNet_SystemTextJson.Program.Main(String[] args) in /Users/am11/projects/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson/Program.cs:line 30\r\n```\r\n\r\nThe runtime type of `IValues value` in custom converter's [`Write` method](https://github.com/Turnerj/SchemaNet_SystemTextJson/blob/573830d5081fb2383fb26460c28dfce7bb4dda04/SchemaNet_SystemTextJson/Schema.NET/ValuesJsonConverter.cs#L110-L111) is `string[]` instead of `OneOrMany<string>`. Looks bad IL which is somehow bypassing `System.ArgumentException` or `System.InvalidCastException`, which (AFAICT) is not reproducible with pure C#.\r\n",
+            "Interesting find @am11 - `OneOrMany<T>` does have an [implicit conversion from `T[]`](https://github.com/Turnerj/SchemaNet_SystemTextJson/blob/573830d5081fb2383fb26460c28dfce7bb4dda04/SchemaNet_SystemTextJson/Schema.NET/OneOrMany%7BT%7D.cs#L155) which (as far as I understand) would occur outside of System.Text.Json's understanding.\r\n\r\nIf I understand you right, you're saying that it didn't implicitly convert to `OneOrMany<string>` thus didn't work? Though like you pointed out, the method itself takes `IValues` as a parameter type so I would figure if something went weird here, wouldn't have we seen a `NullPointerException` or the other exception types you mentioned?\r\n\r\nOn my machine, that `Write` method isn't even called before I hit the `AccessViolationException` - with that in mind, I wonder how related what you're seeing and what I am seeing are - maybe dealing with two different problems?\r\n\r\nEDIT: Oh, I just realised you were testing with Preview 8 - may explain a difference in errors.",
+            "I am getting `EntryPointNotFoundException` from `get_Count` with both netcoreapp3.1 and net5.0 preview 8 on macOS. To run your project with net5.0, I only applied this patch:\r\n\r\n```diff\r\ndiff --git a/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson.csproj b/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson.csproj\r\nindex 68fd6b4..db1358e 100644\r\n--- a/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson.csproj\r\n+++ b/SchemaNet_SystemTextJson/SchemaNet_SystemTextJson.csproj\r\n@@ -2,11 +2,8 @@\r\n \r\n   <PropertyGroup>\r\n     <OutputType>Exe</OutputType>\r\n-    <TargetFramework>netcoreapp3.1</TargetFramework>\r\n+    <TargetFramework>net5.0</TargetFramework>\r\n   </PropertyGroup>\r\n \r\n-  <ItemGroup>\r\n-    <PackageReference Include=\"System.Text.Json\" Version=\"5.0.0-preview.7.20364.11\" />\r\n-  </ItemGroup>\r\n \r\n </Project>\r\n```\r\n\r\n\r\nThis is because the runtime type of `value` (on that line 111) is `string[]`, despite the fact that the compile-time type of `value` is `IValues`.\r\n\r\nI have not looked into internal mechanics on S.T.J, so I am not sure; but looks like there are two issues:\r\n\r\n1. S.T.J is passing wrongly-typed object to the custom converter (`string[]` instead of `OneOrMany<string>` or its interface `IValues`).\r\n2. somewhere in S.T.J, it is emitting bad IL in terms of type info, which runtime is accepting, and it is bypassing the runtime type validation.\r\n    * if we try to isolate library-free repro of this issue with reflection (or activator etc.) in pure C#, we get proper runtime exceptions, such as; `Unhandled exception. System.InvalidCastException: Unable to cast object of type 'System.String[]' to type 'IValues'.` or `Unhandled exception. System.ArgumentException: Object of type 'System.String[]' cannot be converted to type 'IValues'.` (depending on which reflection/DI approach we use).",
+            "> On my machine, that Write method isn't even called before I hit the AccessViolationException \r\n\r\nMaybe because we are using different operating system (Windows, macOS)?\r\n\r\n> EntryPointNotFoundException\r\n\r\nBtw, this mysterious EntryPointNotFoundException due to usage of generic structs has also been reported to roslyn repo few times: https://github.com/dotnet/roslyn/search?q=EntryPointNotFoundException&type=Issues. A self-contained repro is bit tricky but would be great to nib the bug.",
+            "> This is because the runtime type of value (on that line 111) is string[], despite the fact that the compile-time type of value is IValues.\r\n\r\nI wonder if this occurs for other types then like `int?` or more complex types like `Uri`. Like, do you see anything different with this for example using `int?`?\r\n\r\n```csharp\r\npublic class CustomType : Thing, IThing\r\n{\r\n\tpublic override string Type => \"CustomType\";\r\n\r\n\t[JsonPropertyName(\"number\")]\r\n\t[JsonConverter(typeof(ValuesJsonConverter))]\r\n\tpublic OneOrMany<int?> Number { get; set; }\r\n\r\n\t[JsonPropertyName(\"uri\")]\r\n\t[JsonConverter(typeof(ValuesJsonConverter))]\r\n\tpublic Values<string, Uri> Uri { get; set; }\r\n}\r\n\r\nclass Program\r\n{\r\n\tstatic void Main(string[] args)\r\n\t{\r\n\t\t// {\"@context\":\"https://schema.org\",\"@type\":\"CustomType\",\"Number\":123}\r\n\t\tvar inputObj = new CustomType\r\n\t\t{\r\n\t\t\tNumber = 123\r\n\t\t};\r\n\r\n\t\tvar json = SchemaSerializer.SerializeObject(inputObj);\r\n\r\n\t\tvar outputObj = SchemaSerializer.DeserializeObject<CustomType>(json);\r\n\t}\r\n}\r\n```\r\n\r\nFor me, it is still the same error for the same configuration as in the issue description (.NET Core 3.1, S.T.J v5 Preview 7).\r\n\r\n> Btw, this mysterious EntryPointNotFoundException due to usage of generic structs has also been reported to roslyn repo few times: https://github.com/dotnet/roslyn/search?q=EntryPointNotFoundException&type=Issues. A self-contained repro is bit tricky but would be great to nib the bug.\r\n\r\nInteresting - this is the first I think Ive seen of an `EntryPointNotFoundException` - I feel like it is one of those exceptions where it only occurs when the code screws up REAL bad. Back in Preview 4 of S.T.J, I was getting exceptions for the IL that was being generated at runtime: \r\n\r\n> System.InvalidProgramException : Invalid IL code in (wrapper dynamic-method) object:get_Property (object): IL_000b: ret",
+            "> I wonder if this occurs for other types then like int? or more complex types like Uri. Like, do you see anything different with this for example using int??\r\n\r\nTested with few alternatives (value types included) and it is throwing EntryPointNotFoundException on macOS for all T in `OneOnMany<T>`, with `netcoreapp3.1, OOTB preview 7 S.T.J` and `net5 preview 8 inbox S.T.J`. I have also seen it in other cases where AccessViolationException on Windows for the exact same code is something else on Unix-like OS with CoreCLR.\r\n",
+            "I had a look into the `ReflectionEmitMemberAccessor` that causes the problem in the description. The dynamically generated getter is of type `IValues` but leaves an `OneOrMany<string>` on the stack. Clearely this must go horrible wrong without boxing - what it does. It seems an additional `generator.Emit(OpCodes.Box, typeof(OneOrMany<string>));` solves the problem for this case. ",
+            "> The dynamically generated getter is of type IValues but leaves an OneOrMany<string> on the stack. Clearely this must go horrible wrong without boxing - what it does.\r\n\r\nMight explain why @am11 had `string[]` rather than `OneOrMany<string>` in the `Write` method. In `OneOrMany<T>`, the first property is a readonly array of `T` - wouldn't surprise me if it accessed that instead under certain conditions.",
+            "Yes, makes sense.",
+            "Hi @layomia, I have a test and fix for this ready. Are you interested in a PR? ",
+            "@Turnerj, thanks for the detailed repro.\r\n\r\n> Hi @layomia, I have a test and fix for this ready. Are you interested in a PR?\r\n\r\n@devsko, thanks for digging into this. Yes, please open a PR and I'll take a look.",
+            "Hi @Turnerj \r\nroot cause of this issue is that you have a single `JsonConverter<IValues>` and the implementations of that interface are value types. That means the property values have to be boxed while serializing and unboxed while deserializing. \r\n\r\nFor performance reasons, STJ generates getter/setter in plain IL and [explicitly without boxing](https://github.com/dotnet/runtimelab/blob/JsonCodeGen/src/libraries/System.Text.Json/docs/SerializerProgrammingModel.md#performance). As a result, in this case **the generated IL is invalid** because the values (say an Int32) are treated as pointer to an object. \r\nThe `AccessViolationException` is just one possible consequence - I tested some scenarios and observed scary effects.\r\n\r\nIn #40914 the missing box/unbox IL is emitted, which fixes the problem, but I assume there are performance concerns and it will not be merged - at least in .NET 5. As a workaround you can create a `JsonConverter<T>` for each implementation type like in this [PR](https://github.com/Turnerj/SchemaNet_SystemTextJson/pull/1).\r\n\r\n@layomia Please let me know what you think about the boxing in #40914. If that is not possible, there should a `NotSupportedException` get thrown in this case. Fortunately the runtime is pretty robust but a `AccessViolationException` or `InvalidProgramException` can be frightening ;)",
+            "Re-opening until the fix is back-ported to .NET 5 - https://github.com/dotnet/runtime/pull/41366.",
+            "Fixed for 5.0 in https://github.com/dotnet/runtime/pull/41366.",
+            "Thanks for working on this so fast and solving the underlying issues @devsko and @layomia - would I expect to see this in 5.0 RC1?",
+            "Thanks @Turnerj. Yes, the fix will come in 5.0 RC1. Please let us know how things go with the fix."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 8597,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 384,
+            "original_line": 359,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 81,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: add new line"
+            ]
+        },
+        {
+            "hunk_id": 4365,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 384,
+            "original_line": 359,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 81,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you add and test another version of this class where the value-type properties are nullable?\r\n\r\nI'd expect `InvalidOperationException` to (already) be thrown for these cases.\r\n\r\nAdding this test variant will help us close https://github.com/dotnet/runtime/issues/36329 as well.",
+                "Added a test with nullables ~and added `[ActiveIssue(\"https://github.com/dotnet/runtime/issues/36329\")]`~"
+            ]
+        },
+        {
+            "hunk_id": 8601,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 333,
+            "original_line": 334,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Please add comment stating that if it is a user's custom converter, even though a polymorphic converter (which right now only means the converter returns `typeof(object)`), then they expect that the converter is actually called for both reading and writing."
+            ]
+        },
+        {
+            "hunk_id": 4369,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/ExtensionDataTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1082,
+            "original_line": 1080,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Pls add comment: \r\n\r\n`// Since we are in a user-provided (not internal to S.T.Json) object converter, this converter will be called, not the string converter.`"
+            ]
+        },
+        {
+            "hunk_id": 8599,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 506,
+            "original_line": 378,
+            "side": "RIGHT",
+            "original_position": 68,
+            "position": 203,
+            "subject_type": "line",
+            "review_comments": [
+                "Please test serialization as well and ensure that the converter's write method is called.\r\n\r\nThis may require this line to be changed:\r\n\r\nhttps://github.com/dotnet/runtime/blob/dc6ad2a89cde71714b87e42a159ed6264fa7093d/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs#L334\r\n\r\n```cs\r\nif (type != TypeToConvert && IsInternalconverter)\r\n```\r\n",
+                "@layomia  This basically works for the tests in this PR but apparently at least `ExtensionDataTest.CustomObjectConverterInExtensionProperty` depends on the current behavior\r\n``` cs\r\n            public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options)\r\n            {\r\n                // Since we are converter for object, the string converter will be called instead of this.\r\n                throw new InvalidOperationException();\r\n            }\r\n```\r\nI can fix that `Write` implementation to work as expected. But don't know if this change is breaking anyone else.",
+                "I think the premise that any `JsonConverter<object>` is an internal converter and shouldn't have it's `Write` method called is a wrong one. I don't imagine a lot of people depend on the behavior of the `Write` method not being called. I'd fix the test - let's see what the change looks like."
+            ]
+        },
+        {
+            "hunk_id": 8600,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 320,
+            "original_line": 316,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "what's the reason for returning true here? I wouldn't expect this to be overridden since the converter sits on the individual properties.",
+                "@layomia `CanConvert` gets called in `GetConverterFromAttribute` also and returns `typeToConvert == typeof(object)` as default"
+            ]
+        },
+        {
+            "hunk_id": 4366,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 506,
+            "original_line": 378,
+            "side": "RIGHT",
+            "original_position": 68,
+            "position": 203,
+            "subject_type": "line",
+            "review_comments": [
+                "Please test serialization as well and ensure that the converter's write method is called.\r\n\r\nThis may require this line to be changed:\r\n\r\nhttps://github.com/dotnet/runtime/blob/dc6ad2a89cde71714b87e42a159ed6264fa7093d/src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs#L334\r\n\r\n```cs\r\nif (type != TypeToConvert && IsInternalconverter)\r\n```\r\n",
+                "@layomia  This basically works for the tests in this PR but apparently at least `ExtensionDataTest.CustomObjectConverterInExtensionProperty` depends on the current behavior\r\n``` cs\r\n            public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options)\r\n            {\r\n                // Since we are converter for object, the string converter will be called instead of this.\r\n                throw new InvalidOperationException();\r\n            }\r\n```\r\nI can fix that `Write` implementation to work as expected. But don't know if this change is breaking anyone else.",
+                "I think the premise that any `JsonConverter<object>` is an internal converter and shouldn't have it's `Write` method called is a wrong one. I don't imagine a lot of people depend on the behavior of the `Write` method not being called. I'd fix the test - let's see what the change looks like."
+            ]
+        },
+        {
+            "hunk_id": 4368,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/src/System/Text/Json/Serialization/JsonConverterOfT.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 333,
+            "original_line": 334,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "Please add comment stating that if it is a user's custom converter, even though a polymorphic converter (which right now only means the converter returns `typeof(object)`), then they expect that the converter is actually called for both reading and writing."
+            ]
+        },
+        {
+            "hunk_id": 8598,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 384,
+            "original_line": 359,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 81,
+            "subject_type": "line",
+            "review_comments": [
+                "Can you add and test another version of this class where the value-type properties are nullable?\r\n\r\nI'd expect `InvalidOperationException` to (already) be thrown for these cases.\r\n\r\nAdding this test variant will help us close https://github.com/dotnet/runtime/issues/36329 as well.",
+                "Added a test with nullables ~and added `[ActiveIssue(\"https://github.com/dotnet/runtime/issues/36329\")]`~"
+            ]
+        },
+        {
+            "hunk_id": 8602,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/ExtensionDataTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1082,
+            "original_line": 1080,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "Pls add comment: \r\n\r\n`// Since we are in a user-provided (not internal to S.T.Json) object converter, this converter will be called, not the string converter.`"
+            ]
+        },
+        {
+            "hunk_id": 4367,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 320,
+            "original_line": 316,
+            "side": "RIGHT",
+            "original_position": 6,
+            "position": 17,
+            "subject_type": "line",
+            "review_comments": [
+                "what's the reason for returning true here? I wouldn't expect this to be overridden since the converter sits on the individual properties.",
+                "@layomia `CanConvert` gets called in `GetConverterFromAttribute` also and returns `typeToConvert == typeof(object)` as default"
+            ]
+        },
+        {
+            "hunk_id": 4364,
+            "commit_id": "a8b2046876f2776d24932917db42daa2b2d1a454",
+            "original_commit_id": "15839c0294b51d8bb9b7f689669da86ebe64546d",
+            "path": "src/libraries/System.Text.Json/tests/Serialization/CustomConverterTests/CustomConverterTests.Object.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 384,
+            "original_line": 359,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 81,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: add new line"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,260 @@
+{
+    "repo": "duckdb/duckdb",
+    "pr_number": 4189,
+    "lang": "cpp",
+    "pr_title": "Implement Out-of-Core Hash Join and Re-Work Query Verification",
+    "pr_body": "## Out-of-Core Hash Join\r\nThis PR adds out-of-core functionality to our hash join, allowing it to join more data than fits in memory.\r\nOptimizations to this functionality will be done in future PRs, for now this adds just the basic functionality.\r\n\r\nThis functionality has been added to the `PhysicalHashJoin`, and is triggered dynamically during runtime, so the optimizer does not have to predict whether the data fits in memory.\r\n\r\nWith an out-of-core join there's basically two options: sorting or partitioning. We've opted for partitioning.\r\nIn summary, I've changed the following in `PhysicalHashJoin`:\r\n\r\n#### Sink\r\nEach thread now has its own thread-local HT.\r\n\r\nThere's now a threshold on how much data the build side accumulates. When the threshold is reached, we swizzled the pointers to variable-size data, and unpin the blocks, allowing them to be spilled to disk.\r\n\r\n#### Finalize\r\nIf we did not accumulate enough data to warrant an external join, the thread-local HT's are merged into the thread-global HT, and the operator does the same old hash join we all know.\r\n\r\nIf we did accumulate enough data for an external join, we schedule tasks for each thread to radix-partition their thread-local data.\r\nAfter all threads finish partitioning their data, we build a hash table on some of the partitions, which is decided by the memory limit.\r\n\r\n#### Execute\r\nIf we're doing an external hash join, the probe looks slightly different. We check the radix of the probe-side hashes, and determine if we can probe it against the current partitioned hash table. The rows that can be probed, are simply probed against the hash table.\r\n\r\nThe rows that cannot be probed against the hash table are accumulated. If a threshold is exceeded, we swizzle the pointers in the accumulated probe-side data, and unpin the blocks, allowing them to be spilled to disk.\r\n\r\n#### GetData\r\nAfter the initial probe phase, each thread partitions their thread-local probe-side data.\r\nThen, one thread builds the hash table for the next partitions, and all threads probe it using the same partitions. Rinse and repeat until all partitions are done.\r\n\r\n## Query Verification Re-Work\r\nThis PR also re-works query verification, which happens during testing. I've added a `StatementVerifier` base class, which has a few derived classes: `CopiedStatementVerifier`, `DeserializedStatementVerifier`, `ParsedStatementVerifier`, `PreparedStatementVerifier`, `UnoptimizedStatementVerifier`.\r\n\r\nWe performed all of these verifications before, but now they are contained within their own class. I've also added the new `ExternalStatementVerifier`, which runs a query with `force_external` turned on, and compares the result to running the query with `force_external` turned off. This saves a ton of time writing tests for operators with out-of-core capabilities, as we can just add `PRAGMA verify_external` to existing tests.\r\n",
+    "pr_comments": [
+        "Looking into the regressions in the micro benchmarks, and it seems like some of the join pipelines are not running in parallel anymore. Going to investigate why",
+        "I've been playing around with this using a synthetic benchmark.\r\n\r\nI've created two tables with one integer column and 100M rows. Both contain the values 0 to 1000.\r\nAll other values in both tables are greater than 1000. In one table, these values are even; in the other table, they are odd so they won't match, and we always get precisely 1000 matches.\r\n\r\nWe then run:\r\n```sql\r\nSELECT count(*) FROM t1 JOIN t2 USING (i);\r\n-- 1000\r\n```\r\n\r\nRunning this with different memory limits gives the following results (median of 5 runs):\r\n| Memory limit (GB) | time (s) |\r\n| :-|:-|\r\n|10|2.11|\r\n|9|2.14|\r\n|8|2.50|\r\n|7|2.52|\r\n|6|2.43|\r\n|5|2.49|\r\n|4|4.09|\r\n|3|4.83|\r\n|2|9.88|\r\n|1|10.92|\r\n\r\nThe external hash join is triggered with a memory limit of 8GB, as the hash table takes up more than the threshold of 60% of maximum memory at this point.\r\n\r\nThere's two large drops in performance, from 5GB to 6GB and from 3GB to 2GB, which are due to adding an additional round of partitioned probing. The pointer table has to be re-built for every round, which happens in a single thread, making it a big bottleneck.",
+        "I think this PR is ready for review now!\r\n\r\nI've refactored the `GetData` method to a parallel state machine, which I think is much more readable, and requires much less locking (unless we're initializing shared structures), most of the synchronization is handled with atomics. In my Instruments trace it looks like all cores are busy throughout the entire query. This is also due to parallelizing `Finalize` using compare-and-swap.\r\n\r\nI've also refactored to use the new `ColumnDataCollection` on the probe-side, which is really efficient. However, we cannot partition that yet, so we just re-scan the materialized data. For now, this hurts us especially when the amount of available memory is really low, because we incur a lot of I/O. However, when we go over the memory limit only slightly, we don't need to partition, because there will only be two probe rounds. I've disabled external full/outer for now until I write code to partition the CDC.\r\n\r\nI've re-run the synthetic benchmark that I described in a previous comment on this PR, with the following results:\r\n| Memory limit (GB) | time (s) |\r\n| :-|:-|\r\n|10|1.97|\r\n|9|1.97|\r\n|8|2.23|\r\n|7|2.23|\r\n|6|2.27|\r\n|5|2.27|\r\n|4|2.81|\r\n|3|5.60|\r\n|2|7.69|\r\n|1|17.73|\r\n\r\nCompared with before, when the probe-side data was being materialized in a `RowDataCollection`, and being partitioned, the low-memory cases were faster. When I implement partitioning of the CDC, I expect the low run-times for low-memory cases to improve.",
+        "@Mytherin Thanks for the review. I have currently disabled external `FULL OUTER JOIN`s, because the logic here only works when we partition the probe side, which we don't yet. I think adding a test with a very large `FULL OUTER JOIN` is a good idea, and I will add that in my next PR when I add probe-side partitioning.\r\n\r\nI will add the test with many duplicates to stress test the parallel CAS hash table construction.",
+        "Just noticed that I refactored the parallel state machine once more after you reviewed it, but the idea is the same.\n\nAlso passing CI now, so I think this is good to go",
+        "Fixed #4445, all tests passing now. Can merge when @hannes gets back and @hawkfish gives the OK!",
+        "Sorry another merge conflict...",
+        "That's ok, merge conflicts keep me off the streets. I hope I merged it right, waiting for CI"
+    ],
+    "merged": true,
+    "created_at": "2022-08-17T16:45:49Z",
+    "issue_context": {
+        "number": 4445,
+        "title": "Recursive CTE + UNION + RIGHT JOIN = SIGSEGV",
+        "body": "### What happens?\n\nThis is a blocker for my external hash join PR #4189\r\n\r\nExternal hash join schedules an additional child source pipeline, exactly like RIGHT JOIN. Now, `test/issues/fuzz/recursive_view_expression_assertion.test` is failing. I thought it was due to my changes at first, but it also fails on master (when I change the equality join to a RIGHT JOIN).\r\n\r\nThe crash is due to a null pointer in `Executor::ScheduleChildPipeline`. The `parent_entry` is a nullptr.\r\n\r\nJust documenting this here, will try to fix the bug myself.\n\n### To Reproduce\n\n```sql\r\n-- Create a view with UNION in a recursive CTE \r\ncreate view strings as (\r\n    with recursive t(a) as (\r\n        select 1 union select a+1 from t where a < 3\r\n    ) select * from t order by a\r\n);\r\n-- Query with RIGHT JOIN\r\nSELECT a, (SELECT a\r\n           FROM strings i2\r\n           RIGHT JOIN (SELECT SUM(a) sum_a\r\n                       FROM strings i2\r\n                       WHERE i2.a>i1.a) sq\r\n           ON i2.a = sq.sum_a)\r\nFROM strings i1\r\nORDER BY 1;\r\n-- SIGSEGV\r\n```\n\n### OS:\n\nMacOS\n\n### DuckDB Version:\n\nmaster\n\n### DuckDB Client:\n\nunittest\n\n### Full Name:\n\nLaurens Kuiper\n\n### Affiliation:\n\nDuckDB Labs\n\n### Have you tried this on the latest `master` branch?\n\n- [x] I agree\n\n### Have you tried the steps to reproduce? Do they include all relevant data and configuration? Does the issue you report still appear there?\n\n- [X] I agree",
+        "comments": [
+            "I have pushed a fix for this in my #4189 PR, should be fixed when it gets merged.",
+            "it runs on termux 0.118\r\n```\r\nReport issues at https://termux.org/issues\r\n\r\n~ $ duckdb\r\nv0.4.0 da9ee49\r\nEnter \".help\" for usage hints.\r\nConnected to a transient in-memory database.\r\nUse \".open FILENAME\" to reopen on a persistent database.\r\nD create view strings as (\r\n> with recursive t(a) as (\r\n> select 1 union select a+1 from t where a < 3\r\n> ) select * from t order by a\r\n> );\r\nD SELECT a, (SELECT a\r\n> FROM strings i2\r\n> RIGHT JOIN (SELECT SUM(a) sum_a\r\n> FROM strings i2\r\n> WHERE i2.a>i1.a) sq\r\n> ON i2.a = sq.sum_a)\r\n> FROM strings i1\r\n> ORDER BY 1;\r\n\u250c\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\r\n\u2502 a \u2502 (SELECT a FROM strings AS i2 RIGHT JOIN (SELECT sum(a) AS sum_a FROM strings AS... \u2502\r\n\u251c\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\r\n\u2502 1 \u2502                                                                                    \u2502\r\n\u2502 2 \u2502 3                                                                                  \u2502\r\n\u2502 3 \u2502                                                                                    \u2502\r\n\u2514\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\r\n```",
+            "@l1t1 You are using an older version of DuckDB where the bug did not exist yet. Try using DuckDB master, it will crash regardless of OS.",
+            "Looks like this is fixed"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 23594,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/common/types/column_data_collection.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 685,
+            "original_line": 678,
+            "side": "RIGHT",
+            "original_position": 60,
+            "position": 60,
+            "subject_type": "line",
+            "review_comments": [
+                "Does this work when row_index is non-zero? It only seems to write it, not read it.",
+                "I've copied this code from Mark CDC PR. I've just split scanning up in acquiring indices and actually reading the data, rather than them being in one function. I needed the more fine-grained control for my parallel state machine in `PhysicalHashJoin::GetData`\r\n\r\nI think it should work for non-zero row indices, since `ColumnDataCollection::NextScanIndex` can assign non-zero indices."
+            ]
+        },
+        {
+            "hunk_id": 23600,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 506,
+            "original_line": 506,
+            "side": "RIGHT",
+            "original_position": 261,
+            "position": 261,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this for performance (so the compiler will keep it in a register)?",
+                "Yes. I've noticed a lot of time is spent in `InitializeSelectionVector`, this method should be optimized further, but that's for a future PR."
+            ]
+        },
+        {
+            "hunk_id": 23596,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 63,
+            "original_line": 63,
+            "side": "RIGHT",
+            "original_position": 26,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "I kept getting burned by `keep_pinned` not transferring. Don't know if that is a problem here.",
+                "I think the `swizzled_block_collection` does not need to have the `keep_pinned` flag no?\r\n\r\nThe idea of the `swizzled_block_collection` is that it is spillable, and does not need to keep the blocks pinned."
+            ]
+        },
+        {
+            "hunk_id": 23605,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/common/radix_partitioning.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 144,
+            "original_line": 196,
+            "side": "RIGHT",
+            "original_position": 196,
+            "position": 144,
+            "subject_type": "line",
+            "review_comments": [
+                "`vector<uint32_t>(CONSTANTS::NUM_PARTITIONS, 0)`? Or are you trying to avoid memory allocation/fragmentation by allocating on the stack? (I'm asking more for my own understanding of some of our code idioms.)",
+                "It's only used within this scope so I prefer allocating on the stack."
+            ]
+        },
+        {
+            "hunk_id": 23602,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 854,
+            "original_line": 854,
+            "side": "RIGHT",
+            "original_position": 348,
+            "position": 348,
+            "subject_type": "line",
+            "review_comments": [
+                "The method says full outer, but this looks like a right outer? ",
+                "This is essentially a full/outer scan, but since the right side is our build side, we need to do this for right outer too. The method already had this name, I would rather not change it."
+            ]
+        },
+        {
+            "hunk_id": 23595,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/include/duckdb/execution/operator/join/physical_hash_join.hpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 74,
+            "original_line": 71,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 43,
+            "subject_type": "line",
+            "review_comments": [
+                "The comment does not match the implementation - in fact it seems to contradict it?",
+                "How so? Right now the control flow of the operator is:\r\n1. Sink operator interface for build side\r\n2. Operator interface for probing\r\n3. Source operator interface for partitioned probing (anything that we couldn't probe in (2.))\r\n\r\nIt has to always be marked as a source because we need to schedule the source pipeline before execution (it can decide at any point during execution to go external and become a source op).",
+                "Sorry not sure what I was thinking there - it makes sense now."
+            ]
+        },
+        {
+            "hunk_id": 23597,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 88,
+            "original_line": 88,
+            "side": "RIGHT",
+            "original_position": 51,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "Does the other `partition_lock` need to be held as you are moving blocks out of it? Or does the caller guarantee that?",
+                "Moving blocks out of the partitions should always be done by a single thread, so no need to hold the lock."
+            ]
+        },
+        {
+            "hunk_id": 23599,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 325,
+            "original_line": 325,
+            "side": "RIGHT",
+            "original_position": 137,
+            "position": 137,
+            "subject_type": "line",
+            "review_comments": [
+                "`MinValue`?",
+                "We need `MaxValue` here, since `Count()` can be larger than `tuples_per_round` in edges cases where the data is skewed. If we do `MinValue` instead, we will allocate too small of a pointer table."
+            ]
+        },
+        {
+            "hunk_id": 23598,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 314,
+            "original_line": 314,
+            "side": "RIGHT",
+            "original_position": 115,
+            "position": 115,
+            "subject_type": "line",
+            "review_comments": [
+                "This is one of my favourite C++ atomic tricks!"
+            ]
+        },
+        {
+            "hunk_id": 23604,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1039,
+            "original_line": 955,
+            "side": "RIGHT",
+            "original_position": 449,
+            "position": 533,
+            "subject_type": "line",
+            "review_comments": [
+                "Can this trigger a divide by zero?",
+                "We check for `total_count` being greater than 0 a few lines before, so I think this is fine."
+            ]
+        },
+        {
+            "hunk_id": 23601,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 834,
+            "original_line": 834,
+            "side": "RIGHT",
+            "original_position": 308,
+            "position": 308,
+            "subject_type": "line",
+            "review_comments": [
+                "I think you will lose the pin on the first block, invalidating the previous `key_locations` entries unless you move it into a handle vector? I tripped over this in the RDC scanner the other day.",
+                "These blocks are actually pinned somewhere else too, in `JoinHashTable::pinned_handles`. We just pin again here to get the pointer. These blocks will only be unpinned when we go to the next build stage, so i think this is fine."
+            ]
+        },
+        {
+            "hunk_id": 23603,
+            "commit_id": "c137347ea36feb9cae10ec78b770070fea5ebd7e",
+            "original_commit_id": "988a2e5ac982f0e71304a974edd459a7234e5f88",
+            "path": "src/execution/join_hashtable.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 999,
+            "original_line": 915,
+            "side": "RIGHT",
+            "original_position": 409,
+            "position": 493,
+            "subject_type": "line",
+            "review_comments": [
+                "It might improve safety here to assert that the heap blocks are pinned?",
+                "We pin them both here, I don't see why this should be asserted"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,47 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 127025,
+    "lang": "go",
+    "pr_title": "server: emit disk slowness detected/cleared events in eventlog",
+    "pr_body": "Previously, disk slowness events would show up in metrics as well as in the pebble log, but not as a structured event or in the system.eventlog table. This change adds two events: a DiskSlownessDetected and a DiskSlownessCleared event. The former is emitted when disk slowness is first observed on a node, and the latter is emitted when no disk slowness events have been observed on a node for more than 30 seconds.\r\n\r\nEpic: none\r\nFixes: #125977\r\n\r\nRelease note (ops change): Add eventlog events for disk slowness detected and disk slowness cleared on a store.",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/127025)\n<!-- Reviewable:end -->\n",
+        "Given the last two LGTMs, I think this is ready to merge.\r\n\r\nbors r=nicktrav",
+        "Build succeeded:\n  * [examples_orms](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461850666)\n  * [windows_build](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461854538)\n  * [linux_amd64_build](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461851676)\n  * [docker_image_amd64](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461851367)\n  * [unit_tests](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461854212)\n  * [local_roachtest_fips](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461853052)\n  * [acceptance](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461849647)\n  * [macos_amd64_build](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461853389)\n  * [linux_amd64_fips_build](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461851981)\n  * [check_generated_code](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461850346)\n  * [local_roachtest](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461852697)\n  * [macos_arm64_build](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461853795)\n  * lint\n  * [linux_arm64_build](https://github.com/cockroachdb/cockroach/actions/runs/9941826517/job/27461852307)"
+    ],
+    "merged": true,
+    "created_at": "2024-07-12T16:00:22Z",
+    "issue_context": {
+        "number": 125977,
+        "title": "storage: log disk stalls to system.eventlog",
+        "body": "Perusing the \"events\" window in the DB console is a common initial flow when diagnosing issues to make sure nothing obvious correlates with timeline of an issue. Disk slowness and stalls are not currently logged in the event view (which is sourced from `system.eventlog` table). Currently disk slowness and stalls are only logged in pebble logs.\r\n\r\nAsk here is that the we log an event into `system.eventlog`. Log when the slowness is first detected, and then when it clears log the event:\r\n\r\n- Timestamp\r\n- EventType: disk_slowness_detected; disk_slowness_cleared\r\n- NodeID: node\r\n- StoreID: store_id\r\n\r\nNote:  Writing to the event log in these cases should be best effort, as if there's a disk stall, and the leaseholder for the event log is on the same node, we think it might deadlock. \r\n\r\nJira issue: CRDB-39694",
+        "comments": [
+            "Currently the EventListener API between Pebble and Cockroach for disk slowness events looks like this:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/9af051e4151254a8ef10ce50a0990f7c26605226/pkg/storage/pebble.go#L1593\r\n\r\nUsually when there's a slow disk, we see a splutter of calls to this method over the slowness period of time. We could either change this API on Pebble's side to explicitly emit start/end events (with the ends not being guaranteed in case of a crash, obviously), or we could coalesce these events into a start/end event on the Cockroach side.\r\n\r\nIn the interest of keeping the Pebble-side disk health checks as simple as possible so they catch all instances of slownesses, I'd be in favour of doing this coalescing/deduplication on the Cockroach side, where a store keeps track of whether it's in a slowness event already (if not, it creates one) when it sees a Pebble DiskSlow, then 20 seconds after the last disk slowness event from Pebble, we mark an event on that store as having ended. The 20 seconds could be configurable, or it could reuse the same MaxSyncDuration cluster setting as disk stalls.",
+            "@mwang1026 We're trying to come up with more general ways to do this kind of thing and I had a few questions. If a node is hitting slowness events for long periods of time, it is possible that the start event is old and not noticed anymore. Would it be useful to periodically post a \"still happening\" event? We're also thinking about perhaps assigning a period of time to each event, and showing all intersecting events for the current metrics timeframe. In that world, we would periodically post \"disk slowness detected\" events which contain a specific timeframe (and no \"cleared\" event).\r\n\r\nBasically I want to see if I'm missing an important customer perspective or requirement, or if it's ok to make whatever decisions here we feel make for the best usability.",
+            "> If a node is hitting slowness events for long periods of time, it is possible that the start event is old and not noticed anymore.\r\n\r\nHow old? My understanding is we don't fire off that many alerts to system.event_log that 20s will have that alert buried deep, short of some major schema changes or something going on at the same time, but I can check a few cloud clusters to validate that.\r\n\r\n>  Would it be useful to periodically post a \"still happening\" event?\r\n\r\nThat could be an alternative approach. Let me ask a few folks -- the core issue here is correlating disk stall/slowness with other symptoms, usually sql thruput/latency blips -- and it might actually be more useful to have the periodic ping vs. having to find start and stop, and even those starts and stops being somewhat inaccurate (in that it's subject to how often we check for a stall). With a periodic check you could just assume the first and last that you see in a time frame, +/- some amount, is how long the disk was stalled. The only tricky part with this would be \"flopping\" disks but I'm not sure start/stop variant would be better in that instance either. Thoughts?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14509,
+            "commit_id": "fd6ea0af46d86a8842e0004152e521332281a025",
+            "original_commit_id": "0cc32025dd8934f857ee25e3dea148e505ab1ece",
+            "path": "pkg/server/node.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 943,
+            "original_line": 943,
+            "side": "RIGHT",
+            "original_position": 100,
+            "position": 114,
+            "subject_type": "line",
+            "review_comments": [
+                "Is this blocking, or best effort? What happens if we're attempting to log slowness for the store that is the LH for the event log, and its disk is indefinitely stalled?",
+                "This method does a log to the node's logger (where a stall would have a different flushing goroutine wait instead), and it does an INSERT asynchronously in a different goroutine into the eventlog table. So it seems like we should be covered here, and shouldn't unintentionally hold up the disk health checker.",
+                "Sounds good to me. Might be worth putting this as a comment - either here, or as a function comment, detailing the semantics / contract.",
+                "On closer inspection the `log.StructuredEvent` could under some cases write directly to the logger file sink, even though the SQL write will always be async. So to decouple this from the handler coming all the way from Pebble, I moved the entire `logStructuredEvent` call into the async task below, and left a comment about it."
+            ]
+        }
+    ]
+}

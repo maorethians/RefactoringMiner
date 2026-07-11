@@ -1,0 +1,116 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 8700,
+    "lang": "c",
+    "pr_title": "Replace dict's hash table with HAMT",
+    "pr_body": "A drop-in replacement of the hash tables in dict, affecting the key space and all other uses of the dict. Fixes #8698.\r\n\r\nStatus: It's working-ish. The the dict tests are passing, but the Redis test suites are not passing. Most tests are passing ocationally but Redis seems to hang at various times until it's killed by the test runner. Debugging help is most welcome.\r\n\r\nThe dict in hiredis gets it's function names prefixed with `hi_` to avoid collisions. This needs to be done upstream in hiredis...\r\n\r\nPerformance comparison\r\n-----------------------------\r\n\r\nComparison using `./redis-server test dict 10000000` (compiled using `make\r\nCFLAGS=-DREDIS_TEST`) on my laptop (64-bit Linux, 32G RAM).\r\n\r\nClassic dict:\r\n\r\n    Inserting: 10000000 items in 4746 ms\r\n    Linear access of existing elements: 10000000 items in 2474 ms\r\n    Linear access of existing elements (2nd round): 10000000 items in 2459 ms\r\n    Random access of existing elements: 10000000 items in 3726 ms\r\n    Accessing random keys: 10000000 items in 1287 ms\r\n    Accessing missing: 10000000 items in 2638 ms\r\n    Removing and adding: 10000000 items in 4516 ms\r\n\r\nHAMT:\r\n\r\n    Inserting: 10000000 items in 3253 ms\r\n    Linear access of existing elements: 10000000 items in 2793 ms\r\n    Linear access of existing elements (2nd round): 10000000 items in 2805 ms\r\n    Random access of existing elements: 10000000 items in 3676 ms\r\n    Accessing random keys: 10000000 items in 1103 ms\r\n    Accessing missing: 10000000 items in 2240 ms\r\n    Removing and adding: 10000000 items in 6467 ms\r\n\r\nStructure\r\n---------\r\n\r\n```\r\n+--------------------+\r\n| dict               |\r\n|--------------------|   +--------------------+   +--------------------+\r\n| bitmaps | children---->| bitmaps | children---->| key     | value    |\r\n| size               |   | key     | value    |   | ...     | ...      |\r\n| dictType           |   | key     | value    |   +--------------------+\r\n| privdata           |   | key     | value    |\r\n+--------------------+   | key     | value    |   +--------------------+\r\n                         | bitmaps | children---->| key     | value    |\r\n                         | key     | value    |   | bitmaps | children--->..\r\n                         | ...     | ...      |   | value   | key      |\r\n                         +--------------------+   | ...     | ...      |\r\n                                                  +--------------------+\r\n```\r\n\r\nIn each level, 5 bits of the hash is used as an index into the children. A\r\nbitmap indicates which of the children exist (1) and which don't (0). Whether\r\nthe child is a leaf or a subnode is indicated by a second bitmap, \"leafmap\".\r\n\r\n```\r\nhash(key) = 0010 10010 01011 00101 01001 10110 11101\r\n(64 bits)   10101 11001 01001 01101 10111 11010\r\n                                          ^^^^^\r\n                                            26\r\n\r\nbitmap    = 00100101 00000010 00010100 01100001\r\n(level 0)        ^\r\n                 bit 26 is 1, so there is a child node or leaf\r\n\r\nleafmap   = 00000100 00000010 00010000 01100000\r\n(level 0)        ^\r\n                 bit 26 is 1, so the child is a key-value entry\r\n```\r\n\r\nThe children array is compact and its length is equal to the number of 1s in\r\nthe bitmap. In the bitmap above, our bit is the 2nd 1-bit from the left, so\r\nwe look at the 2nd child.\r\n\r\n```\r\nchildren  = +--------------------+\r\n            | bitmaps | children |\r\n            | key     | value    | <-- The 2nd child is a key-value entry. If\r\n            | bitmaps | children |     the key matches our key, then it's our\r\n            | ...     | ...      |     key. Otherwise, the dict doesn't\r\n            +--------------------+     contain our key.\r\n```\r\n\r\nIf, instead, our child is a subnode, we use the next 5 bits from the hash to\r\nindex into the next level of children.\r\n\r\nThe classic dict has this structure:\r\n\r\n```\r\n+------+\r\n| dict |\r\n|------|    +-------+     +-------+       +----------+\r\n| ht[0]---->| slot ------>| key   |   ,-->| key      |\r\n| ...  |    | NULL  |     | value |  /    | value    |\r\n+------+    | slot  |     | next----'     | next=NULL|\r\n            | ...   |     +-------+       +----------+\r\n            +-------+\r\n```\r\n\r\nMemory comparison: The classic dict has an entry pointer for every slot and a\r\n'next' pointer in every entry. The HAMT stores the entries within the nodes, so\r\nthe only overhead is the subnode pointers and the bitmaps for each subnode. The\r\nnumber of subnodes is logarithmic to the number of keys.\r\n\r\nPossible improvements\r\n---------------------\r\n\r\nTo increase speed for large HAMTs, a possible optimization is to resize the root\r\ntable. This can be done incrementally and without rehashing the keys, so it's\r\nmuch faster than resizing a regular hash table. It's explained in the paper.\r\nIt's not implemented (yet) and the performance comparision above is done without\r\nthis optimization.\r\n",
+    "pr_comments": [
+        "Cool \uff01",
+        "@zuiderkwast This is really great work!\r\nI think we need to think and come up with a plan of what it takes to get it ready to ship in Redis 7, as it's a non-trivial change naturally. The immediate things I can consider before giving that any real thought are these:\r\n\r\n* Consider/test impact on memory fragmentation and maybe CoW\r\n* Run some more real-world benchmarks to demonstrate/measure where HAMT shines and where it fails\r\n* Do we necessarily want it as an all-in replacement for dict, or have them co-exist? The benefits for the large global dicts are clear, but what about hash keys or other specific use cases like the command table?",
+        "> @zuiderkwast This is really great work!\r\n\r\n@yossigo I'm happy you like the idea.\r\n\r\n> I think we need to think and come up with a plan of what it takes to get it ready to ship in Redis 7, as it's a non-trivial change naturally. The immediate things I can consider before giving that any real thought are these:\r\n> \r\n> * Consider/test impact on memory fragmentation and maybe CoW\r\n\r\nThe defrag code should be updated to defrag/reallocate the HAMT nodes. I consider it a TODO. The impact on copy-on-write should be just positive. It would be good to be able to test and compare though, of course.\r\n\r\n> * Run some more real-world benchmarks to demonstrate/measure where HAMT shines and where it fails\r\n\r\nYes, I'd need help with that. Do you have any realistic test data to run such tests?\r\n\r\n> * Do we necessarily want it as an all-in replacement for dict, or have them co-exist? The benefits for the large global dicts are clear, but what about hash keys or other specific use cases like the command table?\r\n\r\nI made a drop-in replacement because it was easier (a smaller change) than breaking out the key space dict (and the expire dict) from the other ones. The alternative would involve much more work and more changes AFAICT. Large hashes probably benefit from a HAMT just like the main key space (while small hashes use ziplist/listpack) and for the remaining dicts (command table, etc.), I guess it doesn't really matter if they're changed or not, but the total complexity would be reduced if we can get rid of the old dict altogether. Any pros and cons should be considered though.\r\n\r\nThe main blocker right now IMO is the failing builds/tests. Possibly, there's a Heisenbug. They fail at seemingly random test cases and I don't know why. Redis nodes hang and need to be killed by the test runner.\r\n\r\nOne more TODO is to handle the (unlikely) scenario of 64-bit hash colissions. It can be handled with an array of the duplicates on the last level (or alternatively by using a second hash function when we run out of bits).",
+        "> The defrag code should be updated to defrag/reallocate the HAMT nodes. I consider it a TODO. The impact on copy-on-write should be just positive. It would be good to be able to test and compare though, of course.\r\n\r\nI was actually referring to the impact on fragmentation itself, due to more allocations and deallocations per key operation. Anyway yes, it's really down to testing.\r\n\r\n> I made a drop-in replacement because it was easier (a smaller change) than breaking out the key space dict (and the expire dict) from the other ones. The alternative would involve much more work and more changes AFAICT. Large hashes probably benefit from a HAMT just like the main key space (while small hashes use ziplist/listpack) and for the remaining dicts (command table, etc.), I guess it doesn't really matter if they're changed or not, but the total complexity would be reduced if we can get rid of the old dict altogether. Any pros and cons should be considered though.\r\n\r\nI agree with this reasoning as a way to get to a working HAMT dict with as little friction as possible, and I'd probably take the same approach. But once it's there and stabilized and we need to consider the next step, I'm not sure if the simplicity of having just a single dict will surpass potential drawbacks. This will take some analysis I believe.\r\n\r\n> The main blocker right now IMO is the failing builds/tests. Possibly, there's a Heisenbug. They fail at seemingly random test cases and I don't know why. Redis nodes hang and need to be killed by the test runner.\r\n\r\nDid you try to kill them with `SIGSEGV` and look at the stack trace? Also, did you try to fuzz the new implementation at a low level (i.e. directly calling `dict*`)?\r\n",
+        "@zuiderkwast  Would you like to add your implementation to https://github.com/romange/hash-table-shootout/tree/simple ?\r\nI added there redis-dict, you can see it under \"redis\" directory. The wrapper code is https://github.com/romange/hash-table-shootout/blob/simple/src/redis_dict.cc \r\n\r\nOnce yours will be added, I will be able to share an extensive benchmark report showing how well HAMT performs compared to vanilla redis-dict on dozens of use-cases. ",
+        "@romange Nice, can you show some example of the stats you can produce? When I add it, I'd need to rename all the functions so they don't clash with the original dict functions you added, right? Anyway, I want to make it work properly (Redis tests pass) before focusing on benchmarking further.\r\n\r\n@yossigo I've tried killing it with SIGSEGV and got stack traces at seemingly random locations. I've tried running the tests with gdb attached and looked at the stack traces at random times also without finding anything useful. I've also tried compiling with address santitizer and other sanitizers.\r\n\r\nFragmentation may be higher than before and the paper actually recommends using active defrag, so it's nice that we have the defrag framework in place already.",
+        "@zuiderkwast  you can read the article that uses this framework to benchmark other hash tables: \r\nhttps://tessil.github.io/2016/08/29/benchmark-hopscotch-map.html\r\nbtw, you may also find this repo useful for finding the bugs in your code. \r\n\r\nyou do not have to rename the symbols because each hashtable is represented via a separate binary.",
+        "Thanks @JimB123 for review and analysis! I agree with your points and I haven't really done any more analysis than this. For smaller test runs I get similar results, but it's worth doing more.\r\n\r\nI think the root level will always be in the CPU cache, so the root level lookup is likely faster then the other levels. Perhaps the over all lower memory usage might allow more of the table to be in the cache, which might explain why it's faster in some cases.\r\n\r\nThanks for pointing that returned dictEntry pointers become invalid whenever anything is added or deleted. I've tried (earlier) to check all code which calls the dict to see that it's safe, but perhaps refactoring the API to not expose the dictEntry at all would be safer.",
+        "The above tests lack the memory usages of Redis hash dict and HAMT that is the most important metric for HAMT. Could you add the test results of memory usage?",
+        "> The above tests lack the memory usages of Redis hash dict and HAMT that is the most important metric for HAMT. Could you add the test results of memory usage?\r\n\r\n@CaixinGong I need help. How do you suggest to do this test?",
+        "> > The above tests lack the memory usages of Redis hash dict and HAMT that is the most important metric for HAMT. Could you add the test results of memory usage?\r\n> \r\n> @CaixinGong I need help. How do you suggest to do this test?\r\n\r\nThe default Redis benchmark _redis-benchmark_ may help for simple test.\r\nFor more complicated test, you can use the YCSB tool: https://help.aliyun.com/document_detail/185197.html?spm=a2c4g.11186623.6.888.5c0e5fe1BEEbtE",
+        "I've rebased and squashed the commits. It's not ready to merge, but I've performed a ...\r\n\r\n## Memory usage test\r\n\r\nRedis started with default config, empty db and then populated with 1M keys\r\nusing `debug populate 1000000`. Then `info memory`.\r\n\r\n| Branch    | used_memory | used_memory_dataset | used_memory_dataset_perc |\r\n|-----------|-------------|---------------------|--------------------------|\r\n| unstable  | 81237016    | 32020368            | 39.81%                   |\r\n| dict-hamt | 70521704    | 37708784 (incorrect)| 54.08% (incorrect)       |\r\n| Diff      | 10715312 (13% save) |             |                          |\r\n\r\nNote: The dataset memory usage reported for the HAMT by `dictEstimateMem()` is incorrect. That's new code that I didn't focus on yet.\r\n",
+        "[![CLA assistant check](https://cla-assistant.io/pull/badge/not_signed)](https://cla-assistant.io/redis/redis?pullRequest=8700) <br/>Thank you for your submission! We really appreciate it. Like many open source projects, we ask that you sign our [Contributor License Agreement](https://cla-assistant.io/redis/redis?pullRequest=8700) before we can accept your contribution.<br/><sub>You have signed the CLA already but the status is still pending? Let us [recheck](https://cla-assistant.io/check/redis/redis?pullRequest=8700) it.</sub>"
+    ],
+    "merged": false,
+    "created_at": "2021-07-15T16:06:26Z",
+    "issue_context": {
+        "number": 8698,
+        "title": "[NEW] Replace dict's hash table with HAMT",
+        "body": "The known problems with the hash table:\r\n\r\n* huge allocations makes malloc/free freeze the system (#8611)\r\n* even more memory is used while incremental rehashing is ongoing\r\n* (anything else?)\r\n\r\nIt has been discussed to replace the hash table with a rax, but I think a HAMT is a better idea.\r\n\r\n**Hash Array Mapped Trie (HAMT)** is a kind of nested hash table or hash tree.\r\n\r\nIt's a hash table of (a fixed number, typically) 32 slots, where each slot is either empty, an entry or (on\r\ncollition) a subnode with the same structure. For each level, 5 bits of the\r\nhashed key is used as an index into the 32 slots. To save memory, each 32-slot\r\nnode is stored in a compact way using a bitmap to flag the existence of each of\r\nthe 32 potential slots.\r\n\r\n* Introduction: https://en.wikipedia.org/wiki/Hash_array_mapped_trie\r\n* Detailed paper: https://infoscience.epfl.ch/record/64398/files/idealhashtrees.pdf\r\n\r\nBenefits\r\n--------\r\n\r\n* No rehashing needed.\r\n* No huge allocations.\r\n* It's automatically balanced (if our hash function is good, which it is).\r\n* Speed comparable to classic dict.\r\n* Memory usage less than classic dict (roughly 2 words less per entry).\r\n* SCAN and random key are simple to implement.\r\n* All operations are safe during iteration.\r\n* Fairly simple design.\r\n\r\nWhy not a Radix Tree (RAX)?\r\n---------------------------\r\n\r\n* The rax needs much memory for large keys without a shared prefix.\r\n* There are no known SCAN and fair random key selection algorithms.\r\n\r\nThe HAMT is similar to a RAX, but instead of the key itself, the hashed key is\r\nused as the path in the tree. Since a hashed key is a number, it can also be used\r\nas a cursor. A random number used as a cursor picks a random key.\r\n",
+        "comments": [
+            "A note about the RAX is that it's ordered, which allows some cool stuff like deleting all keys with a given prefix.",
+            "Should we be making this modular to allow the customer choose the mechanism ?\r\n\r\n* Hash Table [Default]\r\n* HAMT [Provided with 7.0]\r\n* Radix Tree [If somebody implements it]\r\n\r\nThis would avoid any possible bug causing issues having nothing to fallback to.\r\nAlso if the customers have usecase of lot's of keys with same prefix, they could take advantage of Radix tree. ",
+            "> Should we be making this modular to allow the customer choose the mechanism ?\r\n> \r\n> * Hash Table [Default]\r\n> * HAMT [Provided with 7.0]\r\n> * Radix Tree [If somebody implements it]\r\n> \r\n> This would avoid any possible bug causing issues having nothing to fallback to.\r\n> Also if the customers have usecase of lot's of keys with same prefix, they could take advantage of Radix tree.\r\n\r\nI think this idea looks great, so we seem to have the ability to subsequently introduce more customer-specific data sets with special optimizations. It seems that changing the first member table in the struct dict to an enum is a feasible method."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48768,
+            "commit_id": "9979edc0e24a2389aad52f76fc1e7d5339713257",
+            "original_commit_id": "fe359cbfc25f4ada01e314ee4bb123b744422c62",
+            "path": "src/dict.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 43,
+            "original_line": 43,
+            "side": "RIGHT",
+            "original_position": 18,
+            "position": 18,
+            "subject_type": "line",
+            "review_comments": [
+                "#include <stdarg.h>\r\n#include <limits.h>\r\n\r\nthese 2 header file are not used"
+            ]
+        },
+        {
+            "hunk_id": 48767,
+            "commit_id": "9979edc0e24a2389aad52f76fc1e7d5339713257",
+            "original_commit_id": "fe359cbfc25f4ada01e314ee4bb123b744422c62",
+            "path": "src/dict.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 255,
+            "original_line": 255,
+            "side": "RIGHT",
+            "original_position": 416,
+            "position": 419,
+            "subject_type": "line",
+            "review_comments": [
+                "Whether we can make the root always be a `subnode`, so that we can remove the special case `d->size == 1`?",
+                "I guess it's possible, but then we need some other special cases in other parts of the code, I think...",
+                "I feel special cases will be less. Maybe I'm wrong.",
+                "Thanks for the suggestion. I will look into it, but first I want to make the build pass. :-)",
+                "This PR is difficult. It takes me some time to understand it."
+            ]
+        },
+        {
+            "hunk_id": 48766,
+            "commit_id": "9979edc0e24a2389aad52f76fc1e7d5339713257",
+            "original_commit_id": "fe359cbfc25f4ada01e314ee4bb123b744422c62",
+            "path": "src/dict.c",
+            "start_line": 797,
+            "original_start_line": 830,
+            "start_side": "RIGHT",
+            "line": 800,
+            "original_line": 800,
+            "side": "RIGHT",
+            "original_position": 1189,
+            "position": 1186,
+            "subject_type": "line",
+            "review_comments": [
+                "Can we?, should we?, add the additional hash bits to the cursor value?  Could the cursor maintain the full (extended) hash of the last value returned?",
+                "There can be 64 bit hash collisions, for which storing the duplicates is not yet implemented. (The idea is to just store all the entries in level 13 (is it?) in a compact array and use one of the bitmaps for its length.)",
+                "OK - so you're planning to diverge from the HAMT strategy of generating a 2nd hash to add more bits.\r\n\r\nIn this case, for iteration, maybe consider keeping the `key` and/or index and/or next-key pointer in the iterator.  Then, when the iterator hits such a list you scan until you hit the key you last iterated on.  This would avoid the weird pattern where an iterator can return multiple items in this rare case.  It's simpler for users if the iterator only returns 1 item each time.\r\n\r\nIf you're worried about the values changing/moving during iteration, maybe you could clone the list of keys into the iterator at this point, then, for each key, check that it still exists in the map before returning it.",
+                "Good ideas. Yes, using a second hash function was the initial idea, but I think just storing the collisions is fine and simpler. I don't have a strong preference though.\r\n\r\nI don't think the scan cursor should be more than 64 bits (maybe only 32 bits for 32-bit builds?) so SCAN would need to sometimes return more than the requested number of elements. An iterator should of course only return one element each time though, so it would need to store the duplicate index or a clone of the duplicates list in the iterator, yes."
+            ]
+        },
+        {
+            "hunk_id": 48765,
+            "commit_id": "9979edc0e24a2389aad52f76fc1e7d5339713257",
+            "original_commit_id": "fe359cbfc25f4ada01e314ee4bb123b744422c62",
+            "path": "src/dict.c",
+            "start_line": 298,
+            "original_start_line": 331,
+            "start_side": "RIGHT",
+            "line": 303,
+            "original_line": 303,
+            "side": "RIGHT",
+            "original_position": 464,
+            "position": 467,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't forget to implement this.  Also, at this point, there are 4 bits of the original hash still unused.",
+                "True. I didn't do this exactly right yet. There are 12 levels of 5 bits each, one level of 4 bits. Then the next level will be a flat sequence of collisions."
+            ]
+        }
+    ]
+}

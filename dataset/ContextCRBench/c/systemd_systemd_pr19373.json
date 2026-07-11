@@ -1,0 +1,97 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 19373,
+    "lang": "c",
+    "pr_title": "journald: Retry if posix_fallocate returned -1 (EINTR)",
+    "pr_body": "On some conditions (particularly when mobile CPUs are going to sleep),\r\nthe posix_fallocate(), which is called when a new journal file is allocated,\r\ncan return -1 (EINTR). This is counted as a fatal error. So the journald\r\ncloses both old and journals, and simply throwing away further incoming\r\nevents, because of no log files open.\r\n\r\nLet's restart posix_fallocate() in a case of EINTR.\r\n\r\nFixes: #19041\r\n\r\nSigned-off-by: Igor Zhbanov <i.zhbanov@omprussia.ru>",
+    "pr_comments": [
+        "ptrace attach/detach might cause EINTR iirc, since they cannot attach while the process is in kernel mode, so it synthesizes EINTR, so that it can attach afterwards",
+        "I've run entire systemd-journald from the start under strace. And 600 megabytes after start, I've got the error. So it shouldn't be related to attaching/detaching.",
+        "I don't think there's any POSIX requirement in general for `EINTR` to actually be accompanied by a signal, so it's been getting abused (or maybe that's a \"feature\"?)\r\n\r\nIn terms of process freezing/thawing I can imagine why the kernel would synthesize `EINTR` thawing blocking \"slow\" syscalls; it's assuming the caller may handle this explicitly and do something appropriate upon noticing potentially a lot of real-time has passed, or it'll just blindly restart the operation.\r\n\r\nI'm short on time currently, but wonder if instead of performing a potentially infinite retry loop here, why isn't journald ever re-attempting the journal open after this one error is realized?  That seems like it could be considered a bug, for journald to never resume logging after what could be just a transient condition causing journal open failures.",
+        "> I'm short on time currently, but wonder if instead of performing a potentially infinite retry loop here, why isn't journald ever re-attempting the journal open after this one error is realized? That seems like it could be considered a bug, for journald to never resume logging after what could be just a transient condition causing journal open failures.\r\n\r\nWell, that's what I'm exactly written in the issue. :-) So, yes, my current fix is more about the particular issue. But surely jourlnald should be more resilient to transient errors like no disk space, etc. And should try at least to make some number of attempts with may be some delay.",
+        "> > I'm short on time currently, but wonder if instead of performing a potentially infinite retry loop here, why isn't journald ever re-attempting the journal open after this one error is realized? That seems like it could be considered a bug, for journald to never resume logging after what could be just a transient condition causing journal open failures.\r\n> \r\n> Well, that's what I'm exactly written in the issue. :-) So, yes, my current fix is more about the particular issue. But surely jourlnald should be more resilient to transient errors like no disk space, etc. And should try at least to make some number of attempts with may be some delay.\r\n\r\nPerhaps if the higher-order issue of journald recovery from errors is addressed, this specific call site's error handling becomes irrelevant?\r\n\r\nEither way, `TEMP_FAILURE_RETRY()` is arguably an unbounded busy loop spinning on a syscall.  At a glance, my knee-jerk reaction is to NAK its use here or anywhere in the systemd source.\r\n\r\nIf retrying at the call site is appropriate, make it both bounded, and perhaps with an increasing delay until giving up.  I don't recall if there's already a helper for doing that in-tree.  Logging the >1 retries might also be desirable.\r\n\r\nIn the scenario we're specifically thinking about here, we expect the normal execution to be just a single retry after an EINTR, correct?",
+        "Added retry count. So now it will call posix_fallocate() at most 2 times.",
+        "As for generic journald improvements, I don't know current architecture guidelines, i.e. how to name retry attempts option? Should it be made separate for volatile and persistent storages?\r\nThe same is for the retry delay. Should it be fixed, or doubled after each attempt until some maximal duration reached?\r\nAt what journald function nesting level should we try to restart?\r\nOr should we just abort the journald entirely so systemd can simply restart it? (Although we can lose some messages.)\r\n\r\nSo this task is not complex, but requires to know current best systemd's architectural practices.",
+        "hmm, so I'd prefer this could be moved to some helper function in src/basic/fs-util.[ch], as we use posix_fallocate() at two other places, and they should take benefit of this logic too. maybe call this posix_fallocate_loop().\r\n\r\nI think just counting down is not going to work though, if we really are concerned about busy looping. iirc strace will generate EINTR when attaching and when detaching, hence in particular if you pick 2 you already hit it. \r\n\r\nMy suggestion: let's use the ratelimit logic we already have for this. Specifically something like this:\r\n\r\n```c\r\nint posix_fallocate_loop(int fd, uint64_t offset, uint64_t size) {\r\n        Ratelimit rl;\r\n        int r;\r\n\r\n        r = posix_fallocate(fd, offset, size); /* returns positive errnos on error */\r\n        if (r != EINTR)\r\n                return -r; /* Let's return negative errnos, like common in our codebase */\r\n\r\n        /* On EINTR try a couple of times more, but protect against busy looping (not more than 16 times per 10s) */\r\n        rl = (RateLimit) { 10 * USEC_PER_SEC, 16 };        \r\n        while (ratelimit_below(&rl)) {\r\n                r = posix_fallocate(fd, offset, size);\r\n                if (r != EINTR)\r\n                        return -r;\r\n        }\r\n        return -EINTR;\r\n}\r\n```\r\n\r\n(yeah, I'd fix up the error semantics to be more like our usual ones, i.e. return negative errnos. And I think it would be wise to always try posix_fallocate() once without preparing the ratelimit stuff, since that requires querying the clock. Also, off_t sucks because noone knows that that is, hence I'd fix the offset/size params to be uint64_t)",
+        "Updated. Next attempt.",
+        "Lgtm. Thanks!",
+        "centosci failed with TEST-50-DISSECT and TEST-58-REPART. We have fixes in flight for those, the failures should be unrelated.",
+        "mkosi / ci (arch): Failed to dissect image '/home/runner/work/systemd/systemd/image.raw': Connection timed out. Hmm.\r\nI'll restart the test."
+    ],
+    "merged": true,
+    "created_at": "2021-04-21T15:59:41Z",
+    "issue_context": {
+        "number": 19041,
+        "title": "On some errors journald can close the journal and not try to open the new ones",
+        "body": "I've found a strange bug that systemd-journald stopped to write new messages on disk, while leaving the journal files in the corrupted state.\r\nBy running it under strace I've found at least one cause of it: sometimes fallocate() (which is called during journal rotation) can return -1 (EINTR). (I don't know yet why this could happen.)\r\nThen the journald prints the error in the dmesg: \"Failed to create new runtime journal: Interrupted system call\" then simply accepting further incoming events and not writing it anywhere, because no journal files are open.\r\n\r\nYou can test it with strace fault injection:\r\n`strace -v -s 8192 -y -f -e inject=fallocate:error=EINTR:when=5+3 /usr/lib/systemd/systemd-journald`\r\nThen you can send -SIGUSR2 a couple of times to force the journal rotation.\r\nThen you can check in the `/proc/PID/fd` that no journal files are open.\r\n\r\nSo I can see 2 issues here:\r\n1) It would be better to handle EINTR or to set-up automatic syscall restarts with the sigaction().\r\n2) Journald could do better when it is unable to create the new journal file. I.e. it could at least try to make it again after some time.",
+        "comments": [
+            "I suggest:\r\n1) Use automatic syscalls restart (SA_RESTART flag for sigaction())\r\n2) The journal should make several attampts (configurable option) with some delay (configurable option) after that it should terminate, so the systemd can restart it.",
+            "Should we wait for a fix, or are you expecting us to propose it?",
+            "It seems that the problem happens when a mobile device is going to sleep:\r\n```\r\n[ 2165.360317]  (0)[399:systemd-journal]Restarting tasks ... \r\n[ 2165.369641]  (0)[399:systemd-journal]systemd-journald[399]: Failed to create new runtime journal: Interrupted system call\r\n```\r\nThe first line is printed by the kernel in `kernel/power/process.c:thaw_processes()`:\r\n```\r\nvoid thaw_processes(void)\r\n{\r\n        struct task_struct *g, *p;\r\n        struct task_struct *curr = current;\r\n\r\n        trace_suspend_resume(TPS(\"thaw_processes\"), 0, true);\r\n        if (pm_freezing)\r\n                atomic_dec(&system_freezing_cnt);\r\n        pm_freezing = false;\r\n        pm_nosig_freezing = false;\r\n\r\n        oom_killer_enable();\r\n\r\n        printk(\"Restarting tasks ... \");\r\n\r\n        __usermodehelper_set_disable_depth(UMH_FREEZING);\r\n        thaw_workqueues();\r\n\r\n        read_lock(&tasklist_lock);\r\n        for_each_process_thread(g, p) {\r\n                /* No other threads should have PF_SUSPEND_TASK set */\r\n                WARN_ON((p != curr) && (p->flags & PF_SUSPEND_TASK));\r\n                __thaw_task(p);\r\n        }\r\n        read_unlock(&tasklist_lock);\r\n\r\n        WARN_ON(!(curr->flags & PF_SUSPEND_TASK));\r\n        curr->flags &= ~PF_SUSPEND_TASK;\r\n\r\n        usermodehelper_enable();\r\n\r\n        schedule();\r\n        printk(\"done.\\n\");\r\n        trace_suspend_resume(TPS(\"thaw_processes\"), 0, false);\r\n}\r\n```\r\n",
+            "https://github.com/systemd/systemd/pull/19373"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32563,
+            "commit_id": "e79554d4b8378aab779fb66fd2430f696d8a0ef3",
+            "original_commit_id": "ea846e45c18883dab2f58e2f0d23fd0577b58c8e",
+            "path": "src/basic/fs-util.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1730,
+            "original_line": 1730,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "I'd prefer\r\n```C\r\nRateLimit rl = { 10 * USEC_PER_SEC, 16 };\r\n```\r\nbut OK.",
+                "Well, I don't see other (at least many) examples of this \"C++-style\" variables declaration in the middle of a function.",
+                "Actually, I couldn't have find any example (by a brief looking across different files).",
+                "But I can move it to the start of the function.",
+                "Although...\r\n```\r\n int posix_fallocate_loop(int fd, uint64_t offset, uint64_t size) {\r\n         int r;\r\n        /* On EINTR try a couple of times more, but protect against busy looping\r\n         * (not more than 16 times per 10s) */\r\n        RateLimit rl = { 10 * USEC_PER_SEC, 16 };\r\n\r\n         r = posix_fallocate(fd, offset, size); /* returns positive errnos on error */\r\n         if (r != EINTR)\r\n                 return -r; /* Let's return negative errnos, like common in our codebase */\r\n\r\n         while (ratelimit_below(&rl)) {\r\n                 r = posix_fallocate(fd, offset, size);\r\n                 if (r != EINTR)\r\n```\r\nIn this version the comment is farther from `ratelimit_below()` call. Do you prefer this way?",
+                "There is no need to move the definition up. Just define it in the exact same place where it was initialized before (and where I made the comment\u2026).\r\n\r\n> Well, I don't see other (at least many) examples of this \"C++-style\" variables declaration in the middle of a function.\r\n\r\nThe style changed. Old code pushed all variable declarations to the top of the function, new code doesn't do that, at least not always.\r\n\r\nBut anyway, it's a minor style issue, we can merge this as is."
+            ]
+        },
+        {
+            "hunk_id": 32562,
+            "commit_id": "e79554d4b8378aab779fb66fd2430f696d8a0ef3",
+            "original_commit_id": "ea846e45c18883dab2f58e2f0d23fd0577b58c8e",
+            "path": "src/test/test-sigbus.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 39,
+            "original_line": 39,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "ha, the old check was entirely borked even...",
+                "Now it should work after return value negation on errors."
+            ]
+        },
+        {
+            "hunk_id": 32561,
+            "commit_id": "e79554d4b8378aab779fb66fd2430f696d8a0ef3",
+            "original_commit_id": "ea846e45c18883dab2f58e2f0d23fd0577b58c8e",
+            "path": "src/libsystemd/sd-journal/journal-file.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 712,
+            "original_line": 712,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "ditto",
+                "I've changed the condition to (r < 0) but kept \"return r\" because we changed the return value of posix_fallocate_loop() to be negative on errors."
+            ]
+        }
+    ]
+}

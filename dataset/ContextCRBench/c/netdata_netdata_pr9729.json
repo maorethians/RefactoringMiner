@@ -1,0 +1,46 @@
+{
+    "repo": "netdata/netdata",
+    "pr_number": 9729,
+    "lang": "c",
+    "pr_title": "Add code to release memory used by the global GUID map",
+    "pr_body": "Fixes #9728\r\n##### Summary\r\nCleanup the memory allocated for the global GUID map and release the associated Judy arrays.\r\n\r\n##### Component Name\r\ndatabase\r\n\r\n##### Test Plan\r\n- Run with `valgrind` or address sanitizer before and after the cleanup code\r\n\r\n##### Additional information\r\nAs this uses memory to keep track of the objects we need to release, we may want to enable this with a compile flag so that the code is activated only during debugging.\r\n\r\n",
+    "pr_comments": [
+        "Let me check that I've understood the big-picture behind what you're doing in this change.\r\n\r\n* JudySL only stores strings and cannot contain NUL-bytes in the key.\r\n* JudyHL allows keys with NUL-bytes but there is no interface to iterate over the keys, and no hook to free up the value when freeing the whole structure.\r\n* The MAP_STORE is being used as an auxiliary store to track the pointers.\r\n* The global_lock for the GUID-map is serializing access to the MAP_STORE so the code does not need to be thread-safe.\r\n* The MAP_STORE is a monotonically growing list of what is stored in the Judy array.\r\n\r\nIf I've understood correctly then I'm concerned about what we are doing. We are removing the static analysis errors by freeing the values when the process terminates. But in order to do so we are:\r\n\r\n* Using more memory.\r\n* The size of the MAP_STORE will increase during execution of the agent so it will behave like a memory leak if the agent is running for a long duration.",
+        "> Let me check that I've understood the big-picture behind what you're doing in this change.\r\n> \r\n> * JudySL only stores strings and cannot contain NUL-bytes in the key.\r\n> * JudyHL allows keys with NUL-bytes but there is no interface to iterate over the keys, and no hook to free up the value when freeing the whole structure.\r\n> * The MAP_STORE is being used as an auxiliary store to track the pointers.\r\n> * The global_lock for the GUID-map is serializing access to the MAP_STORE so the code does not need to be thread-safe.\r\n> * The MAP_STORE is a monotonically growing list of what is stored in the Judy array.\r\n> \r\n> If I've understood correctly then I'm concerned about what we are doing. We are removing the static analysis errors by freeing the values when the process terminates. But in order to do so we are:\r\n> \r\n> * Using more memory.\r\n> * The size of the MAP_STORE will increase during execution of the agent so it will behave like a memory leak if the agent is running for a long duration.\r\n\r\nYes we are using more memory to keep track what to release (which would be released anyway) as the size of the MAP_STORE will eventually max as the number of charts / dimensions stabilizes \r\n\r\nThat's why I say we may want to enable this only during debugging (if tracking memory leaks) so that it keeps the valgrind's output cleaner.\r\n\r\nNow I think about it, I guess it could work without storing extra memory by using the information stored in  `rd->state->metric_uuid`\r\n\r\n",
+        "Can you tie it to the normal `_destroy` calls for the structures? (i.e. instead of holding an extra list attempt to free the uuid and remove it from the map when the structure is destroyed)",
+        "> Can you tie it to the normal `_destroy` calls for the structures? (i.e. instead of holding an extra list attempt to free the uuid and remove it from the map when the structure is destroyed)\r\n\r\nYes I will try to do that",
+        "Missing the final judy array destruction now -- will fix",
+        "It looks like there is a missing `uv_rwlock_rdunlock(&global_lock)` in `find_object_by_guid` https://github.com/netdata/netdata/blob/bca54e920c918bd0a8ce9edbdaad5e43c6aa4c42/database/engine/global_uuid_map/global_uuid_map.c#L172",
+        "Same on https://github.com/netdata/netdata/blob/bca54e920c918bd0a8ce9edbdaad5e43c6aa4c42/database/engine/global_uuid_map/global_uuid_map.c#L178",
+        "> The call-sites look correct and the assumptions about the memory layout match up with the contents of `guid_store_nolock` and ` find_object_by_guid` (although the difference of one byte at the beginning is confusing). Please check the missing unlocks and insert them if they are necessary.\r\n\r\nYes the locks are needed for completeness (all the calls to this unction provide enough space -- RRD_ID_LENGTH_MAX for the CHAR type)\r\n\r\nI will add  the missing unlocks and rebase if CI/CD fails."
+    ],
+    "merged": true,
+    "created_at": "2020-08-14T08:22:58Z",
+    "issue_context": {
+        "number": 9728,
+        "title": "Release the memory allocated for the global GUID map on agent shutdown",
+        "body": "#### Summary\r\n\r\nWhen the agent exits the memory allocated for the global GUID map is not released. Although that is not causing a issue\r\nbecause the memory is reclaimed by the operating system anyway, using e.g `valgrind` to detect agent memory leaks pollutes the output with dozens of entries related to the global GUID map allocations.\r\n\r\ne.g.\r\n\r\n```\r\n==2734329== 24 bytes in 1 blocks are possibly lost in loss record 1,121 of 2,895\r\n==2734329==    at 0x483B7F3: malloc (in /usr/lib/x86_64-linux-gnu/valgrind/vgpreload_memcheck-amd64-linux.so)\r\n==2734329==    by 0x4CAD604: ??? (in /usr/lib/x86_64-linux-gnu/libJudy.so.1.0.3)\r\n==2734329==    by 0x1CE9B3: guid_store_nolock (global_uuid_map.c:54)\r\n==2734329==    by 0x1CF27A: find_or_generate_guid (global_uuid_map.c:243)\r\n==2734329==    by 0x1A6C68: rrdhost_create (rrdhost.c:297)\r\n==2734329==    by 0x1CC242: metalog_pluginsd_host_action (metalogpluginsd.c:68)\r\n==2734329==    by 0x1958C4: metalog_pluginsd_host (pluginsd_parser.c:663)\r\n==2734329==    by 0x1ECAE9: parser_action (parser.c:296)\r\n==2734329==    by 0x1CA7F8: replay_record (logfile.c:411)\r\n==2734329==    by 0x1CAED5: iterate_records (logfile.c:527)\r\n==2734329==    by 0x1CB0B8: load_metadata_logfile (logfile.c:563)\r\n==2734329==    by 0x1CB9A9: scan_metalog_files (logfile.c:696)\r\n==2734329== \r\n==2734329== 32 bytes in 1 blocks are possibly lost in loss record 1,284 of 2,895\r\n==2734329==    at 0x483B7F3: malloc (in /usr/lib/x86_64-linux-gnu/valgrind/vgpreload_memcheck-amd64-linux.so)\r\n==2734329==    by 0x4CAD604: ??? (in /usr/lib/x86_64-linux-gnu/libJudy.so.1.0.3)\r\n==2734329==    by 0x1CEB0E: guid_store_nolock (global_uuid_map.c:83)\r\n==2734329==    by 0x1CF27A: find_or_generate_guid (global_uuid_map.c:243)\r\n==2734329==    by 0x1A6C68: rrdhost_create (rrdhost.c:297)\r\n==2734329==    by 0x1A80CE: rrd_init (rrdhost.c:634)\r\n==2734329==    by 0x129DC3: main (main.c:1448)\r\n==2734329== \r\n==2734329== 32 bytes in 1 blocks are possibly lost in loss record 1,285 of 2,895\r\n==2734329==    at 0x483B7F3: malloc (in /usr/lib/x86_64-linux-gnu/valgrind/vgpreload_memcheck-amd64-linux.so)\r\n==2734329==    by 0x4CAD604: ??? (in /usr/lib/x86_64-linux-gnu/libJudy.so.1.0.3)\r\n==2734329==    by 0x1CEB0E: guid_store_nolock (global_uuid_map.c:83)\r\n==2734329==    by 0x1CF27A: find_or_generate_guid (global_uuid_map.c:243)\r\n==2734329==    by 0x1A6C68: rrdhost_create (rrdhost.c:297)\r\n==2734329==    by 0x1CC242: metalog_pluginsd_host_action (metalogpluginsd.c:68)\r\n==2734329==    by 0x1958C4: metalog_pluginsd_host (pluginsd_parser.c:663)\r\n==2734329==    by 0x1ECAE9: parser_action (parser.c:296)\r\n==2734329==    by 0x1CA7F8: replay_record (logfile.c:411)\r\n==2734329==    by 0x1CAED5: iterate_records (logfile.c:527)\r\n==2734329==    by 0x1CB0B8: load_metadata_logfile (logfile.c:563)\r\n==2734329==    by 0x1CB9A9: scan_metalog_files (logfile.c:696)\r\n```\r\n\r\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 31791,
+            "commit_id": "e287a6114dee5d8cedfd8ab531514dabbb4211ce",
+            "original_commit_id": "b9fa9d01e9f39370b7f7b4b423277e954d3a02d8",
+            "path": "database/rrddim.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 533,
+            "original_line": 533,
+            "side": "RIGHT",
+            "original_position": 22,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "At this point we know the `uuid` and the object address. A call int othe dbengine could delete the entry from the map and free the memory - then we don't need to track the global list.",
+                "(and the second call site obviously :) )"
+            ]
+        }
+    ]
+}

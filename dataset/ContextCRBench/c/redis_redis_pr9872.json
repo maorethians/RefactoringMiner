@@ -1,0 +1,176 @@
+{
+    "repo": "redis/redis",
+    "pr_number": 9872,
+    "lang": "c",
+    "pr_title": "Wait for replicas when shutting down",
+    "pr_body": "To avoid data loss, this commit adds a grace period for lagging replicas to\r\ncatch up the replication offset.\r\n\r\nDone:\r\n\r\n* Wait for replicas when shutdown is triggered by SIGTERM and SIGINT.\r\n\r\n* Wait for replicas when shutdown is triggered by the SHUTDOWN command. A new\r\n  blocked client type BLOCKED_SHUTDOWN is introduced, allowing multiple clients\r\n  to call SHUTDOWN in parallel.\r\n  Note that they don't expect a response unless an error happens and shutdown is aborted.\r\n\r\n* Log warning for each replica lagging behind when finishing shutdown.\r\n\r\n* CLIENT_PAUSE_WRITE while waiting for replicas.\r\n\r\n* Configurable grace period 'shutdown-timeout' in seconds (default 10).\r\n\r\n* New flags for the SHUTDOWN command:\r\n\r\n    - NOW disables the grace period for lagging replicas.\r\n\r\n    - FORCE ignores errors writing the RDB or AOF files which would normally\r\n      prevent a shutdown.\r\n\r\n    - ABORT cancels ongoing shutdown. Can't be combined with other flags.\r\n\r\n* New field in the output of the INFO command: 'shutdown_in_milliseconds'. The\r\n  value is the remaining maximum time to wait for lagging replicas before\r\n  finishing the shutdown. This field is present in the Server section **only**\r\n  during shutdown.\r\n\r\nNot directly related:\r\n\r\n* When shutting down, if there is an AOF saving child, it is killed **even** if AOF\r\n  is disabled. This can happen if BGREWRITEAOF is used when AOF is off.\r\n\r\n* Client pause now has end time and type (WRITE or ALL) per purpose. The\r\n  different pause purposes are *CLIENT PAUSE command*, *failover* and\r\n  *shutdown*. If clients are unpaused for one purpose, it doesn't affect client\r\n  pause for other purposes. For example, the CLIENT UNPAUSE command doesn't\r\n  affect client pause initiated by the failover or shutdown procedures. A completed\r\n  failover or a failed shutdown doesn't unpause clients paused by the CLIENT\r\n  PAUSE command.\r\n\r\nNotes:\r\n\r\n* DEBUG RESTART doesn't wait for replicas.\r\n\r\n* We already have a warning logged when a replica disconnects. This means that\r\n  if any replica connection is lost during the shutdown, it is either logged as\r\n  disconnected or as lagging at the time of exit.\r\n\r\nFixes #9693",
+    "pr_comments": [
+        "@zuiderkwast it occurred to me that there's probably an opportunity for some semi-related cleanup.\r\nwhen we get SIGTERM during loading, we immediately `exit`.\r\nIIRC this code was written before prepareForShutdown had the NOSAVE option (which was added for the SHUTDOWN command).\r\nNow that it has it, i think it's better to go though prepareForShutdown, and pass the appropriate flags (NOSAVE / FORCE).\r\nThere are no should be no fork children at that time, but it's still a good idea to go though other cleanup steps (e.g. modules).\r\n\r\nwhile we are no the subject, i did notice that we're terminating the AOF child only if AOF is enabled, but currently it is also possible to do BGREWRITEAOF when it's disabled (see #9794), so i think the child should be stopped.\r\nSo, if you're already working in that area, we can make additional cleanups.",
+        "Full daily CI: https://github.com/redis/redis/actions/runs/1581569033",
+        "@zuiderkwast unstable now contains shutdown.json, which this PR needs to modify.\r\nthe two things to modify are to provide details on the new arguments (FORCE, and NOW).\r\nand also describe the complexity which was missing till now, but i think now is the chance to describe it.\r\ni.e. if we end up doing foreground save, then it's the same complexity of the SAVE command.",
+        "Approval is for the high level design, I didn't look at the details.",
+        "@redis/core-team May I have your attention again? Two more things added in this PR:\r\n\r\n* Client pause per purpose (failover, shutdown, client pause command)\r\n* SHUTDOWN ABORT",
+        "@zuiderkwast thank you.\r\nI suppose there are some docs that will benefit from an update about this change.\r\nobviously the SHUTDOWN command (which must refer to the new config, and new args), but maybe some other places too?",
+        "@oranagra Thank YOU! Yes, I have updated the page about signal handling. It's merged already in redis/redis-doc#1711."
+    ],
+    "merged": true,
+    "created_at": "2021-12-02T10:29:47Z",
+    "issue_context": {
+        "number": 9693,
+        "title": "[BUG] Data loss when performing a graceful master shutdown under high load",
+        "body": "**Describe the bug**\r\n\r\nA master Redis instance replicating to a replica instance will not successfully perform a graceful shutdown (such as triggered by SIGTERM) in the presence of TCP congestion or CPU overload, losing significant portions of the data offset between the master and replica. This appears to be due to incomplete socket handling.\r\n\r\n**To reproduce**\r\n\r\nTo reproduce I ran experiments with a low-powered computer as the replica, a larger computer running the master, and hacked up a script. All computers were running Linux. The replica computer is slower than the master, ensuring it can't keep up when under heavy load. It was tested with Redis 6.2.6 and b7afac6bc, which include the recent replication improvements (#9166), but with the same results in this area.\r\n\r\n```\r\n#!/usr/bin/env python3\r\n\r\nimport time\r\nimport redis\r\n\r\nr = redis.Redis(host='master', port='6379')\r\nr2 = redis.Redis(host='slave', port='6379')\r\n\r\npipe = r.pipeline(transaction=False)\r\n\r\nfor i in range(1, 5000000):\r\n    pipe.set('mykey', i)\r\n\r\n    if (i % 100 == 0):\r\n        try:\r\n            pipe.execute()\r\n            last_i = i\r\n        except redis.exceptions.ConnectionError:\r\n            print('i:', i, 'last i:', last_i)\r\n            time.sleep(1)\r\n            slave_i = int(r2.get('mykey'))\r\n            print('s:', slave_i)\r\n            print('nice!' if (slave_i in (i, last_i)) else 'ate my data :(')\r\n            exit()\r\n\r\n    if (i % 50000 == 0):\r\n        print('m: {} s: {}'.format(int(r.get('mykey')), int(r2.get('mykey'))))\r\n\r\npipe.execute()\r\n```\r\n\r\nExample output where 76607 writes were lost after several seconds of high load followed by a graceful master shutdown:\r\n\r\n> m: 50000 s: 38899\r\n> m: 100000 s: 76823\r\n> m: 150000 s: 115703\r\n> m: 200000 s: 155760\r\n> m: 250000 s: 198549\r\n> m: 300000 s: 242704\r\n> m: 350000 s: 285037\r\n> m: 400000 s: 325550\r\n> m: 450000 s: 362876\r\n> m: 500000 s: 406120\r\n> User manually issued a SIGINT to the server here.\r\n> i: 523000 last i: 522900\r\n> s: 446293\r\n> ate my data :(\r\n\r\n\r\n**Expected behavior**\r\n\r\nLike when writing to disk (if enabled) at shutdown, make a thorough effort completing writing to replicas before shutdown. I did not find a detailed description in the documentation of what should be expected, but I interpret this section of the replication docs to imply writing to a replica should be equivalent to writing to disk, which I assume is only slow under high load, rather than losing data:\r\n\r\n> It is possible to use replication to avoid the cost of having the master writing the full dataset to disk: a typical technique involves configuring your master redis.conf to avoid persisting to disk at all, then connect a replica configured to save from time to time, or with AOF enabled. However this setup must be handled with care, since a restarting master will start with an empty dataset: if the replica tries to synchronize with it, the replica will be emptied as well.\r\n\r\n\r\n**Additional information**\r\n\r\nI've found two root causes:\r\n\r\n1. writeToClient has logic to \"send as much as possible if the client is a slave\", but if it gets an error it will abort sending. Errors include EAGAIN or EWOULDBLOCK (TCP congestion). Thus graceful shutdown relies on the entire remaining replication data to fit in the socket buffer, else it will give up and cause data loss.\r\n2. After sending sockets are promptly closed and the process exit. However the slave still sends periodic ACK messages and the socket has not been shutdown or handled this case in any other way, and if received before sending all data, that will abort draining the socket buffer (what did fit), closing the connecting by sending an RST.\r\n\r\nI find that at low load (no congestion and able to complete draining the second in under one second) and high luck (hope last ACK was sent just before the shutdown began, so the master has a full second to complete draining the socket), the graceful disconnection of replicas works and the TCP connection is closed by the master by a FIN.\r\n\r\nAt a high load, presumably high enough to consistently fill the socket buffer, you get hit by both these issues.\r\n\r\nI can confirm the first issue by setting the slave socket to blocking mode in flushSlavesOutputBuffers before writeToClient. This completed writing the application buffer to the socket buffer, as it blocks on congestion instead of returning EAGAIN and aborting.\r\n\r\nBlocking works and is roughly equivalent to writing to (a slow) disk, however unlike a (one) file, when replicating the master could be configured with multiple replicas. They would be handled strictly one at a time, which could increase the time to shut down much more than if they would drain concurrently, depending on where the bottleneck is, so blocking is no ideal here.\r\n\r\nThis improves the result considerably but there's still a window at the end where the second issue may abort when draining what's left in the socket buffer. To confirm this I did a quick and dirty removal of the 1-second replication cron task which sends the ACK message. This kept the replica quiet on its end of the socket during the time the master shuts down, which allowed the socket to drain fully then and end the conversation with a FIN.\r\n\r\nWith both hacks in place the example script works \"all the time\", meaning, the several times I've tried, on Linux only, and with no other edge cases taken into account.\r\n\r\n> m: 50000 s: 39825\r\n> m: 100000 s: 79622\r\n> m: 150000 s: 120246\r\n> m: 200000 s: 158027\r\n> m: 250000 s: 198540\r\n> m: 300000 s: 236777\r\n> m: 350000 s: 276379\r\n> m: 400000 s: 315071\r\n> m: 450000 s: 354218\r\n> m: 500000 s: 392000\r\n> i: 530100 last i: 530000\r\n> s: 530000\r\n> nice!",
+        "comments": [
+            "Some replication systems work using coordinate system for e.g in mysql slave server uses binlog position to get updates from from the master server. From this perspective, I am not sure if the issue is actually a data loss. Also, should we really compare write to disk to replication. Writing to disk completely may be necessary to guarantee ACID properties but that does not hold for replication.\r\nEAGAIN or EWOULDBLOCK are totally acceptable in case of non-blocking sockets, is also a non fatal error. The read/write should be retried when there read/write is allowed as per the socket event recognized by poll().",
+            "As a note; it's possible to reproduce the outcome by running the replica within a container on the dev. machine, i.e. same machine as the master but using different ports. The CPU resources can be limited using `--cpus`, like:\r\n\r\n`docker run --cpus=\".09\" --network host --rm -v $CONFIGPATH:/usr/local/etc/redis redis:6.2.6 redis-server /usr/local/etc/redis/replica.conf`",
+            "There'a already a call to `flushSlavesOutputBuffers()` in `prepareForShutdown()`, and we can also maybe properly close these sockets, but i don't think we should keep the master alive (unresponsive to clients) and try to write additional data to sockets that are already full (EWOULDBLOCK).\r\n\r\nWe can also maybe change some logic in the replica to keep reading data from the master even if it failed writing, although that part sounds risky since it'll also delay re-connection.\r\n\r\nHowever, despite both of these \"best effort\" fixes, the end result is the same. the only proper way to safely restart the master is to drain the traffic before doing that.\r\ni.e. either promote the replica with a `FAILOVER`, or just `CLIENT PAUSE WRITE`, and wait for the `master_repl_offset` to match.",
+            "@yesbox Do you have a specific use case where this is a problem than cannot be solved in the other ways @oranagra described?\r\n\r\nIt can be tempting to address this issue with something like `SHUTDOWN DRAIN-REPLICATION` which will block and wait for all replication buffers to flush - but will this be a complete solution? If our goal is to make sure replicas are fully synced when shutting down, we would still not achieve that:\r\n\r\n* We could hang forever, or alternatively time out and still lose data\r\n* How do we handle connection drops? If we allow reconnects we're practically still \"up\" and accepting clients as well.\r\n* Even if we've flushed to socket successfully, we have no guarantee the replica was able to read and load the data.",
+            "The [Kubernetes way of doing graceful shutdown](https://cloud.google.com/blog/products/containers-kubernetes/kubernetes-best-practices-terminating-with-grace) of any service is SIGTERM. I suppose that's why you need this trigger, is that right @yesbox?\r\n\r\nIMHO I think it would be good if graceful shutdown can be a little more graceful. Instead of `shutdown_asap = 1` can we do \"shutdown_soon\", stop accepting writes, keep the event loop, wait for replication to catch up? Then we can force shutdown after a timeout (10 seconds or configurable?) if replication still didn't catch up. It's no guarantee but it's a better best effort perhaps.",
+            "Hi,\r\n\r\nThank you very much for the responses.\r\n\r\n**Addressing the feedback**\r\n\r\nMy expectation is a more thorough effort completing writing to replicas before the process exit or slave sockets to close at graceful shutdown. I expect that this when this effort fails, which we can allow it to, an error per replica we failed to complete writing to is logged before process exit, so that the data loss if any is not quiet.\r\n\r\nKubernetes is a good example and I'm sure that's a problem I will have soon enough, but it's also about being a well behaved daemon in general. When shutting down or rebooting any computer I use, the OS will signal to all processes to shut down and allow them some time to do so. Same goes for stopping/restarting daemons using your init system or what have you. We should use this time to not lose data, as I believe is the intention. That is the type of particular system I'm working with today, where every process gets a SIGTERM from the init system, and no early warning system.\r\n\r\nA database highly valuing racing to exit over not losing recently written data, to me goes against the principle of least astonishment. Up until investigating and finding the cause of intermittent data loss, everyone in contact with this system assumed shutting down was safe, so this is far from obvious and not what users expect. Therefore I don't think that was ever the intention, but rather an issue.\r\n\r\nReferring to the [Redis Signals Handling](https://redis.io/topics/signals) I found just now, I see we are valuing not losing data more highly than I first thought, when replicating to disk. Not only do we synchronous save and fsync (this much I expected), so this will already take an unbound amount of time by default, as Redis replicates to disk by default, but we also:\r\n\r\n> In case the RDB file can't be saved, the shutdown fails, and the server continues to run in order to ensure no data loss. Since Redis 2.6.11 no further attempt to shut down will be made unless a new SIGTERM will be received or the SHUTDOWN command issued.\r\n\r\nI think this makes a good case for extending these values to slave replication, bringing it closer to the legacy expectations already in place for disk replication.\r\n\r\n**Proposal**\r\n\r\nNow combining the feedback @oranagra, @yossigo and @zuiderkwast I see an opening. It's essentially what @zuiderkwast already said but with more words, but here it goes. A proposal:\r\n\r\nOn SIGTERM/SIGINT, if there are the instance has slaves, shutdown_soon is changed from 0 to a timestamp we'll check in serverCron when non-zero, checking if the current time is higher than a configurable shutdown_timeout added to the shutdown_soon timestamp. That makes it still best effort, more so than disk replication, but we can now make a more thorough effort.\r\n\r\nNow that we don't immediately jump out of the event loop, we can CLIENT PAUSE WRITE (conceptually or exactly) and wait for check for all currently connected replicas to report an offset equal to ours, which we'll now check since shutdown_soon is non-zero.\r\n\r\nBonus points for querying the replicas for the offset at a higher rate than the 1 second replica report interval, not to add up to 1 second of extra latency to the detection and exit, and widening the window during which we could falsely report data loss when the shutdown timeout and first report where all replicas caught up races.\r\n\r\nWhen the master has drained to all connected replicas, then \"shutdown_asap\". Maybe log a line saying there were replicas connected and they are all good now, if that's what we do for disk replication already. Otherwise, not losing data should be the default expected case, and we don't speak up when everything is working as expected.\r\n\r\nIf the timeout is reached before the master has drained to all connected replicas, then too bad - log an error and \"shutdown_asap\".\r\n\r\nIf any replica connection is lost during the shutdown before reporting the final offset, log an error. If all replica connections are lost, log an error and \"shutdown_asap\".\r\n\r\nThat makes it three ways to complete shutdown_soon, excluding there being no replicas, in which case it need not enter this state in the first place:\r\n- All connected replicas reported no master offset, while the master no longer accepts writes. Excellent!\r\n- All connected replicas disconnected. Bad, but now we know!\r\n- Timed out. Bad, but now we know!\r\n\r\nI'm leaning towards not letting any replicas or other clients connect during shutdown. We're going down soon, so rejecting is likely the best outcome for clients, so they may connect to a master which may accept writes. As for (re-)connecting replicas during shutdown - if they were not already connected, or so unstable that they could not keep the connection open, attempting to keep them up to date at this time goes beyond best effort. Given that the time to shutdown is short, their connection attempt could just as well have been too late anyway, as this is a race against the shutdown.\r\n\r\nThis way we do not complicate the synchronous prepareForShutdown procedure. We do get confirmation from the replicas by means of offset reporting and comparison before exiting which I think is somewhat equivalent to fsync returning. We keep the responsibility of being connected and receiving updates with replicas as this jibes well with how replicas are set up with replicaof, connecting to their master and not the other way around. We cannot hang forever, and if we fail despite our good efforts, it was not in vain because at least we didn't go quietly. \ud83d\ude42",
+            "@yesbox I think we'll need to consider what additional implications and side effects this may have, but I mostly agree with this proposal.",
+            "I'm willing to work on this once we sort out the some details.\r\n\r\nFAILOVER or just CLIENT PAUSE WRITE?\r\n\r\nCLIENT PAUSE WRITE ensures that there is no data loss, but to also keep the cluster as available as possible, we can promote a replica as soon as it has caught up replication. It makes the cluster accept writes again as fast as possible. Any downsides with this idea?\r\n\r\nI suppose it would have to be slightly different logic for cluster and standalone mode (FAILOVER vs CLUSTER FAILOVER), right?\r\n\r\nAfter a successful failover, we could send CLUSTER FORGET before we exit. How about that?\r\n \r\nFYI: I've been informed about a project where they use a private fork of https://github.com/AmadeusITGroup/Redis-Operator to run Redis Cluster on K8s. It contains a Go program which starts the Redis process. It catches the SIGTERM and sends a FAILOVER command to Redis and then a FORGET after successful failover. Apparently, this works well for \"pod delete\", but it doesn't work for \"worker shutdown\". In the \"worker shutdown\" case, both the Go program and the Redis process will receive SIGTERM simultaneously and then Redis is fast enough to shutdown to cause data loss.",
+            "@zuiderkwast, I think just using CLIENT PAUSE WRITE and ensuring no data loss is appropriate as a first conservative default or option, and additional optimization could be optional and discussed as a separate issue."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 48817,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/server.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 5748,
+            "original_line": 7402,
+            "side": "RIGHT",
+            "original_position": 175,
+            "position": 380,
+            "subject_type": "line",
+            "review_comments": [
+                "Should we update this comment?\r\nWith default configs (i.e server.shutdown_timeout=10) three CTRL+C is now needed to quit ASAP without waiting for disk writings (unless I have missed something..)\r\nIt looks like the second CTRL+C will now trigger a call to finishShutdown() which does AOF and RDB file writings.",
+                "You're right. It's good that you highlight this. I don't know if we need this or if it's enough to just exit(1) on the second CTRL+C. The downside is that if we're waiting for replicas and exit, we don't even try to write the rdb file, but if you press CTRL+C twice, I guess you can live with data loss either way. Any strong opinions?"
+            ]
+        },
+        {
+            "hunk_id": 48822,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/server.c",
+            "start_line": 3816,
+            "original_start_line": 5757,
+            "start_side": "RIGHT",
+            "line": 3819,
+            "original_line": 5760,
+            "side": "RIGHT",
+            "original_position": 212,
+            "position": 280,
+            "subject_type": "line",
+            "review_comments": [
+                "technically speaking, in current code, i guess we can change this to `server.aof_state == AOF_ON`, since in WAIT_REWRITE there's no \"current\" file to flush  to.\r\n\r\nhowever, soon, in #9788 this is gonna change, and in case the state is WAIT_REWRITE, we'll want to delete the new part.\r\n\r\n@chenyang8094 please confirm what i state above, and let's change that code in this PR to be:\r\n1. safe / correct in current unstable \r\n2. make sure it'll cause a merge conflict in your PR so that you'll handle that case there too.",
+                "@oranagra do you want me to change to `server.aof_state == AOF_ON` in this PR?\r\n\r\nI don't think #9788 affects this.",
+                "I think it's the right thing to do (change that condition), specifically if this PR is the last one, and then we publish a release.\r\nbut considering that we're going to change things again soon, and considering that this PR didn't break anything (the condition was wrong to before, and it has no actual implications.\r\nlet's keep the current code in this PR."
+            ]
+        },
+        {
+            "hunk_id": 48819,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/server.c",
+            "start_line": 1766,
+            "original_start_line": 3700,
+            "start_side": "RIGHT",
+            "line": 1767,
+            "original_line": 3701,
+            "side": "RIGHT",
+            "original_position": 45,
+            "position": 65,
+            "subject_type": "line",
+            "review_comments": [
+                "i think we may want to indicate these in INFO",
+                "In the `# Server` section? Always present or only during shutdown? Any specific ideas regarding names of fields and values?",
+                "i suppose that they're such a niche, that maybe we should only have them during shutdown.\r\nbut let's document that and seek feedback.",
+                "I'll append these to the Server section only during shutdown:\r\n\r\n* `shutdown_in_milliseconds:NNNN` (remaining time to wait for repl, calculated)\r\n* `shutdown_flags:snw` (value is a string where s = save, n = nosave, w = waiting for repl.)",
+                "ok, the usability of these is a bit limited, but i guess that for someone that really needs to monitor the shutdown it's enough.\r\nlet be sure to document them (and their elusive pretense) in the top comment and later on in redis.io",
+                "Sure, I'll document it. Do you have a better idea for fields and values?",
+                "Not really. But I can share some random thoughts.. \r\n\r\nI'm not sure if the flags are needed. \r\nI saw you use them in the tests but didn't look closely if that was really necessary. \r\n\r\nThe other thought I had was that other places in the past that showed ETA, or bytes left, we later realized that it wasn't enough in order to calculate progress (I.e. The total was also needed). But I'm not sure if it's applicable in this case. \r\nIt's probably enough to have a boolean, and if instead we have a countdown, that's probably sufficient. ",
+                "Good, I'll skip the flags and keep `shutdown_in_milliseconds` only. We can always add more fields later."
+            ]
+        },
+        {
+            "hunk_id": 48820,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/server.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3801,
+            "original_line": 5738,
+            "side": "RIGHT",
+            "original_position": 30,
+            "position": 258,
+            "subject_type": "line",
+            "review_comments": [
+                "let's mention this change in the top comment. (killing an BGREWRITEAOF child in case AOF is off)",
+                "Done. Top comment is up to date with current implementation."
+            ]
+        },
+        {
+            "hunk_id": 48818,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/db.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 1085,
+            "original_line": 1040,
+            "side": "RIGHT",
+            "original_position": 13,
+            "position": 61,
+            "subject_type": "line",
+            "review_comments": [
+                "thinking out loud here, maybe it's better to reply OK, and let that client (and others) monitor the shudown, instead of blocking it?\r\n\r\ni.e. i imagine we better add some INFO field that they can monitor, or even decide to respond to PING with some SHUTTINGDOWN message?\r\n\r\non the other hand, doing this would be somewhat of a breaking change, since the docs mention this command never replies when it succeeds..",
+                "Yeah, it's worth considering. I went for blocking since it's backwards compatible. I imagine there are scripts using `redis-cli shutdown` in a synchronous way (like [this one](https://src.fedoraproject.org/rpms/redis/blob/main/f/redis-shutdown) that was mentioned in issue #9355 recently).",
+                "ok, let's keep the blocking, but maybe add an INFO field?\r\n\r\nthinking out loud again maybe we can also reject write commands?\r\nin normal PAUSE_WRITES we don't wanna reject the commands since we can get un-paused and run them.\r\nif shutdown is terminal, we can refuse them right away.\r\nif we do that, maybe we should also have some new PING response too?\r\n\r\nhowever, IIUC our shutdown is not always terminal (we can abort it), and also, it's expected to be rather quick (just a few seconds), so let's only add the INFO field."
+            ]
+        },
+        {
+            "hunk_id": 48821,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/server.c",
+            "start_line": 3805,
+            "original_start_line": 5746,
+            "start_side": "RIGHT",
+            "line": 3806,
+            "original_line": 5747,
+            "side": "RIGHT",
+            "original_position": 195,
+            "position": 263,
+            "subject_type": "line",
+            "review_comments": [
+                "maybe we need to also delete the temp file here?",
+                "killAppendOnlyChild is called a few lines below. It deletes the temp file."
+            ]
+        },
+        {
+            "hunk_id": 48823,
+            "commit_id": "1e932e3279086c7c7828c156f8510440a64be33a",
+            "original_commit_id": "b0c06e904a94bbc2da8003a1b230482ee34d6d5f",
+            "path": "src/networking.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 3563,
+            "original_line": 3552,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 44,
+            "subject_type": "line",
+            "review_comments": [
+                "```suggestion\r\n\r\n    /* Find the furthest end time among the pause purposes of the most restrictive type */\r\n    for (int i = 0; i < NUM_PAUSE_PURPOSES; i++) {\r\n```"
+            ]
+        }
+    ]
+}

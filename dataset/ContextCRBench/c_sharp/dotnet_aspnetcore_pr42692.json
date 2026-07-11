@@ -1,0 +1,165 @@
+{
+    "repo": "dotnet/aspnetcore",
+    "pr_number": 42692,
+    "lang": "c_sharp",
+    "pr_title": "[Blazor] Dynamic authentication requests",
+    "pr_body": "Fixes https://github.com/dotnet/aspnetcore/issues/42580\r\n\r\nAdds a new type InteractiveRequestOptions that contains the data developers can use to customize the authentication flows. The data is passed in through the State parameter to the remoteauthenticatorviewcore which then handles the authentication process.\r\n\r\n* Updates RemoteAuthenticatorViewCore to rely on navigation history state to pass in data around for authentication operations.\r\n* Adds logging to the RemoteAuthenticatorViewCore\r\n* Updates AuthenticationService.ts to handle requesting additional tokens\r\n* Updates AuthenticationService.ts to account for the interactiverequest options.\r\n* Adds E2E tests that demonstrate:\r\n  * Sign in can be customized.\r\n  * Requesting a token interactively for a second resource.\r\n\r\n",
+    "pr_comments": [
+        "Updated "
+    ],
+    "merged": true,
+    "created_at": "2022-07-22T08:53:24Z",
+    "issue_context": {
+        "number": 42580,
+        "title": "[Blazor][Wasm] Dynamic and extensible authentication requests",
+        "body": "The new additions offer a loosely coupled model to interact with the underlying authentication service for customizing the authentication details as well as more granular control of the process.\r\n\r\nThis proposal unblocks:\r\nhttps://github.com/dotnet/aspnetcore/issues/37365\r\nhttps://github.com/dotnet/aspnetcore/issues/32640\r\nhttps://github.com/dotnet/aspnetcore/issues/32782\r\nhttps://github.com/dotnet/aspnetcore/issues/19925\r\nhttps://github.com/dotnet/aspnetcore/issues/33784\r\n\r\nIn the initial version of Blazor Webassembly we shipped support for authentication via OAuth supported by oidc-client.js and MSAL.js. Our support allowed people to login, logout and acquire tokens to talk to APIs. All the required parameters were configured statically at startup time.\r\n\r\nOver time, we have observed the need from people to dynamically tweak the parameters used for performing these authentication flows. Whether they need to add additional parameters for their provider or pass in additional options to change the login behavior or the behavior when interaction is required to provision a token.\r\n\r\nThis presented challenges with the current implementation, as all the configuration was defined during startup and there were many options that did not make sense to configure statically, like the login hint or the prompt behavior for the IdP.\r\n\r\nIn addition to that, adding those options to the existing provider options will add an additional maintenance burden.\r\n\r\nIn general, there are four scenarios that we want to support:\r\n* The developer can implement login and log out (provisioning a token as part of that flow).\r\n* The developer can customize the login and logout flows to force the user to re-enter credentials or change accounts.\r\n* The user is able to provision a token silently.\r\n* The user is able to provision a token interactively when it can't be provisioned silently. This can happen for several reasons:\r\n  * The user credentials expired and a new login operation must take place.\r\n  * Acquiring a token for the given scopes requires interaction, for example, if the user needs to consent.\r\n\r\n```mermaid\r\nstateDiagram-v2\r\n\r\nstate \"/\" as Home\r\nstate \"authentication/login\" as Login\r\nstate authenticate <<choice>>\r\nstate orders <<choice>>\r\nstate \"orders/list\" as Resource\r\n[*] --> Home\r\nHome --> authenticate\r\nauthenticate --> Login : Page requires authenticated user.\r\nauthenticate --> Login : User clicks login.\r\nauthenticate --> Login : User clicks change account.\r\nLogin --> Home : User successfullly authenticates\r\nHome --> orders : User navigates to /orders\r\norders --> Login : [Not Authorized]\r\nLogin --> Resource : [Authorized] User successfully authenticates\r\norders --> Resource : [Authorized]\r\nResource --> Login : [Credentials expired]\\nProvision new credentials\r\n```\r\n\r\nOut of those flows, we currently only supported 1 and 3, since we defined the configuration during startup and we relied on the ability to get tokens silently indefinitely in other cases thanks to the AAD ability to consent ahead of time.\r\n\r\nUnfortunately, there are scenarios when that functionality doesn't work and in addition to that, the latest best pratices recommend not requesting consent for additional scopes until you need them.\r\n\r\nGiven the desire to enable these two new scenarios and unblock our customers ability to customize the login process as well as the process for acquiring additional tokens interactively, we are making a few changes to the webassembly authentication system, to better support these concerns.\r\n\r\n## The \"webassembly authentication\" protocol\r\n\r\nUp to now, we would redirect users to the `authentication/login` endpoint and we would optionally include a `returnUrl` parameter in the query string, indicating where the user should be sent back when they completed the flow.\r\n\r\nThis proved enough to implement basic functionality where the `AuthorizeView` will work in concert with the `RedirectToLogin` component in the template to redirect the user to log in and return back to the page.\r\n\r\nSimilarly, whenever the credentials happened to expire, an exception would be thrown and the user would be redirected to the login endpoint to acquire refreshed credentials and return to the same location.\r\n\r\nThis approach worked for simple scenarios, but it was not without risks. Passing data through the query string requires us to deal with encoding and decoding the data and can open us to risks like open redirects, etc.\r\n\r\nIn addition to that, it is hard to pass in structured data (objects) through the query string. There are several approaches, like serializing to JSON and Base64Url encoding the data before putting it on the query string.\r\n\r\nTo support the new scenarios we care about (customizing the login flow, acquiring tokens interactively, passing in additional data, etc.) we want to allow the developer to pass in parameters to the `authentication/login` endpoint that can flow to the service.\r\n\r\nMany of those parameters might be request specific and not suitable to be part of the default ProviderOptions we offer.\r\n\r\nSimilarly, we don't want to necessarily allow changing things like the authority or similar parameters on a per request basis, as that sets up customers for failure.\r\n\r\n## The \"upgraded authentication\" protocol\r\n\r\nTo address some of the challenges of the existing protocol, as well as \"standarize\" in an approach that can enable additional flexibility for future versions, we are going to introduce a new primitive called the `InteractiveAuthenticationRequest`.\r\n\r\nThis request represents the contract for the `authentication/login` endpoint that the `<RemoteAuthenticatorViewCore>` understands.\r\n```mermaid\r\nclassDiagram\r\nclass InteractiveAuthenticationRequest{\r\n  string ReturnUrl\r\n  string[] Scopes\r\n  InteractiveAuthenticationRequestType RequestType\r\n  AddAdditionalParameter(string name, TParameter value)\r\n  TParameter GetAdditionalParameter(string name)\r\n}\r\n\r\nclass InteractiveAuthenticationRequestType{\r\n  <<enumeration>>\r\n  Login\r\n  GetToken\r\n}\r\n```\r\nIt provides first class support for some of the standard properties that we need for performing the flows, like ReturnUrl and Scopes.\r\n\r\nIt provides methods to add and retrieve additional parameters that will be passed down to the underlying JS implementation.\r\n\r\nIn order to pass these parameters to the login endpoint, we are adding support for passing and retrieving state from the `NavigationManager` when performing internal navigations backed by the history API.\r\n\r\nLeveraging the history API offers several benefits:\r\n* The state that we pass to the endpoint is tied to the navigation we perform to the `authentication/login` endpoint.\r\n* Using `state` in the history API we can avoid having to deal with encoding and decoding data.\r\n* Using `state` in the history API reduces the surface attack area, since unlike the query string, it can't be set via a top level navigation nor be influenced from a different origin.\r\n* Using `state` in the history API removes the need for cleanup as the state is attached to the entry and goes away upon successful login (because we replace the history entry).\r\n\r\nPassing the data to the login endpoint can be done with an extension method on navigation manager that takes care of serializing the data and putting it on the state parameter when navigating:\r\n```\r\nnavigationManager.NavigateToLogin(\"login/path\", interactiveRequest);\r\n```\r\n\r\nWith that in mind, the scenarios we care about enabling look like this:\r\n\r\n#### Customize the login process\r\n```csharp\r\n// Likely will add methods like InteractiveAuthenticationRequest.Login(string returnUrl) tailored for common cases.\r\nvar request = new InteractiveAuthenticationRequest(InteractiveAuthenticationRequestType.Authenticate, navigationManager.Uri);\r\n\r\nrequest.AddAdditionalParameter(\"login_hint\",\"peter@example.com\");\r\n\r\nnavigationManager.NavigateToLogin(\"authentication/login\", request);\r\n```\r\n\r\n#### Customize the options before getting a token interactively\r\n```csharp\r\ntry{\r\n   await httpclient.Get(\"/orders\");\r\n   ...\r\n}catch(AccessTokenNotAvailableException ex)\r\n{\r\n  ex.Redirect(interactiveRequest => {\r\n    interactiveRequest.AddAdditionalParameter(\"login_hint\", \"peter@example.com\");\r\n  });\r\n}\r\n```\r\n\r\n#### Customize the options when using the IAccessTokenProvider directly\r\n```csharp\r\nvar result = provider.GetAccessToken(new AccessTokenOptions{ Scopes = new[] {\"a\", \"b\"}});\r\nif(!result.TryGetToken(out var token))\r\n{\r\n  var interaction = result.InteractiveRequest;\r\n  interactiveRequest.AddAdditionalParameter(\"login_hint\", \"peter@example.com\");\r\n  Navigation.NavigateToLogin(result.InteractiveRequestUrl, interaction);\r\n}\r\n```\r\n\r\nIn addition to that, we are going to provide a callback that will be invoked when a given Authentication event happens so that applications can also centralize the logic for passing in additional parameters to the different operations.\r\n\r\nThat's the reason why we don't expose a `IDictionary<string, object>` as the state is serialized between the location originating the navigation (for example the index page) to the `authentication/login` endpoint and deserialized afterwards, which means that the types in the dictionary are lost (replaced for JsonElement) and that would confuse users.\r\n\r\n#### Other information\r\n* Why not a typed model?\r\n  * It would involve adding an additional generic parameter to our types (and they already have enough).\r\n  * It would require us to define the types ourselves.\r\n  * These scenarios are more advanced, and people can write nice wrappers around them for their library if needed.",
+        "comments": [
+            "# API Review diff and scenarios\r\n## API diff\r\n```diff\r\n+public enum InteractionType\r\n+{\r\n+  SignIn = 0\r\n+  GetToken = 1\r\n+  SignOut = 2\r\n+}\r\n\r\n+ public class InteractiveRequestOptions\r\n+ {\r\n+   public InteractiveRequestOptions();\r\n+   public InteractionType Interaction { get; init; }\r\n+   public string ReturnUrl { get; init; }\r\n+   public System.Collections.Generic.IEnumerable<string> Scopes { get; init; }\r\n+   public System.Collections.Generic.IDictionary<string, object> AdditionalRequestParameters { get; set; }\r\n+ \r\n+   public static InteractiveRequestOptions GetToken(string returnUrl);\r\n+   public static InteractiveRequestOptions GetToken(string returnUrl, System.Collections.Generic.IEnumerable<string> scopes);\r\n+   public static InteractiveRequestOptions SignIn(string returnUrl);\r\n+   public static InteractiveRequestOptions SignIn(string returnUrl, System.Collections.Generic.IEnumerable<string> scopes);\r\n+   public static InteractiveRequestOptions SignOut(string returnUrl);\r\n+ }\r\n\r\npublic class AccessTokenNotAvailableException\r\n{\r\n+  void Redirect(System.Action<InteractiveRequestOptions> request);\r\n}\r\n\r\npublic class AccessTokenResult\r\n{\r\n+  public AccessTokenResult(AccessTokenResultStatus status, AccessToken token, string interactiveRequestUrl, InteractiveRequestOptions interactiveRequest);\r\n+  public InteractiveRequestOptions InteractiveRequest { get; }\r\n+  public string InteractiveRequestUrl { get; }\r\n}\r\n\r\npublic class RemoteAuthenticationContext<TRemoteAuthenticationState>\r\n{\r\n+  public InteractiveRequestOptions InteractiveRequest { get; set; }\r\n}\r\n\r\npublic class RemoteAuthenticationService<TRemoteAuthenticationState, TAccount, TProviderOptions>\r\n{\r\n  // Implemented IDisposable with the Dispose pattern\r\n+  protected void virtual Dispose(bool disposing);\r\n\r\n  // Added an additional constructor overload with a logger parameter\r\n+  public RemoteAuthenticationService(\r\n+    Microsoft.JSInterop.IJSRuntime jsRuntime,\r\n+    Microsoft.Extensions.Options.IOptionsSnapshot<RemoteAuthenticationOptions<TProviderOptions>> options,\r\n+    Microsoft.AspNetCore.Components.NavigationManager navigation, AccountClaimsPrincipalFactory<TAccount> accountClaimsPrincipalFactory,\r\n+    Microsoft.Extensions.Logging.ILogger<RemoteAuthenticationService<TRemoteAuthenticationState, TAccount, TProviderOptions>> logger)\r\n}\r\n\r\n+public static class NavigationManagerExtensions()\r\n+{\r\n+  static void NavigateToLogin(this Microsoft.AspNetCore.Components.NavigationManager manager, string loginPath);\r\n+  static void NavigateToLogin(this Microsoft.AspNetCore.Components.NavigationManager manager, string loginPath, InteractiveRequestOptions request);\r\n+  static void NavigateToLogout(this Microsoft.AspNetCore.Components.NavigationManager manager, string logoutPath);\r\n+  static void NavigateToLogout(this Microsoft.AspNetCore.Components.NavigationManager manager, string logoutPath, string returnUrl);\r\n+}\r\n```\r\n\r\n## Scenarios\r\n\r\n### Customizing sign in requests.\r\n```csharp\r\nvar request = InteractiveRequestOptions.SignIn(Navigation.Uri);\r\nrequest.AdditionalRequestParameters = new Dictionary<string, object>\r\n{\r\n    [\"prompt\"] = \"login\"\r\n};\r\n\r\nNavigation.NavigateToLogin(\"authentication/login\", request);\r\n```\r\n\r\n### Logging out\r\n```csharp\r\n  Navigation.NavigateToLogout(\"authentication/logout\");\r\n```\r\n\r\n### Getting a token for a different resource using the IAccessTokenProvider\r\n\r\n```csharp\r\nvar accessTokenResult = await AuthorizationService.RequestAccessToken(new AccessTokenRequestOptions\r\n    {\r\n        Scopes = new[] { \"SecondAPI\" }\r\n    });\r\n\r\nif (!accessTokenResult.TryGetToken(out var token))\r\n{\r\n    Navigation.NavigateToLogin(accessTokenResult.InteractiveRequestUrl, accessTokenResult.InteractiveRequest);\r\n    return;\r\n}\r\n```\r\n\r\n### Getting a token for a different resource as a result of an exception in the authorization message handler\r\n\r\n```csharp\r\ntry\r\n{\r\n   await httpclient.Get(\"/orders\");   \r\n}\r\ncatch(AccessTokenNotAvailableException ex)\r\n{\r\n  ex.Redirect(requestOptions => \r\n  {\r\n    requestOptions.AdditionalRequestParameters.Add(\"login_hint\", \"peter@example.com\");\r\n  });\r\n}\r\n```",
+            "Thank you for submitting this for API review. This will be reviewed by @dotnet/aspnet-api-review at the next meeting of the ASP.NET Core API Review group. Please ensure you take a look at [the API review process documentation](https://github.com/dotnet/aspnetcore/blob/main/docs/APIReviewProcess.md) and ensure that:\n\n* The PR contains changes to the reference-assembly that describe the API change. **Or**, you have included a snippet of reference-assembly-style code that illustrates the API change.\n* The PR describes the impact to users, both positive (useful new APIs) and negative (breaking changes).\n* Someone is assigned to \"champion\" this change in the meeting, and they understand the impact and design of the change.",
+            "API Review Notes:\r\n\r\n- What about the static factory methods on `InteractiveRequestOptions`?\r\n  - Maybe add \"Create\" to the beginning of the method names to make it clear they are factories.\r\n  - And add \"Options\" to the end?\r\n- Let's used required init for required options and null otherwise.\r\n- What about this crazy \"Redirect\" method on an exception?\r\n  - Another overload already exists\r\n- Does \"Redirect\" need a `Action<InteractiveRequestOptions>` or can it take `InteractiveRequestOptions` directly?\r\n  - Type and ReturnUrl cannot change, so it's nice to prepopulate.\r\n- Will `AccessTokenResult.RedirectUrl` be set with the new constructor?\r\n  - Unsure.\r\n  - Do we need to obsolete `RedirectUrl` and the old ctor?\r\n- Just no to the disposing pattern.\r\n- Do we need to make an internal version of `RemoteAuthenticationService` so we can add a ctor without public API?\r\n  - Not this time. It's a lot of work, and we don't expect it to happen again.\r\n- `InteractiveRequestOptions` parameters should be named `requestOptions` instead of `request`.\r\n\r\n```diff\r\n+public enum InteractionType\r\n+{\r\n+  SignIn = 0\r\n+  GetToken = 1\r\n+  SignOut = 2\r\n+}\r\n\r\n+ public sealed class InteractiveRequestOptions\r\n+ {\r\n+   public InteractiveRequestOptions();\r\n+   public required InteractionType Interaction { get; init; }\r\n+   public required string ReturnUrl { get; init; }\r\n+   public System.Collections.Generic.IEnumerable<string> Scopes { get; init; }\r\n+   public System.Collections.Generic.IDictionary<string, object> AdditionalRequestParameters { get; set; }\r\n+ \r\n+   public static InteractiveRequestOptions CreateGetTokenOptions(string returnUrl);\r\n+   public static InteractiveRequestOptions CreateGetTokenOptions(string returnUrl, System.Collections.Generic.IEnumerable<string> scopes);\r\n+   public static InteractiveRequestOptions CreateSignInOptions(string returnUrl);\r\n+   public static InteractiveRequestOptions CreateSignInOptions(string returnUrl, System.Collections.Generic.IEnumerable<string> scopes);\r\n+   public static InteractiveRequestOptions CreateSignOutOptions(string returnUrl);\r\n+ }\r\n\r\npublic class AccessTokenNotAvailableException\r\n{\r\n+  void Redirect(System.Action<InteractiveRequestOptions> requestOptions);\r\n}\r\n\r\npublic class AccessTokenResult\r\n{\r\n+  public AccessTokenResult(AccessTokenResultStatus status, AccessToken token, string interactiveRequestUrl, InteractiveRequestOptions interactiveRequest);\r\n+  public InteractiveRequestOptions InteractiveRequest { get; }\r\n+  public string InteractiveRequestUrl { get; }\r\n}\r\n\r\npublic class RemoteAuthenticationContext<TRemoteAuthenticationState>\r\n{\r\n+  public InteractiveRequestOptions InteractiveRequestOptions { get; set; }\r\n}\r\n\r\npublic class RemoteAuthenticationService<TRemoteAuthenticationState, TAccount, TProviderOptions>\r\n{\r\n  // Added an additional constructor overload with a logger parameter\r\n+  public RemoteAuthenticationService(\r\n+    Microsoft.JSInterop.IJSRuntime jsRuntime,\r\n+    Microsoft.Extensions.Options.IOptionsSnapshot<RemoteAuthenticationOptions<TProviderOptions>> options,\r\n+    Microsoft.AspNetCore.Components.NavigationManager navigation, AccountClaimsPrincipalFactory<TAccount> accountClaimsPrincipalFactory,\r\n+    Microsoft.Extensions.Logging.ILogger<RemoteAuthenticationService<TRemoteAuthenticationState, TAccount, TProviderOptions>> logger)\r\n}\r\n\r\n+public static class NavigationManagerExtensions()\r\n+{\r\n+  static void NavigateToLogin(this Microsoft.AspNetCore.Components.NavigationManager manager, string loginPath);\r\n+  static void NavigateToLogin(this Microsoft.AspNetCore.Components.NavigationManager manager, string loginPath, InteractiveRequestOptions requestOptions);\r\n+  static void NavigateToLogout(this Microsoft.AspNetCore.Components.NavigationManager manager, string logoutPath);\r\n+  static void NavigateToLogout(this Microsoft.AspNetCore.Components.NavigationManager manager, string logoutPath, string returnUrl);\r\n+}\r\n```"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 12438,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/WebAssembly/WebAssembly.Authentication/src/NavigationManagerExtensions.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 55,
+            "original_line": 55,
+            "side": "RIGHT",
+            "original_position": 51,
+            "position": 55,
+            "subject_type": "line",
+            "review_comments": [
+                "Is there a reason why when you're logging out you can specify a `returnUrl` but when you're logging in you can't?",
+                "I understand that it's commonly the case that a login request would be because you're trying to get to some page that requires auth, but isn't it possible that sometimes you want to programmatically trigger a login request that takes you to some different place? Or do you think the only legit pattern is to send them to the different place first, and then rely on that to trigger the login request?",
+                "Oh, forget this. I just realised you can do that when you configure the `InteractiveRequestOptions`."
+            ]
+        },
+        {
+            "hunk_id": 12439,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/WebAssembly/WebAssembly.Authentication/src/RemoteAuthenticatorViewCore.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 133,
+            "original_line": 133,
+            "side": "RIGHT",
+            "original_position": 80,
+            "position": 82,
+            "subject_type": "line",
+            "review_comments": [
+                "Could you explain more about what's going on here? It looks as if we're using `Navigation.HistoryEntryState` as part of the user-facing UI now. Is that really where the error message string now lives?",
+                "It is being passed as part of the state instead of in the query string.",
+                "> Could you explain more about what's going on here? It looks as if we're using Navigation.HistoryEntryState as part of the user-facing UI now. Is that really where the error message string now lives?\r\n\r\nIs it relevant where the message comes from? From the consuming side, you get the message passed down to you as a parameter, consumers don't know if it comes on the query string or on the history entry state.",
+                "OK, it's fine. Can't remember what I was concerned about here."
+            ]
+        },
+        {
+            "hunk_id": 12437,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/WebAssembly/WebAssembly.Authentication/src/NavigationManagerExtensions.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 9,
+            "original_line": 9,
+            "side": "RIGHT",
+            "original_position": 9,
+            "position": 9,
+            "subject_type": "line",
+            "review_comments": [
+                "I suspect many people will try to call these extension methods and be surprised that we're requiring them to specify the URLs to the logout/login pages. It may feel like the framework should know those URLs and do the right thing for them.\r\n\r\nPresumably that's not possible without adding some new feature, or you would have already done it. Is that right?",
+                "It would require a DI service to be injected, since the URLs are configurable. I also don't want to do things that preclude in the future people having multiple authentication options enabled in the same app (like if you want to have AAD and AAD B2C). \r\n\r\nSo being able to pass it in directly makes it more clear in the template and allows different options depending on the context it is being used on.",
+                "For additional context, this is how we do it on the template right now:\r\nhttps://github.com/dotnet/aspnetcore/blob/93d741edb0fa195f59d13743c35d21ee59099fc1/src/ProjectTemplates/Web.ProjectTemplates/content/ComponentsWebAssembly-CSharp/Client/Shared/LoginDisplay.IndividualLocalAuth.razor#L32",
+                "Understood - thanks for clarifying. The template example looks totally reasonable."
+            ]
+        },
+        {
+            "hunk_id": 12440,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/WebAssembly/WebAssembly.Authentication/src/RemoteAuthenticatorViewCore.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 268,
+            "original_line": 268,
+            "side": "RIGHT",
+            "original_position": 185,
+            "position": 187,
+            "subject_type": "line",
+            "review_comments": [
+                "Congratulations! First usage of `with` in this codebase (at least that I've noticed)",
+                "It is actually pretty nice because it avoids a lot of repetition and allows you to define common things in one place."
+            ]
+        },
+        {
+            "hunk_id": 12443,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/test/E2ETest/Tests/WebAssemblyAuthenticationTests.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 231,
+            "original_line": 231,
+            "side": "RIGHT",
+            "original_position": 11,
+            "position": 11,
+            "subject_type": "line",
+            "review_comments": [
+                "What is this `[PLACEHOLDER]` string for? I don't see any other code in this PR that would care what the value of the password is.",
+                "I see some of the existing tests also use this string, but I still am not sure if it's meant to have some meaning or if it's just a completely arbitrary string (including the square brackets).",
+                "~I think this is because we generate a Guid for the password and replace it, as we need to ensure it complies with the password policy of having uppercase, lowercase, numbers and special characters, but to be honest, that is a guess. I just copy pasted an existing test to use as a starting point for these tests~\r\n\r\nThis is to avoid credscan issues. See \r\n![image](https://user-images.githubusercontent.com/6995051/182385114-0e91a37a-22be-4e39-9ac1-f8e489650300.png)\r\n"
+            ]
+        },
+        {
+            "hunk_id": 12442,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/WebAssembly/WebAssembly.Authentication/src/Services/RemoteAuthenticationService.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 73,
+            "original_line": 73,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 26,
+            "subject_type": "line",
+            "review_comments": [
+                "My guess is that you're retaining this contructor overload (with logger being set to null) just to avoid the breaking change, or perhaps to keep people's unit tests working.\r\n\r\nIf so that's fine, and I can see that the logger isn't even used unless we get an incoming JS interop call, so people's unit tests won't be affected.\r\n\r\nHowever, could we at least mark this constructor overload as `[Obsolete]` if there's no good reason for its continued existence in production? It would be nice to clear away this kind of thing eventually.",
+                "There are a bunch of things like this that I have done to \"avoid the breaking changes\", so I will make sure I obsolete things too.",
+                "I made the other constructor obsolete"
+            ]
+        },
+        {
+            "hunk_id": 12441,
+            "commit_id": "35a4e01ed692dc11f6af6cdc771b1c4ba89bfa11",
+            "original_commit_id": "25a5cd88a66cf52b949fcd1a2795de911332204a",
+            "path": "src/Components/WebAssembly/WebAssembly.Authentication/src/RemoteAuthenticatorViewCore.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 279,
+            "original_line": 279,
+            "side": "RIGHT",
+            "original_position": 196,
+            "position": 198,
+            "subject_type": "line",
+            "review_comments": [
+                "If we have to keep the `SignOutManager` approach to blocking CSRF anyway, what's the point of having a new mechanism?",
+                "I am planning to deprecate the SignOutManager in favor of the new way using the NavigationManager, as the SignOutManager relies on local storage, which is not explicitly tied to the navigation action, and requires an additional concept you need to know about.\r\n\r\nI am keeping the SignOutManager code around here to avoid the breaking change for people.",
+                "I have obsoleted the `SignOutManager` as part of this change."
+            ]
+        }
+    ]
+}

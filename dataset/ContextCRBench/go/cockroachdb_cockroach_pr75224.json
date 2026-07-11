@@ -1,0 +1,98 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 75224,
+    "lang": "go",
+    "pr_title": "kvserver: replace circuit breaker cancel goroutine with per-Replica registry",
+    "pr_body": "PR cockroachdb#71806 originally landed with a very simple solution for the problem\r\nof joining the breaker's cancellation chain with that of the incoming\r\ncontext: spawning a goroutine. This was never meant to be the solution\r\nin prod (spawning goroutines is not cheap) and this PR switches to a\r\nreal solution (which may still have soom room for improvement).\r\n\r\nReplica circuit breakers are still off (cockroachdb#74705) and so this change\r\nshould not change any behavior, unless breakers are turned on. The\r\nprovided benchmarks show both the \"end-to-end\" `Replica.Send` as well as\r\nthe micro-bench `breaker.{R,Un}egister` perf and contrast it with that\r\nof having the breakers disabled.\r\n\r\nThis sets the stage for evaluating and, if necessary, minimizing the\r\noverhead, which (along with some additional end-to-end testing) then\r\nallows us to turn breakers on by default (cockroachdb#74705).\r\n\r\n`BenchmarkReplicaCircuitBreakerSendOverhead` measures `Replica.Send` of\r\nan no-result single-point read. We see that we lose a few percent,\r\nthough this benchmark is pretty micro already.\r\n\r\n`BenchmarkReplicaCircuitBreaker_Register` is even more micro, measuring\r\nthe overhead of making a cancel, and calling `Register()` followed by\r\n`Unregister()`. The \"old\" measurement is essentially just creating a\r\ncancelable context (so the +XXXX% numbers don't mean a lot; we're doing\r\nwork for which there was previously no analog). Here we can clearly see\r\nthat sharding the mutex map can help, though note that this would\r\nalready only be visible at the `Replica.Send` level at much higher\r\nconcurrencies than in this test (16).\r\n\r\nI also ran the kv95 roachtest with what corresponds to the `mutexmap-1`\r\nstrategy above (i.e. a single mutex); [raw data here]. In this\r\nconfiguration (relative to disabling breakers) `kv95/enc=false/nodes=1`\r\nand `kv95/enc=false/nodes=1/cpu=32` sustained a -1.62% hit (in qps,\r\nmedian over five runs). Once we've chosen a suitable shard count, I\r\nexpect that to drop a bit as well, and think we can turn on breakers in\r\nproduction, at least from a performance point of view.\r\n\r\n[raw data here]: https://gist.github.com/tbg/44b53a10d18490a6dabd57e1d1d3225e\r\n\r\nold = disabled, new = enabled:\r\n\r\n```\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-1-16     1.63\u00b5s \u00b1 4%    1.77\u00b5s \u00b1 5%     +8.38%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-2-16     1.66\u00b5s \u00b1 4%    1.75\u00b5s \u00b1 5%     +5.74%  (p=0.000 n=10+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-4-16     1.63\u00b5s \u00b1 6%    1.75\u00b5s \u00b1 4%     +7.48%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-8-16     1.58\u00b5s \u00b1 7%    1.73\u00b5s \u00b1 4%     +9.47%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-12-16    1.57\u00b5s \u00b1 4%    1.62\u00b5s \u00b1 6%     +3.19%  (p=0.046 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-16-16    1.56\u00b5s \u00b1 5%    1.63\u00b5s \u00b1 7%     +4.20%  (p=0.007 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-20-16    1.53\u00b5s \u00b1 5%    1.62\u00b5s \u00b1 8%     +6.01%  (p=0.001 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-24-16    1.55\u00b5s \u00b1 7%    1.61\u00b5s \u00b1 5%     +3.50%  (p=0.049 n=11+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-32-16    1.57\u00b5s \u00b1 7%    1.62\u00b5s \u00b1 6%     +3.53%  (p=0.042 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-64-16    1.53\u00b5s \u00b1 7%    1.64\u00b5s \u00b1 5%     +6.84%  (p=0.000 n=11+12)\r\n\r\nname                                                old alloc/op   new alloc/op   delta\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-1-16     1.42kB \u00b1 0%    1.44kB \u00b1 0%     +1.25%  (p=0.000 n=7+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-2-16     1.42kB \u00b1 0%    1.44kB \u00b1 0%     +1.19%  (p=0.000 n=9+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-4-16     1.42kB \u00b1 0%    1.43kB \u00b1 0%     +1.14%  (p=0.000 n=11+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-8-16     1.42kB \u00b1 0%    1.43kB \u00b1 0%     +1.24%  (p=0.000 n=9+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-12-16    1.42kB \u00b1 0%    1.43kB \u00b1 0%     +1.08%  (p=0.000 n=11+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-16-16    1.42kB \u00b1 0%    1.43kB \u00b1 0%     +1.14%  (p=0.000 n=10+10)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-20-16    1.42kB \u00b1 0%    1.43kB \u00b1 0%     +1.12%  (p=0.000 n=10+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-24-16    1.42kB \u00b1 0%    1.43kB \u00b1 0%     +1.09%  (p=0.000 n=11+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-32-16    1.41kB \u00b1 0%    1.43kB \u00b1 0%     +1.13%  (p=0.000 n=9+11)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-64-16    1.41kB \u00b1 0%    1.43kB \u00b1 0%     +1.23%  (p=0.000 n=9+12)\r\n\r\nname                                                old allocs/op  new allocs/op  delta\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-1-16       11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-2-16       11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-4-16       11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-8-16       11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-12-16      11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-16-16      11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-20-16      11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-24-16      11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-32-16      11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\nReplicaCircuitBreakerSendOverhead/X/mutexmap-64-16      11.0 \u00b1 0%      12.0 \u00b1 0%     +9.09%  (p=0.000 n=11+12)\r\n```\r\n\r\n```\r\nReplicaCircuitBreaker_Register/X/mutexmap-1-16        30.8ns \u00b121%   787.6ns \u00b1 2%  +2457.74%  (p=0.000 n=11+11)\r\nReplicaCircuitBreaker_Register/X/mutexmap-2-16        31.6ns \u00b1 3%   782.0ns \u00b1 2%  +2376.38%  (p=0.000 n=9+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-4-16        31.0ns \u00b1 0%   778.8ns \u00b1 2%  +2409.61%  (p=0.000 n=9+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-8-16        31.0ns \u00b1 0%   775.8ns \u00b1 1%  +2403.11%  (p=0.000 n=10+10)\r\nReplicaCircuitBreaker_Register/X/mutexmap-12-16       31.0ns \u00b1 1%   288.8ns \u00b1 2%   +833.06%  (p=0.000 n=10+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-16-16       31.1ns \u00b1 1%   324.6ns \u00b1 4%   +945.05%  (p=0.000 n=10+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-20-16       31.1ns \u00b1 0%   193.3ns \u00b1 2%   +522.26%  (p=0.000 n=10+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-24-16       31.0ns \u00b1 0%   286.1ns \u00b1 1%   +822.80%  (p=0.000 n=9+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-32-16       31.0ns \u00b1 0%   194.4ns \u00b1 2%   +527.12%  (p=0.000 n=10+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-64-16       31.0ns \u00b1 1%   121.3ns \u00b1 2%   +291.01%  (p=0.000 n=10+12)\r\n\r\nname                                                old alloc/op   new alloc/op   delta\r\nReplicaCircuitBreaker_Register/X/mutexmap-1-16         80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-2-16         80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-4-16         80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-8-16         80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-12-16        80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-16-16        80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-20-16        80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-24-16        80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-32-16        80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-64-16        80.0B \u00b1 0%     96.0B \u00b1 0%    +20.00%  (p=0.000 n=11+12)\r\n\r\nname                                                old allocs/op  new allocs/op  delta\r\nReplicaCircuitBreaker_Register/X/mutexmap-1-16          2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-2-16          2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-4-16          2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-8-16          2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-12-16         2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-16-16         2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-20-16         2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-24-16         2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-32-16         2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\nReplicaCircuitBreaker_Register/X/mutexmap-64-16         2.00 \u00b1 0%      3.00 \u00b1 0%    +50.00%  (p=0.000 n=11+12)\r\n```\r\n\r\nCreated via:\r\n\r\n```\r\n$ ./dev bench ./pkg/kv/kvserver/ -f BenchmarkReplicaCircuitBreaker --count 10 | tee out.txt\r\n$ for f in enabled=true enabled=false; do grep -F \"${f}\" out.txt | sed \"s/${f}/X/\" > \"${f}\"; done && benchstat 'enabled=false' 'enabled=true'\r\n```\r\n\r\nFor the record, I also tried a `sync.Map`, but it was vastly inferior\r\nfor this use case as it is allocation-heavy and its writes are fairly\r\nslow.\r\n\r\nTouches cockroachdb#33007.\r\nFixes cockroachdb#74707.\r\n\r\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/75224)\n<!-- Reviewable:end -->\n",
+        "No need to re-review just yet, I'll ping you.",
+        "RFAL.",
+        "TFTR!\r\n\r\nbors r=erikgrinaker",
+        "Build succeeded:\n  * [GitHub CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=4301996&buildTypeId=Cockroach_UnitTests)"
+    ],
+    "merged": true,
+    "created_at": "2022-02-02T12:12:52Z",
+    "issue_context": {
+        "number": 74707,
+        "title": "kvserver: replace circuit breaker cancel goroutine with per-Replica registry",
+        "body": "Touches #33007.\n\nAs of #71806, replica circuit breakers default to off since they use a simple\nbut inefficient mechanism to fail-fast requests that are inflight while the\nbreaker trips.\n\nWe want to improve on that by adding a registry of the cancel functions on `Replica`\nand by letting the probe cancel everyone. This saves one goroutine per request and\nshould have a small perf impact once suitably optimized.\n\nPrerequisite for #74705.\n\n**Describe the solution you'd like**\n\n```go\ntype Replica struct {\n  // ...\n  breakerCancelsMu {\n    syncutil.Mutex\n    sl []func()\n  }\n}\n\nfunc (r *Replica) sendWithRangeID(...) {\n  ctx, cancel := ...\n  r.breakerCancelsMu.Lock()\n  r.breakerCancelsMu.sl = append(..., cancel)\n  r.breakerCancelsMu.Unlock()\n}\n```\n",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 15537,
+            "commit_id": "5d16099b0a845219ad298d826019ff2a3265428a",
+            "original_commit_id": "d69ef24084076e99c5a01417d2fcc32522c39066",
+            "path": "pkg/kv/kvserver/replica_circuit_breaker.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 104,
+            "original_line": 104,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 51,
+            "subject_type": "line",
+            "review_comments": [
+                "Good catch."
+            ]
+        },
+        {
+            "hunk_id": 15536,
+            "commit_id": "5d16099b0a845219ad298d826019ff2a3265428a",
+            "original_commit_id": "d69ef24084076e99c5a01417d2fcc32522c39066",
+            "path": "pkg/kv/kvserver/replica_circuit_breaker.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 90,
+            "original_line": 90,
+            "side": "RIGHT",
+            "original_position": 42,
+            "position": 37,
+            "subject_type": "line",
+            "review_comments": [
+                "Can't we move this above the `brSig.C() == nil` check above to also exclude these from tracking?",
+                "Actually, wouldn't these leak if we don't, since the `C() == nil` check in `Unregister` would prevent them from being removed?",
+                "Good catch! You're right, requests from the probe currently enter the registry but are never removed. This was not intentional. I'm switching the order which should fix this, but leaving a TODO to add test coverage of this case."
+            ]
+        },
+        {
+            "hunk_id": 15538,
+            "commit_id": "5d16099b0a845219ad298d826019ff2a3265428a",
+            "original_commit_id": "d69ef24084076e99c5a01417d2fcc32522c39066",
+            "path": "pkg/kv/kvserver/replica_circuit_breaker_cancelstorage.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 23,
+            "original_line": 23,
+            "side": "RIGHT",
+            "original_position": 23,
+            "position": 23,
+            "subject_type": "line",
+            "review_comments": [
+                "This seems mostly self-explanatory, but very brief method comments could be useful."
+            ]
+        },
+        {
+            "hunk_id": 15535,
+            "commit_id": "5d16099b0a845219ad298d826019ff2a3265428a",
+            "original_commit_id": "d69ef24084076e99c5a01417d2fcc32522c39066",
+            "path": "pkg/kv/kvserver/replica_send.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 99,
+            "original_line": 99,
+            "side": "LEFT",
+            "original_position": 13,
+            "position": 13,
+            "subject_type": "line",
+            "review_comments": [
+                "Love seeing this chunk of code go."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,108 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 46916,
+    "lang": "c_sharp",
+    "pr_title": "Use NotifyServiceStatusChange in ServiceController.WaitForStatus",
+    "pr_body": "Fixes #45049\r\nFixes #46902",
+    "pr_comments": [
+        "Draft Pull Request was automatically closed for inactivity. It can be manually reopened in the next 30 days if the work resumes."
+    ],
+    "merged": false,
+    "created_at": "2021-01-13T14:41:31Z",
+    "issue_context": {
+        "number": 45049,
+        "title": "ServiceController.WaitForStatus could use NotifyServiceStatusChange WinAPI to avoid polling",
+        "body": "Currently, ServiceController [WaitForStatus](https://github.com/dotnet/runtime/blob/master/src/libraries/System.ServiceProcess.ServiceController/src/System/ServiceProcess/ServiceController.cs#L954) method polls every 250ms to check if the service has reached the desired status.\r\nThis is not optimal and also not very performant, particularly if the service takes less than 250ms to reach that status.\r\nApparently lost in the mists of time, [there was a plan](https://github.com/dotnet/corefx/pull/627/files#r24206059) to use the WinAPI function [NotifyServiceStatusChange](https://docs.microsoft.com/it-it/windows/win32/api/winsvc/nf-winsvc-notifyservicestatuschangea) to avoid polling and get instantly notified when the service reaches a specific status.\r\n\r\nI'm opening this issue to prevent this potential improvement from getting lost again.\r\n\r\nProps to @KalleOlaviNiemitalo for finding this.",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 7221,
+            "commit_id": "ad5781125744b6a4f9e701d81a4c69a3bba46594",
+            "original_commit_id": "79ae74f5ca5c8a6fe3a48935e85bd7374959c570",
+            "path": "src/libraries/Common/src/Interop/Windows/Advapi32/Interop.NotifyServiceStatusChange.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 12,
+            "original_line": 12,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "`in` seems wrong because Windows saves the address of the structure and will update its fields before calling the callback."
+            ]
+        },
+        {
+            "hunk_id": 8444,
+            "commit_id": "ad5781125744b6a4f9e701d81a4c69a3bba46594",
+            "original_commit_id": "79ae74f5ca5c8a6fe3a48935e85bd7374959c570",
+            "path": "src/libraries/System.ServiceProcess.ServiceController/src/System/ServiceProcess/ServiceController.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 992,
+            "original_line": 992,
+            "side": "RIGHT",
+            "original_position": 1811,
+            "position": 1811,
+            "subject_type": "line",
+            "review_comments": [
+                "If SleepEx returns WAIT_IO_COMPLETION, then that means the sleep was interrupted by an asynchronous procedure call, but I don't think you can assume that the APC was caused by NotifyServiceStatusChange. It might have been caused by some I/O that was started before WaitForStatus was called.",
+                "That could then lead to stack corruption if WaitForStatus returns too early and frees the stack frame that contains the SERVICE_NOTIFY structure, and the actual status change occurs later and Windows updates fields of the freed structure.",
+                "The stack corruption might usually be prevented because WaitForStatus disposes of serviceHandle before returning, and NotifyServiceStatusChange documentation says that closing the handle cancels the notification request. However, if the notification request queues an asynchronous procedure call immediately after SleepEx returns, I'm not sure whether CloseServiceHandle will cancel the APC as well. (There is QueueUserAPC  but AFAIK no public function for canceling an APC, so there might be no private function for that either.)",
+                "> It might have been caused by some I/O that was started before WaitForStatus was called.\r\n\r\nAny suggestion on this? I guess we should start a new native thread.",
+                "For APCs caused by unrelated I/O, I guess an easy workaround would be to recheck the status of the service after the sleep. Alternatively, embed the notification structure in another structure and make the callback set a flag there, then check the flag. Either way, it would need a retry loop that computes the remaining time.\n\nFor a service notification APC queued before CloseServiceHandle (e.g. if the service status changes immediately after the sleep times out), maybe it could be flushed by an alertable zero-duration sleep after CloseServiceHandle but before freeing the structure. But first it would be nice to know whether the risk actually exists; maybe CloseServiceHandle instead cancels the APC after all.",
+                "From [SleepEx docs](https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleepex): \r\n> For the completion routine to be executed, the thread that called the I/O function must be in an alertable wait state when the completion callback function occurs. A thread goes into an alertable wait state by calling either SleepEx, [...], with the function's bAlertable parameter set to TRUE.\r\n\r\nFrom [QueueUserAPC docs](https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-queueuserapc):\r\n> When a user-mode APC is queued, **the thread is not directed to call the APC function unless it is in an alertable state**. After the thread is in an alertable state, the thread handles all pending APCs [...]\r\n\r\nMy understanding is that APCs are not executed if the thread is not in an alertable state, but it is not clear if the alertable state persists after SleepEx returns. If that's not the case, I don't think that a stack corruption is possible, right? Or am I missing something?",
+                "The alertable state won't persist after SleepEx returns, but I don't know whether Windows updates the SERVICE_NOTIFY structure even before it queues the APC to the thread.",
+                "Ok, this is clear now. It would be very bad if they did that, because that couldn't be prevented even if the APC was canceled. Since the docs don't seem to help, how can we find that out?",
+                "Perhaps easiest to use a user-mode debugger on a C++ test program. Set a data write breakpoint at _SERVICE_NOTIFY_2W::dwNotificationTriggered and a code execution breakpoint at the callback. Get stack traces of both, with correct Windows symbols. That should show which of these is the case:\r\n\r\n* Windows has a user-mode APC routine that first updates _SERVICE_NOTIFY_2W and then calls the application's callback. The name of that routine should appear in both stack traces.\r\n* Windows has a user-mode APC routine that updates _SERVICE_NOTIFY_2W and then queues a separate APC for the application's callback. This seems unlikely because it would cause more context switches than necessary.\r\n* Windows has a kernel-mode APC routine or I/O completion routine that updates _SERVICE_NOTIFY_2W and then queues a user-mode APC for the application's callback. I think the data breakpoint would not even trigger.\r\n* When the thread is alertable, Windows updates _SERVICE_NOTIFY_2W in kernel mode just before it calls the application's user-mode callback. To distinguish this from the previous case, you'd have to add a non-alertable wait in the test program.\r\n\r\nWhichever is the result, it would then be good to file a request to document the behavior.\r\n\r\nIn overlapped I/O, Windows updates the [OVERLAPPED](https://docs.microsoft.com/windows/win32/api/minwinbase/ns-minwinbase-overlapped) structure even if the thread is not alertable (and this can be detected by [HasOverlappedIoCompleted](https://docs.microsoft.com/windows/win32/api/winbase/nf-winbase-hasoverlappediocompleted)), so it would not be too surprising if the service API behaved the same."
+            ]
+        },
+        {
+            "hunk_id": 7220,
+            "commit_id": "ad5781125744b6a4f9e701d81a4c69a3bba46594",
+            "original_commit_id": "79ae74f5ca5c8a6fe3a48935e85bd7374959c570",
+            "path": "src/libraries/System.ServiceProcess.ServiceController/src/System/ServiceProcess/ServiceController.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 992,
+            "original_line": 992,
+            "side": "RIGHT",
+            "original_position": 1811,
+            "position": 1811,
+            "subject_type": "line",
+            "review_comments": [
+                "If SleepEx returns WAIT_IO_COMPLETION, then that means the sleep was interrupted by an asynchronous procedure call, but I don't think you can assume that the APC was caused by NotifyServiceStatusChange. It might have been caused by some I/O that was started before WaitForStatus was called.",
+                "That could then lead to stack corruption if WaitForStatus returns too early and frees the stack frame that contains the SERVICE_NOTIFY structure, and the actual status change occurs later and Windows updates fields of the freed structure.",
+                "The stack corruption might usually be prevented because WaitForStatus disposes of serviceHandle before returning, and NotifyServiceStatusChange documentation says that closing the handle cancels the notification request. However, if the notification request queues an asynchronous procedure call immediately after SleepEx returns, I'm not sure whether CloseServiceHandle will cancel the APC as well. (There is QueueUserAPC  but AFAIK no public function for canceling an APC, so there might be no private function for that either.)",
+                "> It might have been caused by some I/O that was started before WaitForStatus was called.\r\n\r\nAny suggestion on this? I guess we should start a new native thread.",
+                "For APCs caused by unrelated I/O, I guess an easy workaround would be to recheck the status of the service after the sleep. Alternatively, embed the notification structure in another structure and make the callback set a flag there, then check the flag. Either way, it would need a retry loop that computes the remaining time.\n\nFor a service notification APC queued before CloseServiceHandle (e.g. if the service status changes immediately after the sleep times out), maybe it could be flushed by an alertable zero-duration sleep after CloseServiceHandle but before freeing the structure. But first it would be nice to know whether the risk actually exists; maybe CloseServiceHandle instead cancels the APC after all.",
+                "From [SleepEx docs](https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleepex): \r\n> For the completion routine to be executed, the thread that called the I/O function must be in an alertable wait state when the completion callback function occurs. A thread goes into an alertable wait state by calling either SleepEx, [...], with the function's bAlertable parameter set to TRUE.\r\n\r\nFrom [QueueUserAPC docs](https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-queueuserapc):\r\n> When a user-mode APC is queued, **the thread is not directed to call the APC function unless it is in an alertable state**. After the thread is in an alertable state, the thread handles all pending APCs [...]\r\n\r\nMy understanding is that APCs are not executed if the thread is not in an alertable state, but it is not clear if the alertable state persists after SleepEx returns. If that's not the case, I don't think that a stack corruption is possible, right? Or am I missing something?",
+                "The alertable state won't persist after SleepEx returns, but I don't know whether Windows updates the SERVICE_NOTIFY structure even before it queues the APC to the thread.",
+                "Ok, this is clear now. It would be very bad if they did that, because that couldn't be prevented even if the APC was canceled. Since the docs don't seem to help, how can we find that out?",
+                "Perhaps easiest to use a user-mode debugger on a C++ test program. Set a data write breakpoint at _SERVICE_NOTIFY_2W::dwNotificationTriggered and a code execution breakpoint at the callback. Get stack traces of both, with correct Windows symbols. That should show which of these is the case:\r\n\r\n* Windows has a user-mode APC routine that first updates _SERVICE_NOTIFY_2W and then calls the application's callback. The name of that routine should appear in both stack traces.\r\n* Windows has a user-mode APC routine that updates _SERVICE_NOTIFY_2W and then queues a separate APC for the application's callback. This seems unlikely because it would cause more context switches than necessary.\r\n* Windows has a kernel-mode APC routine or I/O completion routine that updates _SERVICE_NOTIFY_2W and then queues a user-mode APC for the application's callback. I think the data breakpoint would not even trigger.\r\n* When the thread is alertable, Windows updates _SERVICE_NOTIFY_2W in kernel mode just before it calls the application's user-mode callback. To distinguish this from the previous case, you'd have to add a non-alertable wait in the test program.\r\n\r\nWhichever is the result, it would then be good to file a request to document the behavior.\r\n\r\nIn overlapped I/O, Windows updates the [OVERLAPPED](https://docs.microsoft.com/windows/win32/api/minwinbase/ns-minwinbase-overlapped) structure even if the thread is not alertable (and this can be detected by [HasOverlappedIoCompleted](https://docs.microsoft.com/windows/win32/api/winbase/nf-winbase-hasoverlappediocompleted)), so it would not be too surprising if the service API behaved the same."
+            ]
+        },
+        {
+            "hunk_id": 8445,
+            "commit_id": "ad5781125744b6a4f9e701d81a4c69a3bba46594",
+            "original_commit_id": "79ae74f5ca5c8a6fe3a48935e85bd7374959c570",
+            "path": "src/libraries/Common/src/Interop/Windows/Advapi32/Interop.NotifyServiceStatusChange.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 12,
+            "original_line": 12,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "`in` seems wrong because Windows saves the address of the structure and will update its fields before calling the callback."
+            ]
+        }
+    ]
+}

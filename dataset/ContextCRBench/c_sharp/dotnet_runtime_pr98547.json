@@ -1,0 +1,56 @@
+{
+    "repo": "dotnet/runtime",
+    "pr_number": 98547,
+    "lang": "c_sharp",
+    "pr_title": "[NativeAOT] Add null checks into memcpy/memset helpers",
+    "pr_body": "Fixes #95517",
+    "pr_comments": [
+        "Tagging subscribers to this area: @agocke, @MichalStrehovsky, @jkotas\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nFixes #95517\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>filipnavara</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-NativeAOT-coreclr`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+        "What is this extra wrapper going to do to the perf? It may be better to make the JIT to inline the null checks instead.",
+        "> What is this extra wrapper going to do to the perf? It may be better to make the JIT to inline the null checks instead.\r\n\r\nWe discussed implement this in the Jit. It is possible, but mildly involved due to the need to do the zero-length check. Additionally, these helpers are not used in scenarios with small sizes that would be most sensitive to the overhead (unless the user uses `Unsafe.CopyBlock/InitBlock` with small dynamic sizes).\r\n\r\n> This can call SpanHelpers.Fill / Buffer.Memmove instead of the C runtime APIs.\r\n\r\nI will note that this would make the implementation fragile in the sense of being prone to self-recursion depending on Jit implementation details (or even optimization choices). Perhaps that's not a big concern; it would be an obvious failure mode.",
+        "> We discussed implement this in the Jit. It is possible, but mildly involved due to the need to do the zero-length check.\r\n\r\nRight, we have two options:\r\n1) Expand block copies/inits early into a complex workflow (esp if we need if-else for nullchecks if we don't want to have implicit ones) and potentially ruin quite a few opts (although, the size/nullchecks could be then folded)\r\n2) Emit these checks during codegen emit (similar to https://github.com/dotnet/runtime/pull/95530). We won't be able to drop the null/size checks and will have to duplicate a complex emit logic for all 6 targets.",
+        "> Additionally, these helpers are not used in scenarios with small sizes that would be most sensitive to the overhead\r\n\r\nAnd only for structs without gc references. The unroll rules are listed here:\r\n\r\nhttps://github.com/dotnet/runtime/blob/d972a19c077e899d0b3fff97d955968e50906396/src/coreclr/jit/compiler.h#L9215-L9222",
+        "> The unroll rules are listed here:\r\n\r\nThis kicks in for constant sizes only. Are there any important cases where these helpers are used for non-constant sizes?",
+        "> Are there any important cases where these helpers are used for non-constant sizes?\r\n\r\n`cpblk`/`initblk` are the only cases where they are used with a dynamic size.",
+        "cc @VSadov We may want to do something similar for CoreCLR too. The current implementation of these helpers for CoreCLR is not GC suspend friendly.",
+        "> The current implementation of these helpers for CoreCLR is not GC suspend friendly.\r\n\r\nFYI `Buffer.MemoryCopy` throws `ExecutionEngineException` for null ptrs on both runtimes.\r\nThe null check should probably be moved into `Buffer.Memmove` instead.",
+        "> Buffer.MemoryCopy throws ExecutionEngineException for null ptrs on both runtimes. The null check should probably be moved into Buffer.Memmove instead.\r\n\r\nYes, it is by design. Passing invalid unmanaged buffers into BCL APIs is undefined behavior. Invalid unmanaged buffers typically signal process state corruption, buffer overrun, etc. We would not want to intentionally convert any situation where we fail fast for these cases today into something that can be caught and handled.",
+        "> > Buffer.MemoryCopy throws ExecutionEngineException for null ptrs on both runtimes. The null check should probably be moved into Buffer.Memmove instead.\r\n> \r\n> Yes, it is by design. Passing invalid unmanaged buffers into BCL APIs is undefined behavior. Invalid unmanaged buffers typically signal process state corruption, buffer overrun, etc. We would not want to intentionally convert any situation where we fail fast for these cases today into something that can be caught and handled.\r\n\r\nI'd expect null to not be considered \"corrupted process state\" kind of invalid in such API? This also only reproduces with a big size, a small one throws a `NullReferenceException`.",
+        "> We may want to do something similar for CoreCLR too. The current implementation of these helpers for CoreCLR is not GC suspend friendly.\r\n\r\nAre these generally used for small sizes like boxing/unboxing or for potentially big buffers as well?",
+        "> I'd expect null to not be considered \"corrupted process state\" kind of invalid in such API? This also only reproduces with a big size, a small one throws a NullReferenceException.\r\n\r\nRight, passing invalid unmanaged buffer into BCL APIs is undefined behavior. We are not trying to detect and convert all cases into fail fasts. If we were to make the behavior more defined, it would be to detect and fail fast in more cases. It tends to come with performance overhead and it is hard to tell when to stop. For example, how far we should go with detecting `Span<T>` with invalid unmanaged buffers?\r\n\r\nThis approach matches how many C/C++ libraries deal with this issue, including standard C library. For example, try calling `fwrite` with null pointer and non-zero buffer size - you are most likely going to see a fatal crash, the details will vary from platform to platform.",
+        "> Are these generally used for small sizes like boxing/unboxing or for potentially big buffers as well?\r\n\r\nI think the following answers that:\r\n\r\n> Additionally, these helpers are not used in scenarios with small sizes that would be most sensitive to the overhead",
+        "> > Are there any important cases where these helpers are used for non-constant sizes?\r\n\r\n> cpblk/initblk are the only cases where they are used with a dynamic size.\r\n\r\nIt turns out that we use initblk in two places in CoreLib: https://github.com/dotnet/runtime/pull/98623#issuecomment-1950977317 that are slower after this change than they need to be. I expect this to be cleaned up as this gets unified with full CoreCLR CoreLib."
+    ],
+    "merged": true,
+    "created_at": "2024-02-16T10:15:08Z",
+    "issue_context": {
+        "number": 95517,
+        "title": "NativeAOT: Memset/Memcpy helpers don't throw NRE",
+        "body": "Compile the following program and run:\r\n```cs\r\nstatic unsafe void Main(string[] args)\r\n{\r\n    Unsafe.InitBlock(null, 0, 1000);\r\n}\r\n```\r\nCoreCLR:\r\n```\r\nUnhandled exception. System.NullReferenceException: Object reference not set to an instance of an object.\r\n```\r\nNativeAOT:\r\n```\r\nno exception, exits.\r\n```\r\n\r\nI assume this is what these comments mean: https://github.com/dotnet/runtime/blob/3e551673a1215a3fdad2a38b4c406895ef29703c/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/JitHelper.cs#L118-L123\r\nso I decided to file a tracking issue.\r\n\r\n(while CoreCLR wraps memset/memcpy calls into non-inlineable/without tail calls helpers)\r\n",
+        "comments": [
+            "Tagging subscribers to this area: @agocke, @MichalStrehovsky, @jkotas\nSee info in [area-owners.md](https://github.com/dotnet/runtime/blob/main/docs/area-owners.md) if you want to be subscribed.\n<details>\n<summary>Issue Details</summary>\n<hr />\n\nCompile the following program and run:\r\n```cs\r\nstatic unsafe void Main(string[] args)\r\n{\r\n    Unsafe.InitBlock(null, 0, 1000);\r\n}\r\n```\r\nCoreCLR:\r\n```\r\nUnhandled exception. System.NullReferenceException: Object reference not set to an instance of an object.\r\n```\r\nNativeAOT:\r\n```\r\nno exception, exits.\r\n```\r\n\r\nI assume this is what these comments mean: https://github.com/dotnet/runtime/blob/3e551673a1215a3fdad2a38b4c406895ef29703c/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/JitHelper.cs#L118-L123\r\n\r\n(while CoreCLR wraps memset/memcpy calls into non-inlineable/without tail calls helpers)\r\n\n\n<table>\n  <tr>\n    <th align=\"left\">Author:</th>\n    <td>EgorBo</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Assignees:</th>\n    <td>-</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Labels:</th>\n    <td>\n\n`area-NativeAOT-coreclr`\n\n</td>\n  </tr>\n  <tr>\n    <th align=\"left\">Milestone:</th>\n    <td>-</td>\n  </tr>\n</table>\n</details>",
+            "This can happen when unboxing tries to use `memcpy`:\r\n```\r\nstruct X { int a, b, c, d, e, f, g, h, ... };\r\nX? x = null;\r\nobject box = (object)x;\r\nint val = (X)box;\r\n```\r\n\r\nInstead of getting a `NullReferenceException` it results in a crash inside `memcpy` with null dereference that is practically undebuggable (no stack trace available due to native code optimizations)."
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 6950,
+            "commit_id": "9a2a842c47cd10b1712fe84c9ff776f7b6dd0f9b",
+            "original_commit_id": "a3f74163d65fbbd81b9ed946e9d74f080be1dc70",
+            "path": "src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/JitHelper.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 137,
+            "original_line": 137,
+            "side": "RIGHT",
+            "original_position": 5,
+            "position": 5,
+            "subject_type": "line",
+            "review_comments": [
+                "@MichalStrehovsky Is a simple implementation of these new helpers needed in TestCoreLib too or can we live without them there?  ",
+                "We can add them when someone runs into this. I'm not sure we have all the helpers to begin with."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,107 @@
+{
+    "repo": "godotengine/godot",
+    "pr_number": 102636,
+    "lang": "cpp",
+    "pr_title": "Fix global scripts not being added because of bad `global_script_class_cache.cfg`",
+    "pr_body": "Fixes #102557, probably also fixes #102568\r\n\r\nThe Issue:\r\nA [commit](https://github.com/godotengine/godot/commit/318af42020cd349c5c9c3e4c88aa87249ca224b0) made \"is_tool\" and \"is_abstract\" mandatory to add new global classes to `ScriptServer::global_classes`.  But `global_script_class_cache.cfg` from projects before 4.4 lack these properties, so these classes won't be added, causing errors when running the game.\r\n\r\nCurrent Solution:\r\nAfter the editor scans all the scripts for the first time, now forcibly updates `global_script_class_cache.cfg`, resolving the issue. \r\nHowever, running a 4.3 game with 4.4 without first opening it with the editor at least once still fails.\r\n\r\nI've tried to fix this in `ScriptServer::init_languages`, where the global classes are first loaded, but couldn't figure it out. \r\n",
+    "pr_comments": [
+        "Some quick thoughts, but @RandomShaper and @Hilderin should be able to assess this further:\r\n\r\n- This seems to remove an optimization (only update when it's need). Would be good to assess whether this will lead to a lot more updates than necessary and possibly a performance impact, or possible side effects of writing an unchanged file to disk too frequently (Windows can be touchy there). If yes, the alternative could be to figure out how to better check whether an update is needed, instead of always updating.\r\n- Another approach could be to make the new `is_tool` and `is_abstract` not mandatory, and treat those as `false` if they're missing. Or a third bool option (\"unset\") but that would require another variable or changing to an int internally, that's a bit hacky.\r\n\r\nI'm not necessarily suggesting to implement any of the above, it's just food for thought. The proposed solution here might totally be the best one already.",
+        "Thanks for the thoughts!\r\n\r\nAbout removing the optimization, i believe the method is called only once at the start of the editor. Only on the `first_scan` of the `EditorFileSystem`. So there should be no big performance impact.\r\n\r\nAnd i thought about making them not mandatory, but tool scripts were added on 4.3, so any tool script migrating to 4.4 might break if we default to false.\r\n\r\nThe problem is not so much the editor, since it refreshes all the scripts at startup, but the games don't work when `global_script_class_cache.cfg` is bad.",
+        "After looking at the issue a bit, I found 2 problems.\r\n\r\n1. When `_first_scan_process_scripts` calls `_register_global_class_script`, the following lines are never called:\r\n```cpp\r\nScriptServer::save_global_classes();\r\nEditorNode::get_editor_data().script_class_save_icon_paths();\r\n```\r\nThat causes the `global_script_class_cache.cfg` to not be saved on first scan. I tested by modifying the `_first_scan_process_scripts` to return true when a new global script is registered and added the call to these 2 lines when it results true.\r\n\r\n2. The most problematic issue is that the `UIDUpgradeTool::get_singleton()->finish_upgrade` is done before the first scan is done. Since the global cache is invalid and because the first scan was skipped, no global classe are registered during the upgrade process, causing all the scripts processed in the update to be invalid. I fixed that by executing the upgrade after the first scan. Note: I'm kept the scan on `upgrade_finished` just in case, but I'm pretty sure it's useless since the first scan was already executed and that the upgrade only resaves resources which should trigger the `EditorFileSystem` to update directly.\r\n\r\nAnother minor modif: I added a break in `EditorFileSystem::_get_global_script_class` to prevent looping for nothing.\r\n\r\n\r\nI created a branch with my modified test code to help you if you want: https://github.com/godotengine/godot/compare/master...Hilderin:godot:fix-global-class-names-not-save-with-upgrade-tool\r\n\r\n",
+        "Thanks for the help Hilderin!\r\n\r\nNow if a global class is found or removed on the first scan, `global_script_class_cache.cfg` is updated.\r\nThis is to ensure migrations from earlier versions have all the needed properties.\r\n\r\nAlso i noticed that every time that `EditorData::script_class_save_icon_paths` was called, `ScriptServer::save_global_classes` was called immediately before. And both methods changed and saved `global_script_class_cache.cfg`. To avoid writing the file twice I took the liberty of unifying both methods into `script_class_save_icon_paths` (but without modifying `save_global_classes`).\r\n",
+        "`script_class_save_icon_paths()` seems to be called as often as before. Now it updates all class properties, while previously it would *load* class cache, modify one property of each class and save it too, so not much changed on that regard. We could better optimize class cache saving, but this PR does not make it worse.",
+        "Thanks a ton! This solves some of the remaining release blockers for 4.4, so that's a huge contribution!"
+    ],
+    "merged": true,
+    "created_at": "2025-02-12T08:39:21Z",
+    "issue_context": {
+        "number": 102557,
+        "title": "Upgrading project to 4.4 results in GDScript parser errors",
+        "body": "### Tested versions\n\n- Reproducible in: 4.4.beta3\n\n### System information\n\nGodot v4.3.stable - Windows 10.0.26100 - Vulkan (Forward+) - dedicated NVIDIA GeForce RTX 4070 Laptop GPU (NVIDIA; 32.0.15.6636) - AMD Ryzen 9 7940HS w/ Radeon 780M Graphics (16 Threads)\n\n### Issue description\n\nI can't quite explain this one, but I happened to run into this when reporting #102551.\n\nIn short, there's something strange going on with GDScript when upgrading this particular MRP from 4.3 to 4.4, where you'll be met with parser errors after upgrading, that then manifest themselves at runtime as well.\n\nIt seems that it has something to do with the stuff that's cached in the `.godot` folder, as deleting it resolves the errors, regardless if you delete it before or after upgrading. As such, I've included a more comprehensive set of reproduction steps to create the project from scratch, as opposed to providing an MRP.\n\nI tried reducing down the script to something even more minimal, but for whatever reason this particular script seems to force the problem.\n\n### Steps to reproduce\n\n- Create a new project using 4.3-stable\n- Add a 2D main scene, call it `main.tscn`\n- Add a new GDScript script through the FileSystem dock, call it `my_resource.gd`\n- Populate `my_resource.gd` with the following contents:\n\n```gdscript\nextends Resource\nclass_name MyResource\n```\n\n- Attach a new script to the root of `main.tscn`, call it `main.gd`\n- Populate `main.gd` with the following contents:\n\n```gdscript\nextends Node2D\n\n@export var my_resource: MyResource\n\nfunc _ready() -> void:\n\tbytes_to_var_with_objects(var_to_bytes_with_objects(my_resource)) as MyResource\n```\n\n- Run the main scene\n- Note that it runs without errors\n- Close the project\n- Open the project in Godot 4.4-beta3\n- Go through the upgrade process\n- Note errors in Output pane saying:\n\n```\nERROR: res://main.gd:3 - Parse Error: Could not find type \"MyResource\" in the current scope.\nERROR: res://main.gd:3 - Parse Error: Cannot use simple \"@export\" annotation because the type of the initialized value can't be inferred.\nERROR: res://main.gd:6 - Parse Error: Could not find type \"MyResource\" in the current scope.\nERROR: modules/gdscript/gdscript.cpp:3022 - Failed to load script \"res://main.gd\" with error \"Parse error\".\n```\n\n- Reload the project\n- Note the lack of errors\n- Run the main scene\n- Note debugger break with error saying `Parser Error: Could not find type \"MyResource\" in the current scope.`\n- Close the project\n- Delete the `.godot` folder\n- Open the project again\n- Run the main scene\n- Note how it runs fine\n\n### Minimal reproduction project (MRP)\n\nN/A",
+        "comments": []
+    },
+    "changes": [
+        {
+            "hunk_id": 11630,
+            "commit_id": "2ba64a57c5b561e39fd26f1c48465b08c0edf222",
+            "original_commit_id": "f418603522ebda0e00dd1e39646ceb42b8b62055",
+            "path": "editor/editor_node.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 899,
+            "original_line": 899,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "I know this is unrelated, but I was curious about why these checks are excluding. I've found it's only possible that one of them is instructed to run. If only this has been modeled as an enum... But again, not in this PR's scope.",
+                "I plan to eventually replace both tools with a universal one. They do pretty much the same thing."
+            ]
+        },
+        {
+            "hunk_id": 11870,
+            "commit_id": "2ba64a57c5b561e39fd26f1c48465b08c0edf222",
+            "original_commit_id": "f418603522ebda0e00dd1e39646ceb42b8b62055",
+            "path": "editor/editor_file_system.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 325,
+            "original_line": 325,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "At this point, I'm wondering if it's just simpler to always resave the global class cache file. With this modification, the cache is saved everytime when there is at least one global class. If `existing_class_names` is empty, saving the file will be ultra fast.\r\n\r\nI still think the best approach should be to return a bool from `_first_scan_process_scripts` to prevent rewriting the cache when nothing was added. It's easy to do and on a large project it could save a couple of ms.",
+                "Also, the original problem is that migrating from 4.3 to 4.4, the properties \"is_tool\" and \"is_abstract\" are missing from `global_script_class_cache.cfg`. I could check if a class was added or removed or if any of the `existing_class_names` have those properties missing, but maybe that complexity is not worth it.\r\n\r\nAlthough I have no problem trying.",
+                "There's already a check when reading the file to skip lines that does not contains these props. So adding a check here propably not worth it.",
+                "I guess it could be done in another PR if needed, it works with the current state of the PR.",
+                "In fact, It's not bad that the cache is recreated each startup because it forces to update all the props of the global classes if the cache file."
+            ]
+        },
+        {
+            "hunk_id": 11629,
+            "commit_id": "2ba64a57c5b561e39fd26f1c48465b08c0edf222",
+            "original_commit_id": "f418603522ebda0e00dd1e39646ceb42b8b62055",
+            "path": "editor/editor_file_system.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 325,
+            "original_line": 325,
+            "side": "RIGHT",
+            "original_position": 8,
+            "position": 8,
+            "subject_type": "line",
+            "review_comments": [
+                "At this point, I'm wondering if it's just simpler to always resave the global class cache file. With this modification, the cache is saved everytime when there is at least one global class. If `existing_class_names` is empty, saving the file will be ultra fast.\r\n\r\nI still think the best approach should be to return a bool from `_first_scan_process_scripts` to prevent rewriting the cache when nothing was added. It's easy to do and on a large project it could save a couple of ms.",
+                "Also, the original problem is that migrating from 4.3 to 4.4, the properties \"is_tool\" and \"is_abstract\" are missing from `global_script_class_cache.cfg`. I could check if a class was added or removed or if any of the `existing_class_names` have those properties missing, but maybe that complexity is not worth it.\r\n\r\nAlthough I have no problem trying.",
+                "There's already a check when reading the file to skip lines that does not contains these props. So adding a check here propably not worth it.",
+                "I guess it could be done in another PR if needed, it works with the current state of the PR.",
+                "In fact, It's not bad that the cache is recreated each startup because it forces to update all the props of the global classes if the cache file."
+            ]
+        },
+        {
+            "hunk_id": 11871,
+            "commit_id": "2ba64a57c5b561e39fd26f1c48465b08c0edf222",
+            "original_commit_id": "f418603522ebda0e00dd1e39646ceb42b8b62055",
+            "path": "editor/editor_node.cpp",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 899,
+            "original_line": 899,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "I know this is unrelated, but I was curious about why these checks are excluding. I've found it's only possible that one of them is instructed to run. If only this has been modeled as an enum... But again, not in this PR's scope.",
+                "I plan to eventually replace both tools with a universal one. They do pretty much the same thing."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,76 @@
+{
+    "repo": "zephyrproject-rtos/zephyr",
+    "pr_number": 61318,
+    "lang": "c",
+    "pr_title": "mgmt: mcumgr: allow for user defined payload",
+    "pr_body": "Use a flag in `c:struct:mgmt_handler` to skip the cbor start and end byte, and instead use pure custom user defined payload.\r\n\r\nFixes #61248",
+    "pr_comments": [
+        "I do not think that this is the right way to do that.\r\nI think that the property of custom payload should be applied to group not a command, in such case all commands within group would obtain the full payload.",
+        "> I do not think that this is the right way to do that. I think that the property of custom payload should be applied to group not a command, in such case all commands within group would obtain the full payload.\r\n\r\nShould we then add an extra parameter `custom_payload` to `mgmt_find_handler`, that will be set the when the correct group is found? Or how would you figure out in `smp_handle_single_payload` if the cbor start- and end byte should be applied?\r\n\r\nSomething like this;\r\n```c\r\nstruct mgmt_group {\r\n\t/** Entry list node. */\r\n\tsys_snode_t node;\r\n\r\n\t/** Array of handlers; one entry per command ID. */\r\n\tconst struct mgmt_handler *mg_handlers;\r\n\tuint16_t mg_handlers_count;\r\n\r\n\t/** The numeric ID of this group. */\r\n\tuint16_t mg_group_id;\r\n\r\n#if IS_ENABLED(CONFIG_MCUMGR_SMP_SUPPORT_ORIGINAL_PROTOCOL)\r\n\t/** A function handler for translating version 2 SMP error codes to version 1 SMP error\r\n\t * codes (optional)\r\n\t */\r\n\tsmp_translate_error_fn mg_translate_error;\r\n#endif\r\n\r\n#if defined(CONFIG_MCUMGR_MGMT_CUSTOM_PAYLOAD)\r\n\tbool custom_payload;\r\n#endif\r\n};\r\n```\r\n\r\n```c\r\nconst struct mgmt_handler *\r\nmgmt_find_handler(uint16_t group_id, uint16_t command_id, bool *custom_payload)     <-----\r\n{\r\n\tstruct mgmt_group *group = NULL;\r\n\tsys_snode_t *snp, *sns;\r\n\r\n\t/*\r\n\t * Find the group with the specified group id, if one exists\r\n\t * check the handler for the command id and make sure\r\n\t * that is not NULL. If that is not set, look for the group\r\n\t * with a command id that is set\r\n\t */\r\n\tSYS_SLIST_FOR_EACH_NODE_SAFE(&mgmt_group_list, snp, sns) {\r\n\t\tstruct mgmt_group *loop_group =\r\n\t\t\tCONTAINER_OF(snp, struct mgmt_group, node);\r\n\t\tif (loop_group->mg_group_id == group_id) {\r\n\t\t\tif (command_id >= loop_group->mg_handlers_count) {\r\n\t\t\t\tbreak;\r\n\t\t\t}\r\n\r\n\t\t\tif (!loop_group->mg_handlers[command_id].mh_read &&\r\n\t\t\t\t!loop_group->mg_handlers[command_id].mh_write) {\r\n\t\t\t\tcontinue;\r\n\t\t\t}\r\n\r\n\t\t\tgroup = loop_group;\r\n\t\t\tbreak;\r\n\t\t}\r\n\t}\r\n\r\n\tif (group == NULL) {\r\n\t\treturn NULL;\r\n\t}\r\n        *custom_payload = group->custom_payload;    <-------\r\n\treturn &group->mg_handlers[command_id];\r\n}\r\n```",
+        "> > I do not think that this is the right way to do that. I think that the property of custom payload should be applied to group not a command, in such case all commands within group would obtain the full payload.\r\n> \r\n> Should we then add an extra parameter `custom_payload` to `mgmt_find_handler`, that will be set the when the correct group is found? Or how would you figure out in `smp_handle_single_payload` if the cbor start- and end byte should be applied?\r\n> \r\n> Something like this;\r\n\r\nThat or, to weasel out of stable API change, provide `mgmt_find_handler_grp` that would be returning entire group object pointer and redesign the `smp_handle_single_payload` around it.",
+        "Maybe we could split it up a bit, like;\r\n\r\n```c\r\nconst struct mgmt_group *\r\nmgmt_find_group(uint16_t group_id)\r\n{\r\n\tsys_snode_t *snp, *sns;\r\n\r\n\t/*\r\n\t * Find the group with the specified group id, if one exists\r\n\t * check the handler for the command id and make sure\r\n\t * that is not NULL. If that is not set, look for the group\r\n\t * with a command id that is set\r\n\t */\r\n\tSYS_SLIST_FOR_EACH_NODE_SAFE(&mgmt_group_list, snp, sns) {\r\n\t\tstruct mgmt_group *loop_group =\r\n\t\t\tCONTAINER_OF(snp, struct mgmt_group, node);\r\n\t\tif (loop_group->mg_group_id == group_id) {\r\n\t\t\tif (command_id >= loop_group->mg_handlers_count) {\r\n\t\t\t\tbreak;\r\n\t\t\t}\r\n\r\n\t\t\tif (!loop_group->mg_handlers[command_id].mh_read &&\r\n\t\t\t\t!loop_group->mg_handlers[command_id].mh_write) {\r\n\t\t\t\tcontinue;\r\n\t\t\t}\r\n\r\n\t\t\treturn loop_group;\r\n\t\t}\r\n\t}\r\n\r\n\treturn NULL;\r\n}\r\n\r\nconst struct mgmt_handler *\r\nmgmt_get_handler(struct mgmt_group *group, uint16_t command_id)\r\n{\r\n\tif (group == NULL) {\r\n\t\treturn NULL;\r\n\t}\r\n\treturn &group->mg_handlers[command_id];\r\n}\r\n```\r\n\r\n```c\r\nstatic int smp_handle_single_payload(struct smp_streamer *cbuf, const struct smp_hdr *req_hdr,\r\n\t\t\t\t     bool *handler_found)\r\n{\r\n\tconst struct mgmt_group *group;\r\n\tconst struct mgmt_handler *handler;\r\n\tgroup = mgmt_find_group(req_hdr->nh_group);\r\n        handler = mgm_get_handler(group, req_hdr->nh_id);\r\n        if (group->custom_payload) {\r\n                ...\r\n        }\r\n        etc...\r\n}\r\n```",
+        "Something like that, you can probably drop `handler_found` from the `smp_handle_single_payload` and `smp_handle_single_req` as the `MGMT_ERR_ENOTSUP` is probably returned from all paths where handler_found would be set to false and the `smp_process_request_packet` can use the `rc == MGM_ERR_ENOTSUP` from `smp_handle_single_req`  to set value to local `handler_found` as call paths where the `handler_found` could be left false have return value of `MGMT_ERR_ENOTSUP` (with exception of, currently,  unreachable code in `smp_handle_single_payload`.",
+        "What do you think about the new commit? @de-nordic & @nordicjm ",
+        "Hi @de-nordic and @nordicjm, \r\nJust out of curiosity, I'm wondering what the next steps are for this PR?",
+        "Awaiting review by @de-nordic but he is busy with other tasks for now",
+        "> Awaiting review by @de-nordic but he is busy with other tasks for now\r\n\r\nSorry, will take a look later. In meantime @nordicjm do you find anything in my proposal that is against your general idea how this should be approached? ",
+        "@kunoh what's going on with the commit message which doesn't seem at all related to this PR?",
+        "> @kunoh what's going on with the commit message which doesn't seem at all related to this PR?\r\n\r\nDon't know what went wrong during my rebase, but will fix it",
+        "> > @kunoh what's going on with the commit message which doesn't seem at all related to this PR?\r\n> \r\n> Don't know what went wrong during my rebase, but will fix it\r\n\r\nProbably done git commit --amend instead of git rebase --continue, and pushed. I do it all the time.",
+        "> > > @kunoh what's going on with the commit message which doesn't seem at all related to this PR?\r\n> > \r\n> > \r\n> > Don't know what went wrong during my rebase, but will fix it\r\n> \r\n> Probably done git commit --amend instead of git rebase --continue, and pushed. I do it all the time.\r\n\r\nYou are right!\r\n\r\nI think it should be fixed now. :)",
+        "@nordicjm @de-nordic please take a look",
+        "Hi @de-nordic,\r\nWould you mind have a look at this PR? Seems to be blocked because of requested changes, but I think it should all have been resolved."
+    ],
+    "merged": true,
+    "created_at": "2023-08-11T09:56:28Z",
+    "issue_context": {
+        "number": 61248,
+        "title": "mgmt: mcumgr: improve custom payload types",
+        "body": "**Is your enhancement proposal related to a problem? Please describe.**\r\n\r\nThe SMP Protocol allow users to add their own custom groups (user groups) after group 64, using any type of data as payload. Currently the implementation is tightly coupled with cbor and adds a start and end byte in the payload which happens outside of the users scope. The start byte indicates the cbor format used in the payload, and is not changeable from userspace.\r\n\r\nAs a user, I would like to add custom handlers that uses Protobuf as the payload format, but I would now have to ignore the 2 byte overhead start- and end byte as they are pointless to custom payload format.\r\n\r\n**Describe the solution you'd like**\r\n\r\nExtend the Major Types to allow users to add their own payload types, currently described in `c:struct:zcbor_major_type_t` and give the user access to set the start byte using the relevant payload type.\r\n",
+        "comments": [
+            "There was a previous PR about this before the transition to zcbor, it is worth looking at again. Though errors would still be reported in zcbor format.",
+            "Can you point me to that old PR, maybe I can try to make a new PR based on the old one?",
+            "https://github.com/zephyrproject-rtos/zephyr/pull/42611",
+            "Thank you, will have a look :-)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 27865,
+            "commit_id": "e81921dfddc9de8c412a7b94c4c37a7b652a6e3c",
+            "original_commit_id": "639d1f803b3db48941ce7c27e55ad130db67b547",
+            "path": "include/zephyr/mgmt/mcumgr/mgmt/mgmt.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 151,
+            "original_line": 151,
+            "side": "RIGHT",
+            "original_position": 55,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "This is stable API change, just add new function that will extract handler from given group."
+            ]
+        },
+        {
+            "hunk_id": 27866,
+            "commit_id": "e81921dfddc9de8c412a7b94c4c37a7b652a6e3c",
+            "original_commit_id": "639d1f803b3db48941ce7c27e55ad130db67b547",
+            "path": "subsys/mgmt/mcumgr/smp/src/smp.c",
+            "start_line": 198,
+            "original_start_line": 198,
+            "start_side": "RIGHT",
+            "line": 200,
+            "original_line": 200,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "This probably could be replaced with\r\n```\r\nif (!IS_ENABLED(CONFIG_MCUMGR_MGMT_CUSTOM_PAYLOAD) || !group->custom_payload) {\r\n```\r\nto reduce the #ifdefs",
+                "No as that will fail compilation if the Kconfig is not enabled due to the field not existing"
+            ]
+        }
+    ]
+}

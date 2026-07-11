@@ -1,0 +1,58 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 55904,
+    "lang": "go",
+    "pr_title": "kvserver: replace rate.RateLimiter with quotapool.RateLimiter in consistency_queue",
+    "pr_body": "Fixes #55652\r\n\r\nWhen running a large restore job, we discovered high CPU usage, which was attributed to the new rate limiter in the consistency_queue introduced in #49763. During the checksum computation the rate limiter ends up doing a lot of nanosecond waits, due to the typically small size of individual key/value pairs. This is inefficient by itself, but since the rate.RateLimiter creates a new Timer for every wait, it ends up being extremely inefficient. The quota pool.RateLimiter pools Timers reducing allocation churn and supports a minimum wait parameter, which converts a lot of small waits into a few larger waits during checksum calculations.\r\n\r\nRelease note: None",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.png\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/55904)\n<!-- Reviewable:end -->\n",
+        "TFTR!\r\n\r\nbors r+",
+        "bors r-",
+        "Canceled.",
+        "bors r+",
+        "Build succeeded:\n  * [GitHub CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=2403383&buildTypeId=Cockroach_UnitTests)"
+    ],
+    "merged": true,
+    "created_at": "2020-10-23T19:06:57Z",
+    "issue_context": {
+        "number": 55652,
+        "title": "Excessive CPU utilization during restore",
+        "body": "#47290 introduced rate limiter during the computation of sha512 checksums.\r\n\r\nI believe this rate limiter, due to fairly inefficient underlying limiter implementation, results in excessive CPU usage during\r\ncluster RESTORE.\r\n\r\nCPU Utilization during restore on an empty cluster (restore is the only process running):\r\n<img width=\"697\" alt=\"Screen Shot 2020-10-16 at 7 59 21 PM\" src=\"https://user-images.githubusercontent.com/54641364/96323315-9d415300-0fea-11eb-94d6-fd304bcaa1b0.png\">\r\n\r\n5 second profile: checksum computation around 40%.\r\n<img width=\"814\" alt=\"Screen Shot 2020-10-16 at 7 56 39 PM\" src=\"https://user-images.githubusercontent.com/54641364/96323355-c6fa7a00-0fea-11eb-8af9-4e742cba114f.png\">\r\n\r\nZooming in, majority of time spent because of new timer creation.\r\n<img width=\"1210\" alt=\"Screen Shot 2020-10-16 at 7 58 54 PM\" src=\"https://user-images.githubusercontent.com/54641364/96323373-dda0d100-0fea-11eb-835d-f482c0b7af82.png\">\r\n\r\nDuring restore we expect many new ranges to be created rapidly.  Setting \r\n```\r\n set cluster setting server.consistency_check.max_rate='1TB';\r\n```\r\nResults in the following CPU utilization picture on the cluster (setting changed at 00)\r\n<img width=\"696\" alt=\"Screen Shot 2020-10-16 at 8 06 26 PM\" src=\"https://user-images.githubusercontent.com/54641364/96323438-1e98e580-0feb-11eb-97b3-d3075bdbb438.png\">\r\n\r\nCPU utilization drops; though we still need to burn cycles computing checksum, at least, we're not spending this time\r\nin the limiter code:\r\n<img width=\"1273\" alt=\"Screen Shot 2020-10-16 at 8 07 54 PM\" src=\"https://user-images.githubusercontent.com/54641364/96323518-6b7cbc00-0feb-11eb-9bf6-ce60b1e699cb.png\">\r\n\r\n",
+        "comments": [
+            "@miretskiy it's an interesting issue, if restore is consistently hitting the newTimer codepath that means that the checksum computations are being throttled by the limiter. Looking at the rate.Limiter code it looks like the go authors chose to use a Timer instead of Sleep to allow for the wait to terminate early if the context is cancelled or expired. \r\n\r\nIt seems that an interesting avenue to explore would be to see if we can disable or otherwise reduce the consistency_queue checker, since all of those sha512 calculations are also creating a lot of pressure on the CPU. Looking at the code the checker is going to run as soon as it can for a range and then every 24 hours. A potential change would be to introduce an offset to the scheduler, so rather than scheduling a consistency check immediately for a range it can do so at a random offset between 0 and the checker interval (i.e. 24 hours by default). \r\n\r\ncc: @tbg wdyt? ",
+            "Consider adopting https://godoc.org/github.com/cockroachdb/cockroach/pkg/util/quotapool#RateLimiter for the rate limiter. It should be much more efficient. It pools the timers and generally allocates zero objects. ",
+            "Re: better scheduling of these checks, the consistency queue \"generally\" spaces them out over the interval.\r\n\r\nHere's the code that \"sleeps\" between consistency checks:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/59306ed424ed537fdf9502b1461f8980a6369ce7/pkg/kv/kvserver/consistency_queue.go#L187-L199\r\n\r\nused from here:\r\n\r\nhttps://github.com/cockroachdb/cockroach/blob/1ba2821900b7cb0b24f333b471b8858730b28a5d/pkg/kv/kvserver/queue.go#L861-L871\r\n\r\nHowever, the profile probably shows the CPU utilization of a single consistency check running. These checks have to run *sometime*, so this seems mostly \"fine\" and the task at hand is making the check cheaper.\r\n\r\nWe should follow Andrew's suggestion. Additionally, it may be worth looking into a much weaker checksum - sha512 seems like overkill. I'd bet that (the sane comparable alternative to) CRC32 would do just fine here, assuming it shaves significant chunks of CPU off.",
+            "> Zooming in, majority of time spent because of new timer creation.\r\n\r\nI encountered the excessive timer creation problem in Pebble. It was fixed by forking the `rate` package and extending the API to support a `DelayN` operation which allowed the caller to implement the waiting as it sees fit (in pebble this is a `time.Sleep`). See https://github.com/cockroachdb/pebble/commit/62af71ee9887ae8a46822deccdb929d5b3dfc35d.",
+            "One thing that might be simpler than any of this is just to reserve bigger chunks of bytes. We know that the stats computation is single threaded. Just reserve a minimum of 32k at a time or something and I suspect this problem will disappear. ",
+            "something like:\r\n\r\n```go\r\n \r\n+       const rateLimitMinAcquisition = 32 << 10 // 32 KiB\r\n+       var rateLimitBudget int                  // already acquired bytes\r\n        visitor := func(unsafeKey storage.MVCCKey, unsafeValue []byte) error {\r\n                // Rate Limit the scan through the range\r\n-               if err := limiter.WaitN(ctx, len(unsafeKey.Key)+len(unsafeValue)); err != nil {\r\n-                       return err\r\n+               byteLen := len(unsafeKey.Key) + len(unsafeValue)\r\n+               if delta := rateLimitBudget - byteLen; delta < 0 {\r\n+                       toAcquire := -delta\r\n+                       if toAcquire < rateLimitMinAcquisition {\r\n+                               toAcquire = rateLimitMinAcquisition\r\n+                       }\r\n+                       if err := limiter.WaitN(ctx, toAcquire); err != nil {\r\n+                               return err\r\n+                       }\r\n+                       rateLimitBudget += toAcquire\r\n                }\r\n+               rateLimitBudget -= byteLen\r\n \r\n                if snapshot != nil {\r\n```",
+            "@tbg you are correct there is some spacing code, but the the spacing function is based off the time it took to process a consistency check, rather than the consistency check interval. Under a heavy load of range creation and with relatively fast checksum computations, this code would not prevent a steady stream of checks. My suggestion was to delay the first check for range and space it out over the first 24 hours, since checking it right after creation does not sounds particularly useful. \r\n\r\nIt seems switching the rate limiters is a good simple fix, it will also allow us to get rid of the custom monstrosity that we built to deal with the bursts in the first place. I will try out the https://godoc.org/github.com/cockroachdb/cockroach/pkg/util/quotapool#RateLimiter and see how it goes. Separate question should we pull this rate limiter into a separate repo so it could be used in Pebble and Cockroach? It would seem like standardizing here would make sense.  ",
+            "@miretskiy if all goes well I should be able to give this a shot on my flex friday, since thats the only time I would have to write some code. ",
+            "> Separate question should we pull this rate limiter into a separate repo so it could be used in Pebble and Cockroach? It would seem like standardizing here would make sense.\r\n\r\nI'm strongly in favor of that. It's got some dependencies on `util/timeutil` and `util/syncutil` and one tiny one on `util/log` which should be easy to shrug off. I'm happy to do the extraction. I'll make a repo on `cockroach/quotapool` with an Apache license on Friday if there's no objections.",
+            "@lunevalex Thanks for taking a look at this.  Spacing out sha computation seems like a reasonable idea.  Using a better timer implementation should also help.\r\n"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 14902,
+            "commit_id": "673585649202323b5952e45a36e93c9050055fd3",
+            "original_commit_id": "746010f2d1f17f0f0606273e16a8ac46e296e138",
+            "path": "pkg/kv/kvserver/replica_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 10011,
+            "original_line": 10011,
+            "side": "RIGHT",
+            "original_position": 27,
+            "position": 27,
+            "subject_type": "line",
+            "review_comments": [
+                "NewRateLimiter is quiet on whether MaxFloat64 burst works. Good opportunity to check and update the comment there accordingly.",
+                "I have trouble seeing how this can work btw. The burst is also the capacity of the bucket. An infinitely sized bucket limits.. nothing?",
+                "Oh nevermind, this is the plan here. Still good to check the semantics. Sorry about noise",
+                "not sure I follow, which comment? I deleted the custom rate limiter and based on my reading of the code there are no restrictions on the burst value in quotapool.RateLimiter",
+                "APIs that take a float often handle the extremal values poorly, so it's good to point out explicitly when they do (at least according to my preference). It's fine if you don't want to reach into the quotapool package in this PR, though."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,58 @@
+{
+    "repo": "dotnet/orleans",
+    "pr_number": 4907,
+    "lang": "c_sharp",
+    "pr_title": "Propagate message serialization exceptions to callers",
+    "pr_body": "Fixes #4793 \r\n\r\nThere are 6 scenarios being tested, which can be summed up as `{Serialization, Deserialization} exception sending to a {client, grain} from a {client, grain}` except I didn't add tests for the client-to-client cases (they go via silo anyway).\r\n\r\nIn the end, there's similar logic for handling these exceptions in:\r\n* `GatewayConnection.OnMessageSerializationFailure` - client to gateway (request)\r\n* `InvokableObjectManager.LocalObjectMessagePumpAsync` - client to gateway (response)\r\n* `Gateway.GatewaySender.OnMessageSerializationFailure` - gateway to client\r\n* `SiloMessageSender.OnMessageSerializationFailure` - silo to silo\r\n\r\nThe client-to-gateway response scenarios are a little contrived, since client objects are not supposed to be able to return `Task` or `Task<T>`, only `void`. The code generator blocks `Task`/`Task<T>` for external users. Nevertheless, it's worth adding tests for the scenario just in case, and it helped to uncover some issues and places we could improve logging.",
+    "pr_comments": [],
+    "merged": true,
+    "created_at": "2018-08-31T20:18:36Z",
+    "issue_context": {
+        "number": 4793,
+        "title": "Serialization errors on exceptions thrown from grain methods cause client timeouts",
+        "body": "Take grain interface:\r\n\r\n```\r\ninterface IFoo\r\n{\r\n    Task DoSomething();\r\n}\r\n```\r\n\r\nIf, for whatever reason, DoSomething() encounters an unhandled exception that reaches the runtime, and the runtime cannot serialize it back to the client, the runtime sends nothing back to the client causing an eventual client timeout.\r\n\r\nThe expected behavior is the client would receive some generic serialization failed exception.  Without this these types of issues are very difficult to debug.",
+        "comments": [
+            "I believe the issue and crux of the fix is as follows:\r\n\r\n```diff\r\n+@@ -117,12 +126,13 @@ protected override void OnMessageSerializationFailure(Message msg, Exception exc\r\n             {\r\n                 messageCenter.SendRejection(msg, Message.RejectionTypes.Unrecoverable, exc.ToString());\r\n             }\r\n-            else if (msg.Direction == Message.Directions.Response && msg.Result != Message.ResponseTypes.Error)\r\n+            else if (msg.Direction == Message.Directions.Response && msg.ForwardCount < this.options.MaxForwardCount)\r\n             {\r\n                 // if we failed sending an original response, turn the response body into an error and reply with it.\r\n                 // unless the response was already an error response (so we don't loop forever).\r\n                 msg.Result = Message.ResponseTypes.Error;\r\n                 msg.BodyObject = Response.ExceptionResponse(exc);\r\n+                msg.ForwardCount++;\r\n                 messageCenter.SendMessage(msg);\r\n             }\r\n```\r\n\r\nPerhaps using ForwardCount like that is inappropriate and the message should be tagged in another way.\r\n\r\nAlternatively, we could skip this check, since this method is only ever called upon serialization failure and therefore the only exception which we should see here is SerializationException (must ensure there's no InnerException, must also verify that assertion)"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 30374,
+            "commit_id": "334bb43c911c1cbb24a00efb86cef0375dbb8644",
+            "original_commit_id": "44d9c0ca469d0bfbc86c142f37f0fbd70f453809",
+            "path": "src/Orleans.Core/Runtime/InvokableObjectManager.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 190,
+            "original_line": 190,
+            "side": "RIGHT",
+            "original_position": 35,
+            "position": 35,
+            "subject_type": "line",
+            "review_comments": [
+                "why is this method name SendResponseAsyc, it is not async method though. ",
+                "Maybe because it's non-blocking, but I'm not sure. It could be renamed at some point."
+            ]
+        },
+        {
+            "hunk_id": 30373,
+            "commit_id": "334bb43c911c1cbb24a00efb86cef0375dbb8644",
+            "original_commit_id": "44d9c0ca469d0bfbc86c142f37f0fbd70f453809",
+            "path": "src/Orleans.Core/Messaging/GatewayConnection.cs",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 278,
+            "original_line": 278,
+            "side": "RIGHT",
+            "original_position": 48,
+            "position": 42,
+            "subject_type": "line",
+            "review_comments": [
+                "what if serialization on this msg failed as well? do we want to add a try catch here, if this exception failed to serialize, we flatten it to a string, or a minimal Exception to return to the caller, stating serialization issue happened?",
+                "SendMessage just enqueues the message, so no serialization happens at that stage. If this also fails to be serialized then something is very wrong.\r\nIn the case that we're failing while sending a request message, the rejection will be handled locally and therefore won't be serialized. For response messages, the entire message body is being replaced by a different exception, so if that doesn't work then we have big issues (catastrophe).\r\n\r\nIf the message still fails then it could be a RequestContext issue, but that means that we won't even be able to deserialize message headers (so we have no information to go by)\r\n\r\nLonger term, I'd like to move RequestContext out of the headers for this very reason."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,73 @@
+{
+    "repo": "systemd/systemd",
+    "pr_number": 31109,
+    "lang": "c",
+    "pr_title": "nspawn: resolve network interface names before move to container namespace",
+    "pr_body": "Fixes #31104.",
+    "pr_comments": [
+        "It does seem to fix the original issue, but stuff unfortunately breaks a couple of tests later:\r\n\r\n```\r\nJan 27 22:48:04 H testsuite-13.sh[2634]: + for container in nss-mymachines-{noip,singleip,manyips}\r\nJan 27 22:48:04 H testsuite-13.sh[2634]: + timeout 30 bash -xec 'while [[ ! -e /var/lib/machines/nss-mymachines-manyips/initialized ]]; do sleep .5; done'\r\nJan 27 22:48:04 H testsuite-13.sh[2726]: + [[ ! -e /var/lib/machines/nss-mymachines-manyips/initialized ]]\r\nJan 27 22:48:04 H testsuite-13.sh[2634]: + ip addr add 10.1.0.1/24 dev ve-singleip\r\nJan 27 22:48:04 H testsuite-13.sh[2634]: + ip addr add 10.2.0.1/24 dev ve-manyips\r\nJan 27 22:48:04 H testsuite-13.sh[2634]: + ip addr add fd00:dead:beef:cafe::1/64 dev ve-manyips nodad\r\nJan 27 22:48:04 H testsuite-13.sh[2729]: RTNETLINK answers: Permission denied\r\n```\r\n\r\nIt can be easily reproduced with something like:\r\n```\r\n# systemd-nspawn -bD / --volatile=yes --network-veth &\r\n[1] 141930\r\n\u2591 Spawning container centos8s.localdomain on /.\r\n\u2591 Press Ctrl-] three times within 1s to kill container.\r\nUsing default interface naming scheme 'v255'.\r\nNetwork interface name 've-centos8s.localdomain' has been changed to 've-centos8sb2Mq' to fit length constraints.\r\n\r\n[1]+  Stopped                 systemd-nspawn -bD / --volatile=yes --network-veth\r\n# ip l\r\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\r\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\r\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\r\n    link/ether 52:54:00:81:31:6b brd ff:ff:ff:ff:ff:ff\r\n    altname enp0s6\r\n    altname ens6\r\n17: ve-centos8sb2Mq@if2: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000\r\n    link/ether e6:f1:00:48:86:9b brd ff:ff:ff:ff:ff:ff link-netnsid 0\r\n    altname ve-centos8s.localdomain\r\n# ip a add 10.0.0.1/24 dev ve-centos8sb2Mq\r\n# ip a add fd00:dead:beef:cafe::1/64 dev ve-centos8sb2Mq\r\nRTNETLINK answers: Permission denied\r\n```",
+        "Ah, that's not caused by this patch, since it fails with the same error even on main, the altname test just fails first. So I guess it got broken also by https://github.com/systemd/systemd/pull/30956.",
+        "I have no idea. Please confirm that IPv6 is not disabled on the system?\r\nAt least, with kernel v6.6.9 works fine with the above reproducer. Please bisect the kernel and find which commit fixes the issue.\r\nAnd, maybe better to move the new issue to a separated page. At least, the issue should not related to #30956 and this PR.",
+        "> I have no idea. Please confirm that IPv6 is not disabled on the system? At least, with kernel v6.6.9 works fine with the above reproducer. Please bisect the kernel and find which commit fixes the issue. And, maybe better to move the new issue to a separated page. At least, the issue should not related to #30956 and this PR.\r\n\r\nUgh, sorry about that, I completely forgot about this snippet:\r\n```\r\n# grep ipv6 /etc/sysctl.conf \r\nnet.ipv6.conf.all.disable_ipv6 = 1\r\n```\r\n(why netlink returns EPERM instead of EOPNOTSUPP???)\r\n\r\nAnyway, with this sorted out, the test now works as expected. Thanks a lot!",
+        "> (why netlink returns EPERM instead of EOPNOTSUPP???)\r\n\r\nYeah, but this is the behavior for long time.\r\nhttps://github.com/torvalds/linux/blob/41bccc98fb7931d63d03f326a746ac4d429c1dd3/net/ipv6/addrconf.c#L2514-L2515",
+        "By the way, once this is merged, I'll go ahead and bump the C8S CentOS CI job to C9S (which, kernel-wise, means a bump from ~4.18.0 to ~5.14.0).",
+        "lgtm"
+    ],
+    "merged": true,
+    "created_at": "2024-01-29T10:31:01Z",
+    "issue_context": {
+        "number": 31104,
+        "title": "`systemd-nspawn` fails to resolve altname with `--network-interface=` on older kernels",
+        "body": "This seems to be fallout from https://github.com/systemd/systemd/pull/30956, but CI didn't catch it because Ubuntu CI was gone and the C8S job runs QEMU tests only once per day (where it failed, but I got to it just now). It can be easily reproduced with:\r\n\r\n```\r\n# ip link add dev sd-test type dummy && ip link property add dev sd-test altname foo; ip link show sd-test\r\n6: sd-test: <BROADCAST,NOARP> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000\r\n    link/ether be:0e:8b:21:c8:ca brd ff:ff:ff:ff:ff:ff\r\n    altname foo\r\n# systemd-nspawn -D / --volatile=yes --network-interface=sd-test:foo true\r\n\u2591 Spawning container centos8s.localdomain on /.\r\n\u2591 Press Ctrl-] three times within 1s to kill container.\r\n\r\nUnknown interface name foo: No such device\r\n(sd-netns) failed with exit status 1.\r\nFailed to fork process (sd-netns): Protocol error\r\n```\r\n\r\nIt's the `rtnl_resolve_link_alternative_name()` call from `sd_device_new_from_ifname()` that fails in this case, but that's as far as I've gotten. /cc @yuwata",
+        "comments": [
+            "~~Hm? Could you provide a link to the failed log?~~\r\nI found it e.g. https://autopkgtest.ubuntu.com/results/autopkgtest-jammy-upstream-systemd-ci-systemd-ci/jammy/amd64/s/systemd-upstream/20240126_091644_6fa4a@/log.gz",
+            "Does the kernel include the following commit?\r\nhttps://github.com/torvalds/linux/commit/76c9ac0ee878f6693d398d3a95ccaf85e1f597a (v5.5)\r\n\r\nHm, at least the above ubuntu CI failure, the kernel is 5.15...",
+            "Below is in v5.19,\r\nhttps://github.com/torvalds/linux/commit/5ea08b5286f66ee5ac0150668c92d1718e83e1ad (v5.19)\r\nBut, if I believe the commit message, this should not change any behavior for RTM_GETLINK.",
+            "@jpirko Do you have any idea about that?\r\nThe issue is in an old kernel, that we cannot resolve an interface from an alternative interface name (may be in a 'non-main' network namespace, as we have test cases about that in a 'main' network namespace and they works fine if I believe the log).",
+            "@mrc0mmand Does the following work on the old kernel environment?\r\n```sh\r\n$ sudo ip netns add hoge\r\n$ sudo ip netns exec hoge ip link add foo type dummy\r\n$ sudo ip netns exec hoge ip link property add dev foo altname foo-altname\r\n$ sudo ip netns exec hoge ip link show dev foo-altname\r\n5: foo: <BROADCAST,NOARP> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000\r\n    link/ether 06:60:ef:a5:b9:69 brd ff:ff:ff:ff:ff:ff\r\n    altname foo-altname\r\n```",
+            "If I understand the commit message correctly, the following commit should fix the issue:\r\nhttps://github.com/torvalds/linux/commit/8e15aee621618a3ee3abecaf1fd8c1428098b7ef (v6.6).\r\nThe commit message contains exactly the same example in the above.",
+            "So, remaining thing here is, we should workaround the issue in userspace or not...",
+            "Original fix: https://github.com/torvalds/linux/commit/8e15aee621618a3ee3abecaf1fd8c1428098b7ef (v6.6)\r\nv6.5.y: https://github.com/gregkh/linux/commit/5a7b9ca3ec2c4041afdf19b1e4cfcae1df04e420 (v6.5.9)\r\nv6.1.y: https://github.com/gregkh/linux/commit/46de539282f278cae142d38ae32aed3e20f07a09 (v6.1.60)\r\n\r\nThe fix is on top of https://github.com/torvalds/linux/commit/5ea08b5286f66ee5ac0150668c92d1718e83e1ad (v5.19), so the currently the fix has not come to v5.15-stable branch yet.",
+            "So, the fix in the kernel side is quite new. I opened PR #31109 for the issue. I have not tested it, as my laptop runs kernel 6.6. @mrc0mmand Could you test the PR?"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 32747,
+            "commit_id": "a342d9e0875704136a7f8c4bf00f46782917e15e",
+            "original_commit_id": "17f3e91e8107b2b29fe25755651b230bbc81a514",
+            "path": "src/libsystemd/sd-netlink/netlink-util.h",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 71,
+            "original_line": 71,
+            "side": "RIGHT",
+            "original_position": 49,
+            "position": 49,
+            "subject_type": "line",
+            "review_comments": [
+                "assert(name) since it's used in the log, or change it to strna()"
+            ]
+        },
+        {
+            "hunk_id": 32748,
+            "commit_id": "a342d9e0875704136a7f8c4bf00f46782917e15e",
+            "original_commit_id": "17f3e91e8107b2b29fe25755651b230bbc81a514",
+            "path": "src/libsystemd/sd-netlink/netlink-util.c",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 148,
+            "original_line": 148,
+            "side": "RIGHT",
+            "original_position": 140,
+            "position": 138,
+            "subject_type": "line",
+            "review_comments": [
+                "why put this last? I'd really put this first, given it's the cheapest operation",
+                "No reason, but all operations should have the same cost."
+            ]
+        }
+    ]
+}

@@ -1,0 +1,172 @@
+{
+    "repo": "cockroachdb/cockroach",
+    "pr_number": 93324,
+    "lang": "go",
+    "pr_title": "ccl/backupccl: add memory monitor to external SST iterators in restore",
+    "pr_body": "Previously, there was no limit on the amount of memory that can be used while\r\nconstructing edternal SST iterators during restore. This patch adds a memory\r\nmonitor to limit the amount of memory that can be used to construct external\r\nSST iterators. If a restore processor fails to acquire enough memory to open\r\nthe next file for a restore span, it will send the iterator for all of the open\r\nfiles it has accumulated so far, and wait until it can acquire the memory to\r\nresume constructing the iterator for the remaining files.\r\n\r\nThe memory limit can be controlled via the new cluster setting\r\n`bulkio.restore.per_processor_memory_limit`. Regardless of the setting,\r\nhowever, the amount of memory used will not exceed\r\n`COCKROACH_RESTORE_MEM_FRACTION` * `max SQL memory.` The new environment\r\nvariable `COCKROACH_RESTORE_MEM_FRACTION` defaults to 0.5.\r\n\r\nBenchmarking using 10 iterators of 100 files each, each file is 24MiB in size.\r\n```\r\n./dev bench ./pkg/ccl/backupccl/  --filter BenchmarkIteratorMemory/fileCount=100$/iterCount=10$/rows=200000$/enc=false  --bench-mem -- --test_env=COCKROACH_GCS_SST_DIR=gs://rui-backup-test/bench --test_env=COCKROACH_S3_SST_DIR=s3://rui-crl/bench (plus credentials environment variables...)\r\n\r\nGCS unencrypted: 5.0 MiB/file  \r\n  5246162544 B/op\r\n\r\nGCS encrypted: 8.9 MiB/file\r\n  9404394496 B/op\r\n\r\nS3 unencrypted: 1.4 MiB/file \r\n  1511477488 B/op\r\n\r\nS3 encrypted: 1.7 MiB/file\r\n  1834325232 B/op\r\n```\r\n\r\nFixes: #102722 \r\n\r\nRelease note: None\r\n",
+    "pr_comments": [
+        "\n\n<!-- Reviewable:start -->\nThis change is\u2002[<img src=\"https://reviewable.io/review_button.svg\" height=\"34\" align=\"absmiddle\" alt=\"Reviewable\"/>](https://reviewable.io/reviews/cockroachdb/cockroach/93324)\n<!-- Reviewable:end -->\n",
+        "What are next steps here?",
+        "I didn't review everything so sorry if it's written in the pr somewhere, but do you have estimations on how common it would be to write partial ssts? IIUC the first partial sst will be written to L6, the second to L5 and so on, and I assume if you have enough of those we will start writing to L0 (BTW it would be nice to write this somewhere if it's true, in some comment).\r\n\r\nI have no idea whether this means that a tiny fraction will be written to L5 which will trigger a cheap compaction later, or that in some scenarios we would see a significant amount of bytes written to all layers and to L0 which will increase write amplification. I bet it's the former, but do we have a test or a back-of-the-envelop calculation or some estimation? maybe looking at pebble stats after a restore with many incremental layers?\r\n\r\nif the answer is in the code please ignore me and I'll review early next week.",
+        "Recording for posterity on the testing with 30MB of memory limit per restore data processor. Looks like most of the data from restore still ends up in L6. This may be due to the fact that the base layer always gets sent ingested first, thus guaranteeing that most of the data will go into L6.\r\n\r\n```\r\n__level_____count____size___score______in__ingest(sz_cnt)____move(sz_cnt)___write(sz_cnt)____read___r-amp___w-amp__val-bl\r\n    WAL         1    22 M       -   3.2 G       -       -       -       -   3.2 G       -       -       -     1.0\r\n      0         0     0 B    0.00   3.2 G   304 M   1.0 K     0 B       0   317 M     356     0 B       0     0.1     0 B\r\n      1         0     0 B    0.00     0 B     0 B       0     0 B       0     0 B       0     0 B       0     0.0     0 B\r\n      2         0     0 B    0.00     0 B     0 B       0     0 B       0     0 B       0     0 B       0     0.0     0 B\r\n      3        23    62 M    0.98   323 M    16 M       4    15 M      11   1.3 G     409   1.3 G       1     4.2   1.6 M\r\n      4        81   397 M    0.85   471 M   273 M      38    48 M      29   1.5 G     392   1.5 G       1     3.3   5.7 M\r\n      5       235   1.6 G    0.47   387 M   1.2 G     152   8.1 M       6   602 M     171   605 M       1     1.6    17 M\r\n      6      2985    25 G       -   298 M    25 G   3.2 K   1.6 K       1   425 M     168   437 M       1     1.4    26 M\r\n  total      3324    27 G       -    30 G    27 G   4.4 K    71 M      47    34 G   1.5 K   3.9 G       4     1.1    50 M\r\n  flush       208\r\ncompact       738     0 B     0 B       0          (size == estimated-debt, score = in-progress-bytes, in = num-in-progress)\r\n  ctype       497       0     192      47       2       0       0  (default, delete, elision, move, read, rewrite, multi-level)\r\n memtbl         1    64 M\r\nzmemtbl         0     0 B\r\n   ztbl         0     0 B\r\n bcache     362 K    11 G   47.1%  (score == hit-rate)\r\n tcache       878   583 K   98.6%  (score == hit-rate)\r\n  snaps         0       -       0  (score == earliest seq num)\r\n titers         0\r\n filter         -       -   85.3%  (score == utility)\r\n ```",
+        "@lidorcarmel PTAL again. I've rebased this PR on top of your openSSTs to workers change. I've also added an env var `COCKROACH_RESTORE_MEM_FRACTION` in order to control the memory allocated to restore to be 0.5 of max SQL memory.",
+        "\r\n> 2. there will be a future PR to be smarter about the actual minimum number of workers\r\n\r\nunfortunately I think we need a minimum in this pr, because without it we might run a restore with large machines using a single thread which will be a slow restore, and this would be a regression. I do agree that we don't need to be too smart about the min and max numbers. how about half of the threads is the min? meaning, if today we use N workers, with this PR we will only run restore of we can reserver `max(1, N/2)` workers. WDYT?",
+        "> with this PR we will only run restore of we can reserve `max(1, N/2)` workers. WDYT?\r\n\r\nOkay, I've changed the PR so that our min workers is `numRestoreWorkers/2` . Since by default `numRestoreWorkers` setting is `GOMAXPROCS - 1`, I think this should suffice as something that can be controlled by the number of cores but also something that can be overridden by a setting. \r\n\r\nI've also made a small change to reduce the minimum worker memory to `15MB`, which is still more than the memory required by 1 file. This is so that we can pass unit tests if the metamorphic value makes restore choose a minimum of 4 workers (by choosing `defaultNumWorkers=8`)",
+        "bors r=lidorcarmel",
+        "Build failed:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=10037681&buildTypeId=Cockroach_BazelEssentialCi)",
+        "bors retry",
+        "Build succeeded:\n  * [Bazel Essential CI (Cockroach)](https://teamcity.cockroachdb.com/viewLog.html?buildId=10039109&buildTypeId=Cockroach_BazelEssentialCi)"
+    ],
+    "merged": true,
+    "created_at": "2023-04-03T22:39:46Z",
+    "issue_context": {
+        "number": 102722,
+        "title": "Memory bound number of open SSTs in restore data processor",
+        "body": "Currently, there's no limit on the number of external SST readers that can be open in the restore data processor. Because the unit of processing in the restore data processor is an import span and all of the files that overlap that span, it is possible that for restores of backups with many incremental layers, the overhead of the SST readers on all of the simultaneously open files is too large to fit in available memory. During ad-hoc runs of restore on fixtures with many incremental layers, it's been observed occasionally that the restore would fail because of OOMs of this nature.\r\n\r\nWe should address this by associating the opening of an external SST reader with a memory cost, and then bound the total memory that could be used by adding a memory monitor to the restore data processor.\r\n\r\nJira issue: CRDB-27615\n",
+        "comments": [
+            "cc @cockroachdb/disaster-recovery"
+        ]
+    },
+    "changes": [
+        {
+            "hunk_id": 15216,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/ccl/backupccl/restore_data_processor.go",
+            "start_line": 231,
+            "original_start_line": 223,
+            "start_side": "RIGHT",
+            "line": 241,
+            "original_line": 241,
+            "side": "RIGHT",
+            "original_position": 164,
+            "position": 165,
+            "subject_type": "line",
+            "review_comments": [
+                "sorry I think I had a comment about this logic - don't you think we need to always succeed with at least one worker? even if there is no memory at all? it doesn't make sense to me that if some heavy query is running just now, we would fail a restore.\r\n\r\nthere is another issue here that maybe worth mentioning - that if a heavy sql query is running we might pick a single worker for the next 2 hours of restore, even if the query would finish within a minute. But that we can solve in some other PR if this is an issue.",
+                "Having the reserve memory happen before the processor does any work is a way to at least make sure the job fails fast if we suspect that there's not enough memory in the node to continue the restore. Restore is something that can take up a lot of cluster resources and I think failing the restore is before it starts is better than failing some heavy SQL query that's in progress. This pattern also exist in our backup job currently where we reserve the worker memory in the beginning, and fail the job if we are not able to do so.\r\n\r\nWe do have an issue here if the job replans at an unfortunate time and some other queries in the cluster prevents the job from resuming due to lack of memory, but I think in that case it's still better to fail the restore since it wasn't going to be able to continue anyways, and the user can always have an option to pause on error should this become a recurring problem.",
+                "should this PR point to an issue? I'd like to understand the motivation for this change better. I can imagine 2 different motivations: one is that the current restore frequently causes issues such as OOMing nodes or causing queries to fail, and another is that everything is pretty much ok except for some rare failures but we want to increase the number of workers and therefore we need some memory limits. I guess I have the latter in my mind but maybe I'm wrong.\r\ncc @dt to see what you think.",
+                "I think we agreed that this approach of reserving mem and failing the restore if we can't reserve is okay. I added the number of restore workers to the \"starting restore data\" log line for help in debugging issues that may resolve from picking too low of a worker number."
+            ]
+        },
+        {
+            "hunk_id": 15215,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/ccl/backupccl/backuputils/memory_backed_quota_pool_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 12,
+            "original_line": 12,
+            "side": "RIGHT",
+            "original_position": 12,
+            "position": 12,
+            "subject_type": "line",
+            "review_comments": [
+                "nit: why is the tab here 8 characters and not 2? here and in the rest of this file.",
+                "I'm not sure, I don't see the 8 character tab in the editor now?"
+            ]
+        },
+        {
+            "hunk_id": 15214,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/server/server_sql.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 839,
+            "original_line": 839,
+            "side": "RIGHT",
+            "original_position": 4,
+            "position": 4,
+            "subject_type": "line",
+            "review_comments": [
+                "is this a noop for sql? sorry I'm not sure I follow why this is needed..",
+                "This should be. This allows the root SQL memory pool size to be available during the restore processor planning, since the amount of memory we want is limited to a fraction of that. I don't see anything else that exposes this value during restore, but maybe I missed something."
+            ]
+        },
+        {
+            "hunk_id": 15210,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/ccl/backupccl/restore_data_processor.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 98,
+            "original_line": 98,
+            "side": "RIGHT",
+            "original_position": 41,
+            "position": 64,
+            "subject_type": "line",
+            "review_comments": [
+                "5MiB?! ooof, that's bigger than some of the actual files",
+                "Yeah I was surprised as well."
+            ]
+        },
+        {
+            "hunk_id": 15211,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/ccl/backupccl/backup_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 11156,
+            "original_line": 11156,
+            "side": "RIGHT",
+            "original_position": 99,
+            "position": 125,
+            "subject_type": "line",
+            "review_comments": [
+                "so IIUC the test above has a flat wide set of files (no incremental backup) and this one has a narrow and tall set of files. do you think we need a test with a wide and tall set of files? N files in the base layer and M incremental backups? or maybe this is well tested somewhere else and I didn't see it yet..",
+                "The \"tall\" test was only there to verify that we have shadowing disabled and the restore is allowed to succeed without erroring with a collision error.",
+                "right, makes sense and those tests are great. I guess my point is that it would be nice to also have a more complex test that verifies restore when we have shadowing and also more files that can be loaded at the same time in the base layer.",
+                "I modified `TestRestoreMemoryMonitoring` to test for various number of splits in the base layer, number of incrementals, and memory limit on the processor.",
+                "I modified `TestRestoreMemoryMonitoring` to test for various number of splits in the base layer, number of incrementals, and memory limit on the processor."
+            ]
+        },
+        {
+            "hunk_id": 15213,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/ccl/backupccl/bench_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 186,
+            "original_line": 186,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 52,
+            "subject_type": "line",
+            "review_comments": [
+                "comment? are you testing the cloud provider client library? or our iterators? or both?",
+                "added comment"
+            ]
+        },
+        {
+            "hunk_id": 15212,
+            "commit_id": "84ed8acb1eeb745828368da782f2900b43bd01ad",
+            "original_commit_id": "29523d3549402b7cdced8fe211e6c133822e5d5a",
+            "path": "pkg/ccl/backupccl/bench_test.go",
+            "start_line": null,
+            "original_start_line": null,
+            "start_side": null,
+            "line": 186,
+            "original_line": 186,
+            "side": "RIGHT",
+            "original_position": 33,
+            "position": 52,
+            "subject_type": "line",
+            "review_comments": [
+                "can you put the output of this in the pr and/or commit message?",
+                "done, added the output to the commit message",
+                "thanks. usually when adding micro benchmarks we add a few cases of benchmarks, for example:\r\n```\r\nRunThingLowMem\r\nRunThingLowMemEncrypted\r\nRunThingHighMem\r\n...\r\n```\r\nso that later we can run a single `dev bench` command which shows all the results at once. But here the user need to pass the right arguments to get a different test.\r\n\r\nAlso, what happens if I just run `dev bench` without providing the right arguments such as those env vars? I'm asking because we have tools that automatically run those benchmarks and compare results across releases so we don't want those to fail.",
+                "Okay, I split out separate env vars for S3 and GCS files, and added skips so that the benchmark is skipped if the env vars are not present, (for CI tools to pass)"
+            ]
+        }
+    ]
+}
