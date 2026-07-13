@@ -9,7 +9,7 @@ public class NarrativeCli {
         // =========================================================================
         // CONFIGURATION: Change these values before running
         // =========================================================================
-        String url = "https://github.com/maorethians/RefactoringMiner/commit/ad2d52bbd591c50bb233b83b906a9dcc8bbfc2ba";
+        String url = "https://github.com/TeamNewPipe/NewPipe/pull/10018";
         GrainLevel level = GrainLevel.FILE;
         String task = "You are PR-Reviewer, an experienced software engineer and language model designed to review a Git Pull Request (PR).\n" +
                 "Your task is to provide a thorough, constructive, and concise review.\n" +

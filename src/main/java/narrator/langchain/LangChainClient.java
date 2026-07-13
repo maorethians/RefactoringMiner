@@ -52,12 +52,14 @@ public class LangChainClient {
     public String processChapter(String task, String currentUnderstanding, String chapterContent) {
         String prompt = String.format(
                 "Task:\n%s\n\n" +
-                "Understanding of the narrative so far:\n%s\n\n" +
                 "Current chapter:\n%s\n\n" +
-                "Please provide your response in the following format:\n" +
-                "UNDERSTANDING: <updated understanding of the narrative>\n" +
+                "Understanding of the previous chapters:\n%s\n\n" +
+                "Please analyze and understand the current chapter in the context of the understanding of previous chapters.\n" +
+                "Then, perform the task on the current chapter in the context of your understanding about it and the understanding of the previous chapters.\n" +
+                "Finally, provide your response in the following format:\n" +
+                "UNDERSTANDING: <understanding of the current chapter>\n" +
                 "RESULT: <intermediate result for the task on this chapter>",
-                task, currentUnderstanding, chapterContent
+                task, chapterContent, currentUnderstanding
         );
         return generate(prompt);
     }

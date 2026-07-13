@@ -45,7 +45,13 @@ public class NarrativeProcessor {
             // Parse the response
             ParsedResponse parsed = parseResponse(response);
 
-            state = new NarrativeState(parsed.understanding);
+            if (!"No updated understanding provided.".equals(parsed.understanding)) {
+                String chapterUnderstanding = "Chapter " + (i + 1) + ": " + parsed.understanding;
+                String updatedUnderstanding = state.getUnderstanding().equals("No understanding yet.")
+                        ? chapterUnderstanding
+                        : state.getUnderstanding() + "\n\n" + chapterUnderstanding;
+                state = new NarrativeState(updatedUnderstanding);
+            }
             results.add(new ChapterResult(i, content, parsed.result));
         }
 
