@@ -85,16 +85,24 @@ async def proxy_request(request: Request, path: str):
                     async for chunk in resp.aiter_bytes():
                         if chunk:
                             chunk_text = chunk.decode('utf-8', errors='replace')
+                            # 1. OpenAI-style streaming
                             if '"type":"message_delta"' in chunk_text:
                                 try:
-                                    # Extract usage from the chunk
-                                    # The chunk is usually: event: message_delta\ndata: {...}
                                     if 'data: ' in chunk_text:
                                         data_str = chunk_text.split('data: ', 1)[1]
                                         data_json = json.loads(data_str)
                                         if 'usage' in data_json:
                                             final_usage['input_tokens'] = data_json['usage'].get('input_tokens', 0)
                                             final_usage['output_tokens'] = data_json['usage'].get('output_tokens', 0)
+                                except Exception:
+                                    pass
+                            # 2. Native Ollama streaming
+                            elif chunk_text.strip().startswith('{'):
+                                try:
+                                    data_json = json.loads(chunk_text)
+                                    if 'prompt_eval_count' in data_json:
+                                        final_usage['input_tokens'] = data_json.get('prompt_eval_count', 0)
+                                        final_usage['output_tokens'] = data_json.get('eval_count', 0)
                                 except Exception:
                                     pass
                             yield chunk
@@ -117,8 +125,16 @@ async def proxy_request(request: Request, path: str):
             # LOG TOKENS
             try:
                 res_json = resp.json()
-                usage = res_json.get("usage", {})
-                update_token_log(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+                in_tokens = 0
+                out_tokens = 0
+                if "usage" in res_json:
+                    usage = res_json["usage"]
+                    in_tokens = usage.get("input_tokens", 0)
+                    out_tokens = usage.get("output_tokens", 0)
+                elif "prompt_eval_count" in res_json:
+                    in_tokens = res_json.get("prompt_eval_count", 0)
+                    out_tokens = res_json.get("eval_count", 0)
+                update_token_log(in_tokens, out_tokens)
             except Exception:
                 pass
 
