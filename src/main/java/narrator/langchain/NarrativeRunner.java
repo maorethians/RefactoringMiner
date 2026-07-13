@@ -3,7 +3,7 @@ package narrator.langchain;
 import narrator.graph.cluster.traverse.GrainLevel;
 import narrator.service.NarrativeService;
 
-public class NarrativeCli {
+public class NarrativeRunner {
     public static void main(String[] args) {
         // =========================================================================
         // CONFIGURATION: Change these values before running
