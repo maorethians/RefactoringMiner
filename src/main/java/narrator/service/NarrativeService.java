@@ -1,0 +1,174 @@
+package narrator.service;
+
+import narrator.Driver;
+import narrator.graph.Edge;
+import narrator.graph.Node;
+import narrator.graph.cluster.Cluster;
+import narrator.graph.cluster.Clusterer;
+import narrator.graph.cluster.traverse.*;
+import narrator.mcp.html.NarrativeHtmlGenerator;
+import org.jgrapht.Graph;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class NarrativeService {
+    private static final Logger logger = LoggerFactory.getLogger(NarrativeService.class);
+    private final CacheManager cacheManager = new CacheManager();
+
+    public TraversalPattern initializeNarrative(String url) throws Exception {
+        TraversalPattern root = getOrComputeHierarchy(url);
+        if (root == null) {
+            return null;
+        }
+
+        List<Cluster> clusters = getOrComputeClusters(url);
+        Narrator narrator = root.getNarrator();
+        NarrativeHtmlGenerator generator = new NarrativeHtmlGenerator(url, narrator);
+        generator.generateAll(clusters);
+        cacheManager.putHtmlGenerator(url, generator);
+
+        return root;
+    }
+
+    public List<String> getFlatChapters(String url, GrainLevel level) throws Exception {
+        TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
+        if (root == null) {
+            throw new IllegalStateException("No narrative initialized for this URL: " + url);
+        }
+
+        Narrator narrator = root.getNarrator();
+        List<Cluster> clusters = getOrComputeClusters(url);
+
+        if (level == GrainLevel.RAW_DIFF) {
+            return getRawDiffChunks(url, narrator, clusters);
+        } else {
+            return narrator.getFlatChapters(level, clusters);
+        }
+    }
+
+    public void updateHtmlPage(String url, GrainLevel level, List<Cluster> clusters, int progress) {
+        NarrativeHtmlGenerator generator = cacheManager.getHtmlGenerator(url);
+        if (generator != null) {
+            try {
+                generator.generateGrainLevelPage(level, clusters, progress);
+            } catch (Exception e) {
+                logger.error("Failed to update narrative HTML page", e);
+            }
+        }
+    }
+
+    public List<Cluster> getOrComputeClusters(String url) throws Exception {
+        List<Cluster> cached = cacheManager.getClusters(url);
+        if (cached != null) {
+            return cached;
+        }
+
+        Graph<Node, Edge> graph = loadGraph(url);
+        List<Cluster> clusters = new Clusterer(graph).getClusters();
+        cacheManager.putClusters(url, clusters);
+        return clusters;
+    }
+
+    public TraversalPattern getOrComputeHierarchy(String url) throws Exception {
+        String cacheKey = getHierarchyCacheKey(url);
+        TraversalPattern cached = cacheManager.getHierarchy(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        List<Cluster> clusters = getOrComputeClusters(url);
+        List<TraversalPattern> finalHierarchy = new ArrayList<>();
+
+        for (Cluster cluster : clusters) {
+            finalHierarchy.add(new TraversalEngine(cluster).get());
+        }
+
+        TraversalPattern root;
+        if (finalHierarchy.size() > 1) {
+            root = new TraversalComponent(finalHierarchy, ReasonType.CONTEXT);
+        } else if (finalHierarchy.size() == 1) {
+            root = finalHierarchy.get(0);
+        } else {
+            return null;
+        }
+
+        cacheManager.putHierarchy(cacheKey, root);
+        return root;
+    }
+
+    private Graph<Node, Edge> loadGraph(String url) throws Exception {
+        if (url.contains("/pull/") || url.contains("/pr/")) {
+            return Driver.getPullRequestGraph(url);
+        } else {
+            return Driver.getCommitGraph(url);
+        }
+    }
+
+    private List<String> getRawDiffChunks(String url, Narrator narrator, List<Cluster> clusters) throws Exception {
+        List<String> cached = cacheManager.getRawDiffChunks(url);
+        if (cached != null) {
+            return cached;
+        }
+
+        List<String> fileChapters = narrator.getFlatChapters(GrainLevel.FILE, clusters);
+        int numChunks = fileChapters.size();
+        if (numChunks == 0) {
+            return Collections.emptyList();
+        }
+
+        String rawDiffUrl = url;
+        if ((url.contains("/pull/") || url.contains("/pr/") || url.contains("/commit/")) && !url.endsWith(".diff")) {
+            rawDiffUrl = url + ".diff";
+        }
+
+        HttpClient client = HttpClient.newBuilder()
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(rawDiffUrl))
+                .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new Exception("Failed to fetch raw diff from " + rawDiffUrl + ". Status code: " + response.statusCode());
+        }
+        String diffContent = response.body();
+
+        String[] lines = diffContent.split("\n");
+        int totalLines = lines.length;
+        List<String> chunks = new ArrayList<>();
+
+        int baseSize = totalLines / numChunks;
+        int remainder = totalLines % numChunks;
+        int currentLine = 0;
+
+        for (int i = 0; i < numChunks; i++) {
+            int chunkSize = baseSize + (i < remainder ? 1 : 0);
+            StringBuilder chunkBuilder = new StringBuilder();
+            for (int j = 0; j < chunkSize && currentLine < totalLines; j++) {
+                chunkBuilder.append(lines[currentLine++]).append("\n");
+            }
+            chunks.add(chunkBuilder.toString());
+        }
+
+        cacheManager.putRawDiffChunks(url, chunks);
+        return chunks;
+    }
+
+    private String getHierarchyCacheKey(String url) {
+        return "hierarchy:" + url;
+    }
+
+    public CacheManager getCacheManager() {
+        return cacheManager;
+    }
+}

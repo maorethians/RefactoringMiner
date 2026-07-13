@@ -1,4 +1,4 @@
-package narrator.mcp;
+package narrator.service;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;

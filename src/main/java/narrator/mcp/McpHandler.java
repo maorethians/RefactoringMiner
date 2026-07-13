@@ -3,28 +3,19 @@ package narrator.mcp;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
-import narrator.Driver;
-import narrator.graph.Edge;
-import narrator.graph.Node;
 import narrator.graph.cluster.Cluster;
-import narrator.graph.cluster.Clusterer;
 import narrator.graph.cluster.traverse.*;
 import narrator.mcp.html.NarrativeHtmlGenerator;
-import org.jgrapht.Graph;
+import narrator.service.NarrativeService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 
 public class McpHandler {
     private static final Logger logger = LoggerFactory.getLogger(McpHandler.class);
-    private static final CacheManager cacheManager = new CacheManager();
+    private final NarrativeService narrativeService = new NarrativeService();
 
     private static void sendToolError(JsonObject response, int code, String message) {
         JsonObject error = new JsonObject();
@@ -189,8 +180,56 @@ public class McpHandler {
         }
     }
 
-    private String getHierarchyCacheKey(String url) {
-        return "hierarchy:" + url;
+    private String initNarrative(String url, String mode) throws Exception {
+        TraversalPattern root = narrativeService.initializeNarrative(url);
+        if (root == null) {
+            return "No changes found to narrate.";
+        }
+
+        Narrator narrator = root.getNarrator();
+        List<Cluster> clusters = narrativeService.getOrComputeClusters(url);
+
+        StringBuilder summary = new StringBuilder();
+        summary.append("Narrative initialized.\n\n");
+
+        if ("automatic".equalsIgnoreCase(mode)) {
+            summary.append("Mode: Automatic. Use the following metadata to choose the most appropriate GrainLevel:\n\n");
+            summary.append(String.format("%-20s | %-10s | %-18s | %-18s\n", "GrainLevel", "Chapters", "Avg Chapter Lines", "Max Chapter Lines"));
+            summary.append("-------------------------------------------------------------------------------------------------\n");
+
+            for (GrainLevel level : GrainLevel.values()) {
+                List<String> flatChapters = narrativeService.getFlatChapters(url, level);
+                int count = flatChapters.size();
+
+                double totalLines = 0;
+                double maxLines = 0;
+
+                for (String content : flatChapters) {
+                    int lines = content.split("\n").length;
+                    totalLines += lines;
+                    if (lines > maxLines) maxLines = lines;
+                }
+
+                double avgLines = count > 0 ? totalLines / count : 0;
+
+                summary.append(String.format("%-20s | %-10d | %-10.1f | %-10.1f\n", level, count, avgLines, maxLines));
+            }
+            summary.append("\n\nPlease analyze the metadata and decide which GrainLevel to use for the review.");
+        } else {
+            summary.append("You must now guide the user to start the narration. Please follow these steps:\n");
+            summary.append("1. Provide the user with the path to the narrative overview HTML page for a high-level overview: ").append(narrativeService.getCacheManager().getHtmlGenerator(url).getOverviewPath()).append("\n");
+            summary.append("2. List the available GrainLevels and their respective chapter counts from the list below, explaining that they should choose one to start the detailed narration.\n\n");
+            summary.append("Available GrainLevels and their chapter counts:\n");
+
+            for (GrainLevel level : GrainLevel.values()) {
+                int count = narrativeService.getFlatChapters(url, level).size();
+                summary.append("- ").append(level).append(" (").append(level.getDescription()).append("): ").append(count).append(" chapters\n");
+            }
+
+            summary.append("\n3. Ask the user which GrainLevel they would like to use to proceed.");
+        }
+
+        return summary.toString();
     }
 
     private String getNextBatch(String url, String grainLevelStr) throws Exception {
@@ -201,26 +240,22 @@ public class McpHandler {
             throw new IllegalArgumentException("Invalid grainLevel: " + grainLevelStr + ". Valid values are: " + java.util.Arrays.toString(GrainLevel.values()));
         }
 
-        TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
+        List<String> flatChapters = narrativeService.getFlatChapters(url, level);
+
+        // For the MCP server, we need to maintain progress.
+        // Since NarrativeService doesn't track state per-session,
+        // we use the narrator's progress from the root pattern.
+        TraversalPattern root = narrativeService.getCacheManager().getHierarchy("hierarchy:" + url);
         if (root == null) {
             return "No narrative initialized for this URL. Please call init_narrative first.";
         }
         Narrator narrator = root.getNarrator();
-        List<Cluster> clusters = getOrComputeClusters(url);
-        List<String> flatChapters;
-        if (level == GrainLevel.RAW_DIFF) {
-            flatChapters = getRawDiffChunks(url, narrator, clusters);
-        } else {
-            flatChapters = narrator.getFlatChapters(level, clusters);
-        }
 
         int startProgress = narrator.getProgress(level);
         if (startProgress >= flatChapters.size()) {
             return "[End of Narrative] All chapters for grain level " + level + " have been read.";
         }
 
-        // Since Narrator already produces chapters balanced to the threshold,
-        // we just return the next single flat chapter.
         String content = flatChapters.get(startProgress);
         String header = String.format("[Chapter %d of %d]\n", startProgress + 1, flatChapters.size());
         narrator.incrementProgress(level);
@@ -245,18 +280,13 @@ public class McpHandler {
             throw new IllegalArgumentException("Invalid grainLevel: " + grainLevelStr + ". Valid values are: " + java.util.Arrays.toString(GrainLevel.values()));
         }
 
-        TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
+        List<String> flatChapters = narrativeService.getFlatChapters(url, level);
+
+        TraversalPattern root = narrativeService.getCacheManager().getHierarchy("hierarchy:" + url);
         if (root == null) {
             return "No narrative initialized for this URL. Please call init_narrative first.";
         }
         Narrator narrator = root.getNarrator();
-        List<Cluster> clusters = getOrComputeClusters(url);
-        List<String> flatChapters;
-        if (level == GrainLevel.RAW_DIFF) {
-            flatChapters = getRawDiffChunks(url, narrator, clusters);
-        } else {
-            flatChapters = narrator.getFlatChapters(level, clusters);
-        }
 
         int progress = narrator.getProgress(level);
         if (progress >= flatChapters.size()) {
@@ -267,16 +297,7 @@ public class McpHandler {
         String header = String.format("[Chapter %d of %d]\n", progress + 1, flatChapters.size());
         narrator.incrementProgress(level);
 
-        // Update HTML page to expand only the current chapter
-        // We use the progress in the flat list to sync the HTML page.
-        NarrativeHtmlGenerator generator = cacheManager.getHtmlGenerator(url);
-        if (generator != null) {
-            try {
-                generator.generateGrainLevelPage(level, clusters, progress);
-            } catch (Exception e) {
-                logger.error("Failed to update narrative HTML page", e);
-            }
-        }
+        narrativeService.updateHtmlPage(url, level, narrativeService.getOrComputeClusters(url), progress);
 
         StringBuilder output = new StringBuilder();
         output.append(header).append(content);
@@ -291,170 +312,4 @@ public class McpHandler {
 
         return output.toString();
     }
-
-    private String initNarrative(String url, String mode) throws Exception {
-        TraversalPattern root = getOrComputeHierarchy(url);
-        if (root == null) {
-            return "No changes found to narrate.";
-        }
-
-        Narrator narrator = root.getNarrator();
-
-        List<Cluster> clusters = getOrComputeClusters(url);
-        NarrativeHtmlGenerator generator = new NarrativeHtmlGenerator(url, narrator);
-        generator.generateAll(clusters);
-        cacheManager.putHtmlGenerator(url, generator);
-
-        StringBuilder summary = new StringBuilder();
-        summary.append("Narrative initialized.\n\n");
-
-        if ("automatic".equalsIgnoreCase(mode)) {
-            summary.append("Mode: Automatic. Use the following metadata to choose the most appropriate GrainLevel:\n\n");
-            summary.append(String.format("%-20s | %-10s | %-18s | %-18s\n", "GrainLevel", "Chapters", "Avg Chapter Lines", "Max Chapter Lines"));
-            summary.append("-------------------------------------------------------------------------------------------------\n");
-
-            for (GrainLevel level : GrainLevel.values()) {
-                List<String> flatChapters;
-                if (level == GrainLevel.RAW_DIFF) {
-                    flatChapters = getRawDiffChunks(url, narrator, clusters);
-                } else {
-                    flatChapters = narrator.getFlatChapters(level, clusters);
-                }
-                int count = flatChapters.size();
-
-                double totalLines = 0;
-                double maxLines = 0;
-
-                for (String content : flatChapters) {
-                    int lines = content.split("\n").length;
-                    totalLines += lines;
-                    if (lines > maxLines) maxLines = lines;
-                }
-
-                double avgLines = count > 0 ? totalLines / count : 0;
-
-                summary.append(String.format("%-20s | %-10d | %-10.1f | %-10.1f\n", level, count, avgLines, maxLines));
-            }
-            summary.append("\n\nPlease analyze the metadata and decide which GrainLevel to use for the review.");
-        } else {
-            summary.append("You must now guide the user to start the narration. Please follow these steps:\n");
-            summary.append("1. Provide the user with the path to the narrative overview HTML page for a high-level overview: ").append(generator.getOverviewPath()).append("\n");
-            summary.append("2. List the available GrainLevels and their respective chapter counts from the list below, explaining that they should choose one to start the detailed narration.\n\n");
-            summary.append("Available GrainLevels and their chapter counts:\n");
-
-            for (GrainLevel level : GrainLevel.values()) {
-                int count = (level == GrainLevel.RAW_DIFF)
-                        ? getRawDiffChunks(url, narrator, clusters).size()
-                        : narrator.getFlatChapters(level, clusters).size();
-                summary.append("- ").append(level).append(" (").append(level.getDescription()).append("): ").append(count).append(" chapters\n");
-            }
-
-            summary.append("\n3. Ask the user which GrainLevel they would like to use to proceed.");
-        }
-
-        return summary.toString();
-    }
-
-
-    private List<String> getRawDiffChunks(String url, Narrator narrator, List<Cluster> clusters) throws Exception {
-        List<String> cached = cacheManager.getRawDiffChunks(url);
-        if (cached != null) {
-            return cached;
-        }
-
-        // 1. Determine number of chunks from FILE level
-        List<String> fileChapters = narrator.getFlatChapters(GrainLevel.FILE, clusters);
-        int numChunks = fileChapters.size();
-        if (numChunks == 0) {
-            return Collections.emptyList();
-        }
-
-        // 2. Fetch raw diff
-        String rawDiffUrl = url;
-        if ((url.contains("/pull/") || url.contains("/pr/") || url.contains("/commit/")) && !url.endsWith(".diff")) {
-            rawDiffUrl = url + ".diff";
-        }
-
-        HttpClient client = HttpClient.newBuilder()
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(rawDiffUrl))
-                .build();
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200) {
-            throw new Exception("Failed to fetch raw diff from " + rawDiffUrl + ". Status code: " + response.statusCode());
-        }
-        String diffContent = response.body();
-
-        // 3. Split into balanced chunks (by line)
-        String[] lines = diffContent.split("\n");
-        int totalLines = lines.length;
-        List<String> chunks = new ArrayList<>();
-
-        int baseSize = totalLines / numChunks;
-        int remainder = totalLines % numChunks;
-        int currentLine = 0;
-
-        for (int i = 0; i < numChunks; i++) {
-            int chunkSize = baseSize + (i < remainder ? 1 : 0);
-            StringBuilder chunkBuilder = new StringBuilder();
-            for (int j = 0; j < chunkSize && currentLine < totalLines; j++) {
-                chunkBuilder.append(lines[currentLine++]).append("\n");
-            }
-            chunks.add(chunkBuilder.toString());
-        }
-
-        cacheManager.putRawDiffChunks(url, chunks);
-        return chunks;
-    }
-
-    private List<Cluster> getOrComputeClusters(String url) throws Exception {
-        List<Cluster> cached = cacheManager.getClusters(url);
-        if (cached != null) {
-            return cached;
-        }
-
-        Graph<Node, Edge> graph = loadGraph(url);
-        List<Cluster> clusters = new Clusterer(graph).getClusters();
-        cacheManager.putClusters(url, clusters);
-        return clusters;
-    }
-
-    private TraversalPattern getOrComputeHierarchy(String url) throws Exception {
-        String cacheKey = getHierarchyCacheKey(url);
-        TraversalPattern cached = cacheManager.getHierarchy(cacheKey);
-        if (cached != null) {
-            return cached;
-        }
-
-        List<Cluster> clusters = getOrComputeClusters(url);
-        List<TraversalPattern> finalHierarchy = new java.util.ArrayList<>();
-
-        for (Cluster cluster : clusters) {
-            finalHierarchy.add(new TraversalEngine(cluster).get());
-        }
-
-        TraversalPattern root;
-        if (finalHierarchy.size() > 1) {
-            root = new TraversalComponent(finalHierarchy, ReasonType.CONTEXT);
-        } else if (finalHierarchy.size() == 1) {
-            root = finalHierarchy.get(0);
-        } else {
-            return null;
-        }
-
-        cacheManager.putHierarchy(cacheKey, root);
-        return root;
-    }
-
-    private Graph<Node, Edge> loadGraph(String url) throws Exception {
-        if (url.contains("/pull/") || url.contains("/pr/")) {
-            return Driver.getPullRequestGraph(url);
-        } else {
-            return Driver.getCommitGraph(url);
-        }
-    }
-
 }
