@@ -37,7 +37,7 @@ public class LangChainClient {
             model = OllamaChatModel.builder()
                     .baseUrl(baseUrl != null ? baseUrl : "http://localhost:11434")
                     .modelName(modelName)
-                    .timeout(Duration.ofSeconds(60)) // Increase timeout for local large models
+                    .timeout(Duration.ofSeconds(999)) // Increase timeout for local large models
                     .build();
         } else {
             throw new IllegalArgumentException("Unsupported provider: " + provider);
@@ -51,9 +51,9 @@ public class LangChainClient {
 
     public String processChapter(String task, String currentUnderstanding, String chapterContent) {
         String prompt = String.format(
-                "Task: %s\n\n" +
-                "Current understanding of the narrative so far:\n%s\n\n" +
-                "New chapter content:\n%s\n\n" +
+                "Task:\n%s\n\n" +
+                "Understanding of the narrative so far:\n%s\n\n" +
+                "Current chapter:\n%s\n\n" +
                 "Please provide your response in the following format:\n" +
                 "UNDERSTANDING: <updated understanding of the narrative>\n" +
                 "RESULT: <intermediate result for the task on this chapter>",
@@ -64,12 +64,12 @@ public class LangChainClient {
 
     public String compileResults(String task, List<ChapterResult> results) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Task: ").append(task).append("\n\n");
+        sb.append("Task:\n").append(task).append("\n\n");
         sb.append("Below are the intermediate results for each chapter of the narrative:\n\n");
         for (ChapterResult res : results) {
             sb.append(String.format("Chapter %d:\n%s\n\n", res.getChapterIndex() + 1, res.getIntermediateResult()));
         }
-        sb.append("\n\nPlease compile these intermediate results into a final comprehensive answer for the task.");
+        sb.append("\n\nPlease compile these intermediate results into a final comprehensive response to the task.");
         return generate(sb.toString());
     }
 }

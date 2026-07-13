@@ -19,7 +19,7 @@ public class NarrativeProcessor {
         this.langchainClient = langchainClient;
     }
 
-    public NarrativeResponse process(NarrativeRequest request, BiConsumer<Integer, ParsedResponse> progressListener) throws Exception {
+    public NarrativeResponse process(NarrativeRequest request) throws Exception {
         String url = request.getUrl();
         GrainLevel level = request.getGrainLevel();
         String task = request.getTask();
@@ -40,15 +40,13 @@ public class NarrativeProcessor {
 
             String response = langchainClient.processChapter(task, state.getUnderstanding(), content);
 
+            System.out.println(response);
+
             // Parse the response
             ParsedResponse parsed = parseResponse(response);
 
             state = new NarrativeState(parsed.understanding);
             results.add(new ChapterResult(i, content, parsed.result));
-
-            if (progressListener != null) {
-                progressListener.accept(i + 1, parsed);
-            }
         }
 
         // 3. Final compilation
