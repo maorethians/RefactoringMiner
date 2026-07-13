@@ -25,8 +25,6 @@ public class NarrativeCli {
                 "7. **Testing**: Test coverage and the quality/relevance of new or modified tests.\n" +
                 "8. **Refactoring**: Opportunities for simplification, refactoring for better structure, or use of more idiomatic language constructs.\n" +
                 "\n" +
-                "The review should focus on new code added in the PR (lines starting with '+').\n" +
-                "\n" +
                 "The output must be a YAML object equivalent to the following Pydantic definitions:\n" +
                 "=====\n" +
                 "class KeyIssuesComponentLink(BaseModel):\n" +

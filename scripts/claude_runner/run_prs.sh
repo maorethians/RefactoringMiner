@@ -20,8 +20,6 @@ When analyzing the PR, you must independently investigate the following aspects:
 7. **Testing**: Test coverage and the quality/relevance of new or modified tests.
 8. **Refactoring**: Opportunities for simplification, refactoring for better structure, or use of more idiomatic language constructs.
 
-The review should focus on new code added in the PR (lines starting with '+').
-
 The output must be a YAML object equivalent to the following Pydantic definitions:
 =====
 class KeyIssuesComponentLink(BaseModel):
