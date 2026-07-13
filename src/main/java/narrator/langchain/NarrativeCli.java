@@ -1,7 +1,6 @@
 package narrator.langchain;
 
 import narrator.graph.cluster.traverse.GrainLevel;
-import narrator.restapi.LangChainConfig;
 import narrator.service.NarrativeService;
 
 public class NarrativeCli {
@@ -66,8 +65,7 @@ public class NarrativeCli {
             System.out.println("--------------------------------------------------");
 
             NarrativeService narrativeService = new NarrativeService();
-            LangChainClient client = LangChainConfig.createClient();
-            NarrativeProcessor processor = new NarrativeProcessor(narrativeService, client);
+            NarrativeProcessor processor = new NarrativeProcessor(narrativeService);
 
             NarrativeRequest request = new NarrativeRequest(url, level, task);
 

@@ -1,9 +1,10 @@
 package narrator.langchain;
 
-import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
-import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
+import dev.langchain4j.model.openai.OpenAiChatModel;
+
 import java.time.Duration;
 import java.util.List;
 
@@ -14,14 +15,12 @@ public class LangChainClient {
         this.model = model;
     }
 
-    /**
-     * Factory method to create a client based on the provider.
-     * @param provider The LLM provider (anthropic, openai, ollama)
-     * @param apiKey The API key (ignored for ollama)
-     * @param modelName The model name (e.g., gemma4:31b)
-     * @param baseUrl The base URL for the model server (primarily for ollama)
-     */
-    public static LangChainClient create(String provider, String apiKey, String modelName, String baseUrl) {
+    public static LangChainClient create() {
+        String provider = "ollama";
+        String apiKey = "";
+        String modelName = "gemma4:31b";
+        String baseUrl = "http://localhost:11435";
+
         ChatLanguageModel model;
         if ("anthropic".equalsIgnoreCase(provider)) {
             model = AnthropicChatModel.builder()
@@ -50,18 +49,24 @@ public class LangChainClient {
     }
 
     public String processChapter(String task, String currentUnderstanding, String chapterContent) {
-        String prompt = String.format(
-                "Task:\n%s\n\n" +
-                "Current chapter:\n%s\n\n" +
-                "Understanding of the previous chapters:\n%s\n\n" +
-                "Please analyze and understand the current chapter in the context of the understanding of previous chapters.\n" +
-                "Then, perform the task on the current chapter in the context of your understanding about it and the understanding of the previous chapters.\n" +
-                "Finally, provide your response in the following format:\n" +
-                "UNDERSTANDING: <understanding of the current chapter>\n" +
-                "RESULT: <intermediate result for the task on this chapter>",
-                task, chapterContent, currentUnderstanding
-        );
-        return generate(prompt);
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("Task:\n%s\n\n", task));
+        sb.append(String.format("Current chapter:\n%s\n\n", chapterContent));
+
+        if (currentUnderstanding == null || currentUnderstanding.isBlank()) {
+            sb.append("Please analyze and understand the current chapter.\n");
+            sb.append("Then, perform the task on the current chapter in the context of your understanding about it.\n");
+        } else {
+            sb.append(String.format("Understanding of the previous chapters:\n%s\n\n", currentUnderstanding));
+            sb.append("Please analyze and understand the current chapter in the context of the understanding of previous chapters.\n");
+            sb.append("Then, perform the task on the current chapter in the context of your understanding about it and the understanding of the previous chapters.\n");
+        }
+
+        sb.append("Finally, provide your response in the following format:\n");
+        sb.append("UNDERSTANDING: <understanding of the current chapter>\n");
+        sb.append("RESULT: <intermediate result for the task on the current chapter>");
+
+        return generate(sb.toString());
     }
 
     public String compileResults(String task, List<ChapterResult> results) {

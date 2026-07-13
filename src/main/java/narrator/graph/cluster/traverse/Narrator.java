@@ -8,6 +8,7 @@ import java.util.*;
 import java.util.function.Predicate;
 
 public class Narrator {
+    public static final int THRESHOLD = 1000;
     private static final Map<GrainLevel, Set<String>> GRAIN_LEVEL_TYPES = new HashMap<>();
 
     static {
@@ -21,7 +22,6 @@ public class Narrator {
     private final Map<GrainLevel, List<TraversalPattern>> cache = new HashMap<>();
     private final Map<GrainLevel, List<String>> flatCache = new HashMap<>();
     private final Map<GrainLevel, Integer> progressMap = new HashMap<>();
-    public static final int THRESHOLD = 100;
 
 
     public Narrator(TraversalPattern rootPattern) {
@@ -195,8 +195,6 @@ public class Narrator {
         return flatChapters;
     }
 
-    private record ChapterUnit(String content, int lines, int originalIdx) {}
-
     private narrator.graph.cluster.Cluster findClusterForNode(narrator.graph.Node node, List<narrator.graph.cluster.Cluster> clusters) {
         if (clusters.isEmpty()) return null;
         for (narrator.graph.cluster.Cluster cluster : clusters) {
@@ -367,6 +365,9 @@ public class Narrator {
         }
 
         return result;
+    }
+
+    private record ChapterUnit(String content, int lines, int originalIdx) {
     }
 
 }

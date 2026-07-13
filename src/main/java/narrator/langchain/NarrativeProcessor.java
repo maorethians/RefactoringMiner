@@ -7,16 +7,15 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.BiConsumer;
 
 public class NarrativeProcessor {
     private static final Logger logger = LoggerFactory.getLogger(NarrativeProcessor.class);
     private final NarrativeService narrativeService;
     private final LangChainClient langchainClient;
 
-    public NarrativeProcessor(NarrativeService narrativeService, LangChainClient langchainClient) {
+    public NarrativeProcessor(NarrativeService narrativeService) {
         this.narrativeService = narrativeService;
-        this.langchainClient = langchainClient;
+        this.langchainClient = LangChainClient.create();
     }
 
     public NarrativeResponse process(NarrativeRequest request) throws Exception {
@@ -47,7 +46,7 @@ public class NarrativeProcessor {
 
             if (!"No updated understanding provided.".equals(parsed.understanding)) {
                 String chapterUnderstanding = "Chapter " + (i + 1) + ": " + parsed.understanding;
-                String updatedUnderstanding = state.getUnderstanding().equals("No understanding yet.")
+                String updatedUnderstanding = state.getUnderstanding() == null
                         ? chapterUnderstanding
                         : state.getUnderstanding() + "\n\n" + chapterUnderstanding;
                 state = new NarrativeState(updatedUnderstanding);
@@ -88,13 +87,6 @@ public class NarrativeProcessor {
         return new ParsedResponse(understanding, result);
     }
 
-    public static class ParsedResponse {
-        public final String understanding;
-        public final String result;
-
-        public ParsedResponse(String understanding, String result) {
-            this.understanding = understanding;
-            this.result = result;
-        }
+    public record ParsedResponse(String understanding, String result) {
     }
 }

@@ -12,6 +12,6 @@ public class NarrativeState {
     }
 
     public static NarrativeState empty() {
-        return new NarrativeState("No understanding yet.");
+        return new NarrativeState(null);
     }
 }
