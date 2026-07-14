@@ -52,10 +52,10 @@ public class NarrativeRunner {
             "```";
 
     public static void main(String[] args) {
-        System.out.println(runNarrative("https://github.com/TeamNewPipe/NewPipe/pull/10018"));
+        System.out.println(run("https://github.com/TeamNewPipe/NewPipe/pull/10018"));
     }
 
-    public static String runNarrative(String url) {
+    public static String run(String url) {
         try {
             NarrativeService narrativeService = new NarrativeService();
             NarrativeProcessor processor = new NarrativeProcessor(narrativeService);

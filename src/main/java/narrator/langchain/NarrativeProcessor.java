@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class NarrativeProcessor {
-    private static final Logger logger = LoggerFactory.getLogger(NarrativeProcessor.class);
     private final NarrativeService narrativeService;
     private final LangChainClient langchainClient;
 
@@ -23,8 +22,6 @@ public class NarrativeProcessor {
         GrainLevel level = request.getGrainLevel();
         String task = request.getTask();
 
-        logger.info("Processing narrative for URL: {}, Level: {}, Task: {}", url, level, task);
-
         // 1. Initialize and get chapters
         narrativeService.initializeNarrative(url);
         List<String> chapters = narrativeService.getFlatChapters(url, level);
@@ -35,7 +32,7 @@ public class NarrativeProcessor {
         // 2. Iterative processing
         for (int i = 0; i < chapters.size(); i++) {
             String content = chapters.get(i);
-            logger.debug("Processing chapter {} of {}", i + 1, chapters.size());
+            System.out.println(i + 1 + "/" + chapters.size());
 
             String response = langchainClient.processChapter(task, state.getUnderstanding(), content);
 
