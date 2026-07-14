@@ -86,6 +86,15 @@ public class Narrator {
         if (p instanceof AggregatorPattern agg) {
             List<TraversalPattern> sortedSubs = new ArrayList<>(agg.subs);
             sortedSubs.sort((s1, s2) -> {
+                boolean s1DependsOnS2 = s1.dependsOn(s2);
+                boolean s2DependsOnS1 = s2.dependsOn(s1);
+                if (s1DependsOnS2 && !s2DependsOnS1) {
+                    return 1;
+                }
+                if (s2DependsOnS1 && !s1DependsOnS2) {
+                    return -1;
+                }
+
                 int d1 = s1.getDepth();
                 int d2 = s2.getDepth();
                 if (d1 != d2) {
