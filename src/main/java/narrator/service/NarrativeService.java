@@ -25,18 +25,19 @@ public class NarrativeService {
     private final CacheManager cacheManager = new CacheManager();
 
     public TraversalPattern initializeNarrative(String url) throws Exception {
-        TraversalPattern root = getOrComputeHierarchy(url);
-        if (root == null) {
-            return null;
-        }
+        return getOrComputeHierarchy(url);
+    }
 
+    public void generateNarrativeHtml(String url) throws Exception {
         List<Cluster> clusters = getOrComputeClusters(url);
+        TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
+        if (root == null) {
+            return;
+        }
         Narrator narrator = root.getNarrator();
         NarrativeHtmlGenerator generator = new NarrativeHtmlGenerator(url, narrator);
         generator.generateAll(clusters);
         cacheManager.putHtmlGenerator(url, generator);
-
-        return root;
     }
 
     public List<String> getFlatChapters(String url, GrainLevel level) throws Exception {

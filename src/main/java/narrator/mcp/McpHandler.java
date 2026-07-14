@@ -186,9 +186,6 @@ public class McpHandler {
             return "No changes found to narrate.";
         }
 
-        Narrator narrator = root.getNarrator();
-        List<Cluster> clusters = narrativeService.getOrComputeClusters(url);
-
         StringBuilder summary = new StringBuilder();
         summary.append("Narrative initialized.\n\n");
 
@@ -216,6 +213,9 @@ public class McpHandler {
             }
             summary.append("\n\nPlease analyze the metadata and decide which GrainLevel to use for the review.");
         } else {
+            // Manual mode: generate HTML pages so the user can browse them
+            narrativeService.generateNarrativeHtml(url);
+
             summary.append("You must now guide the user to start the narration. Please follow these steps:\n");
             summary.append("1. Provide the user with the path to the narrative overview HTML page for a high-level overview: ").append(narrativeService.getCacheManager().getHtmlGenerator(url).getOverviewPath()).append("\n");
             summary.append("2. List the available GrainLevels and their respective chapter counts from the list below, explaining that they should choose one to start the detailed narration.\n\n");
