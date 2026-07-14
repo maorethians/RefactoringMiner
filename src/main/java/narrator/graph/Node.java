@@ -348,15 +348,15 @@ public class Node {
     if (!thisContextString.equals(altContextString)) {
       if (!(thisContextString.endsWith(this.getContent()) && altContextString.endsWith(
           alt.getContent()))) {
-        operations.add("Move");
+        operations.add("move");
       }
     }
     if (!this.getContent().equals(alt.getContent())) {
-      operations.add("Change");
+      operations.add("change");
     }
 
     if (operations.isEmpty()) {
-      operations.add("Move");
+      operations.add("move");
     }
 
     return operations;
@@ -364,9 +364,9 @@ public class Node {
 
   private String getPromptType(Graph<Node, Edge> graph) {
     String type = switch (this.getNodeType()) {
-      case EXTENSION -> "UNCHANGED";
-      case DELETION -> "DELETED";
-      case ADDITION -> "ADDED";
+      case EXTENSION -> "unchanged";
+      case DELETION -> "deleted";
+      case ADDITION -> "added";
       default -> this.getNodeType().name();
     };
 
@@ -379,12 +379,11 @@ public class Node {
       return type;
     }
 
-    List<String> upperCaseOperations = operations.stream().map(String::toUpperCase).toList();
     if (!this.getMappingSources(graph).isEmpty()) {
-      return "AFTER_" + String.join("_AND_", upperCaseOperations);
+      return "after_" + String.join("_and_", operations);
     }
     if (!this.getMappingTargets(graph).isEmpty()) {
-      return "BEFORE_" + String.join("_AND_", upperCaseOperations);
+      return "before_" + String.join("_and_", operations);
     }
     return type;
   }

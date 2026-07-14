@@ -222,7 +222,7 @@ public class TraversalPattern extends GraphWrapper {
             TraversalPattern leaf = leaves.get(i);
             for (Node s : leaf.getSides()) {
                 if (globalSides.contains(s) && !outputtedSides.contains(s)) {
-                    String content = "<DEPENDENCY>\n    " + s.baseXml(graph).replace("\n", "\n    ") + "\n</DEPENDENCY>";
+                    String content = "<dependency>\n    " + s.baseXml(graph).replace("\n", "\n    ") + "\n</dependency>";
                     elements.add(new NarrativeElement(content, content.split("\n").length, NarrativeElement.ElementType.DEPENDENCY));
                     outputtedSides.add(s);
                 }
@@ -341,38 +341,38 @@ public class TraversalPattern extends GraphWrapper {
 
     private String buildSubChapterXml(MergedGroup mergedGroup, Graph<Node, Edge> graph, List<TraversalPattern> leaves, Map<MergedGroup, List<Node>> localSidesMap) {
         StringBuilder sb = new StringBuilder();
-        sb.append("<SUB_CHAPTER>");
+        sb.append("<sub_chapter>");
 
         for (MappingGroup mg : mergedGroup.groups) {
             sb.append("\n    ").append(buildXmlMappingHunk(mg.sources(), mg.targets(), graph).replace("\n", "\n    "));
         }
 
         if (!mergedGroup.context.isEmpty()) {
-            sb.append("\n    <CONTEXT>");
+            sb.append("\n    <context>");
             Set<String> contextsText = new HashSet<>();
             for (Node context : mergedGroup.context) {
                 contextsText.add(context.mappingXml(graph));
             }
             sb.append("\n        ").append(String.join("\n        ", contextsText.stream().map(text -> text.replace("\n", "\n        ")).toList()));
-            sb.append("\n    </CONTEXT>");
+            sb.append("\n    </context>");
         }
 
         List<Node> localSides = localSidesMap.getOrDefault(mergedGroup, List.of());
         if (!localSides.isEmpty()) {
-            sb.append("\n    <DEPENDENCIES>");
+            sb.append("\n    <dependencies>");
             for (Node side : localSides) {
                 sb.append("\n        ").append(side.baseXml(graph).replace("\n", "\n        "));
             }
-            sb.append("\n    </DEPENDENCIES>");
+            sb.append("\n    </dependencies>");
         }
 
-        sb.append("\n</SUB_CHAPTER>");
+        sb.append("\n</sub_chapter>");
         return sb.toString();
     }
 
     private String buildXmlMappingHunk(List<Node> sources, List<Node> targets, Graph<Node, Edge> graph) {
         StringBuilder xmlOutput = new StringBuilder();
-        xmlOutput.append("<CHANGE>");
+        xmlOutput.append("<change>");
         if (!sources.isEmpty()) {
             xmlOutput.append("\n    ");
             xmlOutput.append(String.join("\n    ", sources.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
@@ -381,7 +381,7 @@ public class TraversalPattern extends GraphWrapper {
             xmlOutput.append("\n    ");
             xmlOutput.append(String.join("\n    ", targets.stream().map(n -> n.baseXml(graph).replace("\n", "\n    ")).toList()));
         }
-        xmlOutput.append("\n</CHANGE>");
+        xmlOutput.append("\n</change>");
         return xmlOutput.toString();
     }
 
