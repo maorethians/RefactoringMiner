@@ -39,8 +39,6 @@ public class NarrativeProcessor {
 
             String response = langchainClient.processChapter(task, state.getUnderstanding(), content);
 
-            System.out.println(response);
-
             // Parse the response
             ParsedResponse parsed = parseResponse(response);
 
