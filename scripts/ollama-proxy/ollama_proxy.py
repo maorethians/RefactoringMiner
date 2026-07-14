@@ -11,7 +11,7 @@ from typing import AsyncGenerator
 # Configuration
 OLLAMA_URL = "http://localhost:11434"
 PROXY_PORT = int(os.getenv("OLLAMA_PROXY_PORT", 11435))
-LOG_FILE = "/tmp/ollama_proxy.log"
+LOG_FILE = "./ollama_proxy.log"
 
 def update_token_log(in_tokens, out_tokens):
     try:
