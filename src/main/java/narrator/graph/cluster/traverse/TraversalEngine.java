@@ -55,6 +55,19 @@ public class TraversalEngine {
             components.clear();
             components.add(finalComponent);
         }
+
+        for (TraversalPattern component : components) {
+            setClusterGraphRecursive(component);
+        }
+    }
+
+    private void setClusterGraphRecursive(TraversalPattern pattern) {
+        pattern.setClusterGraph(graph);
+        if (pattern instanceof AggregatorPattern aggregator) {
+            for (TraversalPattern sub : aggregator.subs) {
+                setClusterGraphRecursive(sub);
+            }
+        }
     }
 
     private void addUsageComponents() {

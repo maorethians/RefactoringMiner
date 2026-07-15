@@ -1,7 +1,9 @@
 package narrator.graph.cluster.traverse;
 
+import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.NodeType;
+import org.jgrapht.Graph;
 import org.refactoringminer.astDiff.utils.Constants;
 
 import java.util.*;
@@ -134,7 +136,7 @@ public class Narrator {
         return cache.computeIfAbsent(grainLevel, this::narrate);
     }
 
-    public List<String> getFlatChapters(GrainLevel level, List<narrator.graph.cluster.Cluster> clusters) {
+    public List<String> getFlatChapters(GrainLevel level) {
         if (flatCache.containsKey(level)) {
             return flatCache.get(level);
         }
@@ -146,16 +148,16 @@ public class Narrator {
         List<ChapterUnit> units = new ArrayList<>();
         for (int i = 0; i < chapters.size(); i++) {
             TraversalPattern chapter = chapters.get(i);
-            narrator.graph.cluster.Cluster cluster = findClusterForNode(chapter.getLead(), clusters);
-            if (cluster == null) {
-                units.add(new ChapterUnit(String.format("[Chapter %d of %d]: Error: Could not find associated cluster.\n\n", i + 1, chapters.size()), 0, i + 1));
+            Graph<Node, Edge> clusterGraph = chapter.getClusterGraph();
+            if (clusterGraph == null) {
+                units.add(new ChapterUnit(String.format("[Chapter %d of %d]: Error: Could not find associated cluster graph.\n\n", i + 1, chapters.size()), 0, i + 1));
                 continue;
             }
 
             List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : Collections.emptyList();
 
             if (chapter instanceof AggregatorPattern agg) {
-                List<NarrativeElement> elements = agg.getElements(cluster.getGraph(), filterPatterns);
+                List<NarrativeElement> elements = agg.getElements(clusterGraph, filterPatterns);
                 int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
 
                 if (totalLines > THRESHOLD) {
@@ -165,11 +167,11 @@ public class Narrator {
                         units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
                     }
                 } else {
-                    String content = agg.extended(cluster.getGraph(), level, filterPatterns);
+                    String content = agg.extended(clusterGraph, level, filterPatterns);
                     units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
                 }
             } else {
-                String content = chapter.extended(cluster.getGraph(), level, filterPatterns);
+                String content = chapter.extended(clusterGraph, level, filterPatterns);
                 units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
             }
         }
@@ -202,14 +204,6 @@ public class Narrator {
 
         flatCache.put(level, flatChapters);
         return flatChapters;
-    }
-
-    private narrator.graph.cluster.Cluster findClusterForNode(narrator.graph.Node node, List<narrator.graph.cluster.Cluster> clusters) {
-        if (clusters.isEmpty()) return null;
-        for (narrator.graph.cluster.Cluster cluster : clusters) {
-            if (cluster.getGraph().vertexSet().contains(node)) return cluster;
-        }
-        return null;
     }
 
     private List<List<NarrativeElement>> createBalancedSplits(List<NarrativeElement> elements) {

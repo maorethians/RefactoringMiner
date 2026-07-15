@@ -12,6 +12,7 @@ import org.jgrapht.Graph;
 import java.util.*;
 
 public class TraversalPattern extends GraphWrapper {
+    protected Graph<Node, Edge> clusterGraph;
     protected final Util util = new Util(getGraph());
     protected final Set<String> identifiers = new HashSet<>();
     private final Narrator narrator = new Narrator(this);
@@ -19,6 +20,14 @@ public class TraversalPattern extends GraphWrapper {
     protected Node cachedLead = null;
     protected NodeType nodeType;
     private List<TraversalPattern> cachedFlatten = null;
+
+    public Graph<Node, Edge> getClusterGraph() {
+        return clusterGraph;
+    }
+
+    public void setClusterGraph(Graph<Node, Edge> clusterGraph) {
+        this.clusterGraph = clusterGraph;
+    }
 
     public static List<MappingGroup> aggregateByMapping(Graph<Node, Edge> graph, Collection<Node> nodes) {
         Set<Node> allowedNodes = new HashSet<>(nodes);

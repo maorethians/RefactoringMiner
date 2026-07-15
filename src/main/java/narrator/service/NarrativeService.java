@@ -47,20 +47,18 @@ public class NarrativeService {
         }
 
         Narrator narrator = root.getNarrator();
-        List<Cluster> clusters = getOrComputeClusters(url);
-
         if (level == GrainLevel.RAW_DIFF) {
-            return getRawDiffChunks(url, narrator, clusters);
+            return getRawDiffChunks(url, narrator);
         } else {
-            return narrator.getFlatChapters(level, clusters);
+            return narrator.getFlatChapters(level);
         }
     }
 
-    public void updateHtmlPage(String url, GrainLevel level, List<Cluster> clusters, int progress) {
+    public void updateHtmlPage(String url, GrainLevel level, int progress) {
         NarrativeHtmlGenerator generator = cacheManager.getHtmlGenerator(url);
         if (generator != null) {
             try {
-                generator.generateGrainLevelPage(level, clusters, progress);
+                generator.generateGrainLevelPage(level, progress);
             } catch (Exception e) {
                 logger.error("Failed to update narrative HTML page", e);
             }
@@ -114,13 +112,13 @@ public class NarrativeService {
         }
     }
 
-    private List<String> getRawDiffChunks(String url, Narrator narrator, List<Cluster> clusters) throws Exception {
+    private List<String> getRawDiffChunks(String url, Narrator narrator) throws Exception {
         List<String> cached = cacheManager.getRawDiffChunks(url);
         if (cached != null) {
             return cached;
         }
 
-        List<String> fileChapters = narrator.getFlatChapters(GrainLevel.FILE, clusters);
+        List<String> fileChapters = narrator.getFlatChapters(GrainLevel.FILE);
         int numChunks = fileChapters.size();
         if (numChunks == 0) {
             return Collections.emptyList();

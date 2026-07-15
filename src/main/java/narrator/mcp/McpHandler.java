@@ -297,7 +297,7 @@ public class McpHandler {
         String header = String.format("[Chapter %d of %d]\n", progress + 1, flatChapters.size());
         narrator.incrementProgress(level);
 
-        narrativeService.updateHtmlPage(url, level, narrativeService.getOrComputeClusters(url), progress);
+        narrativeService.updateHtmlPage(url, level, progress);
 
         StringBuilder output = new StringBuilder();
         output.append(header).append(content);

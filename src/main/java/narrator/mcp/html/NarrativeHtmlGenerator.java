@@ -27,7 +27,7 @@ public class NarrativeHtmlGenerator {
     public String generateAll(List<Cluster> clusters) throws IOException {
         // 1. Generate Grain Level pages
         for (GrainLevel level : GrainLevel.values()) {
-            generateGrainLevelPage(level, clusters, -1);
+            generateGrainLevelPage(level, -1);
         }
 
         // 2. Generate Overview page
@@ -46,7 +46,7 @@ public class NarrativeHtmlGenerator {
 
         html.append("<div class='grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6'>");
         for (GrainLevel level : GrainLevel.values()) {
-            int count = narrator.getFlatChapters(level, clusters).size();
+            int count = narrator.getFlatChapters(level).size();
             String filename = "grain_" + level.name().toLowerCase() + ".html";
             html.append("<a href='").append(filename).append("' class='group p-6 bg-white rounded-xl shadow-sm border border-slate-200 hover:border-indigo-500 hover:shadow-md transition-all duration-200'>");
             html.append("<div class='flex items-center justify-between mb-4'>");
@@ -62,8 +62,8 @@ public class NarrativeHtmlGenerator {
         writeFile("index.html", html.toString());
     }
 
-    public void generateGrainLevelPage(GrainLevel level, List<Cluster> clusters, int expandedChapterIndex) throws IOException {
-        List<String> chapters = narrator.getFlatChapters(level, clusters);
+    public void generateGrainLevelPage(GrainLevel level, int expandedChapterIndex) throws IOException {
+        List<String> chapters = narrator.getFlatChapters(level);
         StringBuilder html = new StringBuilder();
         html.append(getHtmlHeader(level + " Overview"));
         html.append("<div class='max-w-4xl mx-auto px-4 py-12'>");
@@ -107,20 +107,6 @@ public class NarrativeHtmlGenerator {
         writeFile("grain_" + level.name().toLowerCase() + ".html", html.toString());
     }
 
-
-    private Cluster findClusterForNode(Node node, List<Cluster> clusters) {
-        if (clusters == null || clusters.isEmpty()) {
-            return null;
-        }
-
-        for (Cluster cluster : clusters) {
-            if (cluster.getGraph().vertexSet().contains(node)) {
-                return cluster;
-            }
-        }
-
-        return null;
-    }
 
     private void writeFile(String filename, String content) throws IOException {
         Files.write(baseDir.resolve(filename), content.getBytes(StandardCharsets.UTF_8));
