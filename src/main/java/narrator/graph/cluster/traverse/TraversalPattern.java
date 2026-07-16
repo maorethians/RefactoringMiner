@@ -303,25 +303,37 @@ public class TraversalPattern extends GraphWrapper {
     }
 
     public boolean dependsOn(TraversalPattern p) {
+        return dependsOnRecursive(p, new HashSet<>());
+    }
+
+    private boolean dependsOnRecursive(TraversalPattern p, Set<TraversalPattern> visited) {
         if (dependsOnCache.containsKey(p)) {
             return dependsOnCache.get(p);
         }
 
-        List<TraversalPattern> pNarrative = p.flatten();
-        boolean result = false;
-        for (TraversalPattern thisP : this.flatten()) {
-            if (thisP instanceof AggregatorPattern agg) {
-                for (TraversalPattern sub : agg.subs) {
-                    if (pNarrative.contains(sub)) {
-                        result = true;
-                        break;
+        if (visited.contains(this)) {
+            return false;
+        }
+        visited.add(this);
+
+        if (this.flatten().contains(p)) {
+            dependsOnCache.put(p, true);
+            return true;
+        }
+
+        for (TraversalPattern tp : this.flatten()) {
+            if (tp instanceof UsagePattern usage) {
+                for (TraversalPattern req : usage.subs) {
+                    if (req.dependsOnRecursive(p, visited)) {
+                        dependsOnCache.put(p, true);
+                        return true;
                     }
                 }
             }
-            if (result) break;
         }
-        dependsOnCache.put(p, result);
-        return result;
+
+        dependsOnCache.put(p, false);
+        return false;
     }
 
     private List<TraversalPattern> flatten() {
