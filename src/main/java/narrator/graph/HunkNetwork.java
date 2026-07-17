@@ -25,7 +25,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
@@ -47,6 +46,8 @@ public class HunkNetwork {
   private final Map<String, String> dstContents;
   private final Map<String, TreeContext> srcContexts;
   private final Map<String, TreeContext> dstContexts;
+  private final Set<ImportTree> srcTrees = new HashSet<>();
+  private final Set<ImportTree> dstTrees = new HashSet<>();
 
   public HunkNetwork(UMLModelDiff modelDiff, Map<String, String> srcContents,
       Map<String, String> dstContents,
@@ -60,7 +61,7 @@ public class HunkNetwork {
     this.dstContexts = dstContexts;
   }
 
-  private Pair<SrcDst, String> localizeTree(Tree tree) {
+  private TreeLocation localizeTree(Tree tree) {
     List<Tree> parents = tree.getParents();
     Tree root = parents.get(parents.size() - 1);
     return findContext(srcContexts, root, SrcDst.SRC)
@@ -68,13 +69,10 @@ public class HunkNetwork {
         .orElse(null);
   }
 
-  private Optional<Pair<SrcDst, String>> findContext(
-      Map<String, TreeContext> contexts,
-      Tree root,
-      SrcDst srcDst) {
+  private Optional<TreeLocation> findContext(Map<String, TreeContext> contexts, Tree root, SrcDst srcDst) {
     return contexts.entrySet().stream()
         .filter(e -> e.getValue().getRoot().equals(root))
-        .map(e -> new Pair<>(srcDst, e.getKey()))
+        .map(e -> new TreeLocation(srcDst, e.getKey()))
         .findFirst();
   }
 
@@ -84,48 +82,40 @@ public class HunkNetwork {
 
   public void importFiles(List<Entry<String, TreeContext>> deletedFiles,
       List<Entry<String, TreeContext>> addedFiles) {
-    if (deletedFiles.isEmpty() && addedFiles.isEmpty()) {
-      return;
-    }
-
     for (Entry<String, TreeContext> deletedFile : deletedFiles) {
-      List<Pair<Tree, NodeType>> srcTrees = getValidTrees(deletedFile.getKey(),
-          deletedFile.getValue().getRoot().getChildren()).stream()
-          .map(tree -> new Pair<>(tree, NodeType.DELETION)).toList();
-      importTrees(aggregateTrees(srcTrees), SrcDst.SRC, null);
+      String path = deletedFile.getKey();
+      srcTrees.addAll(getValidTrees(path, deletedFile.getValue().getRoot().getChildren()).stream()
+              .map(tree -> new ImportTree(tree, NodeType.DELETION, null, path)).toList());
     }
     for (Entry<String, TreeContext> addedFile : addedFiles) {
-      List<Pair<Tree, NodeType>> dstTrees = getValidTrees(addedFile.getKey(),
-          addedFile.getValue().getRoot().getChildren()).stream()
-          .map(tree -> new Pair<>(tree, NodeType.ADDITION)).toList();
-      importTrees(aggregateTrees(dstTrees), SrcDst.DST, null);
+      String path = addedFile.getKey();
+      dstTrees.addAll(getValidTrees(path, addedFile.getValue().getRoot().getChildren()).stream()
+              .map(tree -> new ImportTree(tree, NodeType.ADDITION, null, path)).toList());
     }
   }
 
   public void importDiff(ASTDiff diff) {
     TreeClassifier classifier = diff.createRootNodesClassifier();
+    String srcPath = diff.getSrcPath();
+    String dstPath = diff.getDstPath();
 
-    Set<Pair<Tree, NodeType>> srcTrees = new HashSet<>(
-        getValidTrees(diff.getSrcPath(), classifier.getMovedSrcs()).stream()
-            .map(tree -> new Pair<>(tree, NodeType.SRC_MOVE)).toList());
-    if (diff.getSrcPath().equals(diff.getDstPath())) {
-      srcTrees.addAll(getValidTrees(diff.getSrcPath(), classifier.getDeletedSrcs()).stream()
-          .map(tree -> new Pair<>(tree, NodeType.DELETION)).toList());
-      srcTrees.addAll(getValidTrees(diff.getSrcPath(), classifier.getUpdatedSrcs()).stream()
-          .map(tree -> new Pair<>(tree, NodeType.SRC_UPDATE)).toList());
+    srcTrees.addAll(getValidTrees(srcPath, classifier.getMovedSrcs()).stream()
+            .map(tree -> new ImportTree(tree, NodeType.SRC_MOVE, diff, srcPath)).toList());
+    if (srcPath.equals(dstPath)) {
+      srcTrees.addAll(getValidTrees(srcPath, classifier.getDeletedSrcs()).stream()
+          .map(tree -> new ImportTree(tree, NodeType.DELETION, diff, srcPath)).toList());
+      srcTrees.addAll(getValidTrees(srcPath, classifier.getUpdatedSrcs()).stream()
+          .map(tree -> new ImportTree(tree, NodeType.SRC_UPDATE, diff, srcPath)).toList());
     }
-    importTrees(aggregateTrees(srcTrees), SrcDst.SRC, diff);
 
-    Set<Pair<Tree, NodeType>> dstTrees = new HashSet<>(
-        getValidTrees(diff.getDstPath(), classifier.getMovedDsts()).stream()
-            .map(tree -> new Pair<>(tree, NodeType.DST_MOVE)).toList());
-    if (diff.getSrcPath().equals(diff.getDstPath())) {
-      dstTrees.addAll(getValidTrees(diff.getDstPath(), classifier.getInsertedDsts()).stream()
-          .map(tree -> new Pair<>(tree, NodeType.ADDITION)).toList());
-      dstTrees.addAll(getValidTrees(diff.getDstPath(), classifier.getUpdatedDsts()).stream()
-          .map(tree -> new Pair<>(tree, NodeType.DST_UPDATE)).toList());
+    dstTrees.addAll(getValidTrees(dstPath, classifier.getMovedDsts()).stream()
+            .map(tree -> new ImportTree(tree, NodeType.DST_MOVE, diff, dstPath)).toList());
+    if (srcPath.equals(dstPath)) {
+      dstTrees.addAll(getValidTrees(dstPath, classifier.getInsertedDsts()).stream()
+          .map(tree -> new ImportTree(tree, NodeType.ADDITION, diff, dstPath)).toList());
+      dstTrees.addAll(getValidTrees(dstPath, classifier.getUpdatedDsts()).stream()
+          .map(tree -> new ImportTree(tree, NodeType.DST_UPDATE, diff, dstPath)).toList());
     }
-    importTrees(aggregateTrees(dstTrees), SrcDst.DST, diff);
   }
 
   private Set<Tree> getValidTrees(String path, Collection<Tree> trees) {
@@ -147,20 +137,19 @@ public class HunkNetwork {
             Collectors.toSet());
   }
 
-  private HashMap<Pair<Tree, NodeType>, Set<Tree>> aggregateTrees(
-      Collection<Pair<Tree, NodeType>> trees) {
-    HashMap<Pair<Tree, NodeType>, Set<Tree>> result = new HashMap<>();
+  private HashMap<ImportTree, Set<ImportTree>> aggregateTrees(Set<ImportTree> importTrees) {
+    HashMap<ImportTree, Set<ImportTree>> result = new HashMap<>();
 
-    for (Pair<Tree, NodeType> subject : trees) {
+    for (ImportTree subject : importTrees) {
       boolean isParent = true;
 
-      for (Pair<Tree, NodeType> object : trees) {
+      for (ImportTree object : importTrees) {
         if (subject.equals(object)) {
           continue;
         }
 
-        if (object.first.getPos() <= subject.first.getPos()
-            && subject.first.getEndPos() <= object.first.getEndPos()) {
+        if (object.path.equals(subject.path) && object.tree.getPos() <= subject.tree.getPos()
+            && subject.tree.getEndPos() <= object.tree.getEndPos()) {
           isParent = false;
           break;
         }
@@ -170,15 +159,16 @@ public class HunkNetwork {
         result.put(subject, new HashSet<>());
       }
     }
-    for (Pair<Tree, NodeType> parent : result.keySet()) {
-      for (Pair<Tree, NodeType> addition : trees) {
-        if (parent.equals(addition)) {
+
+    for (ImportTree parent : result.keySet()) {
+      for (ImportTree importTree : importTrees) {
+        if (parent.equals(importTree)) {
           continue;
         }
 
-        if (parent.first.getPos() <= addition.first.getPos()
-            && addition.first.getEndPos() <= parent.first.getEndPos()) {
-          result.get(parent).add(addition.first);
+        if (parent.path.equals(importTree.path) && parent.tree.getPos() <= importTree.tree.getPos()
+            && importTree.tree.getEndPos() <= parent.tree.getEndPos()) {
+          result.get(parent).add(importTree);
         }
       }
     }
@@ -186,23 +176,22 @@ public class HunkNetwork {
     return result;
   }
 
-  private void importTrees(HashMap<Pair<Tree, NodeType>, Set<Tree>> trees, SrcDst srcDst,
-      ASTDiff diff) {
+  private void importTrees(HashMap<ImportTree, Set<ImportTree>> trees) {
     trees.entrySet().stream().map(entry -> {
-      Tree tree = entry.getKey().first;
-      Set<Tree> subTrees = entry.getValue();
-      Pair<SrcDst, String> treeLocation = localizeTree(tree);
-      return new Node(getFileContent(treeLocation.first, treeLocation.second),
-          treeLocation.second, srcDst, tree, subTrees.isEmpty() ? null : subTrees,
-          null, entry.getKey().second, diff);
+      ImportTree parent = entry.getKey();
+      Set<ImportTree> subs = entry.getValue();
+      TreeLocation treeLocation = localizeTree(parent.tree);
+      String fileContent = getFileContent(treeLocation.srcDst, treeLocation.path);
+      return new Node(fileContent, treeLocation.path, treeLocation.srcDst, parent.tree,
+              subs.stream().map(sub -> new Node(fileContent, sub.path, treeLocation.srcDst, sub.tree, null, sub.type,sub.diff)).collect(Collectors.toSet()),
+              parent.type, parent.diff);
     }).forEach(this::addNode);
   }
 
   private Node addExtensionNode(Tree extensionTree, Node extendedNode) {
-    Pair<SrcDst, String> treeLocation = localizeTree(extensionTree);
-    Node node = new Node(getFileContent(treeLocation.first, treeLocation.second),
-        treeLocation.second, treeLocation.first, extensionTree, null, null,
-        NodeType.EXTENSION, extendedNode.getDiff());
+    TreeLocation treeLocation = localizeTree(extensionTree);
+    Node node = new Node(getFileContent(treeLocation.srcDst, treeLocation.path), treeLocation.path, treeLocation.srcDst,
+            extensionTree, null, NodeType.EXTENSION, extendedNode.getDiff());
     return addNode(node);
   }
 
@@ -228,8 +217,7 @@ public class HunkNetwork {
       String potentialContextId = Node.formatId(path, srcDst, context.second, context.first);
 
       if (!nodeMap.containsKey(potentialContextId)) {
-        Node contextNode = new Node(node.getFileContent(), path, srcDst, context.first,
-            null, null, context.second, node.getDiff());
+        Node contextNode = new Node(node.getFileContent(), path, srcDst, context.first, null, context.second, node.getDiff());
         graph.addVertex(contextNode);
         nodeMap.put(contextNode.getId(), contextNode);
       }
@@ -288,6 +276,9 @@ public class HunkNetwork {
   }
 
   public void process() {
+    importTrees(aggregateTrees(srcTrees));
+    importTrees(aggregateTrees(dstTrees));
+
     processDefUse();
     processClassLevelRelations();
     processExtensions(SrcDst.SRC);
@@ -303,42 +294,51 @@ public class HunkNetwork {
     List<Node> nodes = graph.vertexSet().stream().toList().stream()
         .filter(node -> !node.isExtension()).toList();
     List<Node> srcNodes = nodes.stream().filter(Node::isSrc).toList();
-    List<Node> dstNodes = nodes.stream().filter(Node::isDst).toList();
+    List<NodeTrees> dstNodes = nodes.stream().filter(Node::isDst).map(dstNode -> {
+      Set<Tree> allTrees = new HashSet<>();
+      allTrees.add(dstNode.getTree());
+      if (dstNode.getSubs() != null) {
+        allTrees.addAll(dstNode.getSubs().stream().map(Node::getTree).toList());
+      }
+      return new NodeTrees(dstNode, allTrees);
+    }).toList();
 
     for (Node srcNode : srcNodes) {
-      ASTDiff diff = srcNode.getDiff();
-      if (diff == null) {
-        continue;
+      List<Node> srcOrSubs = new ArrayList<>();
+      srcOrSubs.add(srcNode);
+      if (srcNode.getSubs() != null) {
+        srcOrSubs.addAll(srcNode.getSubs());
       }
-      MappingStore mappingStore = diff.getAllMappings().getMonoMappingStore();
 
-      Set<Tree> srcTrees = new HashSet<>();
-      srcTrees.add(srcNode.getTree());
-      if (srcNode.getSubTrees() != null) {
-        srcTrees.addAll(srcNode.getSubTrees());
-      }
-      List<Tree> dstTrees = srcTrees.stream().map(mappingStore::getDstForSrc)
-          .filter(Objects::nonNull).toList();
-
-      List<Node> mappedDstNodes = dstNodes.stream().filter(dstNode -> {
-        Set<Tree> dstNodeTrees = new HashSet<>();
-        dstNodeTrees.add(dstNode.getTree());
-        if (dstNode.getSubTrees() != null) {
-          dstNodeTrees.addAll(dstNode.getSubTrees());
+      Set<Node> mappedDstNodes = new HashSet<>();
+      for (Node srcOrSub : srcOrSubs) {
+        ASTDiff diff = srcOrSub.getDiff();
+        if (diff == null) {
+          continue;
         }
 
-        return dstNodeTrees.stream().anyMatch(dstTrees::contains);
-      }).toList();
-      if (srcNode.getNodeType().equals(NodeType.SEMANTIC_CONTEXT) || srcNode.getNodeType()
-          .equals(NodeType.LOCATION_CONTEXT)) {
-        mappedDstNodes = mappedDstNodes.stream().filter(dstNode -> {
-          if (!dstNode.getNodeType().equals(NodeType.SEMANTIC_CONTEXT)
-              && !dstNode.getNodeType().equals(NodeType.LOCATION_CONTEXT)) {
-            return true;
-          }
-          return srcNode.getNodeType().equals(dstNode.getNodeType());
-        }).toList();
+        MappingStore mappingStore = diff.getAllMappings().getMonoMappingStore();
+        Tree srcTree = srcOrSub.getTree();
+        Tree dstTree = mappingStore.getDstForSrc(srcTree);
+        if (dstTree == null) {
+          continue;
+        }
+
+
+        List<Node> srcOrSubMappedDstNodes = dstNodes.stream().filter(dstNode -> dstNode.trees.contains(dstTree))
+                .map(dstNode -> dstNode.node).toList();
+        if (srcNode.isContext()) {
+          srcOrSubMappedDstNodes = srcOrSubMappedDstNodes.stream().filter(dstNode -> {
+            if (!dstNode.isContext()) {
+              return true;
+            }
+            return srcNode.getNodeType().equals(dstNode.getNodeType());
+          }).toList();
+        }
+
+        mappedDstNodes.addAll(srcOrSubMappedDstNodes);
       }
+
       for (Node mappedDstNode : mappedDstNodes) {
         addEdge(srcNode, mappedDstNode, EdgeType.MAPPING);
       }
@@ -730,7 +730,7 @@ public class HunkNetwork {
       return null;
     }
 
-    return getUMLClass(localizeTree(tree).second, parentTypeName.getLabel(),
+    return getUMLClass(localizeTree(tree).path, parentTypeName.getLabel(),
         srcDst.equals(SrcDst.SRC) ? modelDiff.getParentModel() : modelDiff.getChildModel());
   }
 
@@ -942,4 +942,10 @@ public class HunkNetwork {
       }
     }
   }
+
+  private record ImportTree(Tree tree, NodeType type, ASTDiff diff, String path) {}
+
+  private record TreeLocation(SrcDst srcDst, String path) {}
+
+  private record NodeTrees(Node node, Set<Tree> trees) {}
 }

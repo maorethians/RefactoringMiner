@@ -29,9 +29,7 @@ public class Driver {
     public static Graph<Node, Edge> getCommitGraph(String url) {
         String repo = URLHelper.getRepo(url);
         String commit = URLHelper.getCommit(url);
-        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommit(repo,
-                commit,
-                1000);
+        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommit(repo, commit, 1000);
 
         return getGraph(projectASTDiff);
     }
@@ -59,8 +57,6 @@ public class Driver {
         List<Entry<String, TreeContext>> addedFiles = dstContexts.entrySet().stream()
                 .filter(entry -> !diffDstPaths.contains(entry.getKey())).toList();
         network.importFiles(deletedFiles, addedFiles);
-
-//            network.importHunks(new HashSet<>(addedTree.getChildren()), null);
 
         network.process();
 

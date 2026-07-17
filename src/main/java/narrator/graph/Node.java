@@ -33,17 +33,14 @@ public class Node {
   private final String fileContent;
   private final Tree tree;
   @Nullable
-  private final Set<Tree> moveTrees;
-  @Nullable
-  private final Set<Tree> subTrees;
+  private final Set<Node> subs;
   private final Set<String> identifiers = new HashSet<>();
   private final NodeType nodeType;
   @Nullable
   private final ASTDiff diff;
 
   public Node(String fileContent, String path, SrcDst srcDst, Tree tree,
-      @Nullable Set<Tree> subTrees, @Nullable Set<Tree> moveTrees, NodeType nodeType,
-      @Nullable ASTDiff diff) {
+      @Nullable Set<Node> subs, NodeType nodeType, @Nullable ASTDiff diff) {
     this.id = formatId(path, srcDst, nodeType, tree);
     this.promptId = generateShortId();
     this.fileContent = fileContent;
@@ -51,8 +48,7 @@ public class Node {
     this.constants = new Constants(path);
     this.srcDst = srcDst;
     this.tree = tree;
-    this.subTrees = subTrees;
-    this.moveTrees = moveTrees;
+    this.subs = subs;
     this.nodeType = nodeType;
     this.diff = diff;
   }
@@ -68,11 +64,6 @@ public class Node {
       sb.append(ALPHABET.charAt(RANDOM.nextInt(ALPHABET.length())));
     }
     return sb.toString();
-  }
-
-  @Nullable
-  public Set<Tree> getMoveTrees() {
-    return moveTrees;
   }
 
   @Nullable
@@ -124,8 +115,7 @@ public class Node {
   }
 
   public boolean isContext() {
-    return nodeType.equals(NodeType.LOCATION_CONTEXT) || nodeType.equals(
-        NodeType.SEMANTIC_CONTEXT);
+    return nodeType.equals(NodeType.LOCATION_CONTEXT) || nodeType.equals(NodeType.SEMANTIC_CONTEXT);
   }
 
   public Tree getTree() {
@@ -133,8 +123,8 @@ public class Node {
   }
 
   @Nullable
-  public Set<Tree> getSubTrees() {
-    return this.subTrees;
+  public Set<Node> getSubs() {
+    return this.subs;
   }
 
   public NodeType getNodeType() {
@@ -262,31 +252,12 @@ public class Node {
     nodeObj.addProperty("endLineOffset", endLineRange.second);
     nodeObj.addProperty("length", this.getTree().getEndPos() - this.getTree().getPos() + 1);
 
-    if (this.getMoveTrees() != null) {
-      JsonArray movesArr = new JsonArray();
-      for (com.github.gumtreediff.tree.Tree move : this.getMoveTrees()) {
-        JsonObject moveObj = new JsonObject();
-
-        Pair<Pair<Integer, Integer>, Pair<Integer, Integer>> dstLineRange =
-            TreeUtilFunctions.getLineRange(move, this.getFileContent());
-        Pair<Integer, Integer> startDstRange = dstLineRange.first;
-        moveObj.addProperty("startLine", startDstRange.first);
-        moveObj.addProperty("startLineOffset", startDstRange.second);
-        Pair<Integer, Integer> endDstRange = dstLineRange.second;
-        moveObj.addProperty("endLine", endDstRange.first);
-        moveObj.addProperty("endLineOffset", endDstRange.second);
-        moveObj.addProperty("length", move.getEndPos() - move.getPos() + 1);
-
-        movesArr.add(moveObj);
-      }
-      nodeObj.add("moves", movesArr);
-    }
-
-    if (this.getSubTrees() != null) {
+    if (this.getSubs() != null) {
       JsonArray subsArr = new JsonArray();
-      for (com.github.gumtreediff.tree.Tree subTree : this.getSubTrees()) {
+      for (Node sub : this.getSubs()) {
         JsonObject exceptionObj = new JsonObject();
 
+        Tree subTree = sub.getTree();
         Pair<Pair<Integer, Integer>, Pair<Integer, Integer>> exceptionLineRange =
             TreeUtilFunctions.getLineRange(subTree, this.getFileContent());
         Pair<Integer, Integer> startExceptionRange = exceptionLineRange.first;
