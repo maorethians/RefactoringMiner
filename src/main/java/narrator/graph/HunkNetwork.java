@@ -182,22 +182,44 @@ public class HunkNetwork {
       Set<ImportTree> subs = entry.getValue();
       TreeLocation treeLocation = localizeTree(parent.tree);
       String fileContent = getFileContent(treeLocation.srcDst, treeLocation.path);
-      return new Node(fileContent, treeLocation.path, treeLocation.srcDst, parent.tree,
-              subs.stream().map(sub -> new Node(fileContent, sub.path, treeLocation.srcDst, sub.tree, null, sub.type,sub.diff)).collect(Collectors.toSet()),
-              parent.type, parent.diff);
+      Set<Node> subsNode = subs.stream().map(sub -> {
+        Node subNode = new Node(fileContent, sub.path, treeLocation.srcDst, sub.tree, null, sub.type);
+        subNode.addDiff(sub.diff);
+        return subNode;
+      }).collect(Collectors.toSet());
+
+      Node parentNode = new Node(fileContent, treeLocation.path, treeLocation.srcDst, parent.tree, subsNode, parent.type);
+      parentNode.addDiff(parent.diff);
+
+      return parentNode;
     }).forEach(this::addNode);
   }
 
   private Node addExtensionNode(Tree extensionTree, Node extendedNode) {
     TreeLocation treeLocation = localizeTree(extensionTree);
-    Node node = new Node(getFileContent(treeLocation.srcDst, treeLocation.path), treeLocation.path, treeLocation.srcDst,
-            extensionTree, null, NodeType.EXTENSION, extendedNode.getDiff());
+    Node node = new Node(getFileContent(treeLocation.srcDst, treeLocation.path), treeLocation.path,
+            treeLocation.srcDst, extensionTree, null, NodeType.EXTENSION);
+    node.addDiffs(extendedNode.getDiffs());
     return addNode(node);
   }
 
   private Node addNode(Node node) {
     if (nodeMap.containsKey(node.getId())) {
-      return nodeMap.get(node.getId());
+      Node existingNode = nodeMap.get(node.getId());
+
+      existingNode.addDiffs(node.getDiffs());
+      if (existingNode.getSubs() != null && node.getSubs() != null) {
+        for (Node sub : node.getSubs()) {
+          Optional<Node> foundSub = existingNode.getSubs().stream().filter(existingSub -> existingSub.getId().equals(sub.getId())).findFirst();
+          if (foundSub.isPresent()) {
+            foundSub.get().addDiffs(sub.getDiffs());
+          } else {
+            existingNode.getSubs().add(sub);
+          }
+        }
+      }
+
+      return existingNode;
     }
 
     graph.addVertex(node);
@@ -217,12 +239,13 @@ public class HunkNetwork {
       String potentialContextId = Node.formatId(path, srcDst, context.second, context.first);
 
       if (!nodeMap.containsKey(potentialContextId)) {
-        Node contextNode = new Node(node.getFileContent(), path, srcDst, context.first, null, context.second, node.getDiff());
+        Node contextNode = new Node(node.getFileContent(), path, srcDst, context.first, null, context.second);
         graph.addVertex(contextNode);
         nodeMap.put(contextNode.getId(), contextNode);
       }
 
       Node contextNode = nodeMap.get(potentialContextId);
+      contextNode.addDiffs(node.getDiffs());
       injectContextNode(contextNode);
     }
 
@@ -287,12 +310,10 @@ public class HunkNetwork {
     processSuccession();
 
     System.out.println(graph.vertexSet().size() + "-" + graph.edgeSet().size());
-//    app/src/main/java/org/schabi/newpipe/util/NavigationHelper.java-DST-DST_MOVE-23428-23733-TryStatement - app/src/main/java/org/schabi/newpipe/util/NavigationHelper.java-DST-ADDITION-22781-23739-MethodDeclaration
   }
 
   private void processMapping() {
-    List<Node> nodes = graph.vertexSet().stream().toList().stream()
-        .filter(node -> !node.isExtension()).toList();
+    List<Node> nodes = graph.vertexSet().stream().toList().stream().filter(node -> !node.isExtension()).toList();
     List<Node> srcNodes = nodes.stream().filter(Node::isSrc).toList();
     List<NodeTrees> dstNodes = nodes.stream().filter(Node::isDst).map(dstNode -> {
       Set<Tree> allTrees = new HashSet<>();
@@ -312,20 +333,9 @@ public class HunkNetwork {
 
       Set<Node> mappedDstNodes = new HashSet<>();
       for (Node srcOrSub : srcOrSubs) {
-        ASTDiff diff = srcOrSub.getDiff();
-        if (diff == null) {
-          continue;
-        }
-
-        MappingStore mappingStore = diff.getAllMappings().getMonoMappingStore();
-        Tree srcTree = srcOrSub.getTree();
-        Tree dstTree = mappingStore.getDstForSrc(srcTree);
-        if (dstTree == null) {
-          continue;
-        }
-
-
-        List<Node> srcOrSubMappedDstNodes = dstNodes.stream().filter(dstNode -> dstNode.trees.contains(dstTree))
+        List<Tree> dstTrees = srcOrSub.getDiffs().stream()
+                .map(diff -> diff.getAllMappings().getMonoMappingStore().getDstForSrc(srcOrSub.getTree())).toList();
+        List<Node> srcOrSubMappedDstNodes = dstNodes.stream().filter(dstNode -> dstNode.trees.stream().anyMatch(dstTrees::contains))
                 .map(dstNode -> dstNode.node).toList();
         if (srcNode.isContext()) {
           srcOrSubMappedDstNodes = srcOrSubMappedDstNodes.stream().filter(dstNode -> {

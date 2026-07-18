@@ -8,11 +8,8 @@ import com.github.gumtreediff.tree.Tree;
 import com.github.gumtreediff.utils.Pair;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+
+import java.util.*;
 import javax.annotation.Nullable;
 import narrator.graph.cluster.traverse.Util;
 import org.jgrapht.Graph;
@@ -36,11 +33,10 @@ public class Node {
   private final Set<Node> subs;
   private final Set<String> identifiers = new HashSet<>();
   private final NodeType nodeType;
-  @Nullable
-  private final ASTDiff diff;
+  private final Set<ASTDiff> diffs = new HashSet<>();
 
   public Node(String fileContent, String path, SrcDst srcDst, Tree tree,
-      @Nullable Set<Node> subs, NodeType nodeType, @Nullable ASTDiff diff) {
+      @Nullable Set<Node> subs, NodeType nodeType) {
     this.id = formatId(path, srcDst, nodeType, tree);
     this.promptId = generateShortId();
     this.fileContent = fileContent;
@@ -50,7 +46,6 @@ public class Node {
     this.tree = tree;
     this.subs = subs;
     this.nodeType = nodeType;
-    this.diff = diff;
   }
 
   public static String formatId(String path, SrcDst srcDst, NodeType nodeType, Tree tree) {
@@ -66,9 +61,19 @@ public class Node {
     return sb.toString();
   }
 
-  @Nullable
-  public ASTDiff getDiff() {
-    return diff;
+  public void addDiffs(Set<ASTDiff> diffs) {
+    this.diffs.addAll(diffs.stream().filter(Objects::nonNull).toList());
+  }
+
+  public void addDiff(ASTDiff diff) {
+    if (diff == null) {
+      return;
+    }
+    this.diffs.add(diff);
+  }
+
+  public Set<ASTDiff> getDiffs() {
+    return diffs;
   }
 
   public SrcDst getSrcDst() {
