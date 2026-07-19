@@ -36,9 +36,9 @@ public class TraversalPattern extends GraphWrapper {
             allowedNodes.addAll(node.getMappingTargets(graph));
         }
 
-        Set<Node> visited = new HashSet<>();
         List<MappingGroup> result = new ArrayList<>();
 
+        Set<Node> visited = new HashSet<>();
         for (Node node : nodes) {
             if (visited.contains(node)) continue;
 
@@ -81,6 +81,7 @@ public class TraversalPattern extends GraphWrapper {
 
             result.add(new MappingGroup(srcNodes, dstNodes));
         }
+
         return result;
     }
 

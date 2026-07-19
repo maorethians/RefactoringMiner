@@ -30,6 +30,74 @@ public class Narrator {
         this.rootPattern = rootPattern;
     }
 
+    public List<TraversalPattern> getNarrative(GrainLevel grainLevel) {
+        return cache.computeIfAbsent(grainLevel, this::narrate);
+    }
+
+    private List<TraversalPattern> narrate(GrainLevel grainLevel) {
+        if (rootPattern == null) {
+            return Collections.emptyList();
+        }
+
+        List<TraversalPattern> result = new ArrayList<>();
+        Set<TraversalPattern> visited = new HashSet<>();
+
+        switch (grainLevel) {
+            case LEAF -> traverse(rootPattern, visited, result, pp -> false, pp -> pp instanceof Leaf);
+            case USAGE_CHAIN_ROOT -> {
+                Set<UsagePattern> roots = findUsageRoots(rootPattern);
+                traverse(rootPattern, visited, result,
+                        pp -> pp instanceof UsagePattern u && roots.contains(u),
+                        pp -> pp instanceof Leaf && (!(pp instanceof UsagePattern) || roots.contains((UsagePattern) pp)));
+            }
+            case SEMANTIC_LEAF -> traverse(rootPattern, visited, result,
+                    pp -> pp instanceof TraversalComponent tc && isSemanticLeaf(tc),
+                    pp -> pp instanceof Leaf);
+            case SEMANTIC_ROOT -> traverse(rootPattern, visited, result,
+                    pp -> pp instanceof TraversalComponent tc && isSemanticRoot(tc),
+                    pp -> pp instanceof Leaf);
+            case METHOD, CLASS, FILE -> traverse(rootPattern, visited, result,
+                    pp -> pp instanceof TraversalComponent tc && matchesGrain(tc, grainLevel),
+                    pp -> pp instanceof Leaf);
+        }
+
+        return sortPatterns(result);
+    }
+
+    private Set<UsagePattern> findUsageRoots(TraversalPattern root) {
+        Set<UsagePattern> allUsages = new HashSet<>();
+        collectUsages(root, allUsages);
+
+        Set<UsagePattern> roots = new HashSet<>();
+        for (UsagePattern usage : allUsages) {
+            if (!isDescendantOfUsage(usage, allUsages)) {
+                roots.add(usage);
+            }
+        }
+        return roots;
+    }
+
+    private void collectUsages(TraversalPattern p, Set<UsagePattern> usages) {
+        if (p instanceof UsagePattern usage) {
+            usages.add(usage);
+        }
+        if (p instanceof AggregatorPattern agg) {
+            for (TraversalPattern sub : agg.subs) {
+                collectUsages(sub, usages);
+            }
+        }
+    }
+
+    private boolean isDescendantOfUsage(UsagePattern p, Set<UsagePattern> allUsages) {
+        for (UsagePattern other : allUsages) {
+            if (p == other) continue;
+            if (p.dependsOn(other)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static boolean isSemanticLeaf(TraversalComponent tc) {
         if (tc.getMergeContexts() == null || tc.getMergeContexts().isEmpty()) return false;
 
@@ -132,9 +200,6 @@ public class Narrator {
         }
     }
 
-    public List<TraversalPattern> getNarrative(GrainLevel grainLevel) {
-        return cache.computeIfAbsent(grainLevel, this::narrate);
-    }
 
     public List<String> getFlatChapters(GrainLevel level) {
         if (flatCache.containsKey(level)) {
@@ -249,70 +314,6 @@ public class Narrator {
 
     public void incrementProgress(GrainLevel grainLevel) {
         progressMap.put(grainLevel, getProgress(grainLevel) + 1);
-    }
-
-    private List<TraversalPattern> narrate(GrainLevel grainLevel) {
-        if (rootPattern == null) {
-            return Collections.emptyList();
-        }
-
-        List<TraversalPattern> result = new ArrayList<>();
-        Set<TraversalPattern> visited = new HashSet<>();
-
-        switch (grainLevel) {
-            case LEAF -> traverse(rootPattern, visited, result, pp -> false, pp -> pp instanceof Leaf);
-            case USAGE_CHAIN_ROOT -> {
-                Set<UsagePattern> roots = findUsageRoots(rootPattern);
-                traverse(rootPattern, visited, result,
-                        pp -> pp instanceof UsagePattern u && roots.contains(u),
-                        pp -> pp instanceof Leaf && (!(pp instanceof UsagePattern) || roots.contains((UsagePattern) pp)));
-            }
-            case SEMANTIC_LEAF -> traverse(rootPattern, visited, result,
-                    pp -> pp instanceof TraversalComponent tc && isSemanticLeaf(tc),
-                    pp -> pp instanceof Leaf);
-            case SEMANTIC_ROOT -> traverse(rootPattern, visited, result,
-                    pp -> pp instanceof TraversalComponent tc && isSemanticRoot(tc),
-                    pp -> pp instanceof Leaf);
-            case METHOD, CLASS, FILE -> traverse(rootPattern, visited, result,
-                    pp -> pp instanceof TraversalComponent tc && matchesGrain(tc, grainLevel),
-                    pp -> pp instanceof Leaf);
-        }
-
-        return sortPatterns(result);
-    }
-
-    private Set<UsagePattern> findUsageRoots(TraversalPattern root) {
-        Set<UsagePattern> allUsages = new HashSet<>();
-        collectUsages(root, allUsages);
-
-        Set<UsagePattern> roots = new HashSet<>();
-        for (UsagePattern usage : allUsages) {
-            if (!isDescendantOfUsage(usage, allUsages)) {
-                roots.add(usage);
-            }
-        }
-        return roots;
-    }
-
-    private void collectUsages(TraversalPattern p, Set<UsagePattern> usages) {
-        if (p instanceof UsagePattern usage) {
-            usages.add(usage);
-        }
-        if (p instanceof AggregatorPattern agg) {
-            for (TraversalPattern sub : agg.subs) {
-                collectUsages(sub, usages);
-            }
-        }
-    }
-
-    private boolean isDescendantOfUsage(UsagePattern p, Set<UsagePattern> allUsages) {
-        for (UsagePattern other : allUsages) {
-            if (p == other) continue;
-            if (p.dependsOn(other)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     public List<TraversalPattern> sortPatterns(List<TraversalPattern> patterns) {
