@@ -168,25 +168,10 @@ public class Node {
       return content;
     }
 
-    int lineStart = fileContent.lastIndexOf('\n', tree.getPos() - 1);
-    String baseIndent = (lineStart == -1)
-        ? fileContent.substring(0, tree.getPos())
-        : fileContent.substring(lineStart + 1, tree.getPos());
+    Pair<Pair<Integer, Integer>, Pair<Integer, Integer>> lineRange = TreeUtilFunctions.getLineRange(tree, fileContent);
+    int baseIndentLen = lineRange.first.second;
 
-    String[] lines = content.split("\n", -1);
-    StringBuilder sb = new StringBuilder();
-    sb.append(lines[0]);
-
-    for (int i = 1; i < lines.length; i++) {
-      sb.append("\n");
-      String line = lines[i];
-      if (line.startsWith(baseIndent)) {
-        sb.append(line.substring(baseIndent.length()));
-      } else {
-        sb.append(line);
-      }
-    }
-    return sb.toString();
+    return " ".repeat(baseIndentLen) + getContent();
   }
 
   public String getFileContent() {
