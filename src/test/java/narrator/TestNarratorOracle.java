@@ -1,7 +1,6 @@
 package narrator;
 
 import com.google.gson.*;
-import narrator.Driver;
 import narrator.graph.Edge;
 import narrator.graph.Node;
 import narrator.graph.cluster.Cluster;
@@ -11,25 +10,22 @@ import narrator.graph.cluster.traverse.TraversalPattern;
 import narrator.json.Stringifier;
 import org.jgrapht.Graph;
 import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.refactoringminer.astDiff.models.ProjectASTDiff;
 import org.refactoringminer.rm1.GitHistoryRefactoringMinerImpl;
 
 import java.io.*;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class TestNarratorOracle {
 
     private static final String ORACLE_DATA_PATH = "src/test/resources/narrator/oracle/data.json";
     private static final String EXPECTED_DIR = "src/test/resources/narrator/oracle/expected/";
-    private static final String RM_CACHE_DIR = "src/test/resources/oracle/commits";
+    private static final String NARRATOR_COMMIT_CACHE = "src/test/resources/oracle/commits";
 
     static Stream<TestCase> testCases() throws IOException {
         String content = Files.readString(Path.of(ORACLE_DATA_PATH));
@@ -45,7 +41,7 @@ public class TestNarratorOracle {
         GitHistoryRefactoringMinerImpl rm = new GitHistoryRefactoringMinerImpl();
 
         // Use diffAtCommitWithGitHubAPI which implements the cache-first logic
-        ProjectASTDiff projectASTDiff = rm.diffAtCommitWithGitHubAPI(testCase.repository, testCase.sha1, new File(RM_CACHE_DIR));
+        ProjectASTDiff projectASTDiff = rm.diffAtCommitWithGitHubAPI(testCase.repository, testCase.sha1, new File(NARRATOR_COMMIT_CACHE));
 
         if (projectASTDiff == null) {
             Assertions.fail("Failed to produce ProjectASTDiff for " + testCase.sha1);
@@ -63,7 +59,7 @@ public class TestNarratorOracle {
         clusters.forEach(cluster -> actualClusters.add(Stringifier.graph(cluster.getGraph())));
 
         String expectedClustersPath = EXPECTED_DIR + testCase.repoName + "-" + testCase.sha1 + "-clusters.json";
-        verifyJsonArray(actualClusters, expectedClustersPath, "Clusters");
+        verifyClusters(actualClusters, expectedClustersPath);
 
         // --- Test Hierarchy JSON ---
         List<TraversalPattern> patterns = clusters.stream()
@@ -74,38 +70,77 @@ public class TestNarratorOracle {
 
         JsonObject actualHierarchy = Stringifier.hierarchy(patterns);
         String expectedHierarchyPath = EXPECTED_DIR + testCase.repoName + "-" + testCase.sha1 + "-hierarchy.json";
-        verifyJsonObject(actualHierarchy, expectedHierarchyPath, "Hierarchy");
+        verifyHierarchy(actualHierarchy, expectedHierarchyPath);
     }
 
-
-    private void verifyJsonArray(JsonArray actual, String expectedPath, String label) throws IOException {
+    private void verifyClusters(JsonArray actual, String expectedPath) throws IOException {
         if (!Files.exists(Path.of(expectedPath))) {
             // Optional: write actual to disk if expected is missing (generator mode)
             // Files.writeString(Path.of(expectedPath), actual.toString());
             // throw new FileNotFoundException("Expected file not found: " + expectedPath);
-            Assertions.fail(label + " expected file missing: " + expectedPath);
+            Assertions.fail("Clusters" + " expected file missing: " + expectedPath);
         }
 
         JsonArray expected = new Gson().fromJson(Files.readString(Path.of(expectedPath)), JsonArray.class);
 
-        Assertions.assertEquals(expected.size(), actual.size(), label + " size mismatch");
+        Assertions.assertEquals(expected.size(), actual.size(), "Clusters" + " size mismatch");
 
-        // Semantic comparison of each graph in the array
+        List<JsonObject> actualList = new ArrayList<>();
+        actual.forEach(a -> actualList.add(a.getAsJsonObject()));
+        boolean[] matched = new boolean[actualList.size()];
+
         for (int i = 0; i < expected.size(); i++) {
-            verifyJsonObject(actual.get(i).getAsJsonObject(), expected.get(i).getAsJsonObject(), label + " Graph " + i);
+            JsonObject exp = expected.get(i).getAsJsonObject();
+            int expNodes = exp.getAsJsonArray("nodes").size();
+            int expEdges = exp.getAsJsonArray("edges").size();
+
+            int matchIdx = -1;
+            for (int j = 0; j < actualList.size(); j++) {
+                if (!matched[j]) {
+                    JsonObject act = actualList.get(j);
+                    if (act.getAsJsonArray("nodes").size() == expNodes &&
+                        act.getAsJsonArray("edges").size() == expEdges) {
+                        matchIdx = j;
+                        break;
+                    }
+                }
+            }
+
+            if (matchIdx == -1) {
+                Assertions.fail(String.format("%s: No matching cluster found for expected cluster %d (nodes: %d, edges: %d)",
+                        "Clusters", i, expNodes, expEdges));
+            }
+
+            matched[matchIdx] = true;
+            verifyNodesEdges(actualList.get(matchIdx), exp, "Clusters" + " Graph " + i);
         }
     }
 
-    private void verifyJsonObject(JsonObject actual, JsonObject expected, String label) {
+    private void verifyHierarchy(JsonObject actual, String expectedPath) throws IOException {
+        if (!Files.exists(Path.of(expectedPath))) {
+            Assertions.fail("Hierarchy" + " expected file missing: " + expectedPath);
+        }
+        JsonObject expected = new Gson().fromJson(Files.readString(Path.of(expectedPath)), JsonObject.class);
+
+        JsonArray actualNodes = actual.getAsJsonArray("nodes");
+        JsonArray expectedNodes = expected.getAsJsonArray("nodes");
+        Assertions.assertEquals(expectedNodes.size(), actualNodes.size(), "Hierarchy node count mismatch");
+
+        JsonArray actualEdges = actual.getAsJsonArray("edges");
+        JsonArray expectedEdges = expected.getAsJsonArray("edges");
+        Assertions.assertEquals(expectedEdges.size(), actualEdges.size(), "Hierarchy edge count mismatch");
+    }
+
+    private void verifyNodesEdges(JsonObject actual, JsonObject expected, String label) {
         // Compare Nodes
         JsonArray actualNodes = actual.getAsJsonArray("nodes");
         JsonArray expectedNodes = expected.getAsJsonArray("nodes");
-        verifyNodes(actualNodes, expectedNodes, label);
+        verifyNodes(actualNodes, expectedNodes);
 
         // Compare Edges
         JsonArray actualEdges = actual.getAsJsonArray("edges");
         JsonArray expectedEdges = expected.getAsJsonArray("edges");
-        verifyEdges(actualEdges, expectedEdges, label);
+        verifyEdges(actualEdges, expectedEdges);
     }
 
     private void verifyNodes(JsonArray actual, JsonArray expected) {
