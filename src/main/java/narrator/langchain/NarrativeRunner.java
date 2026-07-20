@@ -4,7 +4,7 @@ import narrator.graph.cluster.traverse.GrainLevel;
 import narrator.service.NarrativeService;
 
 public class NarrativeRunner {
-    private static final GrainLevel DEFAULT_LEVEL = GrainLevel.FILE;
+    private static final GrainLevel DEFAULT_LEVEL = GrainLevel.SINGLE;
     private static final String DEFAULT_TASK = "You are PR-Reviewer, an experienced software engineer and language model designed to review a Git Pull Request (PR).\n" +
             "Your task is to provide a thorough, constructive, and concise review.\n" +
             "\n" +
