@@ -43,6 +43,7 @@ public class Narrator {
         Set<TraversalPattern> visited = new HashSet<>();
 
         switch (grainLevel) {
+            case SINGLE -> result.add(rootPattern);
             case LEAF -> traverse(rootPattern, visited, result, pp -> false, pp -> pp instanceof Leaf);
             case USAGE_CHAIN_ROOT -> {
                 Set<UsagePattern> roots = findUsageRoots(rootPattern);
