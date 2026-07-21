@@ -244,7 +244,34 @@ public class TraversalEngine {
 
     private void mergeMappingContext(ComponentContexts subject, Map<TraversalPattern, ComponentContexts> componentsContexts,
                                      Set<TraversalPattern> iteratedComponents, Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
-        // needs implementation
+        Set<Node> heads = new HashSet<>();
+
+        Node subjectContextsHead = subject.contexts.get(0);
+        heads.add(subjectContextsHead);
+
+        Set<Node> headMappings = new HashSet<>();
+        headMappings.addAll(util.getMappingSources(subjectContextsHead));
+        headMappings.addAll(util.getMappingTargets(subjectContextsHead));
+        Optional<Node> optionalHeadMapping = headMappings.stream().findFirst();
+        optionalHeadMapping.ifPresent(heads::add);
+
+        List<Pair<TraversalPattern, Integer>> headsDescendants = componentsContexts.entrySet().stream()
+                .map(componentContexts -> {
+                    List<Node> contexts = componentContexts.getValue().contexts;
+                    Optional<Node> firstHeadsContext = contexts.stream().filter(heads::contains).findFirst();
+                    return new Pair<>(componentContexts.getKey(), firstHeadsContext.map(contexts::indexOf).orElse(-1));
+                })
+                .filter(componentIndex -> componentIndex.second != -1).toList();
+        List<TraversalPattern> headsMergeables = headsDescendants.stream()
+                .filter(descendant -> descendant.second == 0)
+                .map(headMergeable -> headMergeable.first).toList();
+        if (headsDescendants.size() > 1) {
+            if (headsMergeables.size() < headsDescendants.size()) {
+                iteratedComponents.add(subject.component);
+            } else {
+                mergeByContext(headsMergeables, subject.contexts, heads, componentsContexts, traversalComponentsTracker);
+            }
+        }
     }
 
     private void mergeSingularContext(ComponentContexts subject, Map<TraversalPattern, ComponentContexts> componentsContexts,
