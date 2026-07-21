@@ -239,22 +239,20 @@ public class TraversalEngine {
             Set<Node> heads = new HashSet<>();
             heads.add(subjectContextsHead);
 
-            List<Pair<TraversalPattern, Integer>> headDescendants = componentsContexts.entrySet()
-                    .stream()
+            List<Pair<TraversalPattern, Integer>> headDescendants = componentsContexts.entrySet().stream()
                     .map(componentContexts -> new Pair<>(componentContexts.getKey(),
                             componentContexts.getValue().indexOf(subjectContextsHead)))
                     .filter(componentIndex -> componentIndex.second != -1).toList();
             List<TraversalPattern> headMergeables = headDescendants.stream()
                     .filter(descendant -> descendant.second == 0)
                     .map(headMergeable -> headMergeable.first).toList();
-            if (headDescendants.size() > 1) {
-                if (headMergeables.size() < headDescendants.size()) {
+            if (!(subject instanceof TraversalComponent tc && tc.getMergeContexts().size() > 1) && headDescendants.size() > 1) {
+                if (headMergeables.size() < headDescendants.size() ||
+                        headMergeables.stream().anyMatch(mergeable -> mergeable instanceof TraversalComponent tc && tc.getMergeContexts().size() > 1)) {
                     iteratedComponents.add(subject);
                 } else {
-                    mergeByContext(headMergeables, subjectContexts, heads, componentsContexts,
-                            traversalComponentsTracker);
+                    mergeByContext(headMergeables, subjectContexts, heads, componentsContexts, traversalComponentsTracker);
                 }
-
                 continue;
             }
 
@@ -323,10 +321,8 @@ public class TraversalEngine {
         traversalComponentsTracker.add(new Pair<>(heads, mergedComponent));
 
         if (subjectContexts.size() > 1) {
-            componentsContexts.put(mergedComponent,
-                    subjectContexts.subList(1, subjectContexts.size()));
+            componentsContexts.put(mergedComponent, new ArrayList<>(subjectContexts.subList(1, subjectContexts.size())));
         }
-
     }
 
     private void finalizeUsagePatterns(
