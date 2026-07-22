@@ -244,9 +244,10 @@ public class TraversalEngine {
 
     private void mergeMappingContext(ComponentContexts subject, Map<TraversalPattern, ComponentContexts> componentsContexts,
                                      Set<TraversalPattern> iteratedComponents, Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
-        Set<Node> heads = new HashSet<>();
+        List<Node> subjectContexts = subject.contexts;
+        Node subjectContextsHead = subjectContexts.get(0);
 
-        Node subjectContextsHead = subject.contexts.get(0);
+        Set<Node> heads = new HashSet<>();
         heads.add(subjectContextsHead);
 
         Set<Node> headMappings = new HashSet<>();
@@ -269,8 +270,18 @@ public class TraversalEngine {
             if (headsMergeables.size() < headsDescendants.size()) {
                 iteratedComponents.add(subject.component);
             } else {
-                mergeByContext(headsMergeables, subject.contexts, heads, componentsContexts, traversalComponentsTracker);
+                mergeByContext(headsMergeables, heads, componentsContexts, traversalComponentsTracker);
             }
+            return;
+        }
+
+        traversalComponentsTracker.add(new Pair<>(heads, subject.component));
+
+        List<Node> nextContexts = getNextContexts(heads);
+        if (nextContexts.isEmpty()) {
+            componentsContexts.remove(subject.component);
+        } else {
+            componentsContexts.put(subject.component, new ComponentContexts(subject.component, nextContexts, subject.mapping));
         }
     }
 
@@ -291,7 +302,7 @@ public class TraversalEngine {
             if (headMergeables.size() < headDescendants.size() || headMergeables.stream().anyMatch(mergeable -> componentsContexts.get(mergeable).mapping)) {
                 iteratedComponents.add(subject.component);
             } else {
-                mergeByContext(headMergeables, subject.contexts, heads, componentsContexts, traversalComponentsTracker);
+                mergeByContext(headMergeables, heads, componentsContexts, traversalComponentsTracker);
             }
             return;
         }
@@ -304,9 +315,11 @@ public class TraversalEngine {
         if (optionalHeadMapping.isEmpty()) {
             traversalComponentsTracker.add(new Pair<>(heads, subject.component));
 
-            componentsContexts.get(subject.component).contexts.remove(subjectContextsHead);
-            if (componentsContexts.get(subject.component).contexts.isEmpty()) {
+            List<Node> nextContexts = getNextContexts(heads);
+            if (nextContexts.isEmpty()) {
                 componentsContexts.remove(subject.component);
+            } else {
+                componentsContexts.put(subject.component, new ComponentContexts(subject.component, nextContexts, subject.mapping));
             }
             return;
         }
@@ -327,9 +340,11 @@ public class TraversalEngine {
         if (mappingDescendants.isEmpty()) {
             traversalComponentsTracker.add(new Pair<>(heads, subject.component));
 
-            componentsContexts.get(subject.component).contexts.remove(subjectContextsHead);
-            if (componentsContexts.get(subject.component).contexts.isEmpty()) {
+            List<Node> nextContexts = getNextContexts(heads);
+            if (nextContexts.isEmpty()) {
                 componentsContexts.remove(subject.component);
+            } else {
+                componentsContexts.put(subject.component, new ComponentContexts(subject.component, nextContexts, subject.mapping));
             }
             return;
         }
@@ -338,13 +353,12 @@ public class TraversalEngine {
         allDescendants.add(headMergeables.get(0));
         allDescendants.add(mappingDescendants.get(0).first);
 
-        mergeByContext(allDescendants, subject.contexts, heads, componentsContexts, traversalComponentsTracker);
+        mergeByContext(allDescendants, heads, componentsContexts, traversalComponentsTracker);
     }
 
-    private void mergeByContext(List<TraversalPattern> mergeComponents, List<Node> subjectContexts,
-            Set<Node> heads, Map<TraversalPattern, ComponentContexts> componentsContexts,
-            Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
-        boolean anyExistingMapping = mergeComponents.stream().anyMatch(component -> !componentsContexts.get(component).mapping);
+    private void mergeByContext(List<TraversalPattern> mergeComponents, Set<Node> heads, Map<TraversalPattern, ComponentContexts> componentsContexts,
+                                Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
+        boolean anyExistingMapping = mergeComponents.stream().anyMatch(component -> componentsContexts.get(component).mapping);
 
         for (TraversalPattern mergeComponent : mergeComponents) {
             componentsContexts.remove(mergeComponent);
@@ -356,10 +370,22 @@ public class TraversalEngine {
         components.add(mergedComponent);
         traversalComponentsTracker.add(new Pair<>(heads, mergedComponent));
 
-        if (subjectContexts.size() > 1) {
-            componentsContexts.put(mergedComponent, new ComponentContexts(mergedComponent,
-                    new ArrayList<>(subjectContexts.subList(1, subjectContexts.size())), anyExistingMapping || heads.size() > 1));
+        List<Node> nextContexts = getNextContexts(heads);
+        if (!nextContexts.isEmpty()) {
+            componentsContexts.put(mergedComponent, new ComponentContexts(mergedComponent, nextContexts, anyExistingMapping || heads.size() > 1));
         }
+    }
+
+    private List<Node> getNextContexts(Set<Node> heads) {
+        // TODO: If both subject and mapping contexts include separate unmapped contexts, this may be problematic
+        List<List<Node>> headsContexts = heads.stream().map(head -> Context.get(graph, head)).toList();
+        List<Node> maxContexts = headsContexts.get(0);
+        for (List<Node> headContexts : headsContexts) {
+            if (maxContexts.size() < headContexts.size()) {
+                maxContexts = headContexts;
+            }
+        }
+        return maxContexts;
     }
 
     private void finalizeUsagePatterns(
