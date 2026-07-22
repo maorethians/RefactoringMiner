@@ -51,7 +51,7 @@ public class TraversalEngine {
 
         if (components.size() > 1) {
             TraversalComponent finalComponent = new TraversalComponent(new ArrayList<>(components),
-                ReasonType.CONTEXT);
+                    ReasonType.CONTEXT);
             components.clear();
             components.add(finalComponent);
         }
@@ -213,14 +213,18 @@ public class TraversalEngine {
 
     private Set<Pair<Set<Node>, TraversalPattern>> mergeByContext() {
         if (components.stream().anyMatch(component -> component instanceof TraversalComponent)) {
-            System.out.println("There should be no TraversalComponent before executing this method");
+            System.out.println(
+                    "There should be no TraversalComponent before executing this method");
         }
 
         Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker = new HashSet<>();
 
         Map<TraversalPattern, ComponentContexts> componentsContexts = new HashMap<>();
         for (TraversalPattern component : components) {
-            componentsContexts.put(component, new ComponentContexts(component, Context.get(component.getGraph(), component.getLead()), false));
+            componentsContexts.put(component,
+                    new ComponentContexts(component,
+                            new Pair<>(Context.get(component.getGraph(), component.getLead()),
+                                    null)));
         }
         Set<TraversalPattern> iteratedComponents = new HashSet<>();
         while (!componentsContexts.isEmpty()) {
@@ -232,100 +236,52 @@ public class TraversalEngine {
             }
             ComponentContexts subject = componentsContexts.get(iteratee.get());
 
-            if (subject.mapping) {
-                mergeMappingContext(subject, componentsContexts, iteratedComponents, traversalComponentsTracker);
-            } else {
-                mergeSingularContext(subject, componentsContexts, iteratedComponents, traversalComponentsTracker);
-            }
+            mergeByContext(subject, componentsContexts, iteratedComponents,
+                    traversalComponentsTracker);
         }
 
         return traversalComponentsTracker;
     }
 
-    private void mergeMappingContext(ComponentContexts subject, Map<TraversalPattern, ComponentContexts> componentsContexts,
-                                     Set<TraversalPattern> iteratedComponents, Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
-        List<Node> subjectContexts = subject.contexts;
-        Node subjectContextsHead = subjectContexts.get(0);
-
-        Set<Node> heads = new HashSet<>();
-        heads.add(subjectContextsHead);
-
-        Set<Node> headMappings = new HashSet<>();
-        headMappings.addAll(util.getMappingSources(subjectContextsHead));
-        headMappings.addAll(util.getMappingTargets(subjectContextsHead));
-        Optional<Node> optionalHeadMapping = headMappings.stream().findFirst();
-        optionalHeadMapping.ifPresent(heads::add);
-
-        List<Pair<TraversalPattern, Integer>> headsDescendants = componentsContexts.entrySet().stream()
-                .map(componentContexts -> {
-                    List<Node> contexts = componentContexts.getValue().contexts;
-                    Optional<Node> firstHeadsContext = contexts.stream().filter(heads::contains).findFirst();
-                    return new Pair<>(componentContexts.getKey(), firstHeadsContext.map(contexts::indexOf).orElse(-1));
-                })
-                .filter(componentIndex -> componentIndex.second != -1).toList();
-        List<TraversalPattern> headsMergeables = headsDescendants.stream()
-                .filter(descendant -> descendant.second == 0)
-                .map(headMergeable -> headMergeable.first).toList();
-        if (headsDescendants.size() > 1) {
-            if (headsMergeables.size() < headsDescendants.size()) {
+    private void mergeByContext(ComponentContexts subject,
+            Map<TraversalPattern, ComponentContexts> componentsContexts,
+            Set<TraversalPattern> iteratedComponents,
+            Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
+        List<ComponentContexts> descendants = componentsContexts.values().stream()
+                .filter(componentContexts -> isDescendant(subject.contextsPair, componentContexts))
+                .toList();
+        List<ComponentContexts> mergeables = descendants.stream()
+                .filter(descendant -> isMergeable(subject, descendant)).toList();
+        if (descendants.size() > 1) {
+            if (mergeables.size() < descendants.size()) {
                 iteratedComponents.add(subject.component);
             } else {
-                mergeByContext(headsMergeables, heads, componentsContexts, traversalComponentsTracker);
+                mergeByContext(mergeables, componentsContexts, traversalComponentsTracker);
             }
             return;
         }
 
-        traversalComponentsTracker.add(new Pair<>(heads, subject.component));
-
-        List<Node> nextContexts = getNextContexts(heads);
-        if (nextContexts.isEmpty()) {
-            componentsContexts.remove(subject.component);
-        } else {
-            componentsContexts.put(subject.component, new ComponentContexts(subject.component, nextContexts, subject.mapping));
-        }
-    }
-
-    private void mergeSingularContext(ComponentContexts subject, Map<TraversalPattern, ComponentContexts> componentsContexts,
-                                      Set<TraversalPattern> iteratedComponents, Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
-        Node subjectContextsHead = subject.contexts.get(0);
-
-        List<Pair<TraversalPattern, Integer>> headDescendants = componentsContexts.entrySet().stream()
-                .map(componentContexts -> new Pair<>(componentContexts.getKey(), componentContexts.getValue().contexts.indexOf(subjectContextsHead)))
-                .filter(componentIndex -> componentIndex.second != -1).toList();
-        List<TraversalPattern> headMergeables = headDescendants.stream()
-                .filter(descendant -> descendant.second == 0)
-                .map(headMergeable -> headMergeable.first).toList();
-        if (headDescendants.size() > 1) {
-            if (headMergeables.size() < headDescendants.size() || headMergeables.stream().anyMatch(mergeable -> componentsContexts.get(mergeable).mapping)) {
-                iteratedComponents.add(subject.component);
-            } else {
-                mergeByContext(headMergeables, Set.of(subjectContextsHead), componentsContexts, traversalComponentsTracker);
-            }
+        if (subject.contextsPair.second != null) {
+            nextHop(subject, componentsContexts, traversalComponentsTracker);
             return;
         }
 
+        Node head = getContextsHeads(subject.contextsPair).iterator().next();
         Set<Node> headMappings = new HashSet<>();
-        headMappings.addAll(util.getMappingSources(subjectContextsHead));
-        headMappings.addAll(util.getMappingTargets(subjectContextsHead));
+        headMappings.addAll(util.getMappingSources(head));
+        headMappings.addAll(util.getMappingTargets(head));
         Optional<Node> optionalHeadMapping = headMappings.stream().findFirst();
 
         if (optionalHeadMapping.isEmpty()) {
-            traversalComponentsTracker.add(new Pair<>(Set.of(subjectContextsHead), subject.component));
-
-            List<Node> nextContexts = getNextContexts(Set.of(subjectContextsHead));
-            if (nextContexts.isEmpty()) {
-                componentsContexts.remove(subject.component);
-            } else {
-                componentsContexts.put(subject.component, new ComponentContexts(subject.component, nextContexts, subject.mapping));
-            }
+            nextHop(subject, componentsContexts, traversalComponentsTracker);
             return;
         }
-
         Node headMapping = optionalHeadMapping.get();
-        List<Pair<TraversalPattern, Integer>> mappingDescendants = componentsContexts.entrySet()
-                .stream()
-                .map(componentContexts -> new Pair<>(componentContexts.getKey(), componentContexts.getValue().contexts.indexOf(headMapping)))
-                .filter(componentIndex -> componentIndex.second != -1).toList();
+
+        List<ComponentContexts> mappingDescendants = componentsContexts.values().stream()
+                .filter(componentContexts -> isDescendant(
+                        new Pair<>(Context.get(graph, headMapping), null), componentContexts))
+                .toList();
         if (mappingDescendants.size() > 1) {
             // merge the mapping first
             iteratedComponents.add(subject.component);
@@ -333,54 +289,152 @@ public class TraversalEngine {
         }
 
         if (mappingDescendants.isEmpty()) {
-            traversalComponentsTracker.add(new Pair<>(Set.of(subjectContextsHead), subject.component));
-
-            List<Node> nextContexts = getNextContexts(Set.of(subjectContextsHead));
-            if (nextContexts.isEmpty()) {
-                componentsContexts.remove(subject.component);
-            } else {
-                 componentsContexts.put(subject.component, new ComponentContexts(subject.component, nextContexts, subject.mapping));
-            }
+            nextHop(subject, componentsContexts, traversalComponentsTracker);
             return;
         }
 
-        List<TraversalPattern> allDescendants = new ArrayList<>();
-        allDescendants.add(headMergeables.get(0));
-        allDescendants.add(mappingDescendants.get(0).first);
+        List<ComponentContexts> allDescendants = new ArrayList<>();
+        allDescendants.add(mergeables.get(0));
+        allDescendants.add(mappingDescendants.get(0));
 
-        mergeByContext(allDescendants, Set.of(subjectContextsHead, headMapping), componentsContexts, traversalComponentsTracker);
+        mergeByContext(allDescendants, componentsContexts, traversalComponentsTracker);
     }
 
-    private void mergeByContext(List<TraversalPattern> mergeComponents, Set<Node> heads, Map<TraversalPattern, ComponentContexts> componentsContexts,
-                                Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
-        boolean anyExistingMapping = mergeComponents.stream().anyMatch(component -> componentsContexts.get(component).mapping);
-
-        for (TraversalPattern mergeComponent : mergeComponents) {
-            componentsContexts.remove(mergeComponent);
-            components.remove(mergeComponent);
+    private void mergeByContext(List<ComponentContexts> mergeComponents,
+            Map<TraversalPattern, ComponentContexts> componentsContexts,
+            Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
+        for (ComponentContexts mergeComponent : mergeComponents) {
+            componentsContexts.remove(mergeComponent.component);
+            components.remove(mergeComponent.component);
         }
 
-        TraversalComponent mergedComponent = new TraversalComponent(mergeComponents, ReasonType.CONTEXT);
-        mergedComponent.setMergeContexts(heads);
+        ComponentContexts reference = getReferenceCC(mergeComponents);
+        Set<Node> referenceHeads = getContextsHeads(reference.contextsPair);
+
+        TraversalComponent mergedComponent = new TraversalComponent(mergeComponents.stream()
+                .map(CC -> CC.component).toList(), ReasonType.CONTEXT);
+        mergedComponent.setMergeContexts(referenceHeads);
         components.add(mergedComponent);
-        traversalComponentsTracker.add(new Pair<>(heads, mergedComponent));
+        traversalComponentsTracker.add(new Pair<>(referenceHeads, mergedComponent));
 
-        List<Node> nextContexts = getNextContexts(heads);
-        if (!nextContexts.isEmpty()) {
-            componentsContexts.put(mergedComponent, new ComponentContexts(mergedComponent, nextContexts, anyExistingMapping || heads.size() > 1));
+        Pair<List<Node>, List<Node>> nextContextsPair = getNextContextsPair(reference.contextsPair);
+        if (nextContextsPair.first != null) {
+            componentsContexts.put(mergedComponent,
+                    new ComponentContexts(mergedComponent, nextContextsPair));
         }
     }
 
-    private List<Node> getNextContexts(Set<Node> heads) {
-        // TODO: If both subject and mapping contexts include separate unmapped contexts, this may be problematic
-        List<List<Node>> headsContexts = heads.stream().map(head -> Context.get(graph, head)).toList();
-        List<Node> maxContexts = headsContexts.get(0);
-        for (List<Node> headContexts : headsContexts) {
-            if (maxContexts.size() < headContexts.size()) {
-                maxContexts = headContexts;
+    private ComponentContexts getReferenceCC(List<ComponentContexts> componentsContexts) {
+        List<ComponentContexts> mappingCCs = componentsContexts.stream()
+                .filter(cc -> cc.contextsPair.second != null).toList();
+        if (!mappingCCs.isEmpty()) {
+            return mappingCCs.get(0);
+        }
+
+        return componentsContexts.get(0);
+    }
+
+    private Pair<List<Node>, List<Node>> getNextContextsPair(
+            Pair<List<Node>, List<Node>> contextsPair) {
+        Set<Node> contextsHeads = getContextsHeads(contextsPair);
+        List<Node> c1 = contextsPair.first.stream()
+                .filter(context -> !contextsHeads.contains(context)).toList();
+        if (c1.isEmpty()) {
+            c1 = null;
+        }
+
+        if (contextsPair.second == null) {
+            return new Pair<>(c1, null);
+        }
+
+        List<Node> c2 = contextsPair.second.stream()
+                .filter(context -> !contextsHeads.contains(context)).toList();
+        if (c2.isEmpty()) {
+            c2 = null;
+        }
+
+        return c1 != null ? new Pair<>(c1, c2) : new Pair<>(c2, c1);
+    }
+
+    private void nextHop(ComponentContexts subject,
+            Map<TraversalPattern, ComponentContexts> componentsContexts,
+            Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
+        traversalComponentsTracker.add(
+                new Pair<>(getContextsHeads(subject.contextsPair), subject.component));
+
+        Pair<List<Node>, List<Node>> nextContextsPair = getNextContextsPair(subject.contextsPair);
+        if (nextContextsPair.first == null) {
+            componentsContexts.remove(subject.component);
+        } else {
+            componentsContexts.put(subject.component,
+                    new ComponentContexts(subject.component, nextContextsPair));
+        }
+    }
+
+    private Set<Node> getContextsHeads(Pair<List<Node>, List<Node>> contextsPair) {
+        List<Node> c1 = contextsPair.first;
+        List<Node> c2 = contextsPair.second;
+        if (c2 == null) {
+            return Set.of(c1.get(0));
+        }
+
+        int c1Idx = -1;
+        int c2Idx = -1;
+        for (int i = 0; i < c1.size(); i++) {
+            Node c1Node = c1.get(i);
+
+            Set<Node> mappings = new HashSet<>();
+            mappings.addAll(util.getMappingSources(c1Node));
+            mappings.addAll(util.getMappingTargets(c1Node));
+            Optional<Node> optionalMapping = mappings.stream().findFirst();
+            if (optionalMapping.isEmpty()) {
+                continue;
+            }
+
+            Node mapping = optionalMapping.get();
+            c2Idx = c2.indexOf(mapping);
+            if (c2Idx != -1) {
+                c1Idx = i;
+                break;
             }
         }
-        return maxContexts;
+
+        if (c1Idx == -1) {
+            System.out.println("Could not find mapping in contexts");
+            return Set.of();
+        }
+
+        if (c1Idx > 0 || c2Idx > 0) {
+            Set<Node> result = new HashSet<>();
+            result.addAll(c1.subList(0, c1Idx));
+            result.addAll(c2.subList(0, c2Idx));
+            return result;
+        }
+
+        return Set.of(c1.get(0), c2.get(0));
+    }
+
+    private boolean isDescendant(Pair<List<Node>, List<Node>> subjectContextsPair,
+            ComponentContexts examinee) {
+        Set<Node> subjectHeads = getContextsHeads(subjectContextsPair);
+
+        List<Node> c1 = examinee.contextsPair.first;
+        if (c1.stream().anyMatch(subjectHeads::contains)) {
+            return true;
+        }
+
+        List<Node> c2 = examinee.contextsPair.second;
+        if (c2 == null) {
+            return false;
+        }
+
+        return c2.stream().anyMatch(subjectHeads::contains);
+    }
+
+    private boolean isMergeable(ComponentContexts subject, ComponentContexts examinee) {
+        Set<Node> subjectHeads = getContextsHeads(subject.contextsPair);
+        Set<Node> examineeHeads = getContextsHeads(examinee.contextsPair);
+        return examineeHeads.stream().anyMatch(subjectHeads::contains);
     }
 
     private void finalizeUsagePatterns(
@@ -551,5 +605,14 @@ public class TraversalEngine {
         return false;
     }
 
-    private record ComponentContexts (TraversalPattern component, List<Node> contexts, boolean mapping) {}
+    private class ComponentContexts {
+
+        final TraversalPattern component;
+        Pair<List<Node>, List<Node>> contextsPair;
+
+        ComponentContexts(TraversalPattern component, Pair<List<Node>, List<Node>> contextsPair) {
+            this.component = component;
+            this.contextsPair = contextsPair;
+        }
+    }
 }
