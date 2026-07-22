@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 import narrator.graph.Context;
 import narrator.graph.Edge;
 import narrator.graph.EdgeType;
@@ -279,8 +280,10 @@ public class TraversalEngine {
         Node headMapping = optionalHeadMapping.get();
 
         List<Node> mappingContexts = Context.get(graph, headMapping);
-        List<ComponentContexts> mappingDescendants = !mappingContexts.isEmpty() ? componentsContexts.values().stream()
-                .filter(componentContexts -> isDescendant(new Pair<>(mappingContexts, null), componentContexts)).toList() : new ArrayList<>();
+        List<ComponentContexts> mappingDescendants =
+                !mappingContexts.isEmpty() ? componentsContexts.values().stream()
+                        .filter(componentContexts -> isDescendant(new Pair<>(mappingContexts, null),
+                                componentContexts)).toList() : new ArrayList<>();
         if (mappingDescendants.size() > 1) {
             // merge the mapping first
             iteratedComponents.add(subject.component);
@@ -307,30 +310,47 @@ public class TraversalEngine {
             components.remove(mergeComponent.component);
         }
 
-        ComponentContexts reference = getReferenceCC(mergeComponents);
-        Set<Node> referenceHeads = getContextsHeads(reference.contextsPair);
+        Pair<List<Node>, List<Node>> contextsPair = produceContextPair(mergeComponents);
+        Set<Node> heads = getContextsHeads(contextsPair);
 
         TraversalComponent mergedComponent = new TraversalComponent(mergeComponents.stream()
                 .map(CC -> CC.component).toList(), ReasonType.CONTEXT);
-        mergedComponent.setMergeContexts(referenceHeads);
+        mergedComponent.setMergeContexts(heads);
         components.add(mergedComponent);
-        traversalComponentsTracker.add(new Pair<>(referenceHeads, mergedComponent));
+        traversalComponentsTracker.add(new Pair<>(heads, mergedComponent));
 
-        Pair<List<Node>, List<Node>> nextContextsPair = getNextContextsPair(reference.contextsPair);
+        Pair<List<Node>, List<Node>> nextContextsPair = getNextContextsPair(contextsPair);
         if (nextContextsPair.first != null) {
             componentsContexts.put(mergedComponent,
                     new ComponentContexts(mergedComponent, nextContextsPair));
         }
     }
 
-    private ComponentContexts getReferenceCC(List<ComponentContexts> componentsContexts) {
-        List<ComponentContexts> mappingCCs = componentsContexts.stream()
-                .filter(cc -> cc.contextsPair.second != null).toList();
-        if (!mappingCCs.isEmpty()) {
-            return mappingCCs.get(0);
+    private Pair<List<Node>, List<Node>> produceContextPair(List<ComponentContexts> from) {
+        Optional<Pair<List<Node>, List<Node>>> optionalMappingContextsPair = from.stream()
+                .map(componentContexts -> componentContexts.contextsPair)
+                .filter(contextsPair -> contextsPair.second != null).findFirst();
+        if (optionalMappingContextsPair.isPresent()) {
+            return optionalMappingContextsPair.get();
         }
 
-        return componentsContexts.get(0);
+        List<List<Node>> contextsLists = from.stream()
+                .map(componentContexts -> componentContexts.contextsPair.first).toList();
+        Set<Node> contextsListsHeads = contextsLists.stream()
+                .map(contextsList -> contextsList.get(0))
+                .collect(Collectors.toSet());
+        List<List<Node>> headsList = contextsListsHeads.stream()
+                .map(contextsListsHead -> contextsLists.stream()
+                        .filter(contextsList -> contextsList.get(0).equals(contextsListsHead))
+                        .findFirst().get()).toList();
+
+        List<Node> c1 = headsList.get(0);
+        List<Node> c2 = null;
+        if (headsList.size() > 1) {
+            c2 = headsList.get(1);
+        }
+
+        return new Pair<>(c1, c2);
     }
 
     private Pair<List<Node>, List<Node>> getNextContextsPair(
