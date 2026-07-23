@@ -36,6 +36,7 @@ import org.jetbrains.kotlin.psi.KtProperty;
 import org.jetbrains.kotlin.psi.KtReferenceExpression;
 import org.jetbrains.kotlin.psi.KtReturnExpression;
 import org.jetbrains.kotlin.psi.KtSafeQualifiedExpression;
+import org.jetbrains.kotlin.psi.KtStringTemplateEntry;
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression;
 import org.jetbrains.kotlin.psi.KtSuperTypeCallEntry;
 import org.jetbrains.kotlin.psi.KtSuperTypeEntry;
@@ -131,7 +132,7 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 		} else if (expression instanceof KtParenthesizedExpression parenthesizedExpression) {
 			this.processParenthesizedExpression(parenthesizedExpression, data);
 		} else if (expression instanceof KtStringTemplateExpression stringTemplate) {
-			this.processStringTemplateExpression(stringTemplate);
+			this.processStringTemplateExpression(stringTemplate, data);
 		} else if (expression instanceof KtArrayAccessExpression arrayAccess) {
 			this.processArrayAccess(arrayAccess, data);
 		} else if (expression instanceof KtSafeQualifiedExpression qualifiedExpression) {
@@ -254,9 +255,20 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 			this.visitExpression(ktProperty.getDelegateExpression(), data);
 	}
 
-	private void processStringTemplateExpression(KtStringTemplateExpression expression) {
+	private void processStringTemplateExpression(KtStringTemplateExpression expression, Object data) {
 		LeafExpression literal = new LeafExpression(cu, sourceFolder, filePath, expression, CodeElementType.STRING_LITERAL, container);
 		stringLiterals.add(literal);
+		for(KtStringTemplateEntry entry : expression.getEntries()) {
+			KtExpression entryExpression = entry.getExpression();
+			if(entryExpression != null) {
+				if(entryExpression instanceof KtReferenceExpression referenceExpression) {
+					processReferenceExpression(referenceExpression);
+				}
+				else if(entryExpression instanceof KtDotQualifiedExpression dotQualifiedExpression) {
+					processDotQualifiedExpression(dotQualifiedExpression, data);
+				}
+			}
+		}
 	}
 
 	private void processArrayAccess(KtArrayAccessExpression expression, Object data) {

@@ -1111,7 +1111,8 @@ public class TestStatementMappings {
 		"TestStatementMappings-v1.txt, TestStatementMappings-v2.txt, src-test/org/refactoringminer/test/TestStatementMappings.java, miner-TestStatementMappings.txt",
 		"FileNameCleanerTest-v1.txt, FileNameCleanerTest-v2.txt, src/test/java/org/jabref/logic/util/FileNameCleanerTest.java, jabRef-FileNameCleanerTest.txt",
 		"CopyMoreActionTest-v1.txt, CopyMoreActionTest-v2.txt, jabgui/src/test/java/org/jabref/gui/edit/CopyMoreActionTest.java, jabRef-CopyMoreActionTest.txt",
-		"OOPreFormatterTest-v1.txt, OOPreFormatterTest-v2.txt, jablib/src/test/java/org/jabref/logic/openoffice/style/OOPreFormatterTest.java, jabRef-OOPreFormatterTest.txt"
+		"OOPreFormatterTest-v1.txt, OOPreFormatterTest-v2.txt, jablib/src/test/java/org/jabref/logic/openoffice/style/OOPreFormatterTest.java, jabRef-OOPreFormatterTest.txt",
+		"UriUtilTest-v1.txt, UriUtilTest-v2.txt, multiapps-controller-core/src/test/java/org/cloudfoundry/multiapps/controller/core/util/UriUtilTest.java, multiapps-controller-d013ec6c2750a7fa1c2340deff9677d7ecc437a2.txt"
 	})
 	public void testParameterizedTestMappings(String input1, String input2, String filePath, String expectedOutput) throws Exception {
 		final List<String> actual = new ArrayList<>();
@@ -1223,7 +1224,10 @@ public class TestStatementMappings {
 	@CsvSource({
 		"https://github.com/apache/camel.git, b57b72d0e85f2340cb2d55be44d2175c0caa7cc1, camel-b57b72d0e85f2340cb2d55be44d2175c0caa7cc1.txt",
 		"https://github.com/dropwizard/dropwizard.git, 9086577e29aba07058619a706701b6d07592aed9, dropwizard-9086577e29aba07058619a706701b6d07592aed9.txt",
-		"https://github.com/apache/commons-lang.git, 7995aad79fab336a4534a5290fdd760df7f55dde, commons-lang-7995aad79fab336a4534a5290fdd760df7f55dde.txt"
+		"https://github.com/apache/commons-lang.git, 7995aad79fab336a4534a5290fdd760df7f55dde, commons-lang-7995aad79fab336a4534a5290fdd760df7f55dde.txt",
+		////one-to-one method to Parameterized Test
+		"https://github.com/ConsenSys/ethsigner.git, 989241dd872beae0e06903a4751b3efa3767503b, ethsigner-989241dd872beae0e06903a4751b3efa3767503b.txt",
+		"https://github.com/eclipse/corrosion.git, e966a935595cd0e0586ab3c4ea3bcaad8f0d8f89, corrosion-e966a935595cd0e0586ab3c4ea3bcaad8f0d8f89.txt",
 	})
 	public void testParameterizedTestMappings(String url, String commit, String testResultFileName) throws Exception {
 		GitHistoryRefactoringMinerImpl miner = new GitHistoryRefactoringMinerImpl();
@@ -1305,6 +1309,7 @@ public class TestStatementMappings {
 		"https://github.com/apache/kafka.git, d171ff08a70f9fa8065e6661fcc1f3da092d7faf, testRejectMinIsrChangeWhenElrEnabled, true, kafka-d171ff08a70f9fa8065e6661fcc1f3da092d7faf.txt",
 		"https://github.com/apache/flink.git, 583722e721a121fa7a6787fe5acb47949b30454a, testCreateAndReuseFiles, true, flink-583722e721a121fa7a6787fe5acb47949b30454a.txt",
 		"https://github.com/tsantalis/RefactoringMiner.git, 1b15f4a76b5aaad9959866fa10dcd815934e1789, findReplacementsWithExactMatching, true, miner-1b15f4a76b5aaad9959866fa10dcd815934e1789.txt",
+		"https://github.com/JetBrains/intellij-community.git, 15b28eeef2044770b8eb908a141b144d5009b209, run, true, intellij-community-15b28eeef2044770b8eb908a141b144d5009b209.txt"
 	})
 	public void testRestructuredStatementMappings(String url, String commitId, String containerName, boolean breakOnFirstMatch, String testResultFileName) throws Exception {
 		GitHistoryRefactoringMinerImpl miner = new GitHistoryRefactoringMinerImpl();

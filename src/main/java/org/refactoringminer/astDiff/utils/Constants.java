@@ -7,6 +7,26 @@ public class Constants {
 		return !LANG1.TYPE_DECLARATION.equals(LANG2.TYPE_DECLARATION);
 	}
 
+	public boolean isRoot(String treeType) {
+		return treeType.equals(COMPILATION_UNIT) || treeType.equals(PROGRAM) || treeType.equals(MODULE) || treeType.equals(SOURCE_FILE) || treeType.equals(TRANSLATION_UNIT);
+	}
+
+	public boolean isNamedBlock(String treeType) {
+		return isType(treeType) || isMethod(treeType);
+	}
+
+	public boolean isType(String treeType) {
+		return treeType.equals(TYPE_DECLARATION) || treeType.equals(ENUM_DECLARATION) || treeType.equals(RECORD_DECLARATION) ||
+				treeType.equals(ANNOTATION_TYPE_DECLARATION) || treeType.equals(INTERFACE_DECLARATION) || treeType.equals(CLASS_DECLARATION);
+	}
+
+	public boolean isMethod(String treeType) {
+		return treeType.equals(METHOD_DECLARATION) || treeType.equals(SECONDARY_CONSTRUCTOR) || treeType.equals(DECORATED_METHOD) ||
+				treeType.equals(ANNOTATION_TYPE_MEMBER_DECLARATION) || treeType.equals(GETTER) || treeType.equals(SETTER) ||
+				treeType.equals(LEXICAL_DECLARATION) || treeType.equals(METHOD_DEFINITION) || treeType.equals(METHOD_SIGNATURE) ||
+				treeType.equals(FUNCTION_SIGNATURE) || treeType.equals(GENERATOR_FUNCTION_DECLARATION) || treeType.equals(PAIR) || treeType.equals(FUNCTION_EXPRESSION) || treeType.equals(VARIABLE_DECLARATION) || treeType.equals(FUNCTION_DECLARATOR);
+	}
+
 	public Constants(String filePath) {
 		if(PathFileUtils.isPythonFile(filePath)) {
 			CLASS_BLOCK = "block";
@@ -36,13 +56,16 @@ public class Constants {
 			PREFIX_EXPRESSION = "prefix_expression";
 			METHOD_INVOCATION_ARGUMENTS = "argument_list";
 			STRING_LITERAL = "string";
+			CHARACTER_LITERAL = "character_literal";
 			BOOLEAN_LITERAL = "boolean_literal"; // True, False labels //TODO introduce List of values
+			NULL_LITERAL = "none";
 			METHOD_INVOCATION = "call";
 			SWITCH_STATEMENT = "";
 			SWITCH_CASE = "";
 			ASSIGNMENT = "assignment";
 			THROW_STATEMENT = "raise_statement";
 			EMPTY_STATEMENT = "empty_statement";
+			PRIMITIVE_TYPE = "primitive_type";
 		}
 		else if(PathFileUtils.isKotlinFile(filePath)) {
 			CLASS_BLOCK = "type_body";
@@ -72,13 +95,16 @@ public class Constants {
 			PREFIX_EXPRESSION = "prefix_expression";
 			METHOD_INVOCATION_ARGUMENTS = "value_arguments";
 			STRING_LITERAL = "string_literal";
+			CHARACTER_LITERAL = "character_literal";
 			BOOLEAN_LITERAL = "boolean_literal";
+			NULL_LITERAL = "null";
 			METHOD_INVOCATION = "call_expression";
 			SWITCH_STATEMENT = "";
 			SWITCH_CASE = "";
 			ASSIGNMENT = "assignment";
 			THROW_STATEMENT = "throw_expression";
 			EMPTY_STATEMENT = "empty_statement";
+			PRIMITIVE_TYPE = "primitive_type";
 		}
 		else if(PathFileUtils.isTypeScriptFile(filePath)) {
 			CLASS_BLOCK = "block";
@@ -108,13 +134,55 @@ public class Constants {
 			PREFIX_EXPRESSION = "prefix_expression";
 			METHOD_INVOCATION_ARGUMENTS = "arguments";
 			STRING_LITERAL = "string_literal";
+			CHARACTER_LITERAL = "character_literal";
 			BOOLEAN_LITERAL = "boolean_literal"; // True, False labels //TODO introduce List of values
+			NULL_LITERAL = "null_literal";
 			METHOD_INVOCATION = "call_expression";
 			SWITCH_STATEMENT = "switch_statement";
 			SWITCH_CASE = "switch_case";
 			ASSIGNMENT = "assignment";
 			THROW_STATEMENT = "throw_statement";
 			EMPTY_STATEMENT = "empty_statement";
+			PRIMITIVE_TYPE = "primitive_type";
+		}
+		else if(PathFileUtils.isCppFile(filePath)) {
+			CLASS_BLOCK = "field_declaration_list";
+			METHOD_DECLARATION = "function_definition";
+			SIMPLE_NAME = "identifier";
+			IMPORT_DECLARATION = "ImportDeclaration";
+			TYPE_DECLARATION = "class_specifier";
+			TYPE_DECLARATION_KIND = "class";
+			BLOCK_COMMENT = "BlockComment";
+			LINE_COMMENT = "comment";
+			EXPRESSION_STATEMENT = "expression_statement";
+			TRY_STATEMENT = "try_statement";
+			CATCH_CLAUSE = "catch_clause";
+			IF_STATEMENT = "if_statement";
+			WHILE_STATEMENT = "while_statement";
+			DO_STATEMENT = "do_statement";
+			FOR_STATEMENT = "for_statement";
+			ENHANCED_FOR_STATEMENT = "EnhancedForStatement";
+			PACKAGE_DECLARATION = "namespace_definition";
+			FIELD_DECLARATION = "field_declaration";
+			MODIFIER = "Modifier";
+			INITIALIZER = "Initializer";
+			CONSTRUCTOR_INVOCATION = "ConstructorInvocation";
+			ENUM_DECLARATION = "EnumDeclaration";
+			ANNOTATION_TYPE_DECLARATION = "AnnotationTypeDeclaration";
+			RECORD_DECLARATION = "RecordDeclaration";
+			PREFIX_EXPRESSION = "PrefixExpression";
+			METHOD_INVOCATION_ARGUMENTS = "METHOD_INVOCATION_ARGUMENTS";
+			STRING_LITERAL = "string_literal";
+			CHARACTER_LITERAL = "character_literal";
+			BOOLEAN_LITERAL = "boolean_literal";
+			NULL_LITERAL = "NullLiteral";
+			METHOD_INVOCATION = "call_expression";
+			SWITCH_STATEMENT = "switch_statement";
+			SWITCH_CASE = "case_statement";
+			ASSIGNMENT = "Assignment";
+			THROW_STATEMENT = "throw_statement";
+			EMPTY_STATEMENT = "EmptyStatement";
+			PRIMITIVE_TYPE = "primitive_type";
 		}
 		else {
 			// Java values as default
@@ -145,13 +213,16 @@ public class Constants {
 			PREFIX_EXPRESSION = "PrefixExpression";
 			METHOD_INVOCATION_ARGUMENTS = "METHOD_INVOCATION_ARGUMENTS";
 			STRING_LITERAL = "StringLiteral";
+			CHARACTER_LITERAL = "CharacterLiteral";
 			BOOLEAN_LITERAL = "BooleanLiteral";
+			NULL_LITERAL = "NullLiteral";
 			METHOD_INVOCATION = "MethodInvocation";
 			SWITCH_STATEMENT = "SwitchStatement";
 			SWITCH_CASE = "SwitchCase";
 			ASSIGNMENT = "Assignment";
 			THROW_STATEMENT = "ThrowStatement";
 			EMPTY_STATEMENT = "EmptyStatement";
+			PRIMITIVE_TYPE = "PrimitiveType";
 		}
 	}
 
@@ -175,7 +246,7 @@ public class Constants {
     public final String EXPRESSION_STATEMENT;
     public final String MODIFIER;
     public final String IMPORT_DECLARATION;
-    public final String PRIMITIVE_TYPE = "PrimitiveType";
+    public final String PRIMITIVE_TYPE;
     public final String TYPE_DECLARATION;
     public final String ENUM_DECLARATION;
     public final String RECORD_DECLARATION;
@@ -214,6 +285,7 @@ public class Constants {
     public final String COMPANION = "companion";
     public final String INFIX = "infix";
     public final String INNER = "inner";
+    public final String VALUE = "value";
 
     public final String METHOD_INVOCATION_ARGUMENTS;
     public final String METHOD_INVOCATION_RECEIVER = "METHOD_INVOCATION_RECEIVER";
@@ -240,10 +312,13 @@ public class Constants {
     public final String INFIX_EXPRESSION = "InfixExpression";
     public final String LAMBDA_EXPRESSION = "LambdaExpression";
     public final String INFIX_EXPRESSION_OPERATOR = "INFIX_EXPRESSION_OPERATOR";
+    public final String PREFIX_EXPRESSION_OPERATOR = "PREFIX_EXPRESSION_OPERATOR";
 
     public final String STRING_LITERAL;
+    public final String CHARACTER_LITERAL;
     public final String NUMBER_LITERAL = "NumberLiteral";
     public final String BOOLEAN_LITERAL;
+    public final String NULL_LITERAL;
 
     public final String SINGLE_MEMBER_ANNOTATION = "SingleMemberAnnotation"; //@type(Expression), for instance
     public final String MARKER_ANNOTATION = "MarkerAnnotation"; //@Deprecated for instance
@@ -257,6 +332,7 @@ public class Constants {
     public final String TAG_NAME = "TAG_NAME";
 
     public final String SIMPLE_TYPE = "SimpleType";
+    public final String PARAMETERIZED_TYPE = "ParameterizedType";
     public final String EXPRESSION_METHOD_REFERENCE = "ExpressionMethodReference";
     public final String PREFIX_EXPRESSION;
     public final String INITIALIZER;
@@ -327,11 +403,14 @@ public class Constants {
     public final String SECONDARY_CONSTRUCTOR = "secondary_constructor";
     public final String PRIMARY_CONSTRUCTOR = "primary_constructor";
     public final String DELEGATION_SPECIFIER = "delegation_specifier";
+    public final String DELEGATE_KEYWORD = "delegate_keyword";
+    public final String EXPLICIT_DELEGATION = "explicit_delegation";
     public final String AFFECTATION_OPERATOR = "affectation_operator";
     public final String COMPANION_OBJECT = "companion_object";
     public final String OBJECT_DECLARATION = "object_declaration";
     public final String OBJECT_LITERAL = "object_literal";
     public final String WHEN_ENTRY = "when_entry";
+    public final String WHEN_CONDITION = "when_condition";
     public final String ARROW = "arrow";
     public final String WHEN_EXPRESSION = "when_expression";
     public final String WHEN_SUBJECT = "when_subject";
@@ -353,13 +432,30 @@ public class Constants {
     public final String NAVIGATION_EXPRESSION = "navigation_expression";
     public final String NAVIGATION_SUFFIX = "navigation_suffix";
     public final String INTEGER_LITERAL = "integer_literal";
+    public final String FLOAT_LITERAL = "real_literal";
     public final String VARIABLE_DECLARATION = "variable_declaration";
     public final String CLASS_MODIFIER = "class_modifier";
     public final String AS_EXPRESSION = "as_expression";
     public final String ANNOTATED_LAMBDA = "annotated_lambda";
+    public final String LAMBDA_LITERAL = "lambda_literal";
     public final String ARITHMETIC_OPERATOR = "arithmetic_operator";
     public final String LONG_LITERAL = "long_literal";
     public final String MULT_EXPRESSION = "multiplicative_expression";
+    public final String DIRECTLY_ASSIGNABLE_EXPRESSION = "directly_assignable_expression";
+    public final String LOGICAL_OPERATOR = "logical_operator";
+    public final String COMPARISON_OPERATOR = "comparison_operator";
+    public final String NOT_PREFIX_OPERATOR = "!";
+    public final String DISJUNCTION_EXPRESSION = "disjunction_expression";
+    public final String EQUALITY_EXPRESSION = "equality_expression";
+    public final String ADDITIVE_EXPRESSION = "additive_expression";
+    public final String MULTIPLICATIVE_EXPRESSION = "multiplicative_expression";
+    public final String INTERPOLATED_IDENTIFIER = "interpolated_identifier";
+    public final String INTERPOLATED_EXPRESSION = "interpolated_expression";
+    public final String AT = "at";
+    public final String PACKAGE = "package";
+    public final String TYPE_ARGUMENTS = "type_arguments";
+    public final String STRING_CONTENT = "string_content";
+    public final String LAMBDA_PARAMETERS = "lambda_parameters";
     
     //TypeScript specific
     public final String FOR_IN_STATEMENT = "for_in_statement";
@@ -458,4 +554,40 @@ public class Constants {
     public final String ASSIGNMENT_EXPRESSION = "assignment_expression";
     public final String UPDATE_EXPRESSION = "update_expression";
     public final String SPREAD_ELEMENT = "spread_element";
+    
+    //C++ specific
+    public final String TRANSLATION_UNIT = "translation_unit"; // This is the root of all trees in C++
+    public final String COMPOUND_STATEMENT = "compound_statement";
+    public final String NAMESPACE = "namespace";
+    public final String NAMESPACE_IDENTIFIER = "namespace_identifier";
+    public final String NESTED_NAMESPACE_SPECIFIER = "nested_namespace_specifier";
+    public final String FUNCTION_DECLARATOR = "function_declarator";
+    public final String POINTER_DECLARATOR = "pointer_declarator";
+    public final String PARAMETER_LIST = "parameter_list";
+    public final String PARAMETER_DECLARATION = "parameter_declaration";
+    public final String FIELD_IDENTIFIER = "field_identifier";
+    public final String QUALIFIED_IDENTIFIER = "qualified_identifier";
+    public final String TYPE_QUALIFIER = "type_qualifier";
+    public final String DECLARATION = "declaration";
+    public final String DECLARATION_LIST = "declaration_list"; //when parent is a namespace
+    public final String INIT_DECLARATOR = "init_declarator";
+    public final String ARRAY_DECLARATOR = "array_declarator";
+    public final String CONDITION_CLAUSE = "condition_clause";
+    public final String PLACEHOLDER_TYPE_SPECIFIER = "placeholder_type_specifier";
+    public final String STRUCTURED_BINDING_DECLARATOR = "structured_binding_declarator";
+    public final String FOR_RANGE_LOOP = "for_range_loop";
+    public final String STRUCT_SPECIFIER = "struct_specifier";
+    public final String STRUCT_KEYWORD = "struct";
+    public final String POINTER = "*";
+    public final String ACCESS_SPECIFIER = "access_specifier";
+    public final String TEMPLATE_DECLARATION = "template_declaration";
+    public final String FIELD_INITIALIZER_LIST = "field_initializer_list";
+    public final String FIELD_INITIALIZER = "field_initializer";
+    public final String REFERENCE_DECLARATOR = "reference_declarator";
+    public final String REFERENCE = "&";
+    public final String TEMPLATE_KEYWORD = "template";
+    public final String TEMPLATE_PARAMETER_LIST = "template_parameter_list";
+    public final String EXPLICIT_FUNCTION_SPECIFIER = "explicit_function_specifier";
+    public final String BASE_CLASS_CLAUSE = "base_class_clause";
+    public final String DESTRUCTOR_NAME = "destructor_name";
 }

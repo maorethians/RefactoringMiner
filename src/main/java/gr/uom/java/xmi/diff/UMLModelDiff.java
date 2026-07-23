@@ -209,103 +209,83 @@ public class UMLModelDiff {
 		return null;
 	}
 
-    private Set<AbstractCodeFragment> findFieldAccesses(UMLAttribute attribute, UMLModel umlModel) {
-        Set<AbstractCodeFragment> set = new LinkedHashSet<>();
-        //references within the same class
-        set.addAll(attribute.getVariableDeclaration().getStatementsInScopeUsingVariable());
-        //find references in other classes, through direct field accesses
-        for(UMLClass umlClass : umlModel.getClassList()) {
-            for(UMLOperation operation : umlClass.getOperations()) {
-                if(operation.getBody() != null) {
-                    for(AbstractStatement statement : operation.getBody().getCompositeStatement().getAllStatements()) {
-                        for(LeafExpression expr : statement.getVariables()) {
-                            if(expr.getString().contains("." + attribute.getName())) {
-                                String prefix = expr.getString().substring(0, expr.getString().lastIndexOf("." + attribute.getName()));
-                                boolean objectVerified = false;
-                                if(operation.variableDeclarationMap().containsKey(prefix)) {
-                                    Set<VariableDeclaration> declarations = operation.variableDeclarationMap().get(prefix);
-                                    for(VariableDeclaration declaration : declarations) {
-                                        if(attribute.getClassName().endsWith(declaration.getType().getClassType())) {
-                                            objectVerified = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if(objectVerified) {
-                                    set.add(statement);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return set;
-    }
+	private Set<AbstractCodeFragment> findFieldAccesses(UMLAttribute attribute, UMLModel umlModel) {
+		Set<AbstractCodeFragment> set = new LinkedHashSet<>();
+		//references within the same class
+		set.addAll(attribute.getVariableDeclaration().getStatementsInScopeUsingVariable());
+		//find references in other classes, through direct field accesses
+		for(UMLClass umlClass : umlModel.getClassList()) {
+			for(UMLOperation operation : umlClass.getOperations()) {
+				if(operation.getBody() != null) {
+					for(AbstractStatement statement : operation.getBody().getCompositeStatement().getAllStatements()) {
+						for(LeafExpression expr : statement.getVariables()) {
+							if(expr.getString().contains("." + attribute.getName())) {
+								String prefix = expr.getString().substring(0, expr.getString().lastIndexOf("." + attribute.getName()));
+								boolean objectVerified = false;
+								if(operation.variableDeclarationMap().containsKey(prefix)) {
+									Set<VariableDeclaration> declarations = operation.variableDeclarationMap().get(prefix);
+									for(VariableDeclaration declaration : declarations) {
+										if(attribute.getClassName().endsWith(declaration.getType().getClassType())) {
+											objectVerified = true;
+											break;
+										}
+									}
+								}
+								if(objectVerified) {
+									set.add(statement);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		return set;
+	}
 
-    public Set<AbstractCodeFragment> findFieldAccessesInParentModel(UMLAttribute attribute) {
-        return findFieldAccesses(attribute, parentModel);
-    }
+	public Set<AbstractCodeFragment> findFieldAccessesInParentModel(UMLAttribute attribute) {
+		return findFieldAccesses(attribute, parentModel);
+	}
 
 	public Set<AbstractCodeFragment> findFieldAccessesInChildModel(UMLAttribute attribute) {
 		return findFieldAccesses(attribute, childModel);
 	}
 
-    public List<AbstractCall> findInvocations(UMLOperation operation, UMLModel umlModel) {
-        List<AbstractCall> invocations = new ArrayList<>();
-        for(UMLClass umlClass : umlModel.getClassList()) {
-            UMLClassBaseDiff classDiff = getUMLClassDiff(umlClass.getName());
-            for(UMLOperation context : umlClass.getOperations()) {
-                for(AbstractCall call : context.getAllOperationInvocations()) {
-                    if(call.matchesOperation(operation, context, classDiff, this)) {
-                        invocations.add(call);
-                    }
-                }
-            }
-            for(UMLInitializer context : umlClass.getInitializers()) {
-                for(AbstractCall call : context.getAllOperationInvocations()) {
-                    if(call.matchesOperation(operation, context, classDiff, this)) {
-                        invocations.add(call);
-                    }
-                }
-            }
-            for(UMLAttribute context : umlClass.getAttributes()) {
-                for(AbstractCall call : context.getAllOperationInvocations()) {
-                    if(call.matchesOperation(operation, context, classDiff, this)) {
-                        invocations.add(call);
-                    }
-                }
-            }
-        }
-        return invocations;
-    }
+	private List<AbstractCall> findInvocations(UMLOperation operation, UMLModel umlModel) {
+		List<AbstractCall> invocations = new ArrayList<AbstractCall>();
+		for(UMLClass umlClass : umlModel.getClassList()) {
+			UMLClassBaseDiff classDiff = getUMLClassDiff(umlClass.getName());
+			for(UMLOperation context : umlClass.getOperations()) {
+				for(AbstractCall call : context.getAllOperationInvocations()) {
+					if(call.matchesOperation(operation, context, classDiff, this)) {
+						invocations.add(call);
+					}
+				}
+			}
+			for(UMLInitializer context : umlClass.getInitializers()) {
+				for(AbstractCall call : context.getAllOperationInvocations()) {
+					if(call.matchesOperation(operation, context, classDiff, this)) {
+						invocations.add(call);
+					}
+				}
+			}
+			for(UMLAttribute context : umlClass.getAttributes()) {
+				for(AbstractCall call : context.getAllOperationInvocations()) {
+					if(call.matchesOperation(operation, context, classDiff, this)) {
+						invocations.add(call);
+					}
+				}
+			}
+		}
+		return invocations;
+	}
 
-    public List<AbstractCall> findInvocationsInParentModel(UMLOperation operation) {
-        return findInvocations(operation, parentModel);
-    }
+	public List<AbstractCall> findInvocationsInParentModel(UMLOperation operation) {
+		return findInvocations(operation, parentModel);
+	}
 
 	public List<AbstractCall> findInvocationsInChildModel(UMLOperation operation) {
 		return findInvocations(operation, childModel);
-	}
-
-    private UMLOperation findDeclarations(UMLOperation callerOperation, AbstractCall invocation, UMLModel umlModel) {
-        for (UMLClass umlClass : umlModel.getClassList()) {
-            UMLClassBaseDiff classDiff = getUMLClassDiff(umlClass.getName());
-            for (UMLOperation operation : umlClass.getOperations()) {
-                if (invocation.matchesOperation(operation, callerOperation, classDiff, this)) {
-                    return operation;
-                }
-            }
-        }
-        return null;
-    }
-
-    public UMLOperation findDeclarationsInParentModel(UMLOperation callerOperation, AbstractCall invocation) {
-        return findDeclarations(callerOperation, invocation, parentModel);
-    }
-
-	public UMLOperation findDeclarationsInChildModel(UMLOperation callerOperation, AbstractCall invocation) {
-		return findDeclarations(callerOperation, invocation, childModel);
 	}
 
 	public void reportAddedClass(UMLClass umlClass) {
@@ -1177,7 +1157,7 @@ public class UMLModelDiff {
 				TreeSet<UMLClassRenameDiff> renameDiffSet = findRenameMatchesForAddedClass(minClassRenameDiff.getRenamedClass(), matcher);
 				TreeSet<UMLClassRenameDiff> union = new TreeSet<>();
 				union.addAll(diffSet);
-				if(!minClassRenameDiff.getMatchResult().isPerfect()) {
+				if(!minClassRenameDiff.getMatchResult().isPerfect()) {	
 					union.addAll(renameDiffSet);
 				}
 				boolean renameMatcherWithFalseMatchResult = false;
@@ -2114,7 +2094,6 @@ public class UMLModelDiff {
 	}
 
 	private void processCandidates(List<MoveAttributeRefactoring> candidates, List<MoveAttributeRefactoring> refactorings, Set<Refactoring> pastRefactorings) throws RefactoringMinerTimedOutException {
-		ArrayList<UMLOperationBodyMapper> operationBodyMapperList = new ArrayList<>();
 		if(candidates.size() > 1) {
 			TreeMap<Integer, List<MoveAttributeRefactoring>> map = new TreeMap<Integer, List<MoveAttributeRefactoring>>();
 			for(MoveAttributeRefactoring candidate : candidates) {
@@ -3178,6 +3157,9 @@ public class UMLModelDiff {
 	private List<ExtractSuperclassRefactoring> identifyExtractSuperclassRefactorings() throws RefactoringMinerTimedOutException {
 		List<ExtractSuperclassRefactoring> refactorings = new ArrayList<ExtractSuperclassRefactoring>();
 		for(UMLClass addedClass : addedClasses) {
+			if(addedClass.isModule() && addedClass.getAttributes().isEmpty() && addedClass.getOperations().isEmpty()) {
+				continue;
+			}
 			Set<UMLClass> subclassSetBefore = new LinkedHashSet<UMLClass>();
 			Set<UMLClass> subclassSetAfter = new LinkedHashSet<UMLClass>();
 			String addedClassName = addedClass.getName();

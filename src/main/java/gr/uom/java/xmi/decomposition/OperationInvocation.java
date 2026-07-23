@@ -35,6 +35,12 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.eclipse.cdt.core.dom.ast.IASTExpression;
+import org.eclipse.cdt.core.dom.ast.IASTFieldReference;
+import org.eclipse.cdt.core.dom.ast.IASTFunctionCallExpression;
+import org.eclipse.cdt.core.dom.ast.IASTIdExpression;
+import org.eclipse.cdt.core.dom.ast.IASTInitializerClause;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionCallExpression;
 import org.eclipse.jdt.core.dom.ClassInstanceCreation;
 import org.eclipse.jdt.core.dom.CompilationUnit;
 import org.eclipse.jdt.core.dom.ConstructorInvocation;
@@ -43,13 +49,16 @@ import org.eclipse.jdt.core.dom.MethodInvocation;
 import org.eclipse.jdt.core.dom.SuperConstructorInvocation;
 import org.eclipse.jdt.core.dom.SuperMethodInvocation;
 import org.eclipse.jdt.core.dom.Type;
+import org.jetbrains.kotlin.psi.KtBinaryExpression;
 import org.jetbrains.kotlin.psi.KtCallExpression;
 import org.jetbrains.kotlin.psi.KtDotQualifiedExpression;
 import org.jetbrains.kotlin.psi.KtExpression;
 import org.jetbrains.kotlin.psi.KtFile;
 import org.jetbrains.kotlin.psi.KtLambdaExpression;
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression;
+import org.jetbrains.kotlin.psi.KtParenthesizedExpression;
 import org.jetbrains.kotlin.psi.KtSafeQualifiedExpression;
+import org.jetbrains.kotlin.psi.KtStringTemplateExpression;
 import org.jetbrains.kotlin.psi.KtTypeProjection;
 import org.jetbrains.kotlin.psi.KtValueArgument;
 import org.refactoringminer.api.Refactoring;
@@ -1207,8 +1216,33 @@ public class OperationInvocation extends AbstractCall {
 		if(calleeExpression instanceof KtNameReferenceExpression nameReference) {
 			this.methodName = nameReference.getReferencedName();
 		}
-		else if(calleeExpression instanceof KtLambdaExpression lambda) {
+		else if(calleeExpression instanceof KtLambdaExpression) {
 			this.methodName = "lambda";
+		}
+		else if(calleeExpression instanceof KtCallExpression) {
+			//f()() is used to call a function that returns another function
+			this.methodName = "";
+		}
+		else if(calleeExpression instanceof KtParenthesizedExpression parenthesized) {
+			KtExpression expr = parenthesized.getExpression();
+			if(expr instanceof KtBinaryExpression binaryExpr) {
+				KtExpression left = binaryExpr.getLeft();
+				KtExpression right = binaryExpr.getRight();
+				if(left instanceof KtCallExpression leftCall && right instanceof KtCallExpression rightCall) {
+					KtExpression leftCalleeExpression = leftCall.getCalleeExpression();
+					KtExpression rightCalleeExpression = rightCall.getCalleeExpression();
+					if(leftCalleeExpression instanceof KtNameReferenceExpression leftNameReference &&
+							rightCalleeExpression instanceof KtNameReferenceExpression rightNameReference &&
+							leftNameReference.getReferencedName().equals(rightNameReference.getReferencedName())) {
+						this.methodName = leftNameReference.getReferencedName();
+					}
+				}
+			}
+			if(this.methodName == null)
+				this.methodName = "";
+		}
+		else if(calleeExpression instanceof KtStringTemplateExpression templateExpression) {
+			this.methodName = "";
 		}
 		this.numberOfArguments = invocation.getValueArguments().size();
 		this.arguments = new ArrayList<String>();
@@ -1350,6 +1384,28 @@ public class OperationInvocation extends AbstractCall {
 				UMLType type = UMLType.extractTypeObject(sourceFolder, filePath, fileContent, typeArgument, 0);
 				this.typeArguments.add(type);
 			}
+		}
+	}
+
+	public OperationInvocation(String sourceFolder, String filePath, IASTFunctionCallExpression invocation, VariableDeclarationContainer container, String fileContent) {
+		super(sourceFolder, filePath, invocation, CodeElementType.METHOD_INVOCATION, container, fileContent);
+		IASTExpression nameExpr = invocation.getFunctionNameExpression();
+		IASTInitializerClause[] arguments = invocation.getArguments();
+		this.arguments = new ArrayList<String>();
+		this.numberOfArguments = arguments.length;
+		for(IASTInitializerClause arg : arguments) {
+			this.arguments.add(arg.getRawSignature());
+		}
+		if (nameExpr instanceof IASTIdExpression) {
+			this.methodName = nameExpr.getRawSignature();
+		}
+		else if(nameExpr instanceof IASTFieldReference fieldReference) {
+			IASTExpression expr = fieldReference.getFieldOwner();
+			this.expression = expr.getRawSignature();
+			this.methodName = fieldReference.getFieldName().toString();
+		}
+		else if(nameExpr instanceof ICPPASTFunctionCallExpression) {
+			this.methodName = "";
 		}
 	}
 }

@@ -6,6 +6,25 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import org.eclipse.cdt.core.dom.ast.IASTDeclSpecifier;
+import org.eclipse.cdt.core.dom.ast.IASTDeclarator;
+import org.eclipse.cdt.core.dom.ast.IASTName;
+import org.eclipse.cdt.core.dom.ast.IASTNode;
+import org.eclipse.cdt.core.dom.ast.IASTParameterDeclaration;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTCatchHandler;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTForStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTIfStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTRangeBasedForStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTSwitchStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTTemplateDeclaration;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTWhileStatement;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTCompositeTypeSpecifier;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTDeclarationStatement;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTFunctionDeclarator;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTNamespaceDefinition;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTParameterDeclaration;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTSimpleDeclaration;
+import org.eclipse.cdt.internal.core.dom.parser.cpp.CPPASTTranslationUnit;
 import org.eclipse.jdt.core.dom.ASTNode;
 import org.eclipse.jdt.core.dom.Annotation;
 import org.eclipse.jdt.core.dom.CompilationUnit;
@@ -121,6 +140,107 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 	private List<UMLModifier> modifiers;
 	private String actualSignature;
 	private final Constants LANG;
+
+	public VariableDeclaration(String sourceFolder, String filePath, IASTParameterDeclaration parameter, IASTDeclSpecifier declSpecifier,
+			VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
+		IASTDeclarator declarator = parameter.getDeclarator();
+		this.annotations = new ArrayList<UMLAnnotation>();
+		this.modifiers = new ArrayList<UMLModifier>();
+		this.locationInfo = new LocationInfo(sourceFolder, filePath, parameter, CodeElementType.SINGLE_VARIABLE_DECLARATION, fileContent);
+		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
+		IASTName name = declarator.getName();
+		this.variableName = name.toString();
+		if(declarator.getInitializer() != null) {
+			this.initializer = new AbstractExpression(sourceFolder, filePath, declarator.getInitializer(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, container, activeVariableDeclarations, fileContent);
+		}
+		this.type = UMLType.extractTypeObject(sourceFolder, filePath, fileContent, declSpecifier, declarator, 0);
+		this.varargsParameter = false;
+		//IASTNode scopeNode = getScopeNode(declarator);
+		int startOffset = locationInfo.getStartOffset();
+		int endOffset = container != null ? container.getLocationInfo().getEndOffset() : locationInfo.getEndOffset();
+		this.scope = new VariableScope(filePath, startOffset, endOffset);
+		this.actualSignature = parameter.getRawSignature();
+	}
+
+	public VariableDeclaration(String sourceFolder, String filePath, IASTDeclarator declarator, IASTDeclSpecifier declSpecifier,
+			VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
+		this.annotations = new ArrayList<UMLAnnotation>();
+		this.modifiers = new ArrayList<UMLModifier>();
+		this.locationInfo = new LocationInfo(sourceFolder, filePath, declarator, CodeElementType.VARIABLE_DECLARATION_STATEMENT, fileContent);
+		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
+		IASTName name = declarator.getName();
+		this.variableName = name.toString();
+		if(declarator.getInitializer() != null) {
+			this.initializer = new AbstractExpression(sourceFolder, filePath, declarator.getInitializer(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, container, activeVariableDeclarations, fileContent);
+		}
+		this.type = UMLType.extractTypeObject(sourceFolder, filePath, fileContent, declSpecifier, declarator, 0);
+		//IScope scope = CPPVisitor.getContainingScope(declarator);
+		IASTNode scopeNode = getScopeNode(declarator);
+		int startOffset = declarator.getFileLocation().getNodeOffset();
+		int endOffset = scopeNode.getFileLocation().getNodeOffset() + scopeNode.getFileLocation().getNodeLength();
+		this.scope = new VariableScope(filePath, startOffset, endOffset);
+		this.actualSignature = declarator.getRawSignature();
+	}
+
+	public VariableDeclaration(String sourceFolder, String filePath, IASTName name, IASTDeclSpecifier declSpecifier,
+			VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
+		this.annotations = new ArrayList<UMLAnnotation>();
+		this.modifiers = new ArrayList<UMLModifier>();
+		this.locationInfo = new LocationInfo(sourceFolder, filePath, name, CodeElementType.VARIABLE_DECLARATION_STATEMENT, fileContent);
+		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
+		this.variableName = name.toString();
+		this.type = UMLType.extractTypeObject(sourceFolder, filePath, fileContent, declSpecifier, null, 0);
+		//IScope scope = CPPVisitor.getContainingScope(declarator);
+		//parent is CPPASTStructuredBindingDeclaration
+		IASTNode scopeNode = name.getParent().getParent();
+		int startOffset = scopeNode.getFileLocation().getNodeOffset();
+		int endOffset = scopeNode.getFileLocation().getNodeOffset() + scopeNode.getFileLocation().getNodeLength();
+		this.scope = new VariableScope(filePath, startOffset, endOffset);
+		this.actualSignature = name.getRawSignature();
+	}
+
+	private IASTNode getScopeNode(IASTDeclarator declarator) {
+		if(declarator.getParent() instanceof CPPASTSimpleDeclaration) {
+			if(declarator.getParent().getParent() instanceof CPPASTDeclarationStatement) {
+				return declarator.getParent().getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof CPPASTTranslationUnit) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof CPPASTCompositeTypeSpecifier) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof CPPASTNamespaceDefinition) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTRangeBasedForStatement) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTCatchHandler) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTForStatement) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTIfStatement) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTSwitchStatement) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTWhileStatement) {
+				return declarator.getParent().getParent();
+			}
+			else if(declarator.getParent().getParent() instanceof ICPPASTTemplateDeclaration templateDeclaration) {
+				return templateDeclaration.getParent();
+			}
+		}
+		else if(declarator.getParent() instanceof CPPASTParameterDeclaration && declarator.getParent().getParent() instanceof CPPASTFunctionDeclarator) {
+			return declarator.getParent().getParent().getParent();
+		}
+		//TODO Handle more scenarios of variable declarations
+		return null;
+	}
 
 	public VariableDeclaration(LangCompilationUnit cu, String sourceFolder, String filePath,
 							   LangSingleVariableDeclaration param, VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {

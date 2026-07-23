@@ -47,37 +47,36 @@ public class MethodSourceAnnotation extends SourceAnnotation implements SingleMe
         if(sameNameMethods.size() > 0) {
             UMLOperation sourceMethod = sameNameMethods.get(0);
             Optional<VariableDeclaration> returnedVarCandidates = sourceMethod.getBody().getAllVariableDeclarations().stream().filter(v -> sourceMethod.getReturnParameter().getType().equals(v.getType())).findAny();
-            String strLiterals;
-            if (returnedVarCandidates.isPresent()) {
-                Set<AbstractCodeFragment> stmtsUsingVar = returnedVarCandidates.get().getStatementsInScopeUsingVariable();
-                strLiterals = stmtsUsingVar.stream()
-                        .flatMap(stmt -> stmt.getStringLiterals().stream())
-                        .map(str -> str.getString())
-                        .collect(Collectors.joining(System.getProperty("line.separator")));
-            } else {
+            if (returnedVarCandidates.isEmpty()) {
                 Optional<StatementObject> stmtCandidate = sourceMethod.getBody().getCompositeStatement().getStatements().stream()
                         .filter(s -> s instanceof StatementObject)
                         .map(s -> (StatementObject) s)
-                        .filter(s -> s.isLastStatement())
+                        .filter(AbstractCodeFragment::isLastStatement)
                         .findAny();
                 if (stmtCandidate.isPresent()) {
-                    strLiterals = stmtCandidate.get().getStringLiterals().stream()
-                            .map(str -> str.getString())
-                            .collect(Collectors.joining(System.getProperty("line.separator")));
                     AbstractCall call = stmtCandidate.get().invocationCoveringEntireFragment();
                     if(call != null && call.getName().equals("of")) {
                         for(AbstractCall nestedCall : stmtCandidate.get().getMethodInvocations()) {
                             if(nestedCall.getExpression() != null && !nestedCall.getExpression().equals("Stream") && nestedCall.getName().equals("of")) {
-                                testParameters.add(nestedCall.arguments());
+                                List<String> resolvedArguments = new ArrayList<>();
                                 List<LeafExpression> leafExpressions = new ArrayList<>();
                                 for(String arg : nestedCall.arguments()) {
-                                    List<LeafExpression> matches = stmtCandidate.get().findExpression(arg);
-                                    for(LeafExpression match : matches) {
-                                        if(nestedCall.getLocationInfo().subsumes(match.getLocationInfo())) {
-                                            leafExpressions.add(match);
+                                    LeafExpression constantLiteral = resolveConstantLiteral(arg);
+                                    if(constantLiteral != null) {
+                                        resolvedArguments.add(constantLiteral.getString());
+                                        leafExpressions.add(constantLiteral);
+                                    }
+                                    else {
+                                        resolvedArguments.add(arg);
+                                        List<LeafExpression> matches = stmtCandidate.get().findExpression(arg);
+                                        for(LeafExpression match : matches) {
+                                            if(nestedCall.getLocationInfo().subsumes(match.getLocationInfo())) {
+                                                leafExpressions.add(match);
+                                            }
                                         }
                                     }
                                 }
+                                testParameters.add(resolvedArguments);
                                 testParameterLeafExpressions.add(leafExpressions);
                             }
                         }
@@ -85,6 +84,25 @@ public class MethodSourceAnnotation extends SourceAnnotation implements SingleMe
                 }
             }
         }
+    }
+
+    private LeafExpression resolveConstantLiteral(String name) {
+        for(UMLAttribute attribute : declaringClass.getAttributes()) {
+            if(attribute.getName().equals(name) && attribute.isFinal() && attribute.isStatic()) {
+                AbstractExpression initializer = attribute.getVariableDeclaration().getInitializer();
+                if(initializer != null) {
+                    List<LeafExpression> literals = new ArrayList<>();
+                    literals.addAll(initializer.getStringLiterals());
+                    literals.addAll(initializer.getNumberLiterals());
+                    literals.addAll(initializer.getBooleanLiterals());
+                    literals.addAll(initializer.getNullLiterals());
+                    if(!literals.isEmpty()) {
+                        return literals.get(0);
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     @Override

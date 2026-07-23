@@ -25,6 +25,7 @@ Table of Contents
 
    * [General info](#general-info)
       * [AST diff features](#ast-diff-features)
+         * [Cross-language diff](#cross-language-diff)
          * [Refactoring-aware tooltips](#refactoring-aware-tooltips)
          * [Refactoring listing with links to diffs](#refactoring-listing-with-links-to-diffs)
          * [Single Page View](#single-page-view)
@@ -50,6 +51,7 @@ Table of Contents
       * [Refactoring detection command line options](documentation/how-to.md#refactoring-detection-command-line-options)
       * [AST diff command line options](documentation/how-to.md#ast-diff-command-line-options)
    * [How to run RefactoringMiner as a local MCP server](documentation/mcp.md#refactoringminer-mcp-server)
+      * [Agent skill for review workflows](documentation/mcp.md#agent-skill-for-review-workflows)
    * [Research](documentation/research.md#research)
       * [How to cite RefactoringMiner](documentation/research.md#how-to-cite-refactoringminer)
       * [Talks about RefactoringMiner](documentation/research.md#talks-about-refactoringminer)
@@ -77,6 +79,11 @@ Since version 3.0, RefactoringMiner can also generate Abstract Syntax Tree (AST)
 You can also use our tool to visualize the diffs in your browser.
 
 ## AST diff features
+
+### Cross-language diff
+Java methods migrated to Kotlin functions
+<img width="1920" height="1080" alt="JavaToKotlinDiff" src="https://github.com/user-attachments/assets/eeffafcd-b503-472a-b0c4-791fcb0a9472" />
+[A Java test file migrated to Kotlin](https://users.encs.concordia.ca/~nikolaos/diffGallery/MockWebServerTest.html)
 
 ### Refactoring-aware tooltips
 <img width="1920" height="1080" alt="RefactoringAwareTooltips" src="https://github.com/user-attachments/assets/e4e14c4c-a966-46e3-b4c7-6808a0506a9c" />

@@ -12,7 +12,7 @@ import java.util.Optional;
 
 import org.refactoringminer.util.PathFileUtils;
 
-public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, Serializable, LocationInfoProvider {
+public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, Serializable, LocationInfoProvider, TypeParameterProvider {
 	public enum ConditionallyCreated {
 		IF, ELSE, NO;
 	}
@@ -35,6 +35,7 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
 	private boolean isObject;
 	private boolean isTypeAlias;
 	private boolean isFunctionalInterface;
+	private boolean isStruct;
     private List<UMLTypeParameter> typeParameters;
     private Optional<PrimaryConstructor> primaryConstructor;
     private Optional<UMLType> functionType;
@@ -47,6 +48,7 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
     private String actualSignature;
     private ConditionallyCreated conditionallyCreated = ConditionallyCreated.NO;
     private Optional<AbstractStatement> parentStatement;
+    private List<UMLPreprocessorStatement> preprocessorStatements;
     
     public UMLClass(String packageName, String name, LocationInfo locationInfo, boolean topLevel, List<UMLImport> importedTypes) {
     	super(packageName, name, locationInfo, importedTypes, topLevel);
@@ -67,6 +69,7 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
         this.packageDeclaration = Optional.empty();
         this.typeAliasList = new ArrayList<UMLTypeAlias>();
         this.parentStatement = Optional.empty();
+        this.preprocessorStatements = new ArrayList<UMLPreprocessorStatement>();
     }
 
     public String getTypeDeclarationKind() {
@@ -80,6 +83,8 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
     		return "record";
     	else if(isObject)
     		return "object";
+    	else if(isStruct)
+    		return "struct";
     	else
     		return "class";
     }
@@ -112,20 +117,20 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
 		return typeParameters;
 	}
 
-	public List<String> getTypeParameterNames() {
-		List<String> typeParameterNames = new ArrayList<String>();
-		for(UMLTypeParameter typeParameter : typeParameters) {
-			typeParameterNames.add(typeParameter.getName());
-		}
-		return typeParameterNames;
-	}
-
 	public List<UMLTypeAlias> getTypeAliasList() {
 		return typeAliasList;
 	}
 
 	public void addTypeAlias(UMLTypeAlias typeAlias) {
 		this.typeAliasList.add(typeAlias);
+	}
+
+	public List<UMLPreprocessorStatement> getPreprocessorStatements() {
+		return preprocessorStatements;
+	}
+
+	public void addPreprocessorStatement(UMLPreprocessorStatement statement) {
+		this.preprocessorStatements.add(statement);
 	}
 
 	public void addSuperTypeCallEntry(AbstractExpression expr) {
@@ -296,6 +301,14 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
 		this.isTypeAlias = isTypeAlias;
 	}
 
+	public boolean isStruct() {
+		return isStruct;
+	}
+
+	public void setStruct(boolean isStruct) {
+		this.isStruct = isStruct;
+	}
+
 	public UMLJavadoc getJavadoc() {
 		return javadoc;
 	}
@@ -398,6 +411,11 @@ public class UMLClass extends UMLAbstractClass implements Comparable<UMLClass>, 
 								UMLType type2 = parameterized2.get(i).getType();
 								if(type1.getTypeArguments().toString().equals(this.typeParameters.toString()) &&
 										type2.getTypeArguments().toString().equals(umlClass.typeParameters.toString())) {
+									renamed++;
+								}
+								boolean b1 = this.typeParameters.stream().anyMatch(p -> type1.toString().equals(p.toString()));
+								boolean b2 = umlClass.typeParameters.stream().anyMatch(p -> type2.toString().equals(p.toString()));
+								if(b1 && b2) {
 									renamed++;
 								}
 							}

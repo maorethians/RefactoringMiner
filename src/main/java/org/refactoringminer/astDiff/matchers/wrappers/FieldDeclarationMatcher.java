@@ -62,10 +62,23 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
         Tree srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.FIELD_DECLARATION);
         Tree dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.FIELD_DECLARATION);
         if (srcFieldDeclaration == null) {
+            srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.DECLARATION);
+        }
+        if (dstFieldDeclaration == null) {
+            dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.DECLARATION);
+        }
+        if (srcFieldDeclaration == null) {
             srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.ENUM_CONSTANT_DECLARATION);
         }
         if (dstFieldDeclaration == null) {
             dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.ENUM_CONSTANT_DECLARATION);
+        }
+        //handle fields expanded with macro
+        if (srcFieldDeclaration == null && srcAttr.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.EXPRESSION_STATEMENT);
+        }
+        if (dstFieldDeclaration == null && dstAttr.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+            dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.EXPRESSION_STATEMENT);
         }
         //handle Record Components (SingleVariableDeclaration)
         if (srcFieldDeclaration == null) {
@@ -136,7 +149,10 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
                 (srcAttr.getType().name.equals(LANG1.SHORTHAND_PROPERTY_IDENTIFIER) && dstAttr.getType().name.equals(LANG2.SHORTHAND_PROPERTY_IDENTIFIER)) ||
                 (srcAttr.getType().name.equals(LANG1.PAIR) && dstAttr.getType().name.equals(LANG2.PAIR)) ||
                 (srcAttr.getType().name.equals(LANG1.ENUM_ASSIGNMENT) && dstAttr.getType().name.equals(LANG2.ENUM_ASSIGNMENT)) ||
-                (srcAttr.getType().name.equals(LANG1.SPREAD_ELEMENT) && dstAttr.getType().name.equals(LANG2.SPREAD_ELEMENT))) {
+                (srcAttr.getType().name.equals(LANG1.SPREAD_ELEMENT) && dstAttr.getType().name.equals(LANG2.SPREAD_ELEMENT)) ||
+                (srcAttr.getType().name.equals(LANG1.INIT_DECLARATOR) && dstAttr.getType().name.equals(LANG2.INIT_DECLARATOR)) ||
+                (srcAttr.getType().name.equals(LANG1.ARRAY_DECLARATOR) && dstAttr.getType().name.equals(LANG2.ARRAY_DECLARATOR)) ||
+                (srcAttr.getType().name.equals(LANG1.FIELD_IDENTIFIER) && dstAttr.getType().name.equals(LANG2.FIELD_IDENTIFIER))) {
             if(srcAttr.getParent() != null && dstAttr.getParent() != null) {
                 int index1 = srcAttr.getParent().getChildPosition(srcAttr);
                 int index2 = dstAttr.getParent().getChildPosition(dstAttr);
@@ -165,6 +181,14 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
                 if(colons != null) {
                     mappingStore.addMapping(colons.first, colons.second);
                 }
+            }
+            com.github.gumtreediff.utils.Pair<Tree, Tree> colons = Helpers.findPairOfType(srcAttr,dstAttr, LANG1.COLON, LANG2.COLON);
+            if(colons != null) {
+                mappingStore.addMapping(colons.first, colons.second);
+            }
+            com.github.gumtreediff.utils.Pair<Tree, Tree> member_expressions = Helpers.findPairOfType(srcAttr,dstAttr, LANG1.MEMBER_EXPRESSION, LANG2.MEMBER_EXPRESSION);
+            if(member_expressions != null) {
+                mappingStore.addMappingRecursively(member_expressions.first, member_expressions.second);
             }
         }
         mappingStore.addMapping(srcFieldDeclaration,dstFieldDeclaration);

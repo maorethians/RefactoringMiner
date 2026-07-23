@@ -33,6 +33,7 @@ public class MappingOptimizer {
 	private UMLAbstractClassDiff classDiff;
 	private final Constants LANG1;
 	private final Constants LANG2;
+	private Set<Refactoring> refactoringsToBeRemoved = new LinkedHashSet<Refactoring>();
 	
 	public MappingOptimizer(UMLAbstractClassDiff classDiff) {
 		this.classDiff = classDiff;
@@ -559,19 +560,26 @@ public class MappingOptimizer {
 							}
 						}
 						//remove refactorings based on mapping
-						Set<Refactoring> refactoringsToBeRemoved = new LinkedHashSet<Refactoring>();
 						Set<Refactoring> refactoringsAfterPostProcessing = mapper.getRefactoringsAfterPostProcessing();
+						Set<Refactoring> otherMapperRefactoringsAfterPostProcessing = new LinkedHashSet<>();
+						for(UMLOperationBodyMapper otherMapper : mappers) {
+							boolean equalMappers = otherMapper.equals(mapper) && otherMapper.getMappings().equals(mapper.getMappings());
+							if(!equalMappers) {
+								otherMapperRefactoringsAfterPostProcessing.addAll(otherMapper.getRefactoringsAfterPostProcessing());
+							}
+						}
 						for(Refactoring r : refactoringsAfterPostProcessing) {
 							if(r instanceof ReferenceBasedRefactoring) {
 								ReferenceBasedRefactoring referenceBased = (ReferenceBasedRefactoring)r;
 								Set<AbstractCodeMapping> references = referenceBased.getReferences();
-								if(references.contains(mapping)) {
+								if(references.contains(mapping) && !otherMapperRefactoringsAfterPostProcessing.contains(r)) {
 									refactoringsToBeRemoved.add(r);
 								}
 							}
 							else if(r instanceof InvertConditionRefactoring) {
 								InvertConditionRefactoring invert = (InvertConditionRefactoring)r;
-								if(mapping.getFragment1().equals(invert.getOriginalConditional()) || mapping.getFragment2().equals(invert.getInvertedConditional())) {
+								if(mapping.getFragment1().equals(invert.getOriginalConditional()) && mapping.getFragment2().equals(invert.getInvertedConditional())
+										 && !otherMapperRefactoringsAfterPostProcessing.contains(r)) {
 									refactoringsToBeRemoved.add(r);
 								}
 							}
@@ -601,7 +609,6 @@ public class MappingOptimizer {
 				index++;
 			}
 		}
-		Set<Refactoring> refactoringsToBeRemoved = new LinkedHashSet<>();
 		for(Refactoring ref : refactorings) {
 			if(ref instanceof ExtractOperationRefactoring) {
 				ExtractOperationRefactoring refactoring = (ExtractOperationRefactoring)ref;
@@ -826,15 +833,28 @@ public class MappingOptimizer {
 						allReplacementsCoverEntireStatement = true;
 					}
 					if(!allReplacementsCoverEntireStatement) {
-						int minimum = replacementTypeCount.get(0);
-						for(int i=1; i<replacementTypeCount.size(); i++) {
-							if(replacementTypeCount.get(i) < minimum && replacementCoversEntireStatement.get(i) == false) {
-								minimum = replacementTypeCount.get(i);
+						double maximumCompositeChildMatchingScore = compositeChildMatchingScores.get(0);
+						for(int i=1; i<compositeChildMatchingScores.size(); i++) {
+							if(compositeChildMatchingScores.get(i) > maximumCompositeChildMatchingScore) {
+								maximumCompositeChildMatchingScore = compositeChildMatchingScores.get(i);
 							}
 						}
-						for(int i=0; i<replacementTypeCount.size(); i++) {
-							if(replacementTypeCount.get(i) > minimum && !extractInlineOverlappingRefactoring.get(i) == true) {
+						for(int i=0; i<compositeChildMatchingScores.size(); i++) {
+							if(compositeChildMatchingScores.get(i) < maximumCompositeChildMatchingScore) {
 								indicesToBeRemoved.add(i);
+							}
+						}
+						if(indicesToBeRemoved.isEmpty()) {
+							int minimum = replacementTypeCount.get(0);
+							for(int i=1; i<replacementTypeCount.size(); i++) {
+								if(replacementTypeCount.get(i) < minimum && replacementCoversEntireStatement.get(i) == false) {
+									minimum = replacementTypeCount.get(i);
+								}
+							}
+							for(int i=0; i<replacementTypeCount.size(); i++) {
+								if(replacementTypeCount.get(i) > minimum && !extractInlineOverlappingRefactoring.get(i) == true) {
+									indicesToBeRemoved.add(i);
+								}
 							}
 						}
 					}

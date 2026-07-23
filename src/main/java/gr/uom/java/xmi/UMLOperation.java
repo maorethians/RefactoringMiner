@@ -30,7 +30,7 @@ import java.util.Set;
 import org.refactoringminer.util.AstUtils;
 import org.refactoringminer.util.PathFileUtils;
 
-public class UMLOperation implements Comparable<UMLOperation>, Serializable, VariableDeclarationContainer, AnnotationProvider {
+public class UMLOperation implements Comparable<UMLOperation>, Serializable, VariableDeclarationContainer, AnnotationProvider, TypeParameterProvider {
 	private LocationInfo locationInfo;
 	private String name;
 	private Visibility visibility;
@@ -560,6 +560,16 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	public boolean equalReturnParameter(UMLOperation operation) {
 		UMLParameter thisReturnParameter = this.getReturnParameter();
 		UMLParameter otherReturnParameter = operation.getReturnParameter();
+		if(this.typeParameters.size() == operation.typeParameters.size() && this.typeParameters.size() > 0 && !this.typeParameters.equals(operation.typeParameters) && thisReturnParameter != null && otherReturnParameter != null) {
+			//check for consistent type parameter rename
+			Map<String, String> map = new LinkedHashMap<>();
+			for(int i=0; i<this.typeParameters.size(); i++) {
+				map.put(this.typeParameters.get(i).toString(), operation.typeParameters.get(i).toString());
+			}
+			if(map.containsKey(thisReturnParameter.getType().toString()) && map.get(thisReturnParameter.getType().toString()).equals(otherReturnParameter.getType().toString())) {
+				return true;
+			}
+		}
 		if(thisReturnParameter != null && otherReturnParameter != null)
 			return thisReturnParameter.equals(otherReturnParameter);
 		else if(thisReturnParameter == null && otherReturnParameter == null)
@@ -785,6 +795,12 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		for(UMLParameter parameter : parameters) {
 			if(parameter.getType().isParameterized()) {
 				params.add(parameter);
+			}
+			for(UMLTypeParameter typeParameter : this.typeParameters) {
+				if(typeParameter.toString().equals(parameter.getType().toString())) {
+					params.add(parameter);
+					break;
+				}
 			}
 		}
 		return params;
@@ -1184,7 +1200,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		for(int i=0; i<parameters.size(); i++) {
 			UMLParameter parameter = parameters.get(i);
 			if(parameter.getKind().equals("in")) {
-				if(LANG.equals(Constants.PYTHON))
+				if(LANG.equals(Constants.PYTHON) || PathFileUtils.isJavaScriptFile(locationInfo.getFilePath()))
 					sb.append(parameter.getName());
 				else
 					sb.append(parameter);
@@ -1285,7 +1301,28 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	public boolean equalParameterTypes(UMLOperation operation) {
-		return this.getParameterTypeList().equals(operation.getParameterTypeList()) && equalTypeParameters(operation);
+		List<UMLType> thisParameterTypeList = this.getParameterTypeList();
+		List<UMLType> otherParameterTypeList = operation.getParameterTypeList();
+		if(this.typeParameters.size() == operation.typeParameters.size() && this.typeParameters.size() > 0 && !this.typeParameters.equals(operation.typeParameters) &&
+				thisParameterTypeList.size() == otherParameterTypeList.size()) {
+			//check for consistent type parameter rename
+			Map<String, String> map = new LinkedHashMap<>();
+			for(int i=0; i<this.typeParameters.size(); i++) {
+				map.put(this.typeParameters.get(i).toString(), operation.typeParameters.get(i).toString());
+			}
+			int matches = 0;
+			for(int i=0; i<thisParameterTypeList.size(); i++) {
+				UMLType type1 = thisParameterTypeList.get(i);
+				UMLType type2 = otherParameterTypeList.get(i);
+				if(map.containsKey(type1.toString()) && map.get(type1.toString()).equals(type2.toString())) {
+					matches++;
+				}
+			}
+			if((matches > 0 && matches == thisParameterTypeList.size()) || thisParameterTypeList.size() == 0) {
+				return true;
+			}
+		}
+		return thisParameterTypeList.equals(otherParameterTypeList) && this.typeParameters.equals(operation.typeParameters);
 	}
 
 	private boolean typeParameterToTypeArgumentMatch(UMLOperation operation, Map<UMLTypeParameter, UMLType> typeParameterToTypeArgumentMap) {
@@ -1310,6 +1347,9 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	private boolean equalTypeParameters(UMLOperation operation) {
+		if(!this.typeParameters.equals(operation.typeParameters) && this.typeParameters.size() == operation.typeParameters.size()) {
+			return this.equalReturnParameter(operation) && this.equalParameterTypes(operation);
+		}
 		return this.typeParameters.equals(operation.typeParameters);
 	}
 
@@ -1502,4 +1542,28 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				a.getMemberValuePairs().containsKey("dataProvider");
 	}
 
+	public boolean commonNameTokensExceptForOne(UMLOperation other) {
+		String[] tokens1 = LeafType.CAMEL_CASE_SPLIT_PATTERN.split(this.getName());
+		String[] tokens2 = LeafType.CAMEL_CASE_SPLIT_PATTERN.split(other.getName());
+		if(tokens1.length > tokens2.length && tokens2.length > 1) {
+			int commonTokens = 0;
+			for(int i=0; i<tokens1.length; i++) {
+				String token1 = tokens1[i];
+				for(int j=0; j<tokens2.length; j++) {
+					String token2 = tokens2[j];
+					if(token1.toLowerCase().equals(token2.toLowerCase())) {
+						commonTokens++;
+						break;
+					}
+					else if(token1.endsWith("es") && !token2.endsWith("es") &&
+							token1.substring(0, token1.length()-2).toLowerCase().equals(token2.toLowerCase())) {
+						commonTokens++;
+						break;
+					}
+				}
+			}
+			return commonTokens > 0 && commonTokens + 1 >= Math.min(tokens1.length, tokens2.length);
+		}
+		return false;
+	}
 }
