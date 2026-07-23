@@ -279,11 +279,11 @@ public class TraversalEngine {
         }
         Node headMapping = optionalHeadMapping.get();
 
-        List<Node> mappingContexts = Context.get(graph, headMapping);
-        List<ComponentContexts> mappingDescendants =
-                !mappingContexts.isEmpty() ? componentsContexts.values().stream()
-                        .filter(componentContexts -> isDescendant(new Pair<>(mappingContexts, null),
-                                componentContexts)).toList() : new ArrayList<>();
+        List<Node> mappingContexts = new ArrayList<>();
+        mappingContexts.add(headMapping);
+        mappingContexts.addAll(Context.get(graph, headMapping));
+        List<ComponentContexts> mappingDescendants = componentsContexts.values().stream()
+                .filter(componentContexts -> isDescendant(new Pair<>(mappingContexts, null), componentContexts)).toList();
         if (mappingDescendants.size() > 1) {
             // merge the mapping first
             iteratedComponents.add(subject.component);
