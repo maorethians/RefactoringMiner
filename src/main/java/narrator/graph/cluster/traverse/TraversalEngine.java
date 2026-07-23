@@ -249,10 +249,9 @@ public class TraversalEngine {
             Set<TraversalPattern> iteratedComponents,
             Set<Pair<Set<Node>, TraversalPattern>> traversalComponentsTracker) {
         List<ComponentContexts> descendants = componentsContexts.values().stream()
-                .filter(componentContexts -> isDescendant(subject.contextsPair, componentContexts))
-                .toList();
+                .filter(componentContexts -> isDescendant(subject.contextsPair, componentContexts.contextsPair)).toList();
         List<ComponentContexts> mergeables = descendants.stream()
-                .filter(descendant -> isMergeable(subject, descendant)).toList();
+                .filter(descendant -> isMergeable(subject.contextsPair, descendant.contextsPair)).toList();
         if (descendants.size() > 1) {
             if (mergeables.size() < descendants.size()) {
                 iteratedComponents.add(subject.component);
@@ -283,7 +282,10 @@ public class TraversalEngine {
         mappingContexts.add(headMapping);
         mappingContexts.addAll(Context.get(graph, headMapping));
         List<ComponentContexts> mappingDescendants = componentsContexts.values().stream()
-                .filter(componentContexts -> isDescendant(new Pair<>(mappingContexts, null), componentContexts)).toList();
+                .filter(componentContexts -> isDescendant(new Pair<>(mappingContexts, null), componentContexts.contextsPair)).toList();
+        List<ComponentContexts> mappingMergeables = componentsContexts.values().stream()
+                .filter(componentContexts -> isMergeable(new Pair<>(mappingContexts, null), componentContexts.contextsPair)).toList();
+
         if (mappingDescendants.size() > 1) {
             // merge the mapping first
             iteratedComponents.add(subject.component);
@@ -295,8 +297,14 @@ public class TraversalEngine {
             return;
         }
 
+        if (mappingMergeables.isEmpty()) {
+            // pull the mapping up first
+            iteratedComponents.add(subject.component);
+            return;
+        }
+
         List<ComponentContexts> allDescendants = new ArrayList<>();
-        allDescendants.add(mergeables.get(0));
+        allDescendants.add(descendants.get(0));
         allDescendants.add(mappingDescendants.get(0));
 
         mergeByContext(allDescendants, componentsContexts, traversalComponentsTracker);
@@ -433,15 +441,15 @@ public class TraversalEngine {
     }
 
     private boolean isDescendant(Pair<List<Node>, List<Node>> subjectContextsPair,
-            ComponentContexts examinee) {
+            Pair<List<Node>, List<Node>> examineeContextsPair) {
         Set<Node> subjectHeads = getContextsHeads(subjectContextsPair);
 
-        List<Node> c1 = examinee.contextsPair.first;
+        List<Node> c1 = examineeContextsPair.first;
         if (c1.stream().anyMatch(subjectHeads::contains)) {
             return true;
         }
 
-        List<Node> c2 = examinee.contextsPair.second;
+        List<Node> c2 = examineeContextsPair.second;
         if (c2 == null) {
             return false;
         }
@@ -449,9 +457,10 @@ public class TraversalEngine {
         return c2.stream().anyMatch(subjectHeads::contains);
     }
 
-    private boolean isMergeable(ComponentContexts subject, ComponentContexts examinee) {
-        Set<Node> subjectHeads = getContextsHeads(subject.contextsPair);
-        Set<Node> examineeHeads = getContextsHeads(examinee.contextsPair);
+    private boolean isMergeable(Pair<List<Node>, List<Node>> subjectContextsPair,
+            Pair<List<Node>, List<Node>> examineeContextsPair) {
+        Set<Node> subjectHeads = getContextsHeads(subjectContextsPair);
+        Set<Node> examineeHeads = getContextsHeads(examineeContextsPair);
         return examineeHeads.stream().anyMatch(subjectHeads::contains);
     }
 
