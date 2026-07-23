@@ -253,7 +253,8 @@ public class TraversalEngine {
         List<ComponentContexts> mergeables = descendants.stream()
                 .filter(descendant -> isMergeable(subject.contextsPair, descendant.contextsPair)).toList();
         if (descendants.size() > 1) {
-            if (mergeables.size() < descendants.size()) {
+            if (mergeables.size() < descendants.size() ||
+                    (subject.contextsPair.second == null && descendants.stream().anyMatch(descendant -> descendant.contextsPair.second != null))) {
                 iteratedComponents.add(subject.component);
             } else {
                 mergeByContext(mergeables, componentsContexts, traversalComponentsTracker);
