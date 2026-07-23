@@ -385,8 +385,7 @@ public class TraversalEngine {
         if (nextContextsPair.first == null) {
             componentsContexts.remove(subject.component);
         } else {
-            componentsContexts.put(subject.component,
-                    new ComponentContexts(subject.component, nextContextsPair));
+            componentsContexts.get(subject.component).contextsPair = nextContextsPair;
         }
     }
 
