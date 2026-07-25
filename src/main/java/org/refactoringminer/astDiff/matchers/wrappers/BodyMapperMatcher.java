@@ -385,6 +385,34 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 if (matched != null) {
                     mappingStore.addMappingRecursively(matched.first,matched.second);
                 }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.TYPE_QUALIFIER, LANG2.TYPE_QUALIFIER);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.QUALIFIED_IDENTIFIER, LANG2.QUALIFIED_IDENTIFIER);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.REFERENCE_DECLARATOR, LANG2.REFERENCE_DECLARATOR);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.BINARY_EXPRESSION, LANG2.BINARY_EXPRESSION);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.SUBSCRIPT_EXPRESSION, LANG2.SUBSCRIPT_EXPRESSION);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.METHOD_INVOCATION, LANG2.METHOD_INVOCATION);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.FIELD_EXPRESSION, LANG2.FIELD_EXPRESSION);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
                 matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.SIMPLE_NAME, LANG2.SIMPLE_NAME);
                 if (matched != null) {
                     mappingStore.addMappingRecursively(matched.first,matched.second);
@@ -729,6 +757,14 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         types = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.PRIMITIVE_TYPE, LANG2.PRIMITIVE_TYPE);
                         if (types != null) {
                             mappingStore.addMappingRecursively(types.first,types.second);
+                        }
+                        Pair<Tree, Tree> reference_declarators = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.REFERENCE_DECLARATOR, LANG2.REFERENCE_DECLARATOR);
+                        if (reference_declarators != null) {
+                            mappingStore.addMappingRecursively(reference_declarators.first,reference_declarators.second);
+                        }
+                        Pair<Tree, Tree> qualified_identifiers = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.QUALIFIED_IDENTIFIER, LANG2.QUALIFIED_IDENTIFIER);
+                        if (qualified_identifiers != null) {
+                            mappingStore.addMappingRecursively(qualified_identifiers.first,qualified_identifiers.second);
                         }
                     }
                 }
