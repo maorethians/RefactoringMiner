@@ -1,6 +1,6 @@
 package narrator.langchain;
 
-import narrator.graph.cluster.traverse.GrainLevel;
+import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 
 public class NarrativeRequest {
     private final String url;

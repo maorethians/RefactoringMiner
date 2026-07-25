@@ -1,7 +1,7 @@
 package narrator.langchain;
 
-import narrator.graph.cluster.traverse.GrainLevel;
 import narrator.service.NarrativeService;
+import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 
 public class NarrativeRunner {
     private static final GrainLevel DEFAULT_LEVEL = GrainLevel.SINGLE;

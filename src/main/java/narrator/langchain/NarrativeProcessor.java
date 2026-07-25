@@ -1,9 +1,7 @@
 package narrator.langchain;
 
-import narrator.graph.cluster.traverse.GrainLevel;
 import narrator.service.NarrativeService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 
 import java.util.ArrayList;
 import java.util.List;

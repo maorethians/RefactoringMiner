@@ -3,11 +3,9 @@ package narrator.service;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.List;
-import narrator.graph.cluster.Cluster;
-import narrator.graph.cluster.traverse.Leaf;
-import narrator.graph.cluster.traverse.TraversalPattern;
-import narrator.graph.cluster.traverse.Narrator;
 import narrator.mcp.html.NarrativeHtmlGenerator;
+import org.refactoringminer.astDiff.graph.cluster.Cluster;
+import org.refactoringminer.astDiff.graph.cluster.traverse.TraversalPattern;
 
 public class CacheManager {
     private final Map<String, List<Cluster>> clustersCache = new ConcurrentHashMap<>();

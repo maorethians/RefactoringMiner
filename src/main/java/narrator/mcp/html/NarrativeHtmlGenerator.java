@@ -1,10 +1,9 @@
 package narrator.mcp.html;
 
-import narrator.graph.Node;
-import narrator.graph.cluster.Cluster;
-import narrator.graph.cluster.traverse.GrainLevel;
-import narrator.graph.cluster.traverse.Narrator;
-import narrator.graph.cluster.traverse.TraversalPattern;
+import org.refactoringminer.astDiff.graph.cluster.Cluster;
+import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
+import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
+
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;

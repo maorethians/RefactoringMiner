@@ -7,14 +7,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import narrator.graph.Edge;
-import narrator.graph.EdgeType;
-import narrator.graph.Node;
-import narrator.graph.NodeType;
-import narrator.graph.cluster.traverse.TraversalComponent;
-import narrator.graph.cluster.traverse.TraversalPattern;
-import narrator.graph.cluster.traverse.UsagePattern;
 import org.jgrapht.Graph;
+import org.refactoringminer.astDiff.graph.Edge;
+import org.refactoringminer.astDiff.graph.EdgeType;
+import org.refactoringminer.astDiff.graph.Node;
+import org.refactoringminer.astDiff.graph.NodeType;
+import org.refactoringminer.astDiff.graph.cluster.traverse.TraversalComponent;
+import org.refactoringminer.astDiff.graph.cluster.traverse.TraversalPattern;
+import org.refactoringminer.astDiff.graph.cluster.traverse.UsagePattern;
 
 public class Stringifier {
 
@@ -50,7 +50,7 @@ public class Stringifier {
     }
 
     private static void stringifyComponentGraph(TraversalPattern traversalComponent,
-            String aggregatorId, Map<String,
+                                                String aggregatorId, Map<String,
                     PreprocessedNode> preprocessedNodes, JsonArray edges) {
         Map<Node, TraversalPattern> requirements = new HashMap<>();
         if (traversalComponent instanceof UsagePattern) {
@@ -189,6 +189,8 @@ public class Stringifier {
         JsonObject graphObj = new JsonObject();
         graphObj.add("nodes", nodesArray);
         graphObj.add("edges", edgesArray);
+        System.out.println(nodesArray.size());
+        System.out.println(edgesArray.size());
 
         return graphObj;
     }

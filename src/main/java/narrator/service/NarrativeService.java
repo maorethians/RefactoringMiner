@@ -1,13 +1,13 @@
 package narrator.service;
 
 import narrator.Driver;
-import narrator.graph.Edge;
-import narrator.graph.Node;
-import narrator.graph.cluster.Cluster;
-import narrator.graph.cluster.Clusterer;
-import narrator.graph.cluster.traverse.*;
 import narrator.mcp.html.NarrativeHtmlGenerator;
 import org.jgrapht.Graph;
+import org.refactoringminer.astDiff.graph.Edge;
+import org.refactoringminer.astDiff.graph.Node;
+import org.refactoringminer.astDiff.graph.cluster.Cluster;
+import org.refactoringminer.astDiff.graph.cluster.Clusterer;
+import org.refactoringminer.astDiff.graph.cluster.traverse.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
