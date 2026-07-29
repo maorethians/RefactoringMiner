@@ -701,6 +701,13 @@ public class MethodMatcher extends BodyMapperMatcher{
         if(srcOperationNode.getType().name.equals(LANG1.FUNCTION_DECLARATOR) && dstOperationNode.getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
             processFunctionDeclarators(srcOperationNode, dstOperationNode, mappingStore);
         }
+        if(srcOperationNode.getType().name.equals(LANG1.FRIEND_DECLARATION) && dstOperationNode.getType().name.equals(LANG2.FRIEND_DECLARATION)) {
+            com.github.gumtreediff.utils.Pair<Tree,Tree> definitions = Helpers.findPairOfType(srcOperationNode,dstOperationNode,LANG1.METHOD_DECLARATION,LANG2.METHOD_DECLARATION);
+            if(definitions != null) {
+                mappingStore.addMapping(definitions.first, definitions.second);
+                processMethodSignature(definitions.first, definitions.second, umlOperationBodyMapper, mappingStore);
+            }
+        }
         matched = Helpers.findPairOfType(srcOperationNode,dstOperationNode,LANG1.CLASS_BLOCK,LANG2.CLASS_BLOCK);
         if (matched != null) {
             mappingStore.addMapping(matched.first,matched.second);
@@ -901,6 +908,10 @@ public class MethodMatcher extends BodyMapperMatcher{
         if (identifiers != null) {
             mappingStore.addMappingRecursively(identifiers.first,identifiers.second);
         }
+        identifiers = Helpers.findPairOfType(functionDeclarator1,functionDeclarator2,LANG1.OPERATOR_NAME,LANG2.OPERATOR_NAME);
+        if (identifiers != null) {
+            mappingStore.addMappingRecursively(identifiers.first,identifiers.second);
+        }
         com.github.gumtreediff.utils.Pair<Tree,Tree> qualified_identifiers = Helpers.findPairOfType(functionDeclarator1,functionDeclarator2,LANG1.QUALIFIED_IDENTIFIER,LANG2.QUALIFIED_IDENTIFIER);
         if (qualified_identifiers != null) {
             mappingStore.addMappingRecursively(qualified_identifiers.first,qualified_identifiers.second);
@@ -944,6 +955,10 @@ public class MethodMatcher extends BodyMapperMatcher{
                     mappingStore.addMapping(closing.first,closing.second);
                 }
             }
+            com.github.gumtreediff.utils.Pair<Tree, Tree> explicitSpecifiers = Helpers.findPairOfType(parent1,parent2,LANG1.EXPLICIT_FUNCTION_SPECIFIER,LANG2.EXPLICIT_FUNCTION_SPECIFIER);
+            if (explicitSpecifiers != null) {
+                mappingStore.addMappingRecursively(explicitSpecifiers.first,explicitSpecifiers.second);
+            }
         }
         if(parent1.getType().name.equals(LANG1.DECLARATION) && parent2.getType().name.equals(LANG2.DECLARATION)) {
             mappingStore.addMapping(parent1,parent2);
@@ -956,6 +971,10 @@ public class MethodMatcher extends BodyMapperMatcher{
             if (primitives != null) {
                 mappingStore.addMapping(primitives.first,primitives.second);
             }
+            com.github.gumtreediff.utils.Pair<Tree, Tree> explicitSpecifiers = Helpers.findPairOfType(parent1,parent2,LANG1.EXPLICIT_FUNCTION_SPECIFIER,LANG2.EXPLICIT_FUNCTION_SPECIFIER);
+            if (explicitSpecifiers != null) {
+                mappingStore.addMappingRecursively(explicitSpecifiers.first,explicitSpecifiers.second);
+            }
         }
         else if(parent1.getType().name.equals(LANG1.FIELD_DECLARATION) && parent2.getType().name.equals(LANG2.FIELD_DECLARATION)) {
             mappingStore.addMapping(parent1,parent2);
@@ -967,6 +986,10 @@ public class MethodMatcher extends BodyMapperMatcher{
             com.github.gumtreediff.utils.Pair<Tree, Tree> primitives = Helpers.findPairOfType(parent1,parent2,LANG1.PRIMITIVE_TYPE,LANG2.PRIMITIVE_TYPE);
             if (primitives != null) {
                 mappingStore.addMapping(primitives.first,primitives.second);
+            }
+            com.github.gumtreediff.utils.Pair<Tree, Tree> explicitSpecifiers = Helpers.findPairOfType(parent1,parent2,LANG1.EXPLICIT_FUNCTION_SPECIFIER,LANG2.EXPLICIT_FUNCTION_SPECIFIER);
+            if (explicitSpecifiers != null) {
+                mappingStore.addMappingRecursively(explicitSpecifiers.first,explicitSpecifiers.second);
             }
         }
     }
