@@ -71,6 +71,7 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 	private Optional<UMLTypeAliasListDiff> typeAliasListDiff;
 	private Optional<UMLNamedExportListDiff> namedExportListDiff;
 	private Optional<UMLPreprocessorStatementListDiff> preprocessorStatementListDiff;
+	private Optional<UMLForwardDeclarationListDiff> forwardDeclarationListDiff;
 	private UMLCommentListDiff packageDeclarationCommentListDiff;
 
 	public UMLClassBaseDiff(UMLClass originalClass, UMLClass nextClass, UMLModelDiff modelDiff) {
@@ -99,6 +100,7 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 			this.packageDeclarationJavadocDiff = Optional.empty();
 		}
 		this.preprocessorStatementListDiff = Optional.empty();
+		this.forwardDeclarationListDiff = Optional.empty();
 		processImports();
 	}
 
@@ -236,6 +238,10 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 		if(getOriginalClass().getPreprocessorStatements().size() > 0 && getNextClass().getPreprocessorStatements().size() > 0) {
 			UMLPreprocessorStatementListDiff diff = new UMLPreprocessorStatementListDiff(getOriginalClass().getPreprocessorStatements(), getNextClass().getPreprocessorStatements());
 			this.preprocessorStatementListDiff = Optional.of(diff);
+		}
+		if(getOriginalClass().getForwardDeclarations().size() > 0 && getNextClass().getForwardDeclarations().size() > 0) {
+			UMLForwardDeclarationListDiff diff = new UMLForwardDeclarationListDiff(getOriginalClass().getForwardDeclarations(), getNextClass().getForwardDeclarations());
+			this.forwardDeclarationListDiff = Optional.of(diff);
 		}
 	}
 
@@ -1273,8 +1279,25 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 		return commonFunctionType;
 	}
 
+	public Optional<UMLForwardDeclarationListDiff> getForwardDeclarationListDiff() {
+		return forwardDeclarationListDiff;
+	}
+
 	public Optional<UMLPreprocessorStatementListDiff> getPreprocessorStatementListDiff() {
 		return preprocessorStatementListDiff;
+	}
+
+	public boolean hasBothAddedAndRemovedPreprocessorStatements() {
+		if(preprocessorStatementListDiff.isPresent()) {
+			return preprocessorStatementListDiff.get().getAddedStatements().size() > 0 && preprocessorStatementListDiff.get().getRemovedStatements().size() > 0;
+		}
+		return false;
+	}
+
+	public void findPreprocessorStatementChanges(String nameBefore, String nameAfter) {
+		if(preprocessorStatementListDiff.isPresent()) {
+			preprocessorStatementListDiff.get().findPreprocessorStatementChanges(nameBefore, nameAfter);
+		}
 	}
 
 	public boolean containsOperationWithTheSameSignatureInOriginalClass(UMLOperation operation) {

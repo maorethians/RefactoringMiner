@@ -1,9 +1,8 @@
 package org.refactoringminer.astDiff.graph.cluster.traverse;
 
-import org.refactoringminer.astDiff.graph.Edge;
+import com.github.gumtreediff.tree.Tree;
 import org.refactoringminer.astDiff.graph.Node;
 import org.refactoringminer.astDiff.graph.NodeType;
-import org.jgrapht.Graph;
 import org.refactoringminer.astDiff.utils.Constants;
 
 import java.util.*;
@@ -11,20 +10,11 @@ import java.util.function.Predicate;
 
 public class Narrator {
     public static final int THRESHOLD = 1000;
-    private static final Map<GrainLevel, Set<String>> GRAIN_LEVEL_TYPES = new HashMap<>();
-
-    static {
-        Constants c = new Constants("");
-        GRAIN_LEVEL_TYPES.put(GrainLevel.METHOD, Set.of(c.METHOD_DECLARATION));
-        GRAIN_LEVEL_TYPES.put(GrainLevel.CLASS, Set.of(c.TYPE_DECLARATION, c.INTERFACE_DECLARATION, c.CLASS_DECLARATION, c.ENUM_DECLARATION, c.RECORD_DECLARATION, c.ANNOTATION_TYPE_DECLARATION));
-        GRAIN_LEVEL_TYPES.put(GrainLevel.FILE, Set.of(c.COMPILATION_UNIT, c.PROGRAM, c.MODULE, c.SOURCE_FILE, c.TRANSLATION_UNIT));
-    }
 
     private final TraversalPattern rootPattern;
     private final Map<GrainLevel, List<TraversalPattern>> cache = new HashMap<>();
     private final Map<GrainLevel, List<String>> flatCache = new HashMap<>();
     private final Map<GrainLevel, Integer> progressMap = new HashMap<>();
-
 
     public Narrator(TraversalPattern rootPattern) {
         this.rootPattern = rootPattern;
@@ -43,23 +33,19 @@ public class Narrator {
         Set<TraversalPattern> visited = new HashSet<>();
 
         switch (grainLevel) {
-            case SINGLE -> traverse(rootPattern, visited, result, pp -> pp.clusterGraph != null, pp -> pp instanceof Leaf);
+            case SINGLE ->
+                    traverse(rootPattern, visited, result, pp -> pp.clusterGraph != null, pp -> pp instanceof Leaf);
             case LEAF -> traverse(rootPattern, visited, result, pp -> false, pp -> pp instanceof Leaf);
             case USAGE_CHAIN_ROOT -> {
                 Set<UsagePattern> roots = findUsageRoots(rootPattern);
-                traverse(rootPattern, visited, result,
-                        pp -> pp instanceof UsagePattern u && roots.contains(u),
-                        pp -> pp instanceof Leaf && (!(pp instanceof UsagePattern) || roots.contains((UsagePattern) pp)));
+                traverse(rootPattern, visited, result, pp -> pp instanceof UsagePattern u && roots.contains(u), pp -> pp instanceof Leaf && (!(pp instanceof UsagePattern) || roots.contains((UsagePattern) pp)));
             }
-            case SEMANTIC_LEAF -> traverse(rootPattern, visited, result,
-                    pp -> pp instanceof TraversalComponent tc && isSemanticLeaf(tc),
-                    pp -> pp instanceof Leaf);
-            case SEMANTIC_ROOT -> traverse(rootPattern, visited, result,
-                    pp -> pp instanceof TraversalComponent tc && isSemanticRoot(tc),
-                    pp -> pp instanceof Leaf);
-            case METHOD, CLASS, FILE -> traverse(rootPattern, visited, result,
-                    pp -> pp instanceof TraversalComponent tc && matchesGrain(tc, grainLevel),
-                    pp -> pp instanceof Leaf);
+            case SEMANTIC_LEAF ->
+                    traverse(rootPattern, visited, result, pp -> pp instanceof TraversalComponent tc && isSemanticLeaf(tc), pp -> pp instanceof Leaf);
+            case SEMANTIC_ROOT ->
+                    traverse(rootPattern, visited, result, pp -> pp instanceof TraversalComponent tc && isSemanticRoot(tc), pp -> pp instanceof Leaf);
+            case METHOD, CLASS, FILE ->
+                    traverse(rootPattern, visited, result, pp -> pp instanceof TraversalComponent tc && matchesGrain(tc, grainLevel), pp -> pp instanceof Leaf);
         }
 
         return sortPatterns(result);
@@ -99,7 +85,7 @@ public class Narrator {
         return false;
     }
 
-    public static boolean isSemanticLeaf(TraversalComponent tc) {
+    private static boolean isSemanticLeaf(TraversalComponent tc) {
         if (tc.getMergeContexts() == null || tc.getMergeContexts().isEmpty()) return false;
 
         boolean hasSemanticContext = false;
@@ -119,7 +105,7 @@ public class Narrator {
         return true;
     }
 
-    public static boolean isSemanticRoot(TraversalComponent tc) {
+    private static boolean isSemanticRoot(TraversalComponent tc) {
         if (tc.getMergeContexts() == null || tc.getMergeContexts().isEmpty()) return false;
 
         for (Node node : tc.getMergeContexts()) {
@@ -131,21 +117,38 @@ public class Narrator {
         return true;
     }
 
-    public static boolean matchesGrain(TraversalComponent tc, GrainLevel grainLevel) {
-        Set<String> allowedTypes = GRAIN_LEVEL_TYPES.get(grainLevel);
-        if (allowedTypes == null || tc.getMergeContexts() == null) return false;
+    private static boolean matchesGrain(TraversalComponent tc, GrainLevel grainLevel) {
+        if (tc.getMergeContexts() == null) {
+            return false;
+        }
 
         for (Node contextNode : tc.getMergeContexts()) {
-            var tree = contextNode.getTree();
-            if (allowedTypes.contains(tree.getType().name)) return true;
-            for (var parent : tree.getParents()) {
-                if (allowedTypes.contains(parent.getType().name)) return true;
+            Constants constants = new Constants(contextNode.getPath());
+            Tree tree = contextNode.getTree();
+
+            if (matchesGrain(tree.getType().name, constants, grainLevel)) {
+                return true;
+            }
+            for (Tree parent : tree.getParents()) {
+                if (matchesGrain(parent.getType().name, constants, grainLevel)) {
+                    return true;
+                }
             }
         }
+
         return false;
     }
 
-    public static void traverse(TraversalPattern p, Set<TraversalPattern> visited, List<TraversalPattern> result, Predicate<TraversalPattern> stopPredicate, Predicate<TraversalPattern> leafPredicate) {
+    private static boolean matchesGrain(String treeType, Constants constants, GrainLevel grainLevel) {
+        return switch (grainLevel) {
+            case METHOD -> constants.isMethod(treeType);
+            case CLASS -> constants.isType(treeType);
+            case FILE -> constants.isRoot(treeType);
+            default -> false;
+        };
+    }
+
+    private static void traverse(TraversalPattern p, Set<TraversalPattern> visited, List<TraversalPattern> result, Predicate<TraversalPattern> stopPredicate, Predicate<TraversalPattern> leafPredicate) {
         if (visited.contains(p)) return;
         visited.add(p);
 
@@ -201,7 +204,6 @@ public class Narrator {
         }
     }
 
-
     public List<String> getFlatChapters(GrainLevel level) {
         if (flatCache.containsKey(level)) {
             return flatCache.get(level);
@@ -214,16 +216,11 @@ public class Narrator {
         List<ChapterUnit> units = new ArrayList<>();
         for (int i = 0; i < chapters.size(); i++) {
             TraversalPattern chapter = chapters.get(i);
-            Graph<Node, Edge> clusterGraph = chapter.getClusterGraph();
-            if (clusterGraph == null) {
-                units.add(new ChapterUnit(String.format("[Chapter %d of %d]: Error: Could not find associated cluster graph.\n\n", i + 1, chapters.size()), 0, i + 1));
-                continue;
-            }
 
             List<TraversalPattern> filterPatterns = i > 0 ? chapters.subList(0, i) : Collections.emptyList();
 
             if (chapter instanceof AggregatorPattern agg) {
-                List<NarrativeElement> elements = agg.getElements(clusterGraph, filterPatterns);
+                List<NarrativeElement> elements = agg.getElements(filterPatterns);
                 int totalLines = elements.stream().mapToInt(NarrativeElement::lineCount).sum();
 
                 if (totalLines > THRESHOLD) {
@@ -233,11 +230,11 @@ public class Narrator {
                         units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
                     }
                 } else {
-                    String content = agg.extended(clusterGraph, level, filterPatterns);
+                    String content = agg.extended(filterPatterns);
                     units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
                 }
             } else {
-                String content = chapter.extended(clusterGraph, level, filterPatterns);
+                String content = chapter.extended(filterPatterns);
                 units.add(new ChapterUnit(content, content.split("\n").length, i + 1));
             }
         }
@@ -317,7 +314,7 @@ public class Narrator {
         progressMap.put(grainLevel, getProgress(grainLevel) + 1);
     }
 
-    public List<TraversalPattern> sortPatterns(List<TraversalPattern> patterns) {
+    private List<TraversalPattern> sortPatterns(List<TraversalPattern> patterns) {
         int n = patterns.size();
         if (n == 0) return Collections.emptyList();
 

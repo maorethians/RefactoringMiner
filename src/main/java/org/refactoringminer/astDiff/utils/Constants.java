@@ -66,6 +66,7 @@ public class Constants {
 			THROW_STATEMENT = "raise_statement";
 			EMPTY_STATEMENT = "empty_statement";
 			PRIMITIVE_TYPE = "primitive_type";
+			CONDITIONAL_EXPRESSION = "conditional_expression";
 		}
 		else if(PathFileUtils.isKotlinFile(filePath)) {
 			CLASS_BLOCK = "type_body";
@@ -105,6 +106,7 @@ public class Constants {
 			THROW_STATEMENT = "throw_expression";
 			EMPTY_STATEMENT = "empty_statement";
 			PRIMITIVE_TYPE = "primitive_type";
+			CONDITIONAL_EXPRESSION = "conditional_expression";
 		}
 		else if(PathFileUtils.isTypeScriptFile(filePath)) {
 			CLASS_BLOCK = "block";
@@ -144,6 +146,7 @@ public class Constants {
 			THROW_STATEMENT = "throw_statement";
 			EMPTY_STATEMENT = "empty_statement";
 			PRIMITIVE_TYPE = "primitive_type";
+			CONDITIONAL_EXPRESSION = "conditional_expression";
 		}
 		else if(PathFileUtils.isCppFile(filePath)) {
 			CLASS_BLOCK = "field_declaration_list";
@@ -183,6 +186,7 @@ public class Constants {
 			THROW_STATEMENT = "throw_statement";
 			EMPTY_STATEMENT = "EmptyStatement";
 			PRIMITIVE_TYPE = "primitive_type";
+			CONDITIONAL_EXPRESSION = "conditional_expression";
 		}
 		else {
 			// Java values as default
@@ -223,6 +227,7 @@ public class Constants {
 			THROW_STATEMENT = "ThrowStatement";
 			EMPTY_STATEMENT = "EmptyStatement";
 			PRIMITIVE_TYPE = "PrimitiveType";
+			CONDITIONAL_EXPRESSION = "ConditionalExpression";
 		}
 	}
 
@@ -306,7 +311,7 @@ public class Constants {
     public final String SYNCHRONIZED_STATEMENT = "SynchronizedStatement";
     public final String THROW_STATEMENT;
     public final String WHILE_STATEMENT;
-    public final String CONDITIONAL_EXPRESSION = "ConditionalExpression";
+    public final String CONDITIONAL_EXPRESSION;
     public final String CAST_EXPRESSION = "CastExpression";
 
     public final String INFIX_EXPRESSION = "InfixExpression";
@@ -577,7 +582,10 @@ public class Constants {
     public final String STRUCTURED_BINDING_DECLARATOR = "structured_binding_declarator";
     public final String FOR_RANGE_LOOP = "for_range_loop";
     public final String STRUCT_SPECIFIER = "struct_specifier";
+    public final String UNION_SPECIFIER = "union_specifier";
     public final String STRUCT_KEYWORD = "struct";
+    public final String UNION_KEYWORD = "union";
+    public final String FRIEND_KEYWORD = "friend";
     public final String POINTER = "*";
     public final String ACCESS_SPECIFIER = "access_specifier";
     public final String TEMPLATE_DECLARATION = "template_declaration";
@@ -594,4 +602,8 @@ public class Constants {
     public final String FIELD_EXPRESSION = "field_expression";
     public final String SUBSCRIPT_EXPRESSION = "subscript_expression";
     public final String ENUMERATOR = "enumerator";
+    public final String ELLIPSIS = "...";
+    public final String STORAGE_CLASS_SPECIFIER = "storage_class_specifier";
+    public final String DEFAULT_METHOD_CLAUSE = "default_method_clause";
+    public final String DELETE_METHOD_CLAUSE = "delete_method_clause";
 }
