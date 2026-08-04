@@ -5854,7 +5854,8 @@ public class UMLModelDiff {
 		return false;
 	}
 
-	private boolean includesReplacementInvolvingAddedMethod(Set<Replacement> replacements, UMLOperation addedOperation, VariableDeclarationContainer caller, UMLAbstractClassDiff classDiff) {
+	private boolean includesReplacementInvolvingAddedMethod(UMLOperationBodyMapper mapper, UMLOperation addedOperation, VariableDeclarationContainer caller, UMLAbstractClassDiff classDiff) {
+		Set<Replacement> replacements = mapper.getReplacementsInvolvingMethodInvocation();
 		for(Replacement replacement : replacements) {
 			if(replacement instanceof ClassInstanceCreationWithMethodInvocationReplacement) {
 				ClassInstanceCreationWithMethodInvocationReplacement r = (ClassInstanceCreationWithMethodInvocationReplacement)replacement;
@@ -5895,6 +5896,16 @@ public class UMLModelDiff {
 			else if(replacement.getAfter().equals(addedOperation.getNonQualifiedClassName()) ||
 					replacement.getAfter().startsWith(addedOperation.getNonQualifiedClassName() + ".")) {
 				return true;
+			}
+		}
+		for(AbstractCodeMapping mapping : mapper.getMappings()) {
+			if(!mapping.isExact()) {
+				List<AbstractCall> calls = mapping.getFragment2().getMethodInvocations();
+				for(AbstractCall call : calls) {
+					if(call.matchesOperation(addedOperation, caller, classDiff, this)) {
+						return true;
+					}
+				}
 			}
 		}
 		return false;
@@ -5996,7 +6007,7 @@ public class UMLModelDiff {
 				for(UMLOperationBodyMapper mapper : mappers) {
 					Pair<VariableDeclarationContainer, VariableDeclarationContainer> pair = Pair.of(mapper.getContainer1(), addedOperation);
 					String className = mapper.getContainer2().getClassName();
-					if(!className.equals(addedOperation.getClassName()) && (mapper.nonMappedElementsT1() > 0 || includesReplacementInvolvingAddedMethod(mapper.getReplacementsInvolvingMethodInvocation(), addedOperation, mapper.getContainer2(), mapper.getClassDiff())) && !mapper.containsExtractOperationRefactoring(addedOperation) && !processedOperationPairs.contains(pair)) {
+					if(!className.equals(addedOperation.getClassName()) && (mapper.nonMappedElementsT1() > 0 || includesReplacementInvolvingAddedMethod(mapper, addedOperation, mapper.getContainer2(), mapper.getClassDiff())) && !mapper.containsExtractOperationRefactoring(addedOperation) && !processedOperationPairs.contains(pair)) {
 						Constants LANG1 = mapper.LANG1;
 						processedOperationPairs.add(pair);
 						Map<String, Set<VariableDeclaration>> variableDeclarationMap = mapper.getContainer2().variableDeclarationMap();
@@ -6153,7 +6164,7 @@ public class UMLModelDiff {
 					if(skip) {
 						continue;
 					}
-					if(!className.equals(addedOperation.getClassName()) && (mapper.nonMappedElementsT1() > 0 || includesReplacementInvolvingAddedMethod(mapper.getReplacementsInvolvingMethodInvocation(), addedOperation, mapper.getContainer2(), mapper.getClassDiff())) && !mapper.containsExtractOperationRefactoring(addedOperation) && !processedOperationPairs.contains(pair)) {
+					if(!className.equals(addedOperation.getClassName()) && (mapper.nonMappedElementsT1() > 0 || includesReplacementInvolvingAddedMethod(mapper, addedOperation, mapper.getContainer2(), mapper.getClassDiff())) && !mapper.containsExtractOperationRefactoring(addedOperation) && !processedOperationPairs.contains(pair)) {
 						processedOperationPairs.add(pair);
 						List<AbstractCall> operationInvocations = mapper.getInvocationsInSourceOperationAfterExtraction();
 						List<AbstractCall> addedOperationInvocations = new ArrayList<AbstractCall>();
@@ -6546,6 +6557,12 @@ public class UMLModelDiff {
 
 	private boolean conflictingExpression(AbstractCall invocation, UMLOperation addedOperation, Map<String, Set<VariableDeclaration>> variableDeclarationMap, Map<String, VariableDeclaration> childFieldDeclarationMap) {
 		String expression = invocation.getExpression();
+		if(expression != null && expression.startsWith(invocation.getLANG().THIS_DOT)) {
+			expression = expression.substring(invocation.getLANG().THIS_DOT.length());
+		}
+		if(expression != null && expression.startsWith("((") && expression.contains(")")) {
+			expression = expression.substring(2, expression.indexOf(")"));
+		}
 		if(expression != null && variableDeclarationMap.containsKey(expression)) {
 			Set<VariableDeclaration> variableDeclarations = variableDeclarationMap.get(expression);
 			UMLClassBaseDiff classDiff = getUMLClassDiff(addedOperation.getClassName());

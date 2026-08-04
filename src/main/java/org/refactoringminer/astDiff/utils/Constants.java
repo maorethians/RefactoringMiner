@@ -26,7 +26,7 @@ public class Constants {
 				treeType.equals(LEXICAL_DECLARATION) || treeType.equals(METHOD_DEFINITION) || treeType.equals(METHOD_SIGNATURE) ||
 				treeType.equals(FUNCTION_SIGNATURE) || treeType.equals(GENERATOR_FUNCTION_DECLARATION) || treeType.equals(PAIR) ||
 				treeType.equals(FUNCTION_EXPRESSION) || treeType.equals(VARIABLE_DECLARATION) || treeType.equals(FUNCTION_DECLARATOR) ||
-				treeType.equals(REFERENCE_DECLARATOR) || treeType.equals(FRIEND_DECLARATION);
+				treeType.equals(REFERENCE_DECLARATOR) || treeType.equals(POINTER_DECLARATOR) || treeType.equals(FRIEND_DECLARATION);
 	}
 
 	public Constants(String filePath) {
@@ -394,6 +394,7 @@ public class Constants {
     public final String TYPE = "type";
     public final String WITH_STATEMENT = "with_statement";
     public final String TYPED_DEFAULT_PARAMETER = "typed_default_parameter";
+    public final String TUPLE_PATTERN = "tuple_pattern";
     
     //Kotlin Specific
     public final String FUNCTION_BODY = "function_body";
@@ -594,6 +595,7 @@ public class Constants {
     public final String FIELD_INITIALIZER_LIST = "field_initializer_list";
     public final String FIELD_INITIALIZER = "field_initializer";
     public final String REFERENCE_DECLARATOR = "reference_declarator";
+    public final String ABSTRACT_REFERENCE_DECLARATOR = "abstract_reference_declarator";
     public final String REFERENCE = "&";
     public final String TEMPLATE_KEYWORD = "template";
     public final String TEMPLATE_PARAMETER_LIST = "template_parameter_list";
@@ -612,4 +614,5 @@ public class Constants {
     public final String FRIEND_DECLARATION = "friend_declaration";
     public final String TRAILING_RETURN_TYPE = "trailing_return_type";
     public final String TEMPLATE_TYPE = "template_type";
+    public final String TEMPLATE_FUNCTION = "template_function";
 }

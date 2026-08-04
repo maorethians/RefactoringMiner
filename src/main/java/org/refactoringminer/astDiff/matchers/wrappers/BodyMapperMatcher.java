@@ -223,6 +223,17 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         mappingStore.addMapping(elifs.first,elifs.second);
                     }
                 }
+                List<Tree> elseIfs1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.ELSE_IF);
+                List<Tree> elseIfs2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.ELSE_IF);
+                if(elseIfs1.size() == elseIfs2.size()) {
+                    for(int i=0; i<elseIfs1.size(); i++) {
+                        mappingStore.addMapping(elseIfs1.get(i), elseIfs2.get(i));
+                        Pair<Tree, Tree> elifs = Helpers.findPairOfType(elseIfs1.get(i), elseIfs2.get(i), LANG1.ELIF_KEYWORD, LANG2.ELIF_KEYWORD);
+                        if (elifs != null) {
+                            mappingStore.addMapping(elifs.first,elifs.second);
+                        }
+                    }
+                }
                 matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.ELSE, LANG2.ELSE);
                 if (matched != null) {
                     mappingStore.addMapping(matched.first,matched.second);
@@ -316,6 +327,10 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.VARIABLE_DECLARATION, LANG2.VARIABLE_DECLARATION);
                 if (matched != null) {
                     mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
+                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.TUPLE_PATTERN, LANG2.TUPLE_PATTERN);
+                if (matched != null) {
+                    mappingStore.addMapping(matched.first,matched.second);
                 }
                 matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.PATTERN_LIST, LANG2.PATTERN_LIST);
                 if (matched != null) {
@@ -774,9 +789,17 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         if (reference_declarators != null) {
                             mappingStore.addMappingRecursively(reference_declarators.first,reference_declarators.second);
                         }
+                        reference_declarators = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.ABSTRACT_REFERENCE_DECLARATOR, LANG2.ABSTRACT_REFERENCE_DECLARATOR);
+                        if (reference_declarators != null) {
+                            mappingStore.addMappingRecursively(reference_declarators.first,reference_declarators.second);
+                        }
                         Pair<Tree, Tree> qualified_identifiers = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.QUALIFIED_IDENTIFIER, LANG2.QUALIFIED_IDENTIFIER);
                         if (qualified_identifiers != null) {
                             mappingStore.addMappingRecursively(qualified_identifiers.first,qualified_identifiers.second);
+                        }
+                        Pair<Tree, Tree> type_identifiers = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.TYPE_IDENTIFIER, LANG2.TYPE_IDENTIFIER);
+                        if (type_identifiers != null) {
+                            mappingStore.addMappingRecursively(type_identifiers.first,type_identifiers.second);
                         }
                     }
                 }

@@ -1748,7 +1748,7 @@ public class ReplacementAlgorithm {
 								String signature1 = parent1.getSignature();
 								String signature2 = parent2.getSignature();
 								if(signature1.equals(signature2)) {
-									LeafMapping leafMapping = operationBodyMapper.createLeafMapping(statement1, fragment2, parameterToArgumentMap, equalNumberOfAssertions);
+									LeafMapping leafMapping = operationBodyMapper.createLeafMapping(statement1, fragment2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 									mappingsToBeAdded.add(leafMapping);
 									break;
 								}
@@ -1895,7 +1895,7 @@ public class ReplacementAlgorithm {
 													List<LeafExpression> leafExpressions1 = fragment1.findExpression(argument1);
 													List<LeafExpression> leafExpressions2 = statement2.findExpression(argument2);
 													if(leafExpressions1.size() == 1 && leafExpressions2.size() == 1) {
-														LeafMapping mapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions);
+														LeafMapping mapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 														operationBodyMapper.addMapping(mapping);
 													}
 													argumentMatched = true;
@@ -1913,7 +1913,7 @@ public class ReplacementAlgorithm {
 					}
 				}
 			}
-			if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2) &&
+			if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2, container1, container2) &&
 					!statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT) &&
 					!statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT) &&
 					!statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE) &&
@@ -2477,7 +2477,7 @@ public class ReplacementAlgorithm {
 				for(AbstractCall invocation1 : methodInvocationMap1.get(key1)) {
 					if(invocation1.identical(assignmentInvocationCoveringTheEntireStatement2, replacementInfo, parameterToArgumentMap, replacementInfo.getLambdaMappers()) &&
 							(!containsInArguments(assignmentInvocationCoveringTheEntireStatement1, key1) || operationBodyMapper.parentMapperContainsMapping(statement1))) {
-						if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2) &&
+						if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2, container1, container2) &&
 								!statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT) &&
 								!statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT)) {
 							return null;
@@ -2889,7 +2889,7 @@ public class ReplacementAlgorithm {
 									if(leafExpressions2.size() == 1) {
 										List<LeafExpression> leafExpressions1 = statement1.findExpression(argument1);
 										if(leafExpressions1.size() == 1) {
-											LeafMapping leafMapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions);
+											LeafMapping leafMapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 											operationBodyMapper.addMapping(leafMapping);
 										}
 									}
@@ -3205,7 +3205,7 @@ public class ReplacementAlgorithm {
 							Replacement replacement = new MethodInvocationReplacement(invocation1.actualString(),
 									invocationCoveringTheEntireStatement2.actualString(), invocation1, invocationCoveringTheEntireStatement2, ReplacementType.METHOD_INVOCATION);
 							replacementInfo.addReplacement(replacement);
-							if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2) &&
+							if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2, container1, container2) &&
 									invocationCoveringTheEntireStatement2.arguments().contains(invocation1.getExpression()) &&
 									!statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT) &&
 									!statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT)) {
@@ -3274,7 +3274,7 @@ public class ReplacementAlgorithm {
 							Replacement replacement = new MethodInvocationReplacement(invocationCoveringTheEntireStatement1.actualString(),
 									invocation2.actualString(), invocationCoveringTheEntireStatement1, invocation2, ReplacementType.METHOD_INVOCATION);
 							replacementInfo.addReplacement(replacement);
-							if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2) &&
+							if(variableDeclarationsWithEverythingReplaced(variableDeclarations1, variableDeclarations2, replacementInfo, LANG1, LANG2, container1, container2) &&
 									invocationCoveringTheEntireStatement1.arguments().contains(invocation2.getExpression()) &&
 									!statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT) &&
 									!statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT)) {
@@ -4293,7 +4293,7 @@ public class ReplacementAlgorithm {
 									List<LeafExpression> leafExpressions1 = fragment1.findExpression(argument1);
 									List<LeafExpression> leafExpressions2 = statement2.findExpression(argument2);
 									if(leafExpressions1.size() == 1 && leafExpressions2.size() == 1) {
-										LeafMapping mapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions);
+										LeafMapping mapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 										operationBodyMapper.addMapping(mapping);
 										additionallyMatchedStatements1.add(fragment1);
 									}
@@ -4347,7 +4347,7 @@ public class ReplacementAlgorithm {
 															List<LeafExpression> leafExpressions1 = fragment1.findExpression(argument1);
 															List<LeafExpression> leafExpressions2 = statement2.findExpression(argument2);
 															if(leafExpressions1.size() == 1 && leafExpressions2.size() == 1) {
-																LeafMapping mapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions);
+																LeafMapping mapping = operationBodyMapper.createLeafMapping(leafExpressions1.get(0), leafExpressions2.get(0), parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 																operationBodyMapper.addMapping(mapping);
 																additionallyMatchedStatements1.add(fragment1);
 															}
@@ -5211,6 +5211,12 @@ public class ReplacementAlgorithm {
 		if(v1 != null && v2 != null) {
 			boolean variableDeclarationMismatch = false;
 			for(AbstractCodeMapping mapping : mappings) {
+				boolean functionLevelScope = mapping.getOperation1().getBody() != null && mapping.getOperation2().getBody() != null &&
+						!v1.isParameter() && !v2.isParameter() &&
+						statement1.getLANG().equals(Constants.PYTHON) && statement2.getLANG().equals(Constants.PYTHON) &&
+						v1.getLocationInfo().getFilePath().equals(v2.getLocationInfo().getFilePath()) &&
+						v1.getScope().getEndOffset() == mapping.getOperation1().getBody().getCompositeStatement().getLocationInfo().getEndOffset() &&
+						v2.getScope().getEndOffset() == mapping.getOperation2().getBody().getCompositeStatement().getLocationInfo().getEndOffset();
 				List<VariableDeclaration> variableDeclarations1 = mapping.getFragment1().getVariableDeclarations();
 				List<VariableDeclaration> variableDeclarations2 = mapping.getFragment2().getVariableDeclarations();
 				if(variableDeclarations1.contains(v1) &&
@@ -5233,7 +5239,7 @@ public class ReplacementAlgorithm {
 						CompositeStatementObject comp2 = (CompositeStatementObject)statement2;
 						containsMapping = comp1.contains(mapping.getFragment1()) && comp2.contains(mapping.getFragment2());
 					}
-					if(containsMapping) {
+					if(containsMapping && !functionLevelScope) {
 						if(VariableReplacementAnalysis.bothFragmentsUseVariable(v1, mapping)) {
 							VariableDeclaration otherV1 = mapping.getFragment1().getVariableDeclaration(v1.getVariableName());
 							if(otherV1 != null) {
@@ -6180,7 +6186,7 @@ public class ReplacementAlgorithm {
 													for(VariableDeclaration variableDeclaration : variableDeclarations) {
 														AbstractExpression initializer = variableDeclaration.getInitializer();
 														if(initializer != null && initializer.getString().equals(lambdaExpression.getString())) {
-															LeafMapping mapping = operationBodyMapper.createLeafMapping(initializer, lambdaExpression, parameterToArgumentMap, false);
+															LeafMapping mapping = operationBodyMapper.createLeafMapping(initializer, lambdaExpression, parameterToArgumentMap, false, false);
 															operationBodyMapper.addMapping(mapping);
 															String before = argument.substring(lambdaArrow.length());
 															String after = parameterName + supplierGet;
