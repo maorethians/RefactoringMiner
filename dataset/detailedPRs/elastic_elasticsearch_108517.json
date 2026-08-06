@@ -1,0 +1,141 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 108517,
+  "pr_number": 108517,
+  "title": "[Transform] Forward indexServiceSafe exceptions to listener",
+  "user": "prwhelan",
+  "created_at": "2024-05-10T17:13:14Z",
+  "merged_at": "2024-05-13T14:11:57Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":ml/Transform",
+    "Team:ML",
+    "v8.15.0"
+  ],
+  "base_commit": "2d14095ebf66bf04881f04b7e7f92ba2834187f3",
+  "merge_commit_sha": "6ecff09193c5f9137ccc673216689ee3f18240fb",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "ready_for_review",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "renamed",
+    "merged",
+    "closed",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/108517",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-05-10T15:45:09Z",
+      "sha": "64abdb7b745fbc1276e86fd2d81176dfddf20e6c",
+      "message": "[Transform] Forward indexServiceSafe exception to listener\n\nIndexService.indexServiceSafe can throw an IndexNotFoundException while\ngetting the Global Checkpoints. TransportGetCheckpointNodeAction will\nnow forward that exception to the listener.\n\nFix #108418",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-05-10T15:45:09Z",
+      "author_date": "2024-05-10T15:45:09Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-05-10T15:45:09Z",
+      "diff_text": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/action/TransportGetCheckpointNodeAction.java\n@@ -6,6 +6,8 @@\n  */\n package org.elasticsearch.xpack.transform.action;\n \n+import org.apache.logging.log4j.LogManager;\n+import org.apache.logging.log4j.Logger;\n import org.elasticsearch.ElasticsearchTimeoutException;\n import org.elasticsearch.action.ActionListener;\n import org.elasticsearch.action.support.ActionFilters;\n@@ -34,6 +36,7 @@\n \n public class TransportGetCheckpointNodeAction extends HandledTransportAction<Request, Response> {\n \n+    private static final Logger logger = LogManager.getLogger(TransportGetCheckpointNodeAction.class);\n     private final IndicesService indicesService;\n \n     @Inject\n@@ -83,17 +86,27 @@ protected static void getGlobalCheckpoints(\n                     return;\n                 }\n             }\n-            final IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());\n-            final IndexShard indexShard = indexService.getShard(shardId.id());\n \n-            checkpointsByIndexOfThisNode.computeIfAbsent(shardId.getIndexName(), k -> {\n-                long[] seqNumbers = new long[indexService.getIndexSettings().getNumberOfShards()];\n-                Arrays.fill(seqNumbers, SequenceNumbers.UNASSIGNED_SEQ_NO);\n-                return seqNumbers;\n-            });\n-            checkpointsByIndexOfThisNode.get(shardId.getIndexName())[shardId.getId()] = indexShard.seqNoStats().getGlobalCheckpoint();\n-            ++numProcessedShards;\n+            try {\n+                final IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());\n+                final IndexShard indexShard = indexService.getShard(shardId.id());\n+\n+                checkpointsByIndexOfThisNode.computeIfAbsent(shardId.getIndexName(), k -> {\n+                    long[] seqNumbers = new long[indexService.getIndexSettings().getNumberOfShards()];\n+                    Arrays.fill(seqNumbers, SequenceNumbers.UNASSIGNED_SEQ_NO);\n+                    return seqNumbers;\n+                });\n+                checkpointsByIndexOfThisNode.get(shardId.getIndexName())[shardId.getId()] = indexShard.seqNoStats().getGlobalCheckpoint();\n+                ++numProcessedShards;\n+            } catch (Exception e) {\n+                logger.atDebug()\n+                    .withThrowable(e)\n+                    .log(\"Failed to get checkpoint for shard [{}] and index [{}]\", shardId.getId(), shardId.getIndexName());\n+                listener.onFailure(e);\n+                return;\n+            }\n         }\n+\n         listener.onResponse(new Response(checkpointsByIndexOfThisNode));\n     }\n }\nx-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/action/TransportGetCheckpointNodeActionTests.java\n@@ -15,6 +15,7 @@\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.index.Index;\n+import org.elasticsearch.index.IndexNotFoundException;\n import org.elasticsearch.index.IndexService;\n import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.index.seqno.SeqNoStats;\n@@ -47,6 +48,8 @@\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.is;\n import static org.hamcrest.Matchers.nullValue;\n+import static org.hamcrest.Matchers.sameInstance;\n+import static org.mockito.ArgumentMatchers.any;\n import static org.mockito.Mockito.mock;\n import static org.mockito.Mockito.when;\n \n@@ -68,35 +71,9 @@ public void setUp() throws Exception {\n             null,\n             (TaskManager) null\n         );\n-        IndexShard indexShardA0 = mock(IndexShard.class);\n-        when(indexShardA0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_000));\n-        IndexShard indexShardA1 = mock(IndexShard.class);\n-        when(indexShardA1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_001));\n-        IndexShard indexShardB0 = mock(IndexShard.class);\n-        when(indexShardB0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_000));\n-        IndexShard indexShardB1 = mock(IndexShard.class);\n-        when(indexShardB1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_001));\n-        Settings commonIndexSettings = Settings.builder()\n-            .put(SETTING_VERSION_CREATED, 1_000_000)\n-            .put(SETTING_NUMBER_OF_SHARDS, 2)\n-            .put(SETTING_NUMBER_OF_REPLICAS, 1)\n-            .build();\n-        IndexService indexServiceA = mock(IndexService.class);\n-        when(indexServiceA.getIndexSettings()).thenReturn(\n-            new IndexSettings(IndexMetadata.builder(\"my-index-A\").settings(commonIndexSettings).build(), Settings.EMPTY)\n-        );\n-        when(indexServiceA.getShard(0)).thenReturn(indexShardA0);\n-        when(indexServiceA.getShard(1)).thenReturn(indexShardA1);\n-        IndexService indexServiceB = mock(IndexService.class);\n-        when(indexServiceB.getIndexSettings()).thenReturn(\n-            new IndexSettings(IndexMetadata.builder(\"my-index-B\").settings(commonIndexSettings).build(), Settings.EMPTY)\n-        );\n-        when(indexServiceB.getShard(0)).thenReturn(indexShardB0);\n-        when(indexServiceB.getShard(1)).thenReturn(indexShardB1);\n+\n         indicesService = mock(IndicesService.class);\n         when(indicesService.clusterService()).thenReturn(clusterService);\n-        when(indicesService.indexServiceSafe(new Index(\"my-index-A\", \"A\"))).thenReturn(indexServiceA);\n-        when(indicesService.indexServiceSafe(new Index(\"my-index-B\", \"B\"))).thenReturn(indexServiceB);\n \n         task = new CancellableTask(123, \"type\", \"action\", \"description\", new TaskId(\"dummy-node:456\"), Map.of());\n         clock = new FakeClock(Instant.now());\n@@ -117,6 +94,7 @@ public void testGetGlobalCheckpointsWithHighTimeout() throws InterruptedExceptio\n     }\n \n     private void testGetGlobalCheckpointsSuccess(TimeValue timeout) throws InterruptedException {\n+        mockIndexServiceResponse();\n         CountDownLatch latch = new CountDownLatch(1);\n         SetOnce<GetCheckpointNodeAction.Response> responseHolder = new SetOnce<>();\n         SetOnce<Exception> exceptionHolder = new SetOnce<>();\n@@ -136,7 +114,38 @@ private void testGetGlobalCheckpointsSuccess(TimeValue timeout) throws Interrupt\n         assertThat(exceptionHolder.get(), is(nullValue()));\n     }\n \n+    private void mockIndexServiceResponse() {\n+        IndexShard indexShardA0 = mock(IndexShard.class);\n+        when(indexShardA0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_000));\n+        IndexShard indexShardA1 = mock(IndexShard.class);\n+        when(indexShardA1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_001));\n+        IndexShard indexShardB0 = mock(IndexShard.class);\n+        when(indexShardB0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_000));\n+        IndexShard indexShardB1 = mock(IndexShard.class);\n+        when(indexShardB1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_001));\n+        Settings commonIndexSettings = Settings.builder()\n+            .put(SETTING_VERSION_CREATED, 1_000_000)\n+            .put(SETTING_NUMBER_OF_SHARDS, 2)\n+            .put(SETTING_NUMBER_OF_REPLICAS, 1)\n+            .build();\n+        IndexService indexServiceA = mock(IndexService.class);\n+        when(indexServiceA.getIndexSettings()).thenReturn(\n+            new IndexSettings(IndexMetadata.builder(\"my-index-A\").settings(commonIndexSettings).build(), Settings.EMPTY)\n+        );\n+        when(indexServiceA.getShard(0)).thenReturn(indexShardA0);\n+        when(indexServiceA.getShard(1)).thenReturn(indexShardA1);\n+        IndexService indexServiceB = mock(IndexService.class);\n+        when(indexServiceB.getIndexSettings()).thenReturn(\n+            new IndexSettings(IndexMetadata.builder(\"my-index-B\").settings(commonIndexSettings).build(), Settings.EMPTY)\n+        );\n+        when(indexServiceB.getShard(0)).thenReturn(indexShardB0);\n+        when(indexServiceB.getShard(1)).thenReturn(indexShardB1);\n+        when(indicesService.indexServiceSafe(new Index(\"my-index-A\", \"A\"))).thenReturn(indexServiceA);\n+        when(indicesService.indexServiceSafe(new Index(\"my-index-B\", \"B\"))).thenReturn(indexServiceB);\n+    }\n+\n     public void testGetGlobalCheckpointsFailureDueToTaskCancelled() throws InterruptedException {\n+        mockIndexServiceResponse();\n         TaskCancelHelper.cancel(task, \"due to apocalypse\");\n \n         CountDownLatch latch = new CountDownLatch(1);\n@@ -156,6 +165,7 @@ public void testGetGlobalCheckpointsFailureDueToTaskCancelled() throws Interrupt\n     }\n \n     public void testGetGlobalCheckpointsFailureDueToTimeout() throws InterruptedException {\n+        mockIndexServiceResponse();\n         // Move the current time past the timeout.\n         clock.advanceTimeBy(Duration.ofSeconds(10));\n \n@@ -184,4 +194,24 @@ public void testGetGlobalCheckpointsFailureDueToTimeout() throws InterruptedExce\n             is(equalTo(\"Transform checkpointing timed out on node [dummy-node] after [5s] having processed [0] of [4] shards\"))\n         );\n     }\n+\n+    public void testIndexNotFoundException() throws InterruptedException {\n+        var expectedException = new IndexNotFoundException(\"some index\");\n+        when(indicesService.indexServiceSafe(any())).thenThrow(expectedException);\n+\n+        var exceptionHolder = new SetOnce<Exception>();\n+        TransportGetCheckpointNodeAction.getGlobalCheckpoints(\n+            indicesService,\n+            task,\n+            shards,\n+            TimeValue.timeValueSeconds(5),\n+            clock,\n+            ActionListener.wrap(r -> {\n+                fail(\"Test is meant to call the onFailure method.\");\n+            }, exceptionHolder::set)\n+        );\n+\n+        assertNotNull(\"Listener's onFailure handler was not called.\", exceptionHolder.get());\n+        assertThat(exceptionHolder.get(), sameInstance(expectedException));\n+    }\n }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/action/TransportGetCheckpointNodeAction.java",
+          "patch": "@@ -6,6 +6,8 @@\n  */\n package org.elasticsearch.xpack.transform.action;\n \n+import org.apache.logging.log4j.LogManager;\n+import org.apache.logging.log4j.Logger;\n import org.elasticsearch.ElasticsearchTimeoutException;\n import org.elasticsearch.action.ActionListener;\n import org.elasticsearch.action.support.ActionFilters;\n@@ -34,6 +36,7 @@\n \n public class TransportGetCheckpointNodeAction extends HandledTransportAction<Request, Response> {\n \n+    private static final Logger logger = LogManager.getLogger(TransportGetCheckpointNodeAction.class);\n     private final IndicesService indicesService;\n \n     @Inject\n@@ -83,17 +86,27 @@ protected static void getGlobalCheckpoints(\n                     return;\n                 }\n             }\n-            final IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());\n-            final IndexShard indexShard = indexService.getShard(shardId.id());\n \n-            checkpointsByIndexOfThisNode.computeIfAbsent(shardId.getIndexName(), k -> {\n-                long[] seqNumbers = new long[indexService.getIndexSettings().getNumberOfShards()];\n-                Arrays.fill(seqNumbers, SequenceNumbers.UNASSIGNED_SEQ_NO);\n-                return seqNumbers;\n-            });\n-            checkpointsByIndexOfThisNode.get(shardId.getIndexName())[shardId.getId()] = indexShard.seqNoStats().getGlobalCheckpoint();\n-            ++numProcessedShards;\n+            try {\n+                final IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());\n+                final IndexShard indexShard = indexService.getShard(shardId.id());\n+\n+                checkpointsByIndexOfThisNode.computeIfAbsent(shardId.getIndexName(), k -> {\n+                    long[] seqNumbers = new long[indexService.getIndexSettings().getNumberOfShards()];\n+                    Arrays.fill(seqNumbers, SequenceNumbers.UNASSIGNED_SEQ_NO);\n+                    return seqNumbers;\n+                });\n+                checkpointsByIndexOfThisNode.get(shardId.getIndexName())[shardId.getId()] = indexShard.seqNoStats().getGlobalCheckpoint();\n+                ++numProcessedShards;\n+            } catch (Exception e) {\n+                logger.atDebug()\n+                    .withThrowable(e)\n+                    .log(\"Failed to get checkpoint for shard [{}] and index [{}]\", shardId.getId(), shardId.getIndexName());\n+                listener.onFailure(e);\n+                return;\n+            }\n         }\n+\n         listener.onResponse(new Response(checkpointsByIndexOfThisNode));\n     }\n }"
+        },
+        {
+          "file": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/action/TransportGetCheckpointNodeActionTests.java",
+          "patch": "@@ -15,6 +15,7 @@\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.index.Index;\n+import org.elasticsearch.index.IndexNotFoundException;\n import org.elasticsearch.index.IndexService;\n import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.index.seqno.SeqNoStats;\n@@ -47,6 +48,8 @@\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.is;\n import static org.hamcrest.Matchers.nullValue;\n+import static org.hamcrest.Matchers.sameInstance;\n+import static org.mockito.ArgumentMatchers.any;\n import static org.mockito.Mockito.mock;\n import static org.mockito.Mockito.when;\n \n@@ -68,35 +71,9 @@ public void setUp() throws Exception {\n             null,\n             (TaskManager) null\n         );\n-        IndexShard indexShardA0 = mock(IndexShard.class);\n-        when(indexShardA0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_000));\n-        IndexShard indexShardA1 = mock(IndexShard.class);\n-        when(indexShardA1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_001));\n-        IndexShard indexShardB0 = mock(IndexShard.class);\n-        when(indexShardB0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_000));\n-        IndexShard indexShardB1 = mock(IndexShard.class);\n-        when(indexShardB1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_001));\n-        Settings commonIndexSettings = Settings.builder()\n-            .put(SETTING_VERSION_CREATED, 1_000_000)\n-            .put(SETTING_NUMBER_OF_SHARDS, 2)\n-            .put(SETTING_NUMBER_OF_REPLICAS, 1)\n-            .build();\n-        IndexService indexServiceA = mock(IndexService.class);\n-        when(indexServiceA.getIndexSettings()).thenReturn(\n-            new IndexSettings(IndexMetadata.builder(\"my-index-A\").settings(commonIndexSettings).build(), Settings.EMPTY)\n-        );\n-        when(indexServiceA.getShard(0)).thenReturn(indexShardA0);\n-        when(indexServiceA.getShard(1)).thenReturn(indexShardA1);\n-        IndexService indexServiceB = mock(IndexService.class);\n-        when(indexServiceB.getIndexSettings()).thenReturn(\n-            new IndexSettings(IndexMetadata.builder(\"my-index-B\").settings(commonIndexSettings).build(), Settings.EMPTY)\n-        );\n-        when(indexServiceB.getShard(0)).thenReturn(indexShardB0);\n-        when(indexServiceB.getShard(1)).thenReturn(indexShardB1);\n+\n         indicesService = mock(IndicesService.class);\n         when(indicesService.clusterService()).thenReturn(clusterService);\n-        when(indicesService.indexServiceSafe(new Index(\"my-index-A\", \"A\"))).thenReturn(indexServiceA);\n-        when(indicesService.indexServiceSafe(new Index(\"my-index-B\", \"B\"))).thenReturn(indexServiceB);\n \n         task = new CancellableTask(123, \"type\", \"action\", \"description\", new TaskId(\"dummy-node:456\"), Map.of());\n         clock = new FakeClock(Instant.now());\n@@ -117,6 +94,7 @@ public void testGetGlobalCheckpointsWithHighTimeout() throws InterruptedExceptio\n     }\n \n     private void testGetGlobalCheckpointsSuccess(TimeValue timeout) throws InterruptedException {\n+        mockIndexServiceResponse();\n         CountDownLatch latch = new CountDownLatch(1);\n         SetOnce<GetCheckpointNodeAction.Response> responseHolder = new SetOnce<>();\n         SetOnce<Exception> exceptionHolder = new SetOnce<>();\n@@ -136,7 +114,38 @@ private void testGetGlobalCheckpointsSuccess(TimeValue timeout) throws Interrupt\n         assertThat(exceptionHolder.get(), is(nullValue()));\n     }\n \n+    private void mockIndexServiceResponse() {\n+        IndexShard indexShardA0 = mock(IndexShard.class);\n+        when(indexShardA0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_000));\n+        IndexShard indexShardA1 = mock(IndexShard.class);\n+        when(indexShardA1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 3_001));\n+        IndexShard indexShardB0 = mock(IndexShard.class);\n+        when(indexShardB0.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_000));\n+        IndexShard indexShardB1 = mock(IndexShard.class);\n+        when(indexShardB1.seqNoStats()).thenReturn(new SeqNoStats(3_000, 2_000, 4_001));\n+        Settings commonIndexSettings = Settings.builder()\n+            .put(SETTING_VERSION_CREATED, 1_000_000)\n+            .put(SETTING_NUMBER_OF_SHARDS, 2)\n+            .put(SETTING_NUMBER_OF_REPLICAS, 1)\n+            .build();\n+        IndexService indexServiceA = mock(IndexService.class);\n+        when(indexServiceA.getIndexSettings()).thenReturn(\n+            new IndexSettings(IndexMetadata.builder(\"my-index-A\").settings(commonIndexSettings).build(), Settings.EMPTY)\n+        );\n+        when(indexServiceA.getShard(0)).thenReturn(indexShardA0);\n+        when(indexServiceA.getShard(1)).thenReturn(indexShardA1);\n+        IndexService indexServiceB = mock(IndexService.class);\n+        when(indexServiceB.getIndexSettings()).thenReturn(\n+            new IndexSettings(IndexMetadata.builder(\"my-index-B\").settings(commonIndexSettings).build(), Settings.EMPTY)\n+        );\n+        when(indexServiceB.getShard(0)).thenReturn(indexShardB0);\n+        when(indexServiceB.getShard(1)).thenReturn(indexShardB1);\n+        when(indicesService.indexServiceSafe(new Index(\"my-index-A\", \"A\"))).thenReturn(indexServiceA);\n+        when(indicesService.indexServiceSafe(new Index(\"my-index-B\", \"B\"))).thenReturn(indexServiceB);\n+    }\n+\n     public void testGetGlobalCheckpointsFailureDueToTaskCancelled() throws InterruptedException {\n+        mockIndexServiceResponse();\n         TaskCancelHelper.cancel(task, \"due to apocalypse\");\n \n         CountDownLatch latch = new CountDownLatch(1);\n@@ -156,6 +165,7 @@ public void testGetGlobalCheckpointsFailureDueToTaskCancelled() throws Interrupt\n     }\n \n     public void testGetGlobalCheckpointsFailureDueToTimeout() throws InterruptedException {\n+        mockIndexServiceResponse();\n         // Move the current time past the timeout.\n         clock.advanceTimeBy(Duration.ofSeconds(10));\n \n@@ -184,4 +194,24 @@ public void testGetGlobalCheckpointsFailureDueToTimeout() throws InterruptedExce\n             is(equalTo(\"Transform checkpointing timed out on node [dummy-node] after [5s] having processed [0] of [4] shards\"))\n         );\n     }\n+\n+    public void testIndexNotFoundException() throws InterruptedException {\n+        var expectedException = new IndexNotFoundException(\"some index\");\n+        when(indicesService.indexServiceSafe(any())).thenThrow(expectedException);\n+\n+        var exceptionHolder = new SetOnce<Exception>();\n+        TransportGetCheckpointNodeAction.getGlobalCheckpoints(\n+            indicesService,\n+            task,\n+            shards,\n+            TimeValue.timeValueSeconds(5),\n+            clock,\n+            ActionListener.wrap(r -> {\n+                fail(\"Test is meant to call the onFailure method.\");\n+            }, exceptionHolder::set)\n+        );\n+\n+        assertNotNull(\"Listener's onFailure handler was not called.\", exceptionHolder.get());\n+        assertThat(exceptionHolder.get(), sameInstance(expectedException));\n+    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-05-10T17:13:14Z",
+      "user": "prwhelan",
+      "body": "IndexService.indexServiceSafe can throw an IndexNotFoundException while getting the Global Checkpoints. \r\n In theory, any exception in TransportGetCheckpointNodeAction should be forwarded to the listener.\r\n\r\nFix #108418\r\n"
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-10T17:13:38Z",
+      "sha": "bcd95bdf40619effa92fc45e73b2b5a6f4c734dd",
+      "message": "Update docs/changelog/108517.yaml",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-05-10T17:13:38Z",
+      "author_date": "2024-05-10T17:13:38Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-05-10T17:13:38Z",
+      "diff_text": "docs/changelog/108517.yaml\n@@ -0,0 +1,6 @@\n+pr: 108517\n+summary: Forward `indexServiceSafe` exception to listener\n+area: Transform\n+type: bug\n+issues:\n+ - 108418",
+      "diff": [
+        {
+          "file": "docs/changelog/108517.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 108517\n+summary: Forward `indexServiceSafe` exception to listener\n+area: Transform\n+type: bug\n+issues:\n+ - 108418"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2104979784,
+      "created_at": "2024-05-10T17:13:39Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @prwhelan, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 2105073212,
+      "created_at": "2024-05-10T18:21:39Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/ml-core (Team:ML)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1598004408,
+      "created_at": "2024-05-13T07:33:02Z",
+      "user": "przemekwitek",
+      "body": "The PR description says that the `IndexNotFoundException` is forwarded but in fact **every** exception is forwarded here.\r\nI think the code is ok, just please update PR description.",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/action/TransportGetCheckpointNodeAction.java",
+      "diff_hunk": "@@ -83,17 +86,27 @@ protected static void getGlobalCheckpoints(\n                     return;\n                 }\n             }\n-            final IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());\n-            final IndexShard indexShard = indexService.getShard(shardId.id());\n \n-            checkpointsByIndexOfThisNode.computeIfAbsent(shardId.getIndexName(), k -> {\n-                long[] seqNumbers = new long[indexService.getIndexSettings().getNumberOfShards()];\n-                Arrays.fill(seqNumbers, SequenceNumbers.UNASSIGNED_SEQ_NO);\n-                return seqNumbers;\n-            });\n-            checkpointsByIndexOfThisNode.get(shardId.getIndexName())[shardId.getId()] = indexShard.seqNoStats().getGlobalCheckpoint();\n-            ++numProcessedShards;\n+            try {\n+                final IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());\n+                final IndexShard indexShard = indexService.getShard(shardId.id());\n+\n+                checkpointsByIndexOfThisNode.computeIfAbsent(shardId.getIndexName(), k -> {\n+                    long[] seqNumbers = new long[indexService.getIndexSettings().getNumberOfShards()];\n+                    Arrays.fill(seqNumbers, SequenceNumbers.UNASSIGNED_SEQ_NO);\n+                    return seqNumbers;\n+                });\n+                checkpointsByIndexOfThisNode.get(shardId.getIndexName())[shardId.getId()] = indexShard.seqNoStats().getGlobalCheckpoint();\n+                ++numProcessedShards;\n+            } catch (Exception e) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 101,
+      "original_line": 101,
+      "side": "RIGHT",
+      "original_position": 42,
+      "position": 42,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2051915176,
+      "created_at": "2024-05-13T07:33:48Z",
+      "user": "przemekwitek",
+      "state": "APPROVED",
+      "body": "LGTM"
+    }
+  ]
+}

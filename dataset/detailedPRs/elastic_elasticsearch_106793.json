@@ -1,0 +1,251 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 106793,
+  "pr_number": 106793,
+  "title": "[Transform] Fail checkpoint on missing clusters",
+  "user": "prwhelan",
+  "created_at": "2024-03-26T23:28:31Z",
+  "merged_at": "2024-03-27T19:22:56Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":ml/Transform",
+    "Team:ML",
+    "v8.13.1",
+    "v8.14.0"
+  ],
+  "base_commit": "9e6b893896a738bbb77b2dab7cc1e6640881ceee",
+  "merge_commit_sha": "eea8d1d65986e95a251a57c1c0f192aca160caca",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "labeled",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/106793",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-03-26T23:25:32Z",
+      "sha": "03ce63df4118b61edfd1b3ce9f69c67f1b236c03",
+      "message": "[Transform] Fail checkpoint on missing clusters\n\nWhen there are no remote or local clusters for a given source index, we\ncall the listener's `onFailure` method with a `CheckpointException`.\nA running transform will fail and retry, eventually moving into an\nunhealthy and failed state.  Any call to the stats API will note the\ncheckpoint failure and return.\n\nThis fixes a timeout issue calling the Transform stats API and prevents\nthe Transform from being stuck in indexing.\n\nFix #106790\nFix #104533",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-03-26T22:48:06Z",
+      "author_date": "2024-03-26T22:48:06Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-03-26T23:25:32Z",
+      "diff_text": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/CheckpointException.java\n@@ -10,6 +10,10 @@\n import org.elasticsearch.ElasticsearchException;\n \n class CheckpointException extends ElasticsearchException {\n+    CheckpointException(String msg, Object... params) {\n+        super(msg, params);\n+    }\n+\n     CheckpointException(String msg, Throwable cause, Object... params) {\n         super(msg, cause, params);\n     }\nx-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java\n@@ -116,6 +116,11 @@ protected void getIndexCheckpoints(TimeValue timeout, ActionListener<Map<String,\n             ResolvedIndices resolvedIndexes = remoteClusterResolver.resolve(transformConfig.getSource().getIndex());\n             ActionListener<Map<String, long[]>> groupedListener = listener;\n \n+            if (resolvedIndexes.numClusters() == 0) {\n+                var indices = String.join(\",\", transformConfig.getSource().getIndex());\n+                listener.onFailure(new CheckpointException(\"No clusters exist for [{}]\", indices));\n+            }\n+\n             if (resolvedIndexes.numClusters() > 1) {\n                 ActionListener<Collection<Map<String, long[]>>> mergeMapsListener = ActionListener.wrap(indexCheckpoints -> {\n                     listener.onResponse(\n@@ -234,10 +239,7 @@ private static void getCheckpointsFromOneClusterV2(\n         );\n         ActionListener<GetCheckpointAction.Response> checkpointListener;\n         if (RemoteClusterService.LOCAL_CLUSTER_GROUP_KEY.equals(cluster)) {\n-            checkpointListener = ActionListener.wrap(\n-                checkpointResponse -> listener.onResponse(checkpointResponse.getCheckpoints()),\n-                listener::onFailure\n-            );\n+            checkpointListener = listener.delegateFailure((l, r) -> l.onResponse(r.getCheckpoints()));\n         } else {\n             checkpointListener = ActionListener.wrap(\n                 checkpointResponse -> listener.onResponse(\n@@ -401,12 +403,12 @@ public void getCheckpointingInfo(\n \n         long timestamp = clock.millis();\n \n-        getIndexCheckpoints(timeout, ActionListener.wrap(checkpointsByIndex -> {\n-            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, checkpointsByIndex, 0L);\n+        getIndexCheckpoints(timeout, listener.delegateFailure((l, r) -> {\n+            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, r, 0L);\n             checkpointingInfoBuilder.setSourceCheckpoint(sourceCheckpoint);\n             checkpointingInfoBuilder.setOperationsBehind(TransformCheckpoint.getBehind(lastCheckpoint, sourceCheckpoint));\n-            listener.onResponse(checkpointingInfoBuilder);\n-        }, listener::onFailure));\n+            l.onResponse(checkpointingInfoBuilder);\n+        }));\n     }\n \n     @Override\nx-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProviderTests.java\n@@ -31,6 +31,7 @@\n import org.elasticsearch.test.MockLogAppender;\n import org.elasticsearch.test.MockLogAppender.LoggingExpectation;\n import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.ActionNotFoundTransportException;\n import org.elasticsearch.xpack.core.transform.action.GetCheckpointAction;\n import org.elasticsearch.xpack.core.transform.transforms.SourceConfig;\n import org.elasticsearch.xpack.core.transform.transforms.TransformCheckpoint;\n@@ -67,7 +68,7 @@\n \n public class DefaultCheckpointProviderTests extends ESTestCase {\n \n-    private static Logger checkpointProviderLogger = LogManager.getLogger(DefaultCheckpointProvider.class);\n+    private static final Logger checkpointProviderLogger = LogManager.getLogger(DefaultCheckpointProvider.class);\n \n     private Clock clock;\n     private Client client;\n@@ -96,7 +97,7 @@ public void setUpMocks() {\n         transformAuditor = MockTransformAuditor.createMockAuditor();\n     }\n \n-    public void testReportSourceIndexChangesRunsEmpty() throws Exception {\n+    public void testReportSourceIndexChangesRunsEmpty() {\n         String transformId = getTestName();\n         TransformConfig transformConfig = TransformConfigTests.randomTransformConfig(transformId);\n         DefaultCheckpointProvider provider = newCheckpointProvider(transformConfig);\n@@ -138,7 +139,7 @@ public void testReportSourceIndexChangesRunsEmpty() throws Exception {\n         );\n     }\n \n-    public void testReportSourceIndexChangesAddDelete() throws Exception {\n+    public void testReportSourceIndexChangesAddDelete() {\n         String transformId = getTestName();\n         TransformConfig transformConfig = TransformConfigTests.randomTransformConfig(transformId);\n         DefaultCheckpointProvider provider = newCheckpointProvider(transformConfig);\n@@ -197,7 +198,7 @@ public void testReportSourceIndexChangesAddDelete() throws Exception {\n         );\n     }\n \n-    public void testReportSourceIndexChangesAddDeleteMany() throws Exception {\n+    public void testReportSourceIndexChangesAddDeleteMany() {\n         String transformId = getTestName();\n         TransformConfig transformConfig = TransformConfigTests.randomTransformConfig(transformId);\n         DefaultCheckpointProvider provider = newCheckpointProvider(transformConfig);\n@@ -231,29 +232,88 @@ public void testReportSourceIndexChangesAddDeleteMany() throws Exception {\n     }\n \n     public void testHandlingShardFailures() throws Exception {\n-        String transformId = getTestName();\n-        String indexName = \"some-index\";\n+        var transformId = getTestName();\n+        var indexName = \"some-index\";\n         TransformConfig transformConfig = new TransformConfig.Builder(TransformConfigTests.randomTransformConfig(transformId)).setSource(\n             new SourceConfig(indexName)\n         ).build();\n \n-        RemoteClusterResolver remoteClusterResolver = mock(RemoteClusterResolver.class);\n+        var remoteClusterResolver = mock(RemoteClusterResolver.class);\n         doReturn(new RemoteClusterResolver.ResolvedIndices(Collections.emptyMap(), Collections.singletonList(indexName))).when(\n             remoteClusterResolver\n         ).resolve(transformConfig.getSource().getIndex());\n \n+        mockGetIndexResponse(indexName);\n+        mockIndicesStatsResponse(indexName);\n+        mockGetCheckpointAction();\n+\n+        var provider = new DefaultCheckpointProvider(\n+            clock,\n+            parentTaskClient,\n+            remoteClusterResolver,\n+            transformConfigManager,\n+            transformAuditor,\n+            transformConfig\n+        );\n+\n+        var latch = new CountDownLatch(1);\n+        provider.createNextCheckpoint(\n+            null,\n+            new LatchedActionListener<>(\n+                ActionListener.wrap(\n+                    response -> fail(\"This test case must fail\"),\n+                    e -> assertThat(\n+                        e.getMessage(),\n+                        startsWith(\n+                            \"Source has [7] failed shards, first shard failure: [some-index][3] failed, \"\n+                                + \"reason [java.lang.Exception: something's wrong\"\n+                        )\n+                    )\n+                ),\n+                latch\n+            )\n+        );\n+        assertTrue(latch.await(1, TimeUnit.MILLISECONDS));\n+    }\n+\n+    private void mockGetIndexResponse(String indexName) {\n         GetIndexResponse getIndexResponse = new GetIndexResponse(new String[] { indexName }, null, null, null, null, null);\n         doAnswer(withResponse(getIndexResponse)).when(client).execute(eq(GetIndexAction.INSTANCE), any(), any());\n+    }\n \n+    private void mockIndicesStatsResponse(String indexName) {\n         IndicesStatsResponse indicesStatsResponse = mock(IndicesStatsResponse.class);\n         doReturn(7).when(indicesStatsResponse).getFailedShards();\n         doReturn(\n             new DefaultShardOperationFailedException[] {\n                 new DefaultShardOperationFailedException(indexName, 3, new Exception(\"something's wrong\")) }\n         ).when(indicesStatsResponse).getShardFailures();\n         doAnswer(withResponse(indicesStatsResponse)).when(client).execute(eq(IndicesStatsAction.INSTANCE), any(), any());\n+    }\n \n-        DefaultCheckpointProvider provider = new DefaultCheckpointProvider(\n+    private void mockGetCheckpointAction() {\n+        doAnswer(invocationOnMock -> {\n+            ActionListener<?> listener = invocationOnMock.getArgument(2);\n+            listener.onFailure(new ActionNotFoundTransportException(\"This should fail.\"));\n+            return null;\n+        }).when(client).execute(eq(GetCheckpointAction.INSTANCE), any(), any());\n+    }\n+\n+    public void testHandlingNoClusters() throws Exception {\n+        var transformId = getTestName();\n+        var indexName = \"some-missing-index\";\n+        var transformConfig = new TransformConfig.Builder(TransformConfigTests.randomTransformConfig(transformId)).setSource(\n+            new SourceConfig(indexName)\n+        ).build();\n+\n+        var remoteClusterResolver = mock(RemoteClusterResolver.class);\n+        doReturn(new RemoteClusterResolver.ResolvedIndices(Map.of(), List.of())).when(remoteClusterResolver)\n+            .resolve(transformConfig.getSource().getIndex());\n+\n+        mockGetIndexResponse(indexName);\n+        mockIndicesStatsResponse(indexName);\n+\n+        var provider = new DefaultCheckpointProvider(\n             clock,\n             parentTaskClient,\n             remoteClusterResolver,\n@@ -262,24 +322,18 @@ public void testHandlingShardFailures() throws Exception {\n             transformConfig\n         );\n \n-        CountDownLatch latch = new CountDownLatch(1);\n+        var latch = new CountDownLatch(1);\n         provider.createNextCheckpoint(\n             null,\n             new LatchedActionListener<>(\n                 ActionListener.wrap(\n                     response -> fail(\"This test case must fail\"),\n-                    e -> assertThat(\n-                        e.getMessage(),\n-                        startsWith(\n-                            \"Source has [7] failed shards, first shard failure: [some-index][3] failed, \"\n-                                + \"reason [java.lang.Exception: something's wrong\"\n-                        )\n-                    )\n+                    e -> assertThat(e.getMessage(), equalTo(\"No clusters exist for [some-missing-index]\"))\n                 ),\n                 latch\n             )\n         );\n-        latch.await(10, TimeUnit.SECONDS);\n+        assertTrue(latch.await(1, TimeUnit.MILLISECONDS));\n     }\n \n     public void testSourceHasChanged() throws InterruptedException {\n@@ -407,8 +461,7 @@ private DefaultCheckpointProvider newCheckpointProvider(TransformConfig transfor\n         );\n     }\n \n-    private void assertExpectation(LoggingExpectation loggingExpectation, AuditExpectation auditExpectation, Runnable codeBlock)\n-        throws IllegalAccessException {\n+    private void assertExpectation(LoggingExpectation loggingExpectation, AuditExpectation auditExpectation, Runnable codeBlock) {\n         MockLogAppender mockLogAppender = new MockLogAppender();\n         mockLogAppender.start();\n \n@@ -429,10 +482,9 @@ private void assertExpectation(LoggingExpectation loggingExpectation, AuditExpec\n         }\n     }\n \n-    @SuppressWarnings(\"unchecked\")\n     private static <Response> Answer<Response> withResponse(Response response) {\n         return invocationOnMock -> {\n-            ActionListener<Response> listener = (ActionListener<Response>) invocationOnMock.getArguments()[2];\n+            ActionListener<Response> listener = invocationOnMock.getArgument(2);\n             listener.onResponse(response);\n             return null;\n         };",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/CheckpointException.java",
+          "patch": "@@ -10,6 +10,10 @@\n import org.elasticsearch.ElasticsearchException;\n \n class CheckpointException extends ElasticsearchException {\n+    CheckpointException(String msg, Object... params) {\n+        super(msg, params);\n+    }\n+\n     CheckpointException(String msg, Throwable cause, Object... params) {\n         super(msg, cause, params);\n     }"
+        },
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java",
+          "patch": "@@ -116,6 +116,11 @@ protected void getIndexCheckpoints(TimeValue timeout, ActionListener<Map<String,\n             ResolvedIndices resolvedIndexes = remoteClusterResolver.resolve(transformConfig.getSource().getIndex());\n             ActionListener<Map<String, long[]>> groupedListener = listener;\n \n+            if (resolvedIndexes.numClusters() == 0) {\n+                var indices = String.join(\",\", transformConfig.getSource().getIndex());\n+                listener.onFailure(new CheckpointException(\"No clusters exist for [{}]\", indices));\n+            }\n+\n             if (resolvedIndexes.numClusters() > 1) {\n                 ActionListener<Collection<Map<String, long[]>>> mergeMapsListener = ActionListener.wrap(indexCheckpoints -> {\n                     listener.onResponse(\n@@ -234,10 +239,7 @@ private static void getCheckpointsFromOneClusterV2(\n         );\n         ActionListener<GetCheckpointAction.Response> checkpointListener;\n         if (RemoteClusterService.LOCAL_CLUSTER_GROUP_KEY.equals(cluster)) {\n-            checkpointListener = ActionListener.wrap(\n-                checkpointResponse -> listener.onResponse(checkpointResponse.getCheckpoints()),\n-                listener::onFailure\n-            );\n+            checkpointListener = listener.delegateFailure((l, r) -> l.onResponse(r.getCheckpoints()));\n         } else {\n             checkpointListener = ActionListener.wrap(\n                 checkpointResponse -> listener.onResponse(\n@@ -401,12 +403,12 @@ public void getCheckpointingInfo(\n \n         long timestamp = clock.millis();\n \n-        getIndexCheckpoints(timeout, ActionListener.wrap(checkpointsByIndex -> {\n-            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, checkpointsByIndex, 0L);\n+        getIndexCheckpoints(timeout, listener.delegateFailure((l, r) -> {\n+            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, r, 0L);\n             checkpointingInfoBuilder.setSourceCheckpoint(sourceCheckpoint);\n             checkpointingInfoBuilder.setOperationsBehind(TransformCheckpoint.getBehind(lastCheckpoint, sourceCheckpoint));\n-            listener.onResponse(checkpointingInfoBuilder);\n-        }, listener::onFailure));\n+            l.onResponse(checkpointingInfoBuilder);\n+        }));\n     }\n \n     @Override"
+        },
+        {
+          "file": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProviderTests.java",
+          "patch": "@@ -31,6 +31,7 @@\n import org.elasticsearch.test.MockLogAppender;\n import org.elasticsearch.test.MockLogAppender.LoggingExpectation;\n import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.ActionNotFoundTransportException;\n import org.elasticsearch.xpack.core.transform.action.GetCheckpointAction;\n import org.elasticsearch.xpack.core.transform.transforms.SourceConfig;\n import org.elasticsearch.xpack.core.transform.transforms.TransformCheckpoint;\n@@ -67,7 +68,7 @@\n \n public class DefaultCheckpointProviderTests extends ESTestCase {\n \n-    private static Logger checkpointProviderLogger = LogManager.getLogger(DefaultCheckpointProvider.class);\n+    private static final Logger checkpointProviderLogger = LogManager.getLogger(DefaultCheckpointProvider.class);\n \n     private Clock clock;\n     private Client client;\n@@ -96,7 +97,7 @@ public void setUpMocks() {\n         transformAuditor = MockTransformAuditor.createMockAuditor();\n     }\n \n-    public void testReportSourceIndexChangesRunsEmpty() throws Exception {\n+    public void testReportSourceIndexChangesRunsEmpty() {\n         String transformId = getTestName();\n         TransformConfig transformConfig = TransformConfigTests.randomTransformConfig(transformId);\n         DefaultCheckpointProvider provider = newCheckpointProvider(transformConfig);\n@@ -138,7 +139,7 @@ public void testReportSourceIndexChangesRunsEmpty() throws Exception {\n         );\n     }\n \n-    public void testReportSourceIndexChangesAddDelete() throws Exception {\n+    public void testReportSourceIndexChangesAddDelete() {\n         String transformId = getTestName();\n         TransformConfig transformConfig = TransformConfigTests.randomTransformConfig(transformId);\n         DefaultCheckpointProvider provider = newCheckpointProvider(transformConfig);\n@@ -197,7 +198,7 @@ public void testReportSourceIndexChangesAddDelete() throws Exception {\n         );\n     }\n \n-    public void testReportSourceIndexChangesAddDeleteMany() throws Exception {\n+    public void testReportSourceIndexChangesAddDeleteMany() {\n         String transformId = getTestName();\n         TransformConfig transformConfig = TransformConfigTests.randomTransformConfig(transformId);\n         DefaultCheckpointProvider provider = newCheckpointProvider(transformConfig);\n@@ -231,29 +232,88 @@ public void testReportSourceIndexChangesAddDeleteMany() throws Exception {\n     }\n \n     public void testHandlingShardFailures() throws Exception {\n-        String transformId = getTestName();\n-        String indexName = \"some-index\";\n+        var transformId = getTestName();\n+        var indexName = \"some-index\";\n         TransformConfig transformConfig = new TransformConfig.Builder(TransformConfigTests.randomTransformConfig(transformId)).setSource(\n             new SourceConfig(indexName)\n         ).build();\n \n-        RemoteClusterResolver remoteClusterResolver = mock(RemoteClusterResolver.class);\n+        var remoteClusterResolver = mock(RemoteClusterResolver.class);\n         doReturn(new RemoteClusterResolver.ResolvedIndices(Collections.emptyMap(), Collections.singletonList(indexName))).when(\n             remoteClusterResolver\n         ).resolve(transformConfig.getSource().getIndex());\n \n+        mockGetIndexResponse(indexName);\n+        mockIndicesStatsResponse(indexName);\n+        mockGetCheckpointAction();\n+\n+        var provider = new DefaultCheckpointProvider(\n+            clock,\n+            parentTaskClient,\n+            remoteClusterResolver,\n+            transformConfigManager,\n+            transformAuditor,\n+            transformConfig\n+        );\n+\n+        var latch = new CountDownLatch(1);\n+        provider.createNextCheckpoint(\n+            null,\n+            new LatchedActionListener<>(\n+                ActionListener.wrap(\n+                    response -> fail(\"This test case must fail\"),\n+                    e -> assertThat(\n+                        e.getMessage(),\n+                        startsWith(\n+                            \"Source has [7] failed shards, first shard failure: [some-index][3] failed, \"\n+                                + \"reason [java.lang.Exception: something's wrong\"\n+                        )\n+                    )\n+                ),\n+                latch\n+            )\n+        );\n+        assertTrue(latch.await(1, TimeUnit.MILLISECONDS));\n+    }\n+\n+    private void mockGetIndexResponse(String indexName) {\n         GetIndexResponse getIndexResponse = new GetIndexResponse(new String[] { indexName }, null, null, null, null, null);\n         doAnswer(withResponse(getIndexResponse)).when(client).execute(eq(GetIndexAction.INSTANCE), any(), any());\n+    }\n \n+    private void mockIndicesStatsResponse(String indexName) {\n         IndicesStatsResponse indicesStatsResponse = mock(IndicesStatsResponse.class);\n         doReturn(7).when(indicesStatsResponse).getFailedShards();\n         doReturn(\n             new DefaultShardOperationFailedException[] {\n                 new DefaultShardOperationFailedException(indexName, 3, new Exception(\"something's wrong\")) }\n         ).when(indicesStatsResponse).getShardFailures();\n         doAnswer(withResponse(indicesStatsResponse)).when(client).execute(eq(IndicesStatsAction.INSTANCE), any(), any());\n+    }\n \n-        DefaultCheckpointProvider provider = new DefaultCheckpointProvider(\n+    private void mockGetCheckpointAction() {\n+        doAnswer(invocationOnMock -> {\n+            ActionListener<?> listener = invocationOnMock.getArgument(2);\n+            listener.onFailure(new ActionNotFoundTransportException(\"This should fail.\"));\n+            return null;\n+        }).when(client).execute(eq(GetCheckpointAction.INSTANCE), any(), any());\n+    }\n+\n+    public void testHandlingNoClusters() throws Exception {\n+        var transformId = getTestName();\n+        var indexName = \"some-missing-index\";\n+        var transformConfig = new TransformConfig.Builder(TransformConfigTests.randomTransformConfig(transformId)).setSource(\n+            new SourceConfig(indexName)\n+        ).build();\n+\n+        var remoteClusterResolver = mock(RemoteClusterResolver.class);\n+        doReturn(new RemoteClusterResolver.ResolvedIndices(Map.of(), List.of())).when(remoteClusterResolver)\n+            .resolve(transformConfig.getSource().getIndex());\n+\n+        mockGetIndexResponse(indexName);\n+        mockIndicesStatsResponse(indexName);\n+\n+        var provider = new DefaultCheckpointProvider(\n             clock,\n             parentTaskClient,\n             remoteClusterResolver,\n@@ -262,24 +322,18 @@ public void testHandlingShardFailures() throws Exception {\n             transformConfig\n         );\n \n-        CountDownLatch latch = new CountDownLatch(1);\n+        var latch = new CountDownLatch(1);\n         provider.createNextCheckpoint(\n             null,\n             new LatchedActionListener<>(\n                 ActionListener.wrap(\n                     response -> fail(\"This test case must fail\"),\n-                    e -> assertThat(\n-                        e.getMessage(),\n-                        startsWith(\n-                            \"Source has [7] failed shards, first shard failure: [some-index][3] failed, \"\n-                                + \"reason [java.lang.Exception: something's wrong\"\n-                        )\n-                    )\n+                    e -> assertThat(e.getMessage(), equalTo(\"No clusters exist for [some-missing-index]\"))\n                 ),\n                 latch\n             )\n         );\n-        latch.await(10, TimeUnit.SECONDS);\n+        assertTrue(latch.await(1, TimeUnit.MILLISECONDS));\n     }\n \n     public void testSourceHasChanged() throws InterruptedException {\n@@ -407,8 +461,7 @@ private DefaultCheckpointProvider newCheckpointProvider(TransformConfig transfor\n         );\n     }\n \n-    private void assertExpectation(LoggingExpectation loggingExpectation, AuditExpectation auditExpectation, Runnable codeBlock)\n-        throws IllegalAccessException {\n+    private void assertExpectation(LoggingExpectation loggingExpectation, AuditExpectation auditExpectation, Runnable codeBlock) {\n         MockLogAppender mockLogAppender = new MockLogAppender();\n         mockLogAppender.start();\n \n@@ -429,10 +482,9 @@ private void assertExpectation(LoggingExpectation loggingExpectation, AuditExpec\n         }\n     }\n \n-    @SuppressWarnings(\"unchecked\")\n     private static <Response> Answer<Response> withResponse(Response response) {\n         return invocationOnMock -> {\n-            ActionListener<Response> listener = (ActionListener<Response>) invocationOnMock.getArguments()[2];\n+            ActionListener<Response> listener = invocationOnMock.getArgument(2);\n             listener.onResponse(response);\n             return null;\n         };"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-03-26T23:28:31Z",
+      "user": "prwhelan",
+      "body": "When there are no remote or local clusters for a given source index, we call the listener's `onFailure` method with a `CheckpointException`. A running transform will fail and retry, eventually moving into an unhealthy and failed state.  Any call to the stats API will note the checkpoint failure and return.\r\n\r\nThis fixes a timeout issue calling the Transform stats API and prevents the Transform from being stuck in indexing.\r\n\r\nFix #106790\r\nFix #104533\r\n"
+    },
+    {
+      "type": "commit",
+      "date": "2024-03-26T23:28:54Z",
+      "sha": "af439cd5f081445b576ddb8107256b4f362645e5",
+      "message": "Update docs/changelog/106793.yaml",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-03-26T23:28:54Z",
+      "author_date": "2024-03-26T23:28:54Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-03-26T23:28:54Z",
+      "diff_text": "docs/changelog/106793.yaml\n@@ -0,0 +1,7 @@\n+pr: 106793\n+summary: Fail checkpoint on missing clusters\n+area: Transform\n+type: bug\n+issues:\n+ - 104533\n+ - 106790",
+      "diff": [
+        {
+          "file": "docs/changelog/106793.yaml",
+          "patch": "@@ -0,0 +1,7 @@\n+pr: 106793\n+summary: Fail checkpoint on missing clusters\n+area: Transform\n+type: bug\n+issues:\n+ - 104533\n+ - 106790"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2021636173,
+      "created_at": "2024-03-26T23:28:54Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/ml-core (Team:ML)"
+    },
+    {
+      "type": "comment",
+      "id": 2021636199,
+      "created_at": "2024-03-26T23:28:55Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @prwhelan, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review_comment",
+      "id": 1540864929,
+      "created_at": "2024-03-27T10:43:55Z",
+      "user": "przemekwitek",
+      "body": "Should we `return;` here to prevent the rest of the code from being executed?",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java",
+      "diff_hunk": "@@ -116,6 +116,11 @@ protected void getIndexCheckpoints(TimeValue timeout, ActionListener<Map<String,\n             ResolvedIndices resolvedIndexes = remoteClusterResolver.resolve(transformConfig.getSource().getIndex());\n             ActionListener<Map<String, long[]>> groupedListener = listener;\n \n+            if (resolvedIndexes.numClusters() == 0) {\n+                var indices = String.join(\",\", transformConfig.getSource().getIndex());\n+                listener.onFailure(new CheckpointException(\"No clusters exist for [{}]\", indices));\n+            }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 123,
+      "original_line": 122,
+      "side": "RIGHT",
+      "original_position": 7,
+      "position": 8,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1541012818,
+          "user": "prwhelan",
+          "body": "Yeah that's probably a good change to increase safety",
+          "created_at": "2024-03-27T12:30:58Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1540866994,
+      "created_at": "2024-03-27T10:45:33Z",
+      "user": "przemekwitek",
+      "body": "Would it make sense to keep using the more descriptive name (`checkpointResponse`) rather than `r`?",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java",
+      "diff_hunk": "@@ -234,10 +239,7 @@ private static void getCheckpointsFromOneClusterV2(\n         );\n         ActionListener<GetCheckpointAction.Response> checkpointListener;\n         if (RemoteClusterService.LOCAL_CLUSTER_GROUP_KEY.equals(cluster)) {\n-            checkpointListener = ActionListener.wrap(\n-                checkpointResponse -> listener.onResponse(checkpointResponse.getCheckpoints()),\n-                listener::onFailure\n-            );\n+            checkpointListener = listener.delegateFailure((l, r) -> l.onResponse(r.getCheckpoints()));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 242,
+      "side": "RIGHT",
+      "original_position": 20,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1541025896,
+          "user": "prwhelan",
+          "body": "Yes, though I replaced this with `listener.safeMap(GetCheckpointAction.Response::getCheckpoints)` since it will do the `l.onResponse` for us",
+          "created_at": "2024-03-27T12:38:18Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1540867398,
+      "created_at": "2024-03-27T10:45:49Z",
+      "user": "przemekwitek",
+      "body": "Would it make sense to keep using the more descriptive name (`checkpointsByIndex`) rather than `r`?",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java",
+      "diff_hunk": "@@ -401,12 +403,12 @@ public void getCheckpointingInfo(\n \n         long timestamp = clock.millis();\n \n-        getIndexCheckpoints(timeout, ActionListener.wrap(checkpointsByIndex -> {\n-            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, checkpointsByIndex, 0L);\n+        getIndexCheckpoints(timeout, listener.delegateFailure((l, r) -> {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 406,
+      "side": "RIGHT",
+      "original_position": 30,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1962940731,
+      "created_at": "2024-03-27T10:46:54Z",
+      "user": "przemekwitek",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1963175023,
+      "created_at": "2024-03-27T12:30:58Z",
+      "user": "prwhelan",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1963195028,
+      "created_at": "2024-03-27T12:38:18Z",
+      "user": "prwhelan",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-03-27T12:45:49Z",
+      "sha": "49df1cf3dd8fd98f45d194aaccbb916d6bf82853",
+      "message": "Adding return statement, replacing delegateFailure with safeMap, expand response term",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-03-27T12:45:49Z",
+      "author_date": "2024-03-27T12:45:49Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-03-27T12:45:49Z",
+      "diff_text": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java\n@@ -119,6 +119,7 @@ protected void getIndexCheckpoints(TimeValue timeout, ActionListener<Map<String,\n             if (resolvedIndexes.numClusters() == 0) {\n                 var indices = String.join(\",\", transformConfig.getSource().getIndex());\n                 listener.onFailure(new CheckpointException(\"No clusters exist for [{}]\", indices));\n+                return;\n             }\n \n             if (resolvedIndexes.numClusters() > 1) {\n@@ -239,7 +240,7 @@ private static void getCheckpointsFromOneClusterV2(\n         );\n         ActionListener<GetCheckpointAction.Response> checkpointListener;\n         if (RemoteClusterService.LOCAL_CLUSTER_GROUP_KEY.equals(cluster)) {\n-            checkpointListener = listener.delegateFailure((l, r) -> l.onResponse(r.getCheckpoints()));\n+            checkpointListener = listener.safeMap(GetCheckpointAction.Response::getCheckpoints);\n         } else {\n             checkpointListener = ActionListener.wrap(\n                 checkpointResponse -> listener.onResponse(\n@@ -403,8 +404,8 @@ public void getCheckpointingInfo(\n \n         long timestamp = clock.millis();\n \n-        getIndexCheckpoints(timeout, listener.delegateFailure((l, r) -> {\n-            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, r, 0L);\n+        getIndexCheckpoints(timeout, listener.delegateFailure((l, checkpointsByIndex) -> {\n+            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, checkpointsByIndex, 0L);\n             checkpointingInfoBuilder.setSourceCheckpoint(sourceCheckpoint);\n             checkpointingInfoBuilder.setOperationsBehind(TransformCheckpoint.getBehind(lastCheckpoint, sourceCheckpoint));\n             l.onResponse(checkpointingInfoBuilder);",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/checkpoint/DefaultCheckpointProvider.java",
+          "patch": "@@ -119,6 +119,7 @@ protected void getIndexCheckpoints(TimeValue timeout, ActionListener<Map<String,\n             if (resolvedIndexes.numClusters() == 0) {\n                 var indices = String.join(\",\", transformConfig.getSource().getIndex());\n                 listener.onFailure(new CheckpointException(\"No clusters exist for [{}]\", indices));\n+                return;\n             }\n \n             if (resolvedIndexes.numClusters() > 1) {\n@@ -239,7 +240,7 @@ private static void getCheckpointsFromOneClusterV2(\n         );\n         ActionListener<GetCheckpointAction.Response> checkpointListener;\n         if (RemoteClusterService.LOCAL_CLUSTER_GROUP_KEY.equals(cluster)) {\n-            checkpointListener = listener.delegateFailure((l, r) -> l.onResponse(r.getCheckpoints()));\n+            checkpointListener = listener.safeMap(GetCheckpointAction.Response::getCheckpoints);\n         } else {\n             checkpointListener = ActionListener.wrap(\n                 checkpointResponse -> listener.onResponse(\n@@ -403,8 +404,8 @@ public void getCheckpointingInfo(\n \n         long timestamp = clock.millis();\n \n-        getIndexCheckpoints(timeout, listener.delegateFailure((l, r) -> {\n-            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, r, 0L);\n+        getIndexCheckpoints(timeout, listener.delegateFailure((l, checkpointsByIndex) -> {\n+            TransformCheckpoint sourceCheckpoint = new TransformCheckpoint(transformConfig.getId(), timestamp, -1L, checkpointsByIndex, 0L);\n             checkpointingInfoBuilder.setSourceCheckpoint(sourceCheckpoint);\n             checkpointingInfoBuilder.setOperationsBehind(TransformCheckpoint.getBehind(lastCheckpoint, sourceCheckpoint));\n             l.onResponse(checkpointingInfoBuilder);"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1963729655,
+      "created_at": "2024-03-27T15:39:49Z",
+      "user": "przemekwitek",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 2023797273,
+      "created_at": "2024-03-27T19:24:21Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💚 Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [8.13](https://github.com/elastic/elasticsearch/pull/106842)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/106842\">](https://github.com/elastic/elasticsearch/pull/106842) |"
+    }
+  ]
+}

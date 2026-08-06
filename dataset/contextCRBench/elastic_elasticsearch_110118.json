@@ -1,0 +1,41 @@
+{
+    "pr_body": "Closes #109866\r\n\r\n`testClientCancellation` had an issue where the test could fail if the cancellation happened before the mock action returned its response. This change tightens up the assertions to ensure that in the event we do create a chunked response, we eventually close it.",
+    "original_commit_id": "f0afd9165064edf9d3e18a5b960e57bf96de71f2",
+    "merged": true,
+    "pr_number": 110118,
+    "pr_title": "Fix Netty4ChunkedContinuationsIT#testClientCancellation",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Raised #110175 in the hope that it might provide more info about the failure and validate the theory",
+        "Btw, maybe it's worth to update the PR description now that you got new findings and fix. Thanks!"
+    ],
+    "commit_id": "8561e5397961c2e3c9ae2161ff951c6441620bbc",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 649,
+            "start_side": null,
+            "start_line": null,
+            "line": 649,
+            "comment_lines": [
+                "[][649]"
+            ],
+            "review_comment": [
+                "After looking at [a failed build scan with the logging turned on](https://gradle-enterprise.elastic.co/s/f6m3yhijj4uwq/tests/task/:modules:transport-netty4:internalClusterTest/details/org.elasticsearch.http.netty4.Netty4ChunkedContinuationsIT/testClientCancellation?top-execution=1), it became apparent that the unbalanced sequence of events went like (most recent first):\r\n\r\n1. BaseRestHandler closing the RestChannelConsumer (decRef)\r\n\t- at `Netty4ChunkedContinuationsIT:641`\r\n2. Closing the resource tracker (decRef)\r\n\t- at `Netty4ChunkedContinuationsIT:324`\r\n3. RestChannelConsumer.accept (incRef)\r\n\t- at `Netty4ChunkedContinuationsIT:646`\r\n4. prepareRequest (incRef)\r\n\t- at `Netty4ChunkedContinuationsIT:637`\r\n5. created (implicit incRef)\r\n\t- at `Netty4ChunkedContinuationsIT.java:322`\r\n\r\nWhich suggests to me the following sequence of events:\r\n1. `RestChannelConsumer.accept` is called (and `mustIncRef` is called)\r\n2. `TransportInfiniteContinuationsAction.doExecute` is called and schedules the return of the chunked response\r\n3. The request is cancelled, the channel is closed\r\n4. The chunked response is returned, `RestActionListener#onResponse` fails in the call to `#ensureOpen()` and ends up calling `RestActionListener#onFailure` instead of `RestActionListener#processResponse` so the `decRef` on line 655 is never called, and we have our inbalance.\r\n\r\n### Options for fixing\r\nIf we move the `mustIncRef` such that it only occurs when we receive the `InfiniteContinuationsPlugin.Response` from the action (as above), the test shouldn't be susceptible to such a failure, but it does indicate that the `Response` object can be created but never closed. I'm not sure if this is an actual bug. `Response` type parameter doesn't have any type constraints in `RestActionListener` so it's not necessarily `Releasable`. I'm not clear on what the contract is here and whether `RestActionListener` has a responsibility to try and close the `Response` when it fails due to `#ensureOpen()` throwing.\r\n\r\n",
+                "I think the new positioning of `mustIncRef` is OK, because instead of\r\n\r\n\"if we accepted the request\" -> \"then we close the chunked response\"\r\n\r\nwe now assert\r\n\r\n\"if we created the chunked response\" -> \"then we close the chunked response\"\r\n\r\nBut I may have missed something.",
+                "The other plugins (`YieldsContinuationsPlugin` at least) seem to have the same issue, but I guess it doesn't trigger because we wait for the request to complete when calling those.",
+                "Good job on tracking this down. I can confirm the test can fail with following diff\r\n```diff\r\n--- a/modules/transport-netty4/src/internalClusterTest/java/org/elasticsearch/http/netty4/Netty4ChunkedContinuationsIT.java\r\n+++ b/modules/transport-netty4/src/internalClusterTest/java/org/elasticsearch/http/netty4/Netty4ChunkedContinuationsIT.java\r\n@@ -645,6 +645,12 @@ public class Netty4ChunkedContinuationsIT extends ESNetty4IntegTestCase {\r\n                             public void accept(RestChannel channel) {\r\n                                 localRefs.mustIncRef();\r\n                                 client.execute(TYPE, new Request(), new RestActionListener<>(channel) {\r\n+                                    @Override\r\n+                                    protected void ensureOpen() {\r\n+                                        safeSleep(500);\r\n+                                        super.ensureOpen();\r\n+                                    }\r\n+\r\n                                     @Override\r\n                                     protected void processResponse(Response response) {\r\n                                         channel.sendResponse(RestResponse.chunked(RestStatus.OK, response.getResponseBodyPart(), () -> {\r\n```\r\n\r\nI think this is the right fix we are doing the same thing in other `RestActionListener` [implementation](https://github.com/elastic/elasticsearch/blob/f0afd9165064edf9d3e18a5b960e57bf96de71f2/server/src/main/java/org/elasticsearch/rest/action/RestChunkedToXContentListener.java#L44). \ud83d\udc4d ",
+                "Good catch, the analysis looks right to me. However I would still prefer that we didn't just leak the response listener in this case, that's not how production code should behave, and we should be able to assert that it's always completed. I opened https://github.com/elastic/elasticsearch/pull/110309 with an alternative fix which I would prefer."
+            ],
+            "path": "modules/transport-netty4/src/internalClusterTest/java/org/elasticsearch/http/netty4/Netty4ChunkedContinuationsIT.java",
+            "id": 34858,
+            "created_at": "2024-06-27T01:59:25Z",
+            "original_position": 8,
+            "side": "RIGHT",
+            "position": 8,
+            "original_start_line": null
+        }
+    ]
+}

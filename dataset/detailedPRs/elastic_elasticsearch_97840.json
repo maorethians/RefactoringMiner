@@ -1,0 +1,166 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 97840,
+  "pr_number": 97840,
+  "title": "Improve exception handling in Coordinator#publish",
+  "user": "DaveCTurner",
+  "created_at": "2023-07-20T11:47:07Z",
+  "merged_at": "2023-07-20T15:38:49Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Cluster Coordination",
+    "Team:Distributed",
+    "v8.10.0",
+    "v8.9.1"
+  ],
+  "base_commit": "067f5d3e9b9cef3caa22826d804a844cd40a8b00",
+  "merge_commit_sha": "52565a35749589c29f5e29335b357b9b13ba0063",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/97840",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-07-20T11:45:47Z",
+      "sha": "3122d9cc1a4acc89173722582f809693fe1b9863",
+      "message": "Improve exception handling in Coordinator#publish\n\nWe shouldn't complete the publication listener under the `mutex`, and\nit's a little tricky to see which exceptions are or are not impossible\nfrom the way the code is written today.\n\nThis commit solves all that by throwing the exception out to a handler\noutside the mutex, and splitting the enclosing `try...catch` block into\nseveral smaller blocks.\n\nIt also fixes a bug where we could fail to complete the publish listener\nif the publication failed to start properly. With this change, we now\nclearly complete the publication listener on all failure paths.\n\nCloses #97798",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-07-20T11:09:51Z",
+      "author_date": "2023-07-20T11:09:51Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-07-20T11:45:47Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java\n@@ -995,6 +995,11 @@ public void execute(ClusterState currentState) {\n                     allocationService.cleanCaches();\n                 }\n             }\n+\n+            @Override\n+            public String toString() {\n+                return \"cleanMasterService\";\n+            }\n         }.submit(masterService, \"clean-up after stepping down as master\");\n     }\n \n@@ -1518,82 +1523,98 @@ public void publish(\n                             clusterStatePublicationEvent.getNewState().term()\n                         )\n                     );\n-                    publishListener.onFailure(\n-                        new FailedToCommitClusterStateException(\n-                            \"node is no longer master for term \"\n-                                + clusterStatePublicationEvent.getNewState().term()\n-                                + \" while handling publication\"\n-                        )\n+                    throw new FailedToCommitClusterStateException(\n+                        \"node is no longer master for term \"\n+                            + clusterStatePublicationEvent.getNewState().term()\n+                            + \" while handling publication\"\n                     );\n-                    return;\n                 }\n \n                 if (currentPublication.isPresent()) {\n                     assert false : \"[\" + currentPublication.get() + \"] in progress, cannot start new publication\";\n-                    logger.warn(\n+                    logger.error(\n                         () -> format(\n                             \"[%s] failed publication as already publication in progress\",\n                             clusterStatePublicationEvent.getSummary()\n                         )\n                     );\n-                    publishListener.onFailure(\n-                        new FailedToCommitClusterStateException(\"publication \" + currentPublication.get() + \" already in progress\")\n-                    );\n-                    return;\n+                    throw new FailedToCommitClusterStateException(\"publication \" + currentPublication.get() + \" already in progress\");\n                 }\n \n                 assert assertPreviousStateConsistency(clusterStatePublicationEvent);\n \n-                final ClusterState clusterState = clusterStatePublicationEvent.getNewState();\n+                final ClusterState clusterState;\n+                final long publicationContextConstructionStartMillis;\n+                final PublicationTransportHandler.PublicationContext publicationContext;\n+                final PublishRequest publishRequest;\n \n-                assert getLocalNode().equals(clusterState.getNodes().get(getLocalNode().getId()))\n-                    : getLocalNode() + \" should be in published \" + clusterState;\n-\n-                final long publicationContextConstructionStartMillis = transportService.getThreadPool().rawRelativeTimeInMillis();\n-                final PublicationTransportHandler.PublicationContext publicationContext = publicationHandler.newPublicationContext(\n-                    clusterStatePublicationEvent\n-                );\n                 try {\n-                    clusterStatePublicationEvent.setPublicationContextConstructionElapsedMillis(\n-                        transportService.getThreadPool().rawRelativeTimeInMillis() - publicationContextConstructionStartMillis\n-                    );\n+                    clusterState = clusterStatePublicationEvent.getNewState();\n+                    assert getLocalNode().equals(clusterState.getNodes().get(getLocalNode().getId()))\n+                        : getLocalNode() + \" should be in published \" + clusterState;\n+                    publicationContextConstructionStartMillis = transportService.getThreadPool().rawRelativeTimeInMillis();\n+                    publicationContext = publicationHandler.newPublicationContext(clusterStatePublicationEvent);\n+                } catch (Exception e) {\n+                    logger.debug(() -> \"[\" + clusterStatePublicationEvent.getSummary() + \"] publishing failed during context creation\", e);\n+                    becomeCandidate(\"publication context creation\");\n+                    throw new FailedToCommitClusterStateException(\"publishing failed during context creation\", e);\n+                }\n \n-                    final PublishRequest publishRequest = coordinationState.get().handleClientValue(clusterState);\n-                    final CoordinatorPublication publication = new CoordinatorPublication(\n-                        clusterStatePublicationEvent,\n-                        publishRequest,\n-                        publicationContext,\n-                        new ListenableFuture<>(),\n-                        ackListener,\n-                        publishListener\n-                    );\n-                    currentPublication = Optional.of(publication);\n+                try (Releasable ignored = publicationContext::decRef) {\n+                    try {\n+                        clusterStatePublicationEvent.setPublicationContextConstructionElapsedMillis(\n+                            transportService.getThreadPool().rawRelativeTimeInMillis() - publicationContextConstructionStartMillis\n+                        );\n+                        publishRequest = coordinationState.get().handleClientValue(clusterState);\n+                    } catch (Exception e) {\n+                        logger.warn(\n+                            \"failed to start publication of state version [\"\n+                                + clusterState.version()\n+                                + \"] in term [\"\n+                                + clusterState.term()\n+                                + \"] for [\"\n+                                + clusterStatePublicationEvent.getSummary()\n+                                + \"]\",\n+                            e\n+                        );\n+                        becomeCandidate(\"publication creation\");\n+                        throw new FailedToCommitClusterStateException(\"publishing failed while starting\", e);\n+                    }\n \n-                    final DiscoveryNodes publishNodes = publishRequest.getAcceptedState().nodes();\n-                    leaderChecker.setCurrentNodes(publishNodes);\n-                    followersChecker.setCurrentNodes(publishNodes);\n-                    lagDetector.setTrackedNodes(publishNodes);\n-                    publication.start(followersChecker.getFaultyNodes());\n-                } catch (Exception e) {\n-                    logger.warn(\n-                        \"failed to start publication of state version [\"\n-                            + clusterState.version()\n-                            + \"] in term [\"\n-                            + clusterState.term()\n-                            + \"] for [\"\n-                            + clusterStatePublicationEvent.getSummary()\n-                            + \"]\",\n-                        e\n-                    );\n-                    assert currentPublication.isEmpty() : e; // should not fail after setting currentPublication\n-                    becomeCandidate(\"publish\");\n-                } finally {\n-                    publicationContext.decRef();\n+                    try {\n+                        final var publication = new CoordinatorPublication(\n+                            clusterStatePublicationEvent,\n+                            publishRequest,\n+                            publicationContext,\n+                            new ListenableFuture<>(),\n+                            ackListener,\n+                            publishListener\n+                        );\n+                        currentPublication = Optional.of(publication);\n+\n+                        final var publishNodes = publishRequest.getAcceptedState().nodes();\n+                        leaderChecker.setCurrentNodes(publishNodes);\n+                        followersChecker.setCurrentNodes(publishNodes);\n+                        lagDetector.setTrackedNodes(publishNodes);\n+                        publication.start(followersChecker.getFaultyNodes());\n+                    } catch (Exception e) {\n+                        assert false : e;\n+                        if (currentPublication.isEmpty()) {\n+                            // log an error and fail the listener\n+                            throw new IllegalStateException(e);\n+                        } else {\n+                            // becoming candidate will clean up the publication, completing the listener\n+                            becomeCandidate(\"publication start\");\n+                        }\n+                    }\n                 }\n             }\n+        } catch (FailedToCommitClusterStateException failedToCommitClusterStateException) {\n+            publishListener.onFailure(failedToCommitClusterStateException);\n         } catch (Exception e) {\n-            logger.debug(() -> \"[\" + clusterStatePublicationEvent.getSummary() + \"] publishing failed\", e);\n-            publishListener.onFailure(new FailedToCommitClusterStateException(\"publishing failed\", e));\n+            assert false : e; // all exceptions should already be caught and wrapped in a FailedToCommitClusterStateException\n+            logger.error(() -> \"[\" + clusterStatePublicationEvent.getSummary() + \"] publishing unexpectedly failed\", e);\n+            publishListener.onFailure(new FailedToCommitClusterStateException(\"publishing unexpectedly failed\", e));\n         }\n     }\n \nserver/src/main/java/org/elasticsearch/cluster/coordination/stateless/StoreHeartbeatService.java\n@@ -103,7 +103,7 @@ public void onResponse(Heartbeat heartBeat) {\n                     || maxTimeSinceLastHeartbeat.millis() <= heartBeat.timeSinceLastHeartbeatInMillis(absoluteTimeInMillis())) {\n                     runnable.run();\n                 } else {\n-                    logger.trace(\"runIfNoRecentLeader: found recent leader\");\n+                    logger.trace(\"runIfNoRecentLeader: found recent leader [{}]\", heartBeat);\n                 }\n             }\n ",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java",
+          "patch": "@@ -995,6 +995,11 @@ public void execute(ClusterState currentState) {\n                     allocationService.cleanCaches();\n                 }\n             }\n+\n+            @Override\n+            public String toString() {\n+                return \"cleanMasterService\";\n+            }\n         }.submit(masterService, \"clean-up after stepping down as master\");\n     }\n \n@@ -1518,82 +1523,98 @@ public void publish(\n                             clusterStatePublicationEvent.getNewState().term()\n                         )\n                     );\n-                    publishListener.onFailure(\n-                        new FailedToCommitClusterStateException(\n-                            \"node is no longer master for term \"\n-                                + clusterStatePublicationEvent.getNewState().term()\n-                                + \" while handling publication\"\n-                        )\n+                    throw new FailedToCommitClusterStateException(\n+                        \"node is no longer master for term \"\n+                            + clusterStatePublicationEvent.getNewState().term()\n+                            + \" while handling publication\"\n                     );\n-                    return;\n                 }\n \n                 if (currentPublication.isPresent()) {\n                     assert false : \"[\" + currentPublication.get() + \"] in progress, cannot start new publication\";\n-                    logger.warn(\n+                    logger.error(\n                         () -> format(\n                             \"[%s] failed publication as already publication in progress\",\n                             clusterStatePublicationEvent.getSummary()\n                         )\n                     );\n-                    publishListener.onFailure(\n-                        new FailedToCommitClusterStateException(\"publication \" + currentPublication.get() + \" already in progress\")\n-                    );\n-                    return;\n+                    throw new FailedToCommitClusterStateException(\"publication \" + currentPublication.get() + \" already in progress\");\n                 }\n \n                 assert assertPreviousStateConsistency(clusterStatePublicationEvent);\n \n-                final ClusterState clusterState = clusterStatePublicationEvent.getNewState();\n+                final ClusterState clusterState;\n+                final long publicationContextConstructionStartMillis;\n+                final PublicationTransportHandler.PublicationContext publicationContext;\n+                final PublishRequest publishRequest;\n \n-                assert getLocalNode().equals(clusterState.getNodes().get(getLocalNode().getId()))\n-                    : getLocalNode() + \" should be in published \" + clusterState;\n-\n-                final long publicationContextConstructionStartMillis = transportService.getThreadPool().rawRelativeTimeInMillis();\n-                final PublicationTransportHandler.PublicationContext publicationContext = publicationHandler.newPublicationContext(\n-                    clusterStatePublicationEvent\n-                );\n                 try {\n-                    clusterStatePublicationEvent.setPublicationContextConstructionElapsedMillis(\n-                        transportService.getThreadPool().rawRelativeTimeInMillis() - publicationContextConstructionStartMillis\n-                    );\n+                    clusterState = clusterStatePublicationEvent.getNewState();\n+                    assert getLocalNode().equals(clusterState.getNodes().get(getLocalNode().getId()))\n+                        : getLocalNode() + \" should be in published \" + clusterState;\n+                    publicationContextConstructionStartMillis = transportService.getThreadPool().rawRelativeTimeInMillis();\n+                    publicationContext = publicationHandler.newPublicationContext(clusterStatePublicationEvent);\n+                } catch (Exception e) {\n+                    logger.debug(() -> \"[\" + clusterStatePublicationEvent.getSummary() + \"] publishing failed during context creation\", e);\n+                    becomeCandidate(\"publication context creation\");\n+                    throw new FailedToCommitClusterStateException(\"publishing failed during context creation\", e);\n+                }\n \n-                    final PublishRequest publishRequest = coordinationState.get().handleClientValue(clusterState);\n-                    final CoordinatorPublication publication = new CoordinatorPublication(\n-                        clusterStatePublicationEvent,\n-                        publishRequest,\n-                        publicationContext,\n-                        new ListenableFuture<>(),\n-                        ackListener,\n-                        publishListener\n-                    );\n-                    currentPublication = Optional.of(publication);\n+                try (Releasable ignored = publicationContext::decRef) {\n+                    try {\n+                        clusterStatePublicationEvent.setPublicationContextConstructionElapsedMillis(\n+                            transportService.getThreadPool().rawRelativeTimeInMillis() - publicationContextConstructionStartMillis\n+                        );\n+                        publishRequest = coordinationState.get().handleClientValue(clusterState);\n+                    } catch (Exception e) {\n+                        logger.warn(\n+                            \"failed to start publication of state version [\"\n+                                + clusterState.version()\n+                                + \"] in term [\"\n+                                + clusterState.term()\n+                                + \"] for [\"\n+                                + clusterStatePublicationEvent.getSummary()\n+                                + \"]\",\n+                            e\n+                        );\n+                        becomeCandidate(\"publication creation\");\n+                        throw new FailedToCommitClusterStateException(\"publishing failed while starting\", e);\n+                    }\n \n-                    final DiscoveryNodes publishNodes = publishRequest.getAcceptedState().nodes();\n-                    leaderChecker.setCurrentNodes(publishNodes);\n-                    followersChecker.setCurrentNodes(publishNodes);\n-                    lagDetector.setTrackedNodes(publishNodes);\n-                    publication.start(followersChecker.getFaultyNodes());\n-                } catch (Exception e) {\n-                    logger.warn(\n-                        \"failed to start publication of state version [\"\n-                            + clusterState.version()\n-                            + \"] in term [\"\n-                            + clusterState.term()\n-                            + \"] for [\"\n-                            + clusterStatePublicationEvent.getSummary()\n-                            + \"]\",\n-                        e\n-                    );\n-                    assert currentPublication.isEmpty() : e; // should not fail after setting currentPublication\n-                    becomeCandidate(\"publish\");\n-                } finally {\n-                    publicationContext.decRef();\n+                    try {\n+                        final var publication = new CoordinatorPublication(\n+                            clusterStatePublicationEvent,\n+                            publishRequest,\n+                            publicationContext,\n+                            new ListenableFuture<>(),\n+                            ackListener,\n+                            publishListener\n+                        );\n+                        currentPublication = Optional.of(publication);\n+\n+                        final var publishNodes = publishRequest.getAcceptedState().nodes();\n+                        leaderChecker.setCurrentNodes(publishNodes);\n+                        followersChecker.setCurrentNodes(publishNodes);\n+                        lagDetector.setTrackedNodes(publishNodes);\n+                        publication.start(followersChecker.getFaultyNodes());\n+                    } catch (Exception e) {\n+                        assert false : e;\n+                        if (currentPublication.isEmpty()) {\n+                            // log an error and fail the listener\n+                            throw new IllegalStateException(e);\n+                        } else {\n+                            // becoming candidate will clean up the publication, completing the listener\n+                            becomeCandidate(\"publication start\");\n+                        }\n+                    }\n                 }\n             }\n+        } catch (FailedToCommitClusterStateException failedToCommitClusterStateException) {\n+            publishListener.onFailure(failedToCommitClusterStateException);\n         } catch (Exception e) {\n-            logger.debug(() -> \"[\" + clusterStatePublicationEvent.getSummary() + \"] publishing failed\", e);\n-            publishListener.onFailure(new FailedToCommitClusterStateException(\"publishing failed\", e));\n+            assert false : e; // all exceptions should already be caught and wrapped in a FailedToCommitClusterStateException\n+            logger.error(() -> \"[\" + clusterStatePublicationEvent.getSummary() + \"] publishing unexpectedly failed\", e);\n+            publishListener.onFailure(new FailedToCommitClusterStateException(\"publishing unexpectedly failed\", e));\n         }\n     }\n "
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/stateless/StoreHeartbeatService.java",
+          "patch": "@@ -103,7 +103,7 @@ public void onResponse(Heartbeat heartBeat) {\n                     || maxTimeSinceLastHeartbeat.millis() <= heartBeat.timeSinceLastHeartbeatInMillis(absoluteTimeInMillis())) {\n                     runnable.run();\n                 } else {\n-                    logger.trace(\"runIfNoRecentLeader: found recent leader\");\n+                    logger.trace(\"runIfNoRecentLeader: found recent leader [{}]\", heartBeat);\n                 }\n             }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-07-20T11:47:07Z",
+      "user": "DaveCTurner",
+      "body": "We shouldn't complete the publication listener under the `mutex`, and\r\nit's a little tricky to see which exceptions are or are not impossible\r\nfrom the way the code is written today.\r\n\r\nThis commit solves all that by throwing the exception out to a handler\r\noutside the mutex, and splitting the enclosing `try...catch` block into\r\nseveral smaller blocks.\r\n\r\nIt also fixes a bug where we could fail to complete the publish listener\r\nif the publication failed to start properly. With this change, we now\r\nclearly complete the publication listener on all failure paths.\r\n\r\nCloses #97798"
+    },
+    {
+      "type": "commit",
+      "date": "2023-07-20T11:47:32Z",
+      "sha": "0f862592836b536300f3ef453fe66b23af1bb131",
+      "message": "Update docs/changelog/97840.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-07-20T11:47:32Z",
+      "author_date": "2023-07-20T11:47:32Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-07-20T11:47:32Z",
+      "diff_text": "docs/changelog/97840.yaml\n@@ -0,0 +1,6 @@\n+pr: 97840\n+summary: Improve exception handling in Coordinator#publish\n+area: Cluster Coordination\n+type: bug\n+issues:\n+ - 97798",
+      "diff": [
+        {
+          "file": "docs/changelog/97840.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 97840\n+summary: Improve exception handling in Coordinator#publish\n+area: Cluster Coordination\n+type: bug\n+issues:\n+ - 97798"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1643779483,
+      "created_at": "2023-07-20T11:47:32Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "comment",
+      "id": 1643779493,
+      "created_at": "2023-07-20T11:47:32Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1643779517,
+      "created_at": "2023-07-20T11:47:34Z",
+      "user": "DaveCTurner",
+      "body": "The missing listener completion was introduced in https://github.com/elastic/elasticsearch/pull/96490."
+    },
+    {
+      "type": "review_comment",
+      "id": 1269567399,
+      "created_at": "2023-07-20T14:42:11Z",
+      "user": "fcofdez",
+      "body": "is this an intended change?",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java",
+      "diff_hunk": "@@ -1518,82 +1523,98 @@ public void publish(\n                             clusterStatePublicationEvent.getNewState().term()\n                         )\n                     );\n-                    publishListener.onFailure(\n-                        new FailedToCommitClusterStateException(\n-                            \"node is no longer master for term \"\n-                                + clusterStatePublicationEvent.getNewState().term()\n-                                + \" while handling publication\"\n-                        )\n+                    throw new FailedToCommitClusterStateException(\n+                        \"node is no longer master for term \"\n+                            + clusterStatePublicationEvent.getNewState().term()\n+                            + \" while handling publication\"\n                     );\n-                    return;\n                 }\n \n                 if (currentPublication.isPresent()) {\n                     assert false : \"[\" + currentPublication.get() + \"] in progress, cannot start new publication\";\n-                    logger.warn(\n+                    logger.error(",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1535,
+      "original_line": 1535,
+      "side": "RIGHT",
+      "original_position": 33,
+      "position": 33,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1269648718,
+          "user": "DaveCTurner",
+          "body": "Yes, this should be impossible, so if it happens in prod we really want to know about it as it may indicate the node is unrecoverably broken.",
+          "created_at": "2023-07-20T15:38:38Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1539439422,
+      "created_at": "2023-07-20T14:42:43Z",
+      "user": "fcofdez",
+      "state": "APPROVED",
+      "body": "LGTM, only a small comment"
+    },
+    {
+      "type": "review",
+      "id": 1539572761,
+      "created_at": "2023-07-20T15:38:38Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

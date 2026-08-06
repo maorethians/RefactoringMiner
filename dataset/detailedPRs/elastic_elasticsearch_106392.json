@@ -1,0 +1,235 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 106392,
+  "pr_number": 106392,
+  "title": "Resume driver when failing to fetch pages",
+  "user": "dnhatn",
+  "created_at": "2024-03-17T06:40:27Z",
+  "merged_at": "2024-03-18T16:32:31Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    "Team:Analytics",
+    ":Analytics/ES|QL",
+    "v8.13.1",
+    "v8.14.0"
+  ],
+  "base_commit": "387eb38bfd83d23a2c6592d7253a302f9e37fa81",
+  "merge_commit_sha": "d66c7d4bc86b32b7d17c5eacbdc4e8d9f88c13a0",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "head_ref_force_pushed",
+    "renamed",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "labeled",
+    "labeled",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "labeled",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "labeled",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/106392",
+  "timeline": [
+    {
+      "type": "description",
+      "created_at": "2024-03-17T06:40:27Z",
+      "user": "dnhatn",
+      "body": "I investigated a heap attack test failure and found that an ESQL request was stuck. This occurred in the following:\r\n\r\n1. The ExchangeSource on the coordinator was blocked on reading because there were no available pages.\r\n2. Meanwhile, the ExchangeSink on the data node had pages ready for fetching.\r\n3. When an exchange request tried to fetch pages, it failed due to a CircuitBreakingException. Despite the failure, no cancellation was triggered because the status of the ExchangeSource on the coordinator remained unchanged.\r\n\r\nTo fix this issue, this PR introduces two changes:\r\n\r\n- Resumes the ExchangeSourceOperator and Driver on the coordinator, eventually allowing the coordinator to trigger cancellation of the request when failing to fetch pages.\r\n\r\n- Ensures that an exchange sink on the data nodes fails when a data node request is cancelled. This callback was inadvertently omitted when introducing the node-level reduction in #106204.\r\n\r\nI plan to spend some time to harden the exchange and compute service.\r\n\r\nCloses #106262"
+    },
+    {
+      "type": "commit",
+      "date": "2024-03-17T06:46:35Z",
+      "sha": "63fcb1022c55f40889c6860683155f0cfc797c3f",
+      "message": "Resume Driver when fail to fetch pages",
+      "author": "Nhat Nguyen",
+      "author_email": "nhat.nguyen@elastic.co",
+      "author_raw_date": "2024-03-17T06:33:02Z",
+      "author_date": "2024-03-17T06:33:02Z",
+      "committer": "Nhat Nguyen",
+      "committer_email": "nhat.nguyen@elastic.co",
+      "raw_date": "2024-03-17T06:46:35Z",
+      "diff_text": "test/external-modules/esql-heap-attack/src/javaRestTest/java/org/elasticsearch/xpack/esql/heap_attack/HeapAttackIT.java\n@@ -10,7 +10,6 @@\n import org.apache.http.HttpHost;\n import org.apache.http.client.config.RequestConfig;\n import org.apache.http.util.EntityUtils;\n-import org.apache.lucene.tests.util.LuceneTestCase;\n import org.elasticsearch.client.Request;\n import org.elasticsearch.client.RequestOptions;\n import org.elasticsearch.client.Response;\n@@ -58,7 +57,6 @@\n  * Tests that run ESQL queries that have, in the past, used so much memory they\n  * crash Elasticsearch.\n  */\n-@LuceneTestCase.AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/106262\")\n public class HeapAttackIT extends ESRestTestCase {\n \n     @ClassRule\nx-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeSinkHandler.java\n@@ -184,4 +184,12 @@ private void onChanged() {\n     long lastUpdatedTimeInMillis() {\n         return lastUpdatedInMillis.get();\n     }\n+\n+    /**\n+     * Returns the number of pages available in the buffer.\n+     * This method should be used for testing only.\n+     */\n+    public int bufferSize() {\n+        return buffer.size();\n+    }\n }\nx-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeSourceHandler.java\n@@ -203,6 +203,7 @@ void onSinkFailed(Exception originEx) {\n                 }\n                 return first;\n             });\n+            buffer.waitForReading().onResponse(null); // resume the Driver if it is being blocked on reading\n             onSinkComplete();\n         }\n \nx-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/EsqlActionTaskIT.java\n@@ -12,35 +12,51 @@\n import org.elasticsearch.action.ActionFuture;\n import org.elasticsearch.action.admin.cluster.node.tasks.cancel.CancelTasksAction;\n import org.elasticsearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;\n+import org.elasticsearch.action.support.PlainActionFuture;\n+import org.elasticsearch.client.internal.Client;\n import org.elasticsearch.common.collect.Iterators;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.common.util.concurrent.AbstractRunnable;\n import org.elasticsearch.compute.lucene.LuceneSourceOperator;\n import org.elasticsearch.compute.lucene.ValuesSourceReaderOperator;\n import org.elasticsearch.compute.operator.DriverStatus;\n import org.elasticsearch.compute.operator.DriverTaskRunner;\n+import org.elasticsearch.compute.operator.exchange.ExchangeService;\n+import org.elasticsearch.compute.operator.exchange.ExchangeSinkHandler;\n import org.elasticsearch.compute.operator.exchange.ExchangeSinkOperator;\n import org.elasticsearch.compute.operator.exchange.ExchangeSourceOperator;\n import org.elasticsearch.logging.LogManager;\n import org.elasticsearch.logging.Logger;\n+import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.tasks.TaskCancelledException;\n import org.elasticsearch.tasks.TaskId;\n import org.elasticsearch.tasks.TaskInfo;\n import org.elasticsearch.test.junit.annotations.TestLogging;\n+import org.elasticsearch.test.transport.MockTransportService;\n+import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.TransportService;\n import org.elasticsearch.xpack.esql.plugin.QueryPragmas;\n import org.junit.Before;\n \n+import java.io.IOException;\n import java.util.ArrayList;\n+import java.util.Collection;\n import java.util.List;\n import java.util.Set;\n+import java.util.concurrent.CountDownLatch;\n+import java.util.concurrent.TimeUnit;\n \n import static org.elasticsearch.test.MapMatcher.assertMap;\n import static org.elasticsearch.test.MapMatcher.matchesMap;\n import static org.hamcrest.Matchers.anyOf;\n import static org.hamcrest.Matchers.both;\n+import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.either;\n import static org.hamcrest.Matchers.emptyIterable;\n import static org.hamcrest.Matchers.emptyOrNullString;\n import static org.hamcrest.Matchers.equalTo;\n+import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.greaterThanOrEqualTo;\n import static org.hamcrest.Matchers.hasSize;\n import static org.hamcrest.Matchers.lessThanOrEqualTo;\n@@ -309,4 +325,81 @@ private void assertCancelled(ActionFuture<EsqlQueryResponse> response) throws Ex\n             )\n         );\n     }\n+\n+    /**\n+     * Ensure that when some exchange requests fail, we cancel the ESQL request, and complete all\n+     * exchange sinks with the failure, despite having outstanding pages in the buffer.\n+     */\n+    public void testCancelRequestWhenFailingFetchingPages() throws Exception {\n+        String coordinator = internalCluster().startCoordinatingOnlyNode(Settings.EMPTY);\n+        String dataNode = internalCluster().startDataOnlyNode();\n+        // block, then fail exchange requests when we have outstanding pages\n+        var transportService = (MockTransportService) internalCluster().getInstance(TransportService.class, dataNode);\n+        CountDownLatch fetchingStarted = new CountDownLatch(1);\n+        CountDownLatch allowedFetching = new CountDownLatch(1);\n+        transportService.addRequestHandlingBehavior(ExchangeService.EXCHANGE_ACTION_NAME, (handler, request, channel, task) -> {\n+            AbstractRunnable runnable = new AbstractRunnable() {\n+                @Override\n+                public void onFailure(Exception e) {\n+                    channel.sendResponse(e);\n+                }\n+\n+                @Override\n+                protected void doRun() throws Exception {\n+                    fetchingStarted.countDown();\n+                    assertTrue(allowedFetching.await(1, TimeUnit.MINUTES));\n+                    onFailure(new IOException(\"failed to fetch pages\"));\n+                }\n+            };\n+            transportService.getThreadPool().executor(ThreadPool.Names.GENERIC).execute(runnable);\n+        });\n+        try {\n+            scriptPermits.release(numberOfDocs()); // do not block Lucene operators\n+            Client client = client(coordinator);\n+            EsqlQueryRequest request = new EsqlQueryRequest();\n+            client().admin()\n+                .indices()\n+                .prepareUpdateSettings(\"test\")\n+                .setSettings(Settings.builder().put(\"index.routing.allocation.include._name\", dataNode).build())\n+                .get();\n+            ensureYellowAndNoInitializingShards(\"test\");\n+            request.query(\"FROM test | LIMIT 10\");\n+            request.pragmas(randomPragmas());\n+            PlainActionFuture<EsqlQueryResponse> future = new PlainActionFuture<>();\n+            client.execute(EsqlQueryAction.INSTANCE, request, future);\n+            try {\n+                List<TaskInfo> foundTasks = new ArrayList<>();\n+                assertBusy(() -> {\n+                    List<TaskInfo> tasks = client().admin()\n+                        .cluster()\n+                        .prepareListTasks()\n+                        .setActions(EsqlQueryAction.NAME)\n+                        .setDetailed(true)\n+                        .get()\n+                        .getTasks();\n+                    assertThat(tasks, hasSize(1));\n+                    foundTasks.addAll(tasks);\n+                });\n+                String sessionId = foundTasks.get(0).taskId().toString();\n+                ExchangeService exchangeService = internalCluster().getInstance(ExchangeService.class, dataNode);\n+                assertTrue(fetchingStarted.await(1, TimeUnit.MINUTES));\n+                ExchangeSinkHandler exchangeSink = exchangeService.getSinkHandler(sessionId);\n+                if (randomBoolean()) {\n+                    // do not fail exchange requests when we have some pages\n+                    assertBusy(() -> assertThat(exchangeSink.bufferSize(), greaterThan(0)));\n+                }\n+            } finally {\n+                allowedFetching.countDown();\n+            }\n+            Exception failure = expectThrows(Exception.class, () -> future.actionGet().close());\n+            assertThat(failure.getMessage(), containsString(\"failed to fetch pages\"));\n+        } finally {\n+            transportService.clearAllRules();\n+        }\n+    }\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), MockTransportService.TestPlugin.class);\n+    }\n }\nx-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plugin/ComputeService.java\n@@ -690,6 +690,7 @@ private void runComputeOnDataNode(\n             dataNodeRequestExecutor.start();\n             // run the node-level reduction\n             var externalSink = exchangeService.getSinkHandler(externalId);\n+            task.addListener(() -> exchangeService.finishSinkHandler(externalId, new TaskCancelledException(task.getReasonCancelled())));\n             var exchangeSource = new ExchangeSourceHandler(1, esqlExecutor);\n             exchangeSource.addRemoteSink(internalSink::fetchPageAsync, 1);\n             ActionListener<Void> reductionListener = cancelOnFailure(task, cancelled, refs.acquire());",
+      "diff": [
+        {
+          "file": "test/external-modules/esql-heap-attack/src/javaRestTest/java/org/elasticsearch/xpack/esql/heap_attack/HeapAttackIT.java",
+          "patch": "@@ -10,7 +10,6 @@\n import org.apache.http.HttpHost;\n import org.apache.http.client.config.RequestConfig;\n import org.apache.http.util.EntityUtils;\n-import org.apache.lucene.tests.util.LuceneTestCase;\n import org.elasticsearch.client.Request;\n import org.elasticsearch.client.RequestOptions;\n import org.elasticsearch.client.Response;\n@@ -58,7 +57,6 @@\n  * Tests that run ESQL queries that have, in the past, used so much memory they\n  * crash Elasticsearch.\n  */\n-@LuceneTestCase.AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/106262\")\n public class HeapAttackIT extends ESRestTestCase {\n \n     @ClassRule"
+        },
+        {
+          "file": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeSinkHandler.java",
+          "patch": "@@ -184,4 +184,12 @@ private void onChanged() {\n     long lastUpdatedTimeInMillis() {\n         return lastUpdatedInMillis.get();\n     }\n+\n+    /**\n+     * Returns the number of pages available in the buffer.\n+     * This method should be used for testing only.\n+     */\n+    public int bufferSize() {\n+        return buffer.size();\n+    }\n }"
+        },
+        {
+          "file": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeSourceHandler.java",
+          "patch": "@@ -203,6 +203,7 @@ void onSinkFailed(Exception originEx) {\n                 }\n                 return first;\n             });\n+            buffer.waitForReading().onResponse(null); // resume the Driver if it is being blocked on reading\n             onSinkComplete();\n         }\n "
+        },
+        {
+          "file": "x-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/EsqlActionTaskIT.java",
+          "patch": "@@ -12,35 +12,51 @@\n import org.elasticsearch.action.ActionFuture;\n import org.elasticsearch.action.admin.cluster.node.tasks.cancel.CancelTasksAction;\n import org.elasticsearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;\n+import org.elasticsearch.action.support.PlainActionFuture;\n+import org.elasticsearch.client.internal.Client;\n import org.elasticsearch.common.collect.Iterators;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.common.util.concurrent.AbstractRunnable;\n import org.elasticsearch.compute.lucene.LuceneSourceOperator;\n import org.elasticsearch.compute.lucene.ValuesSourceReaderOperator;\n import org.elasticsearch.compute.operator.DriverStatus;\n import org.elasticsearch.compute.operator.DriverTaskRunner;\n+import org.elasticsearch.compute.operator.exchange.ExchangeService;\n+import org.elasticsearch.compute.operator.exchange.ExchangeSinkHandler;\n import org.elasticsearch.compute.operator.exchange.ExchangeSinkOperator;\n import org.elasticsearch.compute.operator.exchange.ExchangeSourceOperator;\n import org.elasticsearch.logging.LogManager;\n import org.elasticsearch.logging.Logger;\n+import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.tasks.TaskCancelledException;\n import org.elasticsearch.tasks.TaskId;\n import org.elasticsearch.tasks.TaskInfo;\n import org.elasticsearch.test.junit.annotations.TestLogging;\n+import org.elasticsearch.test.transport.MockTransportService;\n+import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.TransportService;\n import org.elasticsearch.xpack.esql.plugin.QueryPragmas;\n import org.junit.Before;\n \n+import java.io.IOException;\n import java.util.ArrayList;\n+import java.util.Collection;\n import java.util.List;\n import java.util.Set;\n+import java.util.concurrent.CountDownLatch;\n+import java.util.concurrent.TimeUnit;\n \n import static org.elasticsearch.test.MapMatcher.assertMap;\n import static org.elasticsearch.test.MapMatcher.matchesMap;\n import static org.hamcrest.Matchers.anyOf;\n import static org.hamcrest.Matchers.both;\n+import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.either;\n import static org.hamcrest.Matchers.emptyIterable;\n import static org.hamcrest.Matchers.emptyOrNullString;\n import static org.hamcrest.Matchers.equalTo;\n+import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.greaterThanOrEqualTo;\n import static org.hamcrest.Matchers.hasSize;\n import static org.hamcrest.Matchers.lessThanOrEqualTo;\n@@ -309,4 +325,81 @@ private void assertCancelled(ActionFuture<EsqlQueryResponse> response) throws Ex\n             )\n         );\n     }\n+\n+    /**\n+     * Ensure that when some exchange requests fail, we cancel the ESQL request, and complete all\n+     * exchange sinks with the failure, despite having outstanding pages in the buffer.\n+     */\n+    public void testCancelRequestWhenFailingFetchingPages() throws Exception {\n+        String coordinator = internalCluster().startCoordinatingOnlyNode(Settings.EMPTY);\n+        String dataNode = internalCluster().startDataOnlyNode();\n+        // block, then fail exchange requests when we have outstanding pages\n+        var transportService = (MockTransportService) internalCluster().getInstance(TransportService.class, dataNode);\n+        CountDownLatch fetchingStarted = new CountDownLatch(1);\n+        CountDownLatch allowedFetching = new CountDownLatch(1);\n+        transportService.addRequestHandlingBehavior(ExchangeService.EXCHANGE_ACTION_NAME, (handler, request, channel, task) -> {\n+            AbstractRunnable runnable = new AbstractRunnable() {\n+                @Override\n+                public void onFailure(Exception e) {\n+                    channel.sendResponse(e);\n+                }\n+\n+                @Override\n+                protected void doRun() throws Exception {\n+                    fetchingStarted.countDown();\n+                    assertTrue(allowedFetching.await(1, TimeUnit.MINUTES));\n+                    onFailure(new IOException(\"failed to fetch pages\"));\n+                }\n+            };\n+            transportService.getThreadPool().executor(ThreadPool.Names.GENERIC).execute(runnable);\n+        });\n+        try {\n+            scriptPermits.release(numberOfDocs()); // do not block Lucene operators\n+            Client client = client(coordinator);\n+            EsqlQueryRequest request = new EsqlQueryRequest();\n+            client().admin()\n+                .indices()\n+                .prepareUpdateSettings(\"test\")\n+                .setSettings(Settings.builder().put(\"index.routing.allocation.include._name\", dataNode).build())\n+                .get();\n+            ensureYellowAndNoInitializingShards(\"test\");\n+            request.query(\"FROM test | LIMIT 10\");\n+            request.pragmas(randomPragmas());\n+            PlainActionFuture<EsqlQueryResponse> future = new PlainActionFuture<>();\n+            client.execute(EsqlQueryAction.INSTANCE, request, future);\n+            try {\n+                List<TaskInfo> foundTasks = new ArrayList<>();\n+                assertBusy(() -> {\n+                    List<TaskInfo> tasks = client().admin()\n+                        .cluster()\n+                        .prepareListTasks()\n+                        .setActions(EsqlQueryAction.NAME)\n+                        .setDetailed(true)\n+                        .get()\n+                        .getTasks();\n+                    assertThat(tasks, hasSize(1));\n+                    foundTasks.addAll(tasks);\n+                });\n+                String sessionId = foundTasks.get(0).taskId().toString();\n+                ExchangeService exchangeService = internalCluster().getInstance(ExchangeService.class, dataNode);\n+                assertTrue(fetchingStarted.await(1, TimeUnit.MINUTES));\n+                ExchangeSinkHandler exchangeSink = exchangeService.getSinkHandler(sessionId);\n+                if (randomBoolean()) {\n+                    // do not fail exchange requests when we have some pages\n+                    assertBusy(() -> assertThat(exchangeSink.bufferSize(), greaterThan(0)));\n+                }\n+            } finally {\n+                allowedFetching.countDown();\n+            }\n+            Exception failure = expectThrows(Exception.class, () -> future.actionGet().close());\n+            assertThat(failure.getMessage(), containsString(\"failed to fetch pages\"));\n+        } finally {\n+            transportService.clearAllRules();\n+        }\n+    }\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), MockTransportService.TestPlugin.class);\n+    }\n }"
+        },
+        {
+          "file": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plugin/ComputeService.java",
+          "patch": "@@ -690,6 +690,7 @@ private void runComputeOnDataNode(\n             dataNodeRequestExecutor.start();\n             // run the node-level reduction\n             var externalSink = exchangeService.getSinkHandler(externalId);\n+            task.addListener(() -> exchangeService.finishSinkHandler(externalId, new TaskCancelledException(task.getReasonCancelled())));\n             var exchangeSource = new ExchangeSourceHandler(1, esqlExecutor);\n             exchangeSource.addRemoteSink(internalSink::fetchPageAsync, 1);\n             ActionListener<Void> reductionListener = cancelOnFailure(task, cancelled, refs.acquire());"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1942041292,
+      "created_at": "2024-03-18T06:07:07Z",
+      "user": "dnhatn",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1527891530,
+      "created_at": "2024-03-18T06:07:07Z",
+      "user": "dnhatn",
+      "body": "We can notify about the failure, but I think it's simpler just to resume and let the driver handle the error, as if it hadn't been blocked before.",
+      "path": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeSourceHandler.java",
+      "diff_hunk": "@@ -203,6 +203,7 @@ void onSinkFailed(Exception originEx) {\n                 }\n                 return first;\n             });\n+            buffer.waitForReading().onResponse(null); // resume the Driver if it is being blocked on reading",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 206,
+      "original_line": 206,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 4,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "commit",
+      "date": "2024-03-18T06:09:06Z",
+      "sha": "435ee9bafbba257c1d45a60772f0cd8f9ef18c4f",
+      "message": "Update docs/changelog/106392.yaml",
+      "author": "Nhat Nguyen",
+      "author_email": "nhat.nguyen@elastic.co",
+      "author_raw_date": "2024-03-18T06:09:06Z",
+      "author_date": "2024-03-18T06:09:06Z",
+      "committer": "Nhat Nguyen",
+      "committer_email": "nhat.nguyen@elastic.co",
+      "raw_date": "2024-03-18T06:09:06Z",
+      "diff_text": "docs/changelog/106392.yaml\n@@ -0,0 +1,6 @@\n+pr: 106392\n+summary: Resume driver when failing to fetch pages\n+area: ES|QL\n+type: bug\n+issues:\n+ - 106262",
+      "diff": [
+        {
+          "file": "docs/changelog/106392.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 106392\n+summary: Resume driver when failing to fetch pages\n+area: ES|QL\n+type: bug\n+issues:\n+ - 106262"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2003000469,
+      "created_at": "2024-03-18T06:09:07Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @dnhatn, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 2003000473,
+      "created_at": "2024-03-18T06:09:07Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-analytical-engine (Team:Analytics)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1528460791,
+      "created_at": "2024-03-18T12:38:41Z",
+      "user": "nik9000",
+      "body": "Could you stick `@Nullable` on the `exception` argument to `finishSinkHandler` and add a note that it'll fire any errors into the sync - if it is still running. Or something like that. ",
+      "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plugin/ComputeService.java",
+      "diff_hunk": "@@ -690,6 +690,7 @@ private void runComputeOnDataNode(\n             dataNodeRequestExecutor.start();\n             // run the node-level reduction\n             var externalSink = exchangeService.getSinkHandler(externalId);\n+            task.addListener(() -> exchangeService.finishSinkHandler(externalId, new TaskCancelledException(task.getReasonCancelled())));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 693,
+      "original_line": 693,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 4,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1528885446,
+          "user": "dnhatn",
+          "body": "Added in https://github.com/elastic/elasticsearch/pull/106392/commits/3c018f7b6c818346c87fd8da94dc10717978fc61.",
+          "created_at": "2024-03-18T16:31:16Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1942845589,
+      "created_at": "2024-03-18T12:38:47Z",
+      "user": "nik9000",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-03-18T15:41:34Z",
+      "sha": "3c018f7b6c818346c87fd8da94dc10717978fc61",
+      "message": "javadoc",
+      "author": "Nhat Nguyen",
+      "author_email": "nhat.nguyen@elastic.co",
+      "author_raw_date": "2024-03-18T15:36:17Z",
+      "author_date": "2024-03-18T15:36:17Z",
+      "committer": "Nhat Nguyen",
+      "committer_email": "nhat.nguyen@elastic.co",
+      "raw_date": "2024-03-18T15:41:34Z",
+      "diff_text": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeService.java\n@@ -23,6 +23,7 @@\n import org.elasticsearch.common.util.concurrent.ConcurrentCollections;\n import org.elasticsearch.compute.data.BlockFactory;\n import org.elasticsearch.compute.data.BlockStreamInput;\n+import org.elasticsearch.core.Nullable;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.tasks.Task;\n import org.elasticsearch.threadpool.ThreadPool;\n@@ -112,8 +113,9 @@ public ExchangeSinkHandler getSinkHandler(String exchangeId) {\n \n     /**\n      * Removes the exchange sink handler associated with the given exchange id.\n+     * W will abort the sink handler if the given failure is not null.\n      */\n-    public void finishSinkHandler(String exchangeId, Exception failure) {\n+    public void finishSinkHandler(String exchangeId, @Nullable Exception failure) {\n         final ExchangeSinkHandler sinkHandler = sinks.remove(exchangeId);\n         if (sinkHandler != null) {\n             if (failure != null) {",
+      "diff": [
+        {
+          "file": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/exchange/ExchangeService.java",
+          "patch": "@@ -23,6 +23,7 @@\n import org.elasticsearch.common.util.concurrent.ConcurrentCollections;\n import org.elasticsearch.compute.data.BlockFactory;\n import org.elasticsearch.compute.data.BlockStreamInput;\n+import org.elasticsearch.core.Nullable;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.tasks.Task;\n import org.elasticsearch.threadpool.ThreadPool;\n@@ -112,8 +113,9 @@ public ExchangeSinkHandler getSinkHandler(String exchangeId) {\n \n     /**\n      * Removes the exchange sink handler associated with the given exchange id.\n+     * W will abort the sink handler if the given failure is not null.\n      */\n-    public void finishSinkHandler(String exchangeId, Exception failure) {\n+    public void finishSinkHandler(String exchangeId, @Nullable Exception failure) {\n         final ExchangeSinkHandler sinkHandler = sinks.remove(exchangeId);\n         if (sinkHandler != null) {\n             if (failure != null) {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1943607969,
+      "created_at": "2024-03-18T16:31:16Z",
+      "user": "dnhatn",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2004393149,
+      "created_at": "2024-03-18T16:31:22Z",
+      "user": "dnhatn",
+      "body": "Thanks Nik!"
+    },
+    {
+      "type": "comment",
+      "id": 2004398656,
+      "created_at": "2024-03-18T16:33:42Z",
+      "user": "elasticsearchmachine",
+      "body": "Backport to 8.13 in https://github.com/elastic/elasticsearch/pull/106436"
+    }
+  ]
+}

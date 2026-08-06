@@ -1,0 +1,267 @@
+{
+  "repo": "netty/netty",
+  "number": 13274,
+  "pr_number": 13274,
+  "title": "Chunked HTTP length decoding should account for whitespaces/ctrl chars (Fixes #13273)",
+  "user": "franz1981",
+  "created_at": "2023-03-13T22:49:48Z",
+  "merged_at": "2023-03-14T13:34:53Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    "defect"
+  ],
+  "base_commit": "ebfc79c85deb8ba6fda54b8cb7fa925573076b21",
+  "merge_commit_sha": "0e8af543c51209d84162952fc0e607e4189e5c88",
+  "commits": 4,
+  "issue_events": [
+    "labeled",
+    "review_requested",
+    "review_requested",
+    "assigned",
+    "head_ref_force_pushed",
+    "mentioned",
+    "subscribed",
+    "head_ref_force_pushed",
+    "referenced",
+    "merged",
+    "closed",
+    "mentioned",
+    "subscribed",
+    "milestoned",
+    "mentioned",
+    "subscribed"
+  ],
+  "url": "https://github.com/netty/netty/pull/13274",
+  "timeline": [
+    {
+      "type": "description",
+      "created_at": "2023-03-13T22:49:48Z",
+      "user": "franz1981",
+      "body": "Motivation:\r\n\r\n#12321 introduces the assumption that whitespaces/ctrl chars are already stripped out hex chars of HTTP chunk length. It was a wrong assumption.\r\n\r\nModifications:\r\n\r\nCorrectly check for whitespace and ctrl chars and re-introduce whitespace (leading) trim\r\n\r\nResult:\r\n\r\nFixes #13273"
+    },
+    {
+      "type": "comment",
+      "id": 1467090908,
+      "created_at": "2023-03-13T22:59:50Z",
+      "user": "franz1981",
+      "body": " @normanmaurer I've already verified that the previous decoder implementation (before #13273) can run the additional tests without problems, but...creating tons of `String`s, hence this version is now correct and faster/less memory hungry.\r\nSorry for the introduced bug; hope the additional tests will help for the future!"
+    },
+    {
+      "type": "commit",
+      "date": "2023-03-13T23:05:52Z",
+      "sha": "cc424773269ea5b8636d88ce7df1a363d865c46e",
+      "message": "Chunked HTTP length decoding should account for whitespaces/ctrl chars (Fixes #13273)\n\nMotivation:\n\n#12321 introduces the assumption that whitespaces/ctrl chars are already stripped out hex chars of HTTP chunk length.\nIt was a wrong assumption.\n\nModifications:\n\nCorrectly check for whitespace and ctrl chars and re-introduce whitespace (leading) trim\n\nResult:\n\nFixes #13273",
+      "author": "franz1981",
+      "author_email": "nigro.fra@gmail.com",
+      "author_raw_date": "2023-03-13T22:47:33Z",
+      "author_date": "2023-03-13T22:47:33Z",
+      "committer": "franz1981",
+      "committer_email": "nigro.fra@gmail.com",
+      "raw_date": "2023-03-13T23:05:52Z",
+      "diff_text": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java\n@@ -799,16 +799,38 @@ private LastHttpContent readTrailingHeaders(ByteBuf buffer) {\n     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;\n     protected abstract HttpMessage createInvalidMessage();\n \n+    private static int skipWhiteSpaces(byte[] hex, int start, int length) {\n+        for (int i = 0; i < length; i++) {\n+            if (!isWhitespace(hex[start + i])) {\n+                return i;\n+            }\n+        }\n+        return length;\n+    }\n+\n     private static int getChunkSize(byte[] hex, int start, int length) {\n-        // byte[] is produced by LineParse::parseLine that already skip ISO CTRL and Whitespace chars\n+        // trim the leading bytes if white spaces, if any\n+        final int skipped = skipWhiteSpaces(hex, start, length);\n+        if (skipped == length) {\n+            // empty case\n+            throw new NumberFormatException();\n+        }\n+        start = start + skipped;\n+        length = length - skipped;\n         int result = 0;\n         for (int i = 0; i < length; i++) {\n             final int digit = StringUtil.decodeHexNibble(hex[start + i]);\n             if (digit == -1) {\n                 // uncommon path\n-                if (hex[start + i] == ';') {\n+                final byte b = hex[start + i];\n+                if (b == ';' || isControlOrWhitespaceAsciiChar(b)) {\n+                    if (i == 0) {\n+                        // empty case\n+                        throw new NumberFormatException();\n+                    }\n                     return result;\n                 }\n+                // non-hex char fail-fast path\n                 throw new NumberFormatException();\n             }\n             result *= 16;\n@@ -1127,4 +1149,8 @@ public boolean process(byte value) {\n             return ISO_CONTROL_OR_WHITESPACE[128 + value];\n         }\n     };\n+\n+    private static boolean isControlOrWhitespaceAsciiChar(byte b) {\n+        return ISO_CONTROL_OR_WHITESPACE[128 + b];\n+    }\n }\ncodec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java\n@@ -147,6 +147,118 @@ public void testResponseChunked() {\n         assertNull(ch.readInbound());\n     }\n \n+    @Test\n+    public void testResponseChunkedWithValidUncommonPatterns() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        // leading whitespace, trailing whitespace\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing control char\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \"\\0\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing semicolon\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \";\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();\n+        assertNull(ch.readInbound());\n+    }\n+\n+    @Test\n+    public void testResponseChunkedWithControlChars() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();\n+        assertNull(ch.readInbound());\n+    }\n+\n     @Test\n     public void testResponseDisallowPartialChunks() {\n         HttpResponseDecoder decoder = new HttpResponseDecoder(\n@@ -741,6 +853,121 @@ public void testGarbageChunk() {\n         assertThat(channel.finish(), is(false));\n     }\n \n+    @Test\n+    public void testWhiteSpaceGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \" \\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testLeadingWhiteSpacesSemiColonGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"  ;\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testControlCharGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"\\0\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testLeadingWhiteSpacesControlCharGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"  \\0\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testGarbageChunkAfterWhiteSpaces() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"  12345N1 ;\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n     @Test\n     public void testConnectionClosedBeforeHeadersReceived() {\n         EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());",
+      "diff": [
+        {
+          "file": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "patch": "@@ -799,16 +799,38 @@ private LastHttpContent readTrailingHeaders(ByteBuf buffer) {\n     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;\n     protected abstract HttpMessage createInvalidMessage();\n \n+    private static int skipWhiteSpaces(byte[] hex, int start, int length) {\n+        for (int i = 0; i < length; i++) {\n+            if (!isWhitespace(hex[start + i])) {\n+                return i;\n+            }\n+        }\n+        return length;\n+    }\n+\n     private static int getChunkSize(byte[] hex, int start, int length) {\n-        // byte[] is produced by LineParse::parseLine that already skip ISO CTRL and Whitespace chars\n+        // trim the leading bytes if white spaces, if any\n+        final int skipped = skipWhiteSpaces(hex, start, length);\n+        if (skipped == length) {\n+            // empty case\n+            throw new NumberFormatException();\n+        }\n+        start = start + skipped;\n+        length = length - skipped;\n         int result = 0;\n         for (int i = 0; i < length; i++) {\n             final int digit = StringUtil.decodeHexNibble(hex[start + i]);\n             if (digit == -1) {\n                 // uncommon path\n-                if (hex[start + i] == ';') {\n+                final byte b = hex[start + i];\n+                if (b == ';' || isControlOrWhitespaceAsciiChar(b)) {\n+                    if (i == 0) {\n+                        // empty case\n+                        throw new NumberFormatException();\n+                    }\n                     return result;\n                 }\n+                // non-hex char fail-fast path\n                 throw new NumberFormatException();\n             }\n             result *= 16;\n@@ -1127,4 +1149,8 @@ public boolean process(byte value) {\n             return ISO_CONTROL_OR_WHITESPACE[128 + value];\n         }\n     };\n+\n+    private static boolean isControlOrWhitespaceAsciiChar(byte b) {\n+        return ISO_CONTROL_OR_WHITESPACE[128 + b];\n+    }\n }"
+        },
+        {
+          "file": "codec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java",
+          "patch": "@@ -147,6 +147,118 @@ public void testResponseChunked() {\n         assertNull(ch.readInbound());\n     }\n \n+    @Test\n+    public void testResponseChunkedWithValidUncommonPatterns() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        // leading whitespace, trailing whitespace\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing control char\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \"\\0\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing semicolon\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \";\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();\n+        assertNull(ch.readInbound());\n+    }\n+\n+    @Test\n+    public void testResponseChunkedWithControlChars() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();\n+        assertNull(ch.readInbound());\n+    }\n+\n     @Test\n     public void testResponseDisallowPartialChunks() {\n         HttpResponseDecoder decoder = new HttpResponseDecoder(\n@@ -741,6 +853,121 @@ public void testGarbageChunk() {\n         assertThat(channel.finish(), is(false));\n     }\n \n+    @Test\n+    public void testWhiteSpaceGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \" \\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testLeadingWhiteSpacesSemiColonGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"  ;\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testControlCharGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"\\0\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testLeadingWhiteSpacesControlCharGarbageChunk() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"  \\0\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n+    @Test\n+    public void testGarbageChunkAfterWhiteSpaces() {\n+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());\n+        String responseWithIllegalChunk =\n+                \"HTTP/1.1 200 OK\\r\\n\" +\n+                \"Transfer-Encoding: chunked\\r\\n\\r\\n\" +\n+                \"  12345N1 ;\\r\\n\";\n+\n+        channel.writeInbound(Unpooled.copiedBuffer(responseWithIllegalChunk, CharsetUtil.US_ASCII));\n+        assertThat(channel.readInbound(), is(instanceOf(HttpResponse.class)));\n+\n+        // Ensure that the decoder generates the last chunk with correct decoder result.\n+        LastHttpContent invalidChunk = channel.readInbound();\n+        assertThat(invalidChunk.decoderResult().isFailure(), is(true));\n+        invalidChunk.release();\n+\n+        // And no more messages should be produced by the decoder.\n+        assertThat(channel.readInbound(), is(nullValue()));\n+\n+        // .. even after the connection is closed.\n+        assertThat(channel.finish(), is(false));\n+    }\n+\n     @Test\n     public void testConnectionClosedBeforeHeadersReceived() {\n         EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1135109042,
+      "created_at": "2023-03-14T07:39:40Z",
+      "user": "normanmaurer",
+      "body": "Do we need to ensure this will not throw an IndexOutOfBoundsException ?",
+      "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+      "diff_hunk": "@@ -1127,4 +1149,8 @@ public boolean process(byte value) {\n             return ISO_CONTROL_OR_WHITESPACE[128 + value];\n         }\n     };\n+\n+    private static boolean isControlOrWhitespaceAsciiChar(byte b) {\n+        return ISO_CONTROL_OR_WHITESPACE[128 + b];",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1157,
+      "original_line": 1154,
+      "side": "RIGHT",
+      "original_position": 47,
+      "position": 50,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1135170606,
+          "user": "franz1981",
+          "body": "It cannot, in theory, the array should be big enough to cover the full spectrum of byte values ~~(but let me check)~~",
+          "created_at": "2023-03-14T08:29:25Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1135109826,
+      "created_at": "2023-03-14T07:40:35Z",
+      "user": "normanmaurer",
+      "body": "please provide some javadoc / comments to explain what exactly it returns ",
+      "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+      "diff_hunk": "@@ -799,16 +799,38 @@ private LastHttpContent readTrailingHeaders(ByteBuf buffer) {\n     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;\n     protected abstract HttpMessage createInvalidMessage();\n \n+    private static int skipWhiteSpaces(byte[] hex, int start, int length) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 805,
+      "original_line": 802,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 7,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1135110429,
+      "created_at": "2023-03-14T07:41:13Z",
+      "user": "normanmaurer",
+      "body": "```suggestion\r\n        start += skipped;\r\n        length -= skipped;\r\n```",
+      "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+      "diff_hunk": "@@ -799,16 +799,38 @@ private LastHttpContent readTrailingHeaders(ByteBuf buffer) {\n     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;\n     protected abstract HttpMessage createInvalidMessage();\n \n+    private static int skipWhiteSpaces(byte[] hex, int start, int length) {\n+        for (int i = 0; i < length; i++) {\n+            if (!isWhitespace(hex[start + i])) {\n+                return i;\n+            }\n+        }\n+        return length;\n+    }\n+\n     private static int getChunkSize(byte[] hex, int start, int length) {\n-        // byte[] is produced by LineParse::parseLine that already skip ISO CTRL and Whitespace chars\n+        // trim the leading bytes if white spaces, if any\n+        final int skipped = skipWhiteSpaces(hex, start, length);\n+        if (skipped == length) {\n+            // empty case\n+            throw new NumberFormatException();\n+        }\n+        start = start + skipped;\n+        length = length - skipped;",
+      "start_line": null,
+      "original_start_line": 818,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 819,
+      "side": "RIGHT",
+      "original_position": 22,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1135111452,
+      "created_at": "2023-03-14T07:42:11Z",
+      "user": "normanmaurer",
+      "body": "```suggestion\r\n        assertFalse(ch.finish());\r\n```",
+      "path": "codec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java",
+      "diff_hunk": "@@ -147,6 +147,118 @@ public void testResponseChunked() {\n         assertNull(ch.readInbound());\n     }\n \n+    @Test\n+    public void testResponseChunkedWithValidUncommonPatterns() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        // leading whitespace, trailing whitespace\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing control char\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \"\\0\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing semicolon\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \";\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 218,
+      "original_line": 218,
+      "side": "RIGHT",
+      "original_position": 72,
+      "position": 72,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1135111658,
+      "created_at": "2023-03-14T07:42:23Z",
+      "user": "normanmaurer",
+      "body": "```suggestion\r\n        assertFalse(ch.finish());\r\n```",
+      "path": "codec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java",
+      "diff_hunk": "@@ -147,6 +147,118 @@ public void testResponseChunked() {\n         assertNull(ch.readInbound());\n     }\n \n+    @Test\n+    public void testResponseChunkedWithValidUncommonPatterns() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        // leading whitespace, trailing whitespace\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing control char\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \"\\0\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // leading whitespace, trailing semicolon\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \";\\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();\n+        assertNull(ch.readInbound());\n+    }\n+\n+    @Test\n+    public void testResponseChunkedWithControlChars() {\n+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());\n+        ch.writeInbound(Unpooled.copiedBuffer(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\",\n+                                              CharsetUtil.US_ASCII));\n+\n+        HttpResponse res = ch.readInbound();\n+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));\n+        assertThat(res.status(), is(HttpResponseStatus.OK));\n+\n+        byte[] data = new byte[1];\n+        for (int i = 0; i < data.length; i++) {\n+            data[i] = (byte) i;\n+        }\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"  \" + Integer.toHexString(data.length) + \" \\r\\n\",\n+                                                          CharsetUtil.US_ASCII)));\n+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(data)));\n+        HttpContent content = ch.readInbound();\n+        assertEquals(data.length, content.content().readableBytes());\n+\n+        byte[] decodedData = new byte[data.length];\n+        content.content().readBytes(decodedData);\n+        assertArrayEquals(data, decodedData);\n+        content.release();\n+\n+        assertFalse(ch.writeInbound(Unpooled.copiedBuffer(\"\\r\\n\", CharsetUtil.US_ASCII)));\n+\n+        // Write the last chunk.\n+        ch.writeInbound(Unpooled.copiedBuffer(\"0\\r\\n\\r\\n\", CharsetUtil.US_ASCII));\n+\n+        // Ensure the last chunk was decoded.\n+        LastHttpContent lastContent = ch.readInbound();\n+        assertFalse(lastContent.content().isReadable());\n+        lastContent.release();\n+\n+        ch.finish();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 258,
+      "side": "RIGHT",
+      "original_position": 112,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1338622184,
+      "created_at": "2023-03-14T07:42:35Z",
+      "user": "normanmaurer",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1338710763,
+      "created_at": "2023-03-14T08:29:25Z",
+      "user": "franz1981",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2023-03-14T08:29:47Z",
+      "sha": "9580be21db4f06264af56c9e9bb3a1433c13e909",
+      "message": "Update codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java\n\nCo-authored-by: Norman Maurer <norman_maurer@apple.com>",
+      "author": "Francesco Nigro",
+      "author_email": "nigro.fra@gmail.com",
+      "author_raw_date": "2023-03-14T08:29:47Z",
+      "author_date": "2023-03-14T08:29:47Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2023-03-14T08:29:47Z",
+      "diff_text": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java\n@@ -815,8 +815,8 @@ private static int getChunkSize(byte[] hex, int start, int length) {\n             // empty case\n             throw new NumberFormatException();\n         }\n-        start = start + skipped;\n-        length = length - skipped;\n+        start += skipped;\n+        length -= skipped;\n         int result = 0;\n         for (int i = 0; i < length; i++) {\n             final int digit = StringUtil.decodeHexNibble(hex[start + i]);",
+      "diff": [
+        {
+          "file": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "patch": "@@ -815,8 +815,8 @@ private static int getChunkSize(byte[] hex, int start, int length) {\n             // empty case\n             throw new NumberFormatException();\n         }\n-        start = start + skipped;\n-        length = length - skipped;\n+        start += skipped;\n+        length -= skipped;\n         int result = 0;\n         for (int i = 0; i < length; i++) {\n             final int digit = StringUtil.decodeHexNibble(hex[start + i]);"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-03-14T08:30:00Z",
+      "sha": "2567f611a504a776b16368033e46c35474342e0b",
+      "message": "Update codec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java\n\nCo-authored-by: Norman Maurer <norman_maurer@apple.com>",
+      "author": "Francesco Nigro",
+      "author_email": "nigro.fra@gmail.com",
+      "author_raw_date": "2023-03-14T08:30:00Z",
+      "author_date": "2023-03-14T08:30:00Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2023-03-14T08:30:00Z",
+      "diff_text": "codec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java\n@@ -255,7 +255,7 @@ public void testResponseChunkedWithControlChars() {\n         assertFalse(lastContent.content().isReadable());\n         lastContent.release();\n \n-        ch.finish();\n+        assertFalse(ch.finish());\n         assertNull(ch.readInbound());\n     }\n ",
+      "diff": [
+        {
+          "file": "codec-http/src/test/java/io/netty/handler/codec/http/HttpResponseDecoderTest.java",
+          "patch": "@@ -255,7 +255,7 @@ public void testResponseChunkedWithControlChars() {\n         assertFalse(lastContent.content().isReadable());\n         lastContent.release();\n \n-        ch.finish();\n+        assertFalse(ch.finish());\n         assertNull(ch.readInbound());\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-03-14T08:35:57Z",
+      "sha": "79b5884bb1da6b57b10c4a0e90ac00d191a1f3eb",
+      "message": "Updated per Norman's comment",
+      "author": "franz1981",
+      "author_email": "nigro.fra@gmail.com",
+      "author_raw_date": "2023-03-14T08:35:57Z",
+      "author_date": "2023-03-14T08:35:57Z",
+      "committer": "franz1981",
+      "committer_email": "nigro.fra@gmail.com",
+      "raw_date": "2023-03-14T08:35:57Z",
+      "diff_text": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java\n@@ -799,6 +799,9 @@ private LastHttpContent readTrailingHeaders(ByteBuf buffer) {\n     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;\n     protected abstract HttpMessage createInvalidMessage();\n \n+    /**\n+     * It skips any whitespace char and return the number of skipped bytes.\n+     */\n     private static int skipWhiteSpaces(byte[] hex, int start, int length) {\n         for (int i = 0; i < length; i++) {\n             if (!isWhitespace(hex[start + i])) {",
+      "diff": [
+        {
+          "file": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "patch": "@@ -799,6 +799,9 @@ private LastHttpContent readTrailingHeaders(ByteBuf buffer) {\n     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;\n     protected abstract HttpMessage createInvalidMessage();\n \n+    /**\n+     * It skips any whitespace char and return the number of skipped bytes.\n+     */\n     private static int skipWhiteSpaces(byte[] hex, int start, int length) {\n         for (int i = 0; i < length; i++) {\n             if (!isWhitespace(hex[start + i])) {"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1468116222,
+      "created_at": "2023-03-14T13:35:06Z",
+      "user": "normanmaurer",
+      "body": "@franz1981 do we need a PR for main as well ?"
+    },
+    {
+      "type": "comment",
+      "id": 1468121076,
+      "created_at": "2023-03-14T13:38:09Z",
+      "user": "franz1981",
+      "body": "Nope because for @normanmaurer I haven't yet ported the speedup of HTTP 1.1: both decoding/encoding are still WIP in my mind, but probably it's time I can do it for the decoding part at least.\r\nOn  discord I've shared some idea related http types we can think to adopt for Netty 5"
+    }
+  ]
+}

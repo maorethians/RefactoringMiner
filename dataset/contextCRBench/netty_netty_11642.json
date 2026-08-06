@@ -1,0 +1,61 @@
+{
+    "pr_body": "## Motivation\r\nOur server has its own implementation to decide whether to provide service for users according to the real-time estimated total free memory of the heap memory and the direct memory (mainly the memory used by `io.netty.buffer.PooledByteBufAllocator` for our server). If our server detects it's running out of physical memory, it will just respond with the client requests with something like `Service Unavailable`.\r\n\r\nBut the problem is: We cannot know the used memory of PooledByteBufAllocator efficiently. For example, we have allocated and cached 8GB chunks in a `PooledByteBufAllocator`, but there is no property to know: From the user perspective, what exactly the used memory is, 1GB or 8GB?\r\n\r\nThe PR will provide `usedDirectBytes` and `usedHeapBytes` for these purposes.\r\n\r\n## Modification\r\n(Honestly, I didn't come up with better names to distinguish the existing `usedDirectMemory` and the new `usedDirectBytes`. If Netty were a new project, we can distinguish these memories by calling the existing `usedDirectMemory` `committedDirectMemory` and the new memory metric `usedDirectMemory`, but Netty has been widely used in the Java world so I don't call them in this way)\r\n\r\nWhen a pooled buffer is allocated/deallocated, grows, and shrinks, count the increase/decrease size to count `usedDirectBytes` and `usedHeapBytes`\r\n\r\n## Result\r\n\r\nFixes #11637",
+    "original_commit_id": "c8c45cfa4c9632578a772ebcad1edfae431b1011",
+    "merged": false,
+    "pr_number": 11642,
+    "pr_title": "Support getting used memory from a user perspective at `PooledByteBufAllocator` level",
+    "lang": "java",
+    "full_name": "netty/netty",
+    "pr_comment": [
+        "Thanks, @JamesChenX. There are some check style issues. Also, please make sure you've signed the ICLA: https://netty.io/wiki/developer-guide.html",
+        "@chrisvest Thanks for the review, and I have signed the ICLA. PTAL.",
+        "There are already two methods in `PooledByteBufAllocator`, which are `usedHeapMemory` used for counting used heap memory usage and `usedDirectMemory` for direct memory. ",
+        "@medusar `usedHeapMemory` and `usedDirectMemory` should be named `committedHeapMemory` and `committedDirectMemory` in fact, because they count the **committed** memory in `PooledByteBufAllocator` while what we want is to count the used memory in the pooled memory from the user perspective. I know it's a little confusing and that's why I am hesitating about what names we should use to distinguish these two kinds of memory.\r\n\r\ne.g.\r\n```java\r\nByteBuf buffer = allocator.directBuffer(16, 128);\r\nassertEquals(16, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok. \"usedDirectMemory\" should named \"committedDirectMemory\"\r\n\r\nbuffer.release();\r\nassertEquals(0, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok\r\n```",
+        "@chrisvest Thanks. I think we need to confirm whether our expectations are the same for the new methods `getUsedDirectBytes` and `getUsedHeapBytes` first.\r\nWhat you have described seems the behavior of the existing `getUsedDirectMemory` and `getUsedHeapMemory`, which count the actually used and cached buffers in PooledByteBufAllocator, which not what we want. Our new methods `usedDirectBytes` and `usedHeapBytes` count the used bytes that follow the lifecycle of a pooled buffer, which is what we need in our project. e.g.:\r\n```java\r\nByteBuf buffer = allocator.directBuffer(16, 128);\r\nassertEquals(16, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok. \"usedDirectMemory\" should be named \"committedDirectMemory\" or \"reservedDirectMemory\"\r\n\r\nbuffer.release();\r\nassertEquals(0, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok\r\n```\r\nFor details, my expectation for these two new methods is the asserts in: https://github.com/netty/netty/pull/11642/files#diff-5356c1287108c4b93aee8b54109d5ef4d4b9cb2179af1806384e0c520aa9dfe6R694-R722\r\n\r\nDo we expect the same thing?",
+        "@JamesChenX We can think of it as memory committed by the pool, and memory committed to a buffer instance, if that helps.\r\n\r\nThe existing `allocator.usedDirectMemory()` (for example) computes a sum of `arena.numActiveBytes()`, and that in turn computes a sum of `m.chunkSize()` where `m` is a `PoolChunk`. That's the memory committed to the pool, because each chunk is (for direct memory) a single direct memory allocation.\r\n\r\nChunks are then used in pieces by many buffers. Each direct buffer gets a section of a chunk committed to it, which is greater-than-or-equal-to the buffer size, so the buffer can be smaller than the memory committed to it. I think the new method should return the sum of memory committed to the buffers.\r\n\r\nI think we can get that with code similar to what's done for `allocator.usedDirect/HeapMemory()`, but instead of using sums of `chunk.chunkSize()`, we use `chunk.chunkSize() - chunk.freeBytes()`.\r\n\r\nSo in summary, I think we had slightly different expectations, but if the purpose is to do respond to high utilisation of the pooled memory resources, then going by the memory committed to buffers rather than their sizes, will be more accurate.\r\n\r\nMakes sense?\r\n\r\nThen, once we are getting the values out that we want, we can see if computing these sums is too slow and if it would be better to have some `LongCounters`, or perhaps per-arena `AtomicLongs`, to speed up querying.",
+        "@chrisvest Thanks for your kind explanation and I see your point. Though we expect different metrics, `chunk.chunkSize() - chunk.freeBytes()` is accurate and performant enough for our scenarios. So I close the PR, Thanks!"
+    ],
+    "commit_id": "ae47127c62b23f0cc62a821b2c0d5f15f2754f26",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 388,
+            "start_side": null,
+            "start_line": null,
+            "line": 388,
+            "comment_lines": [
+                "[][388]"
+            ],
+            "review_comment": [
+                "I think we should use the size of the actual memory consumed by the buffer, rather than the sum of the capacities of all in-use buffers. So these increments and decrements will be in terms of pool chunk sub-page element size (for \"small\" allocation), pool chunk page-multiple run size (for \"normal\" allocations), or the requested capacity (for \"huge\" allocations).",
+                "In other words, I'd like to see this accounting be pushed down to where memory is removed from, or returned to, the pool."
+            ],
+            "path": "buffer/src/main/java/io/netty/buffer/PooledByteBufAllocator.java",
+            "id": 50648,
+            "created_at": "2021-09-06T15:24:24Z",
+            "original_position": 21,
+            "side": "RIGHT",
+            "position": 21,
+            "original_start_line": null
+        },
+        {
+            "original_line": 105,
+            "start_side": null,
+            "start_line": null,
+            "line": 105,
+            "comment_lines": [
+                "[][105]"
+            ],
+            "review_comment": [
+                "This logic should move into `PoolArena.reallocate`.\r\nAt this location, if the new capacity is less than the current capacity, we would incorrectly count the used memory down even though the memory wasn't actually returned to the pool."
+            ],
+            "path": "buffer/src/main/java/io/netty/buffer/PooledByteBuf.java",
+            "id": 50647,
+            "created_at": "2021-09-06T15:16:56Z",
+            "original_position": 8,
+            "side": "RIGHT",
+            "position": 8,
+            "original_start_line": null
+        }
+    ]
+}

@@ -1,0 +1,403 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 4531,
+  "pr_number": 4531,
+  "title": "remote: output stats on each run",
+  "user": "agoulti",
+  "created_at": "2018-01-26T18:21:51Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "cla: yes"
+  ],
+  "base_commit": "cf097e464bbe2f9ff40ba0f70f2425033c14cefb",
+  "merge_commit_sha": "a0217996f11b669bc38c8efedc9e45f25215ad54",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "assigned",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "closed"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/4531",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2018-01-26T18:19:59Z",
+      "sha": "64c2f8cee94ed90973a143b52312cf31a65a2ebf",
+      "message": "remote: output stats on each run\n\nInitial implementation for outputting a summary of actions ran\nwhen using RemoteSpawnRunner. Breaks down by cached/uncached and\nlocal vs non-local.\n\nCurrently it surfaces a number of local steps that are for Bazel's\nbookkeeping: I've seen CreateRunfiles, though there could be more\nin that category. As a follow up, we need to decide what to do about\nthose: users would expect to see 100% remote execution if everything\nis working properly.\n\nRELNOTES: Bazel now adds action summary statistics when using remote execution.",
+      "author": "agoulti",
+      "author_email": "agoulti@google.com",
+      "author_raw_date": "2018-01-26T17:34:04Z",
+      "author_date": "2018-01-26T17:34:04Z",
+      "committer": "agoulti",
+      "committer_email": "agoulti@google.com",
+      "raw_date": "2018-01-26T18:19:59Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/RemoteActionContextProvider.java\n@@ -37,16 +37,19 @@ final class RemoteActionContextProvider extends ActionContextProvider {\n   private final AbstractRemoteActionCache cache;\n   private final GrpcRemoteExecutor executor;\n   private final DigestUtil digestUtil;\n+  private final RemoteStats stats;\n \n   RemoteActionContextProvider(\n       CommandEnvironment env,\n       @Nullable AbstractRemoteActionCache cache,\n       @Nullable GrpcRemoteExecutor executor,\n-      DigestUtil digestUtil) {\n+      DigestUtil digestUtil,\n+      @Nullable RemoteStats stats) {\n     this.env = env;\n     this.executor = executor;\n     this.cache = cache;\n     this.digestUtil = digestUtil;\n+    this.stats = stats;\n   }\n \n   @Override\n@@ -81,7 +84,8 @@ public Iterable<? extends ActionContext> getActionContexts() {\n               commandId,\n               cache,\n               executor,\n-              digestUtil);\n+              digestUtil,\n+              stats);\n       return ImmutableList.of(new RemoteSpawnStrategy(env.getExecRoot(), spawnRunner));\n     }\n   }\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -15,12 +15,16 @@\n package com.google.devtools.build.lib.remote;\n \n import com.google.common.annotations.VisibleForTesting;\n+import com.google.common.base.Joiner;\n import com.google.common.collect.ImmutableList;\n+import com.google.common.eventbus.Subscribe;\n import com.google.devtools.build.lib.authandtls.AuthAndTLSOptions;\n import com.google.devtools.build.lib.authandtls.GoogleAuthUtils;\n import com.google.devtools.build.lib.buildeventstream.PathConverter;\n import com.google.devtools.build.lib.buildtool.BuildRequest;\n+import com.google.devtools.build.lib.buildtool.buildevent.BuildCompleteEvent;\n import com.google.devtools.build.lib.events.Event;\n+import com.google.devtools.build.lib.events.Reporter;\n import com.google.devtools.build.lib.exec.ExecutorBuilder;\n import com.google.devtools.build.lib.runtime.BlazeModule;\n import com.google.devtools.build.lib.runtime.Command;\n@@ -90,8 +94,14 @@ public void serverInit(OptionsProvider startupOptions, ServerBuilder builder)\n     builder.addPathToUriConverter(converter);\n   }\n \n+  private Reporter reporter;\n+  private RemoteStats stats;\n+\n   @Override\n   public void beforeCommand(CommandEnvironment env) {\n+    stats = new RemoteStats();\n+    this.reporter = env.getReporter();\n+\n     env.getEventBus().register(this);\n     String buildRequestId = env.getBuildRequestId().toString();\n     String commandId = env.getCommandId().toString();\n@@ -153,7 +163,7 @@ public void beforeCommand(CommandEnvironment env) {\n         executor = null;\n       }\n \n-      actionContextProvider = new RemoteActionContextProvider(env, cache, executor, digestUtil);\n+      actionContextProvider = new RemoteActionContextProvider(env, cache, executor, digestUtil, stats);\n     } catch (IOException e) {\n       env.getReporter().handle(Event.error(e.getMessage()));\n       env.getBlazeModuleEnvironment().exit(new AbruptExitException(ExitCode.COMMAND_LINE_ERROR));\n@@ -179,4 +189,9 @@ public static boolean remoteEnabled(RemoteOptions options) {\n     return SimpleBlobStoreFactory.isRemoteCacheOptions(options)\n         || GrpcRemoteCache.isRemoteCacheOptions(options);\n   }\n+\n+  @Subscribe\n+  public void buildComplete(BuildCompleteEvent event) {\n+    reporter.handle(Event.info(stats.Summary()));\n+  }\n }\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteSpawnRunner.java\n@@ -82,6 +82,7 @@ class RemoteSpawnRunner implements SpawnRunner {\n   private final String buildRequestId;\n   private final String commandId;\n   private final DigestUtil digestUtil;\n+  private final RemoteStats stats;\n \n   // Used to ensure that a warning is reported only once.\n   private final AtomicBoolean warningReported = new AtomicBoolean();\n@@ -96,7 +97,8 @@ class RemoteSpawnRunner implements SpawnRunner {\n       String commandId,\n       @Nullable AbstractRemoteActionCache remoteCache,\n       @Nullable GrpcRemoteExecutor remoteExecutor,\n-      DigestUtil digestUtil) {\n+      DigestUtil digestUtil,\n+      @Nullable RemoteStats stats) {\n     this.execRoot = execRoot;\n     this.options = options;\n     this.fallbackRunner = fallbackRunner;\n@@ -107,12 +109,19 @@ class RemoteSpawnRunner implements SpawnRunner {\n     this.buildRequestId = buildRequestId;\n     this.commandId = commandId;\n     this.digestUtil = digestUtil;\n+    this.stats = stats;\n   }\n \n   @Override\n   public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n       throws ExecException, InterruptedException, IOException {\n+    if (stats != null) {\n+      stats.addSpawn();\n+    }\n     if (!Spawns.mayBeExecutedRemotely(spawn) || remoteCache == null) {\n+      if (stats != null) {\n+        stats.addLocal();\n+      }\n       return fallbackRunner.exec(spawn, policy);\n     }\n \n@@ -156,6 +165,9 @@ public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n                     + actionKey.getDigest());\n           }\n           try {\n+            if (stats != null) {\n+              stats.addRemoteCacheHit();\n+            }\n             return downloadRemoteResults(cachedResult, policy.getFileOutErr());\n           } catch (CacheNotFoundException e) {\n             // No cache hit, so we fall through to local or remote execution.\n@@ -193,7 +205,11 @@ public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n       }\n \n       try {\n-        return downloadRemoteResults(result, policy.getFileOutErr());\n+        SpawnResult r = downloadRemoteResults(result, policy.getFileOutErr());\n+        if(stats != null) {\n+          stats.addRemoteExec();\n+        }\n+        return r;\n       } catch (IOException e) {\n         return execLocallyOrFail(spawn, policy, inputMap, actionKey, uploadLocalResults, e);\n       }\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteStats.java\n@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {\n+    total_spawns.incrementAndGet();\n+  }\n+\n+  public void addRemoteCacheHit() { remote_cache_hit.incrementAndGet(); };\n+\n+  // Spawns remotely executed\n+  public void addRemoteExec() { remote_exec.incrementAndGet(); }\n+\n+  // Spawns that are intentionally executed locally (as opposed to fall back mechanism)\n+  public void addLocal() { local.incrementAndGet(); }\n+\n+  public String Summary() {\n+    // We are assuming this is called after all the increments. Calling it at concurrently\n+    // might produce inconsistent stats.\n+    int remote = remote_exec.get() + remote_cache_hit.get();\n+\n+    // Actions that were attempted, but were neither successful remote nor local had to be\n+    // fallbacks to local from remote.\n+    int fallback = total_spawns.get() - remote - local.get();\n+\n+    String result = String.format(\"Remote stats: %d/%d remote actions cached, %d local\",\n+        remote_cache_hit.get(), remote, local.get());\n+    if(fallback > 0) {\n+      result += String.format(\" (%d fallback)\", fallback);\n+    }\n+    return result;\n+  }\n+}\nsrc/test/java/com/google/devtools/build/lib/remote/GrpcRemoteExecutionClientTest.java\n@@ -252,7 +252,8 @@ public PathFragment getExecPath() {\n             \"command-id\",\n             remoteCache,\n             executor,\n-            DIGEST_UTIL);\n+            DIGEST_UTIL,\n+            null);\n     inputDigest = fakeFileCache.createScratchInput(simpleSpawn.getInputFiles().get(0), \"xyz\");\n   }\n \nsrc/test/java/com/google/devtools/build/lib/remote/RemoteSpawnRunnerTest.java\n@@ -134,7 +134,8 @@ public void nonCachableSpawnsShouldNotBeCached_remote() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ExecuteResponse succeeded = ExecuteResponse.newBuilder().setResult(\n         ActionResult.newBuilder().setExitCode(0).build()).build();\n@@ -192,7 +193,8 @@ public void nonCachableSpawnsShouldNotBeCached_local() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     // Throw an IOException to trigger the local fallback.\n     when(executor.executeRemotely(any(ExecuteRequest.class))).thenThrow(IOException.class);\n@@ -244,7 +246,8 @@ public void failedActionShouldOnlyUploadOutputs() throws Exception {\n                 \"command-id\",\n                 cache,\n                 null,\n-                digestUtil));\n+                digestUtil,\n+                null));\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -292,7 +295,8 @@ public void dontAcceptFailedCachedAction() throws Exception {\n                 \"command-id\",\n                 cache,\n                 null,\n-                digestUtil));\n+                digestUtil,\n+                null));\n \n     try {\n       runner.exec(spawn, policy);\n@@ -326,7 +330,8 @@ public void printWarningIfCacheIsDown() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -377,7 +382,8 @@ public void noRemoteExecutorFallbackFails() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -416,7 +422,8 @@ public void remoteCacheErrorFallbackFails() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -452,7 +459,8 @@ public void testLocalFallbackFailureRemoteExecutorFailure() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n     when(executor.executeRemotely(any(ExecuteRequest.class))).thenThrow(new IOException());\n@@ -490,7 +498,8 @@ public void cacheDownloadFailureTriggersRemoteExecution() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(cachedResult);\n@@ -531,7 +540,8 @@ public void testRemoteExecutionTimeout() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n@@ -567,7 +577,8 @@ public void testRemoteExecutionTimeoutDoesNotTriggerFallback() throws Exception\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n@@ -601,7 +612,8 @@ public void testRemoteExecutionCommandFailureDoesNotTriggerFallback() throws Exc\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n@@ -641,7 +653,8 @@ public void testExitCode_executorfailure() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n     when(executor.executeRemotely(any(ExecuteRequest.class))).thenThrow(new IOException());\n@@ -677,7 +690,8 @@ public void testExitCode_executionfailure() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     when(cache.getCachedActionResult(any(ActionKey.class))).thenThrow(new IOException());\n \nsrc/test/shell/bazel/remote_execution_test.sh\n@@ -1,3 +1,4 @@\n+\n #!/bin/bash\n #\n # Copyright 2016 The Bazel Authors. All rights reserved.\n@@ -507,6 +508,90 @@ EOF\n   expect_log \"Remote connection/protocol failed\"\n }\n \n+\n+# Bazel corrects outputs remote statistics\n+function test_remote_stats() {\n+  mkdir -p a\n+  cat > a/BUILD <<'EOF'\n+genrule(\n+  name = \"foo\",\n+  srcs = [],\n+  outs = [\"foo.txt\"],\n+  cmd = \"echo \\\"hello world\\\" > \\\"$@\\\"\",\n+)\n+\n+genrule(\n+  name = \"foo2\",\n+  srcs = [\"foo.txt\"],\n+  outs = [\"foo2.txt\"],\n+  cmd = \"cat $(location foo.txt) > $@\",\n+)\n+EOF\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=localhost:${worker_port} \\\n+      --remote_cache=localhost:${worker_port} \\\n+      //a:foo >& $TEST_log \\\n+      || fail \"Failed to build //a:foo with remote execution\"\n+  expect_log \"Remote stats\" \"Expected remote stats message\"\n+  # This is a clean build. We expect no cache hits and some remote executions.\n+  expect_log \" 0/[1-9][0-9]* remote actions cached\"\n+  expect_not_log \"fallback\"\n+  \n+\n+  bazel clean --expunge >& $TEST_log\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=localhost:${worker_port} \\\n+      --remote_cache=localhost:${worker_port} \\\n+      //a:foo >& $TEST_log \\\n+      || fail \"Failed to rebuild //a:foo with remote execution\"\n+  expect_not_log \" 0/[1-9][0-9]* remote actions cached\"\n+  # Should get no remote execution since everything is cached.\n+  # So, should have the same number cached as uncached.\n+  expect_log \" \\([1-9][0-9]*\\)/\\1 remote actions cached\"\n+  expect_not_log \"fallback\"\n+\n+  bazel clean --expunge >& $TEST_log\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=localhost:${worker_port} \\\n+      --remote_cache=localhost:${worker_port} \\\n+      //a:foo2 >& $TEST_log \\\n+      || fail \"Failed to build //a:foo2 with remote execution\"\n+  # foo2 depends on foo which is cached, but also adds new work.\n+  # Expect a mixture of cached and remote actions: both numbers should be non-zero\n+  # and they should not be the same.\n+  expect_log \" [1-9][0-9]*/[1-9][0-9]* remote actions cached\"\n+  expect_not_log \" \\([1-9][0-9]*\\)/\\1 remote actions cached\"\n+  expect_not_log \"fallback\"\n+}\n+\n+# Bazel corrects outputs remote statistics\n+function test_remote_stats() {\n+  mkdir -p a\n+  cat > a/BUILD <<'EOF'\n+genrule(\n+  name = \"foo\",\n+  srcs = [],\n+  outs = [\"foo.txt\"],\n+  cmd = \"echo \\\"hello world\\\" > \\\"$@\\\"\",\n+)\n+EOF\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=bazel-test-does-not-exist \\\n+      --remote_cache=bazel-test-does-not-exist \\\n+      --remote_local_fallback=true \\\n+      //a:foo >& $TEST_log \\\n+      || fail \"Failed to build //a:foo with fallback\"\n+  expect_log \"Remote stats\" \"Expected remote stats message\"\n+  # Could not reach remote worker. Expect no remote actions or cache hits. Expect non-zero\n+  # fallback actions\n+  expect_log \" 0/0 remote actions cached\"\n+  expect_log \" ([1-9][0-9]* fallback)\"\n+}\n+\n # TODO(alpha): Add a test that fails remote execution when remote worker\n # supports sandbox.\n ",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteActionContextProvider.java",
+          "patch": "@@ -37,16 +37,19 @@ final class RemoteActionContextProvider extends ActionContextProvider {\n   private final AbstractRemoteActionCache cache;\n   private final GrpcRemoteExecutor executor;\n   private final DigestUtil digestUtil;\n+  private final RemoteStats stats;\n \n   RemoteActionContextProvider(\n       CommandEnvironment env,\n       @Nullable AbstractRemoteActionCache cache,\n       @Nullable GrpcRemoteExecutor executor,\n-      DigestUtil digestUtil) {\n+      DigestUtil digestUtil,\n+      @Nullable RemoteStats stats) {\n     this.env = env;\n     this.executor = executor;\n     this.cache = cache;\n     this.digestUtil = digestUtil;\n+    this.stats = stats;\n   }\n \n   @Override\n@@ -81,7 +84,8 @@ public Iterable<? extends ActionContext> getActionContexts() {\n               commandId,\n               cache,\n               executor,\n-              digestUtil);\n+              digestUtil,\n+              stats);\n       return ImmutableList.of(new RemoteSpawnStrategy(env.getExecRoot(), spawnRunner));\n     }\n   }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -15,12 +15,16 @@\n package com.google.devtools.build.lib.remote;\n \n import com.google.common.annotations.VisibleForTesting;\n+import com.google.common.base.Joiner;\n import com.google.common.collect.ImmutableList;\n+import com.google.common.eventbus.Subscribe;\n import com.google.devtools.build.lib.authandtls.AuthAndTLSOptions;\n import com.google.devtools.build.lib.authandtls.GoogleAuthUtils;\n import com.google.devtools.build.lib.buildeventstream.PathConverter;\n import com.google.devtools.build.lib.buildtool.BuildRequest;\n+import com.google.devtools.build.lib.buildtool.buildevent.BuildCompleteEvent;\n import com.google.devtools.build.lib.events.Event;\n+import com.google.devtools.build.lib.events.Reporter;\n import com.google.devtools.build.lib.exec.ExecutorBuilder;\n import com.google.devtools.build.lib.runtime.BlazeModule;\n import com.google.devtools.build.lib.runtime.Command;\n@@ -90,8 +94,14 @@ public void serverInit(OptionsProvider startupOptions, ServerBuilder builder)\n     builder.addPathToUriConverter(converter);\n   }\n \n+  private Reporter reporter;\n+  private RemoteStats stats;\n+\n   @Override\n   public void beforeCommand(CommandEnvironment env) {\n+    stats = new RemoteStats();\n+    this.reporter = env.getReporter();\n+\n     env.getEventBus().register(this);\n     String buildRequestId = env.getBuildRequestId().toString();\n     String commandId = env.getCommandId().toString();\n@@ -153,7 +163,7 @@ public void beforeCommand(CommandEnvironment env) {\n         executor = null;\n       }\n \n-      actionContextProvider = new RemoteActionContextProvider(env, cache, executor, digestUtil);\n+      actionContextProvider = new RemoteActionContextProvider(env, cache, executor, digestUtil, stats);\n     } catch (IOException e) {\n       env.getReporter().handle(Event.error(e.getMessage()));\n       env.getBlazeModuleEnvironment().exit(new AbruptExitException(ExitCode.COMMAND_LINE_ERROR));\n@@ -179,4 +189,9 @@ public static boolean remoteEnabled(RemoteOptions options) {\n     return SimpleBlobStoreFactory.isRemoteCacheOptions(options)\n         || GrpcRemoteCache.isRemoteCacheOptions(options);\n   }\n+\n+  @Subscribe\n+  public void buildComplete(BuildCompleteEvent event) {\n+    reporter.handle(Event.info(stats.Summary()));\n+  }\n }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteSpawnRunner.java",
+          "patch": "@@ -82,6 +82,7 @@ class RemoteSpawnRunner implements SpawnRunner {\n   private final String buildRequestId;\n   private final String commandId;\n   private final DigestUtil digestUtil;\n+  private final RemoteStats stats;\n \n   // Used to ensure that a warning is reported only once.\n   private final AtomicBoolean warningReported = new AtomicBoolean();\n@@ -96,7 +97,8 @@ class RemoteSpawnRunner implements SpawnRunner {\n       String commandId,\n       @Nullable AbstractRemoteActionCache remoteCache,\n       @Nullable GrpcRemoteExecutor remoteExecutor,\n-      DigestUtil digestUtil) {\n+      DigestUtil digestUtil,\n+      @Nullable RemoteStats stats) {\n     this.execRoot = execRoot;\n     this.options = options;\n     this.fallbackRunner = fallbackRunner;\n@@ -107,12 +109,19 @@ class RemoteSpawnRunner implements SpawnRunner {\n     this.buildRequestId = buildRequestId;\n     this.commandId = commandId;\n     this.digestUtil = digestUtil;\n+    this.stats = stats;\n   }\n \n   @Override\n   public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n       throws ExecException, InterruptedException, IOException {\n+    if (stats != null) {\n+      stats.addSpawn();\n+    }\n     if (!Spawns.mayBeExecutedRemotely(spawn) || remoteCache == null) {\n+      if (stats != null) {\n+        stats.addLocal();\n+      }\n       return fallbackRunner.exec(spawn, policy);\n     }\n \n@@ -156,6 +165,9 @@ public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n                     + actionKey.getDigest());\n           }\n           try {\n+            if (stats != null) {\n+              stats.addRemoteCacheHit();\n+            }\n             return downloadRemoteResults(cachedResult, policy.getFileOutErr());\n           } catch (CacheNotFoundException e) {\n             // No cache hit, so we fall through to local or remote execution.\n@@ -193,7 +205,11 @@ public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n       }\n \n       try {\n-        return downloadRemoteResults(result, policy.getFileOutErr());\n+        SpawnResult r = downloadRemoteResults(result, policy.getFileOutErr());\n+        if(stats != null) {\n+          stats.addRemoteExec();\n+        }\n+        return r;\n       } catch (IOException e) {\n         return execLocallyOrFail(spawn, policy, inputMap, actionKey, uploadLocalResults, e);\n       }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+          "patch": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {\n+    total_spawns.incrementAndGet();\n+  }\n+\n+  public void addRemoteCacheHit() { remote_cache_hit.incrementAndGet(); };\n+\n+  // Spawns remotely executed\n+  public void addRemoteExec() { remote_exec.incrementAndGet(); }\n+\n+  // Spawns that are intentionally executed locally (as opposed to fall back mechanism)\n+  public void addLocal() { local.incrementAndGet(); }\n+\n+  public String Summary() {\n+    // We are assuming this is called after all the increments. Calling it at concurrently\n+    // might produce inconsistent stats.\n+    int remote = remote_exec.get() + remote_cache_hit.get();\n+\n+    // Actions that were attempted, but were neither successful remote nor local had to be\n+    // fallbacks to local from remote.\n+    int fallback = total_spawns.get() - remote - local.get();\n+\n+    String result = String.format(\"Remote stats: %d/%d remote actions cached, %d local\",\n+        remote_cache_hit.get(), remote, local.get());\n+    if(fallback > 0) {\n+      result += String.format(\" (%d fallback)\", fallback);\n+    }\n+    return result;\n+  }\n+}"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/GrpcRemoteExecutionClientTest.java",
+          "patch": "@@ -252,7 +252,8 @@ public PathFragment getExecPath() {\n             \"command-id\",\n             remoteCache,\n             executor,\n-            DIGEST_UTIL);\n+            DIGEST_UTIL,\n+            null);\n     inputDigest = fakeFileCache.createScratchInput(simpleSpawn.getInputFiles().get(0), \"xyz\");\n   }\n "
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/RemoteSpawnRunnerTest.java",
+          "patch": "@@ -134,7 +134,8 @@ public void nonCachableSpawnsShouldNotBeCached_remote() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ExecuteResponse succeeded = ExecuteResponse.newBuilder().setResult(\n         ActionResult.newBuilder().setExitCode(0).build()).build();\n@@ -192,7 +193,8 @@ public void nonCachableSpawnsShouldNotBeCached_local() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     // Throw an IOException to trigger the local fallback.\n     when(executor.executeRemotely(any(ExecuteRequest.class))).thenThrow(IOException.class);\n@@ -244,7 +246,8 @@ public void failedActionShouldOnlyUploadOutputs() throws Exception {\n                 \"command-id\",\n                 cache,\n                 null,\n-                digestUtil));\n+                digestUtil,\n+                null));\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -292,7 +295,8 @@ public void dontAcceptFailedCachedAction() throws Exception {\n                 \"command-id\",\n                 cache,\n                 null,\n-                digestUtil));\n+                digestUtil,\n+                null));\n \n     try {\n       runner.exec(spawn, policy);\n@@ -326,7 +330,8 @@ public void printWarningIfCacheIsDown() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -377,7 +382,8 @@ public void noRemoteExecutorFallbackFails() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -416,7 +422,8 @@ public void remoteCacheErrorFallbackFails() throws Exception {\n             \"command-id\",\n             cache,\n             null,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     Spawn spawn = newSimpleSpawn();\n     SpawnExecutionPolicy policy = new FakeSpawnExecutionPolicy(spawn);\n@@ -452,7 +459,8 @@ public void testLocalFallbackFailureRemoteExecutorFailure() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n     when(executor.executeRemotely(any(ExecuteRequest.class))).thenThrow(new IOException());\n@@ -490,7 +498,8 @@ public void cacheDownloadFailureTriggersRemoteExecution() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(cachedResult);\n@@ -531,7 +540,8 @@ public void testRemoteExecutionTimeout() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n@@ -567,7 +577,8 @@ public void testRemoteExecutionTimeoutDoesNotTriggerFallback() throws Exception\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n@@ -601,7 +612,8 @@ public void testRemoteExecutionCommandFailureDoesNotTriggerFallback() throws Exc\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     ActionResult cachedResult = ActionResult.newBuilder().setExitCode(0).build();\n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n@@ -641,7 +653,8 @@ public void testExitCode_executorfailure() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     when(cache.getCachedActionResult(any(ActionKey.class))).thenReturn(null);\n     when(executor.executeRemotely(any(ExecuteRequest.class))).thenThrow(new IOException());\n@@ -677,7 +690,8 @@ public void testExitCode_executionfailure() throws Exception {\n             \"command-id\",\n             cache,\n             executor,\n-            digestUtil);\n+            digestUtil,\n+            null);\n \n     when(cache.getCachedActionResult(any(ActionKey.class))).thenThrow(new IOException());\n "
+        },
+        {
+          "file": "src/test/shell/bazel/remote_execution_test.sh",
+          "patch": "@@ -1,3 +1,4 @@\n+\n #!/bin/bash\n #\n # Copyright 2016 The Bazel Authors. All rights reserved.\n@@ -507,6 +508,90 @@ EOF\n   expect_log \"Remote connection/protocol failed\"\n }\n \n+\n+# Bazel corrects outputs remote statistics\n+function test_remote_stats() {\n+  mkdir -p a\n+  cat > a/BUILD <<'EOF'\n+genrule(\n+  name = \"foo\",\n+  srcs = [],\n+  outs = [\"foo.txt\"],\n+  cmd = \"echo \\\"hello world\\\" > \\\"$@\\\"\",\n+)\n+\n+genrule(\n+  name = \"foo2\",\n+  srcs = [\"foo.txt\"],\n+  outs = [\"foo2.txt\"],\n+  cmd = \"cat $(location foo.txt) > $@\",\n+)\n+EOF\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=localhost:${worker_port} \\\n+      --remote_cache=localhost:${worker_port} \\\n+      //a:foo >& $TEST_log \\\n+      || fail \"Failed to build //a:foo with remote execution\"\n+  expect_log \"Remote stats\" \"Expected remote stats message\"\n+  # This is a clean build. We expect no cache hits and some remote executions.\n+  expect_log \" 0/[1-9][0-9]* remote actions cached\"\n+  expect_not_log \"fallback\"\n+  \n+\n+  bazel clean --expunge >& $TEST_log\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=localhost:${worker_port} \\\n+      --remote_cache=localhost:${worker_port} \\\n+      //a:foo >& $TEST_log \\\n+      || fail \"Failed to rebuild //a:foo with remote execution\"\n+  expect_not_log \" 0/[1-9][0-9]* remote actions cached\"\n+  # Should get no remote execution since everything is cached.\n+  # So, should have the same number cached as uncached.\n+  expect_log \" \\([1-9][0-9]*\\)/\\1 remote actions cached\"\n+  expect_not_log \"fallback\"\n+\n+  bazel clean --expunge >& $TEST_log\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=localhost:${worker_port} \\\n+      --remote_cache=localhost:${worker_port} \\\n+      //a:foo2 >& $TEST_log \\\n+      || fail \"Failed to build //a:foo2 with remote execution\"\n+  # foo2 depends on foo which is cached, but also adds new work.\n+  # Expect a mixture of cached and remote actions: both numbers should be non-zero\n+  # and they should not be the same.\n+  expect_log \" [1-9][0-9]*/[1-9][0-9]* remote actions cached\"\n+  expect_not_log \" \\([1-9][0-9]*\\)/\\1 remote actions cached\"\n+  expect_not_log \"fallback\"\n+}\n+\n+# Bazel corrects outputs remote statistics\n+function test_remote_stats() {\n+  mkdir -p a\n+  cat > a/BUILD <<'EOF'\n+genrule(\n+  name = \"foo\",\n+  srcs = [],\n+  outs = [\"foo.txt\"],\n+  cmd = \"echo \\\"hello world\\\" > \\\"$@\\\"\",\n+)\n+EOF\n+  bazel build \\\n+      --spawn_strategy=remote \\\n+      --remote_executor=bazel-test-does-not-exist \\\n+      --remote_cache=bazel-test-does-not-exist \\\n+      --remote_local_fallback=true \\\n+      //a:foo >& $TEST_log \\\n+      || fail \"Failed to build //a:foo with fallback\"\n+  expect_log \"Remote stats\" \"Expected remote stats message\"\n+  # Could not reach remote worker. Expect no remote actions or cache hits. Expect non-zero\n+  # fallback actions\n+  expect_log \" 0/0 remote actions cached\"\n+  expect_log \" ([1-9][0-9]* fallback)\"\n+}\n+\n # TODO(alpha): Add a test that fails remote execution when remote worker\n # supports sandbox.\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2018-01-26T18:21:51Z",
+      "user": "agoulti",
+      "body": "Initial implementation for outputting a summary of actions ran\r\nwhen using RemoteSpawnRunner. Breaks down by cached/uncached and\r\nlocal vs non-local.\r\n\r\nCurrently it surfaces a number of local steps that are for Bazel's\r\nbookkeeping: I've seen CreateRunfiles, though there could be more\r\nin that category. As a follow up, we need to decide what to do about\r\nthose: users would expect to see 100% remote execution if everything\r\nis working properly.\r\n\r\nRELNOTES: Bazel now adds action summary statistics when using remote execution.\r\nFIXES: #2846"
+    },
+    {
+      "type": "review_comment",
+      "id": 164303243,
+      "created_at": "2018-01-28T15:55:51Z",
+      "user": "buchgr",
+      "body": "Remove the `@Nullable` and add a check that it's non-null. There's no reason for it to be null and it avoids all the null checks further down.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteActionContextProvider.java",
+      "diff_hunk": "@@ -37,16 +37,19 @@\n   private final AbstractRemoteActionCache cache;\n   private final GrpcRemoteExecutor executor;\n   private final DigestUtil digestUtil;\n+  private final RemoteStats stats;\n \n   RemoteActionContextProvider(\n       CommandEnvironment env,\n       @Nullable AbstractRemoteActionCache cache,\n       @Nullable GrpcRemoteExecutor executor,\n-      DigestUtil digestUtil) {\n+      DigestUtil digestUtil,\n+      @Nullable RemoteStats stats) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 47,
+      "original_line": 47,
+      "side": "RIGHT",
+      "original_position": 12,
+      "position": 12,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303269,
+      "created_at": "2018-01-28T15:56:43Z",
+      "user": "buchgr",
+      "body": "Same as above. Remove `@Nullable`.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteSpawnRunner.java",
+      "diff_hunk": "@@ -96,7 +97,8 @@\n       String commandId,\n       @Nullable AbstractRemoteActionCache remoteCache,\n       @Nullable GrpcRemoteExecutor remoteExecutor,\n-      DigestUtil digestUtil) {\n+      DigestUtil digestUtil,\n+      @Nullable RemoteStats stats) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 101,
+      "original_line": 101,
+      "side": "RIGHT",
+      "original_position": 14,
+      "position": 14,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303295,
+      "created_at": "2018-01-28T15:57:27Z",
+      "user": "buchgr",
+      "body": "final please.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 12,
+      "original_line": 12,
+      "side": "RIGHT",
+      "original_position": 12,
+      "position": 12,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303313,
+      "created_at": "2018-01-28T15:57:51Z",
+      "user": "buchgr",
+      "body": "initialize all fields in the declaration and remove the constructor.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 18,
+      "original_line": 18,
+      "side": "RIGHT",
+      "original_position": 18,
+      "position": 18,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303364,
+      "created_at": "2018-01-28T15:59:26Z",
+      "user": "buchgr",
+      "body": "package private please.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 8,
+      "original_line": 8,
+      "side": "RIGHT",
+      "original_position": 8,
+      "position": 8,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303374,
+      "created_at": "2018-01-28T15:59:43Z",
+      "user": "buchgr",
+      "body": "we use camel case for fields.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 11,
+      "original_line": 11,
+      "side": "RIGHT",
+      "original_position": 11,
+      "position": 11,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303396,
+      "created_at": "2018-01-28T16:00:15Z",
+      "user": "buchgr",
+      "body": "Method names start with lower case.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {\n+    total_spawns.incrementAndGet();\n+  }\n+\n+  public void addRemoteCacheHit() { remote_cache_hit.incrementAndGet(); };\n+\n+  // Spawns remotely executed\n+  public void addRemoteExec() { remote_exec.incrementAndGet(); }\n+\n+  // Spawns that are intentionally executed locally (as opposed to fall back mechanism)\n+  public void addLocal() { local.incrementAndGet(); }\n+\n+  public String Summary() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 33,
+      "original_line": 33,
+      "side": "RIGHT",
+      "original_position": 33,
+      "position": 33,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 164433565,
+          "user": "ola-rozenfeld",
+          "body": "Is there a way to run Google Java linter on an external patch? Or just Copybara it in?",
+          "created_at": "2018-01-29T13:43:41Z"
+        },
+        {
+          "id": 164698228,
+          "user": "ulfjack",
+          "body": "It's automatically run on import.",
+          "created_at": "2018-01-30T10:26:13Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 164303422,
+      "created_at": "2018-01-28T16:00:58Z",
+      "user": "buchgr",
+      "body": "`add` doesn't seem like a great fit ... name it `countSpawn`? Same for the methods below.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 21,
+      "original_line": 21,
+      "side": "RIGHT",
+      "original_position": 21,
+      "position": 21,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303450,
+      "created_at": "2018-01-28T16:01:39Z",
+      "user": "buchgr",
+      "body": "Use javadoc comments.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {\n+    total_spawns.incrementAndGet();\n+  }\n+\n+  public void addRemoteCacheHit() { remote_cache_hit.incrementAndGet(); };\n+\n+  // Spawns remotely executed",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 27,
+      "original_line": 27,
+      "side": "RIGHT",
+      "original_position": 27,
+      "position": 27,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303471,
+      "created_at": "2018-01-28T16:02:11Z",
+      "user": "buchgr",
+      "body": "`countRemoteExecSpawn()`?",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {\n+    total_spawns.incrementAndGet();\n+  }\n+\n+  public void addRemoteCacheHit() { remote_cache_hit.incrementAndGet(); };\n+\n+  // Spawns remotely executed\n+  public void addRemoteExec() { remote_exec.incrementAndGet(); }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 28,
+      "original_line": 28,
+      "side": "RIGHT",
+      "original_position": 28,
+      "position": 28,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 164303491,
+      "created_at": "2018-01-28T16:03:00Z",
+      "user": "buchgr",
+      "body": "`countLocalExecSpawn()`?",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteStats.java",
+      "diff_hunk": "@@ -0,0 +1,49 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/** Collecting always-on stats on a remote run */\n+@ThreadSafe\n+public class RemoteStats {\n+  AtomicInteger total_spawns;\n+  AtomicInteger remote_cache_hit;\n+  AtomicInteger remote_exec;\n+  AtomicInteger local;\n+\n+  public RemoteStats() {\n+    total_spawns = new AtomicInteger();\n+    remote_cache_hit = new AtomicInteger();\n+    remote_exec = new AtomicInteger();\n+    local = new AtomicInteger();\n+  }\n+\n+  public void addSpawn() {\n+    total_spawns.incrementAndGet();\n+  }\n+\n+  public void addRemoteCacheHit() { remote_cache_hit.incrementAndGet(); };\n+\n+  // Spawns remotely executed\n+  public void addRemoteExec() { remote_exec.incrementAndGet(); }\n+\n+  // Spawns that are intentionally executed locally (as opposed to fall back mechanism)\n+  public void addLocal() { local.incrementAndGet(); }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 31,
+      "original_line": 31,
+      "side": "RIGHT",
+      "original_position": 31,
+      "position": 31,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 92057186,
+      "created_at": "2018-01-28T16:08:21Z",
+      "user": "buchgr",
+      "state": "CHANGES_REQUESTED",
+      "body": "Just some nits. "
+    },
+    {
+      "type": "review_comment",
+      "id": 164436274,
+      "created_at": "2018-01-29T13:54:21Z",
+      "user": "ola-rozenfeld",
+      "body": "I think it's confusing that you are counting only successful executions, for some definition of successful that will not be clear to the user. I think it will be simpler if you count all remote and local executions explicitly, even if you need to add a counter for fallback (you can just increment it into execLocallyOrFail, probably).\r\n\r\nMy other concern is that this might not be what Nick had in mind. This will only be enabled at all if remote execution or one form of remote caching is enabled (but not the other, --experimental_remote_spawn_cache). I suspect that Nick wants (a) cache hit ratio for the --experimental_remote_spawn_cache option as well (b) local cache hit ratio (c) stats for local execution only with no remoting. Better check with him just in case.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteSpawnRunner.java",
+      "diff_hunk": "@@ -193,7 +205,11 @@ public SpawnResult exec(Spawn spawn, SpawnExecutionPolicy policy)\n       }\n \n       try {\n-        return downloadRemoteResults(result, policy.getFileOutErr());\n+        SpawnResult r = downloadRemoteResults(result, policy.getFileOutErr());\n+        if(stats != null) {\n+          stats.addRemoteExec();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 210,
+      "original_line": 210,
+      "side": "RIGHT",
+      "original_position": 55,
+      "position": 55,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 92203951,
+      "created_at": "2018-01-29T13:54:51Z",
+      "user": "ola-rozenfeld",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 92508204,
+      "created_at": "2018-01-30T10:26:14Z",
+      "user": "ulfjack",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 361550036,
+      "created_at": "2018-01-30T10:28:22Z",
+      "user": "ulfjack",
+      "body": "I'm not sure that this is the right approach - maybe it makes more sense to have all SpawnRunner implementations return stats, and then aggregate and print them at a higher level? That'll also include stats about local execution and whatnot, which seems like a good thing in general."
+    },
+    {
+      "type": "comment",
+      "id": 364118775,
+      "created_at": "2018-02-08T13:57:33Z",
+      "user": "buchgr",
+      "body": "friendly ping :)"
+    },
+    {
+      "type": "comment",
+      "id": 364144398,
+      "created_at": "2018-02-08T15:20:37Z",
+      "user": "agoulti",
+      "body": "I agree that this should be re-engineered to make it more general.\r\nI'm reading through the architecture to figure out the best way of doing it."
+    },
+    {
+      "type": "comment",
+      "id": 371123435,
+      "created_at": "2018-03-07T12:29:07Z",
+      "user": "buchgr",
+      "body": "Can this be closed?"
+    },
+    {
+      "type": "comment",
+      "id": 371170220,
+      "created_at": "2018-03-07T15:13:37Z",
+      "user": "alexeagle",
+      "body": "Does the Build Event Protocol already produce the data we need? It's not essential that it's printed in the terminal output."
+    },
+    {
+      "type": "comment",
+      "id": 371203756,
+      "created_at": "2018-03-07T16:50:38Z",
+      "user": "buchgr",
+      "body": "@alexeagle no it unfortunately doesn't (but it will). @agoulti is working on this but took a different approach as in this PR IIUC."
+    },
+    {
+      "type": "comment",
+      "id": 371804359,
+      "created_at": "2018-03-09T12:52:31Z",
+      "user": "laszlocsomor",
+      "body": "Are there any updates? Can we import this PR until there's a better long-term solution? Can we close it otherwise?"
+    },
+    {
+      "type": "comment",
+      "id": 371837642,
+      "created_at": "2018-03-09T15:03:37Z",
+      "user": "agoulti",
+      "body": "The other approach is almost ready to submit. I've been busy with other things but I'm planning on submitting a new version next week."
+    }
+  ]
+}

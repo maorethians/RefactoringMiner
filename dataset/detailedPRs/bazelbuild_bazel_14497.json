@@ -1,0 +1,303 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 14497,
+  "pr_number": 14497,
+  "title": "Support buildfiles function for external repositories in Bazel query",
+  "user": "linzhp",
+  "created_at": "2021-12-28T23:16:24Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "e0baf5996ef30ed6a9eec00a5fc8c1abf50e2785",
+  "merge_commit_sha": "9baa60a275e1ff37fc862f819807658e416fb9c1",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "assigned",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "convert_to_draft",
+    "mentioned",
+    "subscribed",
+    "closed",
+    "referenced",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/14497",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-12-28T17:14:48Z",
+      "sha": "755953ba271961b2439ded8083abaebd6389e89d",
+      "message": "Support buildfiles function for external repositories in Bazel query",
+      "author": "Zhongpeng Lin",
+      "author_email": "zplin@uber.com",
+      "author_raw_date": "2021-12-28T17:14:48Z",
+      "author_date": "2021-12-28T17:14:48Z",
+      "committer": "Zhongpeng Lin",
+      "committer_email": "zplin@uber.com",
+      "raw_date": "2021-12-28T17:14:48Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java\n@@ -13,8 +13,10 @@\n // limitations under the License.\n package com.google.devtools.build.lib.query2.query;\n \n+import com.google.common.collect.ImmutableList;\n import com.google.common.collect.Sets;\n import com.google.devtools.build.lib.cmdline.Label;\n+import com.google.devtools.build.lib.cmdline.LabelSyntaxException;\n import com.google.devtools.build.lib.cmdline.PackageIdentifier;\n import com.google.devtools.build.lib.cmdline.TargetParsingException;\n import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;\n@@ -24,6 +26,7 @@\n import com.google.devtools.build.lib.packages.CachingPackageLocator;\n import com.google.devtools.build.lib.packages.NoSuchThingException;\n import com.google.devtools.build.lib.packages.Package;\n+import com.google.devtools.build.lib.packages.Rule;\n import com.google.devtools.build.lib.packages.Target;\n import com.google.devtools.build.lib.pkgcache.QueryTransitivePackagePreloader;\n import com.google.devtools.build.lib.pkgcache.TargetEdgeObserver;\n@@ -45,6 +48,8 @@\n import com.google.devtools.build.lib.query2.engine.QueryUtil.UniquifierImpl;\n import com.google.devtools.build.lib.query2.engine.SkyframeRestartQueryException;\n import com.google.devtools.build.lib.query2.engine.Uniquifier;\n+import com.google.devtools.build.lib.server.FailureDetails.Query.Code;\n+import com.google.devtools.build.lib.vfs.Path;\n import com.google.devtools.build.lib.vfs.PathFragment;\n import java.util.ArrayList;\n import java.util.Collection;\n@@ -56,6 +61,7 @@\n import java.util.Set;\n import java.util.function.Predicate;\n import javax.annotation.Nullable;\n+import net.starlark.java.eval.StarlarkThread.CallStackEntry;\n \n /**\n  * The environment of a Blaze query. Not thread-safe.\n@@ -416,36 +422,55 @@ public ThreadSafeMutableSet<Target> getBuildFiles(\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();\n+          for (CallStackEntry entry : callStackEntries) {\n+            PathFragment extFile = PathFragment.create(entry.location.file());\n+            PathFragment workspaceRoot = pkg.getPackageDirectory().asFragment();\n+            if (extFile.startsWith(workspaceRoot)) {\n+              try {\n+                Label extension = Label.create(\n+                    extFile.relativeTo(workspaceRoot).getParentDirectory().getPathString(),\n+                    extFile.getBaseName());\n+                extensions.add(extension);\n+              } catch (LabelSyntaxException e) {\n+                throw new QueryException(\"cannot build a label for \" + extFile,\n+                    Code.BUILD_FILE_ERROR);\n+              }\n+            }\n+          }\n+        }\n+      } else if (seenPackages.add(pkg.getPackageIdentifier())) {\n         if (buildFiles) {\n           dependentFiles.add(pkg.getBuildFile());\n         }\n \n-        List<Label> extensions = new ArrayList<>();\n         if (loads) {\n           extensions.addAll(pkg.getStarlarkFileDependencies());\n         }\n+      }\n \n-        for (Label extension : extensions) {\n-          Target loadTarget = new FakeLoadTarget(extension, pkg);\n-          dependentFiles.add(loadTarget);\n-\n-          // Also add the BUILD file of the extension.\n-          if (buildFiles) {\n-            // Can be null in genquery: see http://b/123795023#comment6.\n-            String baseName =\n-                cachingPackageLocator.getBaseNameForLoadedPackage(\n-                    loadTarget.getLabel().getPackageIdentifier());\n-            if (baseName != null) {\n-              Label buildFileLabel =\n-                  Label.createUnvalidated(loadTarget.getLabel().getPackageIdentifier(), baseName);\n-              dependentFiles.add(new FakeLoadTarget(buildFileLabel, pkg));\n-            }\n+      for (Label extension : extensions) {\n+        Target loadTarget = new FakeLoadTarget(extension, pkg);\n+        dependentFiles.add(loadTarget);\n+\n+        // Also add the BUILD file of the extension.\n+        if (buildFiles) {\n+          // Can be null in genquery: see http://b/123795023#comment6.\n+          Path buildFile = cachingPackageLocator.getBuildFileForPackage(extension.getPackageIdentifier());\n+          if (buildFile != null) {\n+            Label buildFileLabel = Label.createUnvalidated(extension.getPackageIdentifier(), buildFile.getBaseName());\n+            dependentFiles.add(new FakeLoadTarget(buildFileLabel, pkg));\n           }\n         }\n       }\nsrc/test/py/bazel/query_test.py\n@@ -38,6 +38,27 @@ def testSimpleQuery(self):\n     self._AssertQueryOutput('deps(//foo:top-rule, 1)', '//foo:top-rule',\n                             '//foo:dep-rule')\n \n+  def testBuildFilesForExternalRepos(self):\n+    self.ScratchFile('WORKSPACE', [\n+      'load(\"//:http_archives.bzl\", \"http_archives\")',\n+      'http_archives()',\n+    ])\n+    self.ScratchFile('BUILD.bazel')\n+    self.ScratchFile('http_archives.bzl', [\n+      'load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")',\n+      'def http_archives():',\n+      '    http_archive(',\n+      '        name = \"io_bazel_rules_go\",',\n+      '        sha256 = \"2b1641428dff9018f9e85c0384f03ec6c10660d935b750e3fa1492a281a53b0f\",',\n+      '        urls = [',\n+      '            \"https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip\",',\n+      '            \"https://github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip\",',\n+      '        ],',\n+      '    )',\n+    ])\n+    self._AssertQueryOutput('buildfiles(//external:io_bazel_rules_go)',\n+                            '//:WORKSPACE', '//:http_archives.bzl', '//:BUILD.bazel')\n+\n   def _AssertQueryOutput(self, query_expr, *expected_results):\n     exit_code, stdout, stderr = self.RunBazel(['query', query_expr])\n     self.AssertExitCode(exit_code, 0, stderr)",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+          "patch": "@@ -13,8 +13,10 @@\n // limitations under the License.\n package com.google.devtools.build.lib.query2.query;\n \n+import com.google.common.collect.ImmutableList;\n import com.google.common.collect.Sets;\n import com.google.devtools.build.lib.cmdline.Label;\n+import com.google.devtools.build.lib.cmdline.LabelSyntaxException;\n import com.google.devtools.build.lib.cmdline.PackageIdentifier;\n import com.google.devtools.build.lib.cmdline.TargetParsingException;\n import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;\n@@ -24,6 +26,7 @@\n import com.google.devtools.build.lib.packages.CachingPackageLocator;\n import com.google.devtools.build.lib.packages.NoSuchThingException;\n import com.google.devtools.build.lib.packages.Package;\n+import com.google.devtools.build.lib.packages.Rule;\n import com.google.devtools.build.lib.packages.Target;\n import com.google.devtools.build.lib.pkgcache.QueryTransitivePackagePreloader;\n import com.google.devtools.build.lib.pkgcache.TargetEdgeObserver;\n@@ -45,6 +48,8 @@\n import com.google.devtools.build.lib.query2.engine.QueryUtil.UniquifierImpl;\n import com.google.devtools.build.lib.query2.engine.SkyframeRestartQueryException;\n import com.google.devtools.build.lib.query2.engine.Uniquifier;\n+import com.google.devtools.build.lib.server.FailureDetails.Query.Code;\n+import com.google.devtools.build.lib.vfs.Path;\n import com.google.devtools.build.lib.vfs.PathFragment;\n import java.util.ArrayList;\n import java.util.Collection;\n@@ -56,6 +61,7 @@\n import java.util.Set;\n import java.util.function.Predicate;\n import javax.annotation.Nullable;\n+import net.starlark.java.eval.StarlarkThread.CallStackEntry;\n \n /**\n  * The environment of a Blaze query. Not thread-safe.\n@@ -416,36 +422,55 @@ public ThreadSafeMutableSet<Target> getBuildFiles(\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();\n+          for (CallStackEntry entry : callStackEntries) {\n+            PathFragment extFile = PathFragment.create(entry.location.file());\n+            PathFragment workspaceRoot = pkg.getPackageDirectory().asFragment();\n+            if (extFile.startsWith(workspaceRoot)) {\n+              try {\n+                Label extension = Label.create(\n+                    extFile.relativeTo(workspaceRoot).getParentDirectory().getPathString(),\n+                    extFile.getBaseName());\n+                extensions.add(extension);\n+              } catch (LabelSyntaxException e) {\n+                throw new QueryException(\"cannot build a label for \" + extFile,\n+                    Code.BUILD_FILE_ERROR);\n+              }\n+            }\n+          }\n+        }\n+      } else if (seenPackages.add(pkg.getPackageIdentifier())) {\n         if (buildFiles) {\n           dependentFiles.add(pkg.getBuildFile());\n         }\n \n-        List<Label> extensions = new ArrayList<>();\n         if (loads) {\n           extensions.addAll(pkg.getStarlarkFileDependencies());\n         }\n+      }\n \n-        for (Label extension : extensions) {\n-          Target loadTarget = new FakeLoadTarget(extension, pkg);\n-          dependentFiles.add(loadTarget);\n-\n-          // Also add the BUILD file of the extension.\n-          if (buildFiles) {\n-            // Can be null in genquery: see http://b/123795023#comment6.\n-            String baseName =\n-                cachingPackageLocator.getBaseNameForLoadedPackage(\n-                    loadTarget.getLabel().getPackageIdentifier());\n-            if (baseName != null) {\n-              Label buildFileLabel =\n-                  Label.createUnvalidated(loadTarget.getLabel().getPackageIdentifier(), baseName);\n-              dependentFiles.add(new FakeLoadTarget(buildFileLabel, pkg));\n-            }\n+      for (Label extension : extensions) {\n+        Target loadTarget = new FakeLoadTarget(extension, pkg);\n+        dependentFiles.add(loadTarget);\n+\n+        // Also add the BUILD file of the extension.\n+        if (buildFiles) {\n+          // Can be null in genquery: see http://b/123795023#comment6.\n+          Path buildFile = cachingPackageLocator.getBuildFileForPackage(extension.getPackageIdentifier());\n+          if (buildFile != null) {\n+            Label buildFileLabel = Label.createUnvalidated(extension.getPackageIdentifier(), buildFile.getBaseName());\n+            dependentFiles.add(new FakeLoadTarget(buildFileLabel, pkg));\n           }\n         }\n       }"
+        },
+        {
+          "file": "src/test/py/bazel/query_test.py",
+          "patch": "@@ -38,6 +38,27 @@ def testSimpleQuery(self):\n     self._AssertQueryOutput('deps(//foo:top-rule, 1)', '//foo:top-rule',\n                             '//foo:dep-rule')\n \n+  def testBuildFilesForExternalRepos(self):\n+    self.ScratchFile('WORKSPACE', [\n+      'load(\"//:http_archives.bzl\", \"http_archives\")',\n+      'http_archives()',\n+    ])\n+    self.ScratchFile('BUILD.bazel')\n+    self.ScratchFile('http_archives.bzl', [\n+      'load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")',\n+      'def http_archives():',\n+      '    http_archive(',\n+      '        name = \"io_bazel_rules_go\",',\n+      '        sha256 = \"2b1641428dff9018f9e85c0384f03ec6c10660d935b750e3fa1492a281a53b0f\",',\n+      '        urls = [',\n+      '            \"https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip\",',\n+      '            \"https://github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip\",',\n+      '        ],',\n+      '    )',\n+    ])\n+    self._AssertQueryOutput('buildfiles(//external:io_bazel_rules_go)',\n+                            '//:WORKSPACE', '//:http_archives.bzl', '//:BUILD.bazel')\n+\n   def _AssertQueryOutput(self, query_expr, *expected_results):\n     exit_code, stdout, stderr = self.RunBazel(['query', query_expr])\n     self.AssertExitCode(exit_code, 0, stderr)"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-12-28T23:16:24Z",
+      "user": "linzhp",
+      "body": "All repository rules are in the package `//external`, which is different from other packages. Calling `Package.getBuildFile()` returns the `WORKSPACE` file and `Package.getStarlarkFileDependencies()` returns empty. A possible fix is to have the graph keep track of all Starlark files loaded by `WORKSPACE`, so we can treat the package `//external` in the same way as other packages during query execution. However, this means that evaluating `buildfiles(//external:foo)` is the same as evaluating `buildfiles(//external:*)`, which would include Starlark files not related to the repository `@foo`. \r\n\r\nThis PR takes a different approach by using the call stack of an external repository to get the precise set of Starlark files needed by `//external:foo`.\r\n\r\nFixed #14280"
+    },
+    {
+      "type": "comment",
+      "id": 1017039709,
+      "created_at": "2022-01-20T01:53:40Z",
+      "user": "aiuto",
+      "body": "@zhengwei143 You've been in this code more than most other people. Can you take a look."
+    },
+    {
+      "type": "review_comment",
+      "id": 788896652,
+      "created_at": "2022-01-20T15:47:31Z",
+      "user": "janakdr",
+      "body": "Please use LabelConstants#EXTERNAL_PACKAGE_IDENTIFIER. PackageIdentifiers are interned, so this check becomes instant, as opposed to potentially a character-by-character String equality check (depending on how the JVM canonicalizes string constants).",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 432,
+      "original_line": 432,
+      "side": "RIGHT",
+      "original_position": 48,
+      "position": 48,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 788897809,
+      "created_at": "2022-01-20T15:48:38Z",
+      "user": "janakdr",
+      "body": "Please pull this out of the for loop so you're not doing the same work on each iteration.",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();\n+          for (CallStackEntry entry : callStackEntries) {\n+            PathFragment extFile = PathFragment.create(entry.location.file());\n+            PathFragment workspaceRoot = pkg.getPackageDirectory().asFragment();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 439,
+      "original_line": 439,
+      "side": "RIGHT",
+      "original_position": 55,
+      "position": 55,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 788901375,
+      "created_at": "2022-01-20T15:52:09Z",
+      "user": "janakdr",
+      "body": "nit: if this is a performance issue, could provide an iterator from CallStack, since you don't need anything else about the immutable list here.",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 436,
+      "original_line": 436,
+      "side": "RIGHT",
+      "original_position": 52,
+      "position": 52,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 788902182,
+      "created_at": "2022-01-20T15:52:54Z",
+      "user": "janakdr",
+      "body": "when does this check fail?",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();\n+          for (CallStackEntry entry : callStackEntries) {\n+            PathFragment extFile = PathFragment.create(entry.location.file());\n+            PathFragment workspaceRoot = pkg.getPackageDirectory().asFragment();\n+            if (extFile.startsWith(workspaceRoot)) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 440,
+      "original_line": 440,
+      "side": "RIGHT",
+      "original_position": 56,
+      "position": 56,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 790160358,
+          "user": "linzhp",
+          "body": "If the extension file is in an external repo, then this check will fail. For example, if we have this in `WORKSPACE`:\r\n\r\n```python\r\nload(\"@io_bazel_rules_go//go:deps.bzl\", \"go_rules_dependencies\")\r\n\r\ngo_rules_dependencies()\r\n```\r\nThen the location of the extension file for the target `//external:platforms` (which is one of the repos loaded by `go_rule_dependencies()`) will be in somewhere like `/private/var/tmp/_bazel_zplin/db67431f618bf23018777556a2edc2eb/external/io_bazel_rules_go/go/private/repositories.bzl`, which is outside the workspace root.\r\n\r\n\r\n",
+          "created_at": "2022-01-22T16:47:02Z"
+        },
+        {
+          "id": 790190905,
+          "user": "janakdr",
+          "body": "Wouldn't that external bzl file be a valid result if buildfiles returned it, though? I can imagine a user being surprised that only bzl files in the main repository are returned.",
+          "created_at": "2022-01-22T22:23:26Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 788902519,
+      "created_at": "2022-01-20T15:53:14Z",
+      "user": "janakdr",
+      "body": "couldn't there be duplicates here? Please add a test that covers this situation (the bzl file calls another function in the same file)",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();\n+          for (CallStackEntry entry : callStackEntries) {\n+            PathFragment extFile = PathFragment.create(entry.location.file());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 438,
+      "original_line": 438,
+      "side": "RIGHT",
+      "original_position": 54,
+      "position": 54,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 788903190,
+      "created_at": "2022-01-20T15:53:53Z",
+      "user": "janakdr",
+      "body": "is this construction true? A bzl file can be in a subdirectory of a package. Please add a test for this situation.",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {\n+        // External repository rules\n+        if (seenRepos.add(x.getName())) {\n+          ImmutableList<CallStackEntry> callStackEntries = x.getAssociatedRule().getCallStack()\n+              .toList();\n+          for (CallStackEntry entry : callStackEntries) {\n+            PathFragment extFile = PathFragment.create(entry.location.file());\n+            PathFragment workspaceRoot = pkg.getPackageDirectory().asFragment();\n+            if (extFile.startsWith(workspaceRoot)) {\n+              try {\n+                Label extension = Label.create(\n+                    extFile.relativeTo(workspaceRoot).getParentDirectory().getPathString(),",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 443,
+      "original_line": 443,
+      "side": "RIGHT",
+      "original_position": 59,
+      "position": 59,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 788905511,
+      "created_at": "2022-01-20T15:56:07Z",
+      "user": "janakdr",
+      "body": "Please change test to not require network access.",
+      "path": "src/test/py/bazel/query_test.py",
+      "diff_hunk": "@@ -38,6 +38,27 @@ def testSimpleQuery(self):\n     self._AssertQueryOutput('deps(//foo:top-rule, 1)', '//foo:top-rule',\n                             '//foo:dep-rule')\n \n+  def testBuildFilesForExternalRepos(self):\n+    self.ScratchFile('WORKSPACE', [\n+      'load(\"//:http_archives.bzl\", \"http_archives\")',\n+      'http_archives()',\n+    ])\n+    self.ScratchFile('BUILD.bazel')\n+    self.ScratchFile('http_archives.bzl', [\n+      'load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")',\n+      'def http_archives():',\n+      '    http_archive(',\n+      '        name = \"io_bazel_rules_go\",',\n+      '        sha256 = \"2b1641428dff9018f9e85c0384f03ec6c10660d935b750e3fa1492a281a53b0f\",',\n+      '        urls = [',\n+      '            \"https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip\",',",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 54,
+      "original_line": 54,
+      "side": "RIGHT",
+      "original_position": 17,
+      "position": 17,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 788914460,
+      "created_at": "2022-01-20T16:05:20Z",
+      "user": "janakdr",
+      "body": "This will still be incomplete if you have a non-Rule target in a Package, right? You can get a situation with `exports_files([...])` or just if the query restricts the output to source files or output files. The package will still be loaded and require those bzl files to work correctly (and since `buildfiles` is often used to check if a package needs to be reloaded, that's important), but those bzl files won't be listed here. That makes me think you're doing this at a fundamentally wrong place, although I don't have a better one to suggest since I'm not familiar with external repos. In any case, please add a test for these situations: querying for a source file exported via `exports_files([...])`; querying for an output file (the output of a genrule, not the genrule itself); and a query that filters for source files (`kind('source_file',...)`).",
+      "path": "src/main/java/com/google/devtools/build/lib/query2/query/GraphlessBlazeQueryEnvironment.java",
+      "diff_hunk": "@@ -416,36 +422,55 @@ private Target getTargetOrThrow(Label label)\n       throws QueryException {\n     ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();\n     Set<PackageIdentifier> seenPackages = new HashSet<>();\n+    Set<String> seenRepos = new HashSet<>();\n \n     // Adds all the package definition files (BUILD files and build extensions) for package \"pkg\",\n     // to dependentFiles.\n     for (Target x : nodes) {\n+      List<Label> extensions = new ArrayList<>();\n       Package pkg = x.getPackage();\n-      if (seenPackages.add(pkg.getPackageIdentifier())) {\n+      if (x instanceof Rule && pkg.getPackageIdentifier().getCanonicalForm().equals(\"//external\")) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 432,
+      "original_line": 432,
+      "side": "RIGHT",
+      "original_position": 48,
+      "position": 48,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 789968568,
+          "user": "linzhp",
+          "body": "This is a special case for `//external`. The only non-rule target there is `WORKSPACE`. For example, from Bazel's own repo:\r\n\r\n```\r\nbazel query 'kind(\"source file\", //external:all-targets)'\r\n//external:WORKSPACE\r\n```\r\n\r\nFor `genrule` and `exports_files` in external repos, their labels are like `@some_repo//:data.txt`, which is not in the `//external` package, and out of scope of this pull request. I can write tests to cover them, but their behavior in `buildfiles` is not affected by this pull request.",
+          "created_at": "2022-01-21T20:18:11Z"
+        },
+        {
+          "id": 789979309,
+          "user": "janakdr",
+          "body": "Oh, I see. Thanks, you can disregard this comment in that case.",
+          "created_at": "2022-01-21T20:38:17Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 858442953,
+      "created_at": "2022-01-20T16:05:37Z",
+      "user": "janakdr",
+      "state": "COMMENTED",
+      "body": "Leaving comments on overall design and utility to @zhengwei143, just commenting on performance and bugs."
+    },
+    {
+      "type": "review",
+      "id": 859989386,
+      "created_at": "2022-01-21T20:18:11Z",
+      "user": "linzhp",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 860005073,
+      "created_at": "2022-01-21T20:38:18Z",
+      "user": "janakdr",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 860222266,
+      "created_at": "2022-01-22T16:47:02Z",
+      "user": "linzhp",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 860246555,
+      "created_at": "2022-01-22T22:23:26Z",
+      "user": "janakdr",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1019600100,
+      "created_at": "2022-01-24T00:09:34Z",
+      "user": "linzhp",
+      "body": "> That makes me think you're doing this at a fundamentally wrong place\r\n\r\n@janakdr I started to think that you may be right about this. So I implement another approach in #14630. Can you take a look?"
+    },
+    {
+      "type": "comment",
+      "id": 1019716089,
+      "created_at": "2022-01-24T04:46:33Z",
+      "user": "linzhp",
+      "body": "Closing in favor of #14630"
+    }
+  ]
+}

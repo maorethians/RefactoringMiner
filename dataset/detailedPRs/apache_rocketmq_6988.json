@@ -1,0 +1,130 @@
+{
+  "repo": "apache/rocketmq",
+  "number": 6988,
+  "pr_number": 6988,
+  "title": "[ISSUE #6987]feat:Add LMQ quantity check",
+  "user": "humkum",
+  "created_at": "2023-07-03T10:10:27Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "stale"
+  ],
+  "base_commit": "5c3bd98e50098caa5ad701d99f4cfffb65e69b3f",
+  "merge_commit_sha": "e3463fcf454939743121f350c08dc3a67d14c414",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "closed"
+  ],
+  "url": "https://github.com/apache/rocketmq/pull/6988",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-07-03T09:59:22Z",
+      "sha": "067a109685db4d37cce621c5a4c16fff43f1a71a",
+      "message": "feat:Add LMQ quantity check",
+      "author": "Hankunming",
+      "author_email": "1109939087@qq.com",
+      "author_raw_date": "2023-07-03T09:44:27Z",
+      "author_date": "2023-07-03T09:44:27Z",
+      "committer": "Hankunming",
+      "committer_email": "1109939087@qq.com",
+      "raw_date": "2023-07-03T09:59:22Z",
+      "diff_text": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java\n@@ -529,6 +529,13 @@ private synchronized RemotingCommand deleteTopic(ChannelHandlerContext ctx,\n             }\n         }\n \n+        if (MixAll.isLmq(topic)) {\n+            this.brokerController.getMessageStore().cleanUnusedLmqTopic(topic);\n+            response.setCode(ResponseCode.SUCCESS);\n+            response.setRemark(null);\n+            return response;\n+        }\n+\n         this.brokerController.getTopicConfigManager().deleteTopicConfig(requestHeader.getTopic());\n         this.brokerController.getTopicQueueMappingManager().delete(requestHeader.getTopic());\n         this.brokerController.getConsumerOffsetManager().cleanOffsetByTopic(requestHeader.getTopic());\nstore/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java\n@@ -545,6 +545,20 @@ public void destroyLogics() {\n         this.consumeQueueStore.destroy();\n     }\n \n+    private PutMessageStatus checkLmqMessage(MessageExtBrokerInner msg) {\n+        if (msg.getProperties() != null\n+            && StringUtils.isNotBlank(msg.getProperty(MessageConst.PROPERTY_INNER_MULTI_DISPATCH))\n+            && this.isLmqConsumeQueueNumExceeded()) {\n+            return PutMessageStatus.LMQ_CONSUME_QUEUE_NUM_EXCEEDED;\n+        }\n+        return PutMessageStatus.PUT_OK;\n+    }\n+\n+    private boolean isLmqConsumeQueueNumExceeded() {\n+        return this.getMessageStoreConfig().isEnableLmq() && this.getMessageStoreConfig().isEnableMultiDispatch()\n+            && this.consumeQueueStore.getLmqConsumeQueueNum().get() > this.messageStoreConfig.getMaxLmqConsumeQueueNum();\n+    }\n+\n     @Override\n     public CompletableFuture<PutMessageResult> asyncPutMessage(MessageExtBrokerInner msg) {\n \n@@ -569,6 +583,11 @@ public CompletableFuture<PutMessageResult> asyncPutMessage(MessageExtBrokerInner\n             }\n         }\n \n+        PutMessageStatus lmqMsgCheckStatus = this.checkLmqMessage(msg);\n+        if (lmqMsgCheckStatus == PutMessageStatus.LMQ_CONSUME_QUEUE_NUM_EXCEEDED) {\n+            return CompletableFuture.completedFuture(new PutMessageResult(lmqMsgCheckStatus, null));\n+        }\n+\n         long beginTime = this.getSystemClock().now();\n         CompletableFuture<PutMessageResult> putResultFuture = this.commitLog.asyncPutMessage(msg);\n \n@@ -773,6 +792,11 @@ public GetMessageResult getMessage(final String group, final String topic, final\n             return null;\n         }\n \n+        if (MixAll.isLmq(topic) && this.isLmqConsumeQueueNumExceeded()) {\n+            LOGGER.warn(\"message store is not available, broker config enableLmq and enableMultiDispatch, lmq consumeQueue num exceed maxLmqConsumeQueueNum config num\");\n+            return null;\n+        }\n+\n         Optional<TopicConfig> topicConfig = getTopicConfig(topic);\n         CleanupPolicy policy = CleanupPolicyUtils.getDeletePolicy(topicConfig);\n         //check request topic flag\n@@ -3286,4 +3310,26 @@ public boolean isTransientStorePoolEnable() {\n     public long getReputFromOffset() {\n         return this.reputMessageService.getReputFromOffset();\n     }\n+\n+    public void cleanUnusedLmqTopic(String topic) {\n+        if (this.consumeQueueStore.getConsumeQueueTable().containsKey(topic)) {\n+            ConcurrentMap<Integer, ConsumeQueueInterface> map = this.consumeQueueStore.getConsumeQueueTable().get(topic);\n+            if (map != null) {\n+                ConsumeQueue cq = (ConsumeQueue) map.get(0);\n+                cq.destroy();\n+                LOGGER.info(\"cleanUnusedLmqTopic: {} {} ConsumeQueue cleaned\",\n+                    cq.getTopic(),\n+                    cq.getQueueId()\n+                );\n+\n+                this.consumeQueueStore.removeTopicQueueTable(cq.getTopic(), cq.getQueueId());\n+                this.consumeQueueStore.getLmqConsumeQueueNum().getAndDecrement();\n+            }\n+            this.consumeQueueStore.getConsumeQueueTable().remove(topic);\n+            if (this.brokerConfig.isAutoDeleteUnusedStats()) {\n+                this.brokerStatsManager.onTopicDeleted(topic);\n+            }\n+            LOGGER.info(\"cleanUnusedLmqTopic: {},topic destroyed\", topic);\n+        }\n+    }\n }\nstore/src/main/java/org/apache/rocketmq/store/MessageStore.java\n@@ -961,4 +961,14 @@ DispatchRequest checkMessageAndReturnSize(final ByteBuffer byteBuffer, final boo\n      * @param attributesBuilderSupplier metrics attributes builder\n      */\n     void initMetrics(Meter meter, Supplier<AttributesBuilder> attributesBuilderSupplier);\n+\n+    /**\n+     * Clean unused lmq topic.\n+     * When calling to clean up the lmq topic,\n+     * the lmq topic cannot be used to write messages at the same time,\n+     * otherwise the messages of the cleaning lmq topic may be lost,\n+     * please call this method with caution\n+     * @param topic lmq topic\n+     */\n+    void cleanUnusedLmqTopic(String topic);\n }\nstore/src/main/java/org/apache/rocketmq/store/plugin/AbstractPluginMessageStore.java\n@@ -651,4 +651,9 @@ public List<Pair<InstrumentSelector, View>> getMetricsView() {\n     public void initMetrics(Meter meter, Supplier<AttributesBuilder> attributesBuilderSupplier) {\n         next.initMetrics(meter, attributesBuilderSupplier);\n     }\n+\n+    @Override\n+    public void cleanUnusedLmqTopic(String topic) {\n+        next.cleanUnusedLmqTopic(topic);\n+    }\n }\nstore/src/main/java/org/apache/rocketmq/store/queue/ConsumeQueueStore.java\n@@ -26,6 +26,8 @@\n import java.util.concurrent.LinkedBlockingQueue;\n import java.util.concurrent.ThreadPoolExecutor;\n import java.util.concurrent.TimeUnit;\n+\n+import org.apache.rocketmq.common.MixAll;\n import org.apache.rocketmq.common.ThreadFactoryImpl;\n import org.apache.rocketmq.common.TopicConfig;\n import org.apache.rocketmq.common.attribute.CQType;\n@@ -51,6 +53,7 @@\n import java.util.Optional;\n import java.util.concurrent.ConcurrentHashMap;\n import java.util.concurrent.ConcurrentMap;\n+import java.util.concurrent.atomic.AtomicInteger;\n \n import static java.lang.String.format;\n import static org.apache.rocketmq.store.config.StorePathConfigHelper.getStorePathBatchConsumeQueue;\n@@ -63,6 +66,7 @@ public class ConsumeQueueStore {\n     protected final MessageStoreConfig messageStoreConfig;\n     protected final QueueOffsetOperator queueOffsetOperator = new QueueOffsetOperator();\n     protected final ConcurrentMap<String/* topic */, ConcurrentMap<Integer/* queueId */, ConsumeQueueInterface>> consumeQueueTable;\n+    private final AtomicInteger lmqConsumeQueueNum = new AtomicInteger(0);\n \n     public ConsumeQueueStore(DefaultMessageStore messageStore, MessageStoreConfig messageStoreConfig) {\n         this.messageStore = messageStore;\n@@ -356,6 +360,9 @@ private ConsumeQueueInterface doFindOrCreateConsumeQueue(String topic, int queue\n             logic = oldLogic;\n         } else {\n             logic = newLogic;\n+            if (MixAll.isLmq(topic)) {\n+                lmqConsumeQueueNum.getAndIncrement();\n+            }\n         }\n \n         return logic;\n@@ -401,12 +408,19 @@ public ConcurrentMap<String, ConcurrentMap<Integer, ConsumeQueueInterface>> getC\n         return consumeQueueTable;\n     }\n \n+    public AtomicInteger getLmqConsumeQueueNum() {\n+        return lmqConsumeQueueNum;\n+    }\n+\n     private void putConsumeQueue(final String topic, final int queueId, final ConsumeQueueInterface consumeQueue) {\n         ConcurrentMap<Integer/* queueId */, ConsumeQueueInterface> map = this.consumeQueueTable.get(topic);\n         if (null == map) {\n             map = new ConcurrentHashMap<>();\n             map.put(queueId, consumeQueue);\n             this.consumeQueueTable.put(topic, map);\n+            if (MixAll.isLmq(topic)) {\n+                this.lmqConsumeQueueNum.getAndIncrement();\n+            }\n         } else {\n             map.put(queueId, consumeQueue);\n         }\ntieredstore/src/main/java/org/apache/rocketmq/tieredstore/TieredMessageStore.java\n@@ -363,6 +363,11 @@ public void initMetrics(Meter meter, Supplier<AttributesBuilder> attributesBuild\n         TieredStoreMetricsManager.init(meter, attributesBuilderSupplier, storeConfig, fetcher, next);\n     }\n \n+    @Override\n+    public void cleanUnusedLmqTopic(String topic) {\n+        super.cleanUnusedLmqTopic(topic);\n+    }\n+\n     @Override\n     public void shutdown() {\n         next.shutdown();",
+      "diff": [
+        {
+          "file": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "patch": "@@ -529,6 +529,13 @@ private synchronized RemotingCommand deleteTopic(ChannelHandlerContext ctx,\n             }\n         }\n \n+        if (MixAll.isLmq(topic)) {\n+            this.brokerController.getMessageStore().cleanUnusedLmqTopic(topic);\n+            response.setCode(ResponseCode.SUCCESS);\n+            response.setRemark(null);\n+            return response;\n+        }\n+\n         this.brokerController.getTopicConfigManager().deleteTopicConfig(requestHeader.getTopic());\n         this.brokerController.getTopicQueueMappingManager().delete(requestHeader.getTopic());\n         this.brokerController.getConsumerOffsetManager().cleanOffsetByTopic(requestHeader.getTopic());"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java",
+          "patch": "@@ -545,6 +545,20 @@ public void destroyLogics() {\n         this.consumeQueueStore.destroy();\n     }\n \n+    private PutMessageStatus checkLmqMessage(MessageExtBrokerInner msg) {\n+        if (msg.getProperties() != null\n+            && StringUtils.isNotBlank(msg.getProperty(MessageConst.PROPERTY_INNER_MULTI_DISPATCH))\n+            && this.isLmqConsumeQueueNumExceeded()) {\n+            return PutMessageStatus.LMQ_CONSUME_QUEUE_NUM_EXCEEDED;\n+        }\n+        return PutMessageStatus.PUT_OK;\n+    }\n+\n+    private boolean isLmqConsumeQueueNumExceeded() {\n+        return this.getMessageStoreConfig().isEnableLmq() && this.getMessageStoreConfig().isEnableMultiDispatch()\n+            && this.consumeQueueStore.getLmqConsumeQueueNum().get() > this.messageStoreConfig.getMaxLmqConsumeQueueNum();\n+    }\n+\n     @Override\n     public CompletableFuture<PutMessageResult> asyncPutMessage(MessageExtBrokerInner msg) {\n \n@@ -569,6 +583,11 @@ public CompletableFuture<PutMessageResult> asyncPutMessage(MessageExtBrokerInner\n             }\n         }\n \n+        PutMessageStatus lmqMsgCheckStatus = this.checkLmqMessage(msg);\n+        if (lmqMsgCheckStatus == PutMessageStatus.LMQ_CONSUME_QUEUE_NUM_EXCEEDED) {\n+            return CompletableFuture.completedFuture(new PutMessageResult(lmqMsgCheckStatus, null));\n+        }\n+\n         long beginTime = this.getSystemClock().now();\n         CompletableFuture<PutMessageResult> putResultFuture = this.commitLog.asyncPutMessage(msg);\n \n@@ -773,6 +792,11 @@ public GetMessageResult getMessage(final String group, final String topic, final\n             return null;\n         }\n \n+        if (MixAll.isLmq(topic) && this.isLmqConsumeQueueNumExceeded()) {\n+            LOGGER.warn(\"message store is not available, broker config enableLmq and enableMultiDispatch, lmq consumeQueue num exceed maxLmqConsumeQueueNum config num\");\n+            return null;\n+        }\n+\n         Optional<TopicConfig> topicConfig = getTopicConfig(topic);\n         CleanupPolicy policy = CleanupPolicyUtils.getDeletePolicy(topicConfig);\n         //check request topic flag\n@@ -3286,4 +3310,26 @@ public boolean isTransientStorePoolEnable() {\n     public long getReputFromOffset() {\n         return this.reputMessageService.getReputFromOffset();\n     }\n+\n+    public void cleanUnusedLmqTopic(String topic) {\n+        if (this.consumeQueueStore.getConsumeQueueTable().containsKey(topic)) {\n+            ConcurrentMap<Integer, ConsumeQueueInterface> map = this.consumeQueueStore.getConsumeQueueTable().get(topic);\n+            if (map != null) {\n+                ConsumeQueue cq = (ConsumeQueue) map.get(0);\n+                cq.destroy();\n+                LOGGER.info(\"cleanUnusedLmqTopic: {} {} ConsumeQueue cleaned\",\n+                    cq.getTopic(),\n+                    cq.getQueueId()\n+                );\n+\n+                this.consumeQueueStore.removeTopicQueueTable(cq.getTopic(), cq.getQueueId());\n+                this.consumeQueueStore.getLmqConsumeQueueNum().getAndDecrement();\n+            }\n+            this.consumeQueueStore.getConsumeQueueTable().remove(topic);\n+            if (this.brokerConfig.isAutoDeleteUnusedStats()) {\n+                this.brokerStatsManager.onTopicDeleted(topic);\n+            }\n+            LOGGER.info(\"cleanUnusedLmqTopic: {},topic destroyed\", topic);\n+        }\n+    }\n }"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/MessageStore.java",
+          "patch": "@@ -961,4 +961,14 @@ DispatchRequest checkMessageAndReturnSize(final ByteBuffer byteBuffer, final boo\n      * @param attributesBuilderSupplier metrics attributes builder\n      */\n     void initMetrics(Meter meter, Supplier<AttributesBuilder> attributesBuilderSupplier);\n+\n+    /**\n+     * Clean unused lmq topic.\n+     * When calling to clean up the lmq topic,\n+     * the lmq topic cannot be used to write messages at the same time,\n+     * otherwise the messages of the cleaning lmq topic may be lost,\n+     * please call this method with caution\n+     * @param topic lmq topic\n+     */\n+    void cleanUnusedLmqTopic(String topic);\n }"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/plugin/AbstractPluginMessageStore.java",
+          "patch": "@@ -651,4 +651,9 @@ public List<Pair<InstrumentSelector, View>> getMetricsView() {\n     public void initMetrics(Meter meter, Supplier<AttributesBuilder> attributesBuilderSupplier) {\n         next.initMetrics(meter, attributesBuilderSupplier);\n     }\n+\n+    @Override\n+    public void cleanUnusedLmqTopic(String topic) {\n+        next.cleanUnusedLmqTopic(topic);\n+    }\n }"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/queue/ConsumeQueueStore.java",
+          "patch": "@@ -26,6 +26,8 @@\n import java.util.concurrent.LinkedBlockingQueue;\n import java.util.concurrent.ThreadPoolExecutor;\n import java.util.concurrent.TimeUnit;\n+\n+import org.apache.rocketmq.common.MixAll;\n import org.apache.rocketmq.common.ThreadFactoryImpl;\n import org.apache.rocketmq.common.TopicConfig;\n import org.apache.rocketmq.common.attribute.CQType;\n@@ -51,6 +53,7 @@\n import java.util.Optional;\n import java.util.concurrent.ConcurrentHashMap;\n import java.util.concurrent.ConcurrentMap;\n+import java.util.concurrent.atomic.AtomicInteger;\n \n import static java.lang.String.format;\n import static org.apache.rocketmq.store.config.StorePathConfigHelper.getStorePathBatchConsumeQueue;\n@@ -63,6 +66,7 @@ public class ConsumeQueueStore {\n     protected final MessageStoreConfig messageStoreConfig;\n     protected final QueueOffsetOperator queueOffsetOperator = new QueueOffsetOperator();\n     protected final ConcurrentMap<String/* topic */, ConcurrentMap<Integer/* queueId */, ConsumeQueueInterface>> consumeQueueTable;\n+    private final AtomicInteger lmqConsumeQueueNum = new AtomicInteger(0);\n \n     public ConsumeQueueStore(DefaultMessageStore messageStore, MessageStoreConfig messageStoreConfig) {\n         this.messageStore = messageStore;\n@@ -356,6 +360,9 @@ private ConsumeQueueInterface doFindOrCreateConsumeQueue(String topic, int queue\n             logic = oldLogic;\n         } else {\n             logic = newLogic;\n+            if (MixAll.isLmq(topic)) {\n+                lmqConsumeQueueNum.getAndIncrement();\n+            }\n         }\n \n         return logic;\n@@ -401,12 +408,19 @@ public ConcurrentMap<String, ConcurrentMap<Integer, ConsumeQueueInterface>> getC\n         return consumeQueueTable;\n     }\n \n+    public AtomicInteger getLmqConsumeQueueNum() {\n+        return lmqConsumeQueueNum;\n+    }\n+\n     private void putConsumeQueue(final String topic, final int queueId, final ConsumeQueueInterface consumeQueue) {\n         ConcurrentMap<Integer/* queueId */, ConsumeQueueInterface> map = this.consumeQueueTable.get(topic);\n         if (null == map) {\n             map = new ConcurrentHashMap<>();\n             map.put(queueId, consumeQueue);\n             this.consumeQueueTable.put(topic, map);\n+            if (MixAll.isLmq(topic)) {\n+                this.lmqConsumeQueueNum.getAndIncrement();\n+            }\n         } else {\n             map.put(queueId, consumeQueue);\n         }"
+        },
+        {
+          "file": "tieredstore/src/main/java/org/apache/rocketmq/tieredstore/TieredMessageStore.java",
+          "patch": "@@ -363,6 +363,11 @@ public void initMetrics(Meter meter, Supplier<AttributesBuilder> attributesBuild\n         TieredStoreMetricsManager.init(meter, attributesBuilderSupplier, storeConfig, fetcher, next);\n     }\n \n+    @Override\n+    public void cleanUnusedLmqTopic(String topic) {\n+        super.cleanUnusedLmqTopic(topic);\n+    }\n+\n     @Override\n     public void shutdown() {\n         next.shutdown();"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-07-03T10:10:27Z",
+      "user": "humkum",
+      "body": "<!-- Please make sure the target branch is right. In most case, the target branch should be `develop`. -->\r\n\r\n### Which Issue(s) This PR Fixes\r\n\r\n<!-- Please ensure that the related issue has already been created, and [link this pull request to that issue using keywords](<https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword>) to ensure automatic closure. -->\r\n\r\nFixes #6987 \r\n\r\n"
+    },
+    {
+      "type": "review_comment",
+      "id": 1253013906,
+      "created_at": "2023-07-05T12:10:19Z",
+      "user": "ferrirW",
+      "body": "asynchronously delete is better",
+      "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+      "diff_hunk": "@@ -529,6 +529,13 @@ private synchronized RemotingCommand deleteTopic(ChannelHandlerContext ctx,\n             }\n         }\n \n+        if (MixAll.isLmq(topic)) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 532,
+      "original_line": 532,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 4,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1253017395,
+      "created_at": "2023-07-05T12:13:38Z",
+      "user": "ferrirW",
+      "body": "IMO, you should split two patches:\r\n1. add delete cq logic\r\n2. limit queue number",
+      "path": "store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java",
+      "diff_hunk": "@@ -545,6 +545,20 @@ public void destroyLogics() {\n         this.consumeQueueStore.destroy();\n     }\n \n+    private PutMessageStatus checkLmqMessage(MessageExtBrokerInner msg) {\n+        if (msg.getProperties() != null\n+            && StringUtils.isNotBlank(msg.getProperty(MessageConst.PROPERTY_INNER_MULTI_DISPATCH))\n+            && this.isLmqConsumeQueueNumExceeded()) {\n+            return PutMessageStatus.LMQ_CONSUME_QUEUE_NUM_EXCEEDED;\n+        }\n+        return PutMessageStatus.PUT_OK;\n+    }\n+\n+    private boolean isLmqConsumeQueueNumExceeded() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 557,
+      "original_line": 557,
+      "side": "RIGHT",
+      "original_position": 13,
+      "position": 13,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1514367572,
+      "created_at": "2023-07-05T12:13:41Z",
+      "user": "ferrirW",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2209655693,
+      "created_at": "2024-07-05T00:08:28Z",
+      "user": "github-actions[bot]",
+      "body": "This PR is stale because it has been open for 365 days with no activity. It will be closed in 3 days if no further activity occurs. If you wish not to mark it as stale, please leave a comment in this PR."
+    },
+    {
+      "type": "comment",
+      "id": 2212633908,
+      "created_at": "2024-07-08T00:08:54Z",
+      "user": "github-actions[bot]",
+      "body": "This PR was closed because it has been inactive for 3 days since being marked as stale."
+    }
+  ]
+}

@@ -1,0 +1,179 @@
+{
+  "repo": "netty/netty",
+  "number": 11642,
+  "pr_number": 11642,
+  "title": "Support getting used memory from a user perspective at `PooledByteBufAllocator` level",
+  "user": "JamesChenX",
+  "created_at": "2021-09-01T14:07:37Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "c8c45cfa4c9632578a772ebcad1edfae431b1011",
+  "merge_commit_sha": "c05d716f5b20ee20d94918088b8648c5e53c07eb",
+  "commits": 1,
+  "issue_events": [
+    "ready_for_review",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "closed",
+    "mentioned",
+    "subscribed"
+  ],
+  "url": "https://github.com/netty/netty/pull/11642",
+  "timeline": [
+    {
+      "type": "description",
+      "created_at": "2021-09-01T14:07:37Z",
+      "user": "JamesChenX",
+      "body": "## Motivation\r\nOur server has its own implementation to decide whether to provide service for users according to the real-time estimated total free memory of the heap memory and the direct memory (mainly the memory used by `io.netty.buffer.PooledByteBufAllocator` for our server). If our server detects it's running out of physical memory, it will just respond with the client requests with something like `Service Unavailable`.\r\n\r\nBut the problem is: We cannot know the used memory of PooledByteBufAllocator efficiently. For example, we have allocated and cached 8GB chunks in a `PooledByteBufAllocator`, but there is no property to know: From the user perspective, what exactly the used memory is, 1GB or 8GB?\r\n\r\nThe PR will provide `usedDirectBytes` and `usedHeapBytes` for these purposes.\r\n\r\n## Modification\r\n(Honestly, I didn't come up with better names to distinguish the existing `usedDirectMemory` and the new `usedDirectBytes`. If Netty were a new project, we can distinguish these memories by calling the existing `usedDirectMemory` `committedDirectMemory` and the new memory metric `usedDirectMemory`, but Netty has been widely used in the Java world so I don't call them in this way)\r\n\r\nWhen a pooled buffer is allocated/deallocated, grows, and shrinks, count the increase/decrease size to count `usedDirectBytes` and `usedHeapBytes`\r\n\r\n## Result\r\n\r\nFixes #11637"
+    },
+    {
+      "type": "comment",
+      "id": 911416867,
+      "created_at": "2021-09-02T08:58:32Z",
+      "user": "chrisvest",
+      "body": "Thanks, @JamesChenX. There are some check style issues. Also, please make sure you've signed the ICLA: https://netty.io/wiki/developer-guide.html"
+    },
+    {
+      "type": "commit",
+      "date": "2021-09-02T09:36:27Z",
+      "sha": "ae47127c62b23f0cc62a821b2c0d5f15f2754f26",
+      "message": "Add two counters `usedDirectBytes` and `usedHeapBytes` to count used bytes in PooledByteBufAllocator (#11641)\n\nMotivation:\n\nTo know the free memory of the pooled memory in PooledByteBufAllocator so that our servers can know whether it's time to stop allocate new memory\n\nModification:\n\nAdd two counters `usedDirectBytes` and `usedHeapBytes` to count used bytes when a pooled buffer is allocated, deallocated, grows, and shrinks\n\nResult:\n\nwe can know the free memory in pooled buffers",
+      "author": "JamesChenX",
+      "author_email": "eurekajameschen@gmail.com",
+      "author_raw_date": "2021-09-02T09:36:27Z",
+      "author_date": "2021-09-02T09:36:27Z",
+      "committer": "JamesChenX",
+      "committer_email": "eurekajameschen@gmail.com",
+      "raw_date": "2021-09-02T09:36:27Z",
+      "diff_text": "buffer/src/main/java/io/netty/buffer/PoolArena.java\n@@ -209,20 +209,32 @@ private void incSmallAllocation() {\n         allocationsSmall.increment();\n     }\n \n+    private void incUsedBytes(int bytes) {\n+        if (isDirect()) {\n+            parent.incrementUsedDirectBytes(bytes);\n+        } else {\n+            parent.incrementUsedHeapBytes(bytes);\n+        }\n+    }\n+\n     private void allocateHuge(PooledByteBuf<T> buf, int reqCapacity) {\n         PoolChunk<T> chunk = newUnpooledChunk(reqCapacity);\n         activeBytesHuge.add(chunk.chunkSize());\n         buf.initUnpooled(chunk, reqCapacity);\n         allocationsHuge.increment();\n     }\n \n-    void free(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity, PoolThreadCache cache) {\n+    void free(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity,\n+              PoolThreadCache cache, boolean decreaseUsedBytes) {\n         if (chunk.unpooled) {\n             int size = chunk.chunkSize();\n             destroyChunk(chunk);\n             activeBytesHuge.add(-size);\n             deallocationsHuge.increment();\n         } else {\n+            if (decreaseUsedBytes) {\n+                incUsedBytes(-normCapacity);\n+            }\n             SizeClass sizeClass = sizeClass(handle);\n             if (cache != null && cache.add(this, chunk, nioBuffer, handle, normCapacity, sizeClass)) {\n                 // cached so not free it.\n@@ -293,7 +305,7 @@ void reallocate(PooledByteBuf<T> buf, int newCapacity, boolean freeOldMemory) {\n         }\n         memoryCopy(oldMemory, oldOffset, buf, bytesToCopy);\n         if (freeOldMemory) {\n-            free(oldChunk, oldNioBuffer, oldHandle, oldMaxLength, buf.cache);\n+            free(oldChunk, oldNioBuffer, oldHandle, oldMaxLength, buf.cache, false);\n         }\n     }\n \nbuffer/src/main/java/io/netty/buffer/PooledByteBuf.java\n@@ -98,6 +98,11 @@ public final ByteBuf capacity(int newCapacity) {\n             return this;\n         }\n         checkNewCapacity(newCapacity);\n+        if (isDirect()) {\n+            chunk.arena.parent.incrementUsedDirectBytes(newCapacity - length);\n+        } else {\n+            chunk.arena.parent.incrementUsedHeapBytes(newCapacity - length);\n+        }\n         if (!chunk.unpooled) {\n             // If the request capacity does not require reallocation, just update the length of the memory.\n             if (newCapacity > length) {\n@@ -168,7 +173,7 @@ protected final void deallocate() {\n             final long handle = this.handle;\n             this.handle = -1;\n             memory = null;\n-            chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache);\n+            chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache, true);\n             tmpNioBuf = null;\n             chunk = null;\n             recycle();\nbuffer/src/main/java/io/netty/buffer/PooledByteBufAllocator.java\n@@ -22,6 +22,7 @@\n import io.netty.util.concurrent.EventExecutor;\n import io.netty.util.concurrent.FastThreadLocal;\n import io.netty.util.concurrent.FastThreadLocalThread;\n+import io.netty.util.internal.LongCounter;\n import io.netty.util.internal.PlatformDependent;\n import io.netty.util.internal.StringUtil;\n import io.netty.util.internal.SystemPropertyUtil;\n@@ -185,6 +186,8 @@ public void run() {\n     private final int normalCacheSize;\n     private final List<PoolArenaMetric> heapArenaMetrics;\n     private final List<PoolArenaMetric> directArenaMetrics;\n+    private final LongCounter usedHeapBytes = PlatformDependent.newLongCounter();\n+    private final LongCounter usedDirectBytes = PlatformDependent.newLongCounter();\n     private final PoolThreadLocalCache threadCache;\n     private final int chunkSize;\n     private final PooledByteBufAllocatorMetric metric;\n@@ -382,6 +385,8 @@ protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {\n                     new UnpooledHeapByteBuf(this, initialCapacity, maxCapacity);\n         }\n \n+        incrementUsedHeapBytes(initialCapacity);\n+\n         return toLeakAwareBuffer(buf);\n     }\n \n@@ -399,9 +404,19 @@ protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {\n                     new UnpooledDirectByteBuf(this, initialCapacity, maxCapacity);\n         }\n \n+        incrementUsedDirectBytes(initialCapacity);\n+\n         return toLeakAwareBuffer(buf);\n     }\n \n+    protected void incrementUsedHeapBytes(int bytes) {\n+        usedHeapBytes.add(bytes);\n+    }\n+\n+    protected void incrementUsedDirectBytes(int bytes) {\n+        usedDirectBytes.add(bytes);\n+    }\n+\n     /**\n      * Default number of heap arenas - System Property: io.netty.allocator.numHeapArenas - default 2 * cores\n      */\n@@ -663,6 +678,14 @@ final long usedDirectMemory() {\n         return usedMemory(directArenas);\n     }\n \n+    final long usedHeapBytes() {\n+        return usedHeapBytes.value();\n+    }\n+\n+    final long usedDirectBytes() {\n+        return usedDirectBytes.value();\n+    }\n+\n     private static long usedMemory(PoolArena<?>[] arenas) {\n         if (arenas == null) {\n             return -1;\nbuffer/src/main/java/io/netty/buffer/PooledByteBufAllocatorMetric.java\n@@ -107,12 +107,22 @@ public long usedDirectMemory() {\n         return allocator.usedDirectMemory();\n     }\n \n+    public long usedHeapBytes() {\n+        return allocator.usedHeapBytes();\n+    }\n+\n+    public long usedDirectBytes() {\n+        return allocator.usedDirectBytes();\n+    }\n+\n     @Override\n     public String toString() {\n         StringBuilder sb = new StringBuilder(256);\n         sb.append(StringUtil.simpleClassName(this))\n                 .append(\"(usedHeapMemory: \").append(usedHeapMemory())\n                 .append(\"; usedDirectMemory: \").append(usedDirectMemory())\n+                .append(\"; usedHeapBytes: \").append(usedHeapBytes())\n+                .append(\"; usedDirectBytes: \").append(usedDirectBytes())\n                 .append(\"; numHeapArenas: \").append(numHeapArenas())\n                 .append(\"; numDirectArenas: \").append(numDirectArenas())\n                 .append(\"; smallCacheSize: \").append(smallCacheSize())\nbuffer/src/test/java/io/netty/buffer/PooledByteBufAllocatorTest.java\n@@ -689,4 +689,67 @@ public void testNormalPoolSubpageRelease() {\n \n         assertTrue(beforeFreeBytes < afterFreeBytes);\n     }\n+\n+    @Test\n+    void testCountUsedDirectBytes() {\n+        PooledByteBufAllocator allocator = new PooledByteBufAllocator(true, 1, 1, 8192, 11, 256, 64, false);\n+        assertEquals(0, allocator.usedDirectBytes());\n+\n+        // Allocate\n+        ByteBuf buffer = allocator.directBuffer(16, 128);\n+        assertEquals(16, allocator.usedDirectBytes());\n+\n+        // Shrink\n+        buffer.capacity(8);\n+        assertEquals(8, allocator.usedDirectBytes());\n+\n+        buffer.capacity(2);\n+        assertEquals(2, allocator.usedDirectBytes());\n+\n+        // Grow\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedDirectBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedDirectBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(64, allocator.usedDirectBytes());\n+\n+        // Release\n+        buffer.release();\n+        assertEquals(0, allocator.usedDirectBytes());\n+    }\n+\n+    @Test\n+    void testCountUsedHeapBytes() {\n+        PooledByteBufAllocator allocator = new PooledByteBufAllocator(true, 1, 1, 8192, 11, 256, 64, false);\n+        assertEquals(0, allocator.usedHeapBytes());\n+\n+        // Allocate\n+        ByteBuf buffer = allocator.heapBuffer(16, 128);\n+        assertEquals(16, allocator.usedHeapBytes());\n+\n+        // Shrink\n+        buffer.capacity(8);\n+        assertEquals(8, allocator.usedHeapBytes());\n+\n+        buffer.capacity(2);\n+        assertEquals(2, allocator.usedHeapBytes());\n+\n+        // Grow\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedHeapBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedHeapBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(64, allocator.usedHeapBytes());\n+\n+        // Release\n+        buffer.release();\n+        assertEquals(0, allocator.usedHeapBytes());\n+    }\n+\n }",
+      "diff": [
+        {
+          "file": "buffer/src/main/java/io/netty/buffer/PoolArena.java",
+          "patch": "@@ -209,20 +209,32 @@ private void incSmallAllocation() {\n         allocationsSmall.increment();\n     }\n \n+    private void incUsedBytes(int bytes) {\n+        if (isDirect()) {\n+            parent.incrementUsedDirectBytes(bytes);\n+        } else {\n+            parent.incrementUsedHeapBytes(bytes);\n+        }\n+    }\n+\n     private void allocateHuge(PooledByteBuf<T> buf, int reqCapacity) {\n         PoolChunk<T> chunk = newUnpooledChunk(reqCapacity);\n         activeBytesHuge.add(chunk.chunkSize());\n         buf.initUnpooled(chunk, reqCapacity);\n         allocationsHuge.increment();\n     }\n \n-    void free(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity, PoolThreadCache cache) {\n+    void free(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity,\n+              PoolThreadCache cache, boolean decreaseUsedBytes) {\n         if (chunk.unpooled) {\n             int size = chunk.chunkSize();\n             destroyChunk(chunk);\n             activeBytesHuge.add(-size);\n             deallocationsHuge.increment();\n         } else {\n+            if (decreaseUsedBytes) {\n+                incUsedBytes(-normCapacity);\n+            }\n             SizeClass sizeClass = sizeClass(handle);\n             if (cache != null && cache.add(this, chunk, nioBuffer, handle, normCapacity, sizeClass)) {\n                 // cached so not free it.\n@@ -293,7 +305,7 @@ void reallocate(PooledByteBuf<T> buf, int newCapacity, boolean freeOldMemory) {\n         }\n         memoryCopy(oldMemory, oldOffset, buf, bytesToCopy);\n         if (freeOldMemory) {\n-            free(oldChunk, oldNioBuffer, oldHandle, oldMaxLength, buf.cache);\n+            free(oldChunk, oldNioBuffer, oldHandle, oldMaxLength, buf.cache, false);\n         }\n     }\n "
+        },
+        {
+          "file": "buffer/src/main/java/io/netty/buffer/PooledByteBuf.java",
+          "patch": "@@ -98,6 +98,11 @@ public final ByteBuf capacity(int newCapacity) {\n             return this;\n         }\n         checkNewCapacity(newCapacity);\n+        if (isDirect()) {\n+            chunk.arena.parent.incrementUsedDirectBytes(newCapacity - length);\n+        } else {\n+            chunk.arena.parent.incrementUsedHeapBytes(newCapacity - length);\n+        }\n         if (!chunk.unpooled) {\n             // If the request capacity does not require reallocation, just update the length of the memory.\n             if (newCapacity > length) {\n@@ -168,7 +173,7 @@ protected final void deallocate() {\n             final long handle = this.handle;\n             this.handle = -1;\n             memory = null;\n-            chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache);\n+            chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache, true);\n             tmpNioBuf = null;\n             chunk = null;\n             recycle();"
+        },
+        {
+          "file": "buffer/src/main/java/io/netty/buffer/PooledByteBufAllocator.java",
+          "patch": "@@ -22,6 +22,7 @@\n import io.netty.util.concurrent.EventExecutor;\n import io.netty.util.concurrent.FastThreadLocal;\n import io.netty.util.concurrent.FastThreadLocalThread;\n+import io.netty.util.internal.LongCounter;\n import io.netty.util.internal.PlatformDependent;\n import io.netty.util.internal.StringUtil;\n import io.netty.util.internal.SystemPropertyUtil;\n@@ -185,6 +186,8 @@ public void run() {\n     private final int normalCacheSize;\n     private final List<PoolArenaMetric> heapArenaMetrics;\n     private final List<PoolArenaMetric> directArenaMetrics;\n+    private final LongCounter usedHeapBytes = PlatformDependent.newLongCounter();\n+    private final LongCounter usedDirectBytes = PlatformDependent.newLongCounter();\n     private final PoolThreadLocalCache threadCache;\n     private final int chunkSize;\n     private final PooledByteBufAllocatorMetric metric;\n@@ -382,6 +385,8 @@ protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {\n                     new UnpooledHeapByteBuf(this, initialCapacity, maxCapacity);\n         }\n \n+        incrementUsedHeapBytes(initialCapacity);\n+\n         return toLeakAwareBuffer(buf);\n     }\n \n@@ -399,9 +404,19 @@ protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {\n                     new UnpooledDirectByteBuf(this, initialCapacity, maxCapacity);\n         }\n \n+        incrementUsedDirectBytes(initialCapacity);\n+\n         return toLeakAwareBuffer(buf);\n     }\n \n+    protected void incrementUsedHeapBytes(int bytes) {\n+        usedHeapBytes.add(bytes);\n+    }\n+\n+    protected void incrementUsedDirectBytes(int bytes) {\n+        usedDirectBytes.add(bytes);\n+    }\n+\n     /**\n      * Default number of heap arenas - System Property: io.netty.allocator.numHeapArenas - default 2 * cores\n      */\n@@ -663,6 +678,14 @@ final long usedDirectMemory() {\n         return usedMemory(directArenas);\n     }\n \n+    final long usedHeapBytes() {\n+        return usedHeapBytes.value();\n+    }\n+\n+    final long usedDirectBytes() {\n+        return usedDirectBytes.value();\n+    }\n+\n     private static long usedMemory(PoolArena<?>[] arenas) {\n         if (arenas == null) {\n             return -1;"
+        },
+        {
+          "file": "buffer/src/main/java/io/netty/buffer/PooledByteBufAllocatorMetric.java",
+          "patch": "@@ -107,12 +107,22 @@ public long usedDirectMemory() {\n         return allocator.usedDirectMemory();\n     }\n \n+    public long usedHeapBytes() {\n+        return allocator.usedHeapBytes();\n+    }\n+\n+    public long usedDirectBytes() {\n+        return allocator.usedDirectBytes();\n+    }\n+\n     @Override\n     public String toString() {\n         StringBuilder sb = new StringBuilder(256);\n         sb.append(StringUtil.simpleClassName(this))\n                 .append(\"(usedHeapMemory: \").append(usedHeapMemory())\n                 .append(\"; usedDirectMemory: \").append(usedDirectMemory())\n+                .append(\"; usedHeapBytes: \").append(usedHeapBytes())\n+                .append(\"; usedDirectBytes: \").append(usedDirectBytes())\n                 .append(\"; numHeapArenas: \").append(numHeapArenas())\n                 .append(\"; numDirectArenas: \").append(numDirectArenas())\n                 .append(\"; smallCacheSize: \").append(smallCacheSize())"
+        },
+        {
+          "file": "buffer/src/test/java/io/netty/buffer/PooledByteBufAllocatorTest.java",
+          "patch": "@@ -689,4 +689,67 @@ public void testNormalPoolSubpageRelease() {\n \n         assertTrue(beforeFreeBytes < afterFreeBytes);\n     }\n+\n+    @Test\n+    void testCountUsedDirectBytes() {\n+        PooledByteBufAllocator allocator = new PooledByteBufAllocator(true, 1, 1, 8192, 11, 256, 64, false);\n+        assertEquals(0, allocator.usedDirectBytes());\n+\n+        // Allocate\n+        ByteBuf buffer = allocator.directBuffer(16, 128);\n+        assertEquals(16, allocator.usedDirectBytes());\n+\n+        // Shrink\n+        buffer.capacity(8);\n+        assertEquals(8, allocator.usedDirectBytes());\n+\n+        buffer.capacity(2);\n+        assertEquals(2, allocator.usedDirectBytes());\n+\n+        // Grow\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedDirectBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedDirectBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(64, allocator.usedDirectBytes());\n+\n+        // Release\n+        buffer.release();\n+        assertEquals(0, allocator.usedDirectBytes());\n+    }\n+\n+    @Test\n+    void testCountUsedHeapBytes() {\n+        PooledByteBufAllocator allocator = new PooledByteBufAllocator(true, 1, 1, 8192, 11, 256, 64, false);\n+        assertEquals(0, allocator.usedHeapBytes());\n+\n+        // Allocate\n+        ByteBuf buffer = allocator.heapBuffer(16, 128);\n+        assertEquals(16, allocator.usedHeapBytes());\n+\n+        // Shrink\n+        buffer.capacity(8);\n+        assertEquals(8, allocator.usedHeapBytes());\n+\n+        buffer.capacity(2);\n+        assertEquals(2, allocator.usedHeapBytes());\n+\n+        // Grow\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedHeapBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(16, allocator.usedHeapBytes());\n+\n+        buffer.writeLong(1);\n+        assertEquals(64, allocator.usedHeapBytes());\n+\n+        // Release\n+        buffer.release();\n+        assertEquals(0, allocator.usedHeapBytes());\n+    }\n+\n }"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 911462725,
+      "created_at": "2021-09-02T09:41:39Z",
+      "user": "JamesChenX",
+      "body": "@chrisvest Thanks for the review, and I have signed the ICLA. PTAL."
+    },
+    {
+      "type": "comment",
+      "id": 911587777,
+      "created_at": "2021-09-02T11:54:42Z",
+      "user": "exceptionplayer",
+      "body": "There are already two methods in `PooledByteBufAllocator`, which are `usedHeapMemory` used for counting used heap memory usage and `usedDirectMemory` for direct memory. "
+    },
+    {
+      "type": "comment",
+      "id": 911598715,
+      "created_at": "2021-09-02T12:05:50Z",
+      "user": "JamesChenX",
+      "body": "@medusar `usedHeapMemory` and `usedDirectMemory` should be named `committedHeapMemory` and `committedDirectMemory` in fact, because they count the **committed** memory in `PooledByteBufAllocator` while what we want is to count the used memory in the pooled memory from the user perspective. I know it's a little confusing and that's why I am hesitating about what names we should use to distinguish these two kinds of memory.\r\n\r\ne.g.\r\n```java\r\nByteBuf buffer = allocator.directBuffer(16, 128);\r\nassertEquals(16, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok. \"usedDirectMemory\" should named \"committedDirectMemory\"\r\n\r\nbuffer.release();\r\nassertEquals(0, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok\r\n```"
+    },
+    {
+      "type": "review_comment",
+      "id": 702969776,
+      "created_at": "2021-09-06T15:16:56Z",
+      "user": "chrisvest",
+      "body": "This logic should move into `PoolArena.reallocate`.\r\nAt this location, if the new capacity is less than the current capacity, we would incorrectly count the used memory down even though the memory wasn't actually returned to the pool.",
+      "path": "buffer/src/main/java/io/netty/buffer/PooledByteBuf.java",
+      "diff_hunk": "@@ -98,6 +98,11 @@ public final ByteBuf capacity(int newCapacity) {\n             return this;\n         }\n         checkNewCapacity(newCapacity);\n+        if (isDirect()) {\n+            chunk.arena.parent.incrementUsedDirectBytes(newCapacity - length);\n+        } else {\n+            chunk.arena.parent.incrementUsedHeapBytes(newCapacity - length);\n+        }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 105,
+      "original_line": 105,
+      "side": "RIGHT",
+      "original_position": 8,
+      "position": 8,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 702973926,
+      "created_at": "2021-09-06T15:24:24Z",
+      "user": "chrisvest",
+      "body": "I think we should use the size of the actual memory consumed by the buffer, rather than the sum of the capacities of all in-use buffers. So these increments and decrements will be in terms of pool chunk sub-page element size (for \"small\" allocation), pool chunk page-multiple run size (for \"normal\" allocations), or the requested capacity (for \"huge\" allocations).",
+      "path": "buffer/src/main/java/io/netty/buffer/PooledByteBufAllocator.java",
+      "diff_hunk": "@@ -382,6 +385,8 @@ protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {\n                     new UnpooledHeapByteBuf(this, initialCapacity, maxCapacity);\n         }\n \n+        incrementUsedHeapBytes(initialCapacity);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 388,
+      "original_line": 388,
+      "side": "RIGHT",
+      "original_position": 21,
+      "position": 21,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 702974357,
+          "user": "chrisvest",
+          "body": "In other words, I'd like to see this accounting be pushed down to where memory is removed from, or returned to, the pool.",
+          "created_at": "2021-09-06T15:25:13Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 747310970,
+      "created_at": "2021-09-06T15:29:48Z",
+      "user": "chrisvest",
+      "state": "CHANGES_REQUESTED",
+      "body": "Hey, thanks for doing this work.\r\n\r\nI'm not in favour of the granularity of the accounting being done here, because it misrepresents the amount of memory that is actually removed from the shared pool by a buffer. I think it should be done in terms of the internal allocation units."
+    },
+    {
+      "type": "comment",
+      "id": 913843584,
+      "created_at": "2021-09-06T20:30:56Z",
+      "user": "JamesChenX",
+      "body": "@chrisvest Thanks. I think we need to confirm whether our expectations are the same for the new methods `getUsedDirectBytes` and `getUsedHeapBytes` first.\r\nWhat you have described seems the behavior of the existing `getUsedDirectMemory` and `getUsedHeapMemory`, which count the actually used and cached buffers in PooledByteBufAllocator, which not what we want. Our new methods `usedDirectBytes` and `usedHeapBytes` count the used bytes that follow the lifecycle of a pooled buffer, which is what we need in our project. e.g.:\r\n```java\r\nByteBuf buffer = allocator.directBuffer(16, 128);\r\nassertEquals(16, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok. \"usedDirectMemory\" should be named \"committedDirectMemory\" or \"reservedDirectMemory\"\r\n\r\nbuffer.release();\r\nassertEquals(0, allocator.usedDirectBytes()); // ok\r\nassertEquals(16777216, allocator.usedDirectMemory()); // ok\r\n```\r\nFor details, my expectation for these two new methods is the asserts in: https://github.com/netty/netty/pull/11642/files#diff-5356c1287108c4b93aee8b54109d5ef4d4b9cb2179af1806384e0c520aa9dfe6R694-R722\r\n\r\nDo we expect the same thing?"
+    },
+    {
+      "type": "comment",
+      "id": 914226724,
+      "created_at": "2021-09-07T11:32:32Z",
+      "user": "chrisvest",
+      "body": "@JamesChenX We can think of it as memory committed by the pool, and memory committed to a buffer instance, if that helps.\r\n\r\nThe existing `allocator.usedDirectMemory()` (for example) computes a sum of `arena.numActiveBytes()`, and that in turn computes a sum of `m.chunkSize()` where `m` is a `PoolChunk`. That's the memory committed to the pool, because each chunk is (for direct memory) a single direct memory allocation.\r\n\r\nChunks are then used in pieces by many buffers. Each direct buffer gets a section of a chunk committed to it, which is greater-than-or-equal-to the buffer size, so the buffer can be smaller than the memory committed to it. I think the new method should return the sum of memory committed to the buffers.\r\n\r\nI think we can get that with code similar to what's done for `allocator.usedDirect/HeapMemory()`, but instead of using sums of `chunk.chunkSize()`, we use `chunk.chunkSize() - chunk.freeBytes()`.\r\n\r\nSo in summary, I think we had slightly different expectations, but if the purpose is to do respond to high utilisation of the pooled memory resources, then going by the memory committed to buffers rather than their sizes, will be more accurate.\r\n\r\nMakes sense?\r\n\r\nThen, once we are getting the values out that we want, we can see if computing these sums is too slow and if it would be better to have some `LongCounters`, or perhaps per-arena `AtomicLongs`, to speed up querying."
+    },
+    {
+      "type": "comment",
+      "id": 914287089,
+      "created_at": "2021-09-07T13:01:38Z",
+      "user": "JamesChenX",
+      "body": "@chrisvest Thanks for your kind explanation and I see your point. Though we expect different metrics, `chunk.chunkSize() - chunk.freeBytes()` is accurate and performant enough for our scenarios. So I close the PR, Thanks!"
+    }
+  ]
+}

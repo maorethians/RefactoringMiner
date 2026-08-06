@@ -1,0 +1,148 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 68469,
+  "pr_number": 68469,
+  "title": "Fix Encrypted Repo Test and RepositoriesService Logging",
+  "user": "original-brownbear",
+  "created_at": "2021-02-03T16:32:25Z",
+  "merged_at": "2021-02-04T14:27:34Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">test",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v7.12.0",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "d5d8be9bff0c328b8c1b1fa73622701118889eed",
+  "merge_commit_sha": "f3446f521a3bb81357b48b4be71ec737eb615cf1",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "review_requested",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "unlabeled",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "head_ref_restored"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/68469",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-02-03T15:22:37Z",
+      "sha": "fea4e3ae1141d0bd925788aab6e79263fa73f2fd",
+      "message": "Fix Encrypted Repo Test and RepositoriesService Logging\n\nThis test creates a strange situation when it restarts the\ntwo master nodes back to back without strong guarantees about\nwhether or not the cluster has cleanly formed again. Since we really just want to\nmake sure that the master is after the restart is actually running\nwith the changed password, it seemed easiest to simply do a full restart rather than the\ncurrent loop.\n\nAlso, this commit fixes the logging around repository creation and deletion which made this\nhard to debug and by logging before a CS update has actually been processed would also\nlog incorrectly.\nLastly, I removed the now unnecessary hacks of using the generic pool on a node to fetch\nrepository data. This logic is not needed any longer and the repository will now automatically\nuse the correct thread under the hood. The hack effectively just adds another possible failure\nmode around node restarts since the generic pool quietly rejects tasks after shutdown.\n\nCloses #67834",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-02-03T15:15:49Z",
+      "author_date": "2021-02-03T15:15:49Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-02-03T15:22:37Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java\n@@ -168,13 +168,15 @@ public void registerRepository(final PutRepositoryRequest request, final ActionL\n         clusterService.submitStateUpdateTask(\"put_repository [\" + request.name() + \"]\",\n             new AckedClusterStateUpdateTask(request, acknowledgementStep) {\n \n+                private boolean found = false;\n+                private boolean changed = false;\n+\n                 @Override\n                 public ClusterState execute(ClusterState currentState) {\n                     ensureRepositoryNotInUse(currentState, request.name());\n                     Metadata metadata = currentState.metadata();\n                     Metadata.Builder mdBuilder = Metadata.builder(currentState.metadata());\n                     RepositoriesMetadata repositories = metadata.custom(RepositoriesMetadata.TYPE, RepositoriesMetadata.EMPTY);\n-                    boolean found = false;\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n@@ -189,13 +191,11 @@ public ClusterState execute(ClusterState currentState) {\n                         }\n                     }\n                     if (found == false) {\n-                        logger.info(\"put repository [{}]\", request.name());\n                         repositoriesMetadata.add(new RepositoryMetadata(request.name(), request.type(), request.settings()));\n-                    } else {\n-                        logger.info(\"update repository [{}]\", request.name());\n                     }\n                     repositories = new RepositoriesMetadata(repositoriesMetadata);\n                     mdBuilder.putCustom(RepositoriesMetadata.TYPE, repositories);\n+                    changed = true;\n                     return ClusterState.builder(currentState).metadata(mdBuilder).build();\n                 }\n \n@@ -214,6 +214,13 @@ public boolean mustAck(DiscoveryNode discoveryNode) {\n \n                 @Override\n                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    if (changed) {\n+                        if (found) {\n+                            logger.info(\"updated repository [{}]\", request.name());\n+                        } else {\n+                            logger.info(\"put repository [{}]\", request.name());\n+                        }\n+                    }\n                     publicationStep.onResponse(null);\n                 }\n             });\n@@ -288,6 +295,8 @@ public void unregisterRepository(final DeleteRepositoryRequest request, final Ac\n         clusterService.submitStateUpdateTask(\"delete_repository [\" + request.name() + \"]\",\n             new AckedClusterStateUpdateTask(request, listener) {\n \n+                private final List<String> deletedRepositories = new ArrayList<>();\n+\n                 @Override\n                 public ClusterState execute(ClusterState currentState) {\n                     Metadata metadata = currentState.metadata();\n@@ -299,7 +308,7 @@ public ClusterState execute(ClusterState currentState) {\n                         for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                             if (Regex.simpleMatch(request.name(), repositoryMetadata.name())) {\n                                 ensureRepositoryNotInUse(currentState, repositoryMetadata.name());\n-                                logger.info(\"delete repository [{}]\", repositoryMetadata.name());\n+                                deletedRepositories.add(repositoryMetadata.name());\n                                 changed = true;\n                             } else {\n                                 repositoriesMetadata.add(repositoryMetadata);\n@@ -317,6 +326,13 @@ public ClusterState execute(ClusterState currentState) {\n                     throw new RepositoryMissingException(request.name());\n                 }\n \n+                @Override\n+                public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    if (deletedRepositories.isEmpty() == false) {\n+                        logger.info(\"deleted repositories [{}]\", deletedRepositories);\n+                    }\n+                }\n+\n                 @Override\n                 public boolean mustAck(DiscoveryNode discoveryNode) {\n                     // repository was created on both master and data nodes\nx-pack/plugin/repository-encrypted/src/internalClusterTest/java/org/elasticsearch/repositories/encrypted/EncryptedFSBlobStoreRepositoryIntegTests.java\n@@ -6,7 +6,6 @@\n  */\n package org.elasticsearch.repositories.encrypted;\n \n-import org.elasticsearch.action.ActionRunnable;\n import org.elasticsearch.action.support.PlainActionFuture;\n import org.elasticsearch.common.settings.MockSecureSettings;\n import org.elasticsearch.common.settings.Settings;\n@@ -157,9 +156,7 @@ public void testTamperedEncryptionMetadata() throws Exception {\n         assertThat(\n             expectThrows(\n                 RepositoryException.class,\n-                () -> PlainActionFuture.<RepositoryData, Exception>get(\n-                    f -> blobStoreRepository.threadPool().generic().execute(ActionRunnable.wrap(f, blobStoreRepository::getRepositoryData))\n-                )\n+                () -> PlainActionFuture.<RepositoryData, Exception>get(blobStoreRepository::getRepositoryData)\n             ).getMessage(),\n             containsString(\"the encryption metadata in the repository has been corrupted\")\n         );\nx-pack/plugin/repository-encrypted/src/internalClusterTest/java/org/elasticsearch/repositories/encrypted/EncryptedRepositorySecretIntegTests.java\n@@ -8,7 +8,6 @@\n package org.elasticsearch.repositories.encrypted;\n \n import org.elasticsearch.ElasticsearchSecurityException;\n-import org.elasticsearch.action.ActionRunnable;\n import org.elasticsearch.action.admin.cluster.repositories.verify.VerifyRepositoryResponse;\n import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;\n import org.elasticsearch.action.admin.cluster.snapshots.get.GetSnapshotsResponse;\n@@ -40,7 +39,6 @@\n \n import java.util.Arrays;\n import java.util.Collection;\n-import java.util.HashSet;\n import java.util.List;\n import java.util.Locale;\n import java.util.Set;\n@@ -549,7 +547,6 @@ public void testWrongRepositoryPassword() throws Exception {\n         internalCluster().startNodes(2, Settings.builder().setSecureSettings(secureSettingsWithPassword).build());\n         ensureStableCluster(2);\n         createRepository(repositoryName, repositorySettings, true);\n-        // create empty smapshot\n         final String snapshotName = randomName();\n         logger.info(\"-->  create empty snapshot {}:{}\", repositoryName, snapshotName);\n         CreateSnapshotResponse createSnapshotResponse = client().admin()\n@@ -575,14 +572,9 @@ public void testWrongRepositoryPassword() throws Exception {\n             EncryptedRepositoryPlugin.ENCRYPTION_PASSWORD_SETTING.getConcreteSettingForNamespace(repositoryName).getKey(),\n             wrongPassword\n         );\n-        Set<String> nodesWithWrongPassword = new HashSet<>();\n-        do {\n-            String masterNodeName = internalCluster().getMasterName();\n-            logger.info(\"-->  restart master node {}\", masterNodeName);\n-            internalCluster().restartNode(masterNodeName, new InternalTestCluster.RestartCallback());\n-            nodesWithWrongPassword.add(masterNodeName);\n-            ensureStableCluster(2);\n-        } while (false == nodesWithWrongPassword.contains(internalCluster().getMasterName()));\n+\n+        internalCluster().fullRestart();\n+        ensureStableCluster(2);\n         // maybe recreate the repository\n         if (randomBoolean()) {\n             deleteRepository(repositoryName);\n@@ -594,9 +586,7 @@ public void testWrongRepositoryPassword() throws Exception {\n         ).repository(repositoryName);\n         RepositoryException e = expectThrows(\n             RepositoryException.class,\n-            () -> PlainActionFuture.<RepositoryData, Exception>get(\n-                f -> blobStoreRepository.threadPool().generic().execute(ActionRunnable.wrap(f, blobStoreRepository::getRepositoryData))\n-            )\n+            () -> PlainActionFuture.<RepositoryData, Exception>get(blobStoreRepository::getRepositoryData)\n         );\n         assertThat(e.getCause().getMessage(), containsString(\"repository password is incorrect\"));\n         e = expectThrows(\n@@ -626,13 +616,8 @@ public void testWrongRepositoryPassword() throws Exception {\n             EncryptedRepositoryPlugin.ENCRYPTION_PASSWORD_SETTING.getConcreteSettingForNamespace(repositoryName).getKey(),\n             goodPassword\n         );\n-        do {\n-            String masterNodeName = internalCluster().getMasterName();\n-            logger.info(\"-->  restart master node {}\", masterNodeName);\n-            internalCluster().restartNode(masterNodeName, new InternalTestCluster.RestartCallback());\n-            nodesWithWrongPassword.remove(masterNodeName);\n-            ensureStableCluster(2);\n-        } while (nodesWithWrongPassword.contains(internalCluster().getMasterName()));\n+        internalCluster().fullRestart();\n+        ensureStableCluster(2);\n         // ensure get snapshot works\n         getSnapshotResponse = client().admin().cluster().prepareGetSnapshots(repositoryName).get();\n         assertThat(getSnapshotResponse.getFailedResponses().keySet(), empty());",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java",
+          "patch": "@@ -168,13 +168,15 @@ public void registerRepository(final PutRepositoryRequest request, final ActionL\n         clusterService.submitStateUpdateTask(\"put_repository [\" + request.name() + \"]\",\n             new AckedClusterStateUpdateTask(request, acknowledgementStep) {\n \n+                private boolean found = false;\n+                private boolean changed = false;\n+\n                 @Override\n                 public ClusterState execute(ClusterState currentState) {\n                     ensureRepositoryNotInUse(currentState, request.name());\n                     Metadata metadata = currentState.metadata();\n                     Metadata.Builder mdBuilder = Metadata.builder(currentState.metadata());\n                     RepositoriesMetadata repositories = metadata.custom(RepositoriesMetadata.TYPE, RepositoriesMetadata.EMPTY);\n-                    boolean found = false;\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n@@ -189,13 +191,11 @@ public ClusterState execute(ClusterState currentState) {\n                         }\n                     }\n                     if (found == false) {\n-                        logger.info(\"put repository [{}]\", request.name());\n                         repositoriesMetadata.add(new RepositoryMetadata(request.name(), request.type(), request.settings()));\n-                    } else {\n-                        logger.info(\"update repository [{}]\", request.name());\n                     }\n                     repositories = new RepositoriesMetadata(repositoriesMetadata);\n                     mdBuilder.putCustom(RepositoriesMetadata.TYPE, repositories);\n+                    changed = true;\n                     return ClusterState.builder(currentState).metadata(mdBuilder).build();\n                 }\n \n@@ -214,6 +214,13 @@ public boolean mustAck(DiscoveryNode discoveryNode) {\n \n                 @Override\n                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    if (changed) {\n+                        if (found) {\n+                            logger.info(\"updated repository [{}]\", request.name());\n+                        } else {\n+                            logger.info(\"put repository [{}]\", request.name());\n+                        }\n+                    }\n                     publicationStep.onResponse(null);\n                 }\n             });\n@@ -288,6 +295,8 @@ public void unregisterRepository(final DeleteRepositoryRequest request, final Ac\n         clusterService.submitStateUpdateTask(\"delete_repository [\" + request.name() + \"]\",\n             new AckedClusterStateUpdateTask(request, listener) {\n \n+                private final List<String> deletedRepositories = new ArrayList<>();\n+\n                 @Override\n                 public ClusterState execute(ClusterState currentState) {\n                     Metadata metadata = currentState.metadata();\n@@ -299,7 +308,7 @@ public ClusterState execute(ClusterState currentState) {\n                         for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                             if (Regex.simpleMatch(request.name(), repositoryMetadata.name())) {\n                                 ensureRepositoryNotInUse(currentState, repositoryMetadata.name());\n-                                logger.info(\"delete repository [{}]\", repositoryMetadata.name());\n+                                deletedRepositories.add(repositoryMetadata.name());\n                                 changed = true;\n                             } else {\n                                 repositoriesMetadata.add(repositoryMetadata);\n@@ -317,6 +326,13 @@ public ClusterState execute(ClusterState currentState) {\n                     throw new RepositoryMissingException(request.name());\n                 }\n \n+                @Override\n+                public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    if (deletedRepositories.isEmpty() == false) {\n+                        logger.info(\"deleted repositories [{}]\", deletedRepositories);\n+                    }\n+                }\n+\n                 @Override\n                 public boolean mustAck(DiscoveryNode discoveryNode) {\n                     // repository was created on both master and data nodes"
+        },
+        {
+          "file": "x-pack/plugin/repository-encrypted/src/internalClusterTest/java/org/elasticsearch/repositories/encrypted/EncryptedFSBlobStoreRepositoryIntegTests.java",
+          "patch": "@@ -6,7 +6,6 @@\n  */\n package org.elasticsearch.repositories.encrypted;\n \n-import org.elasticsearch.action.ActionRunnable;\n import org.elasticsearch.action.support.PlainActionFuture;\n import org.elasticsearch.common.settings.MockSecureSettings;\n import org.elasticsearch.common.settings.Settings;\n@@ -157,9 +156,7 @@ public void testTamperedEncryptionMetadata() throws Exception {\n         assertThat(\n             expectThrows(\n                 RepositoryException.class,\n-                () -> PlainActionFuture.<RepositoryData, Exception>get(\n-                    f -> blobStoreRepository.threadPool().generic().execute(ActionRunnable.wrap(f, blobStoreRepository::getRepositoryData))\n-                )\n+                () -> PlainActionFuture.<RepositoryData, Exception>get(blobStoreRepository::getRepositoryData)\n             ).getMessage(),\n             containsString(\"the encryption metadata in the repository has been corrupted\")\n         );"
+        },
+        {
+          "file": "x-pack/plugin/repository-encrypted/src/internalClusterTest/java/org/elasticsearch/repositories/encrypted/EncryptedRepositorySecretIntegTests.java",
+          "patch": "@@ -8,7 +8,6 @@\n package org.elasticsearch.repositories.encrypted;\n \n import org.elasticsearch.ElasticsearchSecurityException;\n-import org.elasticsearch.action.ActionRunnable;\n import org.elasticsearch.action.admin.cluster.repositories.verify.VerifyRepositoryResponse;\n import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;\n import org.elasticsearch.action.admin.cluster.snapshots.get.GetSnapshotsResponse;\n@@ -40,7 +39,6 @@\n \n import java.util.Arrays;\n import java.util.Collection;\n-import java.util.HashSet;\n import java.util.List;\n import java.util.Locale;\n import java.util.Set;\n@@ -549,7 +547,6 @@ public void testWrongRepositoryPassword() throws Exception {\n         internalCluster().startNodes(2, Settings.builder().setSecureSettings(secureSettingsWithPassword).build());\n         ensureStableCluster(2);\n         createRepository(repositoryName, repositorySettings, true);\n-        // create empty smapshot\n         final String snapshotName = randomName();\n         logger.info(\"-->  create empty snapshot {}:{}\", repositoryName, snapshotName);\n         CreateSnapshotResponse createSnapshotResponse = client().admin()\n@@ -575,14 +572,9 @@ public void testWrongRepositoryPassword() throws Exception {\n             EncryptedRepositoryPlugin.ENCRYPTION_PASSWORD_SETTING.getConcreteSettingForNamespace(repositoryName).getKey(),\n             wrongPassword\n         );\n-        Set<String> nodesWithWrongPassword = new HashSet<>();\n-        do {\n-            String masterNodeName = internalCluster().getMasterName();\n-            logger.info(\"-->  restart master node {}\", masterNodeName);\n-            internalCluster().restartNode(masterNodeName, new InternalTestCluster.RestartCallback());\n-            nodesWithWrongPassword.add(masterNodeName);\n-            ensureStableCluster(2);\n-        } while (false == nodesWithWrongPassword.contains(internalCluster().getMasterName()));\n+\n+        internalCluster().fullRestart();\n+        ensureStableCluster(2);\n         // maybe recreate the repository\n         if (randomBoolean()) {\n             deleteRepository(repositoryName);\n@@ -594,9 +586,7 @@ public void testWrongRepositoryPassword() throws Exception {\n         ).repository(repositoryName);\n         RepositoryException e = expectThrows(\n             RepositoryException.class,\n-            () -> PlainActionFuture.<RepositoryData, Exception>get(\n-                f -> blobStoreRepository.threadPool().generic().execute(ActionRunnable.wrap(f, blobStoreRepository::getRepositoryData))\n-            )\n+            () -> PlainActionFuture.<RepositoryData, Exception>get(blobStoreRepository::getRepositoryData)\n         );\n         assertThat(e.getCause().getMessage(), containsString(\"repository password is incorrect\"));\n         e = expectThrows(\n@@ -626,13 +616,8 @@ public void testWrongRepositoryPassword() throws Exception {\n             EncryptedRepositoryPlugin.ENCRYPTION_PASSWORD_SETTING.getConcreteSettingForNamespace(repositoryName).getKey(),\n             goodPassword\n         );\n-        do {\n-            String masterNodeName = internalCluster().getMasterName();\n-            logger.info(\"-->  restart master node {}\", masterNodeName);\n-            internalCluster().restartNode(masterNodeName, new InternalTestCluster.RestartCallback());\n-            nodesWithWrongPassword.remove(masterNodeName);\n-            ensureStableCluster(2);\n-        } while (nodesWithWrongPassword.contains(internalCluster().getMasterName()));\n+        internalCluster().fullRestart();\n+        ensureStableCluster(2);\n         // ensure get snapshot works\n         getSnapshotResponse = client().admin().cluster().prepareGetSnapshots(repositoryName).get();\n         assertThat(getSnapshotResponse.getFailedResponses().keySet(), empty());"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-02-03T16:32:25Z",
+      "user": "original-brownbear",
+      "body": "This test creates a strange situation when it restarts the\r\ntwo master nodes back to back without strong guarantees about\r\nwhether or not the cluster has cleanly formed again. Since we really just want to\r\nmake sure that the master is after the restart is actually running\r\nwith the changed password, it seemed easiest to simply do a full restart rather than the\r\ncurrent loop.\r\n\r\nAlso, this commit fixes the logging around repository creation and deletion which made this\r\nhard to debug and by logging before a CS update has actually been processed would also\r\nlog incorrectly.\r\nLastly, I removed the now unnecessary hacks of using the generic pool on a node to fetch\r\nrepository data. This logic is not needed any longer and the repository will now automatically\r\nuse the correct thread under the hood. The hack effectively just adds another possible failure\r\nmode around node restarts since the generic pool quietly rejects tasks after shutdown.\r\n\r\nCloses #67834\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 772642218,
+      "created_at": "2021-02-03T16:32:29Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review_comment",
+      "id": 570194308,
+      "created_at": "2021-02-04T12:45:13Z",
+      "user": "albertzaharovits",
+      "body": "This assumes that `execute` was called on the same thread, which looks to be the case, but still made me check.\r\nI would've made them `volatile` (and synchronized list for `deletedRepositories`), but I'll leave this up to you, because the assumption of a single thread in the master service might be very firmly established.",
+      "path": "server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java",
+      "diff_hunk": "@@ -214,6 +214,13 @@ public boolean mustAck(DiscoveryNode discoveryNode) {\n \n                 @Override\n                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    if (changed) {\n+                        if (found) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 218,
+      "original_line": 218,
+      "side": "RIGHT",
+      "original_position": 37,
+      "position": 37,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 570200602,
+      "created_at": "2021-02-04T12:55:11Z",
+      "user": "albertzaharovits",
+      "body": "I get that we should avoid restarting the master node, unless this is exactly what is being tested, and prefer restarting the whole cluster? Is this true in general?.\r\nIn this particular case, it was only required that master be among the nodes restarted (so that it updates its password).",
+      "path": "x-pack/plugin/repository-encrypted/src/internalClusterTest/java/org/elasticsearch/repositories/encrypted/EncryptedRepositorySecretIntegTests.java",
+      "diff_hunk": "@@ -575,14 +572,9 @@ public void testWrongRepositoryPassword() throws Exception {\n             EncryptedRepositoryPlugin.ENCRYPTION_PASSWORD_SETTING.getConcreteSettingForNamespace(repositoryName).getKey(),\n             wrongPassword\n         );\n-        Set<String> nodesWithWrongPassword = new HashSet<>();\n-        do {\n-            String masterNodeName = internalCluster().getMasterName();\n-            logger.info(\"-->  restart master node {}\", masterNodeName);\n-            internalCluster().restartNode(masterNodeName, new InternalTestCluster.RestartCallback());\n-            nodesWithWrongPassword.add(masterNodeName);\n-            ensureStableCluster(2);\n-        } while (false == nodesWithWrongPassword.contains(internalCluster().getMasterName()));\n+\n+        internalCluster().fullRestart();\n+        ensureStableCluster(2);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 577,
+      "original_line": 577,
+      "side": "RIGHT",
+      "original_position": 38,
+      "position": 38,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 583353479,
+      "created_at": "2021-02-04T13:05:06Z",
+      "user": "albertzaharovits",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 773350740,
+      "created_at": "2021-02-04T14:27:24Z",
+      "user": "original-brownbear",
+      "body": "Thanks Albert! (merging since we discussed the open points on another channel)"
+    }
+  ]
+}

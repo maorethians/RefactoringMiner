@@ -1,0 +1,144 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 61770,
+  "pr_number": 61770,
+  "title": "Fix Concurrent Snapshot Create+Delete + Delete Index",
+  "user": "original-brownbear",
+  "created_at": "2020-09-01T08:41:14Z",
+  "merged_at": "2020-09-01T10:28:10Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v7.10.0",
+    "v7.9.1",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "b2b081bc7404e299dce377be8211366585ea7516",
+  "merge_commit_sha": "ca00a6fe8a60b64b0487b2663789bcfc2050f91e",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "review_requested",
+    "review_requested",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "head_ref_restored",
+    "unlabeled",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/61770",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-09-01T08:38:24Z",
+      "sha": "ef9e508536cb2e66f39f5848319b7578a2a6ae47",
+      "message": "Fix Concurrent Snapshot Create+Delete + Delete Index\n\nWe had a bug here were we put a `null` value into the shard\nassignment mapping when reassigning work after a snapshot delete\nhad gone through. This only affects partial snaphots but essentially\ndead-locks the snapshot process.\n\nCloses #61762",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2020-08-31T22:34:30Z",
+      "author_date": "2020-08-31T22:34:30Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2020-09-01T08:38:24Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java\n@@ -819,6 +819,28 @@ public void testMultipleSnapshotsQueuedAfterDelete() throws Exception {\n         assertAcked(deleteFuture.get());\n     }\n \n+    public void testMultiplePartialSnapshotsQueuedAfterDelete() throws Exception {\n+        final String masterNode = internalCluster().startMasterOnlyNode();\n+        internalCluster().startDataOnlyNode();\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"mock\");\n+        createIndexWithContent(\"index-one\");\n+        createIndexWithContent(\"index-two\");\n+        createNSnapshots(repoName, randomIntBetween(1, 5));\n+\n+        final ActionFuture<AcknowledgedResponse> deleteFuture = startAndBlockOnDeleteSnapshot(repoName, \"*\");\n+        final ActionFuture<CreateSnapshotResponse> snapshotThree = startFullSnapshot(repoName, \"snapshot-three\", true);\n+        final ActionFuture<CreateSnapshotResponse> snapshotFour = startFullSnapshot(repoName, \"snapshot-four\", true);\n+        awaitNSnapshotsInProgress(2);\n+\n+        assertAcked(client().admin().indices().prepareDelete(\"index-two\"));\n+        unblockNode(repoName, masterNode);\n+\n+        assertThat(snapshotThree.get().getSnapshotInfo().state(), is(SnapshotState.PARTIAL));\n+        assertThat(snapshotFour.get().getSnapshotInfo().state(), is(SnapshotState.PARTIAL));\n+        assertAcked(deleteFuture.get());\n+    }\n+\n     public void testQueuedSnapshotsWaitingForShardReady() throws Exception {\n         internalCluster().startMasterOnlyNode();\n         internalCluster().startDataOnlyNodes(2);\n@@ -1238,8 +1260,13 @@ private ActionFuture<CreateSnapshotResponse> startFullSnapshotFromMasterClient(S\n     }\n \n     private ActionFuture<CreateSnapshotResponse> startFullSnapshot(String repoName, String snapshotName) {\n+        return startFullSnapshot(repoName, snapshotName, false);\n+    }\n+\n+    private ActionFuture<CreateSnapshotResponse> startFullSnapshot(String repoName, String snapshotName, boolean partial) {\n         logger.info(\"--> creating full snapshot [{}] to repo [{}]\", snapshotName, repoName);\n-        return client().admin().cluster().prepareCreateSnapshot(repoName, snapshotName).setWaitForCompletion(true).execute();\n+        return client().admin().cluster().prepareCreateSnapshot(repoName, snapshotName).setWaitForCompletion(true)\n+                .setPartial(partial).execute();\n     }\n \n     private void awaitClusterState(Predicate<ClusterState> statePredicate) throws Exception {\nserver/src/main/java/org/elasticsearch/cluster/SnapshotsInProgress.java\n@@ -412,6 +412,13 @@ public static class ShardSnapshotStatus implements Writeable {\n         public static final ShardSnapshotStatus UNASSIGNED_QUEUED =\n                 new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.QUEUED, null);\n \n+        /**\n+         * Shard snapshot status for shards that could not be snapshotted because their index was deleted from before the shard snapshot\n+         * started.\n+         */\n+        public static final ShardSnapshotStatus MISSING =\n+                new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.MISSING, \"missing index\", null);\n+\n         private final ShardState state;\n \n         @Nullable\nserver/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java\n@@ -1623,9 +1623,17 @@ private SnapshotsInProgress updatedSnapshotsInProgress(ClusterState currentState\n                             final ImmutableOpenMap.Builder<ShardId, ShardSnapshotStatus> updatedAssignmentsBuilder =\n                                     ImmutableOpenMap.builder(entry.shards());\n                             for (ShardId shardId : canBeUpdated) {\n-                                final boolean added = reassignedShardIds.add(shardId);\n-                                assert added;\n-                                updatedAssignmentsBuilder.put(shardId, shardAssignments.get(shardId));\n+                                final ShardSnapshotStatus updated = shardAssignments.get(shardId);\n+                                if (updated == null) {\n+                                    // We don't have a new assignment for this shard because its index was concurrently deleted\n+                                    assert currentState.routingTable().hasIndex(shardId.getIndex()) == false :\n+                                            \"Missing assignment for [\" + shardId + \"]\";\n+                                    updatedAssignmentsBuilder.put(shardId, ShardSnapshotStatus.MISSING);\n+                                } else {\n+                                    final boolean added = reassignedShardIds.add(shardId);\n+                                    assert added;\n+                                    updatedAssignmentsBuilder.put(shardId, updated);\n+                                }\n                             }\n                             snapshotEntries.add(entry.withStartedShards(updatedAssignmentsBuilder.build()));\n                             changed = true;\n@@ -1715,8 +1723,7 @@ private static ImmutableOpenMap<ShardId, SnapshotsInProgress.ShardSnapshotStatus\n             IndexMetadata indexMetadata = metadata.index(indexName);\n             if (indexMetadata == null) {\n                 // The index was deleted before we managed to start the snapshot - mark it as missing.\n-                builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0),\n-                    new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.MISSING, \"missing index\", null));\n+                builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0), ShardSnapshotStatus.MISSING);\n             } else {\n                 final IndexRoutingTable indexRoutingTable = routingTable.index(indexName);\n                 assert indexRoutingTable != null;",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java",
+          "patch": "@@ -819,6 +819,28 @@ public void testMultipleSnapshotsQueuedAfterDelete() throws Exception {\n         assertAcked(deleteFuture.get());\n     }\n \n+    public void testMultiplePartialSnapshotsQueuedAfterDelete() throws Exception {\n+        final String masterNode = internalCluster().startMasterOnlyNode();\n+        internalCluster().startDataOnlyNode();\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"mock\");\n+        createIndexWithContent(\"index-one\");\n+        createIndexWithContent(\"index-two\");\n+        createNSnapshots(repoName, randomIntBetween(1, 5));\n+\n+        final ActionFuture<AcknowledgedResponse> deleteFuture = startAndBlockOnDeleteSnapshot(repoName, \"*\");\n+        final ActionFuture<CreateSnapshotResponse> snapshotThree = startFullSnapshot(repoName, \"snapshot-three\", true);\n+        final ActionFuture<CreateSnapshotResponse> snapshotFour = startFullSnapshot(repoName, \"snapshot-four\", true);\n+        awaitNSnapshotsInProgress(2);\n+\n+        assertAcked(client().admin().indices().prepareDelete(\"index-two\"));\n+        unblockNode(repoName, masterNode);\n+\n+        assertThat(snapshotThree.get().getSnapshotInfo().state(), is(SnapshotState.PARTIAL));\n+        assertThat(snapshotFour.get().getSnapshotInfo().state(), is(SnapshotState.PARTIAL));\n+        assertAcked(deleteFuture.get());\n+    }\n+\n     public void testQueuedSnapshotsWaitingForShardReady() throws Exception {\n         internalCluster().startMasterOnlyNode();\n         internalCluster().startDataOnlyNodes(2);\n@@ -1238,8 +1260,13 @@ private ActionFuture<CreateSnapshotResponse> startFullSnapshotFromMasterClient(S\n     }\n \n     private ActionFuture<CreateSnapshotResponse> startFullSnapshot(String repoName, String snapshotName) {\n+        return startFullSnapshot(repoName, snapshotName, false);\n+    }\n+\n+    private ActionFuture<CreateSnapshotResponse> startFullSnapshot(String repoName, String snapshotName, boolean partial) {\n         logger.info(\"--> creating full snapshot [{}] to repo [{}]\", snapshotName, repoName);\n-        return client().admin().cluster().prepareCreateSnapshot(repoName, snapshotName).setWaitForCompletion(true).execute();\n+        return client().admin().cluster().prepareCreateSnapshot(repoName, snapshotName).setWaitForCompletion(true)\n+                .setPartial(partial).execute();\n     }\n \n     private void awaitClusterState(Predicate<ClusterState> statePredicate) throws Exception {"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/SnapshotsInProgress.java",
+          "patch": "@@ -412,6 +412,13 @@ public static class ShardSnapshotStatus implements Writeable {\n         public static final ShardSnapshotStatus UNASSIGNED_QUEUED =\n                 new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.QUEUED, null);\n \n+        /**\n+         * Shard snapshot status for shards that could not be snapshotted because their index was deleted from before the shard snapshot\n+         * started.\n+         */\n+        public static final ShardSnapshotStatus MISSING =\n+                new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.MISSING, \"missing index\", null);\n+\n         private final ShardState state;\n \n         @Nullable"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java",
+          "patch": "@@ -1623,9 +1623,17 @@ private SnapshotsInProgress updatedSnapshotsInProgress(ClusterState currentState\n                             final ImmutableOpenMap.Builder<ShardId, ShardSnapshotStatus> updatedAssignmentsBuilder =\n                                     ImmutableOpenMap.builder(entry.shards());\n                             for (ShardId shardId : canBeUpdated) {\n-                                final boolean added = reassignedShardIds.add(shardId);\n-                                assert added;\n-                                updatedAssignmentsBuilder.put(shardId, shardAssignments.get(shardId));\n+                                final ShardSnapshotStatus updated = shardAssignments.get(shardId);\n+                                if (updated == null) {\n+                                    // We don't have a new assignment for this shard because its index was concurrently deleted\n+                                    assert currentState.routingTable().hasIndex(shardId.getIndex()) == false :\n+                                            \"Missing assignment for [\" + shardId + \"]\";\n+                                    updatedAssignmentsBuilder.put(shardId, ShardSnapshotStatus.MISSING);\n+                                } else {\n+                                    final boolean added = reassignedShardIds.add(shardId);\n+                                    assert added;\n+                                    updatedAssignmentsBuilder.put(shardId, updated);\n+                                }\n                             }\n                             snapshotEntries.add(entry.withStartedShards(updatedAssignmentsBuilder.build()));\n                             changed = true;\n@@ -1715,8 +1723,7 @@ private static ImmutableOpenMap<ShardId, SnapshotsInProgress.ShardSnapshotStatus\n             IndexMetadata indexMetadata = metadata.index(indexName);\n             if (indexMetadata == null) {\n                 // The index was deleted before we managed to start the snapshot - mark it as missing.\n-                builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0),\n-                    new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.MISSING, \"missing index\", null));\n+                builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0), ShardSnapshotStatus.MISSING);\n             } else {\n                 final IndexRoutingTable indexRoutingTable = routingTable.index(indexName);\n                 assert indexRoutingTable != null;"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-09-01T08:41:14Z",
+      "user": "original-brownbear",
+      "body": "We had a bug here that is new to `7.9` were we put a `null` value into the shard\r\nassignment mapping when reassigning work after a snapshot delete\r\nhad gone through. This only affects partial snaphots but essentially\r\ndead-locks the snapshot process.\r\n\r\nCloses #61762\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 684585021,
+      "created_at": "2020-09-01T08:41:16Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (:Distributed/Snapshot/Restore)"
+    },
+    {
+      "type": "review",
+      "id": 479535410,
+      "created_at": "2020-09-01T08:57:31Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 480981525,
+      "created_at": "2020-09-01T08:57:31Z",
+      "user": "original-brownbear",
+      "body": "Before concurrent snapshots this spot would cover all possible scenarios because we'd only be dealing with shard ids for indices that still exist in the repo ever beyond this point. If an index was deleted after assignment then it would just fail in the `SnapshotShardsService` and things would work out that way.\r\nBut with concurrent snapshots where we could have indices deleted from under a queued up shard snapshot we have to explicitly deal with this situation.",
+      "path": "server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java",
+      "diff_hunk": "@@ -1715,8 +1723,7 @@ public static ClusterState updateWithSnapshots(ClusterState state,\n             IndexMetadata indexMetadata = metadata.index(indexName);\n             if (indexMetadata == null) {\n                 // The index was deleted before we managed to start the snapshot - mark it as missing.\n-                builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0),\n-                    new SnapshotsInProgress.ShardSnapshotStatus(null, ShardState.MISSING, \"missing index\", null));\n+                builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0), ShardSnapshotStatus.MISSING);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1726,
+      "original_line": 1726,
+      "side": "RIGHT",
+      "original_position": 27,
+      "position": 27,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 479597493,
+      "created_at": "2020-09-01T10:11:46Z",
+      "user": "ywelsch",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 684745612,
+      "created_at": "2020-09-01T10:28:04Z",
+      "user": "original-brownbear",
+      "body": "Thanks Yannick!"
+    },
+    {
+      "type": "comment",
+      "id": 788702774,
+      "created_at": "2021-03-02T08:01:11Z",
+      "user": "DaveCTurner",
+      "body": "Linking this to #56911 so that I can find it again in future."
+    }
+  ]
+}

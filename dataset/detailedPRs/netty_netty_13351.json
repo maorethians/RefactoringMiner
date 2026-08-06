@@ -1,0 +1,265 @@
+{
+  "repo": "netty/netty",
+  "number": 13351,
+  "pr_number": 13351,
+  "title": "Guard against unbounded grow of suppressed exceptions storage",
+  "user": "normanmaurer",
+  "created_at": "2023-04-21T08:11:57Z",
+  "merged_at": "2023-04-23T14:07:32Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "c1f8cb0d3ed636a58a82ecde49d6fc05a4dbe26f",
+  "merge_commit_sha": "ba1ff7a3c6bad4bddb24da2a6ae6416906dc2e0f",
+  "commits": 2,
+  "issue_events": [
+    "milestoned",
+    "review_requested",
+    "review_requested",
+    "head_ref_force_pushed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced"
+  ],
+  "url": "https://github.com/netty/netty/pull/13351",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-04-21T08:09:02Z",
+      "sha": "9026c8f8fa842e7c1d3d967e83ab154c3661e081",
+      "message": "Guard against unbounded grow of suppressed exceptions storage\n\nMotivation:\n\nWe should guard against unbounded grows of suppressed exceptions in our SSLEngine implementation to prevent possible OOME\n\nModifications:\n\n- Check if a suppressed exception was already added for a specific error code before adding it again\n- Ensure we always null out pending exception field.\n\nResult:\n\nFixes https://github.com/netty/netty/issues/13350",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2023-04-21T08:09:02Z",
+      "author_date": "2023-04-21T08:09:02Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2023-04-21T08:09:02Z",
+      "diff_text": "common/src/main/java/io/netty/util/internal/ThrowableUtil.java\n@@ -22,6 +22,8 @@\n \n public final class ThrowableUtil {\n \n+    private static final Throwable[] EMPTY = new Throwable[0];\n+\n     private ThrowableUtil() { }\n \n     /**\n@@ -76,4 +78,12 @@ public static void addSuppressed(Throwable target, List<Throwable> suppressed) {\n             addSuppressed(target, t);\n         }\n     }\n+\n+    @SuppressJava6Requirement(reason = \"Throwable getSuppressed is only available for >= 7. Has check for < 7.\")\n+    public static Throwable[] getSuppressed(Throwable source) {\n+        if (!haveSuppressed()) {\n+            return EMPTY;\n+        }\n+        return source.getSuppressed();\n+    }\n }\nhandler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java\n@@ -1077,20 +1077,17 @@ private SSLException shutdownWithError(String operations, int sslError) {\n     }\n \n     private SSLException shutdownWithError(String operation, int sslError, int error) {\n-        String errorString = SSL.getErrorString(error);\n         if (logger.isDebugEnabled()) {\n+            String errorString = SSL.getErrorString(error);\n             logger.debug(\"{} failed with {}: OpenSSL error: {} {}\",\n                          operation, sslError, error, errorString);\n         }\n \n         // There was an internal error -- shutdown\n         shutdown();\n-        if (handshakeState == HandshakeState.FINISHED) {\n-            return new SSLException(errorString);\n-        }\n \n-        SSLHandshakeException exception = new SSLHandshakeException(errorString);\n-        // If we have a handshakeException stored already we should include it as well to help the user debug things.\n+        SSLException exception = newSSLExceptionForError(error);\n+        // If we have a pendingException stored already we should include it as well to help the user debug things.\n         if (pendingException != null) {\n             exception.initCause(pendingException);\n             pendingException = null;\n@@ -1360,15 +1357,12 @@ private boolean needWrapAgain(int stackError) {\n         // This is needed so we ensure close_notify etc is correctly send to the remote peer.\n         // See https://github.com/netty/netty/issues/3900\n         if (SSL.bioLengthNonApplication(networkBIO) > 0) {\n-            // we seems to have data left that needs to be transferred and so the user needs\n+            // we seem to have data left that needs to be transferred and so the user needs\n             // call wrap(...). Store the error so we can pick it up later.\n-            String message = SSL.getErrorString(stackError);\n-            SSLException exception = handshakeState == HandshakeState.FINISHED ?\n-                    new SSLException(message) : new SSLHandshakeException(message);\n             if (pendingException == null) {\n-                pendingException = exception;\n-            } else {\n-                ThrowableUtil.addSuppressed(pendingException, exception);\n+                pendingException = newSSLExceptionForError(stackError);\n+            } else if (shouldAddSuppressed(pendingException, stackError)) {\n+                ThrowableUtil.addSuppressed(pendingException, newSSLExceptionForError(stackError));\n             }\n             // We need to clear all errors so we not pick up anything that was left on the stack on the next\n             // operation. Note that shutdownWithError(...) will cleanup the stack as well so its only needed here.\n@@ -1378,6 +1372,23 @@ private boolean needWrapAgain(int stackError) {\n         return false;\n     }\n \n+    private SSLException newSSLExceptionForError(int stackError) {\n+        String message = SSL.getErrorString(stackError);\n+        return handshakeState == HandshakeState.FINISHED ?\n+                new OpenSslException(message, stackError) : new OpenSslHandshakeException(message, stackError);\n+    }\n+\n+    private static boolean shouldAddSuppressed(Throwable target, int errorCode) {\n+        for (Throwable suppressed: ThrowableUtil.getSuppressed(target)) {\n+            if (suppressed instanceof NativeSslException &&\n+                    ((NativeSslException) suppressed).errorCode() == errorCode) {\n+                /// An exception with this errorCode was already added before.\n+                return false;\n+            }\n+        }\n+        return true;\n+    }\n+\n     private SSLEngineResult sslReadErrorResult(int error, int stackError, int bytesConsumed, int bytesProduced)\n             throws SSLException {\n         if (needWrapAgain(stackError)) {\n@@ -2661,4 +2672,36 @@ public String toString() {\n                     '}';\n         }\n     }\n+\n+    private interface NativeSslException {\n+        int errorCode();\n+    }\n+\n+    private static final class OpenSslException extends SSLException implements NativeSslException {\n+        private final int errorCode;\n+\n+        OpenSslException(String reason, int errorCode) {\n+            super(reason);\n+            this.errorCode = errorCode;\n+        }\n+\n+        @Override\n+        public int errorCode() {\n+            return errorCode;\n+        }\n+    }\n+\n+    private static final class OpenSslHandshakeException extends SSLHandshakeException implements NativeSslException {\n+        private final int errorCode;\n+\n+        OpenSslHandshakeException(String reason, int errorCode) {\n+            super(reason);\n+            this.errorCode = errorCode;\n+        }\n+\n+        @Override\n+        public int errorCode() {\n+            return errorCode;\n+        }\n+    }\n }",
+      "diff": [
+        {
+          "file": "common/src/main/java/io/netty/util/internal/ThrowableUtil.java",
+          "patch": "@@ -22,6 +22,8 @@\n \n public final class ThrowableUtil {\n \n+    private static final Throwable[] EMPTY = new Throwable[0];\n+\n     private ThrowableUtil() { }\n \n     /**\n@@ -76,4 +78,12 @@ public static void addSuppressed(Throwable target, List<Throwable> suppressed) {\n             addSuppressed(target, t);\n         }\n     }\n+\n+    @SuppressJava6Requirement(reason = \"Throwable getSuppressed is only available for >= 7. Has check for < 7.\")\n+    public static Throwable[] getSuppressed(Throwable source) {\n+        if (!haveSuppressed()) {\n+            return EMPTY;\n+        }\n+        return source.getSuppressed();\n+    }\n }"
+        },
+        {
+          "file": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "patch": "@@ -1077,20 +1077,17 @@ private SSLException shutdownWithError(String operations, int sslError) {\n     }\n \n     private SSLException shutdownWithError(String operation, int sslError, int error) {\n-        String errorString = SSL.getErrorString(error);\n         if (logger.isDebugEnabled()) {\n+            String errorString = SSL.getErrorString(error);\n             logger.debug(\"{} failed with {}: OpenSSL error: {} {}\",\n                          operation, sslError, error, errorString);\n         }\n \n         // There was an internal error -- shutdown\n         shutdown();\n-        if (handshakeState == HandshakeState.FINISHED) {\n-            return new SSLException(errorString);\n-        }\n \n-        SSLHandshakeException exception = new SSLHandshakeException(errorString);\n-        // If we have a handshakeException stored already we should include it as well to help the user debug things.\n+        SSLException exception = newSSLExceptionForError(error);\n+        // If we have a pendingException stored already we should include it as well to help the user debug things.\n         if (pendingException != null) {\n             exception.initCause(pendingException);\n             pendingException = null;\n@@ -1360,15 +1357,12 @@ private boolean needWrapAgain(int stackError) {\n         // This is needed so we ensure close_notify etc is correctly send to the remote peer.\n         // See https://github.com/netty/netty/issues/3900\n         if (SSL.bioLengthNonApplication(networkBIO) > 0) {\n-            // we seems to have data left that needs to be transferred and so the user needs\n+            // we seem to have data left that needs to be transferred and so the user needs\n             // call wrap(...). Store the error so we can pick it up later.\n-            String message = SSL.getErrorString(stackError);\n-            SSLException exception = handshakeState == HandshakeState.FINISHED ?\n-                    new SSLException(message) : new SSLHandshakeException(message);\n             if (pendingException == null) {\n-                pendingException = exception;\n-            } else {\n-                ThrowableUtil.addSuppressed(pendingException, exception);\n+                pendingException = newSSLExceptionForError(stackError);\n+            } else if (shouldAddSuppressed(pendingException, stackError)) {\n+                ThrowableUtil.addSuppressed(pendingException, newSSLExceptionForError(stackError));\n             }\n             // We need to clear all errors so we not pick up anything that was left on the stack on the next\n             // operation. Note that shutdownWithError(...) will cleanup the stack as well so its only needed here.\n@@ -1378,6 +1372,23 @@ private boolean needWrapAgain(int stackError) {\n         return false;\n     }\n \n+    private SSLException newSSLExceptionForError(int stackError) {\n+        String message = SSL.getErrorString(stackError);\n+        return handshakeState == HandshakeState.FINISHED ?\n+                new OpenSslException(message, stackError) : new OpenSslHandshakeException(message, stackError);\n+    }\n+\n+    private static boolean shouldAddSuppressed(Throwable target, int errorCode) {\n+        for (Throwable suppressed: ThrowableUtil.getSuppressed(target)) {\n+            if (suppressed instanceof NativeSslException &&\n+                    ((NativeSslException) suppressed).errorCode() == errorCode) {\n+                /// An exception with this errorCode was already added before.\n+                return false;\n+            }\n+        }\n+        return true;\n+    }\n+\n     private SSLEngineResult sslReadErrorResult(int error, int stackError, int bytesConsumed, int bytesProduced)\n             throws SSLException {\n         if (needWrapAgain(stackError)) {\n@@ -2661,4 +2672,36 @@ public String toString() {\n                     '}';\n         }\n     }\n+\n+    private interface NativeSslException {\n+        int errorCode();\n+    }\n+\n+    private static final class OpenSslException extends SSLException implements NativeSslException {\n+        private final int errorCode;\n+\n+        OpenSslException(String reason, int errorCode) {\n+            super(reason);\n+            this.errorCode = errorCode;\n+        }\n+\n+        @Override\n+        public int errorCode() {\n+            return errorCode;\n+        }\n+    }\n+\n+    private static final class OpenSslHandshakeException extends SSLHandshakeException implements NativeSslException {\n+        private final int errorCode;\n+\n+        OpenSslHandshakeException(String reason, int errorCode) {\n+            super(reason);\n+            this.errorCode = errorCode;\n+        }\n+\n+        @Override\n+        public int errorCode() {\n+            return errorCode;\n+        }\n+    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-04-21T08:11:57Z",
+      "user": "normanmaurer",
+      "body": "Motivation:\r\n\r\nWe should guard against unbounded grows of suppressed exceptions in our SSLEngine implementation to prevent possible OOME\r\n\r\nModifications:\r\n\r\n- Check if a suppressed exception was already added for a specific error code before adding it again\r\n- Ensure we always null out pending exception field.\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/13350\r\n"
+    },
+    {
+      "type": "review_comment",
+      "id": 1173690907,
+      "created_at": "2023-04-21T12:06:09Z",
+      "user": "trustin",
+      "body": "Could move to `EmptyArrays`?",
+      "path": "common/src/main/java/io/netty/util/internal/ThrowableUtil.java",
+      "diff_hunk": "@@ -22,6 +22,8 @@\n \n public final class ThrowableUtil {\n \n+    private static final Throwable[] EMPTY = new Throwable[0];",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 25,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1173706403,
+          "user": "normanmaurer",
+          "body": "I did place it here as it's the only place we need it. ",
+          "created_at": "2023-04-21T12:24:44Z"
+        },
+        {
+          "id": 1173794832,
+          "user": "trustin",
+          "body": "I'd still recommend putting it there for consistency's sake.",
+          "created_at": "2023-04-21T13:50:56Z"
+        },
+        {
+          "id": 1173830558,
+          "user": "normanmaurer",
+          "body": "ok ... I am not strong on this one. Let me do it.",
+          "created_at": "2023-04-21T14:22:11Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1173691475,
+      "created_at": "2023-04-21T12:06:54Z",
+      "user": "trustin",
+      "body": "Not necessarily part of this PR but this method should be named `hasSuppressed()`.",
+      "path": "common/src/main/java/io/netty/util/internal/ThrowableUtil.java",
+      "diff_hunk": "@@ -76,4 +78,12 @@ public static void addSuppressed(Throwable target, List<Throwable> suppressed) {\n             addSuppressed(target, t);\n         }\n     }\n+\n+    @SuppressJava6Requirement(reason = \"Throwable getSuppressed is only available for >= 7. Has check for < 7.\")\n+    public static Throwable[] getSuppressed(Throwable source) {\n+        if (!haveSuppressed()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 82,
+      "original_line": 84,
+      "side": "RIGHT",
+      "original_position": 16,
+      "position": 7,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1173706619,
+          "user": "normanmaurer",
+          "body": "we can do the as another PR ",
+          "created_at": "2023-04-21T12:24:57Z"
+        },
+        {
+          "id": 1173792228,
+          "user": "trustin",
+          "body": "Sure.",
+          "created_at": "2023-04-21T13:48:23Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1173693728,
+      "created_at": "2023-04-21T12:09:38Z",
+      "user": "trustin",
+      "body": "How about using an `abstract class` instead?\r\n\r\n```java\r\nprivate static abstract class NativeSslException extends SSLException {\r\n    final int errorCode; // or maybe add a package-private getter\r\n    NativeSslException(String reason, int errorCode) {\r\n        super(reason);\r\n        this.errorCode = errorCode;\r\n    }\r\n}\r\n\r\nprivate static final OpenSslException extends NativeSslException {...}\r\n```",
+      "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+      "diff_hunk": "@@ -2661,4 +2672,36 @@ public String toString() {\n                     '}';\n         }\n     }\n+\n+    private interface NativeSslException {\n+        int errorCode();\n+    }",
+      "start_line": 2676,
+      "original_start_line": 2676,
+      "start_side": "RIGHT",
+      "line": 2678,
+      "original_line": 2678,
+      "side": "RIGHT",
+      "original_position": 75,
+      "position": 75,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1173706102,
+          "user": "normanmaurer",
+          "body": "This will not work as I also need this for `SSLHandshakeException`",
+          "created_at": "2023-04-21T12:24:21Z"
+        },
+        {
+          "id": 1173795115,
+          "user": "trustin",
+          "body": "Doh, never mind, then.",
+          "created_at": "2023-04-21T13:51:13Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1395649302,
+      "created_at": "2023-04-21T12:09:45Z",
+      "user": "trustin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395672113,
+      "created_at": "2023-04-21T12:24:22Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395672601,
+      "created_at": "2023-04-21T12:24:44Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395672901,
+      "created_at": "2023-04-21T12:24:57Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395806986,
+      "created_at": "2023-04-21T13:48:24Z",
+      "user": "trustin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395810950,
+      "created_at": "2023-04-21T13:50:56Z",
+      "user": "trustin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395811392,
+      "created_at": "2023-04-21T13:51:13Z",
+      "user": "trustin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1395875821,
+      "created_at": "2023-04-21T14:22:12Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2023-04-21T14:26:07Z",
+      "sha": "5f71c6249ae0e1394619d4a16b213d2237988249",
+      "message": "move array",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2023-04-21T14:26:06Z",
+      "author_date": "2023-04-21T14:26:06Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2023-04-21T14:26:07Z",
+      "diff_text": "common/src/main/java/io/netty/util/internal/EmptyArrays.java\n@@ -37,5 +37,7 @@ public final class EmptyArrays {\n     public static final X509Certificate[] EMPTY_X509_CERTIFICATES = {};\n     public static final javax.security.cert.X509Certificate[] EMPTY_JAVAX_X509_CERTIFICATES = {};\n \n+    public static final Throwable[] EMPTY_THROWABLES = {};\n+\n     private EmptyArrays() { }\n }\ncommon/src/main/java/io/netty/util/internal/ThrowableUtil.java\n@@ -22,8 +22,6 @@\n \n public final class ThrowableUtil {\n \n-    private static final Throwable[] EMPTY = new Throwable[0];\n-\n     private ThrowableUtil() { }\n \n     /**\n@@ -82,7 +80,7 @@ public static void addSuppressed(Throwable target, List<Throwable> suppressed) {\n     @SuppressJava6Requirement(reason = \"Throwable getSuppressed is only available for >= 7. Has check for < 7.\")\n     public static Throwable[] getSuppressed(Throwable source) {\n         if (!haveSuppressed()) {\n-            return EMPTY;\n+            return EmptyArrays.EMPTY_THROWABLES;\n         }\n         return source.getSuppressed();\n     }",
+      "diff": [
+        {
+          "file": "common/src/main/java/io/netty/util/internal/EmptyArrays.java",
+          "patch": "@@ -37,5 +37,7 @@ public final class EmptyArrays {\n     public static final X509Certificate[] EMPTY_X509_CERTIFICATES = {};\n     public static final javax.security.cert.X509Certificate[] EMPTY_JAVAX_X509_CERTIFICATES = {};\n \n+    public static final Throwable[] EMPTY_THROWABLES = {};\n+\n     private EmptyArrays() { }\n }"
+        },
+        {
+          "file": "common/src/main/java/io/netty/util/internal/ThrowableUtil.java",
+          "patch": "@@ -22,8 +22,6 @@\n \n public final class ThrowableUtil {\n \n-    private static final Throwable[] EMPTY = new Throwable[0];\n-\n     private ThrowableUtil() { }\n \n     /**\n@@ -82,7 +80,7 @@ public static void addSuppressed(Throwable target, List<Throwable> suppressed) {\n     @SuppressJava6Requirement(reason = \"Throwable getSuppressed is only available for >= 7. Has check for < 7.\")\n     public static Throwable[] getSuppressed(Throwable source) {\n         if (!haveSuppressed()) {\n-            return EMPTY;\n+            return EmptyArrays.EMPTY_THROWABLES;\n         }\n         return source.getSuppressed();\n     }"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1396012087,
+      "created_at": "2023-04-21T15:47:32Z",
+      "user": "chrisvest",
+      "state": "APPROVED",
+      "body": "Neat"
+    },
+    {
+      "type": "review",
+      "id": 1396917579,
+      "created_at": "2023-04-23T14:18:50Z",
+      "user": "trustin",
+      "state": "COMMENTED",
+      "body": "Belated LGTM. Thanks for taking care of this, @normanmaurer 🙇 "
+    }
+  ]
+}

@@ -1,0 +1,330 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 11937,
+  "pr_number": 11937,
+  "title": "Add channel pool for remote execution to overcome gRPC connections limitation.",
+  "user": "coeuvre",
+  "created_at": "2020-08-13T09:15:52Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "cla: yes"
+  ],
+  "base_commit": "d394250a971f0f8ee97797844f6e09133b5e1605",
+  "merge_commit_sha": "cf9e0b7fb0fc8a647e4e223b5d422aa02e7288f7",
+  "commits": 3,
+  "issue_events": [
+    "review_requested",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "unsubscribed",
+    "closed",
+    "referenced"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/11937",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-08-13T09:13:35Z",
+      "sha": "0c109d30ec23f5e9fa841b22cae784acf2a0847a",
+      "message": "Add `ReferenceCountedChannelPool` which create `poolSize` number of channels and round-robin across them.",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2020-08-13T09:05:08Z",
+      "author_date": "2020-08-13T09:05:08Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2020-08-13T09:13:35Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/BUILD\n@@ -26,6 +26,7 @@ java_library(\n         exclude = [\n             \"ExecutionStatusException.java\",\n             \"ReferenceCountedChannel.java\",\n+            \"ReferenceCountedChannelPool.java\",\n             \"RemoteRetrier.java\",\n             \"RemoteRetrierUtils.java\",\n             \"Retrier.java\",\n@@ -40,6 +41,7 @@ java_library(\n         \":ExecutionStatusException\",\n         \":ReferenceCountedChannel\",\n         \":Retrier\",\n+        \"//src/main/java/com/google/devtools/build/lib:build-request-options\",\n         \"//src/main/java/com/google/devtools/build/lib:runtime\",\n         \"//src/main/java/com/google/devtools/build/lib/actions\",\n         \"//src/main/java/com/google/devtools/build/lib/actions:artifacts\",\n@@ -121,8 +123,12 @@ java_library(\n \n java_library(\n     name = \"ReferenceCountedChannel\",\n-    srcs = [\"ReferenceCountedChannel.java\"],\n+    srcs = [\n+        \"ReferenceCountedChannel.java\",\n+        \"ReferenceCountedChannelPool.java\",\n+    ],\n     deps = [\n+        \"//third_party:guava\",\n         \"//third_party:netty\",\n         \"//third_party/grpc:grpc-jar\",\n     ],\nsrc/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannel.java\n@@ -31,20 +31,25 @@\n public class ReferenceCountedChannel extends ManagedChannel implements ReferenceCounted {\n \n   private final ManagedChannel channel;\n-  private final AbstractReferenceCounted referenceCounted = new AbstractReferenceCounted() {\n-    @Override\n-    protected void deallocate() {\n-      channel.shutdown();\n-    }\n-\n-    @Override\n-    public ReferenceCounted touch(Object o) {\n-      return this;\n-    }\n-  };\n+  private final AbstractReferenceCounted referenceCounted;\n \n   public ReferenceCountedChannel(ManagedChannel channel) {\n+    this(channel, new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        channel.shutdown();\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return this;\n+      }\n+    });\n+  }\n+\n+  protected ReferenceCountedChannel(ManagedChannel channel, AbstractReferenceCounted referenceCounted) {\n     this.channel = channel;\n+    this.referenceCounted = referenceCounted;\n   }\n \n   @Override\nsrc/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java\n@@ -0,0 +1,101 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.common.collect.ImmutableList;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.ManagedChannel;\n+import io.grpc.MethodDescriptor;\n+import io.netty.util.AbstractReferenceCounted;\n+import io.netty.util.ReferenceCounted;\n+import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/**\n+ * <p>See {@link ReferenceCounted} for more information about reference counting.\n+ */\n+public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n+\n+  private final AtomicInteger indexTicker = new AtomicInteger();\n+  private final ImmutableList<ManagedChannel> channels;\n+\n+  public ReferenceCountedChannelPool(ImmutableList<ManagedChannel> channels) {\n+    super(channels.get(0), new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        for (ManagedChannel channel : channels) {\n+          channel.shutdown();\n+        }\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return null;\n+      }\n+    });\n+    this.channels = channels;\n+  }\n+\n+  @Override\n+  public boolean isShutdown() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isShutdown()) {\n+        return false;\n+      }\n+    }\n+    return true;\n+  }\n+\n+  @Override\n+  public boolean isTerminated() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isTerminated()) {\n+        return false;\n+      }\n+    }\n+    return true;  }\n+\n+  @Override\n+  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n+    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(l);\n+    for (ManagedChannel channel : channels) {\n+      long awaitTimeNanos = endTimeNanos - System.nanoTime();\n+      if (awaitTimeNanos <= 0) {\n+        break;\n+      }\n+      channel.awaitTermination(awaitTimeNanos, TimeUnit.NANOSECONDS);\n+    }\n+    return isTerminated();\n+  }\n+\n+  @Override\n+  public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(\n+      MethodDescriptor<RequestT, ResponseT> methodDescriptor, CallOptions callOptions) {\n+    return getNextChannel().newCall(methodDescriptor, callOptions);\n+  }\n+\n+  @Override\n+  public String authority() {\n+    // Assume all channels have the same authority.\n+    return channels.get(0).authority();\n+  }\n+\n+  /**\n+   * Performs a simple round robin on the list of {@link ManagedChannel}s in the {@code channels}\n+   * list.\n+   *\n+   * @return A {@link ManagedChannel} that can be used for a single RPC call.\n+   */\n+  private ManagedChannel getNextChannel() {\n+    return getChannel(indexTicker.getAndIncrement());\n+  }\n+\n+  private ManagedChannel getChannel(int affinity) {\n+    int index = affinity % channels.size();\n+    index = Math.abs(index);\n+    // If index is the most negative int, abs(index) is still negative.\n+    if (index < 0) {\n+      index = 0;\n+    }\n+    return channels.get(index);\n+  }\n+}\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteCacheClientFactory.java\n@@ -29,9 +29,11 @@\n import com.google.devtools.build.lib.vfs.Path;\n import com.google.devtools.build.lib.vfs.PathFragment;\n import io.grpc.ClientInterceptor;\n+import io.grpc.ManagedChannel;\n import io.netty.channel.unix.DomainSocketAddress;\n import java.io.IOException;\n import java.net.URI;\n+import java.util.ArrayList;\n import java.util.List;\n import javax.annotation.Nullable;\n \n@@ -66,6 +68,20 @@ public static ReferenceCountedChannel createGrpcChannel(\n         GoogleAuthUtils.newChannel(target, proxyUri, authOptions, interceptors));\n   }\n \n+  public static ReferenceCountedChannel createGrpcChannelPool(\n+      int poolSize,\n+      String target,\n+      String proxyUri,\n+      AuthAndTLSOptions authOptions,\n+      @Nullable List<ClientInterceptor> interceptors)\n+      throws IOException {\n+    List<ManagedChannel> channels = new ArrayList<>();\n+    for (int i = 0; i < poolSize; i++) {\n+      channels.add(GoogleAuthUtils.newChannel(target, proxyUri, authOptions, interceptors));\n+    }\n+    return new ReferenceCountedChannelPool(ImmutableList.copyOf(channels));\n+  }\n+\n   public static RemoteCacheClient create(\n       RemoteOptions options,\n       @Nullable Credentials creds,\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -42,6 +42,7 @@\n import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader;\n import com.google.devtools.build.lib.buildeventstream.LocalFilesArtifactUploader;\n import com.google.devtools.build.lib.buildtool.BuildRequest;\n+import com.google.devtools.build.lib.buildtool.BuildRequestOptions;\n import com.google.devtools.build.lib.collect.nestedset.NestedSet;\n import com.google.devtools.build.lib.events.Event;\n import com.google.devtools.build.lib.events.Reporter;\n@@ -255,6 +256,13 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n     ReferenceCountedChannel execChannel = null;\n     ReferenceCountedChannel cacheChannel = null;\n     ReferenceCountedChannel downloaderChannel = null;\n+\n+    int poolSize = 1;\n+    BuildRequestOptions buildRequestOptions = env.getOptions().getOptions(BuildRequestOptions.class);\n+    if (buildRequestOptions != null) {\n+      // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?\n+      poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 50.0);\n+    }\n     if (enableRemoteExecution) {\n       ImmutableList.Builder<ClientInterceptor> interceptors = ImmutableList.builder();\n       interceptors.add(TracingMetadataUtils.newExecHeadersInterceptor(remoteOptions));\n@@ -264,7 +272,8 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n       interceptors.add(new NetworkTime.Interceptor());\n       try {\n         execChannel =\n-            RemoteCacheClientFactory.createGrpcChannel(\n+            RemoteCacheClientFactory.createGrpcChannelPool(\n+                poolSize,\n                 remoteOptions.remoteExecutor,\n                 remoteOptions.remoteProxy,\n                 authAndTlsOptions,\n@@ -290,7 +299,8 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n       interceptors.add(new NetworkTime.Interceptor());\n       try {\n         cacheChannel =\n-            RemoteCacheClientFactory.createGrpcChannel(\n+            RemoteCacheClientFactory.createGrpcChannelPool(\n+                poolSize,\n                 remoteOptions.remoteCache,\n                 remoteOptions.remoteProxy,\n                 authAndTlsOptions,\n@@ -313,7 +323,8 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n         }\n         try {\n           downloaderChannel =\n-              RemoteCacheClientFactory.createGrpcChannel(\n+              RemoteCacheClientFactory.createGrpcChannelPool(\n+                  poolSize,\n                   remoteOptions.remoteDownloader,\n                   remoteOptions.remoteProxy,\n                   authAndTlsOptions,",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/BUILD",
+          "patch": "@@ -26,6 +26,7 @@ java_library(\n         exclude = [\n             \"ExecutionStatusException.java\",\n             \"ReferenceCountedChannel.java\",\n+            \"ReferenceCountedChannelPool.java\",\n             \"RemoteRetrier.java\",\n             \"RemoteRetrierUtils.java\",\n             \"Retrier.java\",\n@@ -40,6 +41,7 @@ java_library(\n         \":ExecutionStatusException\",\n         \":ReferenceCountedChannel\",\n         \":Retrier\",\n+        \"//src/main/java/com/google/devtools/build/lib:build-request-options\",\n         \"//src/main/java/com/google/devtools/build/lib:runtime\",\n         \"//src/main/java/com/google/devtools/build/lib/actions\",\n         \"//src/main/java/com/google/devtools/build/lib/actions:artifacts\",\n@@ -121,8 +123,12 @@ java_library(\n \n java_library(\n     name = \"ReferenceCountedChannel\",\n-    srcs = [\"ReferenceCountedChannel.java\"],\n+    srcs = [\n+        \"ReferenceCountedChannel.java\",\n+        \"ReferenceCountedChannelPool.java\",\n+    ],\n     deps = [\n+        \"//third_party:guava\",\n         \"//third_party:netty\",\n         \"//third_party/grpc:grpc-jar\",\n     ],"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannel.java",
+          "patch": "@@ -31,20 +31,25 @@\n public class ReferenceCountedChannel extends ManagedChannel implements ReferenceCounted {\n \n   private final ManagedChannel channel;\n-  private final AbstractReferenceCounted referenceCounted = new AbstractReferenceCounted() {\n-    @Override\n-    protected void deallocate() {\n-      channel.shutdown();\n-    }\n-\n-    @Override\n-    public ReferenceCounted touch(Object o) {\n-      return this;\n-    }\n-  };\n+  private final AbstractReferenceCounted referenceCounted;\n \n   public ReferenceCountedChannel(ManagedChannel channel) {\n+    this(channel, new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        channel.shutdown();\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return this;\n+      }\n+    });\n+  }\n+\n+  protected ReferenceCountedChannel(ManagedChannel channel, AbstractReferenceCounted referenceCounted) {\n     this.channel = channel;\n+    this.referenceCounted = referenceCounted;\n   }\n \n   @Override"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+          "patch": "@@ -0,0 +1,101 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.common.collect.ImmutableList;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.ManagedChannel;\n+import io.grpc.MethodDescriptor;\n+import io.netty.util.AbstractReferenceCounted;\n+import io.netty.util.ReferenceCounted;\n+import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/**\n+ * <p>See {@link ReferenceCounted} for more information about reference counting.\n+ */\n+public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n+\n+  private final AtomicInteger indexTicker = new AtomicInteger();\n+  private final ImmutableList<ManagedChannel> channels;\n+\n+  public ReferenceCountedChannelPool(ImmutableList<ManagedChannel> channels) {\n+    super(channels.get(0), new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        for (ManagedChannel channel : channels) {\n+          channel.shutdown();\n+        }\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return null;\n+      }\n+    });\n+    this.channels = channels;\n+  }\n+\n+  @Override\n+  public boolean isShutdown() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isShutdown()) {\n+        return false;\n+      }\n+    }\n+    return true;\n+  }\n+\n+  @Override\n+  public boolean isTerminated() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isTerminated()) {\n+        return false;\n+      }\n+    }\n+    return true;  }\n+\n+  @Override\n+  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n+    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(l);\n+    for (ManagedChannel channel : channels) {\n+      long awaitTimeNanos = endTimeNanos - System.nanoTime();\n+      if (awaitTimeNanos <= 0) {\n+        break;\n+      }\n+      channel.awaitTermination(awaitTimeNanos, TimeUnit.NANOSECONDS);\n+    }\n+    return isTerminated();\n+  }\n+\n+  @Override\n+  public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(\n+      MethodDescriptor<RequestT, ResponseT> methodDescriptor, CallOptions callOptions) {\n+    return getNextChannel().newCall(methodDescriptor, callOptions);\n+  }\n+\n+  @Override\n+  public String authority() {\n+    // Assume all channels have the same authority.\n+    return channels.get(0).authority();\n+  }\n+\n+  /**\n+   * Performs a simple round robin on the list of {@link ManagedChannel}s in the {@code channels}\n+   * list.\n+   *\n+   * @return A {@link ManagedChannel} that can be used for a single RPC call.\n+   */\n+  private ManagedChannel getNextChannel() {\n+    return getChannel(indexTicker.getAndIncrement());\n+  }\n+\n+  private ManagedChannel getChannel(int affinity) {\n+    int index = affinity % channels.size();\n+    index = Math.abs(index);\n+    // If index is the most negative int, abs(index) is still negative.\n+    if (index < 0) {\n+      index = 0;\n+    }\n+    return channels.get(index);\n+  }\n+}"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteCacheClientFactory.java",
+          "patch": "@@ -29,9 +29,11 @@\n import com.google.devtools.build.lib.vfs.Path;\n import com.google.devtools.build.lib.vfs.PathFragment;\n import io.grpc.ClientInterceptor;\n+import io.grpc.ManagedChannel;\n import io.netty.channel.unix.DomainSocketAddress;\n import java.io.IOException;\n import java.net.URI;\n+import java.util.ArrayList;\n import java.util.List;\n import javax.annotation.Nullable;\n \n@@ -66,6 +68,20 @@ public static ReferenceCountedChannel createGrpcChannel(\n         GoogleAuthUtils.newChannel(target, proxyUri, authOptions, interceptors));\n   }\n \n+  public static ReferenceCountedChannel createGrpcChannelPool(\n+      int poolSize,\n+      String target,\n+      String proxyUri,\n+      AuthAndTLSOptions authOptions,\n+      @Nullable List<ClientInterceptor> interceptors)\n+      throws IOException {\n+    List<ManagedChannel> channels = new ArrayList<>();\n+    for (int i = 0; i < poolSize; i++) {\n+      channels.add(GoogleAuthUtils.newChannel(target, proxyUri, authOptions, interceptors));\n+    }\n+    return new ReferenceCountedChannelPool(ImmutableList.copyOf(channels));\n+  }\n+\n   public static RemoteCacheClient create(\n       RemoteOptions options,\n       @Nullable Credentials creds,"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -42,6 +42,7 @@\n import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader;\n import com.google.devtools.build.lib.buildeventstream.LocalFilesArtifactUploader;\n import com.google.devtools.build.lib.buildtool.BuildRequest;\n+import com.google.devtools.build.lib.buildtool.BuildRequestOptions;\n import com.google.devtools.build.lib.collect.nestedset.NestedSet;\n import com.google.devtools.build.lib.events.Event;\n import com.google.devtools.build.lib.events.Reporter;\n@@ -255,6 +256,13 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n     ReferenceCountedChannel execChannel = null;\n     ReferenceCountedChannel cacheChannel = null;\n     ReferenceCountedChannel downloaderChannel = null;\n+\n+    int poolSize = 1;\n+    BuildRequestOptions buildRequestOptions = env.getOptions().getOptions(BuildRequestOptions.class);\n+    if (buildRequestOptions != null) {\n+      // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?\n+      poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 50.0);\n+    }\n     if (enableRemoteExecution) {\n       ImmutableList.Builder<ClientInterceptor> interceptors = ImmutableList.builder();\n       interceptors.add(TracingMetadataUtils.newExecHeadersInterceptor(remoteOptions));\n@@ -264,7 +272,8 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n       interceptors.add(new NetworkTime.Interceptor());\n       try {\n         execChannel =\n-            RemoteCacheClientFactory.createGrpcChannel(\n+            RemoteCacheClientFactory.createGrpcChannelPool(\n+                poolSize,\n                 remoteOptions.remoteExecutor,\n                 remoteOptions.remoteProxy,\n                 authAndTlsOptions,\n@@ -290,7 +299,8 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n       interceptors.add(new NetworkTime.Interceptor());\n       try {\n         cacheChannel =\n-            RemoteCacheClientFactory.createGrpcChannel(\n+            RemoteCacheClientFactory.createGrpcChannelPool(\n+                poolSize,\n                 remoteOptions.remoteCache,\n                 remoteOptions.remoteProxy,\n                 authAndTlsOptions,\n@@ -313,7 +323,8 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n         }\n         try {\n           downloaderChannel =\n-              RemoteCacheClientFactory.createGrpcChannel(\n+              RemoteCacheClientFactory.createGrpcChannelPool(\n+                  poolSize,\n                   remoteOptions.remoteDownloader,\n                   remoteOptions.remoteProxy,\n                   authAndTlsOptions,"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-08-13T09:15:52Z",
+      "user": "coeuvre",
+      "body": "This PR add a `ReferenceCountedChannelPool` which will create `poolSize` number of channels and round-robin across them for gRPC requests.\r\n\r\nThe `poolSize` is calculated as `jobs / 100`.\r\n\r\nFixes #11801."
+    },
+    {
+      "type": "comment",
+      "id": 673364257,
+      "created_at": "2020-08-13T09:16:18Z",
+      "user": "coeuvre",
+      "body": "cc @ulfjack "
+    },
+    {
+      "type": "review",
+      "id": 466629340,
+      "created_at": "2020-08-13T10:16:55Z",
+      "user": "meisterT",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 469848448,
+      "created_at": "2020-08-13T10:16:55Z",
+      "user": "meisterT",
+      "body": "yeah, this is my main question: How did you come up with this number?",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+      "diff_hunk": "@@ -255,6 +256,13 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n     ReferenceCountedChannel execChannel = null;\n     ReferenceCountedChannel cacheChannel = null;\n     ReferenceCountedChannel downloaderChannel = null;\n+\n+    int poolSize = 1;\n+    BuildRequestOptions buildRequestOptions = env.getOptions().getOptions(BuildRequestOptions.class);\n+    if (buildRequestOptions != null) {\n+      // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 263,
+      "side": "RIGHT",
+      "original_position": 16,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 469889665,
+          "user": "gkousik",
+          "body": "I believe its based on the recommendation here - https://github.com/bazelbuild/bazel/issues/11801#issuecomment-672973245",
+          "created_at": "2020-08-13T11:42:00Z"
+        },
+        {
+          "id": 469898895,
+          "user": "meisterT",
+          "body": "That makes sense indeed. Chi, can you please document this in the code?",
+          "created_at": "2020-08-13T12:00:40Z"
+        },
+        {
+          "id": 470123499,
+          "user": "EricBurnett",
+          "body": "Note that the recommendation there is to either take into account the number of IPs (the number of connections, aka subchannels, per channel), or to assume 2 IPs per host which would be jobs/100 \"Channels\" in this pool.\r\n\r\nLooking at this code, just assuming 2 makes more sense to me than having to also reimplement the subchannel->channel interface, which I think would be required to count the IPs. So I vote for simply changing this constant to 100 and documenting clearly why it is what it is.",
+          "created_at": "2020-08-13T17:32:30Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 466682287,
+      "created_at": "2020-08-13T11:42:00Z",
+      "user": "gkousik",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 469902789,
+      "created_at": "2020-08-13T12:08:01Z",
+      "user": "meisterT",
+      "body": "Please add the default copyright header here",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+      "diff_hunk": "@@ -0,0 +1,101 @@\n+package com.google.devtools.build.lib.remote;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 14,
+      "original_line": 1,
+      "side": "RIGHT",
+      "original_position": 1,
+      "position": 14,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 469903874,
+      "created_at": "2020-08-13T12:10:04Z",
+      "user": "meisterT",
+      "body": "Reference https://github.com/grpc/grpc/issues/21386#issuecomment-564742173 in the comment?",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+      "diff_hunk": "@@ -0,0 +1,101 @@\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.common.collect.ImmutableList;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.ManagedChannel;\n+import io.grpc.MethodDescriptor;\n+import io.netty.util.AbstractReferenceCounted;\n+import io.netty.util.ReferenceCounted;\n+import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/**\n+ * <p>See {@link ReferenceCounted} for more information about reference counting.\n+ */\n+public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n+\n+  private final AtomicInteger indexTicker = new AtomicInteger();\n+  private final ImmutableList<ManagedChannel> channels;\n+\n+  public ReferenceCountedChannelPool(ImmutableList<ManagedChannel> channels) {\n+    super(channels.get(0), new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        for (ManagedChannel channel : channels) {\n+          channel.shutdown();\n+        }\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return null;\n+      }\n+    });\n+    this.channels = channels;\n+  }\n+\n+  @Override\n+  public boolean isShutdown() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isShutdown()) {\n+        return false;\n+      }\n+    }\n+    return true;\n+  }\n+\n+  @Override\n+  public boolean isTerminated() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isTerminated()) {\n+        return false;\n+      }\n+    }\n+    return true;  }\n+\n+  @Override\n+  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n+    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(l);\n+    for (ManagedChannel channel : channels) {\n+      long awaitTimeNanos = endTimeNanos - System.nanoTime();\n+      if (awaitTimeNanos <= 0) {\n+        break;\n+      }\n+      channel.awaitTermination(awaitTimeNanos, TimeUnit.NANOSECONDS);\n+    }\n+    return isTerminated();\n+  }\n+\n+  @Override\n+  public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(\n+      MethodDescriptor<RequestT, ResponseT> methodDescriptor, CallOptions callOptions) {\n+    return getNextChannel().newCall(methodDescriptor, callOptions);\n+  }\n+\n+  @Override\n+  public String authority() {\n+    // Assume all channels have the same authority.\n+    return channels.get(0).authority();\n+  }\n+\n+  /**\n+   * Performs a simple round robin on the list of {@link ManagedChannel}s in the {@code channels}\n+   * list.",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 103,
+      "original_line": 84,
+      "side": "RIGHT",
+      "original_position": 84,
+      "position": 103,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 466693864,
+      "created_at": "2020-08-13T12:16:28Z",
+      "user": "meisterT",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 673443658,
+      "created_at": "2020-08-13T12:18:29Z",
+      "user": "meisterT",
+      "body": "@coeuvre ISTR that Bazel has a RBE pool with 100 executors (I might be mistaken), but I would like you to test this before submission. Perhaps @EricBurnett can help you out with a larger pool."
+    },
+    {
+      "type": "comment",
+      "id": 673447716,
+      "created_at": "2020-08-13T12:27:19Z",
+      "user": "gkousik",
+      "body": "I just tested it using repro I had previously here - https://github.com/gkousik/bazel-parallelism-test. It simply runs 490 actions in parallel where each action sleeps for 10 seconds. \r\n\r\nWith this change (whole build runs in 12s on a 500 worker pool):\r\n```\r\n➜  bazel-parallelism-test git:(master) ✗ ./runbuild.sh\r\nINFO: Invocation ID: eb16917c-3c40-4407-8e58-f2c3973e9e5c\r\nERROR: /usr/local/google/home/kousikk/.cache/bazel/_bazel_kousikk/07c64333bc485db1757df85f8da29b91/external/bazel_gazelle_go_repository_config/WORKSPACE:3:1: name 'go_repository' is not defined (did you mean 'local_repository'?)\r\nERROR: /usr/local/google/home/kousikk/.cache/bazel/_bazel_kousikk/07c64333bc485db1757df85f8da29b91/external/bazel_gazelle_go_repository_config/WORKSPACE:8:1: name 'go_repository' is not defined (did you mean 'local_repository'?)\r\nDEBUG: /usr/local/google/home/kousikk/.cache/bazel/_bazel_kousikk/07c64333bc485db1757df85f8da29b91/external/bazel_toolchains/rules/rbe_repo/version_check.bzl:59:14:\r\nCurrent running Bazel is not a release version and one was not defined explicitly in rbe_autoconfig target. Falling back to '3.2.0'\r\nINFO: Build option --action_env has changed, discarding analysis cache.\r\nDEBUG: /usr/local/google/home/kousikk/.cache/bazel/_bazel_kousikk/07c64333bc485db1757df85f8da29b91/external/bazel_toolchains/rules/rbe_repo.bzl:491:10: Bazel 3.2.0 is used in rbe_default.\r\nINFO: Analyzed 489 targets (6 packages loaded, 500 targets configured).\r\nINFO: Found 489 targets...\r\nINFO: Elapsed time: 12.484s, Critical Path: 11.87s\r\nINFO: 489 processes: 489 remote.\r\nINFO: Build completed successfully, 490 total actions\r\n```\r\n\r\nWithout this change (whole build takes 35s on a 500 worker pool):\r\n```\r\n➜  bazel-parallelism-test git:(master) ✗ ./runbuild.sh\r\nStarting local Bazel server and connecting to it...\r\nINFO: Invocation ID: 5e7bc63c-3e9f-42c5-95c4-300a444c4ddb\r\nDEBUG: /usr/local/google/home/kousikk/.cache/bazel/_bazel_kousikk/07c64333bc485db1757df85f8da29b91/external/bazel_toolchains/rules/rbe_repo.bzl:491:10: Bazel 3.2.0 is used in rbe_default.\r\nINFO: Analyzed 489 targets (7 packages loaded, 500 targets configured).\r\nINFO: Found 489 targets...\r\nINFO: Elapsed time: 53.713s, Critical Path: 35.42s\r\nINFO: 489 processes: 489 remote.\r\nINFO: Build completed successfully, 490 total actions\r\n```"
+    },
+    {
+      "type": "comment",
+      "id": 673526961,
+      "created_at": "2020-08-13T14:54:54Z",
+      "user": "coeuvre",
+      "body": "@meisterT  Yes, I have tested before creating this PR and got similar result to above. (Bazel's default RBE pool has 400 workers) Thanks for your comments!"
+    },
+    {
+      "type": "review",
+      "id": 466986418,
+      "created_at": "2020-08-13T17:38:17Z",
+      "user": "EricBurnett",
+      "state": "COMMENTED",
+      "body": "Thanks for the quick change Chi! It looks very nice to me (to the extent I understand java code, anyways :) )"
+    },
+    {
+      "type": "commit",
+      "date": "2020-08-14T02:54:58Z",
+      "sha": "e8550b9ff52348d139a0d1f9ee58245956c3f098",
+      "message": "Add some comments.",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2020-08-14T02:54:58Z",
+      "author_date": "2020-08-14T02:54:58Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2020-08-14T02:54:58Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java\n@@ -1,3 +1,16 @@\n+// Copyright 2020 The Bazel Authors. All rights reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//    http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n package com.google.devtools.build.lib.remote;\n \n import com.google.common.collect.ImmutableList;\n@@ -11,6 +24,11 @@\n import java.util.concurrent.atomic.AtomicInteger;\n \n /**\n+ *  A wrapper around a {@link io.grpc.ManagedChannel} exposing a reference count and performing a\n+ *  round-robin load balance across a list of channels. When instantiated the reference count is 1.\n+ *  {@link ManagedChannel#shutdown()} will be called on the wrapped channel when the reference count\n+ *  reaches 0.\n+ *\n  * <p>See {@link ReferenceCounted} for more information about reference counting.\n  */\n public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n@@ -83,6 +101,8 @@ public String authority() {\n    * Performs a simple round robin on the list of {@link ManagedChannel}s in the {@code channels}\n    * list.\n    *\n+   * @see <a href=\"https://github.com/grpc/grpc/issues/21386#issuecomment-564742173\">Suggestion from gRPC team.</a>\n+   *\n    * @return A {@link ManagedChannel} that can be used for a single RPC call.\n    */\n   private ManagedChannel getNextChannel() {\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -260,8 +260,17 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n     int poolSize = 1;\n     BuildRequestOptions buildRequestOptions = env.getOptions().getOptions(BuildRequestOptions.class);\n     if (buildRequestOptions != null) {\n+      // The following calculation is based on the suggestion from comment\n+      // https://github.com/bazelbuild/bazel/issues/11801#issuecomment-672973245\n+      //\n+      // The number of concurrent requests for one connection to a gRPC server is limited by\n+      // MAX_CONCURRENT_STREAMS which is normally being 100+. We assume 50 concurrent requests for\n+      // each connection should be fairly well. The number of connections opened by one channel is\n+      // based on the resolved IPs of that server. We assume servers normally have 2 IPs. So the\n+      // number of required channel is calculated as: ceil(jobs / 100).\n+      //\n       // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?\n-      poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 50.0);\n+      poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 100.0);\n     }\n     if (enableRemoteExecution) {\n       ImmutableList.Builder<ClientInterceptor> interceptors = ImmutableList.builder();",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+          "patch": "@@ -1,3 +1,16 @@\n+// Copyright 2020 The Bazel Authors. All rights reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//    http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n package com.google.devtools.build.lib.remote;\n \n import com.google.common.collect.ImmutableList;\n@@ -11,6 +24,11 @@\n import java.util.concurrent.atomic.AtomicInteger;\n \n /**\n+ *  A wrapper around a {@link io.grpc.ManagedChannel} exposing a reference count and performing a\n+ *  round-robin load balance across a list of channels. When instantiated the reference count is 1.\n+ *  {@link ManagedChannel#shutdown()} will be called on the wrapped channel when the reference count\n+ *  reaches 0.\n+ *\n  * <p>See {@link ReferenceCounted} for more information about reference counting.\n  */\n public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n@@ -83,6 +101,8 @@ public String authority() {\n    * Performs a simple round robin on the list of {@link ManagedChannel}s in the {@code channels}\n    * list.\n    *\n+   * @see <a href=\"https://github.com/grpc/grpc/issues/21386#issuecomment-564742173\">Suggestion from gRPC team.</a>\n+   *\n    * @return A {@link ManagedChannel} that can be used for a single RPC call.\n    */\n   private ManagedChannel getNextChannel() {"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -260,8 +260,17 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n     int poolSize = 1;\n     BuildRequestOptions buildRequestOptions = env.getOptions().getOptions(BuildRequestOptions.class);\n     if (buildRequestOptions != null) {\n+      // The following calculation is based on the suggestion from comment\n+      // https://github.com/bazelbuild/bazel/issues/11801#issuecomment-672973245\n+      //\n+      // The number of concurrent requests for one connection to a gRPC server is limited by\n+      // MAX_CONCURRENT_STREAMS which is normally being 100+. We assume 50 concurrent requests for\n+      // each connection should be fairly well. The number of connections opened by one channel is\n+      // based on the resolved IPs of that server. We assume servers normally have 2 IPs. So the\n+      // number of required channel is calculated as: ceil(jobs / 100).\n+      //\n       // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?\n-      poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 50.0);\n+      poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 100.0);\n     }\n     if (enableRemoteExecution) {\n       ImmutableList.Builder<ClientInterceptor> interceptors = ImmutableList.builder();"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 470425391,
+      "created_at": "2020-08-14T05:57:38Z",
+      "user": "meisterT",
+      "body": "nit: move } to the next line",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+      "diff_hunk": "@@ -0,0 +1,121 @@\n+// Copyright 2020 The Bazel Authors. All rights reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//    http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.common.collect.ImmutableList;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.ManagedChannel;\n+import io.grpc.MethodDescriptor;\n+import io.netty.util.AbstractReferenceCounted;\n+import io.netty.util.ReferenceCounted;\n+import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/**\n+ *  A wrapper around a {@link io.grpc.ManagedChannel} exposing a reference count and performing a\n+ *  round-robin load balance across a list of channels. When instantiated the reference count is 1.\n+ *  {@link ManagedChannel#shutdown()} will be called on the wrapped channel when the reference count\n+ *  reaches 0.\n+ *\n+ * <p>See {@link ReferenceCounted} for more information about reference counting.\n+ */\n+public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n+\n+  private final AtomicInteger indexTicker = new AtomicInteger();\n+  private final ImmutableList<ManagedChannel> channels;\n+\n+  public ReferenceCountedChannelPool(ImmutableList<ManagedChannel> channels) {\n+    super(channels.get(0), new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        for (ManagedChannel channel : channels) {\n+          channel.shutdown();\n+        }\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return null;\n+      }\n+    });\n+    this.channels = channels;\n+  }\n+\n+  @Override\n+  public boolean isShutdown() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isShutdown()) {\n+        return false;\n+      }\n+    }\n+    return true;\n+  }\n+\n+  @Override\n+  public boolean isTerminated() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isTerminated()) {\n+        return false;\n+      }\n+    }\n+    return true;  }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 73,
+      "side": "RIGHT",
+      "original_position": 73,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 470426080,
+      "created_at": "2020-08-14T05:59:59Z",
+      "user": "meisterT",
+      "body": "In a separate PR after this one: please change `l` to `timeout` in this method and the method it overrides.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+      "diff_hunk": "@@ -0,0 +1,121 @@\n+// Copyright 2020 The Bazel Authors. All rights reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//    http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n+package com.google.devtools.build.lib.remote;\n+\n+import com.google.common.collect.ImmutableList;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.ManagedChannel;\n+import io.grpc.MethodDescriptor;\n+import io.netty.util.AbstractReferenceCounted;\n+import io.netty.util.ReferenceCounted;\n+import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n+\n+/**\n+ *  A wrapper around a {@link io.grpc.ManagedChannel} exposing a reference count and performing a\n+ *  round-robin load balance across a list of channels. When instantiated the reference count is 1.\n+ *  {@link ManagedChannel#shutdown()} will be called on the wrapped channel when the reference count\n+ *  reaches 0.\n+ *\n+ * <p>See {@link ReferenceCounted} for more information about reference counting.\n+ */\n+public class ReferenceCountedChannelPool extends ReferenceCountedChannel {\n+\n+  private final AtomicInteger indexTicker = new AtomicInteger();\n+  private final ImmutableList<ManagedChannel> channels;\n+\n+  public ReferenceCountedChannelPool(ImmutableList<ManagedChannel> channels) {\n+    super(channels.get(0), new AbstractReferenceCounted() {\n+      @Override\n+      protected void deallocate() {\n+        for (ManagedChannel channel : channels) {\n+          channel.shutdown();\n+        }\n+      }\n+\n+      @Override\n+      public ReferenceCounted touch(Object o) {\n+        return null;\n+      }\n+    });\n+    this.channels = channels;\n+  }\n+\n+  @Override\n+  public boolean isShutdown() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isShutdown()) {\n+        return false;\n+      }\n+    }\n+    return true;\n+  }\n+\n+  @Override\n+  public boolean isTerminated() {\n+    for (ManagedChannel channel : channels) {\n+      if (!channel.isTerminated()) {\n+        return false;\n+      }\n+    }\n+    return true;  }\n+\n+  @Override\n+  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 76,
+      "side": "RIGHT",
+      "original_position": 76,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 470426406,
+      "created_at": "2020-08-14T06:01:09Z",
+      "user": "meisterT",
+      "body": "I think you can remove this TODO.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+      "diff_hunk": "@@ -255,6 +256,22 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n     ReferenceCountedChannel execChannel = null;\n     ReferenceCountedChannel cacheChannel = null;\n     ReferenceCountedChannel downloaderChannel = null;\n+\n+    int poolSize = 1;\n+    BuildRequestOptions buildRequestOptions = env.getOptions().getOptions(BuildRequestOptions.class);\n+    if (buildRequestOptions != null) {\n+      // The following calculation is based on the suggestion from comment\n+      // https://github.com/bazelbuild/bazel/issues/11801#issuecomment-672973245\n+      //\n+      // The number of concurrent requests for one connection to a gRPC server is limited by\n+      // MAX_CONCURRENT_STREAMS which is normally being 100+. We assume 50 concurrent requests for\n+      // each connection should be fairly well. The number of connections opened by one channel is\n+      // based on the resolved IPs of that server. We assume servers normally have 2 IPs. So the\n+      // number of required channel is calculated as: ceil(jobs / 100).\n+      //\n+      // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 272,
+      "side": "RIGHT",
+      "original_position": 25,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 467324223,
+      "created_at": "2020-08-14T06:01:14Z",
+      "user": "meisterT",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2020-08-14T06:24:47Z",
+      "sha": "c00c8091aee444d363ce64a64033fb6ce8e39837",
+      "message": "Remove TODO and reformat code;",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2020-08-14T06:24:47Z",
+      "author_date": "2020-08-14T06:24:47Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2020-08-14T06:24:47Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannel.java\n@@ -75,8 +75,8 @@ public ManagedChannel shutdownNow() {\n   }\n \n   @Override\n-  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n-    return channel.awaitTermination(l, timeUnit);\n+  public boolean awaitTermination(long timeout, TimeUnit timeUnit) throws InterruptedException {\n+    return channel.awaitTermination(timeout, timeUnit);\n   }\n \n   @Override\nsrc/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java\n@@ -70,11 +70,12 @@ public boolean isTerminated() {\n         return false;\n       }\n     }\n-    return true;  }\n+    return true;\n+  }\n \n   @Override\n-  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n-    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(l);\n+  public boolean awaitTermination(long timeout, TimeUnit timeUnit) throws InterruptedException {\n+    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(timeout);\n     for (ManagedChannel channel : channels) {\n       long awaitTimeNanos = endTimeNanos - System.nanoTime();\n       if (awaitTimeNanos <= 0) {\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -267,9 +267,7 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n       // MAX_CONCURRENT_STREAMS which is normally being 100+. We assume 50 concurrent requests for\n       // each connection should be fairly well. The number of connections opened by one channel is\n       // based on the resolved IPs of that server. We assume servers normally have 2 IPs. So the\n-      // number of required channel is calculated as: ceil(jobs / 100).\n-      //\n-      // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?\n+      // number of required channels is calculated as: ceil(jobs / 100).\n       poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 100.0);\n     }\n     if (enableRemoteExecution) {",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannel.java",
+          "patch": "@@ -75,8 +75,8 @@ public ManagedChannel shutdownNow() {\n   }\n \n   @Override\n-  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n-    return channel.awaitTermination(l, timeUnit);\n+  public boolean awaitTermination(long timeout, TimeUnit timeUnit) throws InterruptedException {\n+    return channel.awaitTermination(timeout, timeUnit);\n   }\n \n   @Override"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannelPool.java",
+          "patch": "@@ -70,11 +70,12 @@ public boolean isTerminated() {\n         return false;\n       }\n     }\n-    return true;  }\n+    return true;\n+  }\n \n   @Override\n-  public boolean awaitTermination(long l, TimeUnit timeUnit) throws InterruptedException {\n-    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(l);\n+  public boolean awaitTermination(long timeout, TimeUnit timeUnit) throws InterruptedException {\n+    long endTimeNanos = System.nanoTime() + timeUnit.toNanos(timeout);\n     for (ManagedChannel channel : channels) {\n       long awaitTimeNanos = endTimeNanos - System.nanoTime();\n       if (awaitTimeNanos <= 0) {"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -267,9 +267,7 @@ public void beforeCommand(CommandEnvironment env) throws AbruptExitException {\n       // MAX_CONCURRENT_STREAMS which is normally being 100+. We assume 50 concurrent requests for\n       // each connection should be fairly well. The number of connections opened by one channel is\n       // based on the resolved IPs of that server. We assume servers normally have 2 IPs. So the\n-      // number of required channel is calculated as: ceil(jobs / 100).\n-      //\n-      // TODO(chiwang): Should we use a more intelligent way to calculate poolSize?\n+      // number of required channels is calculated as: ceil(jobs / 100).\n       poolSize = (int) Math.ceil((double) buildRequestOptions.jobs / 100.0);\n     }\n     if (enableRemoteExecution) {"
+        }
+      ]
+    }
+  ]
+}

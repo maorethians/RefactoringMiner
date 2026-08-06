@@ -1,0 +1,343 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 111576,
+  "pr_number": 111576,
+  "title": "Execute shard snapshot tasks in shard-id order",
+  "user": "DaveCTurner",
+  "created_at": "2024-08-05T05:45:36Z",
+  "merged_at": "2024-08-05T17:26:29Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">enhancement",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v8.16.0"
+  ],
+  "base_commit": "e58678da4eee1c3f844c80e6ac0a4df8aadacca5",
+  "merge_commit_sha": "88c8da3f81259e30eea540e2be6e663a4d0352fa",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "merged",
+    "closed",
+    "referenced",
+    "head_ref_deleted",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/111576",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-08-05T05:42:25Z",
+      "sha": "2e9e13b828f022193d70d17316468aa963c628a7",
+      "message": "Execute shard snapshot tasks in shard-id order\n\nToday within a single snapshot we execute tasks in an undefined order,\nwhich can lead to a high level of WIP that must be repeated if shard\nsnapshots are paused for node shutdown. This commit adds an extra\ncomparator to sort the tasks according to their shard ID to ensure we\nfocus on completing ongoing shard snapshots ahead of starting new ones.\n\nCloses #108739",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2024-08-05T05:41:21Z",
+      "author_date": "2024-08-05T05:41:21Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2024-08-05T05:42:25Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunner.java\n@@ -16,6 +16,7 @@\n import org.elasticsearch.common.util.concurrent.AbstractRunnable;\n import org.elasticsearch.common.util.concurrent.PrioritizedThrottledTaskRunner;\n import org.elasticsearch.core.Strings;\n+import org.elasticsearch.index.shard.ShardId;\n import org.elasticsearch.repositories.SnapshotShardContext;\n \n import java.io.IOException;\n@@ -38,23 +39,41 @@ public class ShardSnapshotTaskRunner {\n     private final CheckedBiConsumer<SnapshotShardContext, FileInfo, IOException> fileSnapshotter;\n \n     abstract static class SnapshotTask extends AbstractRunnable implements Comparable<SnapshotTask> {\n-\n-        private static final Comparator<SnapshotTask> COMPARATOR = Comparator.comparingLong(\n-            (SnapshotTask t) -> t.context().snapshotStartTime()\n-        ).thenComparing(t -> t.context().snapshotId().getUUID()).thenComparingInt(SnapshotTask::priority);\n-\n         protected final SnapshotShardContext context;\n \n         SnapshotTask(SnapshotShardContext context) {\n             this.context = context;\n         }\n \n+        public final SnapshotShardContext context() {\n+            return context;\n+        }\n+\n+        private long getSnapshotStartTime() {\n+            return context().snapshotStartTime();\n+        }\n+\n+        private String snapshotUUID() {\n+            return context().snapshotId().getUUID();\n+        }\n+\n         public abstract int priority();\n \n-        public SnapshotShardContext context() {\n-            return context;\n+        @SuppressWarnings(\"resource\")\n+        private ShardId shardId() {\n+            return context().store().shardId();\n         }\n \n+        private static final Comparator<SnapshotTask> COMPARATOR = Comparator\n+            // Prefer work from the oldest running snapshot ...\n+            .comparingLong(SnapshotTask::getSnapshotStartTime)\n+            // ... tiebreaking on UUID ...\n+            .thenComparing(SnapshotTask::snapshotUUID)\n+            // ... then prefer starting new shard snapshots over uploading files for ongoing ones (for fast noop shard snapshots) ...\n+            .thenComparingInt(SnapshotTask::priority)\n+            // .. finally breaking ties by shard ID to limit WIP\n+            .thenComparing(SnapshotTask::shardId);\n+\n         @Override\n         public final int compareTo(SnapshotTask other) {\n             return COMPARATOR.compare(this, other);\nserver/src/test/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunnerTests.java\n@@ -14,6 +14,7 @@\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.common.UUIDs;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.core.Nullable;\n import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.index.IndexVersion;\n import org.elasticsearch.index.engine.Engine;\n@@ -31,12 +32,14 @@\n import org.elasticsearch.threadpool.TestThreadPool;\n import org.elasticsearch.threadpool.ThreadPool;\n \n+import java.util.ArrayList;\n+import java.util.List;\n+import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.Executor;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicInteger;\n \n import static org.hamcrest.Matchers.equalTo;\n-import static org.hamcrest.Matchers.lessThan;\n \n public class ShardSnapshotTaskRunnerTests extends ESTestCase {\n \n@@ -110,13 +113,17 @@ public static SnapshotShardContext dummyContext() {\n     }\n \n     public static SnapshotShardContext dummyContext(final SnapshotId snapshotId, final long startTime) {\n-        IndexId indexId = new IndexId(randomAlphaOfLength(10), UUIDs.randomBase64UUID());\n-        ShardId shardId = new ShardId(indexId.getName(), indexId.getId(), 1);\n-        IndexSettings indexSettings = new IndexSettings(\n+        return dummyContext(snapshotId, startTime, randomIdentifier(), 1);\n+    }\n+\n+    public static SnapshotShardContext dummyContext(final SnapshotId snapshotId, final long startTime, String indexName, int shardIndex) {\n+        final var indexId = new IndexId(indexName, UUIDs.randomBase64UUID());\n+        final var shardId = new ShardId(indexId.getName(), UUIDs.randomBase64UUID(), shardIndex);\n+        final var indexSettings = new IndexSettings(\n             IndexMetadata.builder(indexId.getName()).settings(indexSettings(IndexVersion.current(), 1, 0)).build(),\n             Settings.EMPTY\n         );\n-        Store dummyStore = new Store(shardId, indexSettings, new ByteBuffersDirectory(), new DummyShardLock(shardId));\n+        final var dummyStore = new Store(shardId, indexSettings, new ByteBuffersDirectory(), new DummyShardLock(shardId));\n         return new SnapshotShardContext(\n             dummyStore,\n             null,\n@@ -151,43 +158,78 @@ public void testShardSnapshotTaskRunner() throws Exception {\n     }\n \n     public void testCompareToShardSnapshotTask() {\n-        ShardSnapshotTaskRunner workers = new ShardSnapshotTaskRunner(1, executor, context -> {}, (context, fileInfo) -> {});\n-        SnapshotId s1 = new SnapshotId(\"s1\", \"s1-uuid\");\n-        SnapshotId s2 = new SnapshotId(\"s2\", \"s2-uuid\");\n-        SnapshotId s3 = new SnapshotId(\"s3\", \"s3-uuid\");\n-        ActionListener<Void> listener = ActionListener.noop();\n-        final long s1StartTime = threadPool.absoluteTimeInMillis();\n-        final long s2StartTime = s1StartTime + randomLongBetween(1, 1000);\n-        SnapshotShardContext s1Context = dummyContext(s1, s1StartTime);\n-        SnapshotShardContext s2Context = dummyContext(s2, s2StartTime);\n-        SnapshotShardContext s3Context = dummyContext(s3, s2StartTime);\n-        // Shard snapshot and file snapshot tasks for earlier snapshots have higher priority\n-        assertThat(\n-            workers.new ShardSnapshotTask(s1Context).compareTo(\n-                workers.new FileSnapshotTask(s2Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener)\n-            ),\n-            lessThan(0)\n-        );\n-        assertThat(\n-            workers.new FileSnapshotTask(s1Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener).compareTo(\n-                workers.new ShardSnapshotTask(s2Context)\n-            ),\n-            lessThan(0)\n-        );\n-        // Two tasks with the same start time and of the same type are ordered by snapshot UUID\n-        assertThat(workers.new ShardSnapshotTask(s2Context).compareTo(workers.new ShardSnapshotTask(s3Context)), lessThan(0));\n-        assertThat(\n-            workers.new FileSnapshotTask(s2Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener).compareTo(\n-                workers.new ShardSnapshotTask(s3Context)\n-            ),\n-            lessThan(0)\n-        );\n-        // Shard snapshot task has a higher priority over file snapshot within the same snapshot\n-        assertThat(\n-            workers.new ShardSnapshotTask(s1Context).compareTo(\n-                workers.new FileSnapshotTask(s1Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener)\n-            ),\n-            lessThan(0)\n-        );\n+\n+        record CapturedTask(SnapshotShardContext context, @Nullable BlobStoreIndexShardSnapshot.FileInfo fileInfo) {\n+            CapturedTask(SnapshotShardContext context) {\n+                this(context, null);\n+            }\n+        }\n+\n+        final List<CapturedTask> tasksInExpectedOrder = new ArrayList<>();\n+\n+        // first snapshot, one shard, one file, but should execute the shard-level task before the file task\n+        final var earlyStartTime = randomLongBetween(1L, Long.MAX_VALUE - 1000);\n+        final var s1Context = dummyContext(new SnapshotId(randomIdentifier(), randomUUID()), earlyStartTime);\n+        tasksInExpectedOrder.add(new CapturedTask(s1Context));\n+        tasksInExpectedOrder.add(new CapturedTask(s1Context, dummyFileInfo()));\n+\n+        // second snapshot, also one shard and one file, starts later than the first\n+        final var laterStartTime = randomLongBetween(earlyStartTime + 1, Long.MAX_VALUE);\n+        final var s2Context = dummyContext(new SnapshotId(randomIdentifier(), \"early-uuid\"), laterStartTime);\n+        tasksInExpectedOrder.add(new CapturedTask(s2Context));\n+        tasksInExpectedOrder.add(new CapturedTask(s2Context, dummyFileInfo()));\n+\n+        // third snapshot, starts at the same time as the second but has a later UUID\n+        final var snapshotId3 = new SnapshotId(randomIdentifier(), \"later-uuid\");\n+\n+        // the third snapshot has three shards, and their respective tasks should execute in shard-id then index-name order:\n+        final var s3ContextShard1 = dummyContext(snapshotId3, laterStartTime, \"early-index-name\", 0);\n+        final var s3ContextShard2 = dummyContext(snapshotId3, laterStartTime, \"later-index-name\", 0);\n+        final var s3ContextShard3 = dummyContext(snapshotId3, laterStartTime, randomIdentifier(), 1);\n+\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard1));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard2));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard3));\n+\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard1, dummyFileInfo()));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard2, dummyFileInfo()));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard3, dummyFileInfo()));\n+\n+        final var readyLatch = new CountDownLatch(1);\n+        final var startLatch = new CountDownLatch(1);\n+        final var doneLatch = new CountDownLatch(tasksInExpectedOrder.size() + 1);\n+\n+        final List<CapturedTask> tasksInExecutionOrder = new ArrayList<>();\n+        final var runner = new ShardSnapshotTaskRunner(1, executor, context -> {\n+            tasksInExecutionOrder.add(new CapturedTask(context, null));\n+            readyLatch.countDown();\n+            safeAwait(startLatch);\n+            doneLatch.countDown();\n+        }, (context, fileInfo) -> {\n+            tasksInExecutionOrder.add(new CapturedTask(context, fileInfo));\n+            doneLatch.countDown();\n+        });\n+\n+        // prime the pipeline by executing a dummy task and waiting for it to block the executor, so that the rest of the tasks are sorted\n+        // by the underlying PriorityQueue before any of them start to execute\n+        runner.enqueueShardSnapshot(dummyContext(new SnapshotId(randomIdentifier(), UUIDs.randomBase64UUID()), randomNonNegativeLong()));\n+        safeAwait(readyLatch);\n+        tasksInExecutionOrder.clear(); // remove the dummy task\n+\n+        // submit the tasks in random order\n+        for (final var task : shuffledList(tasksInExpectedOrder)) {\n+            if (task.fileInfo() == null) {\n+                runner.enqueueShardSnapshot(task.context());\n+            } else {\n+                runner.enqueueFileSnapshot(task.context(), task::fileInfo, ActionListener.noop());\n+            }\n+        }\n+\n+        // allow the tasks to execute\n+        startLatch.countDown();\n+        safeAwait(doneLatch);\n+\n+        // finally verify that they executed in the order we expected\n+        assertEquals(tasksInExpectedOrder, tasksInExecutionOrder);\n     }\n }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunner.java",
+          "patch": "@@ -16,6 +16,7 @@\n import org.elasticsearch.common.util.concurrent.AbstractRunnable;\n import org.elasticsearch.common.util.concurrent.PrioritizedThrottledTaskRunner;\n import org.elasticsearch.core.Strings;\n+import org.elasticsearch.index.shard.ShardId;\n import org.elasticsearch.repositories.SnapshotShardContext;\n \n import java.io.IOException;\n@@ -38,23 +39,41 @@ public class ShardSnapshotTaskRunner {\n     private final CheckedBiConsumer<SnapshotShardContext, FileInfo, IOException> fileSnapshotter;\n \n     abstract static class SnapshotTask extends AbstractRunnable implements Comparable<SnapshotTask> {\n-\n-        private static final Comparator<SnapshotTask> COMPARATOR = Comparator.comparingLong(\n-            (SnapshotTask t) -> t.context().snapshotStartTime()\n-        ).thenComparing(t -> t.context().snapshotId().getUUID()).thenComparingInt(SnapshotTask::priority);\n-\n         protected final SnapshotShardContext context;\n \n         SnapshotTask(SnapshotShardContext context) {\n             this.context = context;\n         }\n \n+        public final SnapshotShardContext context() {\n+            return context;\n+        }\n+\n+        private long getSnapshotStartTime() {\n+            return context().snapshotStartTime();\n+        }\n+\n+        private String snapshotUUID() {\n+            return context().snapshotId().getUUID();\n+        }\n+\n         public abstract int priority();\n \n-        public SnapshotShardContext context() {\n-            return context;\n+        @SuppressWarnings(\"resource\")\n+        private ShardId shardId() {\n+            return context().store().shardId();\n         }\n \n+        private static final Comparator<SnapshotTask> COMPARATOR = Comparator\n+            // Prefer work from the oldest running snapshot ...\n+            .comparingLong(SnapshotTask::getSnapshotStartTime)\n+            // ... tiebreaking on UUID ...\n+            .thenComparing(SnapshotTask::snapshotUUID)\n+            // ... then prefer starting new shard snapshots over uploading files for ongoing ones (for fast noop shard snapshots) ...\n+            .thenComparingInt(SnapshotTask::priority)\n+            // .. finally breaking ties by shard ID to limit WIP\n+            .thenComparing(SnapshotTask::shardId);\n+\n         @Override\n         public final int compareTo(SnapshotTask other) {\n             return COMPARATOR.compare(this, other);"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunnerTests.java",
+          "patch": "@@ -14,6 +14,7 @@\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.common.UUIDs;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.core.Nullable;\n import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.index.IndexVersion;\n import org.elasticsearch.index.engine.Engine;\n@@ -31,12 +32,14 @@\n import org.elasticsearch.threadpool.TestThreadPool;\n import org.elasticsearch.threadpool.ThreadPool;\n \n+import java.util.ArrayList;\n+import java.util.List;\n+import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.Executor;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicInteger;\n \n import static org.hamcrest.Matchers.equalTo;\n-import static org.hamcrest.Matchers.lessThan;\n \n public class ShardSnapshotTaskRunnerTests extends ESTestCase {\n \n@@ -110,13 +113,17 @@ public static SnapshotShardContext dummyContext() {\n     }\n \n     public static SnapshotShardContext dummyContext(final SnapshotId snapshotId, final long startTime) {\n-        IndexId indexId = new IndexId(randomAlphaOfLength(10), UUIDs.randomBase64UUID());\n-        ShardId shardId = new ShardId(indexId.getName(), indexId.getId(), 1);\n-        IndexSettings indexSettings = new IndexSettings(\n+        return dummyContext(snapshotId, startTime, randomIdentifier(), 1);\n+    }\n+\n+    public static SnapshotShardContext dummyContext(final SnapshotId snapshotId, final long startTime, String indexName, int shardIndex) {\n+        final var indexId = new IndexId(indexName, UUIDs.randomBase64UUID());\n+        final var shardId = new ShardId(indexId.getName(), UUIDs.randomBase64UUID(), shardIndex);\n+        final var indexSettings = new IndexSettings(\n             IndexMetadata.builder(indexId.getName()).settings(indexSettings(IndexVersion.current(), 1, 0)).build(),\n             Settings.EMPTY\n         );\n-        Store dummyStore = new Store(shardId, indexSettings, new ByteBuffersDirectory(), new DummyShardLock(shardId));\n+        final var dummyStore = new Store(shardId, indexSettings, new ByteBuffersDirectory(), new DummyShardLock(shardId));\n         return new SnapshotShardContext(\n             dummyStore,\n             null,\n@@ -151,43 +158,78 @@ public void testShardSnapshotTaskRunner() throws Exception {\n     }\n \n     public void testCompareToShardSnapshotTask() {\n-        ShardSnapshotTaskRunner workers = new ShardSnapshotTaskRunner(1, executor, context -> {}, (context, fileInfo) -> {});\n-        SnapshotId s1 = new SnapshotId(\"s1\", \"s1-uuid\");\n-        SnapshotId s2 = new SnapshotId(\"s2\", \"s2-uuid\");\n-        SnapshotId s3 = new SnapshotId(\"s3\", \"s3-uuid\");\n-        ActionListener<Void> listener = ActionListener.noop();\n-        final long s1StartTime = threadPool.absoluteTimeInMillis();\n-        final long s2StartTime = s1StartTime + randomLongBetween(1, 1000);\n-        SnapshotShardContext s1Context = dummyContext(s1, s1StartTime);\n-        SnapshotShardContext s2Context = dummyContext(s2, s2StartTime);\n-        SnapshotShardContext s3Context = dummyContext(s3, s2StartTime);\n-        // Shard snapshot and file snapshot tasks for earlier snapshots have higher priority\n-        assertThat(\n-            workers.new ShardSnapshotTask(s1Context).compareTo(\n-                workers.new FileSnapshotTask(s2Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener)\n-            ),\n-            lessThan(0)\n-        );\n-        assertThat(\n-            workers.new FileSnapshotTask(s1Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener).compareTo(\n-                workers.new ShardSnapshotTask(s2Context)\n-            ),\n-            lessThan(0)\n-        );\n-        // Two tasks with the same start time and of the same type are ordered by snapshot UUID\n-        assertThat(workers.new ShardSnapshotTask(s2Context).compareTo(workers.new ShardSnapshotTask(s3Context)), lessThan(0));\n-        assertThat(\n-            workers.new FileSnapshotTask(s2Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener).compareTo(\n-                workers.new ShardSnapshotTask(s3Context)\n-            ),\n-            lessThan(0)\n-        );\n-        // Shard snapshot task has a higher priority over file snapshot within the same snapshot\n-        assertThat(\n-            workers.new ShardSnapshotTask(s1Context).compareTo(\n-                workers.new FileSnapshotTask(s1Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener)\n-            ),\n-            lessThan(0)\n-        );\n+\n+        record CapturedTask(SnapshotShardContext context, @Nullable BlobStoreIndexShardSnapshot.FileInfo fileInfo) {\n+            CapturedTask(SnapshotShardContext context) {\n+                this(context, null);\n+            }\n+        }\n+\n+        final List<CapturedTask> tasksInExpectedOrder = new ArrayList<>();\n+\n+        // first snapshot, one shard, one file, but should execute the shard-level task before the file task\n+        final var earlyStartTime = randomLongBetween(1L, Long.MAX_VALUE - 1000);\n+        final var s1Context = dummyContext(new SnapshotId(randomIdentifier(), randomUUID()), earlyStartTime);\n+        tasksInExpectedOrder.add(new CapturedTask(s1Context));\n+        tasksInExpectedOrder.add(new CapturedTask(s1Context, dummyFileInfo()));\n+\n+        // second snapshot, also one shard and one file, starts later than the first\n+        final var laterStartTime = randomLongBetween(earlyStartTime + 1, Long.MAX_VALUE);\n+        final var s2Context = dummyContext(new SnapshotId(randomIdentifier(), \"early-uuid\"), laterStartTime);\n+        tasksInExpectedOrder.add(new CapturedTask(s2Context));\n+        tasksInExpectedOrder.add(new CapturedTask(s2Context, dummyFileInfo()));\n+\n+        // third snapshot, starts at the same time as the second but has a later UUID\n+        final var snapshotId3 = new SnapshotId(randomIdentifier(), \"later-uuid\");\n+\n+        // the third snapshot has three shards, and their respective tasks should execute in shard-id then index-name order:\n+        final var s3ContextShard1 = dummyContext(snapshotId3, laterStartTime, \"early-index-name\", 0);\n+        final var s3ContextShard2 = dummyContext(snapshotId3, laterStartTime, \"later-index-name\", 0);\n+        final var s3ContextShard3 = dummyContext(snapshotId3, laterStartTime, randomIdentifier(), 1);\n+\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard1));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard2));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard3));\n+\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard1, dummyFileInfo()));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard2, dummyFileInfo()));\n+        tasksInExpectedOrder.add(new CapturedTask(s3ContextShard3, dummyFileInfo()));\n+\n+        final var readyLatch = new CountDownLatch(1);\n+        final var startLatch = new CountDownLatch(1);\n+        final var doneLatch = new CountDownLatch(tasksInExpectedOrder.size() + 1);\n+\n+        final List<CapturedTask> tasksInExecutionOrder = new ArrayList<>();\n+        final var runner = new ShardSnapshotTaskRunner(1, executor, context -> {\n+            tasksInExecutionOrder.add(new CapturedTask(context, null));\n+            readyLatch.countDown();\n+            safeAwait(startLatch);\n+            doneLatch.countDown();\n+        }, (context, fileInfo) -> {\n+            tasksInExecutionOrder.add(new CapturedTask(context, fileInfo));\n+            doneLatch.countDown();\n+        });\n+\n+        // prime the pipeline by executing a dummy task and waiting for it to block the executor, so that the rest of the tasks are sorted\n+        // by the underlying PriorityQueue before any of them start to execute\n+        runner.enqueueShardSnapshot(dummyContext(new SnapshotId(randomIdentifier(), UUIDs.randomBase64UUID()), randomNonNegativeLong()));\n+        safeAwait(readyLatch);\n+        tasksInExecutionOrder.clear(); // remove the dummy task\n+\n+        // submit the tasks in random order\n+        for (final var task : shuffledList(tasksInExpectedOrder)) {\n+            if (task.fileInfo() == null) {\n+                runner.enqueueShardSnapshot(task.context());\n+            } else {\n+                runner.enqueueFileSnapshot(task.context(), task::fileInfo, ActionListener.noop());\n+            }\n+        }\n+\n+        // allow the tasks to execute\n+        startLatch.countDown();\n+        safeAwait(doneLatch);\n+\n+        // finally verify that they executed in the order we expected\n+        assertEquals(tasksInExpectedOrder, tasksInExecutionOrder);\n     }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-08-05T05:45:36Z",
+      "user": "DaveCTurner",
+      "body": "Today within a single snapshot we execute tasks in an undefined order,\r\nwhich can lead to a high level of WIP that must be repeated if shard\r\nsnapshots are paused for node shutdown. This commit adds an extra\r\ncomparator to sort the tasks according to their shard ID to ensure we\r\nfocus on completing ongoing shard snapshots ahead of starting new ones.\r\n\r\nCloses #108739"
+    },
+    {
+      "type": "commit",
+      "date": "2024-08-05T05:45:58Z",
+      "sha": "7c24de650d1e1aae4b18e7b5497049aeb6084f0f",
+      "message": "Update docs/changelog/111576.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2024-08-05T05:45:58Z",
+      "author_date": "2024-08-05T05:45:58Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2024-08-05T05:45:58Z",
+      "diff_text": "docs/changelog/111576.yaml\n@@ -0,0 +1,6 @@\n+pr: 111576\n+summary: Execute shard snapshot tasks in shard-id order\n+area: Snapshot/Restore\n+type: enhancement\n+issues:\n+ - 108739",
+      "diff": [
+        {
+          "file": "docs/changelog/111576.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 111576\n+summary: Execute shard snapshot tasks in shard-id order\n+area: Snapshot/Restore\n+type: enhancement\n+issues:\n+ - 108739"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2268219553,
+      "created_at": "2024-08-05T05:45:59Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "comment",
+      "id": 2268219565,
+      "created_at": "2024-08-05T05:45:59Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review",
+      "id": 2218192398,
+      "created_at": "2024-08-05T07:05:36Z",
+      "user": "idegtiarenko",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-08-05T07:48:00Z",
+      "sha": "99699031832005cf6202c3ddadb299bf38cc244e",
+      "message": "Comments",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2024-08-05T07:48:00Z",
+      "author_date": "2024-08-05T07:48:00Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2024-08-05T07:48:00Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunner.java\n@@ -67,11 +67,11 @@ private ShardId shardId() {\n         private static final Comparator<SnapshotTask> COMPARATOR = Comparator\n             // Prefer work from the oldest running snapshot ...\n             .comparingLong(SnapshotTask::getSnapshotStartTime)\n-            // ... tiebreaking on UUID ...\n+            // ... tiebreaking on UUID just in case two of them start at the same millisecond ...\n             .thenComparing(SnapshotTask::snapshotUUID)\n             // ... then prefer starting new shard snapshots over uploading files for ongoing ones (for fast noop shard snapshots) ...\n             .thenComparingInt(SnapshotTask::priority)\n-            // .. finally breaking ties by shard ID to limit WIP\n+            // ... then break ties by shard ID to limit WIP and avoid PAUSED_FOR_NODE_REMOVAL discarding more work than it needs to\n             .thenComparing(SnapshotTask::shardId);\n \n         @Override",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunner.java",
+          "patch": "@@ -67,11 +67,11 @@ private ShardId shardId() {\n         private static final Comparator<SnapshotTask> COMPARATOR = Comparator\n             // Prefer work from the oldest running snapshot ...\n             .comparingLong(SnapshotTask::getSnapshotStartTime)\n-            // ... tiebreaking on UUID ...\n+            // ... tiebreaking on UUID just in case two of them start at the same millisecond ...\n             .thenComparing(SnapshotTask::snapshotUUID)\n             // ... then prefer starting new shard snapshots over uploading files for ongoing ones (for fast noop shard snapshots) ...\n             .thenComparingInt(SnapshotTask::priority)\n-            // .. finally breaking ties by shard ID to limit WIP\n+            // ... then break ties by shard ID to limit WIP and avoid PAUSED_FOR_NODE_REMOVAL discarding more work than it needs to\n             .thenComparing(SnapshotTask::shardId);\n \n         @Override"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2218316103,
+      "created_at": "2024-08-05T08:10:41Z",
+      "user": "pxsalehi",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1704276392,
+      "created_at": "2024-08-05T15:14:06Z",
+      "user": "DiannaHohensee",
+      "body": "Where does the index-name order come in? I don't see it in COMPARATOR 🤔 ",
+      "path": "server/src/test/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunnerTests.java",
+      "diff_hunk": "@@ -151,43 +158,78 @@ public void testShardSnapshotTaskRunner() throws Exception {\n     }\n \n     public void testCompareToShardSnapshotTask() {\n-        ShardSnapshotTaskRunner workers = new ShardSnapshotTaskRunner(1, executor, context -> {}, (context, fileInfo) -> {});\n-        SnapshotId s1 = new SnapshotId(\"s1\", \"s1-uuid\");\n-        SnapshotId s2 = new SnapshotId(\"s2\", \"s2-uuid\");\n-        SnapshotId s3 = new SnapshotId(\"s3\", \"s3-uuid\");\n-        ActionListener<Void> listener = ActionListener.noop();\n-        final long s1StartTime = threadPool.absoluteTimeInMillis();\n-        final long s2StartTime = s1StartTime + randomLongBetween(1, 1000);\n-        SnapshotShardContext s1Context = dummyContext(s1, s1StartTime);\n-        SnapshotShardContext s2Context = dummyContext(s2, s2StartTime);\n-        SnapshotShardContext s3Context = dummyContext(s3, s2StartTime);\n-        // Shard snapshot and file snapshot tasks for earlier snapshots have higher priority\n-        assertThat(\n-            workers.new ShardSnapshotTask(s1Context).compareTo(\n-                workers.new FileSnapshotTask(s2Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener)\n-            ),\n-            lessThan(0)\n-        );\n-        assertThat(\n-            workers.new FileSnapshotTask(s1Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener).compareTo(\n-                workers.new ShardSnapshotTask(s2Context)\n-            ),\n-            lessThan(0)\n-        );\n-        // Two tasks with the same start time and of the same type are ordered by snapshot UUID\n-        assertThat(workers.new ShardSnapshotTask(s2Context).compareTo(workers.new ShardSnapshotTask(s3Context)), lessThan(0));\n-        assertThat(\n-            workers.new FileSnapshotTask(s2Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener).compareTo(\n-                workers.new ShardSnapshotTask(s3Context)\n-            ),\n-            lessThan(0)\n-        );\n-        // Shard snapshot task has a higher priority over file snapshot within the same snapshot\n-        assertThat(\n-            workers.new ShardSnapshotTask(s1Context).compareTo(\n-                workers.new FileSnapshotTask(s1Context, ShardSnapshotTaskRunnerTests::dummyFileInfo, listener)\n-            ),\n-            lessThan(0)\n-        );\n+\n+        record CapturedTask(SnapshotShardContext context, @Nullable BlobStoreIndexShardSnapshot.FileInfo fileInfo) {\n+            CapturedTask(SnapshotShardContext context) {\n+                this(context, null);\n+            }\n+        }\n+\n+        final List<CapturedTask> tasksInExpectedOrder = new ArrayList<>();\n+\n+        // first snapshot, one shard, one file, but should execute the shard-level task before the file task\n+        final var earlyStartTime = randomLongBetween(1L, Long.MAX_VALUE - 1000);\n+        final var s1Context = dummyContext(new SnapshotId(randomIdentifier(), randomUUID()), earlyStartTime);\n+        tasksInExpectedOrder.add(new CapturedTask(s1Context));\n+        tasksInExpectedOrder.add(new CapturedTask(s1Context, dummyFileInfo()));\n+\n+        // second snapshot, also one shard and one file, starts later than the first\n+        final var laterStartTime = randomLongBetween(earlyStartTime + 1, Long.MAX_VALUE);\n+        final var s2Context = dummyContext(new SnapshotId(randomIdentifier(), \"early-uuid\"), laterStartTime);\n+        tasksInExpectedOrder.add(new CapturedTask(s2Context));\n+        tasksInExpectedOrder.add(new CapturedTask(s2Context, dummyFileInfo()));\n+\n+        // third snapshot, starts at the same time as the second but has a later UUID\n+        final var snapshotId3 = new SnapshotId(randomIdentifier(), \"later-uuid\");\n+\n+        // the third snapshot has three shards, and their respective tasks should execute in shard-id then index-name order:",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 185,
+      "original_line": 185,
+      "side": "RIGHT",
+      "original_position": 112,
+      "position": 112,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1704294300,
+          "user": "DaveCTurner",
+          "body": "Here:\r\n\r\nhttps://github.com/elastic/elasticsearch/blob/c16f2c9f877de8d31afc8cb9936d2b249b4be63f/server/src/main/java/org/elasticsearch/index/shard/ShardId.java#L117\r\n\r\n(in `ShardId#compareTo`)",
+          "created_at": "2024-08-05T15:27:38Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1704285511,
+      "created_at": "2024-08-05T15:21:12Z",
+      "user": "DiannaHohensee",
+      "body": "Could you point me at the code where this happens? And is it the case that starting the shard snapshots AFTER finishing uploading files won't be noop shard snapshots?\r\n\r\nI'm mostly thinking about the cases where later snapshots complete shard snapshots even if the older snapshots aren't done. It'd be nice to know for sure that those later ones aren't ever doing work.",
+      "path": "server/src/main/java/org/elasticsearch/repositories/blobstore/ShardSnapshotTaskRunner.java",
+      "diff_hunk": "@@ -38,23 +39,41 @@ public class ShardSnapshotTaskRunner {\n     private final CheckedBiConsumer<SnapshotShardContext, FileInfo, IOException> fileSnapshotter;\n \n     abstract static class SnapshotTask extends AbstractRunnable implements Comparable<SnapshotTask> {\n-\n-        private static final Comparator<SnapshotTask> COMPARATOR = Comparator.comparingLong(\n-            (SnapshotTask t) -> t.context().snapshotStartTime()\n-        ).thenComparing(t -> t.context().snapshotId().getUUID()).thenComparingInt(SnapshotTask::priority);\n-\n         protected final SnapshotShardContext context;\n \n         SnapshotTask(SnapshotShardContext context) {\n             this.context = context;\n         }\n \n+        public final SnapshotShardContext context() {\n+            return context;\n+        }\n+\n+        private long getSnapshotStartTime() {\n+            return context().snapshotStartTime();\n+        }\n+\n+        private String snapshotUUID() {\n+            return context().snapshotId().getUUID();\n+        }\n+\n         public abstract int priority();\n \n-        public SnapshotShardContext context() {\n-            return context;\n+        @SuppressWarnings(\"resource\")\n+        private ShardId shardId() {\n+            return context().store().shardId();\n         }\n \n+        private static final Comparator<SnapshotTask> COMPARATOR = Comparator\n+            // Prefer work from the oldest running snapshot ...\n+            .comparingLong(SnapshotTask::getSnapshotStartTime)\n+            // ... tiebreaking on UUID just in case two of them start at the same millisecond ...\n+            .thenComparing(SnapshotTask::snapshotUUID)\n+            // ... then prefer starting new shard snapshots over uploading files for ongoing ones (for fast noop shard snapshots) ...",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 72,
+      "original_line": 72,
+      "side": "RIGHT",
+      "original_position": 49,
+      "position": 49,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1704296849,
+          "user": "DaveCTurner",
+          "body": "> Could you point me at the code where this happens?\r\n\r\nWhat happens exactly? The code that prefers to start new shard snapshots over uploading files is the line that sorts by `SnapshotTask::priority`.\r\n\r\n> I'm mostly thinking about the cases where later snapshots complete shard snapshots even if the older snapshots aren't done. It'd be nice to know for sure that those later ones aren't ever doing work.\r\n\r\nI mean they could be doing work occasionally, if e.g. there are 10 threads and 9 of them are doing the last 9 tasks for an older snapshot, the free thread will start on the next task in the queue for the newer snapshot.",
+          "created_at": "2024-08-05T15:29:34Z"
+        },
+        {
+          "id": 1704410232,
+          "user": "DiannaHohensee",
+          "body": "Sorry, I was burying the purpose of my questions. The point I was trying to get at is whether prioritizing new shard snapshots is best, instead of prioritizing file uploads and the completion of existing shard snapshots.",
+          "created_at": "2024-08-05T17:06:08Z"
+        },
+        {
+          "id": 1704411392,
+          "user": "DiannaHohensee",
+          "body": "It doesn't seem obvious that the next snapshot of a shard will be a noop, whenever it gets scheduled, sooner vs later, because it could already have been a while since the first snapshot of that shard started.",
+          "created_at": "2024-08-05T17:07:19Z"
+        },
+        {
+          "id": 1704413213,
+          "user": "DiannaHohensee",
+          "body": "I wonder if it would be better to prioritize finishing file uploads of existing shard snapshots. Focus on getting one good overall snapshot, not spreading resources out to other snapshots.",
+          "created_at": "2024-08-05T17:09:11Z"
+        },
+        {
+          "id": 1704414277,
+          "user": "DaveCTurner",
+          "body": "Yeah that's ok, we run one task to start the shard snapshot but then all its file upload tasks get queued up behind other earlier shards' work.",
+          "created_at": "2024-08-05T17:10:13Z"
+        },
+        {
+          "id": 1704426628,
+          "user": "DaveCTurner",
+          "body": "> I wonder if it would be better to prioritize finishing file uploads of existing shard snapshots.\r\n\r\nAFAICT it doesn't matter, or at least there are fairly balanced pros and cons either way. The `ShardSnapshotTask` tasks are much more lightweight than the `FileSnapshotTask` ones so they don't meaningfully add to the WIP we're interested in limiting in this PR; meanwhile it'll save work overall to run them sooner.",
+          "created_at": "2024-08-05T17:22:57Z"
+        },
+        {
+          "id": 1704428053,
+          "user": "DiannaHohensee",
+          "body": "It could be thousands of shards in a new snapshot request that we prioritize starting up instead of running file uploads for an older snapshot.\r\n\r\nWe don't have any stats on this edge case, though, and the behavior in unchanged by this patch, so seems fine to go forward with 👍 ",
+          "created_at": "2024-08-05T17:24:23Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2219268331,
+      "created_at": "2024-08-05T15:24:40Z",
+      "user": "DiannaHohensee",
+      "state": "COMMENTED",
+      "body": "Nice change, I left some questions."
+    },
+    {
+      "type": "review",
+      "id": 2219297651,
+      "created_at": "2024-08-05T15:27:38Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219302081,
+      "created_at": "2024-08-05T15:29:34Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219490526,
+      "created_at": "2024-08-05T17:06:08Z",
+      "user": "DiannaHohensee",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219492412,
+      "created_at": "2024-08-05T17:07:19Z",
+      "user": "DiannaHohensee",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219495396,
+      "created_at": "2024-08-05T17:09:11Z",
+      "user": "DiannaHohensee",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219497099,
+      "created_at": "2024-08-05T17:10:13Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219517512,
+      "created_at": "2024-08-05T17:22:57Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2219519835,
+      "created_at": "2024-08-05T17:24:28Z",
+      "user": "DiannaHohensee",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2269557116,
+      "created_at": "2024-08-05T17:25:56Z",
+      "user": "DaveCTurner",
+      "body": "> It could be thousands of shards in a new snapshot request that we prioritize starting up instead of running file uploads for an older snapshot.\r\n\r\nNono we sort by snapshot start time first in any case, we're only talking here about the priority of tasks within a single snapshot."
+    },
+    {
+      "type": "comment",
+      "id": 2269572740,
+      "created_at": "2024-08-05T17:35:00Z",
+      "user": "DiannaHohensee",
+      "body": "> Nono we sort by snapshot start time first in any case, we're only talking here about the priority of tasks within a single snapshot.\r\n\r\nOh, right. Then we'd still be starting possibly thousands of shard snapshots, within the same overall snapshot, and we'd need to interrupt them all for shutdown regardless of progress? I'm not familiar with the mechanics of each particular step, so maybe that's cheap (no network calls) to do and irrelevant."
+    },
+    {
+      "type": "comment",
+      "id": 2269596631,
+      "created_at": "2024-08-05T17:50:30Z",
+      "user": "DaveCTurner",
+      "body": "When interrupted I think it'd be the almost exactly the same amount of work either way."
+    },
+    {
+      "type": "comment",
+      "id": 2269729176,
+      "created_at": "2024-08-05T19:08:03Z",
+      "user": "DiannaHohensee",
+      "body": "Cool, thanks for clarifying"
+    }
+  ]
+}

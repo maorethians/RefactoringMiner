@@ -1,0 +1,58 @@
+{
+    "pr_body": "[Design doc](https://docs.google.com/document/d/1wM61xufcMS5W0LQ0ar5JBREiN9zKfgu6AnHVD7BSkR4/edit)\r\n\r\nFixes #10880.\r\n\r\nWorking towards #8250.\r\n\r\n",
+    "original_commit_id": "850b33430edbe188249a9dde784271fbd8919c7f",
+    "merged": false,
+    "pr_number": 16660,
+    "pr_title": "Implement a lease service to support remote cache eviction",
+    "lang": "java",
+    "full_name": "bazelbuild/bazel",
+    "pr_comment": [
+        "@alexjski: this is not ready yet but want to get some inputs from you about the changes to `FilesystemValueChecker`.\r\n\r\nThere are two ways to check the TTL for a remote metadata:\r\n1. We call an API provided by the remote service when checking, cache the query result.\r\n2. We agree on a const TTL with the service ahead of time (e.g. use a flag `--remote-cache-ttl=3600s`). When we get the metadata from the remote service, we assume the service will keep the file alive at least for `3600s`.\r\n\r\nThis PR goes with option 2. We save the TTL into the remote metadata and check whether it is still alive before we use it.",
+        "I learnt that some servers would like to set the TTL to `0` due to storage constrains. In this case, for an incremental build, this change makes Bazel ignore cached remote metadata if the files didn't get downloaded in the during previous build and check for the remote cache again.",
+        "During the REAPI meeting we all agreed that it's assumed that build artifacts will continue to exist for the duration of a build. It's on the remote cache to ensure that is the case.",
+        "> Is there a general concern that for slow builds, a file can expire in the middle of it?\r\n\r\nThis is not the concern for this PR at least. Like Brentley mentioned above, most remote cache will ensure the files are available during the build. Bazel will complain and crash if remote cache failed to that. Action rewinding will improve that but in the worst case, it will result in a endless loop (or reach the max rewinding time and crash).\r\n\r\n> We do check the files at the beginning, but that doesn't seem to be updating the leases. \r\n\r\nWe renew the lease by invalidating the skyframe node, by-passing action cache and re-executing the action. Within the execution, we either check remote cache (and get the cache hit if the files are still available) or re-execute the action remotely. In both cases, we inject the metadata with a new expiration.\r\n\r\n",
+        "> > Is there a general concern that for slow builds, a file can expire in the middle of it?\r\n> \r\n> This is not the concern for this PR at least. Like Brentley mentioned above, most remote cache will ensure the files are available during the build. Bazel will complain and crash if remote cache failed to that. Action rewinding will improve that but in the worst case, it will result in a endless loop (or reach the max rewinding time and crash).\r\n\r\nCan you explain the principle behind what guarantees that the files will remain for the duration of the build?\r\n\r\n> most remote cache will ensure the files are available during the build\r\n\r\nIs there code which tracks all remote metadata and proactively renews the leases with RBE in Bazel? Can you point me to that?\r\n\r\n> \r\n> > We do check the files at the beginning, but that doesn't seem to be updating the leases.\r\n> \r\n> We renew the lease by invalidating the skyframe node, by-passing action cache and re-executing the action. Within the execution, we either check remote cache (and get the cache hit if the files are still available) or re-execute the action remotely. In both cases, we inject the metadata with a new expiration.\r\n\r\nI think you looked at the opposite case I was thinking about. If the file still has TTL, do we renew the lease for it? Is the assumption that Bazel side TTL is so much lower that the build is guaranteed to finish before that?",
+        "I think you are right, we can't avoid having a lease service to track all the remote metadata. I will update the code.",
+        "> I think you are right, we can't avoid having a lease service to track all the remote metadata. I will update the code.\r\n\r\nGood question if all this is doing is preventing rewinding. But yeah, if you had a background thread updating those, then the `FileSystemValueChecker` is not a big deal. In fact, all you would care about is for action cache not to introduce a stale file.\r\n\r\nThis background refresh may be a little problematic given it may leak memory (old outputs). You may consider some tricks with weak references to alleviate that. Anyway, that smells of complexity, so please use your judgement (if an occasional rewind works, maybe that's a good enough start?).",
+        "I have updated the [design doc](https://docs.google.com/document/d/1wM61xufcMS5W0LQ0ar5JBREiN9zKfgu6AnHVD7BSkR4/edit) with implementation details and the progress for 6.1. Please have a look if you are interested.",
+        "This PR has been merged in the forms of small CLs. Closing.",
+        "@coeuvre Does that mean `last_green` has the lease service, and we can test it there?",
+        "See #22592 (--experimental_remote_cache_ttl=0s breaks --remote_download_outputs=toplevel (Build without the Bytes))"
+    ],
+    "commit_id": "b58f1b3d4c675a1cd4f083bac9bf97720942da9b",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 52,
+            "start_side": "RIGHT",
+            "start_line": 44,
+            "line": 52,
+            "comment_lines": [
+                "[][44]",
+                "[][45]",
+                "[][46]",
+                "[][47]",
+                "[][48]",
+                "[][49]",
+                "[][50]",
+                "[][51]",
+                "[][52]"
+            ],
+            "review_comment": [
+                "I think this should say what setting this to `0` does. Also, I think the default should be `0`.",
+                "I will add more details and what the behaviour of setting this to `0` after I nail down all the implementation details.\r\n\r\nI agree `2h` is probably not a good default but `0` isn't neither. Probably we should default to `null` which means Bazel assume the blobs will never expire (just like what it does today).",
+                "I disagree that null is a good default. It would mean the reported bug isn't fixed for people unless they set a value here. I think 0 is the best default: bazel will recheck on each build. If you want to optimize it, because you know your remote cache can keep things around for a certain time, you can increase it.\n\nHaving 0 as a default is a nice middle ground: the default situation means people no longer run into the bug, which makes BwtB much more usable, while allowing remote cache maintainers to advise on a value to set for their users.",
+                "Setting to `0` will have extremely bad incremental build performance: Bazel have to invalidate all in-memory cache and call `GetActionResult` on every action.",
+                "Once per build, right?\n\nIf it can't be 0, then a low non-zero value is better than null. In that case I'm supportive of a couple hours. Maybe have it default to whatever the value of https://bazel.build/reference/command-line-reference#flag--max_idle_secs is?",
+                "> Once per build, right?\r\n\r\nyes, once per action per build.\r\n\r\n\r\n\r\n> If it can't be 0, then a low non-zero value is better than null. In that case I'm supportive of a couple hours. Maybe have it default to whatever the value of https://bazel.build/reference/command-line-reference#flag--max_idle_secs is?\r\n\r\nNot sure. I will find a good default value once this PR is finalized."
+            ],
+            "path": "src/main/java/com/google/devtools/build/lib/remote/options/CommonRemoteOptions.java",
+            "id": 20474,
+            "created_at": "2022-11-09T17:55:45Z",
+            "original_position": 32,
+            "side": "RIGHT",
+            "position": 32,
+            "original_start_line": 44
+        }
+    ]
+}

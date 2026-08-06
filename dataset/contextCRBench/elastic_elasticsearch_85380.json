@@ -1,0 +1,126 @@
+{
+    "pr_body": "Fixes a few scalability issues around join validation:\r\n\r\n- compresses the cluster state sent over the wire\r\n- shares the serialized cluster state across multiple nodes\r\n- forks the decompression/deserialization work off the transport thread\r\n\r\nRelates #77466\r\nCloses #83204",
+    "original_commit_id": "54fe403251034eb0afea1e818260e232654ddd5b",
+    "merged": true,
+    "pr_number": 85380,
+    "pr_title": "Reduce resource needs of join validation",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Hi @DaveCTurner, I've created a changelog YAML for you.",
+        "Still needs work on the tests (see AwaitsFix annotations) but I'm opening this to get some CI attention. I doubt I'll get this in for 8.2.",
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Think this is good to go now.\r\n\r\nNote that it changes the semantics of join validation slightly: we obviously don't send the latest state each time any more, it might be up to 60s stale. Also we used to be certain that the sender was marked as the master in the state we sent, but that's no longer the case since we get the state twice. I don't think these are meaningful changes, but worth pointing out anyway.",
+        "Thanks both!"
+    ],
+    "commit_id": "3af680bb60da770d666cee2410eff5b33d68f3d8",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 78,
+            "start_side": null,
+            "start_line": null,
+            "line": 73,
+            "comment_lines": [
+                "[][73]"
+            ],
+            "review_comment": [
+                "Could this be called multiple times?\r\nIf so then input would be read more then once. Should we consider `LazyInitializable` here?",
+                "It is only called once so I think this is fine. I renamed it in fd908df6b82b7f12105b044f5f2b2528cc8dd66a to `getOrReadState` just to make it a bit clearer that this might be more than a simple getter."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/coordination/ValidateJoinRequest.java",
+            "id": 35534,
+            "created_at": "2022-04-12T07:07:53Z",
+            "original_position": 76,
+            "side": "RIGHT",
+            "position": 71,
+            "original_start_line": null
+        },
+        {
+            "original_line": 322,
+            "start_side": null,
+            "start_line": null,
+            "line": 322,
+            "comment_lines": [
+                "[][322]"
+            ],
+            "review_comment": [
+                "This seems cheap enough to just run on the scheduler thread?",
+                "It's not guaranteed I think, a concurrent `execute()` call could enqueue an expensive `JoinValidation` before our `cacheClearer` which we end up running:\r\n\r\n```mermaid\r\nsequenceDiagram\r\n    actor Us\r\n    participant Queue\r\n    actor Other thread\r\n    Other thread ->> Queue: Add JoinValidation\r\n    Us ->> Queue: Add cacheCleaner\r\n    Queue ->>+ Us: queueSize.cas(0,1), run tasks\r\n    Queue ->> Other thread: queueSize.cas(1, 2), stop\r\n    Us ->> Queue: JoinValidation completed, queueSize.cas(2, 1), keep going\r\n    Us ->>- Queue: cacheCleaner completed, queueSize.cas(1, 0), stop\r\n```"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/coordination/JoinValidationService.java",
+            "id": 35538,
+            "created_at": "2022-04-26T09:56:22Z",
+            "original_position": 322,
+            "side": "RIGHT",
+            "position": 322,
+            "original_start_line": null
+        },
+        {
+            "original_line": 331,
+            "start_side": "RIGHT",
+            "start_line": 359,
+            "line": 364,
+            "comment_lines": [
+                "[][359]",
+                "[][360]",
+                "[][361]",
+                "[][362]",
+                "[][363]",
+                "[][364]"
+            ],
+            "review_comment": [
+                "Could this be converted to an unconditional catch or am I missing something?",
+                "I think it's better to close resources in a `finally` like this. For instance this will close the stream in tests even if an assertion trips, which we need to do to avoid tripping the leak detector later on. To get the same effect with a catch block we'd need to `catch (Throwable t)` which is not permitted.",
+                "(on closer inspection I see that on an assertion error we would leak the rest of the queue anyway, see 3af680bb60da)"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/coordination/JoinValidationService.java",
+            "id": 35535,
+            "created_at": "2022-04-12T07:43:52Z",
+            "original_position": 331,
+            "side": "RIGHT",
+            "position": 364,
+            "original_start_line": 326
+        },
+        {
+            "original_line": 69,
+            "start_side": null,
+            "start_line": null,
+            "line": 69,
+            "comment_lines": [
+                "[][69]"
+            ],
+            "review_comment": [
+                "Just a comment, this change is still a winner regardless :) :  \r\n\r\nThis is such an unfortunate pattern that we have in a couple of spots. Instead of copying the bytes we should really be able to just use them outright by incrementing ref count like we do for `BytesTransportRequest` during publication.\r\nThis effectively doubles the memory use relative what we actually need for the full state compressed on heap and still scales in O(N) in the number of nodes we work with.\r\nI'll see if we can clean this up in some neat way now that we only have Netty to worry about :)",
+                "NB `assert out.getVersion().before(Version.V_8_3_0);` we only call this if the target node doesn't support the new wire format, i.e. the cluster is in the middle of a rolling upgrade. I don't think it's worth optimising this case."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/coordination/ValidateJoinRequest.java",
+            "id": 35537,
+            "created_at": "2022-04-26T09:53:54Z",
+            "original_position": 67,
+            "side": "RIGHT",
+            "position": 67,
+            "original_start_line": null
+        },
+        {
+            "original_line": 346,
+            "start_side": null,
+            "start_line": null,
+            "line": 346,
+            "comment_lines": [
+                "[][346]"
+            ],
+            "review_comment": [
+                "Shouldn't this be an `assert false;`? We should never have a state that we fail to serialize to some version?",
+                "Mmm possibly, especially with an `IOException`, but in general exceptions during serialization are the last line of defence if there's some new feature that simply can't be represented in an older version. It's definitely better to avoid using new features in mixed clusters where possible but it's not a hard constraint."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/coordination/JoinValidationService.java",
+            "id": 35536,
+            "created_at": "2022-04-26T09:48:00Z",
+            "original_position": 346,
+            "side": "RIGHT",
+            "position": 346,
+            "original_start_line": null
+        }
+    ]
+}

@@ -1,0 +1,170 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 87248,
+  "pr_number": 87248,
+  "title": "Do not retry client requests when failing with ContentTooLargeException",
+  "user": "swallez",
+  "created_at": "2022-05-31T12:49:07Z",
+  "merged_at": "2022-05-31T14:48:41Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Clients/Java Low Level REST Client",
+    "Team:Clients",
+    "external-contributor",
+    "v6.8.24",
+    "v7.17.5",
+    "v8.4.0",
+    "v8.3.1"
+  ],
+  "base_commit": "a7779212841915c060b98d6097688a438031d79e",
+  "merge_commit_sha": "4d2929bb281fb984c0176a59f76a886552b95ff7",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "labeled",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/87248",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-05-31T12:32:44Z",
+      "sha": "9919a3cc5d098f69dd028839e03ef00dc43139ee",
+      "message": "Do not retry client requests when failing with ContentTooLargeException",
+      "author": "Sylvain Wallez",
+      "author_email": "sylvain@elastic.co",
+      "author_raw_date": "2022-05-31T12:32:44Z",
+      "author_date": "2022-05-31T12:32:44Z",
+      "committer": "Sylvain Wallez",
+      "committer_email": "sylvain@elastic.co",
+      "raw_date": "2022-05-31T12:32:44Z",
+      "diff_text": "client/rest/src/main/java/org/elasticsearch/client/RestClient.java\n@@ -21,6 +21,7 @@\n import org.apache.commons.logging.Log;\n import org.apache.commons.logging.LogFactory;\n import org.apache.http.ConnectionClosedException;\n+import org.apache.http.ContentTooLongException;\n import org.apache.http.Header;\n import org.apache.http.HttpEntity;\n import org.apache.http.HttpHost;\n@@ -298,7 +299,7 @@ private Response performRequest(final NodeTuple<Iterator<Node>> tuple, final Int\n             onFailure(context.node);\n             Exception cause = extractAndWrapCause(e);\n             addSuppressedException(previousException, cause);\n-            if (tuple.nodes.hasNext()) {\n+            if (isRetryableException(e) && tuple.nodes.hasNext()) {\n                 return performRequest(tuple, request, cause);\n             }\n             if (cause instanceof IOException) {\n@@ -414,7 +415,7 @@ public void failed(Exception failure) {\n                     try {\n                         RequestLogger.logFailedRequest(logger, request.httpRequest, context.node, failure);\n                         onFailure(context.node);\n-                        if (tuple.nodes.hasNext()) {\n+                        if (isRetryableException(failure) && tuple.nodes.hasNext()) {\n                             listener.trackFailure(failure);\n                             performRequestAsync(tuple, request, listener);\n                         } else {\n@@ -563,6 +564,19 @@ private static boolean isSuccessfulResponse(int statusCode) {\n         return statusCode < 300;\n     }\n \n+    /**\n+     * Should an exception cause retrying the request?\n+     */\n+    private static boolean isRetryableException(Throwable e) {\n+        if (e instanceof ExecutionException) {\n+            e = e.getCause();\n+        }\n+        if (e instanceof ContentTooLongException) {\n+            return false;\n+        }\n+        return true;\n+    }\n+\n     private static boolean isRetryStatus(int statusCode) {\n         switch (statusCode) {\n             case 502:\nclient/rest/src/test/java/org/elasticsearch/client/RestClientMultipleHostsIntegTests.java\n@@ -31,16 +31,19 @@\n import org.junit.Ignore;\n \n import java.io.IOException;\n+import java.io.OutputStream;\n import java.net.ConnectException;\n import java.net.InetAddress;\n import java.net.InetSocketAddress;\n+import java.nio.charset.StandardCharsets;\n import java.util.ArrayList;\n import java.util.Iterator;\n import java.util.List;\n import java.util.concurrent.CancellationException;\n import java.util.concurrent.CopyOnWriteArrayList;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n \n import static org.elasticsearch.client.RestClientTestUtil.getAllStatusCodes;\n import static org.elasticsearch.client.RestClientTestUtil.randomErrorNoRetryStatusCode;\n@@ -86,10 +89,17 @@ public static void startHttpServer() throws Exception {\n     }\n \n     private static RestClient buildRestClient(NodeSelector nodeSelector) {\n+        return buildRestClient(nodeSelector, null);\n+    }\n+\n+    private static RestClient buildRestClient(NodeSelector nodeSelector, RestClient.FailureListener failureListener) {\n         RestClientBuilder restClientBuilder = RestClient.builder(httpHosts);\n         if (pathPrefix.length() > 0) {\n             restClientBuilder.setPathPrefix((randomBoolean() ? \"/\" : \"\") + pathPrefixWithoutLeadingSlash);\n         }\n+        if (failureListener != null) {\n+            restClientBuilder.setFailureListener(failureListener);\n+        }\n         restClientBuilder.setNodeSelector(nodeSelector);\n         return restClientBuilder.build();\n     }\n@@ -101,6 +111,7 @@ private static HttpServer createHttpServer() throws Exception {\n         for (int statusCode : getAllStatusCodes()) {\n             httpServer.createContext(pathPrefix + \"/\" + statusCode, new ResponseHandler(statusCode));\n         }\n+        httpServer.createContext(pathPrefix + \"/20bytes\", new ResponseHandlerWithContent());\n         httpServer.createContext(pathPrefix + \"/wait\", waitForCancelHandler);\n         return httpServer;\n     }\n@@ -153,6 +164,18 @@ public void handle(HttpExchange httpExchange) throws IOException {\n         }\n     }\n \n+    private static class ResponseHandlerWithContent implements HttpHandler {\n+        @Override\n+        public void handle(HttpExchange httpExchange) throws IOException {\n+            byte[] body = \"01234567890123456789\".getBytes(StandardCharsets.UTF_8);\n+            httpExchange.sendResponseHeaders(200, body.length);\n+            try (OutputStream out = httpExchange.getResponseBody()) {\n+                out.write(body);\n+            }\n+            httpExchange.close();\n+        }\n+    }\n+\n     @AfterClass\n     public static void stopHttpServers() throws IOException {\n         restClient.close();\n@@ -303,6 +326,32 @@ public void testNodeSelector() throws Exception {\n         }\n     }\n \n+    public void testNonRetryableException() throws Exception {\n+        RequestOptions.Builder options = RequestOptions.DEFAULT.toBuilder();\n+        options.setHttpAsyncResponseConsumerFactory(\n+            // Limit to very short responses to trigger a ContentTooLongException\n+            () -> new HeapBufferedAsyncResponseConsumer(10)\n+        );\n+\n+        AtomicInteger failureCount = new AtomicInteger();\n+        RestClient client = buildRestClient(NodeSelector.ANY, new RestClient.FailureListener() {\n+            @Override\n+            public void onFailure(Node node) {\n+                failureCount.incrementAndGet();\n+            }\n+        });\n+\n+        failureCount.set(0);\n+        Request request = new Request(\"POST\", \"/20bytes\");\n+        request.setOptions(options);\n+        try {\n+            RestClientSingleHostTests.performRequestSyncOrAsync(client, request);\n+            fail(\"Request should not succeed\");\n+        } catch (IOException e) {\n+            assertEquals(stoppedFirstHost ? 2 : 1, failureCount.intValue());\n+        }\n+    }\n+\n     private static class TestResponse {\n         private final String method;\n         private final int statusCode;",
+      "diff": [
+        {
+          "file": "client/rest/src/main/java/org/elasticsearch/client/RestClient.java",
+          "patch": "@@ -21,6 +21,7 @@\n import org.apache.commons.logging.Log;\n import org.apache.commons.logging.LogFactory;\n import org.apache.http.ConnectionClosedException;\n+import org.apache.http.ContentTooLongException;\n import org.apache.http.Header;\n import org.apache.http.HttpEntity;\n import org.apache.http.HttpHost;\n@@ -298,7 +299,7 @@ private Response performRequest(final NodeTuple<Iterator<Node>> tuple, final Int\n             onFailure(context.node);\n             Exception cause = extractAndWrapCause(e);\n             addSuppressedException(previousException, cause);\n-            if (tuple.nodes.hasNext()) {\n+            if (isRetryableException(e) && tuple.nodes.hasNext()) {\n                 return performRequest(tuple, request, cause);\n             }\n             if (cause instanceof IOException) {\n@@ -414,7 +415,7 @@ public void failed(Exception failure) {\n                     try {\n                         RequestLogger.logFailedRequest(logger, request.httpRequest, context.node, failure);\n                         onFailure(context.node);\n-                        if (tuple.nodes.hasNext()) {\n+                        if (isRetryableException(failure) && tuple.nodes.hasNext()) {\n                             listener.trackFailure(failure);\n                             performRequestAsync(tuple, request, listener);\n                         } else {\n@@ -563,6 +564,19 @@ private static boolean isSuccessfulResponse(int statusCode) {\n         return statusCode < 300;\n     }\n \n+    /**\n+     * Should an exception cause retrying the request?\n+     */\n+    private static boolean isRetryableException(Throwable e) {\n+        if (e instanceof ExecutionException) {\n+            e = e.getCause();\n+        }\n+        if (e instanceof ContentTooLongException) {\n+            return false;\n+        }\n+        return true;\n+    }\n+\n     private static boolean isRetryStatus(int statusCode) {\n         switch (statusCode) {\n             case 502:"
+        },
+        {
+          "file": "client/rest/src/test/java/org/elasticsearch/client/RestClientMultipleHostsIntegTests.java",
+          "patch": "@@ -31,16 +31,19 @@\n import org.junit.Ignore;\n \n import java.io.IOException;\n+import java.io.OutputStream;\n import java.net.ConnectException;\n import java.net.InetAddress;\n import java.net.InetSocketAddress;\n+import java.nio.charset.StandardCharsets;\n import java.util.ArrayList;\n import java.util.Iterator;\n import java.util.List;\n import java.util.concurrent.CancellationException;\n import java.util.concurrent.CopyOnWriteArrayList;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicInteger;\n \n import static org.elasticsearch.client.RestClientTestUtil.getAllStatusCodes;\n import static org.elasticsearch.client.RestClientTestUtil.randomErrorNoRetryStatusCode;\n@@ -86,10 +89,17 @@ public static void startHttpServer() throws Exception {\n     }\n \n     private static RestClient buildRestClient(NodeSelector nodeSelector) {\n+        return buildRestClient(nodeSelector, null);\n+    }\n+\n+    private static RestClient buildRestClient(NodeSelector nodeSelector, RestClient.FailureListener failureListener) {\n         RestClientBuilder restClientBuilder = RestClient.builder(httpHosts);\n         if (pathPrefix.length() > 0) {\n             restClientBuilder.setPathPrefix((randomBoolean() ? \"/\" : \"\") + pathPrefixWithoutLeadingSlash);\n         }\n+        if (failureListener != null) {\n+            restClientBuilder.setFailureListener(failureListener);\n+        }\n         restClientBuilder.setNodeSelector(nodeSelector);\n         return restClientBuilder.build();\n     }\n@@ -101,6 +111,7 @@ private static HttpServer createHttpServer() throws Exception {\n         for (int statusCode : getAllStatusCodes()) {\n             httpServer.createContext(pathPrefix + \"/\" + statusCode, new ResponseHandler(statusCode));\n         }\n+        httpServer.createContext(pathPrefix + \"/20bytes\", new ResponseHandlerWithContent());\n         httpServer.createContext(pathPrefix + \"/wait\", waitForCancelHandler);\n         return httpServer;\n     }\n@@ -153,6 +164,18 @@ public void handle(HttpExchange httpExchange) throws IOException {\n         }\n     }\n \n+    private static class ResponseHandlerWithContent implements HttpHandler {\n+        @Override\n+        public void handle(HttpExchange httpExchange) throws IOException {\n+            byte[] body = \"01234567890123456789\".getBytes(StandardCharsets.UTF_8);\n+            httpExchange.sendResponseHeaders(200, body.length);\n+            try (OutputStream out = httpExchange.getResponseBody()) {\n+                out.write(body);\n+            }\n+            httpExchange.close();\n+        }\n+    }\n+\n     @AfterClass\n     public static void stopHttpServers() throws IOException {\n         restClient.close();\n@@ -303,6 +326,32 @@ public void testNodeSelector() throws Exception {\n         }\n     }\n \n+    public void testNonRetryableException() throws Exception {\n+        RequestOptions.Builder options = RequestOptions.DEFAULT.toBuilder();\n+        options.setHttpAsyncResponseConsumerFactory(\n+            // Limit to very short responses to trigger a ContentTooLongException\n+            () -> new HeapBufferedAsyncResponseConsumer(10)\n+        );\n+\n+        AtomicInteger failureCount = new AtomicInteger();\n+        RestClient client = buildRestClient(NodeSelector.ANY, new RestClient.FailureListener() {\n+            @Override\n+            public void onFailure(Node node) {\n+                failureCount.incrementAndGet();\n+            }\n+        });\n+\n+        failureCount.set(0);\n+        Request request = new Request(\"POST\", \"/20bytes\");\n+        request.setOptions(options);\n+        try {\n+            RestClientSingleHostTests.performRequestSyncOrAsync(client, request);\n+            fail(\"Request should not succeed\");\n+        } catch (IOException e) {\n+            assertEquals(stoppedFirstHost ? 2 : 1, failureCount.intValue());\n+        }\n+    }\n+\n     private static class TestResponse {\n         private final String method;\n         private final int statusCode;"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-05-31T12:49:07Z",
+      "user": "swallez",
+      "body": "The default configuration of the Low Level Rest Client is to buffer the response body up to 100 MB. If that threshold is exceeded, a `ContentTooLargeException` is thrown in the lower layers of LLRC.\r\n\r\nWhen such an exception occurs, LLRC will retry the request, which has some bad side effects:\r\n- for idempotent requests like a regular search, there's no point in retrying since the response will always be too large.\r\n- for scroll searches, retrying will move to the next scroll slice. With a cluster big enough or a number of scroll slices small enough, retrying may reach the last scroll slice, which is usually be smaller and may fit into the buffer limit. From an application perspective, the request will have succeeded with the last slice as result, despite having effectively skipped a large amount of results.\r\n\r\nThis PR fixes that, by ensuring that no retry happens if a request fails with a `ContentTooLargeException`.\r\n\r\nFixes #86041.\r\n\r\nI added the `v6.8.24` label to backport to 6.8 as this was found by a customer still using 6.8 and even if there's no additional 6.8 release, they may want to use a snapshot version with the fix."
+    },
+    {
+      "type": "comment",
+      "id": 1142092968,
+      "created_at": "2022-05-31T12:49:11Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/clients-team (Team:Clients)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-05-31T12:49:32Z",
+      "sha": "a91440084d4797bcfef3d4fcec6468bb1db732e9",
+      "message": "Update docs/changelog/87248.yaml",
+      "author": "Sylvain Wallez",
+      "author_email": "sylvain@bluxte.net",
+      "author_raw_date": "2022-05-31T12:49:32Z",
+      "author_date": "2022-05-31T12:49:32Z",
+      "committer": "Sylvain Wallez",
+      "committer_email": "sylvain@bluxte.net",
+      "raw_date": "2022-05-31T12:49:32Z",
+      "diff_text": "docs/changelog/87248.yaml\n@@ -0,0 +1,6 @@\n+pr: 87248\n+summary: Do not retry client requests when failing with `ContentTooLargeException`\n+area: Java Low Level REST Client\n+type: bug\n+issues:\n+ - 86041",
+      "diff": [
+        {
+          "file": "docs/changelog/87248.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 87248\n+summary: Do not retry client requests when failing with `ContentTooLargeException`\n+area: Java Low Level REST Client\n+type: bug\n+issues:\n+ - 86041"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1142093386,
+      "created_at": "2022-05-31T12:49:33Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @swallez, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review_comment",
+      "id": 885598553,
+      "created_at": "2022-05-31T12:51:29Z",
+      "user": "nik9000",
+      "body": "I was going to say it'd be better to use the `try` in the caller, but seeing this thing, I get why you didn't.",
+      "path": "client/rest/src/main/java/org/elasticsearch/client/RestClient.java",
+      "diff_hunk": "@@ -563,6 +564,19 @@ private static boolean isSuccessfulResponse(int statusCode) {\n         return statusCode < 300;\n     }\n \n+    /**\n+     * Should an exception cause retrying the request?\n+     */\n+    private static boolean isRetryableException(Throwable e) {\n+        if (e instanceof ExecutionException) {\n+            e = e.getCause();\n+        }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 573,
+      "original_line": 573,
+      "side": "RIGHT",
+      "original_position": 36,
+      "position": 36,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 990391157,
+      "created_at": "2022-05-31T12:52:17Z",
+      "user": "nik9000",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2022-05-31T13:29:28Z",
+      "sha": "19758b5304e3f4dde30801ed0c308a94b559d740",
+      "message": "Close LLRC at test end",
+      "author": "Sylvain Wallez",
+      "author_email": "sylvain@elastic.co",
+      "author_raw_date": "2022-05-31T13:07:08Z",
+      "author_date": "2022-05-31T13:07:08Z",
+      "committer": "Sylvain Wallez",
+      "committer_email": "sylvain@elastic.co",
+      "raw_date": "2022-05-31T13:29:28Z",
+      "diff_text": "client/rest/src/test/java/org/elasticsearch/client/RestClientMultipleHostsIntegTests.java\n@@ -350,6 +350,8 @@ public void onFailure(Node node) {\n         } catch (IOException e) {\n             assertEquals(stoppedFirstHost ? 2 : 1, failureCount.intValue());\n         }\n+\n+        client.close();\n     }\n \n     private static class TestResponse {",
+      "diff": [
+        {
+          "file": "client/rest/src/test/java/org/elasticsearch/client/RestClientMultipleHostsIntegTests.java",
+          "patch": "@@ -350,6 +350,8 @@ public void onFailure(Node node) {\n         } catch (IOException e) {\n             assertEquals(stoppedFirstHost ? 2 : 1, failureCount.intValue());\n         }\n+\n+        client.close();\n     }\n \n     private static class TestResponse {"
+        }
+      ]
+    }
+  ]
+}

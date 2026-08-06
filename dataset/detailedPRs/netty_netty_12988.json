@@ -1,0 +1,214 @@
+{
+  "repo": "netty/netty",
+  "number": 12988,
+  "pr_number": 12988,
+  "title": "HPACK dynamic table size update must happen at the beginning of the h…",
+  "user": "vietj",
+  "created_at": "2022-11-11T09:32:53Z",
+  "merged_at": "2022-11-14T08:32:32Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "76296425f4ee199de6dc3e3e03c40173cc5aa7de",
+  "merge_commit_sha": "ee9bb63aa5382bf9930eb0df4b690286173f126a",
+  "commits": 3,
+  "issue_events": [
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "milestoned",
+    "referenced",
+    "merged",
+    "closed",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "head_ref_deleted",
+    "referenced"
+  ],
+  "url": "https://github.com/netty/netty/pull/12988",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-11-11T09:31:04Z",
+      "sha": "7a821d0621c1d415fde66a81a3dd7f6a11d3e8db",
+      "message": "HPACK dynamic table size update must happen at the beginning of the header block\n\nMotivation:\n\nHpackDecoder accepts dynamic table size updates at any stage of a header block. Such modification should always happen before the table is modified as per RFC 7541.\n\nModifications:\n\nCheck the header block first for dynamic table size updates in a separate method. Then reject any table size update when processing unpacking the rest of the block. Dynamic table size update could have been done with the current switch/case but it requires to keep track of the modifications which is not hard but introduces complexity in the loop (a simple boolean that must be switched for any modification but the table size update). Instead a table size update is achieved first in a simpler loop and then any table size update is rejected.\n\nResult:\n\nFixes #12981",
+      "author": "Julien Viet",
+      "author_email": "julien@julienviet.com",
+      "author_raw_date": "2022-11-10T16:44:32Z",
+      "author_date": "2022-11-10T16:44:32Z",
+      "committer": "Julien Viet",
+      "committer_email": "julien@julienviet.com",
+      "raw_date": "2022-11-11T09:31:04Z",
+      "diff_text": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java\n@@ -79,15 +79,14 @@ final class HpackDecoder {\n             Http2Exception.newStatic(COMPRESSION_ERROR, \"HPACK - max dynamic table size change required\",\n                     Http2Exception.ShutdownHint.HARD_SHUTDOWN, HpackDecoder.class, \"decode(..)\");\n     private static final byte READ_HEADER_REPRESENTATION = 0;\n-    private static final byte READ_MAX_DYNAMIC_TABLE_SIZE = 1;\n-    private static final byte READ_INDEXED_HEADER = 2;\n-    private static final byte READ_INDEXED_HEADER_NAME = 3;\n-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH_PREFIX = 4;\n-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH = 5;\n-    private static final byte READ_LITERAL_HEADER_NAME = 6;\n-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX = 7;\n-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 8;\n-    private static final byte READ_LITERAL_HEADER_VALUE = 9;\n+    private static final byte READ_INDEXED_HEADER = 1;\n+    private static final byte READ_INDEXED_HEADER_NAME = 2;\n+    private static final byte READ_LITERAL_HEADER_NAME_LENGTH_PREFIX = 3;\n+    private static final byte READ_LITERAL_HEADER_NAME_LENGTH = 4;\n+    private static final byte READ_LITERAL_HEADER_NAME = 5;\n+    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX = 6;\n+    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 7;\n+    private static final byte READ_LITERAL_HEADER_VALUE = 8;\n \n     private final HpackHuffmanDecoder huffmanDecoder = new HpackHuffmanDecoder();\n     private final HpackDynamicTable hpackDynamicTable;\n@@ -127,13 +126,27 @@ final class HpackDecoder {\n     void decode(int streamId, ByteBuf in, Http2Headers headers, boolean validateHeaders) throws Http2Exception {\n         Http2HeadersSink sink = new Http2HeadersSink(\n                 streamId, headers, maxHeaderListSize, validateHeaders);\n+        decodeDynamicTableSizeUpdates(in);\n         decode(in, sink);\n \n         // Now that we've read all of our headers we can perform the validation steps. We must\n         // delay throwing until this point to prevent dynamic table corruption.\n         sink.finish();\n     }\n \n+    private void decodeDynamicTableSizeUpdates(ByteBuf in) throws Http2Exception {\n+        byte b;\n+        while (in.isReadable() && ((b = in.getByte(in.readerIndex())) & 0x20) == 0x20 && ((b & 0xC0) == 0x00)) {\n+            in.readByte();\n+            int index = b & 0x1F;\n+            if (index == 0x1F) {\n+                setDynamicTableSize(decodeULE128(in, (long) index));\n+            } else {\n+                setDynamicTableSize(index);\n+            }\n+        }\n+    }\n+\n     private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n         int index = 0;\n         int nameLength = 0;\n@@ -184,13 +197,8 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                         }\n                     } else if ((b & 0x20) == 0x20) {\n                         // Dynamic Table Size Update\n-                        index = b & 0x1F;\n-                        if (index == 0x1F) {\n-                            state = READ_MAX_DYNAMIC_TABLE_SIZE;\n-                        } else {\n-                            setDynamicTableSize(index);\n-                            state = READ_HEADER_REPRESENTATION;\n-                        }\n+                        throw connectionError(COMPRESSION_ERROR, \"Dynamic table size update must happen \" +\n+                            \"at the beginning of the header block\");\n                     } else {\n                         // Literal Header Field without Indexing / never Indexed\n                         indexType = (b & 0x10) == 0x10 ? IndexType.NEVER : IndexType.NONE;\n@@ -211,11 +219,6 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                     }\n                     break;\n \n-                case READ_MAX_DYNAMIC_TABLE_SIZE:\n-                    setDynamicTableSize(decodeULE128(in, (long) index));\n-                    state = READ_HEADER_REPRESENTATION;\n-                    break;\n-\n                 case READ_INDEXED_HEADER:\n                     HpackHeaderField indexedHeader = getIndexedHeader(decodeULE128(in, index));\n                     sink.appendToHeaderList(\ncodec-http2/src/test/java/io/netty/handler/codec/http2/HpackDecoderTest.java\n@@ -403,6 +403,22 @@ public void execute() throws Throwable {\n         });\n     }\n \n+    @Test\n+    public void testDynamicTableSizeUpdateAfterTheBeginingOfTheBlock() throws Http2Exception {\n+        assertThrows(Http2Exception.class, new Executable() {\n+            @Override\n+            public void execute() throws Throwable {\n+                decode(\"8120\");\n+            }\n+        });\n+        assertThrows(Http2Exception.class, new Executable() {\n+            @Override\n+            public void execute() throws Throwable {\n+                decode(\"813FE11F\");\n+            }\n+        });\n+    }\n+\n     @Test\n     public void testLiteralWithIncrementalIndexingWithEmptyName() throws Http2Exception {\n         decode(\"400005\" + hex(\"value\"));",
+      "diff": [
+        {
+          "file": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+          "patch": "@@ -79,15 +79,14 @@ final class HpackDecoder {\n             Http2Exception.newStatic(COMPRESSION_ERROR, \"HPACK - max dynamic table size change required\",\n                     Http2Exception.ShutdownHint.HARD_SHUTDOWN, HpackDecoder.class, \"decode(..)\");\n     private static final byte READ_HEADER_REPRESENTATION = 0;\n-    private static final byte READ_MAX_DYNAMIC_TABLE_SIZE = 1;\n-    private static final byte READ_INDEXED_HEADER = 2;\n-    private static final byte READ_INDEXED_HEADER_NAME = 3;\n-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH_PREFIX = 4;\n-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH = 5;\n-    private static final byte READ_LITERAL_HEADER_NAME = 6;\n-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX = 7;\n-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 8;\n-    private static final byte READ_LITERAL_HEADER_VALUE = 9;\n+    private static final byte READ_INDEXED_HEADER = 1;\n+    private static final byte READ_INDEXED_HEADER_NAME = 2;\n+    private static final byte READ_LITERAL_HEADER_NAME_LENGTH_PREFIX = 3;\n+    private static final byte READ_LITERAL_HEADER_NAME_LENGTH = 4;\n+    private static final byte READ_LITERAL_HEADER_NAME = 5;\n+    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX = 6;\n+    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 7;\n+    private static final byte READ_LITERAL_HEADER_VALUE = 8;\n \n     private final HpackHuffmanDecoder huffmanDecoder = new HpackHuffmanDecoder();\n     private final HpackDynamicTable hpackDynamicTable;\n@@ -127,13 +126,27 @@ final class HpackDecoder {\n     void decode(int streamId, ByteBuf in, Http2Headers headers, boolean validateHeaders) throws Http2Exception {\n         Http2HeadersSink sink = new Http2HeadersSink(\n                 streamId, headers, maxHeaderListSize, validateHeaders);\n+        decodeDynamicTableSizeUpdates(in);\n         decode(in, sink);\n \n         // Now that we've read all of our headers we can perform the validation steps. We must\n         // delay throwing until this point to prevent dynamic table corruption.\n         sink.finish();\n     }\n \n+    private void decodeDynamicTableSizeUpdates(ByteBuf in) throws Http2Exception {\n+        byte b;\n+        while (in.isReadable() && ((b = in.getByte(in.readerIndex())) & 0x20) == 0x20 && ((b & 0xC0) == 0x00)) {\n+            in.readByte();\n+            int index = b & 0x1F;\n+            if (index == 0x1F) {\n+                setDynamicTableSize(decodeULE128(in, (long) index));\n+            } else {\n+                setDynamicTableSize(index);\n+            }\n+        }\n+    }\n+\n     private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n         int index = 0;\n         int nameLength = 0;\n@@ -184,13 +197,8 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                         }\n                     } else if ((b & 0x20) == 0x20) {\n                         // Dynamic Table Size Update\n-                        index = b & 0x1F;\n-                        if (index == 0x1F) {\n-                            state = READ_MAX_DYNAMIC_TABLE_SIZE;\n-                        } else {\n-                            setDynamicTableSize(index);\n-                            state = READ_HEADER_REPRESENTATION;\n-                        }\n+                        throw connectionError(COMPRESSION_ERROR, \"Dynamic table size update must happen \" +\n+                            \"at the beginning of the header block\");\n                     } else {\n                         // Literal Header Field without Indexing / never Indexed\n                         indexType = (b & 0x10) == 0x10 ? IndexType.NEVER : IndexType.NONE;\n@@ -211,11 +219,6 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                     }\n                     break;\n \n-                case READ_MAX_DYNAMIC_TABLE_SIZE:\n-                    setDynamicTableSize(decodeULE128(in, (long) index));\n-                    state = READ_HEADER_REPRESENTATION;\n-                    break;\n-\n                 case READ_INDEXED_HEADER:\n                     HpackHeaderField indexedHeader = getIndexedHeader(decodeULE128(in, index));\n                     sink.appendToHeaderList("
+        },
+        {
+          "file": "codec-http2/src/test/java/io/netty/handler/codec/http2/HpackDecoderTest.java",
+          "patch": "@@ -403,6 +403,22 @@ public void execute() throws Throwable {\n         });\n     }\n \n+    @Test\n+    public void testDynamicTableSizeUpdateAfterTheBeginingOfTheBlock() throws Http2Exception {\n+        assertThrows(Http2Exception.class, new Executable() {\n+            @Override\n+            public void execute() throws Throwable {\n+                decode(\"8120\");\n+            }\n+        });\n+        assertThrows(Http2Exception.class, new Executable() {\n+            @Override\n+            public void execute() throws Throwable {\n+                decode(\"813FE11F\");\n+            }\n+        });\n+    }\n+\n     @Test\n     public void testLiteralWithIncrementalIndexingWithEmptyName() throws Http2Exception {\n         decode(\"400005\" + hex(\"value\"));"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-11-11T09:32:53Z",
+      "user": "vietj",
+      "body": "…eader block\r\n\r\nMotivation:\r\n\r\nHpackDecoder accepts dynamic table size updates at any stage of a header block. Such modification should always happen before the table is modified as per RFC 7541.\r\n\r\nModifications:\r\n\r\nCheck the header block first for dynamic table size updates in a separate method. Then reject any table size update when processing unpacking the rest of the block. Dynamic table size update could have been done with the current switch/case but it requires to keep track of the modifications which is not hard but introduces complexity in the loop (a simple boolean that must be switched for any modification but the table size update). Instead a table size update is achieved first in a simpler loop and then any table size update is rejected.\r\n\r\nResult:\r\n\r\nFixes #12981\r\n"
+    },
+    {
+      "type": "review_comment",
+      "id": 1020064780,
+      "created_at": "2022-11-11T09:59:42Z",
+      "user": "normanmaurer",
+      "body": "```suggestion\r\n        // Check for dynamic table size updates, which must occur at the beginning:\r\n        // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2\r\n        decodeDynamicTableSizeUpdates(in);\r\n```",
+      "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+      "diff_hunk": "@@ -127,13 +126,27 @@ final class HpackDecoder {\n     void decode(int streamId, ByteBuf in, Http2Headers headers, boolean validateHeaders) throws Http2Exception {\n         Http2HeadersSink sink = new Http2HeadersSink(\n                 streamId, headers, maxHeaderListSize, validateHeaders);\n+        decodeDynamicTableSizeUpdates(in);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 131,
+      "original_line": 129,
+      "side": "RIGHT",
+      "original_position": 28,
+      "position": 30,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1020161914,
+          "user": "vietj",
+          "body": "can I commit this directly from github interface ?",
+          "created_at": "2022-11-11T12:07:09Z"
+        },
+        {
+          "id": 1020162592,
+          "user": "normanmaurer",
+          "body": "Yep... I just pressed the button for you :)",
+          "created_at": "2022-11-11T12:08:13Z"
+        },
+        {
+          "id": 1020863768,
+          "user": "vietj",
+          "body": "thanks :-D",
+          "created_at": "2022-11-13T08:41:28Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1020064989,
+      "created_at": "2022-11-11T09:59:58Z",
+      "user": "normanmaurer",
+      "body": "```suggestion\r\n                        // See https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2\r\n                        throw connectionError(COMPRESSION_ERROR, \"Dynamic table size update must happen \" +\r\n```",
+      "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+      "diff_hunk": "@@ -184,13 +197,8 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                         }\n                     } else if ((b & 0x20) == 0x20) {\n                         // Dynamic Table Size Update\n-                        index = b & 0x1F;\n-                        if (index == 0x1F) {\n-                            state = READ_MAX_DYNAMIC_TABLE_SIZE;\n-                        } else {\n-                            setDynamicTableSize(index);\n-                            state = READ_HEADER_REPRESENTATION;\n-                        }\n+                        throw connectionError(COMPRESSION_ERROR, \"Dynamic table size update must happen \" +",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 203,
+      "original_line": 200,
+      "side": "RIGHT",
+      "original_position": 63,
+      "position": 66,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1177111879,
+      "created_at": "2022-11-11T10:00:06Z",
+      "user": "normanmaurer",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1311485384,
+      "created_at": "2022-11-11T10:01:10Z",
+      "user": "normanmaurer",
+      "body": "/cc @ejona86 @idelpivnitskiy "
+    },
+    {
+      "type": "review",
+      "id": 1177253161,
+      "created_at": "2022-11-11T12:07:10Z",
+      "user": "vietj",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2022-11-11T12:07:51Z",
+      "sha": "7497c572b4ff25bce69775513cef607f6821f66d",
+      "message": "Update codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2022-11-11T12:07:51Z",
+      "author_date": "2022-11-11T12:07:51Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2022-11-11T12:07:51Z",
+      "diff_text": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java\n@@ -126,6 +126,8 @@ final class HpackDecoder {\n     void decode(int streamId, ByteBuf in, Http2Headers headers, boolean validateHeaders) throws Http2Exception {\n         Http2HeadersSink sink = new Http2HeadersSink(\n                 streamId, headers, maxHeaderListSize, validateHeaders);\n+        // Check for dynamic table size updates, which must occur at the beginning:\n+        // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2\n         decodeDynamicTableSizeUpdates(in);\n         decode(in, sink);\n ",
+      "diff": [
+        {
+          "file": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+          "patch": "@@ -126,6 +126,8 @@ final class HpackDecoder {\n     void decode(int streamId, ByteBuf in, Http2Headers headers, boolean validateHeaders) throws Http2Exception {\n         Http2HeadersSink sink = new Http2HeadersSink(\n                 streamId, headers, maxHeaderListSize, validateHeaders);\n+        // Check for dynamic table size updates, which must occur at the beginning:\n+        // https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2\n         decodeDynamicTableSizeUpdates(in);\n         decode(in, sink);\n "
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-11-11T12:07:57Z",
+      "sha": "c1bf28343b3799702ac42c0d91474aa01f794423",
+      "message": "Update codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2022-11-11T12:07:57Z",
+      "author_date": "2022-11-11T12:07:57Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2022-11-11T12:07:57Z",
+      "diff_text": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java\n@@ -199,6 +199,7 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                         }\n                     } else if ((b & 0x20) == 0x20) {\n                         // Dynamic Table Size Update\n+                        // See https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2\n                         throw connectionError(COMPRESSION_ERROR, \"Dynamic table size update must happen \" +\n                             \"at the beginning of the header block\");\n                     } else {",
+      "diff": [
+        {
+          "file": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+          "patch": "@@ -199,6 +199,7 @@ private void decode(ByteBuf in, Http2HeadersSink sink) throws Http2Exception {\n                         }\n                     } else if ((b & 0x20) == 0x20) {\n                         // Dynamic Table Size Update\n+                        // See https://www.rfc-editor.org/rfc/rfc7541.html#section-4.2\n                         throw connectionError(COMPRESSION_ERROR, \"Dynamic table size update must happen \" +\n                             \"at the beginning of the header block\");\n                     } else {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1177254227,
+      "created_at": "2022-11-11T12:08:14Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1178205518,
+      "created_at": "2022-11-13T08:41:29Z",
+      "user": "vietj",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1313279826,
+      "created_at": "2022-11-14T08:32:46Z",
+      "user": "normanmaurer",
+      "body": "@vietj thanks a lot!"
+    },
+    {
+      "type": "review",
+      "id": 1180009999,
+      "created_at": "2022-11-14T23:57:43Z",
+      "user": "idelpivnitskiy",
+      "state": "COMMENTED",
+      "body": "Late LGTM, thanks @vietj!"
+    }
+  ]
+}

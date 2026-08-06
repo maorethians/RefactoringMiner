@@ -1,0 +1,937 @@
+{
+  "repo": "netty/netty",
+  "number": 9681,
+  "pr_number": 9681,
+  "title": "TCP Client Fast Open",
+  "user": "colinrgodsey",
+  "created_at": "2019-10-16T22:44:50Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "c735357bf29d07856ad171c6611a2e1a0e0000ec",
+  "merge_commit_sha": "531e826bd20bd93d4fd7e153f3c1f1577db97c1b",
+  "commits": 12,
+  "issue_events": [
+    "renamed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "milestoned",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "demilestoned",
+    "milestoned",
+    "demilestoned",
+    "milestoned",
+    "demilestoned"
+  ],
+  "url": "https://github.com/netty/netty/pull/9681",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2019-10-12T17:51:01Z",
+      "sha": "3822fd3dafaefbe59558b79ece0838b08727a9b1",
+      "message": "fastopen cleanup",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-12T17:51:01Z",
+      "author_date": "2019-10-12T17:51:01Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-12T17:51:01Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java\n@@ -717,7 +717,7 @@ protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddr\n         return connected;\n     }\n \n-    private boolean doConnect0(SocketAddress remote) throws Exception {\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n         boolean success = false;\n         try {\n             boolean connected = socket.connect(remote);\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollStreamChannel.java\n@@ -249,7 +249,7 @@ public void run() {\n      *     no data was accepted</li>\n      * </ul>\n      */\n-    private int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n+    int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n         int readableBytes = buf.readableBytes();\n         if (readableBytes == 0) {\n             in.remove();\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java\n@@ -15,21 +15,27 @@\n  */\n package io.netty.channel.epoll;\n \n+import io.netty.buffer.ByteBuf;\n import io.netty.channel.Channel;\n import io.netty.channel.ChannelException;\n+import io.netty.channel.ChannelOutboundBuffer;\n import io.netty.channel.socket.ServerSocketChannel;\n import io.netty.channel.socket.SocketChannel;\n+import io.netty.channel.unix.IovArray;\n import io.netty.util.concurrent.GlobalEventExecutor;\n \n import java.io.IOException;\n import java.net.InetAddress;\n import java.net.InetSocketAddress;\n+import java.net.SocketAddress;\n+import java.nio.ByteBuffer;\n import java.util.Collection;\n import java.util.Collections;\n import java.util.Map;\n import java.util.concurrent.Executor;\n \n import static io.netty.channel.epoll.LinuxSocket.newSocketStream;\n+import static io.netty.channel.internal.ChannelUtils.WRITE_STATUS_SNDBUF_FULL;\n \n /**\n  * {@link SocketChannel} implementation that uses linux EPOLL Edge-Triggered Mode for\n@@ -40,6 +46,7 @@ public final class EpollSocketChannel extends AbstractEpollStreamChannel impleme\n     private final EpollSocketChannelConfig config;\n \n     private volatile Collection<InetAddress> tcpMd5SigAddresses = Collections.emptyList();\n+    private boolean pendingFastOpenWrite;\n \n     public EpollSocketChannel() {\n         super(newSocketStream(), false);\n@@ -110,6 +117,53 @@ protected AbstractEpollUnsafe newUnsafe() {\n         return new EpollSocketChannelUnsafe();\n     }\n \n+    @Override\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n+        if (Native.IS_SUPPORTING_TCP_FASTOPEN && config.isTcpFastOpenConnect()) {\n+            pendingFastOpenWrite = true;\n+            return true;\n+        }\n+        return super.doConnect0(remote);\n+    }\n+\n+    private long doWriteBytesFastOpen(ByteBuf data) throws Exception {\n+        final long writtenBytes;\n+        if (data.hasMemoryAddress()) {\n+            long memoryAddress = data.memoryAddress();\n+            writtenBytes = socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n+                                                remoteAddress().getAddress(), remoteAddress().getPort(), true);\n+        } else if (data.nioBufferCount() > 1) {\n+            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n+            array.add(data, data.readerIndex(), data.readableBytes());\n+            int cnt = array.count();\n+            assert cnt != 0;\n+\n+            writtenBytes = socket.sendToAddresses(array.memoryAddress(0), cnt, remoteAddress().getAddress(),\n+                                                  remoteAddress().getPort(), true);\n+        } else {\n+            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n+            writtenBytes = socket.sendTo(nioData, nioData.position(), nioData.limit(), remoteAddress().getAddress(),\n+                                         remoteAddress().getPort(), true);\n+        }\n+\n+        return writtenBytes;\n+    }\n+\n+    @Override\n+    int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n+        if (buf.isReadable() && pendingFastOpenWrite) {\n+            long localFlushedAmount = doWriteBytesFastOpen(buf);\n+            if (localFlushedAmount > 0) {\n+                pendingFastOpenWrite = false;\n+                in.removeBytes(localFlushedAmount);\n+                return 1;\n+            }\n+            return WRITE_STATUS_SNDBUF_FULL;\n+        }\n+\n+        return super.writeBytes(in, buf);\n+    }\n+\n     private final class EpollSocketChannelUnsafe extends EpollStreamUnsafe {\n         @Override\n         protected Executor prepareToClose() {\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannelConfig.java\n@@ -39,6 +39,7 @@\n \n public final class EpollSocketChannelConfig extends EpollChannelConfig implements SocketChannelConfig {\n     private volatile boolean allowHalfClosure;\n+    private volatile boolean tcpFastopen;\n \n     /**\n      * Creates a new instance.\n@@ -550,29 +551,21 @@ public boolean isTcpQuickAck() {\n     }\n \n     /**\n-     * Set the {@code TCP_FASTOPEN_CONNECT} option on the socket. Requires Linux kernel 4.11 or later.\n-     * See\n-     * <a href=\"https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=19f6d3f3\">this commit</a>\n-     * for more details.\n+     * Enables client TCP fast open. {@code TCP_FASTOPEN_CONNECT} normally\n+     * requires Linux kernel 4.11 or later, so instead we use the traditional fast open\n+     * client socket mechanics. See this\n+     * <a href=\"https://lwn.net/Articles/508865/\">LWN article</a> for more info.\n      */\n     public EpollSocketChannelConfig setTcpFastOpenConnect(boolean fastOpenConnect) {\n-        try {\n-            ((EpollSocketChannel) channel).socket.setTcpFastOpenConnect(fastOpenConnect);\n-            return this;\n-        } catch (IOException e) {\n-            throw new ChannelException(e);\n-        }\n+        tcpFastopen = fastOpenConnect;\n+        return this;\n     }\n \n     /**\n-     * Returns {@code true} if {@code TCP_FASTOPEN_CONNECT} is enabled, {@code false} otherwise.\n+     * Returns {@code true} if TCP fast open is enabled, {@code false} otherwise.\n      */\n     public boolean isTcpFastOpenConnect() {\n-        try {\n-            return ((EpollSocketChannel) channel).socket.isTcpFastOpenConnect();\n-        } catch (IOException e) {\n-            throw new ChannelException(e);\n-        }\n+        return tcpFastopen;\n     }\n \n     @Override\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/LinuxSocket.java\n@@ -179,14 +179,6 @@ void setTcpFastOpen(int tcpFastopenBacklog) throws IOException {\n         setTcpFastOpen(intValue(), tcpFastopenBacklog);\n     }\n \n-    void setTcpFastOpenConnect(boolean tcpFastOpenConnect) throws IOException {\n-        setTcpFastOpenConnect(intValue(), tcpFastOpenConnect ? 1 : 0);\n-    }\n-\n-    boolean isTcpFastOpenConnect() throws IOException {\n-        return isTcpFastOpenConnect(intValue()) != 0;\n-    }\n-\n     void setTcpKeepIdle(int seconds) throws IOException {\n         setTcpKeepIdle(intValue(), seconds);\n     }\n@@ -369,15 +361,13 @@ private static native long sendFile(int socketFd, DefaultFileRegion src, long ba\n     private static native int isIpRecvOrigDestAddr(int fd) throws IOException;\n     private static native void getTcpInfo(int fd, long[] array) throws IOException;\n     private static native PeerCredentials getPeerCredentials(int fd) throws IOException;\n-    private static native int isTcpFastOpenConnect(int fd) throws IOException;\n \n     private static native void setTcpDeferAccept(int fd, int deferAccept) throws IOException;\n     private static native void setTcpQuickAck(int fd, int quickAck) throws IOException;\n     private static native void setTcpCork(int fd, int tcpCork) throws IOException;\n     private static native void setSoBusyPoll(int fd, int loopMicros) throws IOException;\n     private static native void setTcpNotSentLowAt(int fd, int tcpNotSentLowAt) throws IOException;\n     private static native void setTcpFastOpen(int fd, int tcpFastopenBacklog) throws IOException;\n-    private static native void setTcpFastOpenConnect(int fd, int tcpFastOpenConnect) throws IOException;\n     private static native void setTcpKeepIdle(int fd, int seconds) throws IOException;\n     private static native void setTcpKeepIntvl(int fd, int seconds) throws IOException;\n     private static native void setTcpKeepCnt(int fd, int probes) throws IOException;\ntransport-native-unix-common/src/main/c/netty_unix_socket.c\n@@ -306,7 +306,7 @@ int netty_unix_socket_initSockaddr(JNIEnv* env, jboolean ipv6, jbyteArray addres\n     return 0;\n }\n \n-static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {\n+static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n     struct sockaddr_storage addr;\n     socklen_t addrSize;\n     if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {\n@@ -316,7 +316,7 @@ static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos,\n     ssize_t res;\n     int err;\n     do {\n-       res = sendto(fd, buffer + pos, (size_t) (limit - pos), 0, (struct sockaddr*) &addr, addrSize);\n+       res = sendto(fd, buffer + pos, (size_t) (limit - pos), fastOpen == JNI_TRUE ? MSG_FASTOPEN : 0, (struct sockaddr*) &addr, addrSize);\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \n@@ -617,16 +617,16 @@ static jint netty_unix_socket_newSocketDomainFd(JNIEnv* env, jclass clazz) {\n     return fd;\n }\n \n-static jint netty_unix_socket_sendTo(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jobject jbuffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {\n+static jint netty_unix_socket_sendTo(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jobject jbuffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n     // We check that GetDirectBufferAddress will not return NULL in OnLoad\n-    return _sendTo(env, fd, ipv6, (*env)->GetDirectBufferAddress(env, jbuffer), pos, limit, address, scopeId, port);\n+    return _sendTo(env, fd, ipv6, (*env)->GetDirectBufferAddress(env, jbuffer), pos, limit, address, scopeId, port, fastOpen);\n }\n \n-static jint netty_unix_socket_sendToAddress(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {\n-    return _sendTo(env, fd, ipv6, (void *) (intptr_t) memoryAddress, pos, limit, address, scopeId, port);\n+static jint netty_unix_socket_sendToAddress(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint pos, jint limit, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n+    return _sendTo(env, fd, ipv6, (void *) (intptr_t) memoryAddress, pos, limit, address, scopeId, port, fastOpen);\n }\n \n-static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint length, jbyteArray address, jint scopeId, jint port) {\n+static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint length, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n     struct sockaddr_storage addr;\n     socklen_t addrSize;\n     if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {\n@@ -642,7 +642,7 @@ static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd\n     ssize_t res;\n     int err;\n     do {\n-       res = sendmsg(fd, &m, 0);\n+       res = sendmsg(fd, &m, fastOpen == JNI_TRUE ? MSG_FASTOPEN : 0);\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \ntransport-native-unix-common/src/main/java/io/netty/channel/unix/Socket.java\n@@ -105,6 +105,11 @@ public final boolean isOutputShutdown() {\n     }\n \n     public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, int port) throws IOException {\n+        return sendTo(buf, pos, limit, addr, port, false);\n+    }\n+\n+    public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, int port, boolean fastOpen)\n+            throws IOException {\n         // just duplicate the toNativeInetAddress code here to minimize object creation as this method is expected\n         // to be called frequently\n         byte[] address;\n@@ -117,7 +122,7 @@ public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, in\n             scopeId = 0;\n             address = ipv4MappedIpv6Address(addr.getAddress());\n         }\n-        int res = sendTo(fd, ipv6, buf, pos, limit, address, scopeId, port);\n+        int res = sendTo(fd, ipv6, buf, pos, limit, address, scopeId, port, fastOpen);\n         if (res >= 0) {\n             return res;\n         }\n@@ -129,6 +134,11 @@ public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, in\n \n     public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddress addr, int port)\n             throws IOException {\n+        return sendToAddress(memoryAddress, pos, limit, addr, port, false);\n+    }\n+\n+    public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddress addr, int port,\n+                                   boolean fastOpen) throws IOException {\n         // just duplicate the toNativeInetAddress code here to minimize object creation as this method is expected\n         // to be called frequently\n         byte[] address;\n@@ -141,7 +151,7 @@ public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddre\n             scopeId = 0;\n             address = ipv4MappedIpv6Address(addr.getAddress());\n         }\n-        int res = sendToAddress(fd, ipv6, memoryAddress, pos, limit, address, scopeId, port);\n+        int res = sendToAddress(fd, ipv6, memoryAddress, pos, limit, address, scopeId, port, fastOpen);\n         if (res >= 0) {\n             return res;\n         }\n@@ -152,6 +162,11 @@ public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddre\n     }\n \n     public final int sendToAddresses(long memoryAddress, int length, InetAddress addr, int port) throws IOException {\n+        return sendToAddresses(memoryAddress, length, addr, port, false);\n+    }\n+\n+    public final int sendToAddresses(long memoryAddress, int length, InetAddress addr, int port, boolean fastOpen)\n+            throws IOException {\n         // just duplicate the toNativeInetAddress code here to minimize object creation as this method is expected\n         // to be called frequently\n         byte[] address;\n@@ -164,7 +179,7 @@ public final int sendToAddresses(long memoryAddress, int length, InetAddress add\n             scopeId = 0;\n             address = ipv4MappedIpv6Address(addr.getAddress());\n         }\n-        int res = sendToAddresses(fd, ipv6, memoryAddress, length, address, scopeId, port);\n+        int res = sendToAddresses(fd, ipv6, memoryAddress, length, address, scopeId, port, fastOpen);\n         if (res >= 0) {\n             return res;\n         }\n@@ -457,16 +472,23 @@ protected static int newSocketDomain0() {\n     private static native byte[] localAddress(int fd);\n \n     private static native int sendTo(\n-            int fd, boolean ipv6, ByteBuffer buf, int pos, int limit, byte[] address, int scopeId, int port);\n+            int fd, boolean ipv6, ByteBuffer buf, int pos, int limit, byte[] address, int scopeId, int port,\n+            boolean fastOpen);\n+\n     private static native int sendToAddress(\n-            int fd, boolean ipv6, long memoryAddress, int pos, int limit, byte[] address, int scopeId, int port);\n+            int fd, boolean ipv6, long memoryAddress, int pos, int limit, byte[] address, int scopeId, int port,\n+            boolean fastOpen);\n+\n     private static native int sendToAddresses(\n-            int fd, boolean ipv6, long memoryAddress, int length, byte[] address, int scopeId, int port);\n+            int fd, boolean ipv6, long memoryAddress, int length, byte[] address, int scopeId, int port,\n+            boolean fastOpen);\n \n     private static native DatagramSocketAddress recvFrom(\n             int fd, ByteBuffer buf, int pos, int limit) throws IOException;\n+\n     private static native DatagramSocketAddress recvFromAddress(\n             int fd, long memoryAddress, int pos, int limit) throws IOException;\n+\n     private static native int recvFd(int fd);\n     private static native int sendFd(int socketFd, int fd);\n ",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+          "patch": "@@ -717,7 +717,7 @@ protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddr\n         return connected;\n     }\n \n-    private boolean doConnect0(SocketAddress remote) throws Exception {\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n         boolean success = false;\n         try {\n             boolean connected = socket.connect(remote);"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollStreamChannel.java",
+          "patch": "@@ -249,7 +249,7 @@ public void run() {\n      *     no data was accepted</li>\n      * </ul>\n      */\n-    private int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n+    int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n         int readableBytes = buf.readableBytes();\n         if (readableBytes == 0) {\n             in.remove();"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+          "patch": "@@ -15,21 +15,27 @@\n  */\n package io.netty.channel.epoll;\n \n+import io.netty.buffer.ByteBuf;\n import io.netty.channel.Channel;\n import io.netty.channel.ChannelException;\n+import io.netty.channel.ChannelOutboundBuffer;\n import io.netty.channel.socket.ServerSocketChannel;\n import io.netty.channel.socket.SocketChannel;\n+import io.netty.channel.unix.IovArray;\n import io.netty.util.concurrent.GlobalEventExecutor;\n \n import java.io.IOException;\n import java.net.InetAddress;\n import java.net.InetSocketAddress;\n+import java.net.SocketAddress;\n+import java.nio.ByteBuffer;\n import java.util.Collection;\n import java.util.Collections;\n import java.util.Map;\n import java.util.concurrent.Executor;\n \n import static io.netty.channel.epoll.LinuxSocket.newSocketStream;\n+import static io.netty.channel.internal.ChannelUtils.WRITE_STATUS_SNDBUF_FULL;\n \n /**\n  * {@link SocketChannel} implementation that uses linux EPOLL Edge-Triggered Mode for\n@@ -40,6 +46,7 @@ public final class EpollSocketChannel extends AbstractEpollStreamChannel impleme\n     private final EpollSocketChannelConfig config;\n \n     private volatile Collection<InetAddress> tcpMd5SigAddresses = Collections.emptyList();\n+    private boolean pendingFastOpenWrite;\n \n     public EpollSocketChannel() {\n         super(newSocketStream(), false);\n@@ -110,6 +117,53 @@ protected AbstractEpollUnsafe newUnsafe() {\n         return new EpollSocketChannelUnsafe();\n     }\n \n+    @Override\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n+        if (Native.IS_SUPPORTING_TCP_FASTOPEN && config.isTcpFastOpenConnect()) {\n+            pendingFastOpenWrite = true;\n+            return true;\n+        }\n+        return super.doConnect0(remote);\n+    }\n+\n+    private long doWriteBytesFastOpen(ByteBuf data) throws Exception {\n+        final long writtenBytes;\n+        if (data.hasMemoryAddress()) {\n+            long memoryAddress = data.memoryAddress();\n+            writtenBytes = socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n+                                                remoteAddress().getAddress(), remoteAddress().getPort(), true);\n+        } else if (data.nioBufferCount() > 1) {\n+            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n+            array.add(data, data.readerIndex(), data.readableBytes());\n+            int cnt = array.count();\n+            assert cnt != 0;\n+\n+            writtenBytes = socket.sendToAddresses(array.memoryAddress(0), cnt, remoteAddress().getAddress(),\n+                                                  remoteAddress().getPort(), true);\n+        } else {\n+            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n+            writtenBytes = socket.sendTo(nioData, nioData.position(), nioData.limit(), remoteAddress().getAddress(),\n+                                         remoteAddress().getPort(), true);\n+        }\n+\n+        return writtenBytes;\n+    }\n+\n+    @Override\n+    int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n+        if (buf.isReadable() && pendingFastOpenWrite) {\n+            long localFlushedAmount = doWriteBytesFastOpen(buf);\n+            if (localFlushedAmount > 0) {\n+                pendingFastOpenWrite = false;\n+                in.removeBytes(localFlushedAmount);\n+                return 1;\n+            }\n+            return WRITE_STATUS_SNDBUF_FULL;\n+        }\n+\n+        return super.writeBytes(in, buf);\n+    }\n+\n     private final class EpollSocketChannelUnsafe extends EpollStreamUnsafe {\n         @Override\n         protected Executor prepareToClose() {"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannelConfig.java",
+          "patch": "@@ -39,6 +39,7 @@\n \n public final class EpollSocketChannelConfig extends EpollChannelConfig implements SocketChannelConfig {\n     private volatile boolean allowHalfClosure;\n+    private volatile boolean tcpFastopen;\n \n     /**\n      * Creates a new instance.\n@@ -550,29 +551,21 @@ public boolean isTcpQuickAck() {\n     }\n \n     /**\n-     * Set the {@code TCP_FASTOPEN_CONNECT} option on the socket. Requires Linux kernel 4.11 or later.\n-     * See\n-     * <a href=\"https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=19f6d3f3\">this commit</a>\n-     * for more details.\n+     * Enables client TCP fast open. {@code TCP_FASTOPEN_CONNECT} normally\n+     * requires Linux kernel 4.11 or later, so instead we use the traditional fast open\n+     * client socket mechanics. See this\n+     * <a href=\"https://lwn.net/Articles/508865/\">LWN article</a> for more info.\n      */\n     public EpollSocketChannelConfig setTcpFastOpenConnect(boolean fastOpenConnect) {\n-        try {\n-            ((EpollSocketChannel) channel).socket.setTcpFastOpenConnect(fastOpenConnect);\n-            return this;\n-        } catch (IOException e) {\n-            throw new ChannelException(e);\n-        }\n+        tcpFastopen = fastOpenConnect;\n+        return this;\n     }\n \n     /**\n-     * Returns {@code true} if {@code TCP_FASTOPEN_CONNECT} is enabled, {@code false} otherwise.\n+     * Returns {@code true} if TCP fast open is enabled, {@code false} otherwise.\n      */\n     public boolean isTcpFastOpenConnect() {\n-        try {\n-            return ((EpollSocketChannel) channel).socket.isTcpFastOpenConnect();\n-        } catch (IOException e) {\n-            throw new ChannelException(e);\n-        }\n+        return tcpFastopen;\n     }\n \n     @Override"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/LinuxSocket.java",
+          "patch": "@@ -179,14 +179,6 @@ void setTcpFastOpen(int tcpFastopenBacklog) throws IOException {\n         setTcpFastOpen(intValue(), tcpFastopenBacklog);\n     }\n \n-    void setTcpFastOpenConnect(boolean tcpFastOpenConnect) throws IOException {\n-        setTcpFastOpenConnect(intValue(), tcpFastOpenConnect ? 1 : 0);\n-    }\n-\n-    boolean isTcpFastOpenConnect() throws IOException {\n-        return isTcpFastOpenConnect(intValue()) != 0;\n-    }\n-\n     void setTcpKeepIdle(int seconds) throws IOException {\n         setTcpKeepIdle(intValue(), seconds);\n     }\n@@ -369,15 +361,13 @@ private static native long sendFile(int socketFd, DefaultFileRegion src, long ba\n     private static native int isIpRecvOrigDestAddr(int fd) throws IOException;\n     private static native void getTcpInfo(int fd, long[] array) throws IOException;\n     private static native PeerCredentials getPeerCredentials(int fd) throws IOException;\n-    private static native int isTcpFastOpenConnect(int fd) throws IOException;\n \n     private static native void setTcpDeferAccept(int fd, int deferAccept) throws IOException;\n     private static native void setTcpQuickAck(int fd, int quickAck) throws IOException;\n     private static native void setTcpCork(int fd, int tcpCork) throws IOException;\n     private static native void setSoBusyPoll(int fd, int loopMicros) throws IOException;\n     private static native void setTcpNotSentLowAt(int fd, int tcpNotSentLowAt) throws IOException;\n     private static native void setTcpFastOpen(int fd, int tcpFastopenBacklog) throws IOException;\n-    private static native void setTcpFastOpenConnect(int fd, int tcpFastOpenConnect) throws IOException;\n     private static native void setTcpKeepIdle(int fd, int seconds) throws IOException;\n     private static native void setTcpKeepIntvl(int fd, int seconds) throws IOException;\n     private static native void setTcpKeepCnt(int fd, int probes) throws IOException;"
+        },
+        {
+          "file": "transport-native-unix-common/src/main/c/netty_unix_socket.c",
+          "patch": "@@ -306,7 +306,7 @@ int netty_unix_socket_initSockaddr(JNIEnv* env, jboolean ipv6, jbyteArray addres\n     return 0;\n }\n \n-static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {\n+static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n     struct sockaddr_storage addr;\n     socklen_t addrSize;\n     if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {\n@@ -316,7 +316,7 @@ static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos,\n     ssize_t res;\n     int err;\n     do {\n-       res = sendto(fd, buffer + pos, (size_t) (limit - pos), 0, (struct sockaddr*) &addr, addrSize);\n+       res = sendto(fd, buffer + pos, (size_t) (limit - pos), fastOpen == JNI_TRUE ? MSG_FASTOPEN : 0, (struct sockaddr*) &addr, addrSize);\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \n@@ -617,16 +617,16 @@ static jint netty_unix_socket_newSocketDomainFd(JNIEnv* env, jclass clazz) {\n     return fd;\n }\n \n-static jint netty_unix_socket_sendTo(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jobject jbuffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {\n+static jint netty_unix_socket_sendTo(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jobject jbuffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n     // We check that GetDirectBufferAddress will not return NULL in OnLoad\n-    return _sendTo(env, fd, ipv6, (*env)->GetDirectBufferAddress(env, jbuffer), pos, limit, address, scopeId, port);\n+    return _sendTo(env, fd, ipv6, (*env)->GetDirectBufferAddress(env, jbuffer), pos, limit, address, scopeId, port, fastOpen);\n }\n \n-static jint netty_unix_socket_sendToAddress(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {\n-    return _sendTo(env, fd, ipv6, (void *) (intptr_t) memoryAddress, pos, limit, address, scopeId, port);\n+static jint netty_unix_socket_sendToAddress(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint pos, jint limit, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n+    return _sendTo(env, fd, ipv6, (void *) (intptr_t) memoryAddress, pos, limit, address, scopeId, port, fastOpen);\n }\n \n-static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint length, jbyteArray address, jint scopeId, jint port) {\n+static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint length, jbyteArray address, jint scopeId, jint port, jboolean fastOpen) {\n     struct sockaddr_storage addr;\n     socklen_t addrSize;\n     if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {\n@@ -642,7 +642,7 @@ static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd\n     ssize_t res;\n     int err;\n     do {\n-       res = sendmsg(fd, &m, 0);\n+       res = sendmsg(fd, &m, fastOpen == JNI_TRUE ? MSG_FASTOPEN : 0);\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n "
+        },
+        {
+          "file": "transport-native-unix-common/src/main/java/io/netty/channel/unix/Socket.java",
+          "patch": "@@ -105,6 +105,11 @@ public final boolean isOutputShutdown() {\n     }\n \n     public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, int port) throws IOException {\n+        return sendTo(buf, pos, limit, addr, port, false);\n+    }\n+\n+    public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, int port, boolean fastOpen)\n+            throws IOException {\n         // just duplicate the toNativeInetAddress code here to minimize object creation as this method is expected\n         // to be called frequently\n         byte[] address;\n@@ -117,7 +122,7 @@ public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, in\n             scopeId = 0;\n             address = ipv4MappedIpv6Address(addr.getAddress());\n         }\n-        int res = sendTo(fd, ipv6, buf, pos, limit, address, scopeId, port);\n+        int res = sendTo(fd, ipv6, buf, pos, limit, address, scopeId, port, fastOpen);\n         if (res >= 0) {\n             return res;\n         }\n@@ -129,6 +134,11 @@ public final int sendTo(ByteBuffer buf, int pos, int limit, InetAddress addr, in\n \n     public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddress addr, int port)\n             throws IOException {\n+        return sendToAddress(memoryAddress, pos, limit, addr, port, false);\n+    }\n+\n+    public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddress addr, int port,\n+                                   boolean fastOpen) throws IOException {\n         // just duplicate the toNativeInetAddress code here to minimize object creation as this method is expected\n         // to be called frequently\n         byte[] address;\n@@ -141,7 +151,7 @@ public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddre\n             scopeId = 0;\n             address = ipv4MappedIpv6Address(addr.getAddress());\n         }\n-        int res = sendToAddress(fd, ipv6, memoryAddress, pos, limit, address, scopeId, port);\n+        int res = sendToAddress(fd, ipv6, memoryAddress, pos, limit, address, scopeId, port, fastOpen);\n         if (res >= 0) {\n             return res;\n         }\n@@ -152,6 +162,11 @@ public final int sendToAddress(long memoryAddress, int pos, int limit, InetAddre\n     }\n \n     public final int sendToAddresses(long memoryAddress, int length, InetAddress addr, int port) throws IOException {\n+        return sendToAddresses(memoryAddress, length, addr, port, false);\n+    }\n+\n+    public final int sendToAddresses(long memoryAddress, int length, InetAddress addr, int port, boolean fastOpen)\n+            throws IOException {\n         // just duplicate the toNativeInetAddress code here to minimize object creation as this method is expected\n         // to be called frequently\n         byte[] address;\n@@ -164,7 +179,7 @@ public final int sendToAddresses(long memoryAddress, int length, InetAddress add\n             scopeId = 0;\n             address = ipv4MappedIpv6Address(addr.getAddress());\n         }\n-        int res = sendToAddresses(fd, ipv6, memoryAddress, length, address, scopeId, port);\n+        int res = sendToAddresses(fd, ipv6, memoryAddress, length, address, scopeId, port, fastOpen);\n         if (res >= 0) {\n             return res;\n         }\n@@ -457,16 +472,23 @@ protected static int newSocketDomain0() {\n     private static native byte[] localAddress(int fd);\n \n     private static native int sendTo(\n-            int fd, boolean ipv6, ByteBuffer buf, int pos, int limit, byte[] address, int scopeId, int port);\n+            int fd, boolean ipv6, ByteBuffer buf, int pos, int limit, byte[] address, int scopeId, int port,\n+            boolean fastOpen);\n+\n     private static native int sendToAddress(\n-            int fd, boolean ipv6, long memoryAddress, int pos, int limit, byte[] address, int scopeId, int port);\n+            int fd, boolean ipv6, long memoryAddress, int pos, int limit, byte[] address, int scopeId, int port,\n+            boolean fastOpen);\n+\n     private static native int sendToAddresses(\n-            int fd, boolean ipv6, long memoryAddress, int length, byte[] address, int scopeId, int port);\n+            int fd, boolean ipv6, long memoryAddress, int length, byte[] address, int scopeId, int port,\n+            boolean fastOpen);\n \n     private static native DatagramSocketAddress recvFrom(\n             int fd, ByteBuffer buf, int pos, int limit) throws IOException;\n+\n     private static native DatagramSocketAddress recvFromAddress(\n             int fd, long memoryAddress, int pos, int limit) throws IOException;\n+\n     private static native int recvFd(int fd);\n     private static native int sendFd(int socketFd, int fd);\n "
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-12T18:01:17Z",
+      "sha": "5aedb8f578c1c74678b62b56167ad2280410d602",
+      "message": "abstract epoll send",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-12T18:01:17Z",
+      "author_date": "2019-10-12T18:01:17Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-12T18:01:17Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java\n@@ -35,6 +35,7 @@\n import io.netty.channel.socket.ChannelInputShutdownReadComplete;\n import io.netty.channel.socket.SocketChannelConfig;\n import io.netty.channel.unix.FileDescriptor;\n+import io.netty.channel.unix.IovArray;\n import io.netty.channel.unix.Socket;\n import io.netty.channel.unix.UnixChannel;\n import io.netty.util.ReferenceCountUtil;\n@@ -383,6 +384,39 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n         return WRITE_STATUS_SNDBUF_FULL;\n     }\n \n+    protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n+            throws IOException {\n+        if (data.hasMemoryAddress()) {\n+            long memoryAddress = data.memoryAddress();\n+            if (remoteAddress == null) {\n+                return socket.writeAddress(memoryAddress, data.readerIndex(), data.writerIndex());\n+            } else {\n+                return socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n+                        remoteAddress.getAddress(), remoteAddress.getPort(), fastOpen);\n+            }\n+        } else if (data.nioBufferCount() > 1) {\n+            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n+            array.add(data, data.readerIndex(), data.readableBytes());\n+            int cnt = array.count();\n+            assert cnt != 0;\n+\n+            if (remoteAddress == null) {\n+                return socket.writevAddresses(array.memoryAddress(0), cnt);\n+            } else {\n+                return socket.sendToAddresses(array.memoryAddress(0), cnt,\n+                        remoteAddress.getAddress(), remoteAddress.getPort(), fastOpen);\n+            }\n+        } else  {\n+            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n+            if (remoteAddress == null) {\n+                return socket.write(nioData, nioData.position(), nioData.limit());\n+            } else {\n+                return socket.sendTo(nioData, nioData.position(), nioData.limit(),\n+                        remoteAddress.getAddress(), remoteAddress.getPort(), fastOpen);\n+            }\n+        }\n+    }\n+\n     protected abstract class AbstractEpollUnsafe extends AbstractUnsafe {\n         boolean readPending;\n         boolean maybeMoreDataToRead;\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java\n@@ -379,38 +379,7 @@ private boolean doWriteMessage(Object msg) throws Exception {\n             return true;\n         }\n \n-        final long writtenBytes;\n-        if (data.hasMemoryAddress()) {\n-            long memoryAddress = data.memoryAddress();\n-            if (remoteAddress == null) {\n-                writtenBytes = socket.writeAddress(memoryAddress, data.readerIndex(), data.writerIndex());\n-            } else {\n-                writtenBytes = socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n-                        remoteAddress.getAddress(), remoteAddress.getPort());\n-            }\n-        } else if (data.nioBufferCount() > 1) {\n-            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n-            array.add(data, data.readerIndex(), data.readableBytes());\n-            int cnt = array.count();\n-            assert cnt != 0;\n-\n-            if (remoteAddress == null) {\n-                writtenBytes = socket.writevAddresses(array.memoryAddress(0), cnt);\n-            } else {\n-                writtenBytes = socket.sendToAddresses(array.memoryAddress(0), cnt,\n-                        remoteAddress.getAddress(), remoteAddress.getPort());\n-            }\n-        } else  {\n-            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n-            if (remoteAddress == null) {\n-                writtenBytes = socket.write(nioData, nioData.position(), nioData.limit());\n-            } else {\n-                writtenBytes = socket.sendTo(nioData, nioData.position(), nioData.limit(),\n-                        remoteAddress.getAddress(), remoteAddress.getPort());\n-            }\n-        }\n-\n-        return writtenBytes > 0;\n+        return doWriteOrSendBytes(data, remoteAddress, false) > 0;\n     }\n \n     @Override\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java\n@@ -126,33 +126,10 @@ boolean doConnect0(SocketAddress remote) throws Exception {\n         return super.doConnect0(remote);\n     }\n \n-    private long doWriteBytesFastOpen(ByteBuf data) throws Exception {\n-        final long writtenBytes;\n-        if (data.hasMemoryAddress()) {\n-            long memoryAddress = data.memoryAddress();\n-            writtenBytes = socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n-                                                remoteAddress().getAddress(), remoteAddress().getPort(), true);\n-        } else if (data.nioBufferCount() > 1) {\n-            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n-            array.add(data, data.readerIndex(), data.readableBytes());\n-            int cnt = array.count();\n-            assert cnt != 0;\n-\n-            writtenBytes = socket.sendToAddresses(array.memoryAddress(0), cnt, remoteAddress().getAddress(),\n-                                                  remoteAddress().getPort(), true);\n-        } else {\n-            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n-            writtenBytes = socket.sendTo(nioData, nioData.position(), nioData.limit(), remoteAddress().getAddress(),\n-                                         remoteAddress().getPort(), true);\n-        }\n-\n-        return writtenBytes;\n-    }\n-\n     @Override\n     int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n         if (buf.isReadable() && pendingFastOpenWrite) {\n-            long localFlushedAmount = doWriteBytesFastOpen(buf);\n+            long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n             if (localFlushedAmount > 0) {\n                 pendingFastOpenWrite = false;\n                 in.removeBytes(localFlushedAmount);",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+          "patch": "@@ -35,6 +35,7 @@\n import io.netty.channel.socket.ChannelInputShutdownReadComplete;\n import io.netty.channel.socket.SocketChannelConfig;\n import io.netty.channel.unix.FileDescriptor;\n+import io.netty.channel.unix.IovArray;\n import io.netty.channel.unix.Socket;\n import io.netty.channel.unix.UnixChannel;\n import io.netty.util.ReferenceCountUtil;\n@@ -383,6 +384,39 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n         return WRITE_STATUS_SNDBUF_FULL;\n     }\n \n+    protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n+            throws IOException {\n+        if (data.hasMemoryAddress()) {\n+            long memoryAddress = data.memoryAddress();\n+            if (remoteAddress == null) {\n+                return socket.writeAddress(memoryAddress, data.readerIndex(), data.writerIndex());\n+            } else {\n+                return socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n+                        remoteAddress.getAddress(), remoteAddress.getPort(), fastOpen);\n+            }\n+        } else if (data.nioBufferCount() > 1) {\n+            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n+            array.add(data, data.readerIndex(), data.readableBytes());\n+            int cnt = array.count();\n+            assert cnt != 0;\n+\n+            if (remoteAddress == null) {\n+                return socket.writevAddresses(array.memoryAddress(0), cnt);\n+            } else {\n+                return socket.sendToAddresses(array.memoryAddress(0), cnt,\n+                        remoteAddress.getAddress(), remoteAddress.getPort(), fastOpen);\n+            }\n+        } else  {\n+            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n+            if (remoteAddress == null) {\n+                return socket.write(nioData, nioData.position(), nioData.limit());\n+            } else {\n+                return socket.sendTo(nioData, nioData.position(), nioData.limit(),\n+                        remoteAddress.getAddress(), remoteAddress.getPort(), fastOpen);\n+            }\n+        }\n+    }\n+\n     protected abstract class AbstractEpollUnsafe extends AbstractUnsafe {\n         boolean readPending;\n         boolean maybeMoreDataToRead;"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java",
+          "patch": "@@ -379,38 +379,7 @@ private boolean doWriteMessage(Object msg) throws Exception {\n             return true;\n         }\n \n-        final long writtenBytes;\n-        if (data.hasMemoryAddress()) {\n-            long memoryAddress = data.memoryAddress();\n-            if (remoteAddress == null) {\n-                writtenBytes = socket.writeAddress(memoryAddress, data.readerIndex(), data.writerIndex());\n-            } else {\n-                writtenBytes = socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n-                        remoteAddress.getAddress(), remoteAddress.getPort());\n-            }\n-        } else if (data.nioBufferCount() > 1) {\n-            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n-            array.add(data, data.readerIndex(), data.readableBytes());\n-            int cnt = array.count();\n-            assert cnt != 0;\n-\n-            if (remoteAddress == null) {\n-                writtenBytes = socket.writevAddresses(array.memoryAddress(0), cnt);\n-            } else {\n-                writtenBytes = socket.sendToAddresses(array.memoryAddress(0), cnt,\n-                        remoteAddress.getAddress(), remoteAddress.getPort());\n-            }\n-        } else  {\n-            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n-            if (remoteAddress == null) {\n-                writtenBytes = socket.write(nioData, nioData.position(), nioData.limit());\n-            } else {\n-                writtenBytes = socket.sendTo(nioData, nioData.position(), nioData.limit(),\n-                        remoteAddress.getAddress(), remoteAddress.getPort());\n-            }\n-        }\n-\n-        return writtenBytes > 0;\n+        return doWriteOrSendBytes(data, remoteAddress, false) > 0;\n     }\n \n     @Override"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+          "patch": "@@ -126,33 +126,10 @@ boolean doConnect0(SocketAddress remote) throws Exception {\n         return super.doConnect0(remote);\n     }\n \n-    private long doWriteBytesFastOpen(ByteBuf data) throws Exception {\n-        final long writtenBytes;\n-        if (data.hasMemoryAddress()) {\n-            long memoryAddress = data.memoryAddress();\n-            writtenBytes = socket.sendToAddress(memoryAddress, data.readerIndex(), data.writerIndex(),\n-                                                remoteAddress().getAddress(), remoteAddress().getPort(), true);\n-        } else if (data.nioBufferCount() > 1) {\n-            IovArray array = ((EpollEventLoop) eventLoop()).cleanIovArray();\n-            array.add(data, data.readerIndex(), data.readableBytes());\n-            int cnt = array.count();\n-            assert cnt != 0;\n-\n-            writtenBytes = socket.sendToAddresses(array.memoryAddress(0), cnt, remoteAddress().getAddress(),\n-                                                  remoteAddress().getPort(), true);\n-        } else {\n-            ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());\n-            writtenBytes = socket.sendTo(nioData, nioData.position(), nioData.limit(), remoteAddress().getAddress(),\n-                                         remoteAddress().getPort(), true);\n-        }\n-\n-        return writtenBytes;\n-    }\n-\n     @Override\n     int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n         if (buf.isReadable() && pendingFastOpenWrite) {\n-            long localFlushedAmount = doWriteBytesFastOpen(buf);\n+            long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n             if (localFlushedAmount > 0) {\n                 pendingFastOpenWrite = false;\n                 in.removeBytes(localFlushedAmount);"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-12T18:08:13Z",
+      "sha": "e0b6adbbdedd5919bc074a6c02840014827f39d4",
+      "message": "remove unused fastopen methods",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-12T18:08:13Z",
+      "author_date": "2019-10-12T18:08:13Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-12T18:08:13Z",
+      "diff_text": "transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c\n@@ -122,10 +122,6 @@ static void netty_epoll_linuxsocket_setTcpFastOpen(JNIEnv* env, jclass clazz, ji\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN, &optval, sizeof(optval));\n }\n \n-static void netty_epoll_linuxsocket_setTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n-    netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval));\n-}\n-\n static void netty_epoll_linuxsocket_setTcpKeepIdle(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_KEEPIDLE, &optval, sizeof(optval));\n }\n@@ -594,20 +590,6 @@ static jint netty_epoll_linuxsocket_isTcpQuickAck(JNIEnv* env, jclass clazz, jin\n     return optval;\n }\n \n-static jint netty_epoll_linuxsocket_isTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd) {\n-    int optval;\n-    // We call netty_unix_socket_getOption0 directly so we can handle ENOPROTOOPT by ourself.\n-    if (netty_unix_socket_getOption0(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval)) == -1) {\n-        if (errno == ENOPROTOOPT) {\n-            // Not supported by the system, so just return 0.\n-            return 0;\n-        }\n-        netty_unix_socket_getOptionHandleError(env, errno);\n-        return -1;\n-    }\n-    return optval;\n-}\n-\n static jint netty_epoll_linuxsocket_getTcpNotSentLowAt(JNIEnv* env, jclass clazz, jint fd) {\n     int optval;\n     if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &optval, sizeof(optval)) == -1) {\n@@ -679,8 +661,6 @@ static const JNINativeMethod fixed_method_table[] = {\n   { \"getTcpNotSentLowAt\", \"(I)I\", (void *) netty_epoll_linuxsocket_getTcpNotSentLowAt },\n   { \"isTcpQuickAck\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpQuickAck },\n   { \"setTcpFastOpen\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpen },\n-  { \"setTcpFastOpenConnect\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpenConnect },\n-  { \"isTcpFastOpenConnect\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpFastOpenConnect },\n   { \"setTcpKeepIdle\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIdle },\n   { \"setTcpKeepIntvl\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIntvl },\n   { \"setTcpKeepCnt\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepCnt },",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c",
+          "patch": "@@ -122,10 +122,6 @@ static void netty_epoll_linuxsocket_setTcpFastOpen(JNIEnv* env, jclass clazz, ji\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN, &optval, sizeof(optval));\n }\n \n-static void netty_epoll_linuxsocket_setTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n-    netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval));\n-}\n-\n static void netty_epoll_linuxsocket_setTcpKeepIdle(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_KEEPIDLE, &optval, sizeof(optval));\n }\n@@ -594,20 +590,6 @@ static jint netty_epoll_linuxsocket_isTcpQuickAck(JNIEnv* env, jclass clazz, jin\n     return optval;\n }\n \n-static jint netty_epoll_linuxsocket_isTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd) {\n-    int optval;\n-    // We call netty_unix_socket_getOption0 directly so we can handle ENOPROTOOPT by ourself.\n-    if (netty_unix_socket_getOption0(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval)) == -1) {\n-        if (errno == ENOPROTOOPT) {\n-            // Not supported by the system, so just return 0.\n-            return 0;\n-        }\n-        netty_unix_socket_getOptionHandleError(env, errno);\n-        return -1;\n-    }\n-    return optval;\n-}\n-\n static jint netty_epoll_linuxsocket_getTcpNotSentLowAt(JNIEnv* env, jclass clazz, jint fd) {\n     int optval;\n     if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &optval, sizeof(optval)) == -1) {\n@@ -679,8 +661,6 @@ static const JNINativeMethod fixed_method_table[] = {\n   { \"getTcpNotSentLowAt\", \"(I)I\", (void *) netty_epoll_linuxsocket_getTcpNotSentLowAt },\n   { \"isTcpQuickAck\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpQuickAck },\n   { \"setTcpFastOpen\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpen },\n-  { \"setTcpFastOpenConnect\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpenConnect },\n-  { \"isTcpFastOpenConnect\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpFastOpenConnect },\n   { \"setTcpKeepIdle\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIdle },\n   { \"setTcpKeepIntvl\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIntvl },\n   { \"setTcpKeepCnt\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepCnt },"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-12T18:28:12Z",
+      "sha": "7a2aa94271c0a48dd28ea8238b96c92091af936f",
+      "message": "cleanup and refactor",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-12T18:28:12Z",
+      "author_date": "2019-10-12T18:28:12Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-12T18:28:12Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java\n@@ -384,6 +384,9 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n         return WRITE_STATUS_SNDBUF_FULL;\n     }\n \n+    /**\n+     * Write bytes to the socket. Used for datagram and TCP client fast open writes.\n+     */\n     protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n             throws IOException {\n         if (data.hasMemoryAddress()) {\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java\n@@ -32,7 +32,6 @@\n import io.netty.channel.unix.DatagramSocketAddress;\n import io.netty.channel.unix.Errors;\n import io.netty.channel.unix.Errors.NativeIoException;\n-import io.netty.channel.unix.IovArray;\n import io.netty.channel.unix.Socket;\n import io.netty.channel.unix.UnixChannelUtil;\n import io.netty.util.ReferenceCountUtil;\n@@ -362,7 +361,7 @@ protected void doWrite(ChannelOutboundBuffer in) throws Exception {\n \n     private boolean doWriteMessage(Object msg) throws Exception {\n         final ByteBuf data;\n-        InetSocketAddress remoteAddress;\n+        final InetSocketAddress remoteAddress;\n         if (msg instanceof AddressedEnvelope) {\n             @SuppressWarnings(\"unchecked\")\n             AddressedEnvelope<ByteBuf, InetSocketAddress> envelope =\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java\n@@ -21,14 +21,12 @@\n import io.netty.channel.ChannelOutboundBuffer;\n import io.netty.channel.socket.ServerSocketChannel;\n import io.netty.channel.socket.SocketChannel;\n-import io.netty.channel.unix.IovArray;\n import io.netty.util.concurrent.GlobalEventExecutor;\n \n import java.io.IOException;\n import java.net.InetAddress;\n import java.net.InetSocketAddress;\n import java.net.SocketAddress;\n-import java.nio.ByteBuffer;\n import java.util.Collection;\n import java.util.Collections;\n import java.util.Map;",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+          "patch": "@@ -384,6 +384,9 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n         return WRITE_STATUS_SNDBUF_FULL;\n     }\n \n+    /**\n+     * Write bytes to the socket. Used for datagram and TCP client fast open writes.\n+     */\n     protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n             throws IOException {\n         if (data.hasMemoryAddress()) {"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java",
+          "patch": "@@ -32,7 +32,6 @@\n import io.netty.channel.unix.DatagramSocketAddress;\n import io.netty.channel.unix.Errors;\n import io.netty.channel.unix.Errors.NativeIoException;\n-import io.netty.channel.unix.IovArray;\n import io.netty.channel.unix.Socket;\n import io.netty.channel.unix.UnixChannelUtil;\n import io.netty.util.ReferenceCountUtil;\n@@ -362,7 +361,7 @@ protected void doWrite(ChannelOutboundBuffer in) throws Exception {\n \n     private boolean doWriteMessage(Object msg) throws Exception {\n         final ByteBuf data;\n-        InetSocketAddress remoteAddress;\n+        final InetSocketAddress remoteAddress;\n         if (msg instanceof AddressedEnvelope) {\n             @SuppressWarnings(\"unchecked\")\n             AddressedEnvelope<ByteBuf, InetSocketAddress> envelope ="
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+          "patch": "@@ -21,14 +21,12 @@\n import io.netty.channel.ChannelOutboundBuffer;\n import io.netty.channel.socket.ServerSocketChannel;\n import io.netty.channel.socket.SocketChannel;\n-import io.netty.channel.unix.IovArray;\n import io.netty.util.concurrent.GlobalEventExecutor;\n \n import java.io.IOException;\n import java.net.InetAddress;\n import java.net.InetSocketAddress;\n import java.net.SocketAddress;\n-import java.nio.ByteBuffer;\n import java.util.Collection;\n import java.util.Collections;\n import java.util.Map;"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-12T18:28:28Z",
+      "sha": "d524e474fce24b5950507d58fbafa4992d58800e",
+      "message": "Merge branch '41_fastopen' of github.com:colinrgodsey/netty into 41_fastopen",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-12T18:28:28Z",
+      "author_date": "2019-10-12T18:28:28Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-12T18:28:28Z",
+      "diff_text": "transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c\n@@ -122,10 +122,6 @@ static void netty_epoll_linuxsocket_setTcpFastOpen(JNIEnv* env, jclass clazz, ji\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN, &optval, sizeof(optval));\n }\n \n-static void netty_epoll_linuxsocket_setTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n-    netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval));\n-}\n-\n static void netty_epoll_linuxsocket_setTcpKeepIdle(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_KEEPIDLE, &optval, sizeof(optval));\n }\n@@ -594,20 +590,6 @@ static jint netty_epoll_linuxsocket_isTcpQuickAck(JNIEnv* env, jclass clazz, jin\n     return optval;\n }\n \n-static jint netty_epoll_linuxsocket_isTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd) {\n-    int optval;\n-    // We call netty_unix_socket_getOption0 directly so we can handle ENOPROTOOPT by ourself.\n-    if (netty_unix_socket_getOption0(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval)) == -1) {\n-        if (errno == ENOPROTOOPT) {\n-            // Not supported by the system, so just return 0.\n-            return 0;\n-        }\n-        netty_unix_socket_getOptionHandleError(env, errno);\n-        return -1;\n-    }\n-    return optval;\n-}\n-\n static jint netty_epoll_linuxsocket_getTcpNotSentLowAt(JNIEnv* env, jclass clazz, jint fd) {\n     int optval;\n     if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &optval, sizeof(optval)) == -1) {\n@@ -679,8 +661,6 @@ static const JNINativeMethod fixed_method_table[] = {\n   { \"getTcpNotSentLowAt\", \"(I)I\", (void *) netty_epoll_linuxsocket_getTcpNotSentLowAt },\n   { \"isTcpQuickAck\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpQuickAck },\n   { \"setTcpFastOpen\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpen },\n-  { \"setTcpFastOpenConnect\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpenConnect },\n-  { \"isTcpFastOpenConnect\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpFastOpenConnect },\n   { \"setTcpKeepIdle\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIdle },\n   { \"setTcpKeepIntvl\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIntvl },\n   { \"setTcpKeepCnt\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepCnt },",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c",
+          "patch": "@@ -122,10 +122,6 @@ static void netty_epoll_linuxsocket_setTcpFastOpen(JNIEnv* env, jclass clazz, ji\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN, &optval, sizeof(optval));\n }\n \n-static void netty_epoll_linuxsocket_setTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n-    netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval));\n-}\n-\n static void netty_epoll_linuxsocket_setTcpKeepIdle(JNIEnv* env, jclass clazz, jint fd, jint optval) {\n     netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_KEEPIDLE, &optval, sizeof(optval));\n }\n@@ -594,20 +590,6 @@ static jint netty_epoll_linuxsocket_isTcpQuickAck(JNIEnv* env, jclass clazz, jin\n     return optval;\n }\n \n-static jint netty_epoll_linuxsocket_isTcpFastOpenConnect(JNIEnv* env, jclass clazz, jint fd) {\n-    int optval;\n-    // We call netty_unix_socket_getOption0 directly so we can handle ENOPROTOOPT by ourself.\n-    if (netty_unix_socket_getOption0(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &optval, sizeof(optval)) == -1) {\n-        if (errno == ENOPROTOOPT) {\n-            // Not supported by the system, so just return 0.\n-            return 0;\n-        }\n-        netty_unix_socket_getOptionHandleError(env, errno);\n-        return -1;\n-    }\n-    return optval;\n-}\n-\n static jint netty_epoll_linuxsocket_getTcpNotSentLowAt(JNIEnv* env, jclass clazz, jint fd) {\n     int optval;\n     if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &optval, sizeof(optval)) == -1) {\n@@ -679,8 +661,6 @@ static const JNINativeMethod fixed_method_table[] = {\n   { \"getTcpNotSentLowAt\", \"(I)I\", (void *) netty_epoll_linuxsocket_getTcpNotSentLowAt },\n   { \"isTcpQuickAck\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpQuickAck },\n   { \"setTcpFastOpen\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpen },\n-  { \"setTcpFastOpenConnect\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpFastOpenConnect },\n-  { \"isTcpFastOpenConnect\", \"(I)I\", (void *) netty_epoll_linuxsocket_isTcpFastOpenConnect },\n   { \"setTcpKeepIdle\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIdle },\n   { \"setTcpKeepIntvl\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepIntvl },\n   { \"setTcpKeepCnt\", \"(II)V\", (void *) netty_epoll_linuxsocket_setTcpKeepCnt },"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-12T21:43:28Z",
+      "sha": "083b19c96e12ab13a1d64604b3770fe796e57a61",
+      "message": "echo test",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-12T21:43:28Z",
+      "author_date": "2019-10-12T21:43:28Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-12T21:43:28Z",
+      "diff_text": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFastOpenEchoTest.java\n@@ -0,0 +1,44 @@\n+/*\n+ * Copyright 2014 The Netty Project\n+ *\n+ * The Netty Project licenses this file to you under the Apache License,\n+ * version 2.0 (the \"License\"); you may not use this file except in compliance\n+ * with the License. You may obtain a copy of the License at:\n+ *\n+ *   http://www.apache.org/licenses/LICENSE-2.0\n+ *\n+ * Unless required by applicable law or agreed to in writing, software\n+ * distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n+ * License for the specific language governing permissions and limitations\n+ * under the License.\n+ */\n+package io.netty.channel.epoll;\n+\n+import io.netty.bootstrap.Bootstrap;\n+import io.netty.bootstrap.ServerBootstrap;\n+import io.netty.buffer.ByteBufAllocator;\n+import io.netty.testsuite.transport.TestsuitePermutation;\n+import io.netty.testsuite.transport.socket.SocketEchoTest;\n+\n+import java.util.Collections;\n+import java.util.List;\n+\n+public class EpollSocketFastOpenEchoTest extends SocketEchoTest {\n+\n+    @Override\n+    protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n+        if (!EpollSocketTestPermutation.INSTANCE.isServerFastOpen()) {\n+            return Collections.emptyList();\n+        }\n+\n+        return EpollSocketTestPermutation.INSTANCE.socket();\n+    }\n+\n+    @Override\n+    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n+        bootstrap.option(EpollChannelOption.TCP_FASTOPEN, 5);\n+        bootstrap2.option(EpollChannelOption.TCP_FASTOPEN_CONNECT, true);\n+        super.configure(bootstrap, bootstrap2, allocator);\n+    }\n+}\ntransport-native-unix-common/src/main/c/netty_unix_socket.c\n@@ -976,9 +976,9 @@ static const JNINativeMethod fixed_method_table[] = {\n   { \"newSocketDgramFd\", \"(Z)I\", (void *) netty_unix_socket_newSocketDgramFd },\n   { \"newSocketStreamFd\", \"(Z)I\", (void *) netty_unix_socket_newSocketStreamFd },\n   { \"newSocketDomainFd\", \"()I\", (void *) netty_unix_socket_newSocketDomainFd },\n-  { \"sendTo\", \"(IZLjava/nio/ByteBuffer;II[BII)I\", (void *) netty_unix_socket_sendTo },\n-  { \"sendToAddress\", \"(IZJII[BII)I\", (void *) netty_unix_socket_sendToAddress },\n-  { \"sendToAddresses\", \"(IZJI[BII)I\", (void *) netty_unix_socket_sendToAddresses },\n+  { \"sendTo\", \"(IZLjava/nio/ByteBuffer;II[BIIZ)I\", (void *) netty_unix_socket_sendTo },\n+  { \"sendToAddress\", \"(IZJII[BIIZ)I\", (void *) netty_unix_socket_sendToAddress },\n+  { \"sendToAddresses\", \"(IZJI[BIIZ)I\", (void *) netty_unix_socket_sendToAddresses },\n   // \"recvFrom\" has a dynamic signature\n   // \"recvFromAddress\" has a dynamic signature\n   { \"recvFd\", \"(I)I\", (void *) netty_unix_socket_recvFd },",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFastOpenEchoTest.java",
+          "patch": "@@ -0,0 +1,44 @@\n+/*\n+ * Copyright 2014 The Netty Project\n+ *\n+ * The Netty Project licenses this file to you under the Apache License,\n+ * version 2.0 (the \"License\"); you may not use this file except in compliance\n+ * with the License. You may obtain a copy of the License at:\n+ *\n+ *   http://www.apache.org/licenses/LICENSE-2.0\n+ *\n+ * Unless required by applicable law or agreed to in writing, software\n+ * distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n+ * License for the specific language governing permissions and limitations\n+ * under the License.\n+ */\n+package io.netty.channel.epoll;\n+\n+import io.netty.bootstrap.Bootstrap;\n+import io.netty.bootstrap.ServerBootstrap;\n+import io.netty.buffer.ByteBufAllocator;\n+import io.netty.testsuite.transport.TestsuitePermutation;\n+import io.netty.testsuite.transport.socket.SocketEchoTest;\n+\n+import java.util.Collections;\n+import java.util.List;\n+\n+public class EpollSocketFastOpenEchoTest extends SocketEchoTest {\n+\n+    @Override\n+    protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n+        if (!EpollSocketTestPermutation.INSTANCE.isServerFastOpen()) {\n+            return Collections.emptyList();\n+        }\n+\n+        return EpollSocketTestPermutation.INSTANCE.socket();\n+    }\n+\n+    @Override\n+    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n+        bootstrap.option(EpollChannelOption.TCP_FASTOPEN, 5);\n+        bootstrap2.option(EpollChannelOption.TCP_FASTOPEN_CONNECT, true);\n+        super.configure(bootstrap, bootstrap2, allocator);\n+    }\n+}"
+        },
+        {
+          "file": "transport-native-unix-common/src/main/c/netty_unix_socket.c",
+          "patch": "@@ -976,9 +976,9 @@ static const JNINativeMethod fixed_method_table[] = {\n   { \"newSocketDgramFd\", \"(Z)I\", (void *) netty_unix_socket_newSocketDgramFd },\n   { \"newSocketStreamFd\", \"(Z)I\", (void *) netty_unix_socket_newSocketStreamFd },\n   { \"newSocketDomainFd\", \"()I\", (void *) netty_unix_socket_newSocketDomainFd },\n-  { \"sendTo\", \"(IZLjava/nio/ByteBuffer;II[BII)I\", (void *) netty_unix_socket_sendTo },\n-  { \"sendToAddress\", \"(IZJII[BII)I\", (void *) netty_unix_socket_sendToAddress },\n-  { \"sendToAddresses\", \"(IZJI[BII)I\", (void *) netty_unix_socket_sendToAddresses },\n+  { \"sendTo\", \"(IZLjava/nio/ByteBuffer;II[BIIZ)I\", (void *) netty_unix_socket_sendTo },\n+  { \"sendToAddress\", \"(IZJII[BIIZ)I\", (void *) netty_unix_socket_sendToAddress },\n+  { \"sendToAddresses\", \"(IZJI[BIIZ)I\", (void *) netty_unix_socket_sendToAddresses },\n   // \"recvFrom\" has a dynamic signature\n   // \"recvFromAddress\" has a dynamic signature\n   { \"recvFd\", \"(I)I\", (void *) netty_unix_socket_recvFd },"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-16T18:58:52Z",
+      "sha": "e4821078d056986df48bbc7fe18756b8ba324118",
+      "message": "Epoll test fixup",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-16T18:58:52Z",
+      "author_date": "2019-10-16T18:58:52Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-16T18:58:52Z",
+      "diff_text": "testsuite/src/main/java/io/netty/testsuite/transport/socket/SocketReadPendingTest.java\n@@ -40,7 +40,7 @@\n import static org.junit.Assert.assertTrue;\n \n public class SocketReadPendingTest extends AbstractSocketTest {\n-    @Test(timeout = 30000)\n+    @Test(timeout = 35000)\n     public void testReadPendingIsResetAfterEachRead() throws Throwable {\n         run();\n     }\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java\n@@ -385,7 +385,8 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n     }\n \n     /**\n-     * Write bytes to the socket. Used for datagram and TCP client fast open writes.\n+     * Write bytes to the socket, with or without a remote address.\n+     * Used for datagram and TCP client fast open writes.\n      */\n     protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n             throws IOException {\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java\n@@ -33,7 +33,6 @@\n import java.util.concurrent.Executor;\n \n import static io.netty.channel.epoll.LinuxSocket.newSocketStream;\n-import static io.netty.channel.internal.ChannelUtils.WRITE_STATUS_SNDBUF_FULL;\n \n /**\n  * {@link SocketChannel} implementation that uses linux EPOLL Edge-Triggered Mode for\n@@ -127,13 +126,15 @@ boolean doConnect0(SocketAddress remote) throws Exception {\n     @Override\n     int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n         if (buf.isReadable() && pendingFastOpenWrite) {\n+            pendingFastOpenWrite = false;\n             long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n             if (localFlushedAmount > 0) {\n-                pendingFastOpenWrite = false;\n                 in.removeBytes(localFlushedAmount);\n                 return 1;\n             }\n-            return WRITE_STATUS_SNDBUF_FULL;\n+            // If no cookie is present, the write fails with EINPROGRESS and this call basically\n+            // becomes a normal connect. All writes will be sent normally afterwards.\n+            return 0;\n         }\n \n         return super.writeBytes(in, buf);\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollCompositeBufferGatheringWriteTest.java\n@@ -26,7 +26,7 @@\n public class EpollCompositeBufferGatheringWriteTest extends CompositeBufferGatheringWriteTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollETSocketHalfClosed.java\n@@ -26,7 +26,7 @@\n public class EpollETSocketHalfClosed extends SocketHalfClosedTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollLTSocketHalfClosed.java\n@@ -26,7 +26,7 @@\n public class EpollLTSocketHalfClosed extends SocketHalfClosedTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketCloseForciblyTest.java\n@@ -17,6 +17,7 @@\n \n import io.netty.bootstrap.Bootstrap;\n import io.netty.bootstrap.ServerBootstrap;\n+import io.netty.buffer.ByteBufAllocator;\n import io.netty.testsuite.transport.TestsuitePermutation;\n import io.netty.testsuite.transport.socket.SocketCloseForciblyTest;\n \n@@ -25,6 +26,11 @@\n public class EpollSocketCloseForciblyTest extends SocketCloseForciblyTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n+    }\n+\n+    @Override\n+    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n+        super.configure(bootstrap, bootstrap2, allocator);\n     }\n }\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketConnectTest.java\n@@ -26,6 +26,6 @@ public class EpollSocketConnectTest extends SocketConnectTest {\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n }\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketConnectionAttemptTest.java\n@@ -24,6 +24,6 @@\n public class EpollSocketConnectionAttemptTest extends SocketConnectionAttemptTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapFactory<Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.clientSocket();\n+        return EpollSocketTestPermutation.INSTANCE.clientSocket(false);\n     }\n }\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFastOpenEchoTest.java\n@@ -1,44 +0,0 @@\n-/*\n- * Copyright 2014 The Netty Project\n- *\n- * The Netty Project licenses this file to you under the Apache License,\n- * version 2.0 (the \"License\"); you may not use this file except in compliance\n- * with the License. You may obtain a copy of the License at:\n- *\n- *   http://www.apache.org/licenses/LICENSE-2.0\n- *\n- * Unless required by applicable law or agreed to in writing, software\n- * distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n- * License for the specific language governing permissions and limitations\n- * under the License.\n- */\n-package io.netty.channel.epoll;\n-\n-import io.netty.bootstrap.Bootstrap;\n-import io.netty.bootstrap.ServerBootstrap;\n-import io.netty.buffer.ByteBufAllocator;\n-import io.netty.testsuite.transport.TestsuitePermutation;\n-import io.netty.testsuite.transport.socket.SocketEchoTest;\n-\n-import java.util.Collections;\n-import java.util.List;\n-\n-public class EpollSocketFastOpenEchoTest extends SocketEchoTest {\n-\n-    @Override\n-    protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        if (!EpollSocketTestPermutation.INSTANCE.isServerFastOpen()) {\n-            return Collections.emptyList();\n-        }\n-\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n-    }\n-\n-    @Override\n-    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n-        bootstrap.option(EpollChannelOption.TCP_FASTOPEN, 5);\n-        bootstrap2.option(EpollChannelOption.TCP_FASTOPEN_CONNECT, true);\n-        super.configure(bootstrap, bootstrap2, allocator);\n-    }\n-}\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFileRegionTest.java\n@@ -26,6 +26,7 @@ public class EpollSocketFileRegionTest extends SocketFileRegionTest {\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        //TODO: this should be able to use fastopen....\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n }\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketGatheringWriteTest.java\n@@ -26,6 +26,6 @@ public class EpollSocketGatheringWriteTest extends SocketGatheringWriteTest {\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n }\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketRstTest.java\n@@ -32,7 +32,7 @@\n public class EpollSocketRstTest extends SocketRstTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketShutdownOutputBySelfTest.java\n@@ -24,6 +24,6 @@\n public class EpollSocketShutdownOutputBySelfTest extends SocketShutdownOutputBySelfTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapFactory<Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.clientSocket();\n+        return EpollSocketTestPermutation.INSTANCE.clientSocket(false);\n     }\n }\ntransport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketTestPermutation.java\n@@ -65,6 +65,16 @@ public List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstra\n         return list;\n     }\n \n+    public List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> statefulSocket() {\n+\n+        List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> list =\n+                combo(serverSocket(), clientSocket(false));\n+\n+        list.remove(list.size() - 1); // Exclude NIO x NIO test\n+\n+        return list;\n+    }\n+\n     @SuppressWarnings(\"unchecked\")\n     @Override\n     public List<BootstrapFactory<ServerBootstrap>> serverSocket() {\n@@ -76,7 +86,7 @@ public ServerBootstrap newInstance() {\n                                             .channel(EpollServerSocketChannel.class);\n             }\n         });\n-        if (isServerFastOpen()) {\n+        if (isFastOpen()) {\n             toReturn.add(new BootstrapFactory<ServerBootstrap>() {\n                 @Override\n                 public ServerBootstrap newInstance() {\n@@ -98,23 +108,40 @@ public ServerBootstrap newInstance() {\n         return toReturn;\n     }\n \n-    @SuppressWarnings(\"unchecked\")\n     @Override\n     public List<BootstrapFactory<Bootstrap>> clientSocket() {\n-        return Arrays.asList(\n-                new BootstrapFactory<Bootstrap>() {\n-                    @Override\n-                    public Bootstrap newInstance() {\n-                        return new Bootstrap().group(EPOLL_WORKER_GROUP).channel(EpollSocketChannel.class);\n-                    }\n-                },\n-                new BootstrapFactory<Bootstrap>() {\n-                    @Override\n-                    public Bootstrap newInstance() {\n-                        return new Bootstrap().group(nioWorkerGroup).channel(NioSocketChannel.class);\n-                    }\n+        return clientSocket(true);\n+    }\n+\n+    @SuppressWarnings(\"unchecked\")\n+    public List<BootstrapFactory<Bootstrap>> clientSocket(boolean allowStateless) {\n+        List<BootstrapFactory<Bootstrap>> toReturn = new ArrayList<BootstrapFactory<Bootstrap>>();\n+\n+        toReturn.add(new BootstrapFactory<Bootstrap>() {\n+            @Override\n+            public Bootstrap newInstance() {\n+                return new Bootstrap().group(EPOLL_WORKER_GROUP).channel(EpollSocketChannel.class);\n+            }\n+        });\n+\n+        if (isFastOpen() && allowStateless) {\n+            toReturn.add(new BootstrapFactory<Bootstrap>() {\n+                @Override\n+                public Bootstrap newInstance() {\n+                    return new Bootstrap().group(EPOLL_WORKER_GROUP).channel(EpollSocketChannel.class)\n+                                          .option(EpollChannelOption.TCP_FASTOPEN_CONNECT, true);\n                 }\n-        );\n+            });\n+        }\n+\n+        toReturn.add(new BootstrapFactory<Bootstrap>() {\n+            @Override\n+            public Bootstrap newInstance() {\n+                return new Bootstrap().group(nioWorkerGroup).channel(NioSocketChannel.class);\n+            }\n+        });\n+\n+        return toReturn;\n     }\n \n     @Override\n@@ -226,7 +253,7 @@ public Bootstrap newInstance() {\n         );\n     }\n \n-    public boolean isServerFastOpen() {\n+    public boolean isFastOpen() {\n         return AccessController.doPrivileged(new PrivilegedAction<Integer>() {\n             @Override\n             public Integer run() {\ntransport-native-unix-common/src/main/c/netty_unix_socket.c\n@@ -320,7 +320,9 @@ static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos,\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \n-    if (res < 0) {\n+    if (res == -1 && err == EINPROGRESS && fastOpen == JNI_TRUE) {\n+        return 0;\n+    } else if (res < 0) {\n         return -err;\n     }\n     return (jint) res;\n@@ -646,7 +648,9 @@ static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \n-    if (res < 0) {\n+    if (res == -1 && err == EINPROGRESS && fastOpen == JNI_TRUE) {\n+        return 0;\n+    } else if (res < 0) {\n         return -err;\n     }\n     return (jint) res;",
+      "diff": [
+        {
+          "file": "testsuite/src/main/java/io/netty/testsuite/transport/socket/SocketReadPendingTest.java",
+          "patch": "@@ -40,7 +40,7 @@\n import static org.junit.Assert.assertTrue;\n \n public class SocketReadPendingTest extends AbstractSocketTest {\n-    @Test(timeout = 30000)\n+    @Test(timeout = 35000)\n     public void testReadPendingIsResetAfterEachRead() throws Throwable {\n         run();\n     }"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+          "patch": "@@ -385,7 +385,8 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n     }\n \n     /**\n-     * Write bytes to the socket. Used for datagram and TCP client fast open writes.\n+     * Write bytes to the socket, with or without a remote address.\n+     * Used for datagram and TCP client fast open writes.\n      */\n     protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n             throws IOException {"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+          "patch": "@@ -33,7 +33,6 @@\n import java.util.concurrent.Executor;\n \n import static io.netty.channel.epoll.LinuxSocket.newSocketStream;\n-import static io.netty.channel.internal.ChannelUtils.WRITE_STATUS_SNDBUF_FULL;\n \n /**\n  * {@link SocketChannel} implementation that uses linux EPOLL Edge-Triggered Mode for\n@@ -127,13 +126,15 @@ boolean doConnect0(SocketAddress remote) throws Exception {\n     @Override\n     int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n         if (buf.isReadable() && pendingFastOpenWrite) {\n+            pendingFastOpenWrite = false;\n             long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n             if (localFlushedAmount > 0) {\n-                pendingFastOpenWrite = false;\n                 in.removeBytes(localFlushedAmount);\n                 return 1;\n             }\n-            return WRITE_STATUS_SNDBUF_FULL;\n+            // If no cookie is present, the write fails with EINPROGRESS and this call basically\n+            // becomes a normal connect. All writes will be sent normally afterwards.\n+            return 0;\n         }\n \n         return super.writeBytes(in, buf);"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollCompositeBufferGatheringWriteTest.java",
+          "patch": "@@ -26,7 +26,7 @@\n public class EpollCompositeBufferGatheringWriteTest extends CompositeBufferGatheringWriteTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollETSocketHalfClosed.java",
+          "patch": "@@ -26,7 +26,7 @@\n public class EpollETSocketHalfClosed extends SocketHalfClosedTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollLTSocketHalfClosed.java",
+          "patch": "@@ -26,7 +26,7 @@\n public class EpollLTSocketHalfClosed extends SocketHalfClosedTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketCloseForciblyTest.java",
+          "patch": "@@ -17,6 +17,7 @@\n \n import io.netty.bootstrap.Bootstrap;\n import io.netty.bootstrap.ServerBootstrap;\n+import io.netty.buffer.ByteBufAllocator;\n import io.netty.testsuite.transport.TestsuitePermutation;\n import io.netty.testsuite.transport.socket.SocketCloseForciblyTest;\n \n@@ -25,6 +26,11 @@\n public class EpollSocketCloseForciblyTest extends SocketCloseForciblyTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n+    }\n+\n+    @Override\n+    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n+        super.configure(bootstrap, bootstrap2, allocator);\n     }\n }"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketConnectTest.java",
+          "patch": "@@ -26,6 +26,6 @@ public class EpollSocketConnectTest extends SocketConnectTest {\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n }"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketConnectionAttemptTest.java",
+          "patch": "@@ -24,6 +24,6 @@\n public class EpollSocketConnectionAttemptTest extends SocketConnectionAttemptTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapFactory<Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.clientSocket();\n+        return EpollSocketTestPermutation.INSTANCE.clientSocket(false);\n     }\n }"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFastOpenEchoTest.java",
+          "patch": "@@ -1,44 +0,0 @@\n-/*\n- * Copyright 2014 The Netty Project\n- *\n- * The Netty Project licenses this file to you under the Apache License,\n- * version 2.0 (the \"License\"); you may not use this file except in compliance\n- * with the License. You may obtain a copy of the License at:\n- *\n- *   http://www.apache.org/licenses/LICENSE-2.0\n- *\n- * Unless required by applicable law or agreed to in writing, software\n- * distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n- * License for the specific language governing permissions and limitations\n- * under the License.\n- */\n-package io.netty.channel.epoll;\n-\n-import io.netty.bootstrap.Bootstrap;\n-import io.netty.bootstrap.ServerBootstrap;\n-import io.netty.buffer.ByteBufAllocator;\n-import io.netty.testsuite.transport.TestsuitePermutation;\n-import io.netty.testsuite.transport.socket.SocketEchoTest;\n-\n-import java.util.Collections;\n-import java.util.List;\n-\n-public class EpollSocketFastOpenEchoTest extends SocketEchoTest {\n-\n-    @Override\n-    protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        if (!EpollSocketTestPermutation.INSTANCE.isServerFastOpen()) {\n-            return Collections.emptyList();\n-        }\n-\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n-    }\n-\n-    @Override\n-    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n-        bootstrap.option(EpollChannelOption.TCP_FASTOPEN, 5);\n-        bootstrap2.option(EpollChannelOption.TCP_FASTOPEN_CONNECT, true);\n-        super.configure(bootstrap, bootstrap2, allocator);\n-    }\n-}"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFileRegionTest.java",
+          "patch": "@@ -26,6 +26,7 @@ public class EpollSocketFileRegionTest extends SocketFileRegionTest {\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        //TODO: this should be able to use fastopen....\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n }"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketGatheringWriteTest.java",
+          "patch": "@@ -26,6 +26,6 @@ public class EpollSocketGatheringWriteTest extends SocketGatheringWriteTest {\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n }"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketRstTest.java",
+          "patch": "@@ -32,7 +32,7 @@\n public class EpollSocketRstTest extends SocketRstTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n \n     @Override"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketShutdownOutputBySelfTest.java",
+          "patch": "@@ -24,6 +24,6 @@\n public class EpollSocketShutdownOutputBySelfTest extends SocketShutdownOutputBySelfTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapFactory<Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.clientSocket();\n+        return EpollSocketTestPermutation.INSTANCE.clientSocket(false);\n     }\n }"
+        },
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketTestPermutation.java",
+          "patch": "@@ -65,6 +65,16 @@ public List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstra\n         return list;\n     }\n \n+    public List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> statefulSocket() {\n+\n+        List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> list =\n+                combo(serverSocket(), clientSocket(false));\n+\n+        list.remove(list.size() - 1); // Exclude NIO x NIO test\n+\n+        return list;\n+    }\n+\n     @SuppressWarnings(\"unchecked\")\n     @Override\n     public List<BootstrapFactory<ServerBootstrap>> serverSocket() {\n@@ -76,7 +86,7 @@ public ServerBootstrap newInstance() {\n                                             .channel(EpollServerSocketChannel.class);\n             }\n         });\n-        if (isServerFastOpen()) {\n+        if (isFastOpen()) {\n             toReturn.add(new BootstrapFactory<ServerBootstrap>() {\n                 @Override\n                 public ServerBootstrap newInstance() {\n@@ -98,23 +108,40 @@ public ServerBootstrap newInstance() {\n         return toReturn;\n     }\n \n-    @SuppressWarnings(\"unchecked\")\n     @Override\n     public List<BootstrapFactory<Bootstrap>> clientSocket() {\n-        return Arrays.asList(\n-                new BootstrapFactory<Bootstrap>() {\n-                    @Override\n-                    public Bootstrap newInstance() {\n-                        return new Bootstrap().group(EPOLL_WORKER_GROUP).channel(EpollSocketChannel.class);\n-                    }\n-                },\n-                new BootstrapFactory<Bootstrap>() {\n-                    @Override\n-                    public Bootstrap newInstance() {\n-                        return new Bootstrap().group(nioWorkerGroup).channel(NioSocketChannel.class);\n-                    }\n+        return clientSocket(true);\n+    }\n+\n+    @SuppressWarnings(\"unchecked\")\n+    public List<BootstrapFactory<Bootstrap>> clientSocket(boolean allowStateless) {\n+        List<BootstrapFactory<Bootstrap>> toReturn = new ArrayList<BootstrapFactory<Bootstrap>>();\n+\n+        toReturn.add(new BootstrapFactory<Bootstrap>() {\n+            @Override\n+            public Bootstrap newInstance() {\n+                return new Bootstrap().group(EPOLL_WORKER_GROUP).channel(EpollSocketChannel.class);\n+            }\n+        });\n+\n+        if (isFastOpen() && allowStateless) {\n+            toReturn.add(new BootstrapFactory<Bootstrap>() {\n+                @Override\n+                public Bootstrap newInstance() {\n+                    return new Bootstrap().group(EPOLL_WORKER_GROUP).channel(EpollSocketChannel.class)\n+                                          .option(EpollChannelOption.TCP_FASTOPEN_CONNECT, true);\n                 }\n-        );\n+            });\n+        }\n+\n+        toReturn.add(new BootstrapFactory<Bootstrap>() {\n+            @Override\n+            public Bootstrap newInstance() {\n+                return new Bootstrap().group(nioWorkerGroup).channel(NioSocketChannel.class);\n+            }\n+        });\n+\n+        return toReturn;\n     }\n \n     @Override\n@@ -226,7 +253,7 @@ public Bootstrap newInstance() {\n         );\n     }\n \n-    public boolean isServerFastOpen() {\n+    public boolean isFastOpen() {\n         return AccessController.doPrivileged(new PrivilegedAction<Integer>() {\n             @Override\n             public Integer run() {"
+        },
+        {
+          "file": "transport-native-unix-common/src/main/c/netty_unix_socket.c",
+          "patch": "@@ -320,7 +320,9 @@ static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos,\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \n-    if (res < 0) {\n+    if (res == -1 && err == EINPROGRESS && fastOpen == JNI_TRUE) {\n+        return 0;\n+    } else if (res < 0) {\n         return -err;\n     }\n     return (jint) res;\n@@ -646,7 +648,9 @@ static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd\n        // keep on writing if it was interrupted\n     } while (res == -1 && ((err = errno) == EINTR));\n \n-    if (res < 0) {\n+    if (res == -1 && err == EINPROGRESS && fastOpen == JNI_TRUE) {\n+        return 0;\n+    } else if (res < 0) {\n         return -err;\n     }\n     return (jint) res;"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-16T22:16:09Z",
+      "sha": "d06151e6516f5016cff3e55616bd198c1552814e",
+      "message": "cleanup",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-16T22:16:09Z",
+      "author_date": "2019-10-16T22:16:09Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-16T22:16:09Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java\n@@ -125,18 +125,19 @@ boolean doConnect0(SocketAddress remote) throws Exception {\n \n     @Override\n     int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n-        if (buf.isReadable() && pendingFastOpenWrite) {\n+        if (pendingFastOpenWrite && buf.isReadable()) {\n             pendingFastOpenWrite = false;\n             long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n             if (localFlushedAmount > 0) {\n+                // We had a cookie and our fast-open proceeded. Remove written data\n+                // then continue with normal TCP operation.\n                 in.removeBytes(localFlushedAmount);\n                 return 1;\n             }\n             // If no cookie is present, the write fails with EINPROGRESS and this call basically\n-            // becomes a normal connect. All writes will be sent normally afterwards.\n+            // becomes a normal async connect. All writes will be sent normally afterwards.\n             return 0;\n         }\n-\n         return super.writeBytes(in, buf);\n     }\n ",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+          "patch": "@@ -125,18 +125,19 @@ boolean doConnect0(SocketAddress remote) throws Exception {\n \n     @Override\n     int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n-        if (buf.isReadable() && pendingFastOpenWrite) {\n+        if (pendingFastOpenWrite && buf.isReadable()) {\n             pendingFastOpenWrite = false;\n             long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n             if (localFlushedAmount > 0) {\n+                // We had a cookie and our fast-open proceeded. Remove written data\n+                // then continue with normal TCP operation.\n                 in.removeBytes(localFlushedAmount);\n                 return 1;\n             }\n             // If no cookie is present, the write fails with EINPROGRESS and this call basically\n-            // becomes a normal connect. All writes will be sent normally afterwards.\n+            // becomes a normal async connect. All writes will be sent normally afterwards.\n             return 0;\n         }\n-\n         return super.writeBytes(in, buf);\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2019-10-16T22:44:50Z",
+      "user": "colinrgodsey",
+      "body": "Motivation:\r\n\r\nProvides legacy support for client TCP fast open.\r\n\r\nModification:\r\n\r\nProvides TCP fast open for TCP epoll client sockets. This _could_ normally be available via the TCP_FASTOPEN_CONNECT epoll option, but this isn't supported on older kernels (only 4.11+). This newer option is mostly a convenience feature for the original functionality described [here](https://lwn.net/Articles/508865/), so I have provided an implementation that uses the original functionality to extend support to linux kernel 3.6+.\r\n\r\nResult:\r\n\r\nFixes #9651.\r\n\r\nNotes:\r\n\r\nThis replaces the existing functionality for TCP_FASTOPEN_CONNECT. This implementation should be functionally similar while providing support for legacy kernels. The new implementation is included in the epoll test permutations, but is excluded from some tests. This is to be expected given that client fast open effectively makes the first phase of the connection stateless, and will alter some expected behavior you would normally have with TCP connections that have a stateful connect phase. \r\n\r\nThe existing TCP_FASTOPEN_CONNECT option was not present in any tests or the epoll permutations so it is unknown whether it would have the same effect on the tests, but it is assumed so.\r\n\r\n- [ ] Squashed\r\n- [X] Public API compatibility\r\n- [X] Feature parity\r\n- [X] Epoll test permutations (with some exceptions)\r\n- [x] EpollSocketFileRegionTest behavior confirmation\r\n- [x] Review of test case exceptions\r\n\r\n\r\nCaveat/oddity signoff:\r\n- [ ] No support for sendFile\r\n- [ ] Replaces existing TCP_FASTOPEN_CONNECT mechanics (at parity but more broad kernel support)\r\n- [ ] Elevated doWriteOrSendBytes to AbstractEpollChannel.java \r\n- [ ] Changes to access levels on some methods"
+    },
+    {
+      "type": "review",
+      "id": 302921019,
+      "created_at": "2019-10-16T22:48:55Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 335743104,
+      "created_at": "2019-10-16T22:48:55Z",
+      "user": "colinrgodsey",
+      "body": "There was some timeout that occurred per permutation, had to increase this to account for the new permutations.",
+      "path": "testsuite/src/main/java/io/netty/testsuite/transport/socket/SocketReadPendingTest.java",
+      "diff_hunk": "@@ -40,7 +40,7 @@\n import static org.junit.Assert.assertTrue;\n \n public class SocketReadPendingTest extends AbstractSocketTest {\n-    @Test(timeout = 30000)\n+    @Test(timeout = 35000)",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 43,
+      "original_line": 43,
+      "side": "RIGHT",
+      "original_position": 5,
+      "position": 5,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 542922745,
+      "created_at": "2019-10-16T22:49:03Z",
+      "user": "netty-bot",
+      "body": "Can one of the admins verify this patch?"
+    },
+    {
+      "type": "review",
+      "id": 302921578,
+      "created_at": "2019-10-16T22:50:35Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 335743574,
+      "created_at": "2019-10-16T22:50:35Z",
+      "user": "colinrgodsey",
+      "body": "moved this up. it is now technically a 'stateless' write/send for epoll sockets, instead of just being for datagrams. ",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+      "diff_hunk": "@@ -383,6 +384,43 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n         return WRITE_STATUS_SNDBUF_FULL;\n     }\n \n+    /**\n+     * Write bytes to the socket, with or without a remote address.\n+     * Used for datagram and TCP client fast open writes.\n+     */\n+    protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 391,
+      "original_line": 391,
+      "side": "RIGHT",
+      "original_position": 16,
+      "position": 16,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 335744466,
+      "created_at": "2019-10-16T22:53:46Z",
+      "user": "colinrgodsey",
+      "body": "elevated access for doConnect0 and writeBytes to package private. behavior is no longer strictly generic for epoll/epoll-stream, as EpollSocketChannel has custom requirements for those methods during fast connect. could be a better way to do this",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+      "diff_hunk": "@@ -717,7 +755,7 @@ protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddr\n         return connected;\n     }\n \n-    private boolean doConnect0(SocketAddress remote) throws Exception {\n+    boolean doConnect0(SocketAddress remote) throws Exception {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 759,
+      "original_line": 758,
+      "side": "RIGHT",
+      "original_position": 57,
+      "position": 58,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 335818252,
+          "user": "carl-mastrangelo",
+          "body": "If you expose this method, you should probably add a javadoc explaining the return value.    It will now be API.",
+          "created_at": "2019-10-17T05:46:19Z"
+        },
+        {
+          "id": 336302895,
+          "user": "colinrgodsey",
+          "body": "yea, i was wondering about that. AbstractEpollChannel has a package private constructor, so its still an \"internal\" API, but not exactly hidden. ill add some docs after i confirm this was the right approach, might be a better way still",
+          "created_at": "2019-10-18T02:53:37Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 302922666,
+      "created_at": "2019-10-16T22:53:47Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 302923746,
+      "created_at": "2019-10-16T22:56:51Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 335745374,
+      "created_at": "2019-10-16T22:56:51Z",
+      "user": "colinrgodsey",
+      "body": "This.... kind of sucks for testing. The client cookies are external state stored in the system, and I did not encounter the EINPROGRESS state until after I reset the machine. DNS cache for example is at least... idempotent (ish), this seems to be some whole other next-level machine state testing concerns. ",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+      "diff_hunk": "@@ -110,6 +114,33 @@ protected AbstractEpollUnsafe newUnsafe() {\n         return new EpollSocketChannelUnsafe();\n     }\n \n+    @Override\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n+        if (Native.IS_SUPPORTING_TCP_FASTOPEN && config.isTcpFastOpenConnect()) {\n+            pendingFastOpenWrite = true;\n+            return true;\n+        }\n+        return super.doConnect0(remote);\n+    }\n+\n+    @Override\n+    int writeBytes(ChannelOutboundBuffer in, ByteBuf buf) throws Exception {\n+        if (pendingFastOpenWrite && buf.isReadable()) {\n+            pendingFastOpenWrite = false;\n+            long localFlushedAmount = doWriteOrSendBytes(buf, remoteAddress(), true);\n+            if (localFlushedAmount > 0) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 131,
+      "original_line": 131,
+      "side": "RIGHT",
+      "original_position": 45,
+      "position": 45,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 302924290,
+      "created_at": "2019-10-16T22:58:19Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 335745809,
+      "created_at": "2019-10-16T22:58:19Z",
+      "user": "colinrgodsey",
+      "body": "Some test cases were modified to only use stateful permutations. These have all generally made sense except one, marked with a TODO below. ",
+      "path": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollCompositeBufferGatheringWriteTest.java",
+      "diff_hunk": "@@ -26,7 +26,7 @@\n public class EpollCompositeBufferGatheringWriteTest extends CompositeBufferGatheringWriteTest {\n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        return EpollSocketTestPermutation.INSTANCE.statefulSocket();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 29,
+      "original_line": 29,
+      "side": "RIGHT",
+      "original_position": 5,
+      "position": 5,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-16T22:58:49Z",
+      "sha": "7d3d7e6f7711ca79751065753b5520e54a6c6b51",
+      "message": "cleanup",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-16T22:58:49Z",
+      "author_date": "2019-10-16T22:58:49Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-16T22:58:49Z",
+      "diff_text": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketCloseForciblyTest.java\n@@ -17,7 +17,6 @@\n \n import io.netty.bootstrap.Bootstrap;\n import io.netty.bootstrap.ServerBootstrap;\n-import io.netty.buffer.ByteBufAllocator;\n import io.netty.testsuite.transport.TestsuitePermutation;\n import io.netty.testsuite.transport.socket.SocketCloseForciblyTest;\n \n@@ -28,9 +27,4 @@ public class EpollSocketCloseForciblyTest extends SocketCloseForciblyTest {\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n         return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n-\n-    @Override\n-    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n-        super.configure(bootstrap, bootstrap2, allocator);\n-    }\n }",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketCloseForciblyTest.java",
+          "patch": "@@ -17,7 +17,6 @@\n \n import io.netty.bootstrap.Bootstrap;\n import io.netty.bootstrap.ServerBootstrap;\n-import io.netty.buffer.ByteBufAllocator;\n import io.netty.testsuite.transport.TestsuitePermutation;\n import io.netty.testsuite.transport.socket.SocketCloseForciblyTest;\n \n@@ -28,9 +27,4 @@ public class EpollSocketCloseForciblyTest extends SocketCloseForciblyTest {\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n         return EpollSocketTestPermutation.INSTANCE.statefulSocket();\n     }\n-\n-    @Override\n-    protected void configure(ServerBootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {\n-        super.configure(bootstrap, bootstrap2, allocator);\n-    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-16T23:07:40Z",
+      "sha": "5d70d3048ae0f8fe889f6dece5dc90bd6e9d73bc",
+      "message": "cleanup",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-16T23:07:40Z",
+      "author_date": "2019-10-16T23:07:40Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-16T23:07:40Z",
+      "diff_text": "transport-native-unix-common/src/main/java/io/netty/channel/unix/Socket.java\n@@ -485,10 +485,8 @@ private static native int sendToAddresses(\n \n     private static native DatagramSocketAddress recvFrom(\n             int fd, ByteBuffer buf, int pos, int limit) throws IOException;\n-\n     private static native DatagramSocketAddress recvFromAddress(\n             int fd, long memoryAddress, int pos, int limit) throws IOException;\n-\n     private static native int recvFd(int fd);\n     private static native int sendFd(int socketFd, int fd);\n ",
+      "diff": [
+        {
+          "file": "transport-native-unix-common/src/main/java/io/netty/channel/unix/Socket.java",
+          "patch": "@@ -485,10 +485,8 @@ private static native int sendToAddresses(\n \n     private static native DatagramSocketAddress recvFrom(\n             int fd, ByteBuffer buf, int pos, int limit) throws IOException;\n-\n     private static native DatagramSocketAddress recvFromAddress(\n             int fd, long memoryAddress, int pos, int limit) throws IOException;\n-\n     private static native int recvFd(int fd);\n     private static native int sendFd(int socketFd, int fd);\n "
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 542931153,
+      "created_at": "2019-10-16T23:23:18Z",
+      "user": "normanmaurer",
+      "body": "@netty-bot test this please "
+    },
+    {
+      "type": "comment",
+      "id": 542936709,
+      "created_at": "2019-10-16T23:49:01Z",
+      "user": "colinrgodsey",
+      "body": "```error: ‘MSG_FASTOPEN’ undeclared (first use in this function)```\r\n\r\nCentos6, kernel 2.6. i guess fast open client wasnt until the 3.6 kernel, did not realize that.\r\n\r\nI can add the stub DEFINE for older kernel builds. jenkins won't test any of the fast open stuff, but i suppose its a good smoke test still"
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-16T23:56:08Z",
+      "sha": "ad73f9012c62b79234f5c80454a04e73abf9d8cf",
+      "message": "MSF_GASTOPEN stub",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-16T23:56:08Z",
+      "author_date": "2019-10-16T23:56:08Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-16T23:56:08Z",
+      "diff_text": "transport-native-unix-common/src/main/c/netty_unix_socket.c\n@@ -36,6 +36,11 @@\n #define SO_REUSEPORT 15\n #endif /* SO_REUSEPORT */\n \n+// MSG_FASTOPEN is defined in linux 3.6. We define this here so older kernels can compile.\n+#ifndef MSG_FASTOPEN\n+#define MSG_FASTOPEN 0x20000000\n+#endif\n+\n static jclass datagramSocketAddressClass = NULL;\n static jmethodID datagramSocketAddrMethodId = NULL;\n static jmethodID inetSocketAddrMethodId = NULL;",
+      "diff": [
+        {
+          "file": "transport-native-unix-common/src/main/c/netty_unix_socket.c",
+          "patch": "@@ -36,6 +36,11 @@\n #define SO_REUSEPORT 15\n #endif /* SO_REUSEPORT */\n \n+// MSG_FASTOPEN is defined in linux 3.6. We define this here so older kernels can compile.\n+#ifndef MSG_FASTOPEN\n+#define MSG_FASTOPEN 0x20000000\n+#endif\n+\n static jclass datagramSocketAddressClass = NULL;\n static jmethodID datagramSocketAddrMethodId = NULL;\n static jmethodID inetSocketAddrMethodId = NULL;"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 335763382,
+      "created_at": "2019-10-17T00:15:49Z",
+      "user": "colinrgodsey",
+      "body": "and I guess, it only works from linux 3.6 onwards. its not a massive improvement in coverage... but its maybe worth it. still curious if the same tests would fail if we added the original 4.1 TCP_FASTOPEN_CONNECT to the permutations... pretty sure most of the same ones would. ",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannelConfig.java",
+      "diff_hunk": "@@ -550,29 +551,21 @@ public boolean isTcpQuickAck() {\n     }\n \n     /**\n-     * Set the {@code TCP_FASTOPEN_CONNECT} option on the socket. Requires Linux kernel 4.11 or later.\n-     * See\n-     * <a href=\"https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=19f6d3f3\">this commit</a>\n-     * for more details.\n+     * Enables client TCP fast open. {@code TCP_FASTOPEN_CONNECT} normally\n+     * requires Linux kernel 4.11 or later, so instead we use the traditional fast open\n+     * client socket mechanics. See this\n+     * <a href=\"https://lwn.net/Articles/508865/\">LWN article</a> for more info.",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 557,
+      "original_line": 557,
+      "side": "RIGHT",
+      "original_position": 19,
+      "position": 19,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 302945875,
+      "created_at": "2019-10-17T00:15:50Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303010414,
+      "created_at": "2019-10-17T05:31:28Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 335815105,
+      "created_at": "2019-10-17T05:31:28Z",
+      "user": "carl-mastrangelo",
+      "body": "Would it be correct to put `assert !fastOpen` here?",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+      "diff_hunk": "@@ -383,6 +384,43 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n         return WRITE_STATUS_SNDBUF_FULL;\n     }\n \n+    /**\n+     * Write bytes to the socket, with or without a remote address.\n+     * Used for datagram and TCP client fast open writes.\n+     */\n+    protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n+            throws IOException {\n+        if (data.hasMemoryAddress()) {\n+            long memoryAddress = data.memoryAddress();\n+            if (remoteAddress == null) {\n+                return socket.writeAddress(memoryAddress, data.readerIndex(), data.writerIndex());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 397,
+      "original_line": 396,
+      "side": "RIGHT",
+      "original_position": 21,
+      "position": 22,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 335969555,
+          "user": "colinrgodsey",
+          "body": "Sounds right. hmm, not sure if we should do an assert or an IllegalArgumentException check?  Either one can probably go at that top to just check that remoteAddress must be set if fastOpen is true. ",
+          "created_at": "2019-10-17T12:19:09Z"
+        },
+        {
+          "id": 335982318,
+          "user": "colinrgodsey",
+          "body": "~also, just noticed that this method i moved up (normally used for datagrams) is pretty much the same as the normal method used for TCP (AbstractEpollChannel.doWriteBytes), with the exception of writev. Does writev not work with TCP? if it should work, those methods can probably be combined~",
+          "created_at": "2019-10-17T12:46:57Z"
+        },
+        {
+          "id": 335994350,
+          "user": "colinrgodsey",
+          "body": "hmmm, yea Socket.writev and Socket.writevAddresses appear to do mostly the same thing. will resist trying to condense those for now",
+          "created_at": "2019-10-17T13:11:37Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 335817755,
+      "created_at": "2019-10-17T05:43:58Z",
+      "user": "carl-mastrangelo",
+      "body": "What happens if connect() is called twice with fast open turned on?",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+      "diff_hunk": "@@ -110,6 +114,33 @@ protected AbstractEpollUnsafe newUnsafe() {\n         return new EpollSocketChannelUnsafe();\n     }\n \n+    @Override\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n+        if (Native.IS_SUPPORTING_TCP_FASTOPEN && config.isTcpFastOpenConnect()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 119,
+      "original_line": 119,
+      "side": "RIGHT",
+      "original_position": 33,
+      "position": 33,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 335968508,
+          "user": "colinrgodsey",
+          "body": "The behavior still seems to be maintained. EpollSocketMultipleConnectTest is using the new permutations and passes. AlreadyConnectedException seems to be thrown if a remote address is already set.",
+          "created_at": "2019-10-17T12:16:29Z"
+        },
+        {
+          "id": 336282287,
+          "user": "carl-mastrangelo",
+          "body": "What I mean is, it appears this method will discard the second `doConnect()`, where as the normal channel will complain.    Does EpollSocketMultipleConnectTest account for the fast open variant?",
+          "created_at": "2019-10-18T00:42:06Z"
+        },
+        {
+          "id": 336301900,
+          "user": "colinrgodsey",
+          "body": "yeah, the actual (untouched) `doConnect()` method will check if a remoteAddress is already set and fail before `doConnect0()` (which has an override here) is called, so the AlreadyConnectedException will still be thrown using the expected behavior (it doesnt rely on the actual socket state). EpollSocketMultipleConnectTest uses the new permutation set (with the client fast open) and passes fine. So thankfully that should still work like it normally does. \r\n\r\nThe only tests that needed to exclude the new (client fast open) permutation are mostly based around behavior of the stateful connection phase, without the client sending data, which is expected. The only real unexpected one that failed is the FileRegion test, which I might able to fix... maybe (sendFile doesn't support MSG_FASTOPEN). Still playing around with options there.",
+          "created_at": "2019-10-18T02:48:23Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 303013672,
+      "created_at": "2019-10-17T05:43:59Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303014311,
+      "created_at": "2019-10-17T05:46:20Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303014929,
+      "created_at": "2019-10-17T05:48:56Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 335818727,
+      "created_at": "2019-10-17T05:48:56Z",
+      "user": "carl-mastrangelo",
+      "body": "Should this return false?   The parent caller in `AbstractEpollChannel.doConnect` seems to expect the remote address to be set, even though it won't be.",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannel.java",
+      "diff_hunk": "@@ -110,6 +114,33 @@ protected AbstractEpollUnsafe newUnsafe() {\n         return new EpollSocketChannelUnsafe();\n     }\n \n+    @Override\n+    boolean doConnect0(SocketAddress remote) throws Exception {\n+        if (Native.IS_SUPPORTING_TCP_FASTOPEN && config.isTcpFastOpenConnect()) {\n+            pendingFastOpenWrite = true;\n+            return true;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 121,
+      "original_line": 121,
+      "side": "RIGHT",
+      "original_position": 35,
+      "position": 35,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 335967450,
+          "user": "colinrgodsey",
+          "body": "If I return false here the tests end up hanging waiting for the connect to complete. Hmm still trying to figure out exactly how the logic works in `AbstractEpollChannel.doConnect` for setting remote, but it does seem to get set using the provided remoteAddress using (non-hostname) IPs in the tests on Java 8. That behavior is still required as we need the channel's remoteAddress set so we can do the stateless connect in the first write call. ",
+          "created_at": "2019-10-17T12:13:54Z"
+        },
+        {
+          "id": 335972982,
+          "user": "colinrgodsey",
+          "body": "confirmed that `AbstractEpollChannel.doConnect` will still set remote using the provided address always if the address is missing on the socket. hmmm wondering how this may effect addresses with hostnames",
+          "created_at": "2019-10-17T12:26:41Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 303207633,
+      "created_at": "2019-10-17T12:13:55Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303209001,
+      "created_at": "2019-10-17T12:16:29Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303210429,
+      "created_at": "2019-10-17T12:19:09Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303214846,
+      "created_at": "2019-10-17T12:26:41Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303226928,
+      "created_at": "2019-10-17T12:46:57Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303242766,
+      "created_at": "2019-10-17T13:11:37Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2019-10-17T13:34:50Z",
+      "sha": "302ea6c985f439ca257d57eac55d3901baa2b1bd",
+      "message": "cleanup",
+      "author": "Colin Godsey",
+      "author_email": "crgodsey@gmail.com",
+      "author_raw_date": "2019-10-17T13:34:50Z",
+      "author_date": "2019-10-17T13:34:50Z",
+      "committer": "Colin Godsey",
+      "committer_email": "crgodsey@gmail.com",
+      "raw_date": "2019-10-17T13:34:50Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java\n@@ -390,6 +390,7 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n      */\n     protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n             throws IOException {\n+        assert !(fastOpen && remoteAddress == null) : \"fastOpen requires a remote address\";\n         if (data.hasMemoryAddress()) {\n             long memoryAddress = data.memoryAddress();\n             if (remoteAddress == null) {\ntransport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannelConfig.java\n@@ -553,7 +553,7 @@ public boolean isTcpQuickAck() {\n     /**\n      * Enables client TCP fast open. {@code TCP_FASTOPEN_CONNECT} normally\n      * requires Linux kernel 4.11 or later, so instead we use the traditional fast open\n-     * client socket mechanics. See this\n+     * client socket mechanics that work with kernel 3.6 and later. See this\n      * <a href=\"https://lwn.net/Articles/508865/\">LWN article</a> for more info.\n      */\n     public EpollSocketChannelConfig setTcpFastOpenConnect(boolean fastOpenConnect) {",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/AbstractEpollChannel.java",
+          "patch": "@@ -390,6 +390,7 @@ protected final int doWriteBytes(ChannelOutboundBuffer in, ByteBuf buf) throws E\n      */\n     protected final long doWriteOrSendBytes(ByteBuf data, InetSocketAddress remoteAddress, boolean fastOpen)\n             throws IOException {\n+        assert !(fastOpen && remoteAddress == null) : \"fastOpen requires a remote address\";\n         if (data.hasMemoryAddress()) {\n             long memoryAddress = data.memoryAddress();\n             if (remoteAddress == null) {"
+        },
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollSocketChannelConfig.java",
+          "patch": "@@ -553,7 +553,7 @@ public boolean isTcpQuickAck() {\n     /**\n      * Enables client TCP fast open. {@code TCP_FASTOPEN_CONNECT} normally\n      * requires Linux kernel 4.11 or later, so instead we use the traditional fast open\n-     * client socket mechanics. See this\n+     * client socket mechanics that work with kernel 3.6 and later. See this\n      * <a href=\"https://lwn.net/Articles/508865/\">LWN article</a> for more info.\n      */\n     public EpollSocketChannelConfig setTcpFastOpenConnect(boolean fastOpenConnect) {"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 336276120,
+      "created_at": "2019-10-18T00:07:12Z",
+      "user": "colinrgodsey",
+      "body": "figured out why this fails (no MSG_FASTOPEN flag for sendFile). Not sure what to do about it though.... still playing around with some options.",
+      "path": "transport-native-epoll/src/test/java/io/netty/channel/epoll/EpollSocketFileRegionTest.java",
+      "diff_hunk": "@@ -26,6 +26,7 @@\n \n     @Override\n     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {\n-        return EpollSocketTestPermutation.INSTANCE.socket();\n+        //TODO: this should be able to use fastopen....",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 29,
+      "original_line": 29,
+      "side": "RIGHT",
+      "original_position": 5,
+      "position": 5,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 303609633,
+      "created_at": "2019-10-18T00:07:13Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303617027,
+      "created_at": "2019-10-18T00:42:07Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303641195,
+      "created_at": "2019-10-18T02:48:23Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 303642334,
+      "created_at": "2019-10-18T02:53:37Z",
+      "user": "colinrgodsey",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 548724491,
+      "created_at": "2019-11-01T09:33:41Z",
+      "user": "normanmaurer",
+      "body": "@colinrgodsey sorry for the delay... I will review early next week latest. "
+    },
+    {
+      "type": "comment",
+      "id": 558983283,
+      "created_at": "2019-11-27T08:28:23Z",
+      "user": "normanmaurer",
+      "body": "@netty-bot test this please "
+    },
+    {
+      "type": "comment",
+      "id": 559109403,
+      "created_at": "2019-11-27T14:27:06Z",
+      "user": "normanmaurer",
+      "body": "@colinrgodsey generally speaking I think this looks good. What blockers are left ?"
+    },
+    {
+      "type": "comment",
+      "id": 563974452,
+      "created_at": "2019-12-10T10:41:03Z",
+      "user": "normanmaurer",
+      "body": "@colinrgodsey ping... "
+    },
+    {
+      "type": "comment",
+      "id": 565613206,
+      "created_at": "2019-12-13T21:22:49Z",
+      "user": "colinrgodsey",
+      "body": "@normanmaurer hey, sorry i dropped off the face of the earth for a bit. So, the last thing I was trying to figure out was a way to \"abort\" fastopen if the first send is a sendFile (because the file api is apparently just incompatible with the 'legacy' fastopen style). I didn't get anywhere with it- there was maybe some slightly hacky options, but it didn't really seem worth it. So this might just end up needing to be a small 'gotcha' for now. other than that, no other blockers. "
+    },
+    {
+      "type": "comment",
+      "id": 565616017,
+      "created_at": "2019-12-13T21:32:07Z",
+      "user": "colinrgodsey",
+      "body": "hmm, also the test report for centos6-java11 seems to be gone (for the last test phase). wonder what the issues was there (also going to clean up my github label in gmail so i can actually see the updates here)"
+    },
+    {
+      "type": "comment",
+      "id": 583393102,
+      "created_at": "2020-02-07T13:39:52Z",
+      "user": "normanmaurer",
+      "body": "@netty-bot test this please "
+    },
+    {
+      "type": "comment",
+      "id": 587504926,
+      "created_at": "2020-02-18T15:05:43Z",
+      "user": "colinrgodsey",
+      "body": "@normanmaurer looks like the tests are good now. any other action items to take here?"
+    },
+    {
+      "type": "comment",
+      "id": 590752909,
+      "created_at": "2020-02-25T08:50:18Z",
+      "user": "normanmaurer",
+      "body": "@colinrgodsey yep... I will have a final look and then merge. Sorry for the slow turnaround :/"
+    },
+    {
+      "type": "comment",
+      "id": 595231386,
+      "created_at": "2020-03-05T13:32:43Z",
+      "user": "normanmaurer",
+      "body": "@carl-mastrangelo any more concerns ?"
+    },
+    {
+      "type": "comment",
+      "id": 595418944,
+      "created_at": "2020-03-05T19:59:11Z",
+      "user": "colinrgodsey",
+      "body": "Going to add a checklist to the description detailing some of the changes here for sign-off reasons (just to make sure we're all aligned on the caveats and general oddities),\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 602643971,
+      "created_at": "2020-03-23T14:48:35Z",
+      "user": "hyperxpro",
+      "body": "Are there any updates on this?"
+    },
+    {
+      "type": "comment",
+      "id": 773222652,
+      "created_at": "2021-02-04T11:01:34Z",
+      "user": "chrisvest",
+      "body": "Hey @colinrgodsey is this still something you're interested in working on? I did a rebase locally, and the conflicts weren't hard to resolve.\r\n\r\nI have questions about the approach taken here, though. You've made the fast-open work by delaying the actual connecting until the first write. I think it would be better if people instead had to queue up a write prior to connecting, so that to use fast-open you'd have to write something like this:\r\n\r\n```\r\nboostrap.register().sync().channel().write(...);\r\nboostrap.connect(...);\r\n```\r\n\r\nDoing things that way means the error handling around `connect()` should work like it usually does, and also it's more explicit that a write is being queued up. I think that makes sense because the processing of the data delivered with the SYN packet needs to be idempotent on the server side, and requiring the write before the connect makes it something you have to go out of your way to opt into."
+    },
+    {
+      "type": "comment",
+      "id": 779277519,
+      "created_at": "2021-02-15T15:02:11Z",
+      "user": "chrisvest",
+      "body": "Merged in #11006"
+    }
+  ]
+}

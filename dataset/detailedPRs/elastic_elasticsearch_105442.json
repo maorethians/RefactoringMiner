@@ -1,0 +1,254 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 105442,
+  "pr_number": 105442,
+  "title": "Handling exceptions on watcher reload",
+  "user": "sakurai-youhei",
+  "created_at": "2024-02-13T10:02:58Z",
+  "merged_at": "2024-03-11T23:03:21Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Watcher",
+    "Team:Data Management (obsolete)",
+    "external-contributor",
+    "auto-backport",
+    "v7.17.19",
+    "v8.13.1",
+    "v8.14.0"
+  ],
+  "base_commit": "0951b32c36caf3c1dc752a948229047f1ad86663",
+  "merge_commit_sha": "9fe8b96666864fe8358a37818cae47931ad3ac60",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "convert_to_draft",
+    "ready_for_review",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "unlabeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/105442",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-02-13T09:13:26Z",
+      "sha": "5f24134a06e6c5acaafd6805db117c8fa7437ae1",
+      "message": "Handling exceptions on watcher reload",
+      "author": "Youhei Sakurai",
+      "author_email": "sakurai.youhei@gmail.com",
+      "author_raw_date": "2024-02-13T09:13:26Z",
+      "author_date": "2024-02-13T09:13:26Z",
+      "committer": "Youhei Sakurai",
+      "committer_email": "sakurai.youhei@gmail.com",
+      "raw_date": "2024-02-13T09:13:26Z",
+      "diff_text": "x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleService.java\n@@ -166,7 +166,9 @@ public void clusterChanged(ClusterChangedEvent event) {\n             if (watcherService.validate(event.state())) {\n                 previousShardRoutings.set(localAffectedShardRoutings);\n                 if (state.get() == WatcherState.STARTED) {\n-                    watcherService.reload(event.state(), \"new local watcher shard allocation ids\");\n+                    watcherService.reload(event.state(), \"new local watcher shard allocation ids\", (exception) -> {\n+                        clearAllocationIds(); // will cause reload again\n+                    });\n                 } else if (isStoppedOrStopping) {\n                     this.state.set(WatcherState.STARTING);\n                     watcherService.start(event.state(), () -> this.state.set(WatcherState.STARTED), (exception) -> {\nx-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/WatcherService.java\n@@ -201,7 +201,7 @@ void stopExecutor() {\n      * Reload the watcher service, does not switch the state from stopped to started, just keep going\n      * @param state cluster state, which is needed to find out about local shards\n      */\n-    void reload(ClusterState state, String reason) {\n+    void reload(ClusterState state, String reason, Consumer<Exception> exceptionConsumer) {\n         boolean hasValidWatcherTemplates = WatcherIndexTemplateRegistry.validate(state);\n         if (hasValidWatcherTemplates == false) {\n             logger.warn(\"missing watcher index templates\");\n@@ -221,7 +221,10 @@ void reload(ClusterState state, String reason) {\n         int cancelledTaskCount = executionService.clearExecutionsAndQueue(() -> {});\n         logger.info(\"reloading watcher, reason [{}], cancelled [{}] queued tasks\", reason, cancelledTaskCount);\n \n-        executor.execute(wrapWatcherService(() -> reloadInner(state, reason, false), e -> logger.error(\"error reloading watcher\", e)));\n+        executor.execute(wrapWatcherService(() -> reloadInner(state, reason, false), e -> {\n+            logger.error(\"error reloading watcher\", e);\n+            exceptionConsumer.accept(e);\n+        }));\n     }\n \n     /**\nx-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleServiceTests.java\n@@ -258,6 +258,102 @@ public void testExceptionOnStart() {\n         assertThat(lifeCycleService.getState().get(), equalTo(WatcherState.STARTED));\n     }\n \n+    public void testReloadWithIdenticalRoutingTable() {\n+        /*\n+         * This tests that the identical routing table causes reload only once.\n+         */\n+        startWatcher();\n+\n+        ClusterChangedEvent[] events = masterChangeScenario();\n+        assertThat(events[1].previousState(), equalTo(events[0].state()));\n+        assertFalse(events[1].routingTableChanged());\n+\n+        for (ClusterChangedEvent event : events)\n+        {\n+            when(watcherService.validate(event.state())).thenReturn(true);\n+            lifeCycleService.clusterChanged(event);\n+        }\n+        // reload should occur on the first event\n+        verify(watcherService).reload(eq(events[0].state()), anyString(), any());\n+        // but it shouldn't on the second event unless routing table changes\n+        verify(watcherService, never()).reload(eq(events[1].state()), anyString(), any());\n+    }\n+\n+    public void testReloadWithIdenticalRoutingTableAfterException() {\n+        /*\n+         * This tests that even the identical routing table causes reload again if some exception (for example a timeout while loading\n+         * watches) interrupted the previous one.\n+         */\n+        startWatcher();\n+\n+        ClusterChangedEvent[] events = masterChangeScenario();\n+        assertThat(events[1].previousState(), equalTo(events[0].state()));\n+        assertFalse(events[1].routingTableChanged());\n+\n+        // simulate exception on the first event\n+        doAnswer(invocation -> {\n+            Consumer<Exception> exceptionConsumer = invocation.getArgument(2);\n+            exceptionConsumer.accept(new ElasticsearchTimeoutException(new TimeoutException(\"Artificial timeout\")));\n+            return null;\n+        }).when(watcherService).reload(eq(events[0].state()), anyString(), any());\n+\n+\n+        for (ClusterChangedEvent event : events)\n+        {\n+            when(watcherService.validate(event.state())).thenReturn(true);\n+            lifeCycleService.clusterChanged(event);\n+        }\n+        // reload should occur on the first event but it fails\n+        verify(watcherService).reload(eq(events[0].state()), anyString(), any());\n+        // reload should occur again on the second event because the previous one failed\n+        verify(watcherService).reload(eq(events[1].state()), anyString(), any());\n+    }\n+\n+    private ClusterChangedEvent[] masterChangeScenario() {\n+        DiscoveryNodes nodes = new DiscoveryNodes.Builder()\n+            .localNodeId(\"node_1\")\n+            .add(newNode(\"node_1\"))\n+            .add(newNode(\"node_2\"))\n+            .build();\n+\n+        Index index = new Index(Watch.INDEX, \"uuid\");\n+        IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);\n+        indexRoutingTableBuilder.addShard(\n+            TestShardRouting.newShardRouting(new ShardId(index, 0), \"node_1\", true, ShardRoutingState.STARTED)\n+        );\n+        RoutingTable routingTable = RoutingTable.builder().add(indexRoutingTableBuilder.build()).build();\n+\n+        IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(Watch.INDEX)\n+            .settings(settings(IndexVersion.current()).put(IndexMetadata.INDEX_FORMAT_SETTING.getKey(), 6)) // the internal index format,\n+            // required\n+            .numberOfShards(1)\n+            .numberOfReplicas(0);\n+        Metadata metadata = Metadata.builder()\n+            .put(IndexTemplateMetadata.builder(HISTORY_TEMPLATE_NAME).patterns(randomIndexPatterns()))\n+            .put(indexMetadataBuilder)\n+            .build();\n+\n+        ClusterState emptyState = ClusterState.builder(new ClusterName(\"my-cluster\"))\n+            .nodes(nodes)\n+            .metadata(metadata)\n+            .build();\n+        ClusterState stateWithMasterNode1 = ClusterState.builder(new ClusterName(\"my-cluster\"))\n+            .nodes(nodes.withMasterNodeId(\"node_1\"))\n+            .metadata(metadata)\n+            .routingTable(routingTable)\n+            .build();\n+        ClusterState stateWithMasterNode2 = ClusterState.builder(new ClusterName(\"my-cluster\"))\n+            .nodes(nodes.withMasterNodeId(\"node_2\"))\n+            .metadata(metadata)\n+            .routingTable(routingTable)\n+            .build();\n+\n+        return new ClusterChangedEvent[]{\n+            new ClusterChangedEvent(\"any\", stateWithMasterNode1, emptyState),\n+            new ClusterChangedEvent(\"any\", stateWithMasterNode2, stateWithMasterNode1)\n+        };\n+    }\n+\n     public void testNoLocalShards() {\n         Index watchIndex = new Index(Watch.INDEX, \"foo\");\n         ShardId shardId = new ShardId(watchIndex, 0);\n@@ -301,7 +397,7 @@ public void testNoLocalShards() {\n         when(watcherService.validate(eq(clusterStateWithLocalShards))).thenReturn(true);\n         when(watcherService.validate(eq(clusterStateWithoutLocalShards))).thenReturn(false);\n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", clusterStateWithLocalShards, clusterStateWithoutLocalShards));\n-        verify(watcherService, times(1)).reload(eq(clusterStateWithLocalShards), eq(\"new local watcher shard allocation ids\"));\n+        verify(watcherService, times(1)).reload(eq(clusterStateWithLocalShards), eq(\"new local watcher shard allocation ids\"), any());\n         verify(watcherService, times(1)).validate(eq(clusterStateWithLocalShards));\n         verifyNoMoreInteractions(watcherService);\n \n@@ -380,12 +476,12 @@ public void testReplicaWasAddedOrRemoved() {\n \n         when(watcherService.validate(eq(firstEvent.state()))).thenReturn(true);\n         lifeCycleService.clusterChanged(firstEvent);\n-        verify(watcherService).reload(eq(firstEvent.state()), anyString());\n+        verify(watcherService).reload(eq(firstEvent.state()), anyString(), any());\n \n         reset(watcherService);\n         when(watcherService.validate(eq(secondEvent.state()))).thenReturn(true);\n         lifeCycleService.clusterChanged(secondEvent);\n-        verify(watcherService).reload(eq(secondEvent.state()), anyString());\n+        verify(watcherService).reload(eq(secondEvent.state()), anyString(), any());\n     }\n \n     // make sure that cluster state changes can be processed on nodes that do not hold data\n@@ -425,7 +521,7 @@ public void testNonDataNode() {\n \n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", currentState, previousState));\n         verify(watcherService, times(0)).pauseExecution(any());\n-        verify(watcherService, times(0)).reload(any(), any());\n+        verify(watcherService, times(0)).reload(any(), any(), any());\n     }\n \n     public void testThatMissingWatcherIndexMetadataOnlyResetsOnce() {\n@@ -452,7 +548,7 @@ public void testThatMissingWatcherIndexMetadataOnlyResetsOnce() {\n \n         // first add the shard allocation ids, by going from empty cs to CS with watcher index\n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", clusterStateWithWatcherIndex, clusterStateWithoutWatcherIndex));\n-        verify(watcherService).reload(eq(clusterStateWithWatcherIndex), anyString());\n+        verify(watcherService).reload(eq(clusterStateWithWatcherIndex), anyString(), any());\n \n         // now remove watches index, and ensure that pausing is only called once, no matter how often called (i.e. each CS update)\n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", clusterStateWithoutWatcherIndex, clusterStateWithWatcherIndex));\n@@ -577,7 +673,7 @@ public void testWatcherReloadsOnNodeOutageWithWatcherShard() {\n         when(watcherService.validate(any())).thenReturn(true);\n         ClusterChangedEvent event = new ClusterChangedEvent(\"whatever\", currentState, previousState);\n         lifeCycleService.clusterChanged(event);\n-        verify(watcherService).reload(eq(event.state()), anyString());\n+        verify(watcherService).reload(eq(event.state()), anyString(), any());\n     }\n \n     private void startWatcher() {\n@@ -609,7 +705,7 @@ private void startWatcher() {\n \n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"foo\", state, emptyState));\n         assertThat(lifeCycleService.getState().get(), is(WatcherState.STARTED));\n-        verify(watcherService, times(1)).reload(eq(state), anyString());\n+        verify(watcherService, times(1)).reload(eq(state), anyString(), any());\n         assertThat(lifeCycleService.shardRoutings(), hasSize(1));\n \n         // reset the mock, the user has to mock everything themselves again\nx-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherServiceTests.java\n@@ -77,6 +77,7 @@\n import static org.mockito.Mockito.doAnswer;\n import static org.mockito.Mockito.mock;\n import static org.mockito.Mockito.never;\n+import static org.mockito.Mockito.spy;\n import static org.mockito.Mockito.verify;\n import static org.mockito.Mockito.when;\n \n@@ -349,12 +350,38 @@ void stopExecutor() {}\n         ClusterState.Builder csBuilder = new ClusterState.Builder(new ClusterName(\"_name\"));\n         csBuilder.metadata(Metadata.builder());\n \n-        service.reload(csBuilder.build(), \"whatever\");\n+        service.reload(csBuilder.build(), \"whatever\", exception -> {});\n         verify(executionService).clearExecutionsAndQueue(any());\n         verify(executionService, never()).pause(any());\n         verify(triggerService).pauseExecution();\n     }\n \n+    //  the trigger service should not start unless watches are loaded successfully\n+    public void testReloadingWatcherDoesNotStartTriggerServiceIfFailingToLoadWatches() {\n+        ExecutionService executionService = mock(ExecutionService.class);\n+        TriggerService triggerService = mock(TriggerService.class);\n+        WatcherService service = new WatcherService(\n+            Settings.EMPTY,\n+            triggerService,\n+            mock(TriggeredWatchStore.class),\n+            executionService,\n+            mock(WatchParser.class),\n+            client,\n+            EsExecutors.DIRECT_EXECUTOR_SERVICE\n+        ) {\n+            @Override\n+            void stopExecutor() {}\n+        };\n+\n+        ClusterState.Builder csBuilder = new ClusterState.Builder(new ClusterName(\"_name\"));\n+        Metadata metadata = spy(Metadata.builder().build());\n+        when(metadata.getIndicesLookup()).thenThrow(RuntimeException.class); // simulate exception in WatcherService's private loadWatches()\n+\n+        service.reload(csBuilder.metadata(metadata).build(), \"whatever\", exception -> {});\n+        verify(triggerService).pauseExecution();\n+        verify(triggerService, never()).start(any());\n+    }\n+\n     private static DiscoveryNode newNode() {\n         return DiscoveryNodeUtils.create(\"node\");\n     }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleService.java",
+          "patch": "@@ -166,7 +166,9 @@ public void clusterChanged(ClusterChangedEvent event) {\n             if (watcherService.validate(event.state())) {\n                 previousShardRoutings.set(localAffectedShardRoutings);\n                 if (state.get() == WatcherState.STARTED) {\n-                    watcherService.reload(event.state(), \"new local watcher shard allocation ids\");\n+                    watcherService.reload(event.state(), \"new local watcher shard allocation ids\", (exception) -> {\n+                        clearAllocationIds(); // will cause reload again\n+                    });\n                 } else if (isStoppedOrStopping) {\n                     this.state.set(WatcherState.STARTING);\n                     watcherService.start(event.state(), () -> this.state.set(WatcherState.STARTED), (exception) -> {"
+        },
+        {
+          "file": "x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/WatcherService.java",
+          "patch": "@@ -201,7 +201,7 @@ void stopExecutor() {\n      * Reload the watcher service, does not switch the state from stopped to started, just keep going\n      * @param state cluster state, which is needed to find out about local shards\n      */\n-    void reload(ClusterState state, String reason) {\n+    void reload(ClusterState state, String reason, Consumer<Exception> exceptionConsumer) {\n         boolean hasValidWatcherTemplates = WatcherIndexTemplateRegistry.validate(state);\n         if (hasValidWatcherTemplates == false) {\n             logger.warn(\"missing watcher index templates\");\n@@ -221,7 +221,10 @@ void reload(ClusterState state, String reason) {\n         int cancelledTaskCount = executionService.clearExecutionsAndQueue(() -> {});\n         logger.info(\"reloading watcher, reason [{}], cancelled [{}] queued tasks\", reason, cancelledTaskCount);\n \n-        executor.execute(wrapWatcherService(() -> reloadInner(state, reason, false), e -> logger.error(\"error reloading watcher\", e)));\n+        executor.execute(wrapWatcherService(() -> reloadInner(state, reason, false), e -> {\n+            logger.error(\"error reloading watcher\", e);\n+            exceptionConsumer.accept(e);\n+        }));\n     }\n \n     /**"
+        },
+        {
+          "file": "x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleServiceTests.java",
+          "patch": "@@ -258,6 +258,102 @@ public void testExceptionOnStart() {\n         assertThat(lifeCycleService.getState().get(), equalTo(WatcherState.STARTED));\n     }\n \n+    public void testReloadWithIdenticalRoutingTable() {\n+        /*\n+         * This tests that the identical routing table causes reload only once.\n+         */\n+        startWatcher();\n+\n+        ClusterChangedEvent[] events = masterChangeScenario();\n+        assertThat(events[1].previousState(), equalTo(events[0].state()));\n+        assertFalse(events[1].routingTableChanged());\n+\n+        for (ClusterChangedEvent event : events)\n+        {\n+            when(watcherService.validate(event.state())).thenReturn(true);\n+            lifeCycleService.clusterChanged(event);\n+        }\n+        // reload should occur on the first event\n+        verify(watcherService).reload(eq(events[0].state()), anyString(), any());\n+        // but it shouldn't on the second event unless routing table changes\n+        verify(watcherService, never()).reload(eq(events[1].state()), anyString(), any());\n+    }\n+\n+    public void testReloadWithIdenticalRoutingTableAfterException() {\n+        /*\n+         * This tests that even the identical routing table causes reload again if some exception (for example a timeout while loading\n+         * watches) interrupted the previous one.\n+         */\n+        startWatcher();\n+\n+        ClusterChangedEvent[] events = masterChangeScenario();\n+        assertThat(events[1].previousState(), equalTo(events[0].state()));\n+        assertFalse(events[1].routingTableChanged());\n+\n+        // simulate exception on the first event\n+        doAnswer(invocation -> {\n+            Consumer<Exception> exceptionConsumer = invocation.getArgument(2);\n+            exceptionConsumer.accept(new ElasticsearchTimeoutException(new TimeoutException(\"Artificial timeout\")));\n+            return null;\n+        }).when(watcherService).reload(eq(events[0].state()), anyString(), any());\n+\n+\n+        for (ClusterChangedEvent event : events)\n+        {\n+            when(watcherService.validate(event.state())).thenReturn(true);\n+            lifeCycleService.clusterChanged(event);\n+        }\n+        // reload should occur on the first event but it fails\n+        verify(watcherService).reload(eq(events[0].state()), anyString(), any());\n+        // reload should occur again on the second event because the previous one failed\n+        verify(watcherService).reload(eq(events[1].state()), anyString(), any());\n+    }\n+\n+    private ClusterChangedEvent[] masterChangeScenario() {\n+        DiscoveryNodes nodes = new DiscoveryNodes.Builder()\n+            .localNodeId(\"node_1\")\n+            .add(newNode(\"node_1\"))\n+            .add(newNode(\"node_2\"))\n+            .build();\n+\n+        Index index = new Index(Watch.INDEX, \"uuid\");\n+        IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);\n+        indexRoutingTableBuilder.addShard(\n+            TestShardRouting.newShardRouting(new ShardId(index, 0), \"node_1\", true, ShardRoutingState.STARTED)\n+        );\n+        RoutingTable routingTable = RoutingTable.builder().add(indexRoutingTableBuilder.build()).build();\n+\n+        IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(Watch.INDEX)\n+            .settings(settings(IndexVersion.current()).put(IndexMetadata.INDEX_FORMAT_SETTING.getKey(), 6)) // the internal index format,\n+            // required\n+            .numberOfShards(1)\n+            .numberOfReplicas(0);\n+        Metadata metadata = Metadata.builder()\n+            .put(IndexTemplateMetadata.builder(HISTORY_TEMPLATE_NAME).patterns(randomIndexPatterns()))\n+            .put(indexMetadataBuilder)\n+            .build();\n+\n+        ClusterState emptyState = ClusterState.builder(new ClusterName(\"my-cluster\"))\n+            .nodes(nodes)\n+            .metadata(metadata)\n+            .build();\n+        ClusterState stateWithMasterNode1 = ClusterState.builder(new ClusterName(\"my-cluster\"))\n+            .nodes(nodes.withMasterNodeId(\"node_1\"))\n+            .metadata(metadata)\n+            .routingTable(routingTable)\n+            .build();\n+        ClusterState stateWithMasterNode2 = ClusterState.builder(new ClusterName(\"my-cluster\"))\n+            .nodes(nodes.withMasterNodeId(\"node_2\"))\n+            .metadata(metadata)\n+            .routingTable(routingTable)\n+            .build();\n+\n+        return new ClusterChangedEvent[]{\n+            new ClusterChangedEvent(\"any\", stateWithMasterNode1, emptyState),\n+            new ClusterChangedEvent(\"any\", stateWithMasterNode2, stateWithMasterNode1)\n+        };\n+    }\n+\n     public void testNoLocalShards() {\n         Index watchIndex = new Index(Watch.INDEX, \"foo\");\n         ShardId shardId = new ShardId(watchIndex, 0);\n@@ -301,7 +397,7 @@ public void testNoLocalShards() {\n         when(watcherService.validate(eq(clusterStateWithLocalShards))).thenReturn(true);\n         when(watcherService.validate(eq(clusterStateWithoutLocalShards))).thenReturn(false);\n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", clusterStateWithLocalShards, clusterStateWithoutLocalShards));\n-        verify(watcherService, times(1)).reload(eq(clusterStateWithLocalShards), eq(\"new local watcher shard allocation ids\"));\n+        verify(watcherService, times(1)).reload(eq(clusterStateWithLocalShards), eq(\"new local watcher shard allocation ids\"), any());\n         verify(watcherService, times(1)).validate(eq(clusterStateWithLocalShards));\n         verifyNoMoreInteractions(watcherService);\n \n@@ -380,12 +476,12 @@ public void testReplicaWasAddedOrRemoved() {\n \n         when(watcherService.validate(eq(firstEvent.state()))).thenReturn(true);\n         lifeCycleService.clusterChanged(firstEvent);\n-        verify(watcherService).reload(eq(firstEvent.state()), anyString());\n+        verify(watcherService).reload(eq(firstEvent.state()), anyString(), any());\n \n         reset(watcherService);\n         when(watcherService.validate(eq(secondEvent.state()))).thenReturn(true);\n         lifeCycleService.clusterChanged(secondEvent);\n-        verify(watcherService).reload(eq(secondEvent.state()), anyString());\n+        verify(watcherService).reload(eq(secondEvent.state()), anyString(), any());\n     }\n \n     // make sure that cluster state changes can be processed on nodes that do not hold data\n@@ -425,7 +521,7 @@ public void testNonDataNode() {\n \n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", currentState, previousState));\n         verify(watcherService, times(0)).pauseExecution(any());\n-        verify(watcherService, times(0)).reload(any(), any());\n+        verify(watcherService, times(0)).reload(any(), any(), any());\n     }\n \n     public void testThatMissingWatcherIndexMetadataOnlyResetsOnce() {\n@@ -452,7 +548,7 @@ public void testThatMissingWatcherIndexMetadataOnlyResetsOnce() {\n \n         // first add the shard allocation ids, by going from empty cs to CS with watcher index\n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", clusterStateWithWatcherIndex, clusterStateWithoutWatcherIndex));\n-        verify(watcherService).reload(eq(clusterStateWithWatcherIndex), anyString());\n+        verify(watcherService).reload(eq(clusterStateWithWatcherIndex), anyString(), any());\n \n         // now remove watches index, and ensure that pausing is only called once, no matter how often called (i.e. each CS update)\n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"any\", clusterStateWithoutWatcherIndex, clusterStateWithWatcherIndex));\n@@ -577,7 +673,7 @@ public void testWatcherReloadsOnNodeOutageWithWatcherShard() {\n         when(watcherService.validate(any())).thenReturn(true);\n         ClusterChangedEvent event = new ClusterChangedEvent(\"whatever\", currentState, previousState);\n         lifeCycleService.clusterChanged(event);\n-        verify(watcherService).reload(eq(event.state()), anyString());\n+        verify(watcherService).reload(eq(event.state()), anyString(), any());\n     }\n \n     private void startWatcher() {\n@@ -609,7 +705,7 @@ private void startWatcher() {\n \n         lifeCycleService.clusterChanged(new ClusterChangedEvent(\"foo\", state, emptyState));\n         assertThat(lifeCycleService.getState().get(), is(WatcherState.STARTED));\n-        verify(watcherService, times(1)).reload(eq(state), anyString());\n+        verify(watcherService, times(1)).reload(eq(state), anyString(), any());\n         assertThat(lifeCycleService.shardRoutings(), hasSize(1));\n \n         // reset the mock, the user has to mock everything themselves again"
+        },
+        {
+          "file": "x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherServiceTests.java",
+          "patch": "@@ -77,6 +77,7 @@\n import static org.mockito.Mockito.doAnswer;\n import static org.mockito.Mockito.mock;\n import static org.mockito.Mockito.never;\n+import static org.mockito.Mockito.spy;\n import static org.mockito.Mockito.verify;\n import static org.mockito.Mockito.when;\n \n@@ -349,12 +350,38 @@ void stopExecutor() {}\n         ClusterState.Builder csBuilder = new ClusterState.Builder(new ClusterName(\"_name\"));\n         csBuilder.metadata(Metadata.builder());\n \n-        service.reload(csBuilder.build(), \"whatever\");\n+        service.reload(csBuilder.build(), \"whatever\", exception -> {});\n         verify(executionService).clearExecutionsAndQueue(any());\n         verify(executionService, never()).pause(any());\n         verify(triggerService).pauseExecution();\n     }\n \n+    //  the trigger service should not start unless watches are loaded successfully\n+    public void testReloadingWatcherDoesNotStartTriggerServiceIfFailingToLoadWatches() {\n+        ExecutionService executionService = mock(ExecutionService.class);\n+        TriggerService triggerService = mock(TriggerService.class);\n+        WatcherService service = new WatcherService(\n+            Settings.EMPTY,\n+            triggerService,\n+            mock(TriggeredWatchStore.class),\n+            executionService,\n+            mock(WatchParser.class),\n+            client,\n+            EsExecutors.DIRECT_EXECUTOR_SERVICE\n+        ) {\n+            @Override\n+            void stopExecutor() {}\n+        };\n+\n+        ClusterState.Builder csBuilder = new ClusterState.Builder(new ClusterName(\"_name\"));\n+        Metadata metadata = spy(Metadata.builder().build());\n+        when(metadata.getIndicesLookup()).thenThrow(RuntimeException.class); // simulate exception in WatcherService's private loadWatches()\n+\n+        service.reload(csBuilder.metadata(metadata).build(), \"whatever\", exception -> {});\n+        verify(triggerService).pauseExecution();\n+        verify(triggerService, never()).start(any());\n+    }\n+\n     private static DiscoveryNode newNode() {\n         return DiscoveryNodeUtils.create(\"node\");\n     }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-02-13T10:02:58Z",
+      "user": "sakurai-youhei",
+      "body": "Exceptions during watcher reload, such as those during loading watches, may not start the trigger service, making the watcher stop triggering anything. Coupled with the behavior that the reload does not occur unless the routing table changes, the current exception handling can leave the watcher unfunctional for some time.\r\n\r\nThis PR improves the exception handling to allow the reload to occur again even if the routing table stays identical.\r\n\r\nCloses #69842"
+    },
+    {
+      "type": "commit",
+      "date": "2024-02-13T11:26:47Z",
+      "sha": "cb982a6d7539175a86589092f4c993db1043c82d",
+      "message": "Fix error from :x-pack:plugin:watcher:spotlessJavaCheck",
+      "author": "Youhei Sakurai",
+      "author_email": "sakurai.youhei@gmail.com",
+      "author_raw_date": "2024-02-13T11:26:47Z",
+      "author_date": "2024-02-13T11:26:47Z",
+      "committer": "Youhei Sakurai",
+      "committer_email": "sakurai.youhei@gmail.com",
+      "raw_date": "2024-02-13T11:26:47Z",
+      "diff_text": "x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleServiceTests.java\n@@ -268,8 +268,7 @@ public void testReloadWithIdenticalRoutingTable() {\n         assertThat(events[1].previousState(), equalTo(events[0].state()));\n         assertFalse(events[1].routingTableChanged());\n \n-        for (ClusterChangedEvent event : events)\n-        {\n+        for (ClusterChangedEvent event : events) {\n             when(watcherService.validate(event.state())).thenReturn(true);\n             lifeCycleService.clusterChanged(event);\n         }\n@@ -297,9 +296,7 @@ public void testReloadWithIdenticalRoutingTableAfterException() {\n             return null;\n         }).when(watcherService).reload(eq(events[0].state()), anyString(), any());\n \n-\n-        for (ClusterChangedEvent event : events)\n-        {\n+        for (ClusterChangedEvent event : events) {\n             when(watcherService.validate(event.state())).thenReturn(true);\n             lifeCycleService.clusterChanged(event);\n         }\n@@ -310,11 +307,7 @@ public void testReloadWithIdenticalRoutingTableAfterException() {\n     }\n \n     private ClusterChangedEvent[] masterChangeScenario() {\n-        DiscoveryNodes nodes = new DiscoveryNodes.Builder()\n-            .localNodeId(\"node_1\")\n-            .add(newNode(\"node_1\"))\n-            .add(newNode(\"node_2\"))\n-            .build();\n+        DiscoveryNodes nodes = new DiscoveryNodes.Builder().localNodeId(\"node_1\").add(newNode(\"node_1\")).add(newNode(\"node_2\")).build();\n \n         Index index = new Index(Watch.INDEX, \"uuid\");\n         IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);\n@@ -333,10 +326,7 @@ private ClusterChangedEvent[] masterChangeScenario() {\n             .put(indexMetadataBuilder)\n             .build();\n \n-        ClusterState emptyState = ClusterState.builder(new ClusterName(\"my-cluster\"))\n-            .nodes(nodes)\n-            .metadata(metadata)\n-            .build();\n+        ClusterState emptyState = ClusterState.builder(new ClusterName(\"my-cluster\")).nodes(nodes).metadata(metadata).build();\n         ClusterState stateWithMasterNode1 = ClusterState.builder(new ClusterName(\"my-cluster\"))\n             .nodes(nodes.withMasterNodeId(\"node_1\"))\n             .metadata(metadata)\n@@ -348,10 +338,9 @@ private ClusterChangedEvent[] masterChangeScenario() {\n             .routingTable(routingTable)\n             .build();\n \n-        return new ClusterChangedEvent[]{\n+        return new ClusterChangedEvent[] {\n             new ClusterChangedEvent(\"any\", stateWithMasterNode1, emptyState),\n-            new ClusterChangedEvent(\"any\", stateWithMasterNode2, stateWithMasterNode1)\n-        };\n+            new ClusterChangedEvent(\"any\", stateWithMasterNode2, stateWithMasterNode1) };\n     }\n \n     public void testNoLocalShards() {\nx-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherServiceTests.java\n@@ -356,7 +356,7 @@ void stopExecutor() {}\n         verify(triggerService).pauseExecution();\n     }\n \n-    //  the trigger service should not start unless watches are loaded successfully\n+    // the trigger service should not start unless watches are loaded successfully\n     public void testReloadingWatcherDoesNotStartTriggerServiceIfFailingToLoadWatches() {\n         ExecutionService executionService = mock(ExecutionService.class);\n         TriggerService triggerService = mock(TriggerService.class);",
+      "diff": [
+        {
+          "file": "x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleServiceTests.java",
+          "patch": "@@ -268,8 +268,7 @@ public void testReloadWithIdenticalRoutingTable() {\n         assertThat(events[1].previousState(), equalTo(events[0].state()));\n         assertFalse(events[1].routingTableChanged());\n \n-        for (ClusterChangedEvent event : events)\n-        {\n+        for (ClusterChangedEvent event : events) {\n             when(watcherService.validate(event.state())).thenReturn(true);\n             lifeCycleService.clusterChanged(event);\n         }\n@@ -297,9 +296,7 @@ public void testReloadWithIdenticalRoutingTableAfterException() {\n             return null;\n         }).when(watcherService).reload(eq(events[0].state()), anyString(), any());\n \n-\n-        for (ClusterChangedEvent event : events)\n-        {\n+        for (ClusterChangedEvent event : events) {\n             when(watcherService.validate(event.state())).thenReturn(true);\n             lifeCycleService.clusterChanged(event);\n         }\n@@ -310,11 +307,7 @@ public void testReloadWithIdenticalRoutingTableAfterException() {\n     }\n \n     private ClusterChangedEvent[] masterChangeScenario() {\n-        DiscoveryNodes nodes = new DiscoveryNodes.Builder()\n-            .localNodeId(\"node_1\")\n-            .add(newNode(\"node_1\"))\n-            .add(newNode(\"node_2\"))\n-            .build();\n+        DiscoveryNodes nodes = new DiscoveryNodes.Builder().localNodeId(\"node_1\").add(newNode(\"node_1\")).add(newNode(\"node_2\")).build();\n \n         Index index = new Index(Watch.INDEX, \"uuid\");\n         IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);\n@@ -333,10 +326,7 @@ private ClusterChangedEvent[] masterChangeScenario() {\n             .put(indexMetadataBuilder)\n             .build();\n \n-        ClusterState emptyState = ClusterState.builder(new ClusterName(\"my-cluster\"))\n-            .nodes(nodes)\n-            .metadata(metadata)\n-            .build();\n+        ClusterState emptyState = ClusterState.builder(new ClusterName(\"my-cluster\")).nodes(nodes).metadata(metadata).build();\n         ClusterState stateWithMasterNode1 = ClusterState.builder(new ClusterName(\"my-cluster\"))\n             .nodes(nodes.withMasterNodeId(\"node_1\"))\n             .metadata(metadata)\n@@ -348,10 +338,9 @@ private ClusterChangedEvent[] masterChangeScenario() {\n             .routingTable(routingTable)\n             .build();\n \n-        return new ClusterChangedEvent[]{\n+        return new ClusterChangedEvent[] {\n             new ClusterChangedEvent(\"any\", stateWithMasterNode1, emptyState),\n-            new ClusterChangedEvent(\"any\", stateWithMasterNode2, stateWithMasterNode1)\n-        };\n+            new ClusterChangedEvent(\"any\", stateWithMasterNode2, stateWithMasterNode1) };\n     }\n \n     public void testNoLocalShards() {"
+        },
+        {
+          "file": "x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/WatcherServiceTests.java",
+          "patch": "@@ -356,7 +356,7 @@ void stopExecutor() {}\n         verify(triggerService).pauseExecution();\n     }\n \n-    //  the trigger service should not start unless watches are loaded successfully\n+    // the trigger service should not start unless watches are loaded successfully\n     public void testReloadingWatcherDoesNotStartTriggerServiceIfFailingToLoadWatches() {\n         ExecutionService executionService = mock(ExecutionService.class);\n         TriggerService triggerService = mock(TriggerService.class);"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1941511487,
+      "created_at": "2024-02-13T13:25:46Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-data-management (Team:Data Management)"
+    },
+    {
+      "type": "commit",
+      "date": "2024-02-13T18:25:47Z",
+      "sha": "73ab57795cd261b52cfdaeb977a221a31cea02e9",
+      "message": "Update docs/changelog/105442.yaml",
+      "author": "Youhei Sakurai",
+      "author_email": "sakurai.youhei@gmail.com",
+      "author_raw_date": "2024-02-13T18:25:47Z",
+      "author_date": "2024-02-13T18:25:47Z",
+      "committer": "Youhei Sakurai",
+      "committer_email": "sakurai.youhei@gmail.com",
+      "raw_date": "2024-02-13T18:25:47Z",
+      "diff_text": "docs/changelog/105442.yaml\n@@ -0,0 +1,6 @@\n+pr: 105442\n+summary: Handling exceptions on watcher reload\n+area: Watcher\n+type: bug\n+issues:\n+ - 69842",
+      "diff": [
+        {
+          "file": "docs/changelog/105442.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 105442\n+summary: Handling exceptions on watcher reload\n+area: Watcher\n+type: bug\n+issues:\n+ - 69842"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1942149289,
+      "created_at": "2024-02-13T18:25:47Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @sakurai-youhei, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1944962455,
+      "created_at": "2024-02-14T23:12:39Z",
+      "user": "masseyke",
+      "body": "Thanks @sakurai-youhei. This seems like a good thing to do. A couple of questions though:\r\nDo you think it would be difficult to put this into an integration test? It would be great to have one that has a failure during reload, and see that it does try again.\r\nAlso I notice that if I revert your change but leave the tests, 2 out of the 3 tests still pass. Was that intentional?"
+    },
+    {
+      "type": "comment",
+      "id": 1945395122,
+      "created_at": "2024-02-15T05:26:51Z",
+      "user": "sakurai-youhei",
+      "body": "@masseyke Thank you for your reviewing this PR.\r\n\r\n[1]\r\n> Do you think it would be difficult to put this into an integration test? It would be great to have one that has a failure during reload, and see that it does try again.\r\n\r\nTBH, it's hard to cause the retry intentionally because it requires an exception at the part before `triggerService.start(watches)` [HERE](https://github.com/elastic/elasticsearch/pull/105442/files#diff-50b330fbae6cb904c027fe77a2119d864e78290d6a054ee530f94d4c76798345R258-R279). #69842 shows the exception was rooted in refreshing the watcher index [HERE](https://github.com/elastic/elasticsearch/blob/v7.11.1/x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/WatcherService.java#L284-L285), but I don't think it's reasonably reproducible.\r\n\r\nOne way would be to make the refresh timeout, which is currently fixed in 5 seconds, configurable to reproduce the timeout easily, but I'm afraid that this kind of extra change would be an unfavorable scope extension. If you have other ideas, please let me know, and I will explore the options.\r\n\r\n~~Btw, the retry is compromisely checked with RuntimeException forcibly thrown in one of the unit test cases.~~ (Sorry, I mixed up test cases; the retry itself is not confirmed using any exceptions as of now.)\r\n\r\n[2]\r\n> Also I notice that if I revert your change but leave the tests, 2 out of the 3 tests still pass. Was that intentional?\r\n\r\nYes. Those passing tests declare prerequisite behaviors causing #69842 that require a change in this PR. If either one of them changes in the future, the change introduced through this PR may also need to be reconsidered, so I included the cases."
+    },
+    {
+      "type": "comment",
+      "id": 1977769351,
+      "created_at": "2024-03-05T01:19:14Z",
+      "user": "sakurai-youhei",
+      "body": "@masseyke Can I get your help to release this change? The issue #69842 harms reliability of watcher executions in some circumstances, and I want to eliminate such troubles with this PR."
+    },
+    {
+      "type": "comment",
+      "id": 1981140899,
+      "created_at": "2024-03-06T15:31:27Z",
+      "user": "masseyke",
+      "body": "I've got a lot going on, but I will try to take a look at this later this week."
+    },
+    {
+      "type": "review",
+      "id": 1925968933,
+      "created_at": "2024-03-08T22:37:21Z",
+      "user": "masseyke",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1518383670,
+      "created_at": "2024-03-08T22:37:21Z",
+      "user": "masseyke",
+      "body": "Do we need to also set the state to WatcherState.STARTING here on exception when we clear the allocation ids? It's been a couple of years since i've been in here, so I'm not sure what bad things might happen if the state is STARTED but watcher is actually unavailable.",
+      "path": "x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/WatcherLifeCycleService.java",
+      "diff_hunk": "@@ -166,7 +166,9 @@ public void clusterChanged(ClusterChangedEvent event) {\n             if (watcherService.validate(event.state())) {\n                 previousShardRoutings.set(localAffectedShardRoutings);\n                 if (state.get() == WatcherState.STARTED) {\n-                    watcherService.reload(event.state(), \"new local watcher shard allocation ids\");\n+                    watcherService.reload(event.state(), \"new local watcher shard allocation ids\", (exception) -> {\n+                        clearAllocationIds(); // will cause reload again",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 170,
+      "original_line": 170,
+      "side": "RIGHT",
+      "original_position": 6,
+      "position": 6,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1519217246,
+          "user": "sakurai-youhei",
+          "body": "@masseyke I understand the point but I don't think so. If the state changed to `STARTING` here, the watcher service would no longer be reloaded, which is the problematic state that was also reported in #44981. Since there are only four states, `STARTED` (but it's rather DEGRADED actually) would be affordable, in my opinion.",
+          "created_at": "2024-03-11T06:43:10Z"
+        },
+        {
+          "id": 1520514144,
+          "user": "masseyke",
+          "body": "OK that makes sense. And it's not going to be worse than the current situation (having it in STARTED state, but not doing anything).",
+          "created_at": "2024-03-11T22:50:12Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1927024005,
+      "created_at": "2024-03-11T06:43:11Z",
+      "user": "sakurai-youhei",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1929681888,
+      "created_at": "2024-03-11T22:50:12Z",
+      "user": "masseyke",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1929682995,
+      "created_at": "2024-03-11T22:50:27Z",
+      "user": "masseyke",
+      "state": "APPROVED",
+      "body": "Looks like a good change to me."
+    },
+    {
+      "type": "comment",
+      "id": 1989610677,
+      "created_at": "2024-03-11T23:04:52Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💚 Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [7.17](https://github.com/elastic/elasticsearch/pull/106209)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/106209\">](https://github.com/elastic/elasticsearch/pull/106209) |\n| ✅ |  [8.13](https://github.com/elastic/elasticsearch/pull/106210)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/106210\">](https://github.com/elastic/elasticsearch/pull/106210) |"
+    }
+  ]
+}

@@ -1,0 +1,274 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 93871,
+  "pr_number": 93871,
+  "title": "Fix explain and hybrid search scoring bug",
+  "user": "benwtrent",
+  "created_at": "2023-02-16T18:30:15Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    "Team:Search",
+    ":Search Relevance/Vectors",
+    "v8.7.1",
+    "v8.8.0"
+  ],
+  "base_commit": "7a2266908d44c303b09e22beb8dc9551b3050c7d",
+  "merge_commit_sha": "06298d51c9f1f3de0829bcfd6ad2a1f2e7bbbc9d",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "unlabeled",
+    "closed"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/93871",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-02-16T18:23:50Z",
+      "sha": "54fbc59e4f887de61722d1cf960c1d350fa2b50a",
+      "message": "Fix explain and hybrid search scoring bug",
+      "author": "Benjamin Trent",
+      "author_email": "4357155+benwtrent@users.noreply.github.com",
+      "author_raw_date": "2023-02-16T18:23:50Z",
+      "author_date": "2023-02-16T18:23:50Z",
+      "committer": "Benjamin Trent",
+      "committer_email": "4357155+benwtrent@users.noreply.github.com",
+      "raw_date": "2023-02-16T18:23:50Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java\n@@ -72,9 +72,14 @@ public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float bo\n             throw new IllegalStateException(\"This KnnScoreDocQuery was created by a different reader\");\n         }\n         return new Weight(this) {\n+            @Override\n+            public int count(LeafReaderContext context) {\n+                return segmentStarts[context.ord + 1] - segmentStarts[context.ord];\n+            }\n+\n             @Override\n             public Explanation explain(LeafReaderContext context, int doc) {\n-                int found = Arrays.binarySearch(docs, doc);\n+                int found = Arrays.binarySearch(docs, doc + context.docBase);\n                 if (found < 0) {\n                     return Explanation.noMatch(\"not in top k documents\");\n                 }\n@@ -83,7 +88,11 @@ public Explanation explain(LeafReaderContext context, int doc) {\n \n             @Override\n             public Scorer scorer(LeafReaderContext context) {\n-\n+                // Segment starts indicate how many docs are in the segment,\n+                //   upper equalling lower indicates no documents for this segment\n+                if (segmentStarts[context.ord] == segmentStarts[context.ord + 1]) {\n+                    return null;\n+                }\n                 return new Scorer(this) {\n                     final int lower = segmentStarts[context.ord];\n                     final int upper = segmentStarts[context.ord + 1];\n@@ -121,9 +130,13 @@ public long cost() {\n \n                     @Override\n                     public float getMaxScore(int docId) {\n-                        docId += context.docBase;\n+                        // NO_MORE_DOCS indicates the maximum score for all docs in this segment\n+                        // Anything less than must be accounted for via the docBase.\n+                        if (docId != NO_MORE_DOCS) {\n+                            docId += context.docBase;\n+                        }\n                         float maxScore = 0;\n-                        for (int idx = Math.max(0, upTo); idx < upper && docs[idx] <= docId; idx++) {\n+                        for (int idx = Math.max(lower, upTo); idx < upper && docs[idx] <= docId; idx++) {\n                             maxScore = Math.max(maxScore, scores[idx] * boost);\n                         }\n                         return maxScore;\nserver/src/test/java/org/elasticsearch/search/vectors/KnnScoreDocQueryBuilderTests.java\n@@ -12,11 +12,15 @@\n import org.apache.lucene.document.Field;\n import org.apache.lucene.document.StringField;\n import org.apache.lucene.index.IndexReader;\n+import org.apache.lucene.index.LeafReaderContext;\n import org.apache.lucene.search.IndexSearcher;\n import org.apache.lucene.search.Query;\n import org.apache.lucene.search.ScoreDoc;\n+import org.apache.lucene.search.ScoreMode;\n+import org.apache.lucene.search.Scorer;\n import org.apache.lucene.search.TopDocs;\n import org.apache.lucene.search.TotalHits;\n+import org.apache.lucene.search.Weight;\n import org.apache.lucene.store.Directory;\n import org.apache.lucene.tests.index.RandomIndexWriter;\n import org.elasticsearch.index.query.MatchNoneQueryBuilder;\n@@ -32,6 +36,8 @@\n import java.util.Collection;\n import java.util.Comparator;\n import java.util.List;\n+import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;\n+import static org.hamcrest.Matchers.greaterThan;\n \n public class KnnScoreDocQueryBuilderTests extends AbstractQueryTestCase<KnnScoreDocQueryBuilder> {\n \n@@ -176,18 +182,26 @@ public void testScoreDocQuery() throws IOException {\n                 ScoreDoc[] scoreDocs = scoreDocsList.toArray(new ScoreDoc[0]);\n \n                 KnnScoreDocQueryBuilder queryBuilder = new KnnScoreDocQueryBuilder(scoreDocs);\n-                Query query = queryBuilder.doToQuery(context);\n+                final Query query = queryBuilder.doToQuery(context);\n+                final Weight w = query.createWeight(searcher, ScoreMode.TOP_SCORES, 1.0f);\n \n                 TopDocs topDocs = searcher.search(query, 100);\n                 assertEquals(scoreDocs.length, topDocs.totalHits.value);\n                 assertEquals(TotalHits.Relation.EQUAL_TO, topDocs.totalHits.relation);\n-\n                 Arrays.sort(topDocs.scoreDocs, Comparator.comparingInt(scoreDoc -> scoreDoc.doc));\n                 assertEquals(scoreDocs.length, topDocs.scoreDocs.length);\n                 for (int i = 0; i < scoreDocs.length; i++) {\n                     assertEquals(scoreDocs[i].doc, topDocs.scoreDocs[i].doc);\n                     assertEquals(scoreDocs[i].score, topDocs.scoreDocs[i].score, 0.0001f);\n+                    assertTrue(searcher.explain(query, scoreDocs[i].doc).isMatch());\n+                }\n \n+                for (LeafReaderContext leafReaderContext : searcher.getLeafContexts()) {\n+                    Scorer scorer = w.scorer(leafReaderContext);\n+                    // If we have matching docs, the score should always be greater than 0 for that segment\n+                    if (scorer != null) {\n+                        assertThat(leafReaderContext.toString(), scorer.getMaxScore(NO_MORE_DOCS), greaterThan(0.0f));\n+                    }\n                 }\n             }\n         }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+          "patch": "@@ -72,9 +72,14 @@ public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float bo\n             throw new IllegalStateException(\"This KnnScoreDocQuery was created by a different reader\");\n         }\n         return new Weight(this) {\n+            @Override\n+            public int count(LeafReaderContext context) {\n+                return segmentStarts[context.ord + 1] - segmentStarts[context.ord];\n+            }\n+\n             @Override\n             public Explanation explain(LeafReaderContext context, int doc) {\n-                int found = Arrays.binarySearch(docs, doc);\n+                int found = Arrays.binarySearch(docs, doc + context.docBase);\n                 if (found < 0) {\n                     return Explanation.noMatch(\"not in top k documents\");\n                 }\n@@ -83,7 +88,11 @@ public Explanation explain(LeafReaderContext context, int doc) {\n \n             @Override\n             public Scorer scorer(LeafReaderContext context) {\n-\n+                // Segment starts indicate how many docs are in the segment,\n+                //   upper equalling lower indicates no documents for this segment\n+                if (segmentStarts[context.ord] == segmentStarts[context.ord + 1]) {\n+                    return null;\n+                }\n                 return new Scorer(this) {\n                     final int lower = segmentStarts[context.ord];\n                     final int upper = segmentStarts[context.ord + 1];\n@@ -121,9 +130,13 @@ public long cost() {\n \n                     @Override\n                     public float getMaxScore(int docId) {\n-                        docId += context.docBase;\n+                        // NO_MORE_DOCS indicates the maximum score for all docs in this segment\n+                        // Anything less than must be accounted for via the docBase.\n+                        if (docId != NO_MORE_DOCS) {\n+                            docId += context.docBase;\n+                        }\n                         float maxScore = 0;\n-                        for (int idx = Math.max(0, upTo); idx < upper && docs[idx] <= docId; idx++) {\n+                        for (int idx = Math.max(lower, upTo); idx < upper && docs[idx] <= docId; idx++) {\n                             maxScore = Math.max(maxScore, scores[idx] * boost);\n                         }\n                         return maxScore;"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/search/vectors/KnnScoreDocQueryBuilderTests.java",
+          "patch": "@@ -12,11 +12,15 @@\n import org.apache.lucene.document.Field;\n import org.apache.lucene.document.StringField;\n import org.apache.lucene.index.IndexReader;\n+import org.apache.lucene.index.LeafReaderContext;\n import org.apache.lucene.search.IndexSearcher;\n import org.apache.lucene.search.Query;\n import org.apache.lucene.search.ScoreDoc;\n+import org.apache.lucene.search.ScoreMode;\n+import org.apache.lucene.search.Scorer;\n import org.apache.lucene.search.TopDocs;\n import org.apache.lucene.search.TotalHits;\n+import org.apache.lucene.search.Weight;\n import org.apache.lucene.store.Directory;\n import org.apache.lucene.tests.index.RandomIndexWriter;\n import org.elasticsearch.index.query.MatchNoneQueryBuilder;\n@@ -32,6 +36,8 @@\n import java.util.Collection;\n import java.util.Comparator;\n import java.util.List;\n+import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;\n+import static org.hamcrest.Matchers.greaterThan;\n \n public class KnnScoreDocQueryBuilderTests extends AbstractQueryTestCase<KnnScoreDocQueryBuilder> {\n \n@@ -176,18 +182,26 @@ public void testScoreDocQuery() throws IOException {\n                 ScoreDoc[] scoreDocs = scoreDocsList.toArray(new ScoreDoc[0]);\n \n                 KnnScoreDocQueryBuilder queryBuilder = new KnnScoreDocQueryBuilder(scoreDocs);\n-                Query query = queryBuilder.doToQuery(context);\n+                final Query query = queryBuilder.doToQuery(context);\n+                final Weight w = query.createWeight(searcher, ScoreMode.TOP_SCORES, 1.0f);\n \n                 TopDocs topDocs = searcher.search(query, 100);\n                 assertEquals(scoreDocs.length, topDocs.totalHits.value);\n                 assertEquals(TotalHits.Relation.EQUAL_TO, topDocs.totalHits.relation);\n-\n                 Arrays.sort(topDocs.scoreDocs, Comparator.comparingInt(scoreDoc -> scoreDoc.doc));\n                 assertEquals(scoreDocs.length, topDocs.scoreDocs.length);\n                 for (int i = 0; i < scoreDocs.length; i++) {\n                     assertEquals(scoreDocs[i].doc, topDocs.scoreDocs[i].doc);\n                     assertEquals(scoreDocs[i].score, topDocs.scoreDocs[i].score, 0.0001f);\n+                    assertTrue(searcher.explain(query, scoreDocs[i].doc).isMatch());\n+                }\n \n+                for (LeafReaderContext leafReaderContext : searcher.getLeafContexts()) {\n+                    Scorer scorer = w.scorer(leafReaderContext);\n+                    // If we have matching docs, the score should always be greater than 0 for that segment\n+                    if (scorer != null) {\n+                        assertThat(leafReaderContext.toString(), scorer.getMaxScore(NO_MORE_DOCS), greaterThan(0.0f));\n+                    }\n                 }\n             }\n         }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-02-16T18:30:15Z",
+      "user": "benwtrent",
+      "body": "This PR addresses bugs with KNN search.\r\n\r\nFirst, when searching with KNN, using `explain: true` would give strange results. \r\n\r\nEven though a document obviously matches because of its score, the explanation would indicate that it did NOT match. This bug was because our explanation check was not accounting for the leaf-segment's docBase.\r\n\r\nSecond, when there are multiple segments, and KNN is used in hybrid search, some documents may go unscored by KNN.\r\n\r\nThe main issue here is the disjunction logic within `BoolQuery`. All hybrid queries with `knn` are pure disjunction queries under the hood. And Lucene does its best to optimize the documents it gathers in these types of queries.\r\n\r\nConsequently, it will look for the maximum possible score for an entire segment leaf. However, the underlying KNN query would ALWAYS increment this passed docId by the segment's docBase (this is fairly ironic given the `explain` bug :D). This would cause the `docId` for calculating the maximum score to roll over to the negatives and thus knn would indicate its maximum score to be `0` for certain segments with higher docBase values.\r\n\r\ncloses: https://github.com/elastic/elasticsearch/issues/93830"
+    },
+    {
+      "type": "commit",
+      "date": "2023-02-16T18:30:41Z",
+      "sha": "6d916ae4b874cfba77a82c4a958c60a630c3be37",
+      "message": "Update docs/changelog/93871.yaml",
+      "author": "Benjamin Trent",
+      "author_email": "ben.w.trent@gmail.com",
+      "author_raw_date": "2023-02-16T18:30:41Z",
+      "author_date": "2023-02-16T18:30:41Z",
+      "committer": "Benjamin Trent",
+      "committer_email": "ben.w.trent@gmail.com",
+      "raw_date": "2023-02-16T18:30:41Z",
+      "diff_text": "docs/changelog/93871.yaml\n@@ -0,0 +1,5 @@\n+pr: 93871\n+summary: Fix explain and hybrid search scoring bug\n+area: Vector Search\n+type: bug\n+issues: []",
+      "diff": [
+        {
+          "file": "docs/changelog/93871.yaml",
+          "patch": "@@ -0,0 +1,5 @@\n+pr: 93871\n+summary: Fix explain and hybrid search scoring bug\n+area: Vector Search\n+type: bug\n+issues: []"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1433531979,
+      "created_at": "2023-02-16T18:30:41Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-search (Team:Search)"
+    },
+    {
+      "type": "comment",
+      "id": 1433531988,
+      "created_at": "2023-02-16T18:30:42Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @benwtrent, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review_comment",
+      "id": 1108875151,
+      "created_at": "2023-02-16T18:31:18Z",
+      "user": "benwtrent",
+      "body": "We can optimize our `count` since `segmentStarts` indicate the number of documents within that segment. So, count can be constant time. This is a minor optimization, but prevents creating a scorer and iterating docs needlessly.",
+      "path": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+      "diff_hunk": "@@ -72,9 +72,14 @@ public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float bo\n             throw new IllegalStateException(\"This KnnScoreDocQuery was created by a different reader\");\n         }\n         return new Weight(this) {\n+            @Override\n+            public int count(LeafReaderContext context) {\n+                return segmentStarts[context.ord + 1] - segmentStarts[context.ord];",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 77,
+      "original_line": 77,
+      "side": "RIGHT",
+      "original_position": 6,
+      "position": 6,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1108914909,
+          "user": "javanna",
+          "body": "I think it would be wise to make this change separately. it's a good one but it's a performance improvement rather than a bugfix.",
+          "created_at": "2023-02-16T19:10:06Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1108875481,
+      "created_at": "2023-02-16T18:31:37Z",
+      "user": "benwtrent",
+      "body": "`doc` here is always the doc related to the context base. So, we need to add the base.",
+      "path": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+      "diff_hunk": "@@ -72,9 +72,14 @@ public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float bo\n             throw new IllegalStateException(\"This KnnScoreDocQuery was created by a different reader\");\n         }\n         return new Weight(this) {\n+            @Override\n+            public int count(LeafReaderContext context) {\n+                return segmentStarts[context.ord + 1] - segmentStarts[context.ord];\n+            }\n+\n             @Override\n             public Explanation explain(LeafReaderContext context, int doc) {\n-                int found = Arrays.binarySearch(docs, doc);\n+                int found = Arrays.binarySearch(docs, doc + context.docBase);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 82,
+      "original_line": 82,
+      "side": "RIGHT",
+      "original_position": 12,
+      "position": 12,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1108875899,
+      "created_at": "2023-02-16T18:32:02Z",
+      "user": "benwtrent",
+      "body": "Again, if upper and lower segment starts are equal, there are no docs in this particular segment. So just return null.",
+      "path": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+      "diff_hunk": "@@ -83,7 +88,11 @@ public Explanation explain(LeafReaderContext context, int doc) {\n \n             @Override\n             public Scorer scorer(LeafReaderContext context) {\n-\n+                // Segment starts indicate how many docs are in the segment,\n+                //   upper equalling lower indicates no documents for this segment\n+                if (segmentStarts[context.ord] == segmentStarts[context.ord + 1]) {\n+                    return null;\n+                }",
+      "start_line": 91,
+      "original_start_line": 91,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 95,
+      "side": "RIGHT",
+      "original_position": 25,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1108876497,
+      "created_at": "2023-02-16T18:32:35Z",
+      "user": "benwtrent",
+      "body": "This is the other bug fix. When `NO_MORE_DOCS` is passed, it means we gather the max doc to the END of the given segment.",
+      "path": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+      "diff_hunk": "@@ -121,9 +130,13 @@ public long cost() {\n \n                     @Override\n                     public float getMaxScore(int docId) {\n-                        docId += context.docBase;\n+                        // NO_MORE_DOCS indicates the maximum score for all docs in this segment\n+                        // Anything less than must be accounted for via the docBase.\n+                        if (docId != NO_MORE_DOCS) {\n+                            docId += context.docBase;\n+                        }\n                         float maxScore = 0;",
+      "start_line": 133,
+      "original_start_line": 133,
+      "start_side": "RIGHT",
+      "line": 138,
+      "original_line": 138,
+      "side": "RIGHT",
+      "original_position": 39,
+      "position": 39,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1108877242,
+      "created_at": "2023-02-16T18:33:27Z",
+      "user": "benwtrent",
+      "body": "Previously, this was getting the max score across ALL previous segments and the current one. This seemed weird to me. We should only return the max for the given segment, correct?\r\n\r\n@jpountz am I correct on this?",
+      "path": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+      "diff_hunk": "@@ -121,9 +130,13 @@ public long cost() {\n \n                     @Override\n                     public float getMaxScore(int docId) {\n-                        docId += context.docBase;\n+                        // NO_MORE_DOCS indicates the maximum score for all docs in this segment\n+                        // Anything less than must be accounted for via the docBase.\n+                        if (docId != NO_MORE_DOCS) {\n+                            docId += context.docBase;\n+                        }\n                         float maxScore = 0;\n-                        for (int idx = Math.max(0, upTo); idx < upper && docs[idx] <= docId; idx++) {\n+                        for (int idx = Math.max(lower, upTo); idx < upper && docs[idx] <= docId; idx++) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 139,
+      "original_line": 139,
+      "side": "RIGHT",
+      "original_position": 41,
+      "position": 41,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1302056761,
+      "created_at": "2023-02-16T18:33:42Z",
+      "user": "benwtrent",
+      "state": "COMMENTED",
+      "body": "Self-review to aid in code-review"
+    },
+    {
+      "type": "comment",
+      "id": 1433539503,
+      "created_at": "2023-02-16T18:35:03Z",
+      "user": "benwtrent",
+      "body": "Big thanks to @xiankgx for providing the initial bug report here!"
+    },
+    {
+      "type": "commit",
+      "date": "2023-02-16T18:43:23Z",
+      "sha": "3a6213b262ef915ebcd4ebe9e89c9a9d3ab5b85e",
+      "message": "fixing formatting",
+      "author": "Benjamin Trent",
+      "author_email": "4357155+benwtrent@users.noreply.github.com",
+      "author_raw_date": "2023-02-16T18:43:23Z",
+      "author_date": "2023-02-16T18:43:23Z",
+      "committer": "Benjamin Trent",
+      "committer_email": "4357155+benwtrent@users.noreply.github.com",
+      "raw_date": "2023-02-16T18:43:23Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java\n@@ -89,7 +89,7 @@ public Explanation explain(LeafReaderContext context, int doc) {\n             @Override\n             public Scorer scorer(LeafReaderContext context) {\n                 // Segment starts indicate how many docs are in the segment,\n-                //   upper equalling lower indicates no documents for this segment\n+                // upper equalling lower indicates no documents for this segment\n                 if (segmentStarts[context.ord] == segmentStarts[context.ord + 1]) {\n                     return null;\n                 }\nserver/src/test/java/org/elasticsearch/search/vectors/KnnScoreDocQueryBuilderTests.java\n@@ -36,6 +36,7 @@\n import java.util.Collection;\n import java.util.Comparator;\n import java.util.List;\n+\n import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;\n import static org.hamcrest.Matchers.greaterThan;\n ",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/search/vectors/KnnScoreDocQuery.java",
+          "patch": "@@ -89,7 +89,7 @@ public Explanation explain(LeafReaderContext context, int doc) {\n             @Override\n             public Scorer scorer(LeafReaderContext context) {\n                 // Segment starts indicate how many docs are in the segment,\n-                //   upper equalling lower indicates no documents for this segment\n+                // upper equalling lower indicates no documents for this segment\n                 if (segmentStarts[context.ord] == segmentStarts[context.ord + 1]) {\n                     return null;\n                 }"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/search/vectors/KnnScoreDocQueryBuilderTests.java",
+          "patch": "@@ -36,6 +36,7 @@\n import java.util.Collection;\n import java.util.Comparator;\n import java.util.List;\n+\n import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;\n import static org.hamcrest.Matchers.greaterThan;\n "
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1302118295,
+      "created_at": "2023-02-16T19:33:35Z",
+      "user": "javanna",
+      "state": "COMMENTED",
+      "body": "Fixes make sense to me, I wonder if we should split it in three: count enhancement, explain fix, and scoring fix. I could see how the latter is a blocker compared to the other two who are not.\r\n\r\nAlso, we need tests for explain with multiple segments?"
+    },
+    {
+      "type": "comment",
+      "id": 1433684066,
+      "created_at": "2023-02-16T20:36:57Z",
+      "user": "benwtrent",
+      "body": "> Also, we need tests for explain with multiple segments?\r\n\r\nThe test I have does that. The flushing periodically allows for multiple segments to be created."
+    },
+    {
+      "type": "comment",
+      "id": 1433701278,
+      "created_at": "2023-02-16T20:54:17Z",
+      "user": "benwtrent",
+      "body": "Splitting up into PRs:\r\n\r\n - https://github.com/elastic/elasticsearch/pull/93875\r\n - https://github.com/elastic/elasticsearch/pull/93876\r\n - https://github.com/elastic/elasticsearch/pull/93877"
+    }
+  ]
+}

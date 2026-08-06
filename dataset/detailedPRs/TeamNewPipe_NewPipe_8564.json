@@ -1,0 +1,119 @@
+{
+  "repo": "TeamNewPipe/NewPipe",
+  "number": 8564,
+  "pr_number": 8564,
+  "title": "Actually fix history view count",
+  "user": "Stypox",
+  "created_at": "2022-07-01T14:07:31Z",
+  "merged_at": "2022-07-04T21:06:09Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    "bug",
+    "ASAP",
+    "player"
+  ],
+  "base_commit": "4ee1cd5826d7bbb9c755ce3dbcbbd6175144bc37",
+  "merge_commit_sha": "160891592bf8258f3031db5d5d1c65f6eaff1f04",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "unsubscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/TeamNewPipe/NewPipe/pull/8564",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-07-01T14:07:19Z",
+      "sha": "085d1e0d384fe4babd846163936a4cacfc7196f2",
+      "message": "Actually fix wrong view count",
+      "author": "Stypox",
+      "author_email": "stypox@pm.me",
+      "author_raw_date": "2022-07-01T13:44:27Z",
+      "author_date": "2022-07-01T13:44:27Z",
+      "committer": "Stypox",
+      "committer_email": "stypox@pm.me",
+      "raw_date": "2022-07-01T14:07:19Z",
+      "diff_text": "app/src/main/java/org/schabi/newpipe/database/history/model/StreamHistoryEntity.java\n@@ -4,7 +4,6 @@\n import androidx.room.ColumnInfo;\n import androidx.room.Entity;\n import androidx.room.ForeignKey;\n-import androidx.room.Ignore;\n import androidx.room.Index;\n \n import org.schabi.newpipe.database.stream.model.StreamEntity;\n@@ -42,18 +41,19 @@ public class StreamHistoryEntity {\n     @ColumnInfo(name = STREAM_REPEAT_COUNT)\n     private long repeatCount;\n \n-    public StreamHistoryEntity(final long streamUid, @NonNull final OffsetDateTime accessDate,\n+    /**\n+     * @param streamUid the stream id this history item will refer to\n+     * @param accessDate the last time the stream was accessed\n+     * @param repeatCount the total number of views this stream received\n+     */\n+    public StreamHistoryEntity(final long streamUid,\n+                               @NonNull final OffsetDateTime accessDate,\n                                final long repeatCount) {\n         this.streamUid = streamUid;\n         this.accessDate = accessDate;\n         this.repeatCount = repeatCount;\n     }\n \n-    @Ignore\n-    public StreamHistoryEntity(final long streamUid, @NonNull final OffsetDateTime accessDate) {\n-        this(streamUid, accessDate, 0); // start with 0 views (adding views will be done elsewhere)\n-    }\n-\n     public long getStreamUid() {\n         return streamUid;\n     }\napp/src/main/java/org/schabi/newpipe/local/history/HistoryRecordManager.java\n@@ -128,13 +128,11 @@ public Maybe<Long> markAsWatched(final StreamInfoItem info) {\n \n             // Add a history entry\n             final StreamHistoryEntity latestEntry = streamHistoryTable.getLatestEntry(streamId);\n-            if (latestEntry != null) {\n-                streamHistoryTable.delete(latestEntry);\n-                latestEntry.setAccessDate(currentTime);\n-                latestEntry.setRepeatCount(latestEntry.getRepeatCount() + 1);\n-                return streamHistoryTable.insert(latestEntry);\n+            if (latestEntry == null) {\n+                // never actually viewed: add history entry but with 0 views\n+                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime, 0));\n             } else {\n-                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime));\n+                return 0L;\n             }\n         })).subscribeOn(Schedulers.io());\n     }\n@@ -155,7 +153,8 @@ public Maybe<Long> onViewed(final StreamInfo info) {\n                 latestEntry.setRepeatCount(latestEntry.getRepeatCount() + 1);\n                 return streamHistoryTable.insert(latestEntry);\n             } else {\n-                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime));\n+                // just viewed for the first time: set 1 view\n+                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime, 1));\n             }\n         })).subscribeOn(Schedulers.io());\n     }\napp/src/main/java/org/schabi/newpipe/player/Player.java\n@@ -2485,22 +2485,31 @@ public void onEvents(@NonNull final com.google.android.exoplayer2.Player player,\n         Listener.super.onEvents(player, events);\n         MediaItemTag.from(player.getCurrentMediaItem()).ifPresent(tag -> {\n             if (tag == currentMetadata) {\n-                return;\n+                return; // we still have the same metadata, no need to do anything\n             }\n+            final StreamInfo previousInfo = Optional.ofNullable(currentMetadata)\n+                    .flatMap(MediaItemTag::getMaybeStreamInfo).orElse(null);\n             currentMetadata = tag;\n-            if (!tag.getErrors().isEmpty()) {\n+\n+            if (!currentMetadata.getErrors().isEmpty()) {\n+                // new errors might have been added even if previousInfo == tag.getMaybeStreamInfo()\n                 final ErrorInfo errorInfo = new ErrorInfo(\n-                        tag.getErrors().get(0),\n+                        currentMetadata.getErrors(),\n                         UserAction.PLAY_STREAM,\n-                        \"Loading failed for [\" + tag.getTitle() + \"]: \" + tag.getStreamUrl(),\n-                        tag.getServiceId());\n+                        \"Loading failed for [\" + currentMetadata.getTitle()\n+                                + \"]: \" + currentMetadata.getStreamUrl(),\n+                        currentMetadata.getServiceId());\n                 ErrorUtil.createNotification(context, errorInfo);\n             }\n-            tag.getMaybeStreamInfo().ifPresent(info -> {\n+\n+            currentMetadata.getMaybeStreamInfo().ifPresent(info -> {\n                 if (DEBUG) {\n                     Log.d(TAG, \"ExoPlayer - onEvents() update stream info: \" + info.getName());\n                 }\n-                updateMetadataWith(info);\n+                if (previousInfo == null || !previousInfo.getUrl().equals(info.getUrl())) {\n+                    // only update with the new stream info if it has actually changed\n+                    updateMetadataWith(info);\n+                }\n             });\n         });\n     }",
+      "diff": [
+        {
+          "file": "app/src/main/java/org/schabi/newpipe/database/history/model/StreamHistoryEntity.java",
+          "patch": "@@ -4,7 +4,6 @@\n import androidx.room.ColumnInfo;\n import androidx.room.Entity;\n import androidx.room.ForeignKey;\n-import androidx.room.Ignore;\n import androidx.room.Index;\n \n import org.schabi.newpipe.database.stream.model.StreamEntity;\n@@ -42,18 +41,19 @@ public class StreamHistoryEntity {\n     @ColumnInfo(name = STREAM_REPEAT_COUNT)\n     private long repeatCount;\n \n-    public StreamHistoryEntity(final long streamUid, @NonNull final OffsetDateTime accessDate,\n+    /**\n+     * @param streamUid the stream id this history item will refer to\n+     * @param accessDate the last time the stream was accessed\n+     * @param repeatCount the total number of views this stream received\n+     */\n+    public StreamHistoryEntity(final long streamUid,\n+                               @NonNull final OffsetDateTime accessDate,\n                                final long repeatCount) {\n         this.streamUid = streamUid;\n         this.accessDate = accessDate;\n         this.repeatCount = repeatCount;\n     }\n \n-    @Ignore\n-    public StreamHistoryEntity(final long streamUid, @NonNull final OffsetDateTime accessDate) {\n-        this(streamUid, accessDate, 0); // start with 0 views (adding views will be done elsewhere)\n-    }\n-\n     public long getStreamUid() {\n         return streamUid;\n     }"
+        },
+        {
+          "file": "app/src/main/java/org/schabi/newpipe/local/history/HistoryRecordManager.java",
+          "patch": "@@ -128,13 +128,11 @@ public Maybe<Long> markAsWatched(final StreamInfoItem info) {\n \n             // Add a history entry\n             final StreamHistoryEntity latestEntry = streamHistoryTable.getLatestEntry(streamId);\n-            if (latestEntry != null) {\n-                streamHistoryTable.delete(latestEntry);\n-                latestEntry.setAccessDate(currentTime);\n-                latestEntry.setRepeatCount(latestEntry.getRepeatCount() + 1);\n-                return streamHistoryTable.insert(latestEntry);\n+            if (latestEntry == null) {\n+                // never actually viewed: add history entry but with 0 views\n+                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime, 0));\n             } else {\n-                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime));\n+                return 0L;\n             }\n         })).subscribeOn(Schedulers.io());\n     }\n@@ -155,7 +153,8 @@ public Maybe<Long> onViewed(final StreamInfo info) {\n                 latestEntry.setRepeatCount(latestEntry.getRepeatCount() + 1);\n                 return streamHistoryTable.insert(latestEntry);\n             } else {\n-                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime));\n+                // just viewed for the first time: set 1 view\n+                return streamHistoryTable.insert(new StreamHistoryEntity(streamId, currentTime, 1));\n             }\n         })).subscribeOn(Schedulers.io());\n     }"
+        },
+        {
+          "file": "app/src/main/java/org/schabi/newpipe/player/Player.java",
+          "patch": "@@ -2485,22 +2485,31 @@ public void onEvents(@NonNull final com.google.android.exoplayer2.Player player,\n         Listener.super.onEvents(player, events);\n         MediaItemTag.from(player.getCurrentMediaItem()).ifPresent(tag -> {\n             if (tag == currentMetadata) {\n-                return;\n+                return; // we still have the same metadata, no need to do anything\n             }\n+            final StreamInfo previousInfo = Optional.ofNullable(currentMetadata)\n+                    .flatMap(MediaItemTag::getMaybeStreamInfo).orElse(null);\n             currentMetadata = tag;\n-            if (!tag.getErrors().isEmpty()) {\n+\n+            if (!currentMetadata.getErrors().isEmpty()) {\n+                // new errors might have been added even if previousInfo == tag.getMaybeStreamInfo()\n                 final ErrorInfo errorInfo = new ErrorInfo(\n-                        tag.getErrors().get(0),\n+                        currentMetadata.getErrors(),\n                         UserAction.PLAY_STREAM,\n-                        \"Loading failed for [\" + tag.getTitle() + \"]: \" + tag.getStreamUrl(),\n-                        tag.getServiceId());\n+                        \"Loading failed for [\" + currentMetadata.getTitle()\n+                                + \"]: \" + currentMetadata.getStreamUrl(),\n+                        currentMetadata.getServiceId());\n                 ErrorUtil.createNotification(context, errorInfo);\n             }\n-            tag.getMaybeStreamInfo().ifPresent(info -> {\n+\n+            currentMetadata.getMaybeStreamInfo().ifPresent(info -> {\n                 if (DEBUG) {\n                     Log.d(TAG, \"ExoPlayer - onEvents() update stream info: \" + info.getName());\n                 }\n-                updateMetadataWith(info);\n+                if (previousInfo == null || !previousInfo.getUrl().equals(info.getUrl())) {\n+                    // only update with the new stream info if it has actually changed\n+                    updateMetadataWith(info);\n+                }\n             });\n         });\n     }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-07-01T14:07:31Z",
+      "user": "Stypox",
+      "body": "<!-- Hey there. Thank you so much for improving NewPipe, and filling out the details. Having roughly the same layout helps everyone considerably :)-->\r\n\r\n#### What is it?\r\n- [x] Bugfix (user facing)\r\n- [ ] Feature (user facing)\r\n- [ ] Codebase improvement (dev facing)\r\n- [ ] Meta improvement to the project (dev facing)\r\n\r\n#### Description of the changes in your PR\r\n#8336 did not really fix the problem, it just made so that each item in history has 1 less view. This meant that, even though the bug appeared to be fixed the first time a video is opened (since that video's views are correctly set to 1), the second time the same video is opened the views are incorrectly set to 3. And #8336 actually introduced a regression, since e.g. enqueued videos were registered as \"No views\" as reported in https://github.com/TeamNewPipe/NewPipe/pull/8336#issuecomment-1149998538.\r\n\r\nThe underlying problem was an incorrect usage of Java's `==` (*same*) operator: it was used in the player's `onEvents` function to check if the media item tag in the **ExoPlayer** was equal to the one currently set in our `Player`. The problem with this is, when the player is started from scratch, the media item tag is first updated with a tag with no `LoadedMediaSource` attached (since the player is still loading the media source), and then updated again when the media source was loaded. The second update created a new instance of the media item tag (see `StreamInfoTag.withExtras()` and its usage in `LoadedMediaSource` and `FailedMediaSource`), so the `==` operator is not suitable for comparing them. When the player is not started from scratch, but rather just switches to the next item in the queue, only 1 view was (correctly) registered, since the media source is usually already loaded because of the mechanism of pre-fetching the next item in the queue. \r\n\r\nThis PR solves the issue by comparing the stream info url associated with the media item tag before calling `updateMetadataWith()` with the new stream info.\r\n\r\nThis PR also makes it so that marking a video as watched does not add one view to it, and also does not update its last access time. Now a new history entry **with 0 views** is added, and this happens only if one did not exist before. Tell me if I should revert this.\r\n\r\n#### Fixes the following issue(s)\r\n- Replaces #8336\r\n- Really fixes #8330\r\n\r\n#### APK testing \r\n[app-debug.zip](https://github.com/TeamNewPipe/NewPipe/files/9029513/app-debug.zip)\r\n\r\n#### Due diligence\r\n- [x] I read the [contribution guidelines](https://github.com/TeamNewPipe/NewPipe/blob/HEAD/.github/CONTRIBUTING.md).\r\n"
+    },
+    {
+      "type": "review",
+      "id": 1026780724,
+      "created_at": "2022-07-02T18:49:50Z",
+      "user": "litetex",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "review_comment",
+      "id": 912487171,
+      "created_at": "2022-07-03T13:24:00Z",
+      "user": "AudricV",
+      "body": "You can use `getCurrentStreamInfo()` method to do so, unless you want to avoid confusion between the previous info and the current one :)\r\n\r\n```suggestion\r\n            final StreamInfo previousInfo = getCurrentStreamInfo().orElse(null);\r\n```\r\n\r\n<br>\r\n\r\n<details>\r\n\r\n<summary>Reminder of getCurrentStreamInfo() method</summary>\r\n\r\n```java\r\n    private Optional<StreamInfo> getCurrentStreamInfo() {\r\n        return Optional.ofNullable(currentMetadata).flatMap(MediaItemTag::getMaybeStreamInfo);\r\n    }\r\n```\r\n\r\n</details>",
+      "path": "app/src/main/java/org/schabi/newpipe/player/Player.java",
+      "diff_hunk": "@@ -2485,22 +2485,31 @@ public void onEvents(@NonNull final com.google.android.exoplayer2.Player player,\n         Listener.super.onEvents(player, events);\n         MediaItemTag.from(player.getCurrentMediaItem()).ifPresent(tag -> {\n             if (tag == currentMetadata) {\n-                return;\n+                return; // we still have the same metadata, no need to do anything\n             }\n+            final StreamInfo previousInfo = Optional.ofNullable(currentMetadata)\n+                    .flatMap(MediaItemTag::getMaybeStreamInfo).orElse(null);",
+      "start_line": 2490,
+      "original_start_line": 2490,
+      "start_side": "RIGHT",
+      "line": 2491,
+      "original_line": 2491,
+      "side": "RIGHT",
+      "original_position": 8,
+      "position": 8,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 913266291,
+          "user": "Stypox",
+          "body": "Even tough to my eye your suggestion looks better, I'd prefer to keep the current code as it shows where the stream info comes from",
+          "created_at": "2022-07-04T21:05:58Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1026854741,
+      "created_at": "2022-07-03T13:25:52Z",
+      "user": "AudricV",
+      "state": "COMMENTED",
+      "body": "I didn't really reviewed the whole code but found an optimization in it that you may use.\r\n\r\nI trust @litetex for the rest of the code :)"
+    },
+    {
+      "type": "review",
+      "id": 1027898915,
+      "created_at": "2022-07-04T21:05:58Z",
+      "user": "Stypox",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

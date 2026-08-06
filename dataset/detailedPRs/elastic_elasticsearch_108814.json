@@ -1,0 +1,591 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 108814,
+  "pr_number": 108814,
+  "title": "Deserialize publish requests on generic thread-pool",
+  "user": "nicktindall",
+  "created_at": "2024-05-20T04:49:48Z",
+  "merged_at": "2024-05-21T22:28:08Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Cluster Coordination",
+    "Team:Distributed",
+    "v8.15.0"
+  ],
+  "base_commit": "a2008bd190ec05db4cbd6e3cafd7d5850add647f",
+  "merge_commit_sha": "1778d405c0dd710109ab4728eb20a4e62ee99c22",
+  "commits": 11,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "review_requested",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_request_removed",
+    "merged",
+    "closed",
+    "referenced",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/108814",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-05-20T04:24:15Z",
+      "sha": "25b2df6cab423f8e5033ebcddb9a627ae2b4a8e1",
+      "message": "Deserialize publish requests on generic thread-pool\n\nCloses #106352",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-20T02:52:35Z",
+      "author_date": "2024-05-20T02:52:35Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-20T04:24:15Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java\n@@ -432,6 +432,7 @@ private void onClusterStateApplied() {\n     }\n \n     PublishWithJoinResponse handlePublishRequest(PublishRequest publishRequest) {\n+        assert ThreadPool.assertCurrentThreadPool(Names.CLUSTER_COORDINATION);\n         assert publishRequest.getAcceptedState().nodes().getLocalNode().equals(getLocalNode())\n             : publishRequest.getAcceptedState().nodes().getLocalNode() + \" != \" + getLocalNode();\n \nserver/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -41,6 +41,7 @@\n import org.elasticsearch.transport.BytesTransportRequest;\n import org.elasticsearch.transport.NodeNotConnectedException;\n import org.elasticsearch.transport.Transport;\n+import org.elasticsearch.transport.TransportChannel;\n import org.elasticsearch.transport.TransportException;\n import org.elasticsearch.transport.TransportRequestOptions;\n import org.elasticsearch.transport.TransportService;\n@@ -52,9 +53,11 @@\n import java.util.concurrent.Executor;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReference;\n+import java.util.function.Consumer;\n import java.util.function.Function;\n \n import static org.elasticsearch.core.Strings.format;\n+import static org.elasticsearch.threadpool.ThreadPool.Names.GENERIC;\n \n /**\n  * Implements the low-level mechanics of sending a cluster state to other nodes in the cluster during a publication.\n@@ -105,11 +108,11 @@ public PublicationTransportHandler(\n \n         transportService.registerRequestHandler(\n             PUBLISH_STATE_ACTION_NAME,\n-            this.clusterCoordinationExecutor,\n+            transportService.getThreadPool().generic(),\n             false,\n             false,\n             BytesTransportRequest::new,\n-            (request, channel, task) -> channel.sendResponse(handleIncomingPublishRequest(request))\n+            this::handleIncomingPublishRequest\n         );\n     }\n \n@@ -122,7 +125,9 @@ public PublishClusterStateStats stats() {\n         );\n     }\n \n-    private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportRequest request) throws IOException {\n+    private void handleIncomingPublishRequest(BytesTransportRequest request, TransportChannel transportChannel, Task task)\n+        throws IOException {\n+        assert ThreadPool.assertCurrentThreadPool(GENERIC);\n         final Compressor compressor = CompressorFactory.compressor(request.bytes());\n         StreamInput in = request.bytes().streamInput();\n         try {\n@@ -145,9 +150,7 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                final PublishWithJoinResponse response = acceptState(incomingState);\n-                lastSeenClusterState.set(incomingState);\n-                return response;\n+                acceptState(incomingState, transportChannel, lastSeenClusterState::set);\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -197,20 +200,41 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final PublishWithJoinResponse response = acceptState(incomingState);\n-                    lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                    return response;\n+                    acceptState(\n+                        incomingState,\n+                        transportChannel,\n+                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)\n+                    );\n                 }\n             }\n         } finally {\n             IOUtils.close(in);\n         }\n     }\n \n-    private PublishWithJoinResponse acceptState(ClusterState incomingState) {\n+    /**\n+     * Delegate to cluster-coordination thread to apply received state\n+     *\n+     * @param incomingState The received cluster state\n+     * @param transportChannel The channel on which it was received\n+     * @param onSuccess The action to perform if the new state is accepted\n+     */\n+    private void acceptState(ClusterState incomingState, TransportChannel transportChannel, Consumer<ClusterState> onSuccess) {\n         assert incomingState.nodes().isLocalNodeElectedMaster() == false\n             : \"should handle local publications locally, but got \" + incomingState;\n-        return handlePublishRequest.apply(new PublishRequest(incomingState));\n+        clusterCoordinationExecutor.execute(ActionRunnable.supply(new ActionListener<>() {\n+\n+            @Override\n+            public void onResponse(PublishWithJoinResponse publishWithJoinResponse) {\n+                onSuccess.accept(incomingState);\n+                transportChannel.sendResponse(publishWithJoinResponse);\n+            }\n+\n+            @Override\n+            public void onFailure(Exception e) {\n+                transportChannel.sendResponse(e);\n+            }\n+        }, () -> handlePublishRequest.apply(new PublishRequest(incomingState))));\n     }\n \n     public PublicationContext newPublicationContext(ClusterStatePublicationEvent clusterStatePublicationEvent) {\nserver/src/test/java/org/elasticsearch/cluster/coordination/PublicationTransportHandlerTests.java\n@@ -458,6 +458,7 @@ public void onFailure(Exception e) {\n                 new PublishRequest(clusterState0),\n                 ActionListener.running(() -> assertTrue(completed.compareAndSet(false, true)))\n             );\n+            deterministicTaskQueue.runAllRunnableTasks();\n             assertTrue(completed.getAndSet(false));\n             receivedState0 = receivedStateRef.getAndSet(null);\n             assertEquals(clusterState0.stateUUID(), receivedState0.stateUUID());\n@@ -499,6 +500,7 @@ public void onFailure(Exception e) {\n                 new PublishRequest(clusterState1),\n                 ActionListener.running(() -> assertTrue(completed.compareAndSet(false, true)))\n             );\n+            deterministicTaskQueue.runAllRunnableTasks();\n             assertTrue(completed.getAndSet(false));\n             var receivedState1 = receivedStateRef.getAndSet(null);\n             assertEquals(clusterState1.stateUUID(), receivedState1.stateUUID());",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java",
+          "patch": "@@ -432,6 +432,7 @@ private void onClusterStateApplied() {\n     }\n \n     PublishWithJoinResponse handlePublishRequest(PublishRequest publishRequest) {\n+        assert ThreadPool.assertCurrentThreadPool(Names.CLUSTER_COORDINATION);\n         assert publishRequest.getAcceptedState().nodes().getLocalNode().equals(getLocalNode())\n             : publishRequest.getAcceptedState().nodes().getLocalNode() + \" != \" + getLocalNode();\n "
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -41,6 +41,7 @@\n import org.elasticsearch.transport.BytesTransportRequest;\n import org.elasticsearch.transport.NodeNotConnectedException;\n import org.elasticsearch.transport.Transport;\n+import org.elasticsearch.transport.TransportChannel;\n import org.elasticsearch.transport.TransportException;\n import org.elasticsearch.transport.TransportRequestOptions;\n import org.elasticsearch.transport.TransportService;\n@@ -52,9 +53,11 @@\n import java.util.concurrent.Executor;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReference;\n+import java.util.function.Consumer;\n import java.util.function.Function;\n \n import static org.elasticsearch.core.Strings.format;\n+import static org.elasticsearch.threadpool.ThreadPool.Names.GENERIC;\n \n /**\n  * Implements the low-level mechanics of sending a cluster state to other nodes in the cluster during a publication.\n@@ -105,11 +108,11 @@ public PublicationTransportHandler(\n \n         transportService.registerRequestHandler(\n             PUBLISH_STATE_ACTION_NAME,\n-            this.clusterCoordinationExecutor,\n+            transportService.getThreadPool().generic(),\n             false,\n             false,\n             BytesTransportRequest::new,\n-            (request, channel, task) -> channel.sendResponse(handleIncomingPublishRequest(request))\n+            this::handleIncomingPublishRequest\n         );\n     }\n \n@@ -122,7 +125,9 @@ public PublishClusterStateStats stats() {\n         );\n     }\n \n-    private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportRequest request) throws IOException {\n+    private void handleIncomingPublishRequest(BytesTransportRequest request, TransportChannel transportChannel, Task task)\n+        throws IOException {\n+        assert ThreadPool.assertCurrentThreadPool(GENERIC);\n         final Compressor compressor = CompressorFactory.compressor(request.bytes());\n         StreamInput in = request.bytes().streamInput();\n         try {\n@@ -145,9 +150,7 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                final PublishWithJoinResponse response = acceptState(incomingState);\n-                lastSeenClusterState.set(incomingState);\n-                return response;\n+                acceptState(incomingState, transportChannel, lastSeenClusterState::set);\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -197,20 +200,41 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final PublishWithJoinResponse response = acceptState(incomingState);\n-                    lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                    return response;\n+                    acceptState(\n+                        incomingState,\n+                        transportChannel,\n+                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)\n+                    );\n                 }\n             }\n         } finally {\n             IOUtils.close(in);\n         }\n     }\n \n-    private PublishWithJoinResponse acceptState(ClusterState incomingState) {\n+    /**\n+     * Delegate to cluster-coordination thread to apply received state\n+     *\n+     * @param incomingState The received cluster state\n+     * @param transportChannel The channel on which it was received\n+     * @param onSuccess The action to perform if the new state is accepted\n+     */\n+    private void acceptState(ClusterState incomingState, TransportChannel transportChannel, Consumer<ClusterState> onSuccess) {\n         assert incomingState.nodes().isLocalNodeElectedMaster() == false\n             : \"should handle local publications locally, but got \" + incomingState;\n-        return handlePublishRequest.apply(new PublishRequest(incomingState));\n+        clusterCoordinationExecutor.execute(ActionRunnable.supply(new ActionListener<>() {\n+\n+            @Override\n+            public void onResponse(PublishWithJoinResponse publishWithJoinResponse) {\n+                onSuccess.accept(incomingState);\n+                transportChannel.sendResponse(publishWithJoinResponse);\n+            }\n+\n+            @Override\n+            public void onFailure(Exception e) {\n+                transportChannel.sendResponse(e);\n+            }\n+        }, () -> handlePublishRequest.apply(new PublishRequest(incomingState))));\n     }\n \n     public PublicationContext newPublicationContext(ClusterStatePublicationEvent clusterStatePublicationEvent) {"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/coordination/PublicationTransportHandlerTests.java",
+          "patch": "@@ -458,6 +458,7 @@ public void onFailure(Exception e) {\n                 new PublishRequest(clusterState0),\n                 ActionListener.running(() -> assertTrue(completed.compareAndSet(false, true)))\n             );\n+            deterministicTaskQueue.runAllRunnableTasks();\n             assertTrue(completed.getAndSet(false));\n             receivedState0 = receivedStateRef.getAndSet(null);\n             assertEquals(clusterState0.stateUUID(), receivedState0.stateUUID());\n@@ -499,6 +500,7 @@ public void onFailure(Exception e) {\n                 new PublishRequest(clusterState1),\n                 ActionListener.running(() -> assertTrue(completed.compareAndSet(false, true)))\n             );\n+            deterministicTaskQueue.runAllRunnableTasks();\n             assertTrue(completed.getAndSet(false));\n             var receivedState1 = receivedStateRef.getAndSet(null);\n             assertEquals(clusterState1.stateUUID(), receivedState1.stateUUID());"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-05-20T04:49:48Z",
+      "user": "nicktindall",
+      "body": "This PR moves the `publish_state` handler from the `CLUSTER_COORDINATION` thread pool to the `GENERIC` one. This means the initial handling of the publish request, including the deserialisation of the cluster state, happens on one of the `GENERIC` threads instead of the `CLUSTER_COORDINATION` thread. Once we have deserialised the cluster state and done some validation, we delegate to the `CLUSTER_COORDINATION` pool to apply the new state.\r\n\r\nThe consequences of this include\r\n- The generic pool contains multiple threads, but the cluster coordination pool contains a single thread. So (in theory) multiple instances of the handler could now be executing concurrently, where previously these messages would be handled serially.\r\n- The delegation to the cluster coordination thread for the apply means we add some more asynchrony.\r\n\r\nCloses #106352\r\n"
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-20T04:51:10Z",
+      "sha": "ca1819c8c4f024edf219e130440813ea7cfd2e43",
+      "message": "Update docs/changelog/108814.yaml",
+      "author": "Nick Tindall",
+      "author_email": "pva10x@gmail.com",
+      "author_raw_date": "2024-05-20T04:51:10Z",
+      "author_date": "2024-05-20T04:51:10Z",
+      "committer": "Nick Tindall",
+      "committer_email": "pva10x@gmail.com",
+      "raw_date": "2024-05-20T04:51:10Z",
+      "diff_text": "docs/changelog/108814.yaml\n@@ -0,0 +1,6 @@\n+pr: 108814\n+summary: Deserialize publish requests on generic thread-pool\n+area: Cluster Coordination\n+type: bug\n+issues:\n+ - 106352",
+      "diff": [
+        {
+          "file": "docs/changelog/108814.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 108814\n+summary: Deserialize publish requests on generic thread-pool\n+area: Cluster Coordination\n+type: bug\n+issues:\n+ - 106352"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2119662622,
+      "created_at": "2024-05-20T04:51:11Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @nicktindall, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review",
+      "id": 2065349706,
+      "created_at": "2024-05-20T05:02:23Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1606250551,
+      "created_at": "2024-05-20T05:02:23Z",
+      "user": "nicktindall",
+      "body": "I considered using `ActionListener.runBefore(..., () -> onSuccess.apply(initialState))` but I think just putting the call to `onSuccess` inline in `onResponse` is a bit clearer (it's easy to miss the `runBefore` wrapping IMO, but I'm still new to these utilities)\r\nI know using `runBefore` would behave better in the event `onSuccess` threw an exception, but it's only setting an `AtomicReference` so I don't think that's even possible the way things are.\r\nOpen to feedback on that.\r\n",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+      "diff_hunk": "@@ -197,20 +200,41 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final PublishWithJoinResponse response = acceptState(incomingState);\n-                    lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                    return response;\n+                    acceptState(\n+                        incomingState,\n+                        transportChannel,\n+                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)\n+                    );\n                 }\n             }\n         } finally {\n             IOUtils.close(in);\n         }\n     }\n \n-    private PublishWithJoinResponse acceptState(ClusterState incomingState) {\n+    /**\n+     * Delegate to cluster-coordination thread to apply received state\n+     *\n+     * @param incomingState The received cluster state\n+     * @param transportChannel The channel on which it was received\n+     * @param onSuccess The action to perform if the new state is accepted\n+     */\n+    private void acceptState(ClusterState incomingState, TransportChannel transportChannel, Consumer<ClusterState> onSuccess) {\n         assert incomingState.nodes().isLocalNodeElectedMaster() == false\n             : \"should handle local publications locally, but got \" + incomingState;\n-        return handlePublishRequest.apply(new PublishRequest(incomingState));\n+        clusterCoordinationExecutor.execute(ActionRunnable.supply(new ActionListener<>() {\n+\n+            @Override\n+            public void onResponse(PublishWithJoinResponse publishWithJoinResponse) {\n+                onSuccess.accept(incomingState);\n+                transportChannel.sendResponse(publishWithJoinResponse);\n+            }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 231,
+      "side": "RIGHT",
+      "original_position": 93,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1606397633,
+          "user": "DaveCTurner",
+          "body": "If we passed in an `ActionListener` rather than a `TransportChannel` then the `runBefore` would not be so lost in the noise I think.",
+          "created_at": "2024-05-20T07:57:32Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2065358509,
+      "created_at": "2024-05-20T05:12:39Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1606255961,
+      "created_at": "2024-05-20T05:12:39Z",
+      "user": "nicktindall",
+      "body": "`onSuccess` will end up being called by the `CLUSTER_COORDINATION` thread only after a successful apply, so I wonder if we need to use compare-and-set here, I don't _think_ it's possible for `lastSeenCluster` to have changed between this being dispatched AND the new state being successfully applied. I would think either\r\n- the state _has not_ changed and `onSuccess` is called correctly\r\n- the state _has_ changed and the apply fails due to the version check, so `onSuccess` is not called",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+      "diff_hunk": "@@ -197,20 +200,41 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final PublishWithJoinResponse response = acceptState(incomingState);\n-                    lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                    return response;\n+                    acceptState(\n+                        incomingState,\n+                        transportChannel,\n+                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 206,
+      "side": "RIGHT",
+      "original_position": 66,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1606259361,
+          "user": "nicktindall",
+          "body": "The reason I raise this is because we could do away with the `onSuccess` callback if we were able to safely call `lastSeenClusterState.set` for both the full and diff payloads.",
+          "created_at": "2024-05-20T05:19:16Z"
+        },
+        {
+          "id": 1606400032,
+          "user": "DaveCTurner",
+          "body": "I think it can change in between, dispatch and execution, yes - there could be another update in flight when we read the value when then completes and updates it before we get to run.\r\n\r\nI am however not sure whether this matters. I'll think about this a little more.",
+          "created_at": "2024-05-20T07:59:42Z"
+        },
+        {
+          "id": 1607419245,
+          "user": "nicktindall",
+          "body": "This one still concerns me a bit... the task of applying an update is done in three steps\r\n1. deserialise payload (on `GENERIC`)\r\n2. apply payload if valid (on `CLUSTER_COORDINATION`)\r\n3. update `lastSeen`, send response (on `CLUSTER_COORDINATION`)\r\n\r\nonly (2) happens in the mutex. So you could have the following interleaving (for cluster states `a` - version 7 and `b` - version 8)\r\n\r\n1. `a`-1\r\n2. `b`-1\r\n3. `a`-2 (succeeds, bump version to 7)\r\n4. `b`-2 (succeeds, bump version to 8)\r\n5. `b`-3 (set `lastSeen` to 8)\r\n6. `a`-3 (set `lastSeen` to 7) - this means the next diff would be applied to 7, and a 7/9 hybrid would be applied locally?\r\n\r\nThe above could only happen if there were multiple threads in the `CLUSTER_COORDINATION` pool, but you said that is configurable.\r\n\r\nUnless I've missed something.\r\n\r\nPossible solutions\r\n- Use compare-and-set also for the non-diff case \r\n  - this _feels_ wrong, I suspect there are times it is correct to update`lastSeen` even though it changed since we took a reference to it\r\n- Put an additional check to only bump `lastSeen` when term and version are >= existing term and version?\r\n  - I don't like this because it'd be duplicating business logic \r\n- Move (3) into the mutex?\r\n  - This feels least bad to me \r\n\r\nDo we run tests with `CLUSTER_COORDINATION` size > 1 ?",
+          "created_at": "2024-05-21T00:06:40Z"
+        },
+        {
+          "id": 1607758545,
+          "user": "DaveCTurner",
+          "body": "The sequence of 6 steps is indeed something that could have happened prior to #83576 and can again happen after this change - we could end up having applied state version 8 but with `lastSeen` at state version 7. But that's ok, each diff includes a UUID which identifies the base version which we check here:\r\n\r\nhttps://github.com/elastic/elasticsearch/blob/9ba5651e7478216f17d81b63385ddf6db2331f7f/server/src/main/java/org/elasticsearch/cluster/ClusterState.java#L1170-L1172\r\n\r\nThat `IncompatibleClusterStateVersionException` is caught and handled here:\r\n\r\nhttps://github.com/elastic/elasticsearch/blob/638a45009cb76059dd914c70eb4aa7e777768da2/server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java#L473-L483\r\n\r\nIOW if we receive a diff between versions 8 & 9 but `lastSeen` is at version 7 then we reject the diff and the master sends us the full state at version 9 for us to apply. Somewhat inefficient for sure but still correct.\r\n\r\nThis case will be exercised in `org.elasticsearch.cluster.coordination.CoordinatorTests` in a `cluster.runRandomly()` call, but with rather low probability I think. We could try adding a test there which specifically checks this case.",
+          "created_at": "2024-05-21T07:09:57Z"
+        },
+        {
+          "id": 1607799932,
+          "user": "nicktindall",
+          "body": "Great! not a problem we need to solve here then :)",
+          "created_at": "2024-05-21T07:42:29Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2065365139,
+      "created_at": "2024-05-20T05:19:16Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-20T05:49:49Z",
+      "sha": "755211a72e2a939968115bc0517905c17e415cf6",
+      "message": "Increase AbstractCoordinatorTestCase\n#CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-20T05:49:49Z",
+      "author_date": "2024-05-20T05:49:49Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-20T05:49:49Z",
+      "diff_text": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java\n@@ -219,11 +219,12 @@ protected static int defaultInt(Setting<Integer> setting) {\n     // 3. master sends out PublishRequests to nodes\n     // 4. master receives PublishResponses from nodes\n     // 5. master sends ApplyCommitRequests to nodes\n-    // 6. nodes apply committed cluster state\n-    // 7. master receives ApplyCommitResponses\n-    // 8. apply committed state on master (last one to apply cluster state)\n-    // 9. complete the publication listener back on the master service thread\n-    public static final int CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS = 9;\n+    // 6. nodes deserialize committed cluster state\n+    // 7. nodes apply committed cluster state\n+    // 8. master receives ApplyCommitResponses\n+    // 9. apply committed state on master (last one to apply cluster state)\n+    // 10. complete the publication listener back on the master service thread\n+    public static final int CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS = 10;\n     public static final long DEFAULT_CLUSTER_STATE_UPDATE_DELAY = CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS * DEFAULT_DELAY_VARIABILITY;\n \n     private static final int ELECTION_RETRIES = 10;",
+      "diff": [
+        {
+          "file": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java",
+          "patch": "@@ -219,11 +219,12 @@ protected static int defaultInt(Setting<Integer> setting) {\n     // 3. master sends out PublishRequests to nodes\n     // 4. master receives PublishResponses from nodes\n     // 5. master sends ApplyCommitRequests to nodes\n-    // 6. nodes apply committed cluster state\n-    // 7. master receives ApplyCommitResponses\n-    // 8. apply committed state on master (last one to apply cluster state)\n-    // 9. complete the publication listener back on the master service thread\n-    public static final int CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS = 9;\n+    // 6. nodes deserialize committed cluster state\n+    // 7. nodes apply committed cluster state\n+    // 8. master receives ApplyCommitResponses\n+    // 9. apply committed state on master (last one to apply cluster state)\n+    // 10. complete the publication listener back on the master service thread\n+    public static final int CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS = 10;\n     public static final long DEFAULT_CLUSTER_STATE_UPDATE_DELAY = CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS * DEFAULT_DELAY_VARIABILITY;\n \n     private static final int ELECTION_RETRIES = 10;"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2119740385,
+      "created_at": "2024-05-20T06:13:25Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1606396810,
+      "created_at": "2024-05-20T07:56:52Z",
+      "user": "DaveCTurner",
+      "body": "I think I'd rather we avoided passing the `TransportChannel` directly here. It works, but it's more idiomatic to have async methods accept an `ActionListener<...>` - see the Javadocs for `org.elasticsearch.action.ActionListener` for lots more detail, and also it's useful to constrain the response type as early as possible. In this case a `org.elasticsearch.action.support.ChannelActionListener<PublishWithJoinResponse>` would be a good choice. I think the same comment applies to `handleIncomingPublishRequest` - on the one hand, using a method reference here is kinda neat, but on the other hand we don't use the `Task` argument and it would be easier on the reader to pass in an `ActionListener<PublishWithJoinResponse>` here too.",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+      "diff_hunk": "@@ -197,20 +200,41 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final PublishWithJoinResponse response = acceptState(incomingState);\n-                    lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                    return response;\n+                    acceptState(\n+                        incomingState,\n+                        transportChannel,\n+                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)\n+                    );\n                 }\n             }\n         } finally {\n             IOUtils.close(in);\n         }\n     }\n \n-    private PublishWithJoinResponse acceptState(ClusterState incomingState) {\n+    /**\n+     * Delegate to cluster-coordination thread to apply received state\n+     *\n+     * @param incomingState The received cluster state\n+     * @param transportChannel The channel on which it was received\n+     * @param onSuccess The action to perform if the new state is accepted\n+     */\n+    private void acceptState(ClusterState incomingState, TransportChannel transportChannel, Consumer<ClusterState> onSuccess) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 222,
+      "side": "RIGHT",
+      "original_position": 83,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1607415675,
+          "user": "nicktindall",
+          "body": "Yes that looks much nicer, thanks!",
+          "created_at": "2024-05-20T23:59:14Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2065599365,
+      "created_at": "2024-05-20T07:59:53Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": "Some initial comments, mostly stylistic tho."
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-20T23:36:50Z",
+      "sha": "6e7a4b4ad4880fd7fe4380d42553aeb4ec9c81b3",
+      "message": "Use ActionListeners to tidy up async calls",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-20T23:36:50Z",
+      "author_date": "2024-05-20T23:36:50Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-20T23:36:50Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -14,6 +14,7 @@\n import org.elasticsearch.TransportVersions;\n import org.elasticsearch.action.ActionListener;\n import org.elasticsearch.action.ActionRunnable;\n+import org.elasticsearch.action.support.ChannelActionListener;\n import org.elasticsearch.cluster.ClusterState;\n import org.elasticsearch.cluster.ClusterStatePublicationEvent;\n import org.elasticsearch.cluster.Diff;\n@@ -41,7 +42,6 @@\n import org.elasticsearch.transport.BytesTransportRequest;\n import org.elasticsearch.transport.NodeNotConnectedException;\n import org.elasticsearch.transport.Transport;\n-import org.elasticsearch.transport.TransportChannel;\n import org.elasticsearch.transport.TransportException;\n import org.elasticsearch.transport.TransportRequestOptions;\n import org.elasticsearch.transport.TransportService;\n@@ -53,7 +53,6 @@\n import java.util.concurrent.Executor;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReference;\n-import java.util.function.Consumer;\n import java.util.function.Function;\n \n import static org.elasticsearch.core.Strings.format;\n@@ -112,7 +111,7 @@ public PublicationTransportHandler(\n             false,\n             false,\n             BytesTransportRequest::new,\n-            this::handleIncomingPublishRequest\n+            (request, channel, task) -> this.handleIncomingPublishRequest(request, new ChannelActionListener<>(channel))\n         );\n     }\n \n@@ -125,7 +124,7 @@ public PublishClusterStateStats stats() {\n         );\n     }\n \n-    private void handleIncomingPublishRequest(BytesTransportRequest request, TransportChannel transportChannel, Task task)\n+    private void handleIncomingPublishRequest(BytesTransportRequest request, ActionListener<PublishWithJoinResponse> actionListener)\n         throws IOException {\n         assert ThreadPool.assertCurrentThreadPool(GENERIC);\n         final Compressor compressor = CompressorFactory.compressor(request.bytes());\n@@ -150,7 +149,7 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, Transpo\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(incomingState, transportChannel, lastSeenClusterState::set);\n+                acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -200,11 +199,8 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, Transpo\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(\n-                        incomingState,\n-                        transportChannel,\n-                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)\n-                    );\n+                    final ClusterState stateToApply = incomingState;\n+                    acceptState(stateToApply, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(stateToApply)));\n                 }\n             }\n         } finally {\n@@ -216,25 +212,14 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, Transpo\n      * Delegate to cluster-coordination thread to apply received state\n      *\n      * @param incomingState The received cluster state\n-     * @param transportChannel The channel on which it was received\n-     * @param onSuccess The action to perform if the new state is accepted\n+     * @param actionListener The action to perform once the publish call completes\n      */\n-    private void acceptState(ClusterState incomingState, TransportChannel transportChannel, Consumer<ClusterState> onSuccess) {\n+    private void acceptState(ClusterState incomingState, ActionListener<PublishWithJoinResponse> actionListener) {\n         assert incomingState.nodes().isLocalNodeElectedMaster() == false\n             : \"should handle local publications locally, but got \" + incomingState;\n-        clusterCoordinationExecutor.execute(ActionRunnable.supply(new ActionListener<>() {\n-\n-            @Override\n-            public void onResponse(PublishWithJoinResponse publishWithJoinResponse) {\n-                onSuccess.accept(incomingState);\n-                transportChannel.sendResponse(publishWithJoinResponse);\n-            }\n-\n-            @Override\n-            public void onFailure(Exception e) {\n-                transportChannel.sendResponse(e);\n-            }\n-        }, () -> handlePublishRequest.apply(new PublishRequest(incomingState))));\n+        clusterCoordinationExecutor.execute(\n+            ActionRunnable.supply(actionListener, () -> handlePublishRequest.apply(new PublishRequest(incomingState)))\n+        );\n     }\n \n     public PublicationContext newPublicationContext(ClusterStatePublicationEvent clusterStatePublicationEvent) {",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -14,6 +14,7 @@\n import org.elasticsearch.TransportVersions;\n import org.elasticsearch.action.ActionListener;\n import org.elasticsearch.action.ActionRunnable;\n+import org.elasticsearch.action.support.ChannelActionListener;\n import org.elasticsearch.cluster.ClusterState;\n import org.elasticsearch.cluster.ClusterStatePublicationEvent;\n import org.elasticsearch.cluster.Diff;\n@@ -41,7 +42,6 @@\n import org.elasticsearch.transport.BytesTransportRequest;\n import org.elasticsearch.transport.NodeNotConnectedException;\n import org.elasticsearch.transport.Transport;\n-import org.elasticsearch.transport.TransportChannel;\n import org.elasticsearch.transport.TransportException;\n import org.elasticsearch.transport.TransportRequestOptions;\n import org.elasticsearch.transport.TransportService;\n@@ -53,7 +53,6 @@\n import java.util.concurrent.Executor;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReference;\n-import java.util.function.Consumer;\n import java.util.function.Function;\n \n import static org.elasticsearch.core.Strings.format;\n@@ -112,7 +111,7 @@ public PublicationTransportHandler(\n             false,\n             false,\n             BytesTransportRequest::new,\n-            this::handleIncomingPublishRequest\n+            (request, channel, task) -> this.handleIncomingPublishRequest(request, new ChannelActionListener<>(channel))\n         );\n     }\n \n@@ -125,7 +124,7 @@ public PublishClusterStateStats stats() {\n         );\n     }\n \n-    private void handleIncomingPublishRequest(BytesTransportRequest request, TransportChannel transportChannel, Task task)\n+    private void handleIncomingPublishRequest(BytesTransportRequest request, ActionListener<PublishWithJoinResponse> actionListener)\n         throws IOException {\n         assert ThreadPool.assertCurrentThreadPool(GENERIC);\n         final Compressor compressor = CompressorFactory.compressor(request.bytes());\n@@ -150,7 +149,7 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, Transpo\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(incomingState, transportChannel, lastSeenClusterState::set);\n+                acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -200,11 +199,8 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, Transpo\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(\n-                        incomingState,\n-                        transportChannel,\n-                        (acceptedState) -> lastSeenClusterState.compareAndSet(lastSeen, acceptedState)\n-                    );\n+                    final ClusterState stateToApply = incomingState;\n+                    acceptState(stateToApply, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(stateToApply)));\n                 }\n             }\n         } finally {\n@@ -216,25 +212,14 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, Transpo\n      * Delegate to cluster-coordination thread to apply received state\n      *\n      * @param incomingState The received cluster state\n-     * @param transportChannel The channel on which it was received\n-     * @param onSuccess The action to perform if the new state is accepted\n+     * @param actionListener The action to perform once the publish call completes\n      */\n-    private void acceptState(ClusterState incomingState, TransportChannel transportChannel, Consumer<ClusterState> onSuccess) {\n+    private void acceptState(ClusterState incomingState, ActionListener<PublishWithJoinResponse> actionListener) {\n         assert incomingState.nodes().isLocalNodeElectedMaster() == false\n             : \"should handle local publications locally, but got \" + incomingState;\n-        clusterCoordinationExecutor.execute(ActionRunnable.supply(new ActionListener<>() {\n-\n-            @Override\n-            public void onResponse(PublishWithJoinResponse publishWithJoinResponse) {\n-                onSuccess.accept(incomingState);\n-                transportChannel.sendResponse(publishWithJoinResponse);\n-            }\n-\n-            @Override\n-            public void onFailure(Exception e) {\n-                transportChannel.sendResponse(e);\n-            }\n-        }, () -> handlePublishRequest.apply(new PublishRequest(incomingState))));\n+        clusterCoordinationExecutor.execute(\n+            ActionRunnable.supply(actionListener, () -> handlePublishRequest.apply(new PublishRequest(incomingState)))\n+        );\n     }\n \n     public PublicationContext newPublicationContext(ClusterStatePublicationEvent clusterStatePublicationEvent) {"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-20T23:43:18Z",
+      "sha": "c76b18504379127f56fb8974b9cccabee82f5055",
+      "message": "Refactor to tidy\nWe can make incomingState final if we factor out the deserialisation\nand application of the diff",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-20T23:43:18Z",
+      "author_date": "2024-05-20T23:43:18Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-20T23:43:18Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -157,57 +157,62 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, ActionL\n                     incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     throw new IncompatibleClusterStateVersionException(\"have no local cluster state\");\n                 } else {\n-                    ClusterState incomingState;\n-                    try {\n-                        final Diff<ClusterState> diff;\n-                        final boolean includesLastCommittedData = request.version().onOrAfter(INCLUDES_LAST_COMMITTED_DATA_VERSION);\n-                        final boolean clusterUuidCommitted;\n-                        final CoordinationMetadata.VotingConfiguration lastCommittedConfiguration;\n-\n-                        // Close stream early to release resources used by the de-compression as early as possible\n-                        try (StreamInput input = in) {\n-                            diff = ClusterState.readDiffFrom(input, lastSeen.nodes().getLocalNode());\n-                            if (includesLastCommittedData) {\n-                                clusterUuidCommitted = in.readBoolean();\n-                                lastCommittedConfiguration = new CoordinationMetadata.VotingConfiguration(in);\n-                            } else {\n-                                clusterUuidCommitted = false;\n-                                lastCommittedConfiguration = null;\n-                            }\n-                            assert input.read() == -1;\n-                        }\n-                        incomingState = diff.apply(lastSeen); // might throw IncompatibleClusterStateVersionException\n-                        if (includesLastCommittedData) {\n-                            final var adjustedMetadata = incomingState.metadata()\n-                                .withLastCommittedValues(clusterUuidCommitted, lastCommittedConfiguration);\n-                            if (adjustedMetadata != incomingState.metadata()) {\n-                                incomingState = ClusterState.builder(incomingState).metadata(adjustedMetadata).build();\n-                            }\n-                        }\n-                    } catch (IncompatibleClusterStateVersionException e) {\n-                        incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n-                        throw e;\n-                    } catch (Exception e) {\n-                        logger.warn(\"unexpected error while deserializing an incoming cluster state\", e);\n-                        assert false : e;\n-                        throw e;\n-                    }\n+                    final ClusterState incomingState = deserializeAndApplyDiff(request, in, lastSeen);\n                     compatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     logger.debug(\n                         \"received diff cluster state version [{}] with uuid [{}], diff size [{}]\",\n                         incomingState.version(),\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final ClusterState stateToApply = incomingState;\n-                    acceptState(stateToApply, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(stateToApply)));\n+                    acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n                 }\n             }\n         } finally {\n             IOUtils.close(in);\n         }\n     }\n \n+    private ClusterState deserializeAndApplyDiff(BytesTransportRequest request, StreamInput in, ClusterState currentState)\n+        throws IOException {\n+        ClusterState incomingState;\n+        try {\n+            final Diff<ClusterState> diff;\n+            final boolean includesLastCommittedData = request.version().onOrAfter(INCLUDES_LAST_COMMITTED_DATA_VERSION);\n+            final boolean clusterUuidCommitted;\n+            final CoordinationMetadata.VotingConfiguration lastCommittedConfiguration;\n+\n+            // Close stream early to release resources used by the de-compression as early as possible\n+            try (StreamInput input = in) {\n+                diff = ClusterState.readDiffFrom(input, currentState.nodes().getLocalNode());\n+                if (includesLastCommittedData) {\n+                    clusterUuidCommitted = in.readBoolean();\n+                    lastCommittedConfiguration = new CoordinationMetadata.VotingConfiguration(in);\n+                } else {\n+                    clusterUuidCommitted = false;\n+                    lastCommittedConfiguration = null;\n+                }\n+                assert input.read() == -1;\n+            }\n+            incomingState = diff.apply(currentState); // might throw IncompatibleClusterStateVersionException\n+            if (includesLastCommittedData) {\n+                final var adjustedMetadata = incomingState.metadata()\n+                    .withLastCommittedValues(clusterUuidCommitted, lastCommittedConfiguration);\n+                if (adjustedMetadata != incomingState.metadata()) {\n+                    incomingState = ClusterState.builder(incomingState).metadata(adjustedMetadata).build();\n+                }\n+            }\n+        } catch (IncompatibleClusterStateVersionException e) {\n+            incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n+            throw e;\n+        } catch (Exception e) {\n+            logger.warn(\"unexpected error while deserializing an incoming cluster state\", e);\n+            assert false : e;\n+            throw e;\n+        }\n+        return incomingState;\n+    }\n+\n     /**\n      * Delegate to cluster-coordination thread to apply received state\n      *",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -157,57 +157,62 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, ActionL\n                     incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     throw new IncompatibleClusterStateVersionException(\"have no local cluster state\");\n                 } else {\n-                    ClusterState incomingState;\n-                    try {\n-                        final Diff<ClusterState> diff;\n-                        final boolean includesLastCommittedData = request.version().onOrAfter(INCLUDES_LAST_COMMITTED_DATA_VERSION);\n-                        final boolean clusterUuidCommitted;\n-                        final CoordinationMetadata.VotingConfiguration lastCommittedConfiguration;\n-\n-                        // Close stream early to release resources used by the de-compression as early as possible\n-                        try (StreamInput input = in) {\n-                            diff = ClusterState.readDiffFrom(input, lastSeen.nodes().getLocalNode());\n-                            if (includesLastCommittedData) {\n-                                clusterUuidCommitted = in.readBoolean();\n-                                lastCommittedConfiguration = new CoordinationMetadata.VotingConfiguration(in);\n-                            } else {\n-                                clusterUuidCommitted = false;\n-                                lastCommittedConfiguration = null;\n-                            }\n-                            assert input.read() == -1;\n-                        }\n-                        incomingState = diff.apply(lastSeen); // might throw IncompatibleClusterStateVersionException\n-                        if (includesLastCommittedData) {\n-                            final var adjustedMetadata = incomingState.metadata()\n-                                .withLastCommittedValues(clusterUuidCommitted, lastCommittedConfiguration);\n-                            if (adjustedMetadata != incomingState.metadata()) {\n-                                incomingState = ClusterState.builder(incomingState).metadata(adjustedMetadata).build();\n-                            }\n-                        }\n-                    } catch (IncompatibleClusterStateVersionException e) {\n-                        incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n-                        throw e;\n-                    } catch (Exception e) {\n-                        logger.warn(\"unexpected error while deserializing an incoming cluster state\", e);\n-                        assert false : e;\n-                        throw e;\n-                    }\n+                    final ClusterState incomingState = deserializeAndApplyDiff(request, in, lastSeen);\n                     compatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     logger.debug(\n                         \"received diff cluster state version [{}] with uuid [{}], diff size [{}]\",\n                         incomingState.version(),\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final ClusterState stateToApply = incomingState;\n-                    acceptState(stateToApply, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(stateToApply)));\n+                    acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n                 }\n             }\n         } finally {\n             IOUtils.close(in);\n         }\n     }\n \n+    private ClusterState deserializeAndApplyDiff(BytesTransportRequest request, StreamInput in, ClusterState currentState)\n+        throws IOException {\n+        ClusterState incomingState;\n+        try {\n+            final Diff<ClusterState> diff;\n+            final boolean includesLastCommittedData = request.version().onOrAfter(INCLUDES_LAST_COMMITTED_DATA_VERSION);\n+            final boolean clusterUuidCommitted;\n+            final CoordinationMetadata.VotingConfiguration lastCommittedConfiguration;\n+\n+            // Close stream early to release resources used by the de-compression as early as possible\n+            try (StreamInput input = in) {\n+                diff = ClusterState.readDiffFrom(input, currentState.nodes().getLocalNode());\n+                if (includesLastCommittedData) {\n+                    clusterUuidCommitted = in.readBoolean();\n+                    lastCommittedConfiguration = new CoordinationMetadata.VotingConfiguration(in);\n+                } else {\n+                    clusterUuidCommitted = false;\n+                    lastCommittedConfiguration = null;\n+                }\n+                assert input.read() == -1;\n+            }\n+            incomingState = diff.apply(currentState); // might throw IncompatibleClusterStateVersionException\n+            if (includesLastCommittedData) {\n+                final var adjustedMetadata = incomingState.metadata()\n+                    .withLastCommittedValues(clusterUuidCommitted, lastCommittedConfiguration);\n+                if (adjustedMetadata != incomingState.metadata()) {\n+                    incomingState = ClusterState.builder(incomingState).metadata(adjustedMetadata).build();\n+                }\n+            }\n+        } catch (IncompatibleClusterStateVersionException e) {\n+            incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n+            throw e;\n+        } catch (Exception e) {\n+            logger.warn(\"unexpected error while deserializing an incoming cluster state\", e);\n+            assert false : e;\n+            throw e;\n+        }\n+        return incomingState;\n+    }\n+\n     /**\n      * Delegate to cluster-coordination thread to apply received state\n      *"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-20T23:49:49Z",
+      "sha": "edddf1acb88937b2a24107bbdcbfc8e75afb9711",
+      "message": "Rename listener parameter",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-20T23:49:49Z",
+      "author_date": "2024-05-20T23:49:49Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-20T23:49:49Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -124,8 +124,10 @@ public PublishClusterStateStats stats() {\n         );\n     }\n \n-    private void handleIncomingPublishRequest(BytesTransportRequest request, ActionListener<PublishWithJoinResponse> actionListener)\n-        throws IOException {\n+    private void handleIncomingPublishRequest(\n+        BytesTransportRequest request,\n+        ActionListener<PublishWithJoinResponse> publishResponseListener\n+    ) throws IOException {\n         assert ThreadPool.assertCurrentThreadPool(GENERIC);\n         final Compressor compressor = CompressorFactory.compressor(request.bytes());\n         StreamInput in = request.bytes().streamInput();\n@@ -149,7 +151,10 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, ActionL\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n+                acceptState(\n+                    incomingState,\n+                    ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n+                );\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -165,7 +170,10 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, ActionL\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n+                    acceptState(\n+                        incomingState,\n+                        ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n+                    );\n                 }\n             }\n         } finally {",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -124,8 +124,10 @@ public PublishClusterStateStats stats() {\n         );\n     }\n \n-    private void handleIncomingPublishRequest(BytesTransportRequest request, ActionListener<PublishWithJoinResponse> actionListener)\n-        throws IOException {\n+    private void handleIncomingPublishRequest(\n+        BytesTransportRequest request,\n+        ActionListener<PublishWithJoinResponse> publishResponseListener\n+    ) throws IOException {\n         assert ThreadPool.assertCurrentThreadPool(GENERIC);\n         final Compressor compressor = CompressorFactory.compressor(request.bytes());\n         StreamInput in = request.bytes().streamInput();\n@@ -149,7 +151,10 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, ActionL\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n+                acceptState(\n+                    incomingState,\n+                    ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n+                );\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -165,7 +170,10 @@ private void handleIncomingPublishRequest(BytesTransportRequest request, ActionL\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(incomingState, ActionListener.runBefore(actionListener, () -> lastSeenClusterState.set(incomingState)));\n+                    acceptState(\n+                        incomingState,\n+                        ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n+                    );\n                 }\n             }\n         } finally {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2067230168,
+      "created_at": "2024-05-20T23:55:55Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1607413032,
+      "created_at": "2024-05-20T23:55:55Z",
+      "user": "nicktindall",
+      "body": "This is probably controversial, but by factoring out the `deserialiseAndApplyDiff`, incomingState can be made final and used directly in the runBefore lambda. Git also appears to retain the history for the body of `deserialiseAndApply` nicely.",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+      "diff_hunk": "@@ -145,72 +151,88 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                final PublishWithJoinResponse response = acceptState(incomingState);\n-                lastSeenClusterState.set(incomingState);\n-                return response;\n+                acceptState(\n+                    incomingState,\n+                    ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n+                );\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n                     logger.debug(\"received diff for but don't have any local cluster state - requesting full state\");\n                     incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     throw new IncompatibleClusterStateVersionException(\"have no local cluster state\");\n                 } else {\n-                    ClusterState incomingState;\n-                    try {\n-                        final Diff<ClusterState> diff;\n-                        final boolean includesLastCommittedData = request.version().onOrAfter(INCLUDES_LAST_COMMITTED_DATA_VERSION);\n-                        final boolean clusterUuidCommitted;\n-                        final CoordinationMetadata.VotingConfiguration lastCommittedConfiguration;\n-\n-                        // Close stream early to release resources used by the de-compression as early as possible\n-                        try (StreamInput input = in) {\n-                            diff = ClusterState.readDiffFrom(input, lastSeen.nodes().getLocalNode());\n-                            if (includesLastCommittedData) {\n-                                clusterUuidCommitted = in.readBoolean();\n-                                lastCommittedConfiguration = new CoordinationMetadata.VotingConfiguration(in);\n-                            } else {\n-                                clusterUuidCommitted = false;\n-                                lastCommittedConfiguration = null;\n-                            }\n-                            assert input.read() == -1;\n-                        }\n-                        incomingState = diff.apply(lastSeen); // might throw IncompatibleClusterStateVersionException\n-                        if (includesLastCommittedData) {\n-                            final var adjustedMetadata = incomingState.metadata()\n-                                .withLastCommittedValues(clusterUuidCommitted, lastCommittedConfiguration);\n-                            if (adjustedMetadata != incomingState.metadata()) {\n-                                incomingState = ClusterState.builder(incomingState).metadata(adjustedMetadata).build();\n-                            }\n-                        }\n-                    } catch (IncompatibleClusterStateVersionException e) {\n-                        incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n-                        throw e;\n-                    } catch (Exception e) {\n-                        logger.warn(\"unexpected error while deserializing an incoming cluster state\", e);\n-                        assert false : e;\n-                        throw e;\n-                    }\n+                    final ClusterState incomingState = deserializeAndApplyDiff(request, in, lastSeen);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 165,
+      "original_line": 165,
+      "side": "RIGHT",
+      "original_position": 96,
+      "position": 96,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1607740895,
+          "user": "DaveCTurner",
+          "body": "Nope seems fine to me, nice idea.",
+          "created_at": "2024-05-21T06:54:41Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2067232943,
+      "created_at": "2024-05-20T23:59:14Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2067237904,
+      "created_at": "2024-05-21T00:06:40Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-21T01:57:55Z",
+      "sha": "9184bfb378bfcb7035c9052ad389415f7db431d8",
+      "message": "Only set lastSeen when it was successfully applied",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-21T00:51:53Z",
+      "author_date": "2024-05-21T00:51:53Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-21T01:57:55Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -151,10 +151,10 @@ private void handleIncomingPublishRequest(\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(\n-                    incomingState,\n-                    ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n-                );\n+                acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                    lastSeenClusterState.set(incomingState);\n+                    delegate.onResponse(response);\n+                }));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -170,10 +170,10 @@ private void handleIncomingPublishRequest(\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(\n-                        incomingState,\n-                        ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n-                    );\n+                    acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                        lastSeenClusterState.set(incomingState);\n+                        delegate.onResponse(response);\n+                    }));\n                 }\n             }\n         } finally {",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -151,10 +151,10 @@ private void handleIncomingPublishRequest(\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(\n-                    incomingState,\n-                    ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n-                );\n+                acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                    lastSeenClusterState.set(incomingState);\n+                    delegate.onResponse(response);\n+                }));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n@@ -170,10 +170,10 @@ private void handleIncomingPublishRequest(\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(\n-                        incomingState,\n-                        ActionListener.runBefore(publishResponseListener, () -> lastSeenClusterState.set(incomingState))\n-                    );\n+                    acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                        lastSeenClusterState.set(incomingState);\n+                        delegate.onResponse(response);\n+                    }));\n                 }\n             }\n         } finally {"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-21T01:59:40Z",
+      "sha": "4fc46af2f3124aad0227ed40591621275679b523",
+      "message": "Restore compare-and-set",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-21T01:59:29Z",
+      "author_date": "2024-05-21T01:59:29Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-21T01:59:40Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -171,7 +171,7 @@ private void handleIncomingPublishRequest(\n                         request.bytes().length()\n                     );\n                     acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n-                        lastSeenClusterState.set(incomingState);\n+                        lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n                         delegate.onResponse(response);\n                     }));\n                 }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -171,7 +171,7 @@ private void handleIncomingPublishRequest(\n                         request.bytes().length()\n                     );\n                     acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n-                        lastSeenClusterState.set(incomingState);\n+                        lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n                         delegate.onResponse(response);\n                     }));\n                 }"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1607741872,
+      "created_at": "2024-05-21T06:55:31Z",
+      "user": "DaveCTurner",
+      "body": ":+1: except that this extra step is happening between steps 3 & 4 in the old list. `org.elasticsearch.cluster.coordination.ApplyCommitRequest` only carries the term and version, it's `org.elasticsearch.cluster.coordination.PublishRequest` which carries the state that's being published.",
+      "path": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java",
+      "diff_hunk": "@@ -219,11 +219,12 @@ protected static int defaultInt(Setting<Integer> setting) {\n     // 3. master sends out PublishRequests to nodes\n     // 4. master receives PublishResponses from nodes\n     // 5. master sends ApplyCommitRequests to nodes\n-    // 6. nodes apply committed cluster state\n-    // 7. master receives ApplyCommitResponses\n-    // 8. apply committed state on master (last one to apply cluster state)\n-    // 9. complete the publication listener back on the master service thread\n-    public static final int CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS = 9;\n+    // 6. nodes deserialize committed cluster state\n+    // 7. nodes apply committed cluster state\n+    // 8. master receives ApplyCommitResponses\n+    // 9. apply committed state on master (last one to apply cluster state)\n+    // 10. complete the publication listener back on the master service thread\n+    public static final int CLUSTER_STATE_UPDATE_NUMBER_OF_DELAYS = 10;",
+      "start_line": null,
+      "original_start_line": 222,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 227,
+      "side": "RIGHT",
+      "original_position": 14,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2067692861,
+      "created_at": "2024-05-21T06:56:51Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": "one nit otherwise LGTM"
+    },
+    {
+      "type": "review",
+      "id": 2067723567,
+      "created_at": "2024-05-21T07:09:57Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-21T07:40:07Z",
+      "sha": "cdc7eaed74e14a67a9c37f7f11e9227f112563e0",
+      "message": "Fix NUMBER_OF_DELAYS description",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-05-21T07:40:07Z",
+      "author_date": "2024-05-21T07:40:07Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-05-21T07:40:07Z",
+      "diff_text": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java\n@@ -217,9 +217,9 @@ protected static int defaultInt(Setting<Integer> setting) {\n     // 1. submit the task to the master service\n     // 2. state publisher task on master\n     // 3. master sends out PublishRequests to nodes\n-    // 4. master receives PublishResponses from nodes\n-    // 5. master sends ApplyCommitRequests to nodes\n-    // 6. nodes deserialize committed cluster state\n+    // 4. nodes deserialize received cluster state\n+    // 5. master receives PublishResponses from nodes\n+    // 6. master sends ApplyCommitRequests to nodes\n     // 7. nodes apply committed cluster state\n     // 8. master receives ApplyCommitResponses\n     // 9. apply committed state on master (last one to apply cluster state)",
+      "diff": [
+        {
+          "file": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java",
+          "patch": "@@ -217,9 +217,9 @@ protected static int defaultInt(Setting<Integer> setting) {\n     // 1. submit the task to the master service\n     // 2. state publisher task on master\n     // 3. master sends out PublishRequests to nodes\n-    // 4. master receives PublishResponses from nodes\n-    // 5. master sends ApplyCommitRequests to nodes\n-    // 6. nodes deserialize committed cluster state\n+    // 4. nodes deserialize received cluster state\n+    // 5. master receives PublishResponses from nodes\n+    // 6. master sends ApplyCommitRequests to nodes\n     // 7. nodes apply committed cluster state\n     // 8. master receives ApplyCommitResponses\n     // 9. apply committed state on master (last one to apply cluster state)"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2067790350,
+      "created_at": "2024-05-21T07:42:29Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1607811417,
+      "created_at": "2024-05-21T07:50:55Z",
+      "user": "DaveCTurner",
+      "body": "Sorry one more tiny thing, I would write this sort of thing using `ActionListener#map` to avoid any doubt that we complete the listener on all paths:\r\n\r\n```suggestion\r\n                    acceptState(incomingState, publishResponseListener.map(response -> {\r\n                        lastSeenClusterState.compareAndSet(lastSeen, incomingState);\r\n                        return response;\r\n                    }));\r\n```\r\n\r\nNot a huge deal here ofc but a useful trick in more complex cases for sure.",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+      "diff_hunk": "@@ -145,72 +151,88 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                final PublishWithJoinResponse response = acceptState(incomingState);\n-                lastSeenClusterState.set(incomingState);\n-                return response;\n+                acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                    lastSeenClusterState.set(incomingState);\n+                    delegate.onResponse(response);\n+                }));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();\n                 if (lastSeen == null) {\n                     logger.debug(\"received diff for but don't have any local cluster state - requesting full state\");\n                     incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     throw new IncompatibleClusterStateVersionException(\"have no local cluster state\");\n                 } else {\n-                    ClusterState incomingState;\n-                    try {\n-                        final Diff<ClusterState> diff;\n-                        final boolean includesLastCommittedData = request.version().onOrAfter(INCLUDES_LAST_COMMITTED_DATA_VERSION);\n-                        final boolean clusterUuidCommitted;\n-                        final CoordinationMetadata.VotingConfiguration lastCommittedConfiguration;\n-\n-                        // Close stream early to release resources used by the de-compression as early as possible\n-                        try (StreamInput input = in) {\n-                            diff = ClusterState.readDiffFrom(input, lastSeen.nodes().getLocalNode());\n-                            if (includesLastCommittedData) {\n-                                clusterUuidCommitted = in.readBoolean();\n-                                lastCommittedConfiguration = new CoordinationMetadata.VotingConfiguration(in);\n-                            } else {\n-                                clusterUuidCommitted = false;\n-                                lastCommittedConfiguration = null;\n-                            }\n-                            assert input.read() == -1;\n-                        }\n-                        incomingState = diff.apply(lastSeen); // might throw IncompatibleClusterStateVersionException\n-                        if (includesLastCommittedData) {\n-                            final var adjustedMetadata = incomingState.metadata()\n-                                .withLastCommittedValues(clusterUuidCommitted, lastCommittedConfiguration);\n-                            if (adjustedMetadata != incomingState.metadata()) {\n-                                incomingState = ClusterState.builder(incomingState).metadata(adjustedMetadata).build();\n-                            }\n-                        }\n-                    } catch (IncompatibleClusterStateVersionException e) {\n-                        incompatibleClusterStateDiffReceivedCount.incrementAndGet();\n-                        throw e;\n-                    } catch (Exception e) {\n-                        logger.warn(\"unexpected error while deserializing an incoming cluster state\", e);\n-                        assert false : e;\n-                        throw e;\n-                    }\n+                    final ClusterState incomingState = deserializeAndApplyDiff(request, in, lastSeen);\n                     compatibleClusterStateDiffReceivedCount.incrementAndGet();\n                     logger.debug(\n                         \"received diff cluster state version [{}] with uuid [{}], diff size [{}]\",\n                         incomingState.version(),\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    final PublishWithJoinResponse response = acceptState(incomingState);\n-                    lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                    return response;\n+                    acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                        lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n+                        delegate.onResponse(response);\n+                    }));",
+      "start_line": null,
+      "original_start_line": 173,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 176,
+      "side": "RIGHT",
+      "original_position": 110,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1607815430,
+          "user": "nicktindall",
+          "body": "Hehe yeah it took me a while to work out which helper to use here. Will make the change.",
+          "created_at": "2024-05-21T07:53:48Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1607812338,
+      "created_at": "2024-05-21T07:51:37Z",
+      "user": "DaveCTurner",
+      "body": "Likewise here.\r\n\r\n```suggestion\r\n                acceptState(incomingState, publishResponseListener.map(response -> {\r\n                    lastSeenClusterState.set(incomingState);\r\n                    return response;\r\n                }));\r\n```",
+      "path": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+      "diff_hunk": "@@ -145,72 +151,88 @@ private PublishWithJoinResponse handleIncomingPublishRequest(BytesTransportReque\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                final PublishWithJoinResponse response = acceptState(incomingState);\n-                lastSeenClusterState.set(incomingState);\n-                return response;\n+                acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                    lastSeenClusterState.set(incomingState);\n+                    delegate.onResponse(response);\n+                }));",
+      "start_line": null,
+      "original_start_line": 154,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 157,
+      "side": "RIGHT",
+      "original_position": 53,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2067808543,
+      "created_at": "2024-05-21T07:51:54Z",
+      "user": "DaveCTurner",
+      "state": "APPROVED",
+      "body": "LGTM (one more tiny suggestion but no need for another review)"
+    },
+    {
+      "type": "review",
+      "id": 2067815061,
+      "created_at": "2024-05-21T07:53:48Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-21T07:54:07Z",
+      "sha": "42ba190c1ec8f57ac56a2f4d002ccfe91ab09399",
+      "message": "Update server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n\nCo-authored-by: David Turner <david.turner@elastic.co>",
+      "author": "Nick Tindall",
+      "author_email": "pva10x@gmail.com",
+      "author_raw_date": "2024-05-21T07:54:07Z",
+      "author_date": "2024-05-21T07:54:07Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2024-05-21T07:54:07Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -170,9 +170,9 @@ private void handleIncomingPublishRequest(\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                    acceptState(incomingState, publishResponseListener.map(response -> {\n                         lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                        delegate.onResponse(response);\n+                        return response;\n                     }));\n                 }\n             }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -170,9 +170,9 @@ private void handleIncomingPublishRequest(\n                         incomingState.stateUUID(),\n                         request.bytes().length()\n                     );\n-                    acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                    acceptState(incomingState, publishResponseListener.map(response -> {\n                         lastSeenClusterState.compareAndSet(lastSeen, incomingState);\n-                        delegate.onResponse(response);\n+                        return response;\n                     }));\n                 }\n             }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-05-21T07:54:15Z",
+      "sha": "caae150f82d4a579f547bd711072364280059ebf",
+      "message": "Update server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n\nCo-authored-by: David Turner <david.turner@elastic.co>",
+      "author": "Nick Tindall",
+      "author_email": "pva10x@gmail.com",
+      "author_raw_date": "2024-05-21T07:54:15Z",
+      "author_date": "2024-05-21T07:54:15Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2024-05-21T07:54:15Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java\n@@ -151,9 +151,9 @@ private void handleIncomingPublishRequest(\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                acceptState(incomingState, publishResponseListener.map(response -> {\n                     lastSeenClusterState.set(incomingState);\n-                    delegate.onResponse(response);\n+                    return response;\n                 }));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/coordination/PublicationTransportHandler.java",
+          "patch": "@@ -151,9 +151,9 @@ private void handleIncomingPublishRequest(\n                 }\n                 fullClusterStateReceivedCount.incrementAndGet();\n                 logger.debug(\"received full cluster state version [{}] with size [{}]\", incomingState.version(), request.bytes().length());\n-                acceptState(incomingState, publishResponseListener.delegateFailure((delegate, response) -> {\n+                acceptState(incomingState, publishResponseListener.map(response -> {\n                     lastSeenClusterState.set(incomingState);\n-                    delegate.onResponse(response);\n+                    return response;\n                 }));\n             } else {\n                 final ClusterState lastSeen = lastSeenClusterState.get();"
+        }
+      ]
+    }
+  ]
+}

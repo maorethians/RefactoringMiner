@@ -1,0 +1,171 @@
+{
+  "repo": "apache/rocketmq",
+  "number": 8916,
+  "pr_number": 8916,
+  "title": "[ISSUE #8877] Refactor lock in ReceiptHandleGroup  to make the lock can be properly released when future can not be completed.",
+  "user": "qianye1001",
+  "created_at": "2024-11-13T12:45:47Z",
+  "merged_at": "2024-11-21T09:53:46Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "2bbc852361132db8697a5788197aa31f5e89d4a1",
+  "merge_commit_sha": "5f2642391dad0ec4043c6984a9b8b038f10f89b9",
+  "commits": 2,
+  "issue_events": [
+    "review_dismissed",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/apache/rocketmq/pull/8916",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-11-13T12:40:13Z",
+      "sha": "4292756632843522b792a8c97ff7890c351d361c",
+      "message": "fix",
+      "author": "qianye",
+      "author_email": "wuxingcan.wxc@alibaba-inc.com",
+      "author_raw_date": "2024-11-13T12:40:13Z",
+      "author_date": "2024-11-13T12:40:13Z",
+      "committer": "qianye",
+      "committer_email": "wuxingcan.wxc@alibaba-inc.com",
+      "raw_date": "2024-11-13T12:40:13Z",
+      "diff_text": "proxy/src/main/java/org/apache/rocketmq/proxy/common/ReceiptHandleGroup.java\n@@ -25,6 +25,7 @@\n import java.util.concurrent.ConcurrentHashMap;\n import java.util.concurrent.Semaphore;\n import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.function.Function;\n import org.apache.commons.lang3.builder.ToStringBuilder;\n@@ -98,22 +99,44 @@ public long getOffset() {\n \n     public static class HandleData {\n         private final Semaphore semaphore = new Semaphore(1);\n+        private final AtomicLong lastLockTimeMs = new AtomicLong(-1L);\n         private volatile boolean needRemove = false;\n         private volatile MessageReceiptHandle messageReceiptHandle;\n \n         public HandleData(MessageReceiptHandle messageReceiptHandle) {\n             this.messageReceiptHandle = messageReceiptHandle;\n         }\n \n-        public boolean lock(long timeoutMs) {\n+        public Long lock(long timeoutMs) {\n             try {\n-                return this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                boolean result = this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                long currentTimeMs = System.currentTimeMillis();\n+                if (result) {\n+                    this.lastLockTimeMs.set(currentTimeMs);\n+                    return currentTimeMs;\n+                } else {\n+                    // if the lock is expired, can be acquired again\n+                    long expiredTimeMs = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 3;\n+                    if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                        synchronized (this) {\n+                            if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                                this.lastLockTimeMs.set(currentTimeMs);\n+                                return currentTimeMs;\n+                            }\n+                        }\n+                    }\n+                }\n+                return null;\n             } catch (InterruptedException e) {\n-                return false;\n+                return null;\n             }\n         }\n \n-        public void unlock() {\n+        public void unlock(long lockTimeMs) {\n+            // if the lock is expired, we don't need to unlock it\n+            if (System.currentTimeMillis() - lockTimeMs > ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 2) {\n+                return;\n+            }\n             this.semaphore.release();\n         }\n \n@@ -149,7 +172,8 @@ public void put(String msgID, MessageReceiptHandle value) {\n             if (handleData == null || handleData.needRemove) {\n                 return new HandleData(value);\n             }\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to put handle failed\");\n             }\n             try {\n@@ -158,7 +182,7 @@ public void put(String msgID, MessageReceiptHandle value) {\n                 }\n                 handleData.messageReceiptHandle = value;\n             } finally {\n-                handleData.unlock();\n+                handleData.unlock(lockTimeMs);\n             }\n             return handleData;\n         });\n@@ -176,7 +200,8 @@ public MessageReceiptHandle get(String msgID, String handle) {\n         long timeout = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup();\n         AtomicReference<MessageReceiptHandle> res = new AtomicReference<>();\n         handleMap.computeIfPresent(new HandleKey(handle), (handleKey, handleData) -> {\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to get handle failed\");\n             }\n             try {\n@@ -185,7 +210,7 @@ public MessageReceiptHandle get(String msgID, String handle) {\n                 }\n                 res.set(handleData.messageReceiptHandle);\n             } finally {\n-                handleData.unlock();\n+                handleData.unlock(lockTimeMs);\n             }\n             return handleData;\n         });\n@@ -200,7 +225,8 @@ public MessageReceiptHandle remove(String msgID, String handle) {\n         long timeout = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup();\n         AtomicReference<MessageReceiptHandle> res = new AtomicReference<>();\n         handleMap.computeIfPresent(new HandleKey(handle), (handleKey, handleData) -> {\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to remove and get handle failed\");\n             }\n             try {\n@@ -210,7 +236,7 @@ public MessageReceiptHandle remove(String msgID, String handle) {\n                 }\n                 return null;\n             } finally {\n-                handleData.unlock();\n+                handleData.unlock(lockTimeMs);\n             }\n         });\n         removeHandleMapKeyIfNeed(msgID);\n@@ -240,7 +266,8 @@ public void computeIfPresent(String msgID, String handle,\n         }\n         long timeout = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup();\n         handleMap.computeIfPresent(new HandleKey(handle), (handleKey, handleData) -> {\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to compute failed\");\n             }\n             CompletableFuture<MessageReceiptHandle> future = function.apply(handleData.messageReceiptHandle);\n@@ -255,7 +282,7 @@ public void computeIfPresent(String msgID, String handle,\n                         handleData.messageReceiptHandle = messageReceiptHandle;\n                     }\n                 } finally {\n-                    handleData.unlock();\n+                    handleData.unlock(lockTimeMs);\n                 }\n                 if (handleData.needRemove) {\n                     handleMap.remove(handleKey, handleData);",
+      "diff": [
+        {
+          "file": "proxy/src/main/java/org/apache/rocketmq/proxy/common/ReceiptHandleGroup.java",
+          "patch": "@@ -25,6 +25,7 @@\n import java.util.concurrent.ConcurrentHashMap;\n import java.util.concurrent.Semaphore;\n import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.function.Function;\n import org.apache.commons.lang3.builder.ToStringBuilder;\n@@ -98,22 +99,44 @@ public long getOffset() {\n \n     public static class HandleData {\n         private final Semaphore semaphore = new Semaphore(1);\n+        private final AtomicLong lastLockTimeMs = new AtomicLong(-1L);\n         private volatile boolean needRemove = false;\n         private volatile MessageReceiptHandle messageReceiptHandle;\n \n         public HandleData(MessageReceiptHandle messageReceiptHandle) {\n             this.messageReceiptHandle = messageReceiptHandle;\n         }\n \n-        public boolean lock(long timeoutMs) {\n+        public Long lock(long timeoutMs) {\n             try {\n-                return this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                boolean result = this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                long currentTimeMs = System.currentTimeMillis();\n+                if (result) {\n+                    this.lastLockTimeMs.set(currentTimeMs);\n+                    return currentTimeMs;\n+                } else {\n+                    // if the lock is expired, can be acquired again\n+                    long expiredTimeMs = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 3;\n+                    if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                        synchronized (this) {\n+                            if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                                this.lastLockTimeMs.set(currentTimeMs);\n+                                return currentTimeMs;\n+                            }\n+                        }\n+                    }\n+                }\n+                return null;\n             } catch (InterruptedException e) {\n-                return false;\n+                return null;\n             }\n         }\n \n-        public void unlock() {\n+        public void unlock(long lockTimeMs) {\n+            // if the lock is expired, we don't need to unlock it\n+            if (System.currentTimeMillis() - lockTimeMs > ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 2) {\n+                return;\n+            }\n             this.semaphore.release();\n         }\n \n@@ -149,7 +172,8 @@ public void put(String msgID, MessageReceiptHandle value) {\n             if (handleData == null || handleData.needRemove) {\n                 return new HandleData(value);\n             }\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to put handle failed\");\n             }\n             try {\n@@ -158,7 +182,7 @@ public void put(String msgID, MessageReceiptHandle value) {\n                 }\n                 handleData.messageReceiptHandle = value;\n             } finally {\n-                handleData.unlock();\n+                handleData.unlock(lockTimeMs);\n             }\n             return handleData;\n         });\n@@ -176,7 +200,8 @@ public MessageReceiptHandle get(String msgID, String handle) {\n         long timeout = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup();\n         AtomicReference<MessageReceiptHandle> res = new AtomicReference<>();\n         handleMap.computeIfPresent(new HandleKey(handle), (handleKey, handleData) -> {\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to get handle failed\");\n             }\n             try {\n@@ -185,7 +210,7 @@ public MessageReceiptHandle get(String msgID, String handle) {\n                 }\n                 res.set(handleData.messageReceiptHandle);\n             } finally {\n-                handleData.unlock();\n+                handleData.unlock(lockTimeMs);\n             }\n             return handleData;\n         });\n@@ -200,7 +225,8 @@ public MessageReceiptHandle remove(String msgID, String handle) {\n         long timeout = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup();\n         AtomicReference<MessageReceiptHandle> res = new AtomicReference<>();\n         handleMap.computeIfPresent(new HandleKey(handle), (handleKey, handleData) -> {\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to remove and get handle failed\");\n             }\n             try {\n@@ -210,7 +236,7 @@ public MessageReceiptHandle remove(String msgID, String handle) {\n                 }\n                 return null;\n             } finally {\n-                handleData.unlock();\n+                handleData.unlock(lockTimeMs);\n             }\n         });\n         removeHandleMapKeyIfNeed(msgID);\n@@ -240,7 +266,8 @@ public void computeIfPresent(String msgID, String handle,\n         }\n         long timeout = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup();\n         handleMap.computeIfPresent(new HandleKey(handle), (handleKey, handleData) -> {\n-            if (!handleData.lock(timeout)) {\n+            Long lockTimeMs = handleData.lock(timeout);\n+            if (lockTimeMs == null) {\n                 throw new ProxyException(ProxyExceptionCode.INTERNAL_SERVER_ERROR, \"try to compute failed\");\n             }\n             CompletableFuture<MessageReceiptHandle> future = function.apply(handleData.messageReceiptHandle);\n@@ -255,7 +282,7 @@ public void computeIfPresent(String msgID, String handle,\n                         handleData.messageReceiptHandle = messageReceiptHandle;\n                     }\n                 } finally {\n-                    handleData.unlock();\n+                    handleData.unlock(lockTimeMs);\n                 }\n                 if (handleData.needRemove) {\n                     handleMap.remove(handleKey, handleData);"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-11-13T12:45:47Z",
+      "user": "qianye1001",
+      "body": "<!-- Please make sure the target branch is right. In most case, the target branch should be `develop`. -->\r\n\r\n### Which Issue(s) This PR Fixes\r\n\r\n<!-- Please ensure that the related issue has already been created, and [link this pull request to that issue using keywords](<https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword>) to ensure automatic closure. -->\r\n\r\nFixes #8877\r\n\r\n### Brief Description\r\n\r\n<!-- Write a brief description for your pull request to help the maintainer understand the reasons behind your changes. -->\r\n\r\n### How Did You Test This Change?\r\n\r\n<!-- In order to ensure the code quality of Apache RocketMQ, we expect every pull request to have undergone thorough testing. -->\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 2473588106,
+      "created_at": "2024-11-13T13:13:52Z",
+      "user": "codecov-commenter",
+      "body": "## [Codecov](https://app.codecov.io/gh/apache/rocketmq/pull/8916?dropdown=coverage&src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) Report\n:x: Patch coverage is `41.17647%` with `20 lines` in your changes missing coverage. Please review.\n:white_check_mark: Project coverage is 47.58%. Comparing base ([`5600684`](https://app.codecov.io/gh/apache/rocketmq/commit/5600684eb437dd5a4aeb9c658e24200bcb74909b?dropdown=coverage&el=desc&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache)) to head ([`15bdb27`](https://app.codecov.io/gh/apache/rocketmq/commit/15bdb2741e4f508b99678088584f4345caf61269?dropdown=coverage&el=desc&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache)).\n:warning: Report is 411 commits behind head on develop.\n\n| [Files with missing lines](https://app.codecov.io/gh/apache/rocketmq/pull/8916?dropdown=coverage&src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) | Patch % | Lines |\n|---|---|---|\n| [...ache/rocketmq/proxy/common/ReceiptHandleGroup.java](https://app.codecov.io/gh/apache/rocketmq/pull/8916?src=pr&el=tree&filepath=proxy%2Fsrc%2Fmain%2Fjava%2Forg%2Fapache%2Frocketmq%2Fproxy%2Fcommon%2FReceiptHandleGroup.java&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache#diff-cHJveHkvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3Byb3h5L2NvbW1vbi9SZWNlaXB0SGFuZGxlR3JvdXAuamF2YQ==) | 41.17% | [14 Missing and 6 partials :warning: ](https://app.codecov.io/gh/apache/rocketmq/pull/8916?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) |\n\n<details><summary>Additional details and impacted files</summary>\n\n\n\n```diff\n@@              Coverage Diff              @@\n##             develop    #8916      +/-   ##\n=============================================\n- Coverage      47.71%   47.58%   -0.14%     \n+ Complexity     11763    11743      -20     \n=============================================\n  Files           1304     1304              \n  Lines          91051    91070      +19     \n  Branches       11675    11679       +4     \n=============================================\n- Hits           43448    43338     -110     \n- Misses         42274    42384     +110     \n- Partials        5329     5348      +19     \n```\n</details>\n\n[:umbrella: View full report in Codecov by Sentry](https://app.codecov.io/gh/apache/rocketmq/pull/8916?dropdown=coverage&src=pr&el=continue&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache).   \n:loudspeaker: Have feedback on the report? [Share it here](https://about.codecov.io/codecov-pr-comment-feedback/?utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache).\n<details><summary> :rocket: New features to boost your workflow: </summary>\n\n- :snowflake: [Test Analytics](https://docs.codecov.com/docs/test-analytics): Detect flaky tests, report on failures, and find test suite problems.\n</details>"
+    },
+    {
+      "type": "review",
+      "id": 2434957360,
+      "created_at": "2024-11-14T03:10:09Z",
+      "user": "guyinyou",
+      "state": "APPROVED",
+      "body": "lgtm"
+    },
+    {
+      "type": "comment",
+      "id": 2475327832,
+      "created_at": "2024-11-14T03:16:03Z",
+      "user": "dingshuangxi888",
+      "body": "LGTM"
+    },
+    {
+      "type": "review",
+      "id": 2435146519,
+      "created_at": "2024-11-14T06:23:00Z",
+      "user": "lollipopjin",
+      "state": "DISMISSED",
+      "body": "LGTM"
+    },
+    {
+      "type": "review",
+      "id": 2435230941,
+      "created_at": "2024-11-14T07:21:13Z",
+      "user": "fuyou001",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1841684301,
+      "created_at": "2024-11-14T07:21:13Z",
+      "user": "fuyou001",
+      "body": "add log",
+      "path": "proxy/src/main/java/org/apache/rocketmq/proxy/common/ReceiptHandleGroup.java",
+      "diff_hunk": "@@ -98,22 +99,44 @@ public long getOffset() {\n \n     public static class HandleData {\n         private final Semaphore semaphore = new Semaphore(1);\n+        private final AtomicLong lastLockTimeMs = new AtomicLong(-1L);\n         private volatile boolean needRemove = false;\n         private volatile MessageReceiptHandle messageReceiptHandle;\n \n         public HandleData(MessageReceiptHandle messageReceiptHandle) {\n             this.messageReceiptHandle = messageReceiptHandle;\n         }\n \n-        public boolean lock(long timeoutMs) {\n+        public Long lock(long timeoutMs) {\n             try {\n-                return this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                boolean result = this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                long currentTimeMs = System.currentTimeMillis();\n+                if (result) {\n+                    this.lastLockTimeMs.set(currentTimeMs);\n+                    return currentTimeMs;\n+                } else {\n+                    // if the lock is expired, can be acquired again\n+                    long expiredTimeMs = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 3;\n+                    if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                        synchronized (this) {\n+                            if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                                this.lastLockTimeMs.set(currentTimeMs);\n+                                return currentTimeMs;\n+                            }\n+                        }\n+                    }\n+                }\n+                return null;\n             } catch (InterruptedException e) {\n-                return false;\n+                return null;\n             }\n         }\n \n-        public void unlock() {\n+        public void unlock(long lockTimeMs) {\n+            // if the lock is expired, we don't need to unlock it\n+            if (System.currentTimeMillis() - lockTimeMs > ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 2) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 143,
+      "original_line": 137,
+      "side": "RIGHT",
+      "original_position": 51,
+      "position": 65,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2435231131,
+      "created_at": "2024-11-14T07:21:20Z",
+      "user": "fuyou001",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1841684418,
+      "created_at": "2024-11-14T07:21:20Z",
+      "user": "fuyou001",
+      "body": "add log",
+      "path": "proxy/src/main/java/org/apache/rocketmq/proxy/common/ReceiptHandleGroup.java",
+      "diff_hunk": "@@ -98,22 +99,44 @@ public long getOffset() {\n \n     public static class HandleData {\n         private final Semaphore semaphore = new Semaphore(1);\n+        private final AtomicLong lastLockTimeMs = new AtomicLong(-1L);\n         private volatile boolean needRemove = false;\n         private volatile MessageReceiptHandle messageReceiptHandle;\n \n         public HandleData(MessageReceiptHandle messageReceiptHandle) {\n             this.messageReceiptHandle = messageReceiptHandle;\n         }\n \n-        public boolean lock(long timeoutMs) {\n+        public Long lock(long timeoutMs) {\n             try {\n-                return this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                boolean result = this.semaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);\n+                long currentTimeMs = System.currentTimeMillis();\n+                if (result) {\n+                    this.lastLockTimeMs.set(currentTimeMs);\n+                    return currentTimeMs;\n+                } else {\n+                    // if the lock is expired, can be acquired again\n+                    long expiredTimeMs = ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 3;\n+                    if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                        synchronized (this) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 125,
+      "original_line": 121,
+      "side": "RIGHT",
+      "original_position": 33,
+      "position": 45,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "commit",
+      "date": "2024-11-14T07:50:07Z",
+      "sha": "15bdb2741e4f508b99678088584f4345caf61269",
+      "message": "add log",
+      "author": "qianye",
+      "author_email": "wuxingcan.wxc@alibaba-inc.com",
+      "author_raw_date": "2024-11-14T07:50:07Z",
+      "author_date": "2024-11-14T07:50:07Z",
+      "committer": "qianye",
+      "committer_email": "wuxingcan.wxc@alibaba-inc.com",
+      "raw_date": "2024-11-14T07:50:07Z",
+      "diff_text": "proxy/src/main/java/org/apache/rocketmq/proxy/common/ReceiptHandleGroup.java\n@@ -29,11 +29,15 @@\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.function.Function;\n import org.apache.commons.lang3.builder.ToStringBuilder;\n+import org.apache.rocketmq.common.constant.LoggerName;\n import org.apache.rocketmq.common.consumer.ReceiptHandle;\n import org.apache.rocketmq.common.utils.ConcurrentHashMapUtils;\n+import org.apache.rocketmq.logging.org.slf4j.Logger;\n+import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;\n import org.apache.rocketmq.proxy.config.ConfigurationManager;\n \n public class ReceiptHandleGroup {\n+    protected final static Logger log = LoggerFactory.getLogger(LoggerName.PROXY_LOGGER_NAME);\n \n     // The messages having the same messageId will be deduplicated based on the parameters of broker, queueId, and offset\n     protected final Map<String /* msgID */, Map<HandleKey, HandleData>> receiptHandleMap = new ConcurrentHashMap<>();\n@@ -120,6 +124,8 @@ public Long lock(long timeoutMs) {\n                     if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n                         synchronized (this) {\n                             if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                                log.warn(\"HandleData lock expired, acquire lock success and reset lock time. \" +\n+                                    \"MessageReceiptHandle={}, lockTime={}\", messageReceiptHandle, currentTimeMs);\n                                 this.lastLockTimeMs.set(currentTimeMs);\n                                 return currentTimeMs;\n                             }\n@@ -135,6 +141,8 @@ public Long lock(long timeoutMs) {\n         public void unlock(long lockTimeMs) {\n             // if the lock is expired, we don't need to unlock it\n             if (System.currentTimeMillis() - lockTimeMs > ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 2) {\n+                log.warn(\"HandleData lock expired, unlock fail. MessageReceiptHandle={}, lockTime={}, now={}\",\n+                    messageReceiptHandle, lockTimeMs, System.currentTimeMillis());\n                 return;\n             }\n             this.semaphore.release();",
+      "diff": [
+        {
+          "file": "proxy/src/main/java/org/apache/rocketmq/proxy/common/ReceiptHandleGroup.java",
+          "patch": "@@ -29,11 +29,15 @@\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.function.Function;\n import org.apache.commons.lang3.builder.ToStringBuilder;\n+import org.apache.rocketmq.common.constant.LoggerName;\n import org.apache.rocketmq.common.consumer.ReceiptHandle;\n import org.apache.rocketmq.common.utils.ConcurrentHashMapUtils;\n+import org.apache.rocketmq.logging.org.slf4j.Logger;\n+import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;\n import org.apache.rocketmq.proxy.config.ConfigurationManager;\n \n public class ReceiptHandleGroup {\n+    protected final static Logger log = LoggerFactory.getLogger(LoggerName.PROXY_LOGGER_NAME);\n \n     // The messages having the same messageId will be deduplicated based on the parameters of broker, queueId, and offset\n     protected final Map<String /* msgID */, Map<HandleKey, HandleData>> receiptHandleMap = new ConcurrentHashMap<>();\n@@ -120,6 +124,8 @@ public Long lock(long timeoutMs) {\n                     if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n                         synchronized (this) {\n                             if (currentTimeMs - this.lastLockTimeMs.get() > expiredTimeMs) {\n+                                log.warn(\"HandleData lock expired, acquire lock success and reset lock time. \" +\n+                                    \"MessageReceiptHandle={}, lockTime={}\", messageReceiptHandle, currentTimeMs);\n                                 this.lastLockTimeMs.set(currentTimeMs);\n                                 return currentTimeMs;\n                             }\n@@ -135,6 +141,8 @@ public Long lock(long timeoutMs) {\n         public void unlock(long lockTimeMs) {\n             // if the lock is expired, we don't need to unlock it\n             if (System.currentTimeMillis() - lockTimeMs > ConfigurationManager.getProxyConfig().getLockTimeoutMsInHandleGroup() * 2) {\n+                log.warn(\"HandleData lock expired, unlock fail. MessageReceiptHandle={}, lockTime={}, now={}\",\n+                    messageReceiptHandle, lockTimeMs, System.currentTimeMillis());\n                 return;\n             }\n             this.semaphore.release();"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2437455577,
+      "created_at": "2024-11-15T00:40:39Z",
+      "user": "fuyou001",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2437947512,
+      "created_at": "2024-11-15T08:17:41Z",
+      "user": "lizhimins",
+      "state": "APPROVED",
+      "body": ""
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "repo": "apache/rocketmq",
+  "number": 6554,
+  "pr_number": 6554,
+  "title": "[#6535] Unify proxy loadingcache to caffeine LoadingCache",
+  "user": "redlsz",
+  "created_at": "2023-04-09T09:14:30Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "stale"
+  ],
+  "base_commit": "9574165fe38c51f789eebbba485291bee505ab2b",
+  "merge_commit_sha": "e5ff2dd06bf9e5b506c5c0e81c70cb48280f368a",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "closed"
+  ],
+  "url": "https://github.com/apache/rocketmq/pull/6554",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-04-09T09:09:58Z",
+      "sha": "96dbb431c178d5c95f609c50f9c4749938cf5642",
+      "message": "refactor(proxy): unify proxy loadingcache to caffeine",
+      "author": "redlsz",
+      "author_email": "szliu0927@gmail.com",
+      "author_raw_date": "2023-04-09T09:09:58Z",
+      "author_date": "2023-04-09T09:09:58Z",
+      "committer": "redlsz",
+      "committer_email": "szliu0927@gmail.com",
+      "raw_date": "2023-04-09T09:09:58Z",
+      "diff_text": "proxy/src/main/java/org/apache/rocketmq/proxy/common/AbstractCacheLoader.java\n@@ -16,31 +16,25 @@\n  */\n package org.apache.rocketmq.proxy.common;\n \n-import com.google.common.cache.CacheLoader;\n-import com.google.common.util.concurrent.ListenableFuture;\n-import com.google.common.util.concurrent.ListenableFutureTask;\n-import java.util.concurrent.ThreadPoolExecutor;\n+import com.github.benmanes.caffeine.cache.CacheLoader;\n+import java.util.concurrent.CompletableFuture;\n+import java.util.concurrent.Executor;\n import javax.annotation.Nonnull;\n \n-public abstract class AbstractCacheLoader<K, V> extends CacheLoader<K, V> {\n-    private final ThreadPoolExecutor cacheRefreshExecutor;\n+public abstract class AbstractCacheLoader<K, V> implements CacheLoader<K, V> {\n \n-    public AbstractCacheLoader(ThreadPoolExecutor cacheRefreshExecutor) {\n-        this.cacheRefreshExecutor = cacheRefreshExecutor;\n-    }\n-\n-    @Override\n-    public ListenableFuture<V> reload(@Nonnull K key, @Nonnull V oldValue) throws Exception {\n-        ListenableFutureTask<V> task = ListenableFutureTask.create(() -> {\n+    @Override @Nonnull\n+    public CompletableFuture<V> asyncReload(@Nonnull K key, @Nonnull V oldValue, @Nonnull Executor executor) {\n+        CompletableFuture<V> future = new CompletableFuture<>();\n+        executor.execute(() -> {\n             try {\n-                return getDirectly(key);\n+                future.complete(getDirectly(key));\n             } catch (Exception e) {\n                 onErr(key, e);\n-                return oldValue;\n+                future.complete(oldValue);\n             }\n         });\n-        cacheRefreshExecutor.execute(task);\n-        return task;\n+        return future;\n     }\n \n     @Override\nproxy/src/main/java/org/apache/rocketmq/proxy/service/metadata/ClusterMetadataService.java\n@@ -17,8 +17,8 @@\n \n package org.apache.rocketmq.proxy.service.metadata;\n \n-import com.google.common.cache.CacheBuilder;\n-import com.google.common.cache.LoadingCache;\n+import com.github.benmanes.caffeine.cache.Caffeine;\n+import com.github.benmanes.caffeine.cache.LoadingCache;\n import java.util.Optional;\n import java.util.concurrent.ThreadPoolExecutor;\n import java.util.concurrent.TimeUnit;\n@@ -66,13 +66,15 @@ public ClusterMetadataService(TopicRouteService topicRouteService, MQClientAPIFa\n             \"MetadataCacheRefresh\",\n             config.getMetadataThreadPoolQueueCapacity()\n         );\n-        this.topicConfigCache = CacheBuilder.newBuilder()\n+        this.topicConfigCache = Caffeine.newBuilder()\n             .maximumSize(config.getTopicConfigCacheMaxNum())\n             .refreshAfterWrite(config.getTopicConfigCacheExpiredInSeconds(), TimeUnit.SECONDS)\n+            .executor(this.cacheRefreshExecutor)\n             .build(new ClusterTopicConfigCacheLoader());\n-        this.subscriptionGroupConfigCache = CacheBuilder.newBuilder()\n+        this.subscriptionGroupConfigCache = Caffeine.newBuilder()\n             .maximumSize(config.getSubscriptionGroupConfigCacheMaxNum())\n             .refreshAfterWrite(config.getSubscriptionGroupConfigCacheExpiredInSeconds(), TimeUnit.SECONDS)\n+            .executor(this.cacheRefreshExecutor)\n             .build(new ClusterSubscriptionGroupConfigCacheLoader());\n \n         this.init();\n@@ -112,10 +114,6 @@ public SubscriptionGroupConfig getSubscriptionGroupConfig(String group) {\n \n     protected class ClusterSubscriptionGroupConfigCacheLoader extends AbstractCacheLoader<String, SubscriptionGroupConfig> {\n \n-        public ClusterSubscriptionGroupConfigCacheLoader() {\n-            super(cacheRefreshExecutor);\n-        }\n-\n         @Override\n         protected SubscriptionGroupConfig getDirectly(String consumerGroup) throws Exception {\n             ProxyConfig config = ConfigurationManager.getProxyConfig();\n@@ -136,10 +134,6 @@ protected void onErr(String consumerGroup, Exception e) {\n \n     protected class ClusterTopicConfigCacheLoader extends AbstractCacheLoader<String, TopicConfigAndQueueMapping> {\n \n-        public ClusterTopicConfigCacheLoader() {\n-            super(cacheRefreshExecutor);\n-        }\n-\n         @Override\n         protected TopicConfigAndQueueMapping getDirectly(String topic) throws Exception {\n             Optional<BrokerData> brokerDataOptional = findOneBroker(topic);\nproxy/src/main/java/org/apache/rocketmq/proxy/service/route/TopicRouteService.java\n@@ -139,10 +139,6 @@ protected static boolean isTopicRouteValid(TopicRouteData routeData) {\n \n     protected abstract class AbstractTopicRouteCacheLoader extends AbstractCacheLoader<String, MessageQueueView> {\n \n-        public AbstractTopicRouteCacheLoader() {\n-            super(cacheRefreshExecutor);\n-        }\n-\n         protected abstract TopicRouteData loadTopicRouteData(String topic) throws Exception;\n \n         @Override",
+      "diff": [
+        {
+          "file": "proxy/src/main/java/org/apache/rocketmq/proxy/common/AbstractCacheLoader.java",
+          "patch": "@@ -16,31 +16,25 @@\n  */\n package org.apache.rocketmq.proxy.common;\n \n-import com.google.common.cache.CacheLoader;\n-import com.google.common.util.concurrent.ListenableFuture;\n-import com.google.common.util.concurrent.ListenableFutureTask;\n-import java.util.concurrent.ThreadPoolExecutor;\n+import com.github.benmanes.caffeine.cache.CacheLoader;\n+import java.util.concurrent.CompletableFuture;\n+import java.util.concurrent.Executor;\n import javax.annotation.Nonnull;\n \n-public abstract class AbstractCacheLoader<K, V> extends CacheLoader<K, V> {\n-    private final ThreadPoolExecutor cacheRefreshExecutor;\n+public abstract class AbstractCacheLoader<K, V> implements CacheLoader<K, V> {\n \n-    public AbstractCacheLoader(ThreadPoolExecutor cacheRefreshExecutor) {\n-        this.cacheRefreshExecutor = cacheRefreshExecutor;\n-    }\n-\n-    @Override\n-    public ListenableFuture<V> reload(@Nonnull K key, @Nonnull V oldValue) throws Exception {\n-        ListenableFutureTask<V> task = ListenableFutureTask.create(() -> {\n+    @Override @Nonnull\n+    public CompletableFuture<V> asyncReload(@Nonnull K key, @Nonnull V oldValue, @Nonnull Executor executor) {\n+        CompletableFuture<V> future = new CompletableFuture<>();\n+        executor.execute(() -> {\n             try {\n-                return getDirectly(key);\n+                future.complete(getDirectly(key));\n             } catch (Exception e) {\n                 onErr(key, e);\n-                return oldValue;\n+                future.complete(oldValue);\n             }\n         });\n-        cacheRefreshExecutor.execute(task);\n-        return task;\n+        return future;\n     }\n \n     @Override"
+        },
+        {
+          "file": "proxy/src/main/java/org/apache/rocketmq/proxy/service/metadata/ClusterMetadataService.java",
+          "patch": "@@ -17,8 +17,8 @@\n \n package org.apache.rocketmq.proxy.service.metadata;\n \n-import com.google.common.cache.CacheBuilder;\n-import com.google.common.cache.LoadingCache;\n+import com.github.benmanes.caffeine.cache.Caffeine;\n+import com.github.benmanes.caffeine.cache.LoadingCache;\n import java.util.Optional;\n import java.util.concurrent.ThreadPoolExecutor;\n import java.util.concurrent.TimeUnit;\n@@ -66,13 +66,15 @@ public ClusterMetadataService(TopicRouteService topicRouteService, MQClientAPIFa\n             \"MetadataCacheRefresh\",\n             config.getMetadataThreadPoolQueueCapacity()\n         );\n-        this.topicConfigCache = CacheBuilder.newBuilder()\n+        this.topicConfigCache = Caffeine.newBuilder()\n             .maximumSize(config.getTopicConfigCacheMaxNum())\n             .refreshAfterWrite(config.getTopicConfigCacheExpiredInSeconds(), TimeUnit.SECONDS)\n+            .executor(this.cacheRefreshExecutor)\n             .build(new ClusterTopicConfigCacheLoader());\n-        this.subscriptionGroupConfigCache = CacheBuilder.newBuilder()\n+        this.subscriptionGroupConfigCache = Caffeine.newBuilder()\n             .maximumSize(config.getSubscriptionGroupConfigCacheMaxNum())\n             .refreshAfterWrite(config.getSubscriptionGroupConfigCacheExpiredInSeconds(), TimeUnit.SECONDS)\n+            .executor(this.cacheRefreshExecutor)\n             .build(new ClusterSubscriptionGroupConfigCacheLoader());\n \n         this.init();\n@@ -112,10 +114,6 @@ public SubscriptionGroupConfig getSubscriptionGroupConfig(String group) {\n \n     protected class ClusterSubscriptionGroupConfigCacheLoader extends AbstractCacheLoader<String, SubscriptionGroupConfig> {\n \n-        public ClusterSubscriptionGroupConfigCacheLoader() {\n-            super(cacheRefreshExecutor);\n-        }\n-\n         @Override\n         protected SubscriptionGroupConfig getDirectly(String consumerGroup) throws Exception {\n             ProxyConfig config = ConfigurationManager.getProxyConfig();\n@@ -136,10 +134,6 @@ protected void onErr(String consumerGroup, Exception e) {\n \n     protected class ClusterTopicConfigCacheLoader extends AbstractCacheLoader<String, TopicConfigAndQueueMapping> {\n \n-        public ClusterTopicConfigCacheLoader() {\n-            super(cacheRefreshExecutor);\n-        }\n-\n         @Override\n         protected TopicConfigAndQueueMapping getDirectly(String topic) throws Exception {\n             Optional<BrokerData> brokerDataOptional = findOneBroker(topic);"
+        },
+        {
+          "file": "proxy/src/main/java/org/apache/rocketmq/proxy/service/route/TopicRouteService.java",
+          "patch": "@@ -139,10 +139,6 @@ protected static boolean isTopicRouteValid(TopicRouteData routeData) {\n \n     protected abstract class AbstractTopicRouteCacheLoader extends AbstractCacheLoader<String, MessageQueueView> {\n \n-        public AbstractTopicRouteCacheLoader() {\n-            super(cacheRefreshExecutor);\n-        }\n-\n         protected abstract TopicRouteData loadTopicRouteData(String topic) throws Exception;\n \n         @Override"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-04-09T09:14:30Z",
+      "user": "redlsz",
+      "body": "**Make sure set the target branch to `develop`**\r\n\r\n## What is the purpose of the change\r\n\r\nfix #6535\r\n\r\n## Brief changelog\r\n\r\nUnify proxy loadingcache to caffeine\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 1501149472,
+      "created_at": "2023-04-09T15:03:13Z",
+      "user": "codecov-commenter",
+      "body": "## [Codecov](https://codecov.io/gh/apache/rocketmq/pull/6554?src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation) Report\n> Merging [#6554](https://codecov.io/gh/apache/rocketmq/pull/6554?src=pr&el=desc&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation) (96dbb43) into [develop](https://codecov.io/gh/apache/rocketmq/commit/9574165fe38c51f789eebbba485291bee505ab2b?el=desc&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation) (9574165) will **decrease** coverage by `0.07%`.\n> The diff coverage is `50.00%`.\n\n```diff\n@@              Coverage Diff              @@\n##             develop    #6554      +/-   ##\n=============================================\n- Coverage      43.16%   43.10%   -0.07%     \n+ Complexity      9014     8999      -15     \n=============================================\n  Files           1107     1107              \n  Lines          78255    78251       -4     \n  Branches       10201    10201              \n=============================================\n- Hits           33777    33728      -49     \n- Misses         40241    40302      +61     \n+ Partials        4237     4221      -16     \n```\n\n\n| [Impacted Files](https://codecov.io/gh/apache/rocketmq/pull/6554?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation) | Coverage Δ | |\n|---|---|---|\n| [...ocketmq/proxy/service/route/TopicRouteService.java](https://codecov.io/gh/apache/rocketmq/pull/6554?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation#diff-cHJveHkvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3Byb3h5L3NlcnZpY2Uvcm91dGUvVG9waWNSb3V0ZVNlcnZpY2UuamF2YQ==) | `57.40% <ø> (-1.53%)` | :arrow_down: |\n| [...che/rocketmq/proxy/common/AbstractCacheLoader.java](https://codecov.io/gh/apache/rocketmq/pull/6554?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation#diff-cHJveHkvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3Byb3h5L2NvbW1vbi9BYnN0cmFjdENhY2hlTG9hZGVyLmphdmE=) | `18.18% <16.66%> (-18.19%)` | :arrow_down: |\n| [...proxy/service/metadata/ClusterMetadataService.java](https://codecov.io/gh/apache/rocketmq/pull/6554?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation#diff-cHJveHkvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3Byb3h5L3NlcnZpY2UvbWV0YWRhdGEvQ2x1c3Rlck1ldGFkYXRhU2VydmljZS5qYXZh) | `77.41% <100.00%> (-0.71%)` | :arrow_down: |\n\n... and [41 files with indirect coverage changes](https://codecov.io/gh/apache/rocketmq/pull/6554/indirect-changes?src=pr&el=tree-more&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation)\n\n:mega: We’re building smart automated test selection to slash your CI/CD build times. [Learn more](https://about.codecov.io/iterative-testing/?utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=The+Apache+Software+Foundation)\n"
+    },
+    {
+      "type": "review",
+      "id": 1393306172,
+      "created_at": "2023-04-20T06:45:31Z",
+      "user": "drpmma",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1172148582,
+      "created_at": "2023-04-20T06:45:31Z",
+      "user": "drpmma",
+      "body": "Now that the cacheloader uses an async interface. Why not implement AsyncCacheLoader directly？\r\nAnd would it be better that `getDirectly` also returns a future to adapt to the potential async interface?",
+      "path": "proxy/src/main/java/org/apache/rocketmq/proxy/common/AbstractCacheLoader.java",
+      "diff_hunk": "@@ -16,31 +16,25 @@\n  */\n package org.apache.rocketmq.proxy.common;\n \n-import com.google.common.cache.CacheLoader;\n-import com.google.common.util.concurrent.ListenableFuture;\n-import com.google.common.util.concurrent.ListenableFutureTask;\n-import java.util.concurrent.ThreadPoolExecutor;\n+import com.github.benmanes.caffeine.cache.CacheLoader;\n+import java.util.concurrent.CompletableFuture;\n+import java.util.concurrent.Executor;\n import javax.annotation.Nonnull;\n \n-public abstract class AbstractCacheLoader<K, V> extends CacheLoader<K, V> {\n-    private final ThreadPoolExecutor cacheRefreshExecutor;\n+public abstract class AbstractCacheLoader<K, V> implements CacheLoader<K, V> {\n \n-    public AbstractCacheLoader(ThreadPoolExecutor cacheRefreshExecutor) {\n-        this.cacheRefreshExecutor = cacheRefreshExecutor;\n-    }\n-\n-    @Override\n-    public ListenableFuture<V> reload(@Nonnull K key, @Nonnull V oldValue) throws Exception {\n-        ListenableFutureTask<V> task = ListenableFutureTask.create(() -> {\n+    @Override @Nonnull\n+    public CompletableFuture<V> asyncReload(@Nonnull K key, @Nonnull V oldValue, @Nonnull Executor executor) {\n+        CompletableFuture<V> future = new CompletableFuture<>();\n+        executor.execute(() -> {\n             try {\n-                return getDirectly(key);\n+                future.complete(getDirectly(key));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 31,
+      "original_line": 31,
+      "side": "RIGHT",
+      "original_position": 30,
+      "position": 30,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 2067411375,
+      "created_at": "2024-04-20T00:07:43Z",
+      "user": "github-actions[bot]",
+      "body": "This PR is stale because it has been open for 365 days with no activity. It will be closed in 3 days if no further activity occurs. If you wish not to mark it as stale, please leave a comment in this PR."
+    },
+    {
+      "type": "comment",
+      "id": 2071152316,
+      "created_at": "2024-04-23T00:08:18Z",
+      "user": "github-actions[bot]",
+      "body": "This PR was closed because it has been inactive for 3 days since being marked as stale."
+    }
+  ]
+}

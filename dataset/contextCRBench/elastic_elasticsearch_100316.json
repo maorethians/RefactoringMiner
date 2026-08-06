@@ -1,0 +1,145 @@
+{
+    "pr_body": "After deleting a snapshot today we clean up all the now-dangling indices\r\nsequentially, which can be rather slow. With this commit we parallelize\r\nthe work across the whole `SNAPSHOT` pool on the master node.\r\n\r\nCloses #61513\r\n\r\nCo-authored-by: Piyush Daftary <pdaftary@amazon.com>",
+    "original_commit_id": "ff08e0208d5248418c1bf80eb259d95429c19bc1",
+    "merged": true,
+    "pr_number": 100316,
+    "pr_title": "Parallelize stale index deletion",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Hi @DaveCTurner, I've created a changelog YAML for you.",
+        "@elasticmachine please run elasticsearch-ci/part-1",
+        "I'm slightly concerned about the lack of backpressure in this area, we could in theory end up with an ever-increasing pile of delete work in the queue; previously that would eventually have blocked all the snapshot threads but with this change even that doesn't happen any more. I've raised this point for discussion with the team.",
+        "One possible solution would be to preserve today's behaviour of always blocking at least one `SNAPSHOT` thread for each cleanup operation, so that falling behind would still eventually end up with all the `SNAPSHOT` threads processing deletes, slowing down subsequent snapshots. Obviously we don't just want to pause that thread, but we could use it to eagerly steal work from the queue:\r\n\r\n```diff\r\ndiff --git a/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java b/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\r\nindex fa699a76fadd..f7f9ed22efe4 100644\r\n--- a/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\r\n+++ b/server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\r\n@@ -147,6 +147,7 @@ import java.util.concurrent.ConcurrentHashMap;\r\n import java.util.concurrent.Executor;\r\n import java.util.concurrent.LinkedBlockingQueue;\r\n import java.util.concurrent.TimeUnit;\r\n+import java.util.concurrent.atomic.AtomicBoolean;\r\n import java.util.concurrent.atomic.AtomicLong;\r\n import java.util.concurrent.atomic.AtomicReference;\r\n import java.util.function.Consumer;\r\n@@ -1194,6 +1195,28 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp\r\n                 }));\r\n             }\r\n         }\r\n+\r\n+        // dedicate a single SNAPSHOT thread for this work, so that if we fall too far behind with deletes then eventually we stop taking\r\n+        // snapshots too\r\n+        threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(new AbstractRunnable() {\r\n+            @Override\r\n+            protected void doRun() {\r\n+                final AtomicBoolean isDone = new AtomicBoolean(true);\r\n+                final Releasable ref = () -> isDone.set(true);\r\n+                ActionListener<Releasable> nextTask;\r\n+                while ((nextTask = staleBlobDeleteRunner.takeNextTask()) != null) {\r\n+                    isDone.set(false);\r\n+                    nextTask.onResponse(ref);\r\n+                    assert isDone.get();\r\n+                }\r\n+            }\r\n+\r\n+            @Override\r\n+            public void onFailure(Exception e) {\r\n+                logger.error(\"unexpected failure while processing deletes on dedicated snapshot thread\", e);\r\n+                assert false : e;\r\n+            }\r\n+        });\r\n     }\r\n\r\n     /**\r\n```",
+        "@elasticmachine please run elasticsearch-ci/part-2",
+        "Thanks both!"
+    ],
+    "commit_id": "3673d40f8cca5f5844f62579f7dcc4a9a9d91a31",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 163,
+            "start_side": null,
+            "start_line": null,
+            "line": 163,
+            "comment_lines": [
+                "[][163]"
+            ],
+            "review_comment": [
+                "Why not have an overload version of `runSyncTasksEagerly()` that just use the TaskRunner's own executor for the eager run as well?",
+                "Yes that could work too. I'm going to wait and see on that idea tho, I'd rather do one or the other, and the choice depends on whether we have other users that want to do something else or whether everyone just forks another task on `AbstractThrottledTaskRunner#executor`."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/common/util/concurrent/AbstractThrottledTaskRunner.java",
+            "id": 37775,
+            "created_at": "2023-10-09T10:33:57Z",
+            "original_position": 16,
+            "side": "RIGHT",
+            "position": 16,
+            "original_start_line": null
+        },
+        {
+            "original_line": 189,
+            "start_side": "RIGHT",
+            "start_line": 190,
+            "line": 191,
+            "comment_lines": [
+                "[][190]",
+                "[][191]"
+            ],
+            "review_comment": [
+                "For my learning:\r\n1. Why do we need assert the queue is empty here? We already asserted it has 0 size four lines above. I don't see how the queue size can increase after all tasks are enqueued?\r\n2. In the existing `assertNoRunningTasks`, why is it necessary to spawn a batch of `Runnable`s before verify `runningTasks` size is 0? We already verified that the `queue` is empty. It seems to me that just verify `runningTasks` is sufficient? Also running the extra `Runnable` does not guarantee that they actually excercise every thread in the pool. So not sure the purpose here.",
+                "Really we're just doing the same as the other tests here, verifying that the task runner is completely finished at the end of the test.\r\n\r\nIn `assertNoRunningTasks()` we need to wait for all the tasks spawned by the `AbstractThrottledTaskRunner` to completely finish before we can be sure the running task count is zero. That's because we call `runningTasks.decrementAndGet()` after completing each task, so when e.g. `executedCountDown` completes the count will not have reached zero yet. In order to make sure that the thread pool is completely free from all its current work, we enqueue N barrier tasks, which must therefore all be waiting on the barrier at the same time.\r\n\r\nPut differently, if you remove that and run the tests in a loop then you should see them fail occasionally.\r\n\r\nI'll add a comment.",
+                "Sorry for dragging on this point. But I think this threads flushing behaviour is not necessary for this test because the `releasable` is used in a try-with-resource block and should be released before `executedCountDown` finishes. This behaviour is needed for `testEnqueueSpawnsNewTasksUpToMax` because it [explicitly closes the releasable after the countDown](https://github.com/elastic/elasticsearch/blob/055df9a104a646cbb12db0b4d11ccaf6ecba6ffa/server/src/test/java/org/elasticsearch/common/util/concurrent/AbstractThrottledTaskRunnerTests.java#L118-L119). If I flip the order, it also runs successfully 10K times without the thread flushing logic.",
+                "Ah hm I see what you mean now. Yes I think you're right we could simplify this if we made sure to release all the task refs before allowing that test to proceed."
+            ],
+            "path": "server/src/test/java/org/elasticsearch/common/util/concurrent/AbstractThrottledTaskRunnerTests.java",
+            "id": 37774,
+            "created_at": "2023-10-05T12:11:01Z",
+            "original_position": 47,
+            "side": "RIGHT",
+            "position": 58,
+            "original_start_line": 188
+        },
+        {
+            "original_line": 301,
+            "start_side": null,
+            "start_line": null,
+            "line": 315,
+            "comment_lines": [
+                "[][315]"
+            ],
+            "review_comment": [
+                "This is a cool test and I learnt a few tips and tricks from it. But it does not test the new parallelization change. Do we care?",
+                "This test is largely from the original contributor, but I think it's a reasonable test to write. I've played around with a few ideas for testing the new threading more precisely but it seems pretty tricky, and kinda doesn't matter so much as long as we do actually do the work somehow. I think I had an idea for a test tho.",
+                "Ok my idea seems to work, see `testCleanupStaleBlobsConcurrency` added in b56455c12cc845958808978b6627d2778558037e (sorry for the force-push)"
+            ],
+            "path": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/RepositoriesIT.java",
+            "id": 37773,
+            "created_at": "2023-10-05T09:16:43Z",
+            "original_position": 18,
+            "side": "RIGHT",
+            "position": 44,
+            "original_start_line": null
+        },
+        {
+            "original_line": 1194,
+            "start_side": "RIGHT",
+            "start_line": 1188,
+            "line": 1206,
+            "comment_lines": [
+                "[][1188]",
+                "[][1189]",
+                "[][1190]",
+                "[][1191]",
+                "[][1192]",
+                "[][1193]",
+                "[][1194]",
+                "[][1195]",
+                "[][1196]",
+                "[][1197]",
+                "[][1198]",
+                "[][1199]",
+                "[][1200]",
+                "[][1201]",
+                "[][1202]",
+                "[][1203]",
+                "[][1204]",
+                "[][1205]",
+                "[][1206]"
+            ],
+            "review_comment": [
+                "Do we want to keep this and above in their own separate methods as how they are now? Fewer nesting levels could be helpful?",
+                "I inlined these because we ended up having to pass really quite a lot of parameters in, and it wasn't really even a coherent set of parameters so much as just \"the things needed to run this method\". It's still less than one screenful (on my screen anyway) and nicely exposes the execution pattern, so tbh I prefer it as it is now.",
+                "This is actually kind of a code smell throughout this class (and the snapshot codebase more generally). I have been working on a refactoring that should help simplify things in this area and will open a followup in the next few days."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java",
+            "id": 37771,
+            "created_at": "2023-10-05T08:50:08Z",
+            "original_position": 100,
+            "side": "RIGHT",
+            "position": 93,
+            "original_start_line": 1176
+        },
+        {
+            "original_line": 308,
+            "start_side": null,
+            "start_line": null,
+            "line": 322,
+            "comment_lines": [
+                "[][322]"
+            ],
+            "review_comment": [
+                "For my knowledge: I noticed this is the existing pattern in this file. But are these logging necessary? I seem to remember there were discussions about we should prefer for less logging in tests due to some CI infrastucture cost?",
+                "Yeah not really necessary IMO although it isn't really too bad here, this test triggers actions in ES that emit quite a lot of logs too."
+            ],
+            "path": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/RepositoriesIT.java",
+            "id": 37772,
+            "created_at": "2023-10-05T08:58:25Z",
+            "original_position": 25,
+            "side": "RIGHT",
+            "position": 51,
+            "original_start_line": null
+        }
+    ]
+}

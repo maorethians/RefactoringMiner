@@ -1,0 +1,419 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 92693,
+  "pr_number": 92693,
+  "title": "Delay master task failure notifications until commit",
+  "user": "DaveCTurner",
+  "created_at": "2023-01-04T21:02:14Z",
+  "merged_at": "2023-01-05T11:02:59Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Cluster Coordination",
+    "Team:Distributed",
+    "v8.7.0"
+  ],
+  "base_commit": "722410a5e50e0c30ab49a046895e3131ba2c2c3e",
+  "merge_commit_sha": "73863dda7be0a03d89150b1a66cb9407c7ab55d7",
+  "commits": 9,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/92693",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-01-04T20:58:47Z",
+      "sha": "0f458e93a366d5e052af81006281d0418430380d",
+      "message": "Delay master task failure notifications until commit\n\nToday when the master service processes a batch of tasks in which some\ntasks fail and others succeed, the failure notifications occur straight\naway. However, the tasks may have failed because earlier tasks in the\nbatch succeeded, and the effects of those successful tasks will not be\nvisible to clients straight away. This commit delays all notifications\nuntil the publication is complete.",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-04T20:30:52Z",
+      "author_date": "2023-01-04T20:30:52Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-04T20:58:47Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/service/MasterService.java\n@@ -277,12 +277,6 @@ private void runTasks(\n             previousClusterState,\n             executeTasks(previousClusterState, executionResults, executor, summary, threadPool.getThreadContext())\n         );\n-        // fail all tasks that have failed\n-        for (final var executionResult : executionResults) {\n-            if (executionResult.failure != null) {\n-                executionResult.updateTask.onFailure(executionResult.failure, executionResult::restoreResponseHeaders);\n-            }\n-        }\n         final TimeValue computationTime = getTimeSince(computationStartTime);\n         logExecutionTime(computationTime, \"compute cluster state update\", summary);\n \n@@ -950,7 +944,7 @@ void onBatchFailure(Exception failure) {\n \n         void onPublishSuccess(ClusterState newClusterState) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n-                assert failure != null;\n+                notifyFailure();\n                 return;\n             }\n             try (ThreadContext.StoredContext ignored = updateTask.threadContextSupplier.get()) {\n@@ -967,7 +961,7 @@ void onPublishSuccess(ClusterState newClusterState) {\n \n         void onClusterStateUnchanged(ClusterState clusterState) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n-                assert failure != null;\n+                notifyFailure();\n                 return;\n             }\n             try (ThreadContext.StoredContext ignored = updateTask.threadContextSupplier.get()) {\n@@ -984,7 +978,7 @@ void onClusterStateUnchanged(ClusterState clusterState) {\n \n         void onPublishFailure(FailedToCommitClusterStateException e) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n-                assert failure != null;\n+                notifyFailure();\n                 return;\n             }\n             try (ThreadContext.StoredContext ignored = updateTask.threadContextSupplier.get()) {\n@@ -996,9 +990,14 @@ void onPublishFailure(FailedToCommitClusterStateException e) {\n             }\n         }\n \n+        void notifyFailure() {\n+            assert failure != null;\n+            this.updateTask.onFailure(this.failure, this::restoreResponseHeaders);\n+        }\n+\n         ContextPreservingAckListener getContextPreservingAckListener() {\n             assert incomplete() == false;\n-            return updateTask.wrapInTaskContext(clusterStateAckListener, this::restoreResponseHeaders);\n+            return failure == null ? updateTask.wrapInTaskContext(clusterStateAckListener, this::restoreResponseHeaders) : null;\n         }\n \n         @Override\nserver/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java\n@@ -903,8 +903,10 @@ class Task implements ClusterStateTaskListener {\n \n             final ActionListener<ClusterState> publishListener;\n             final String responseHeaderValue;\n+            final boolean expectFailure;\n \n-            Task(String responseHeaderValue, ActionListener<ClusterState> publishListener) {\n+            Task(boolean expectFailure, String responseHeaderValue, ActionListener<ClusterState> publishListener) {\n+                this.expectFailure = expectFailure;\n                 this.responseHeaderValue = responseHeaderValue;\n                 this.publishListener = publishListener;\n             }\n@@ -920,6 +922,8 @@ public void onFailure(Exception e) {\n \n         final var testResponseHeaderName = \"test-response-header\";\n \n+        final String exceptionMessage = \"simulated\";\n+\n         final var executor = new ClusterStateTaskExecutor<Task>() {\n             @Override\n             @SuppressForbidden(reason = \"consuming published cluster state for legacy reasons\")\n@@ -928,7 +932,11 @@ public ClusterState execute(BatchExecutionContext<Task> batchExecutionContext) {\n                     try (var ignored = taskContext.captureResponseHeaders()) {\n                         threadPool.getThreadContext().addResponseHeader(testResponseHeaderName, taskContext.getTask().responseHeaderValue);\n                     }\n-                    taskContext.success(taskContext.getTask().publishListener::onResponse);\n+                    if (taskContext.getTask().expectFailure) {\n+                        taskContext.onFailure(new ElasticsearchException(exceptionMessage));\n+                    } else {\n+                        taskContext.success(taskContext.getTask().publishListener::onResponse);\n+                    }\n                 }\n                 return ClusterState.builder(batchExecutionContext.initialState()).build();\n             }\n@@ -971,9 +979,11 @@ public void onFailure(Exception e) {\n                     final var testContextHeaderValue = randomAlphaOfLength(10);\n                     final var testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n-                    final var task = new Task(testResponseHeaderValue, new ActionListener<>() {\n+                    final var expectFailure = randomBoolean();\n+                    final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n+                            assertFalse(expectFailure);\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertSame(publishedState.get(), clusterState);\n@@ -982,7 +992,12 @@ public void onResponse(ClusterState clusterState) {\n \n                         @Override\n                         public void onFailure(Exception e) {\n-                            throw new AssertionError(e);\n+                            assertTrue(expectFailure);\n+                            assertThat(e, instanceOf(ElasticsearchException.class));\n+                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n+                            assertNotNull(publishedState.get());\n+                            publishSuccessCountdown.countDown();\n                         }\n                     });\n \n@@ -999,7 +1014,6 @@ public void onFailure(Exception e) {\n             masterService.submitUnbatchedStateUpdateTask(\"block\", blockMasterTask);\n             executionBarrier.await(10, TimeUnit.SECONDS); // wait for the master service to be blocked\n \n-            final String exceptionMessage = \"simulated\";\n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n                 publishListener.onFailure(new FailedToCommitClusterStateException(exceptionMessage));\n@@ -1013,7 +1027,8 @@ public void onFailure(Exception e) {\n                     final String testContextHeaderValue = randomAlphaOfLength(10);\n                     final String testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n-                    final var task = new Task(testResponseHeaderValue, new ActionListener<>() {\n+                    final var expectFailure = randomBoolean();\n+                    final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n                             throw new AssertionError(\"should not succeed\");\n@@ -1023,7 +1038,11 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n-                            assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            if (expectFailure) {\n+                                assertThat(e, instanceOf(ElasticsearchException.class));\n+                            } else {\n+                                assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            }\n                             assertThat(e.getMessage(), equalTo(exceptionMessage));\n                             publishFailureCountdown.countDown();\n                         }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/service/MasterService.java",
+          "patch": "@@ -277,12 +277,6 @@ private void runTasks(\n             previousClusterState,\n             executeTasks(previousClusterState, executionResults, executor, summary, threadPool.getThreadContext())\n         );\n-        // fail all tasks that have failed\n-        for (final var executionResult : executionResults) {\n-            if (executionResult.failure != null) {\n-                executionResult.updateTask.onFailure(executionResult.failure, executionResult::restoreResponseHeaders);\n-            }\n-        }\n         final TimeValue computationTime = getTimeSince(computationStartTime);\n         logExecutionTime(computationTime, \"compute cluster state update\", summary);\n \n@@ -950,7 +944,7 @@ void onBatchFailure(Exception failure) {\n \n         void onPublishSuccess(ClusterState newClusterState) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n-                assert failure != null;\n+                notifyFailure();\n                 return;\n             }\n             try (ThreadContext.StoredContext ignored = updateTask.threadContextSupplier.get()) {\n@@ -967,7 +961,7 @@ void onPublishSuccess(ClusterState newClusterState) {\n \n         void onClusterStateUnchanged(ClusterState clusterState) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n-                assert failure != null;\n+                notifyFailure();\n                 return;\n             }\n             try (ThreadContext.StoredContext ignored = updateTask.threadContextSupplier.get()) {\n@@ -984,7 +978,7 @@ void onClusterStateUnchanged(ClusterState clusterState) {\n \n         void onPublishFailure(FailedToCommitClusterStateException e) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n-                assert failure != null;\n+                notifyFailure();\n                 return;\n             }\n             try (ThreadContext.StoredContext ignored = updateTask.threadContextSupplier.get()) {\n@@ -996,9 +990,14 @@ void onPublishFailure(FailedToCommitClusterStateException e) {\n             }\n         }\n \n+        void notifyFailure() {\n+            assert failure != null;\n+            this.updateTask.onFailure(this.failure, this::restoreResponseHeaders);\n+        }\n+\n         ContextPreservingAckListener getContextPreservingAckListener() {\n             assert incomplete() == false;\n-            return updateTask.wrapInTaskContext(clusterStateAckListener, this::restoreResponseHeaders);\n+            return failure == null ? updateTask.wrapInTaskContext(clusterStateAckListener, this::restoreResponseHeaders) : null;\n         }\n \n         @Override"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+          "patch": "@@ -903,8 +903,10 @@ class Task implements ClusterStateTaskListener {\n \n             final ActionListener<ClusterState> publishListener;\n             final String responseHeaderValue;\n+            final boolean expectFailure;\n \n-            Task(String responseHeaderValue, ActionListener<ClusterState> publishListener) {\n+            Task(boolean expectFailure, String responseHeaderValue, ActionListener<ClusterState> publishListener) {\n+                this.expectFailure = expectFailure;\n                 this.responseHeaderValue = responseHeaderValue;\n                 this.publishListener = publishListener;\n             }\n@@ -920,6 +922,8 @@ public void onFailure(Exception e) {\n \n         final var testResponseHeaderName = \"test-response-header\";\n \n+        final String exceptionMessage = \"simulated\";\n+\n         final var executor = new ClusterStateTaskExecutor<Task>() {\n             @Override\n             @SuppressForbidden(reason = \"consuming published cluster state for legacy reasons\")\n@@ -928,7 +932,11 @@ public ClusterState execute(BatchExecutionContext<Task> batchExecutionContext) {\n                     try (var ignored = taskContext.captureResponseHeaders()) {\n                         threadPool.getThreadContext().addResponseHeader(testResponseHeaderName, taskContext.getTask().responseHeaderValue);\n                     }\n-                    taskContext.success(taskContext.getTask().publishListener::onResponse);\n+                    if (taskContext.getTask().expectFailure) {\n+                        taskContext.onFailure(new ElasticsearchException(exceptionMessage));\n+                    } else {\n+                        taskContext.success(taskContext.getTask().publishListener::onResponse);\n+                    }\n                 }\n                 return ClusterState.builder(batchExecutionContext.initialState()).build();\n             }\n@@ -971,9 +979,11 @@ public void onFailure(Exception e) {\n                     final var testContextHeaderValue = randomAlphaOfLength(10);\n                     final var testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n-                    final var task = new Task(testResponseHeaderValue, new ActionListener<>() {\n+                    final var expectFailure = randomBoolean();\n+                    final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n+                            assertFalse(expectFailure);\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertSame(publishedState.get(), clusterState);\n@@ -982,7 +992,12 @@ public void onResponse(ClusterState clusterState) {\n \n                         @Override\n                         public void onFailure(Exception e) {\n-                            throw new AssertionError(e);\n+                            assertTrue(expectFailure);\n+                            assertThat(e, instanceOf(ElasticsearchException.class));\n+                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n+                            assertNotNull(publishedState.get());\n+                            publishSuccessCountdown.countDown();\n                         }\n                     });\n \n@@ -999,7 +1014,6 @@ public void onFailure(Exception e) {\n             masterService.submitUnbatchedStateUpdateTask(\"block\", blockMasterTask);\n             executionBarrier.await(10, TimeUnit.SECONDS); // wait for the master service to be blocked\n \n-            final String exceptionMessage = \"simulated\";\n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n                 publishListener.onFailure(new FailedToCommitClusterStateException(exceptionMessage));\n@@ -1013,7 +1027,8 @@ public void onFailure(Exception e) {\n                     final String testContextHeaderValue = randomAlphaOfLength(10);\n                     final String testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n-                    final var task = new Task(testResponseHeaderValue, new ActionListener<>() {\n+                    final var expectFailure = randomBoolean();\n+                    final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n                             throw new AssertionError(\"should not succeed\");\n@@ -1023,7 +1038,11 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n-                            assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            if (expectFailure) {\n+                                assertThat(e, instanceOf(ElasticsearchException.class));\n+                            } else {\n+                                assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            }\n                             assertThat(e.getMessage(), equalTo(exceptionMessage));\n                             publishFailureCountdown.countDown();\n                         }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-01-04T21:02:14Z",
+      "user": "DaveCTurner",
+      "body": "Today when the master service processes a batch of tasks in which some tasks fail and others succeed, the failure notifications occur straight away. However, the tasks may have failed because earlier tasks in the batch succeeded, and the effects of those successful tasks will not be visible to clients straight away. This commit delays all notifications until the publication is complete.\r\n\r\nCloses #92677"
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-04T21:02:37Z",
+      "sha": "1eed3a74415c40da15432f50dd772d497602e4b6",
+      "message": "Update docs/changelog/92693.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-04T21:02:37Z",
+      "author_date": "2023-01-04T21:02:37Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-04T21:02:37Z",
+      "diff_text": "docs/changelog/92693.yaml\n@@ -0,0 +1,5 @@\n+pr: 92693\n+summary: Delay master task failure notifications until commit\n+area: Cluster Coordination\n+type: bug\n+issues: []",
+      "diff": [
+        {
+          "file": "docs/changelog/92693.yaml",
+          "patch": "@@ -0,0 +1,5 @@\n+pr: 92693\n+summary: Delay master task failure notifications until commit\n+area: Cluster Coordination\n+type: bug\n+issues: []"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1371414754,
+      "created_at": "2023-01-04T21:02:37Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "comment",
+      "id": 1371414755,
+      "created_at": "2023-01-04T21:02:37Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review",
+      "id": 1236475415,
+      "created_at": "2023-01-04T21:03:17Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1061881127,
+      "created_at": "2023-01-04T21:03:17Z",
+      "user": "DaveCTurner",
+      "body": "This is debatable, but preserves today's behaviour. Maybe we should return a `FailedToCommitClusterStateException` if the commit failed?",
+      "path": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+      "diff_hunk": "@@ -1023,7 +1038,11 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n-                            assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            if (expectFailure) {\n+                                assertThat(e, instanceOf(ElasticsearchException.class));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 1042,
+      "side": "RIGHT",
+      "original_position": 85,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1061904365,
+          "user": "henningandersen",
+          "body": "Agreed, I think that is the right thing to do, since otherwise, a conflict could still be reported without the offender being committed. Also, I sort of think the failed to commit exception trumps the \"application\" exception here.",
+          "created_at": "2023-01-04T21:39:35Z"
+        },
+        {
+          "id": 1062233930,
+          "user": "DaveCTurner",
+          "body": "Ok, I adjusted this in 4fc44103ddb867100e7b4d05ef17186369c1c50a.",
+          "created_at": "2023-01-05T08:48:04Z"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-04T21:12:29Z",
+      "sha": "a068d048eb6d3c03abacc72baea5ffd3f7ab3c5c",
+      "message": "Update docs/changelog/92693.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-04T21:12:29Z",
+      "author_date": "2023-01-04T21:12:29Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-04T21:12:29Z",
+      "diff_text": "docs/changelog/92693.yaml\n@@ -2,4 +2,5 @@ pr: 92693\n summary: Delay master task failure notifications until commit\n area: Cluster Coordination\n type: bug\n-issues: []\n+issues:\n+ - 92677",
+      "diff": [
+        {
+          "file": "docs/changelog/92693.yaml",
+          "patch": "@@ -2,4 +2,5 @@ pr: 92693\n summary: Delay master task failure notifications until commit\n area: Cluster Coordination\n type: bug\n-issues: []\n+issues:\n+ - 92677"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1371424770,
+      "created_at": "2023-01-04T21:12:29Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've updated the changelog YAML for you."
+    },
+    {
+      "type": "review_comment",
+      "id": 1061909085,
+      "created_at": "2023-01-04T21:45:40Z",
+      "user": "henningandersen",
+      "body": "Can we assert that `publishSuccessCountdown.getCount() > 0`? Also in `onSuccess`.",
+      "path": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+      "diff_hunk": "@@ -982,7 +992,12 @@ public void onResponse(ClusterState clusterState) {\n \n                         @Override\n                         public void onFailure(Exception e) {\n-                            throw new AssertionError(e);\n+                            assertTrue(expectFailure);\n+                            assertThat(e, instanceOf(ElasticsearchException.class));\n+                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n+                            assertNotNull(publishedState.get());\n+                            publishSuccessCountdown.countDown();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1012,
+      "original_line": 1000,
+      "side": "RIGHT",
+      "original_position": 57,
+      "position": 96,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1062233772,
+          "user": "DaveCTurner",
+          "body": "I added some checks that tasks are not double-completed in 34e0605cafed1aea283744f2056e7f1af79c730a.",
+          "created_at": "2023-01-05T08:47:50Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1061915652,
+      "created_at": "2023-01-04T21:53:33Z",
+      "user": "henningandersen",
+      "body": "It is not entirely clear to me that this could not be the state returned from the `blockMasterTask`? Perhaps we can pollute the cluster state returned from the real executor with a piece of data to check the presence of?\r\n",
+      "path": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+      "diff_hunk": "@@ -982,7 +992,12 @@ public void onResponse(ClusterState clusterState) {\n \n                         @Override\n                         public void onFailure(Exception e) {\n-                            throw new AssertionError(e);\n+                            assertTrue(expectFailure);\n+                            assertThat(e, instanceOf(ElasticsearchException.class));\n+                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n+                            assertNotNull(publishedState.get());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1009,
+      "original_line": 999,
+      "side": "RIGHT",
+      "original_position": 56,
+      "position": 93,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1062233383,
+          "user": "DaveCTurner",
+          "body": "The `blockMasterTask` returns an unchanged state so it isn't published. I added some more machinery to verify this in 34e0605cafed1aea283744f2056e7f1af79c730a.",
+          "created_at": "2023-01-05T08:47:23Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1236512967,
+      "created_at": "2023-01-04T21:55:03Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": "This looks good. Left a few comments. I think I prefer this approach."
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-05T08:21:22Z",
+      "sha": "1ebbeaee290c8be87de22310f99bc0d410e81e49",
+      "message": "Merge branch 'main' into 2023-01-04-master-service-failure-notification-on-commit",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-05T08:21:22Z",
+      "author_date": "2023-01-05T08:21:22Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-05T08:21:22Z",
+      "diff_text": "docs/changelog/92640.yaml\n@@ -0,0 +1,5 @@\n+pr: 92640\n+summary: Added new field `rollout_duration_seconds` to fleet-actions\n+area: Infra/Core\n+type: enhancement\n+issues: []\ndocs/changelog/92687.yaml\n@@ -0,0 +1,5 @@\n+pr: 92687\n+summary: 'Fix `_bulk` api `dynamic_templates` and explicit `op_type`'\n+area: Mapping\n+type: bug\n+issues: []\nrest-api-spec/src/yamlRestTest/resources/rest-api-spec/test/bulk/11_dynamic_templates.yml\n@@ -24,20 +24,20 @@\n       bulk:\n         refresh: true\n         body:\n-          - index:\n+          - create:\n               _index: test_index\n               _id: id_1\n               dynamic_templates:\n                 location: location\n-          - { \"location\": [ -71.34, 41.12 ]}\n+          - { \"location\": \"41.12,-71.34\"}\n           - index:\n               _index: test_index\n               _id: id_2\n               dynamic_templates:\n                 location: location\n-          - { \"location\": \"41.12,-71.34\"}\n+          - { \"location\": [ -71.34, 41.12 ]}\n   - match: { errors: false }\n-  - match: { items.0.index.result: created }\n+  - match: { items.0.create.result: created }\n   - match: { items.1.index.result: created }\n \n   - do:\n@@ -65,7 +65,7 @@\n               _index: test_index\n               _id: id_3\n           - { \"my_location\": \"41.12,-71.34\" } # matches the field name defined in the `my_location` template\n-          - index:\n+          - create:\n               _index: test_index\n               _id: id_4\n               dynamic_templates:\n@@ -169,3 +169,64 @@\n   - match: { items.0.index.error.reason: \"failed to parse field [foo] of type [keyword] in document with id 'id_11'. Preview of field's value: '{bar=hello world}'\"}\n   - match: { items.1.index.status: 201 }\n   - match: { items.1.index.result: created }\n+\n+---\n+\"Dynamic templates with op_type\":\n+  - skip:\n+      version: \" - 8.6.99\"\n+      reason: \"bug fixed in 8.7.0\"\n+\n+  - do:\n+      indices.create:\n+        index: test_index\n+        body:\n+          mappings:\n+            dynamic_templates:\n+              - location:\n+                  mapping:\n+                    type: geo_point\n+              - my_location:\n+                  match: my*\n+                  mapping:\n+                    type: geo_point\n+              - string:\n+                  mapping:\n+                    type: keyword\n+  - do:\n+      bulk:\n+        refresh: true\n+        body:\n+          - index:\n+              _index: test_index\n+              _id: id_1\n+              op_type: create\n+              dynamic_templates:\n+                location: location\n+          - { \"location\": \"41.12,-71.34\"}\n+          - index:\n+              _index: test_index\n+              _id: id_2\n+              op_type: index\n+              dynamic_templates:\n+                location: location\n+          - { \"location\": [ -71.34, 41.12 ]}\n+  - match: { errors: false }\n+  - match: { items.0.create.result: created }\n+  - match: { items.1.index.result: created }\n+\n+  - do:\n+      search:\n+        index: test_index\n+        body:\n+          query:\n+            geo_bounding_box:\n+              location:\n+                top_left:\n+                  lat: 42\n+                  lon: -72\n+                bottom_right:\n+                  lat: 40\n+                  lon: -74\n+  - match: { hits.total.value: 2 }\n+  - match: { hits.hits.0._id: id_1 }\n+  - match: { hits.hits.1._id: id_2 }\nserver/src/main/java/org/elasticsearch/action/bulk/BulkRequestParser.java\n@@ -357,6 +357,7 @@ public void parse(\n                                     .setIfSeqNo(ifSeqNo)\n                                     .setIfPrimaryTerm(ifPrimaryTerm)\n                                     .source(sliceTrimmingCarriageReturn(data, from, nextMarker, xContentType), xContentType)\n+                                    .setDynamicTemplates(dynamicTemplates)\n                                     .setRequireAlias(requireAlias),\n                                 type\n                             );\nserver/src/main/java/org/elasticsearch/ingest/IngestCtxMap.java\n@@ -22,7 +22,7 @@\n  * _index, _id and _routing must be a String or null\n  * _version_type must be a lower case VersionType or null\n  * _version must be representable as a long without loss of precision or null\n- * _dyanmic_templates must be a map\n+ * _dynamic_templates must be a map\n  * _if_seq_no must be a long or null\n  * _if_primary_term must be a long or null\n  *\nx-pack/plugin/core/src/main/resources/fleet-actions.json\n@@ -28,6 +28,9 @@\n         \"minimum_execution_duration\": {\n           \"type\": \"integer\"\n         },\n+        \"rollout_duration_seconds\": {\n+          \"type\": \"integer\"\n+        },\n         \"input_type\": {\n           \"type\": \"keyword\"\n         },",
+      "diff": [
+        {
+          "file": "docs/changelog/92640.yaml",
+          "patch": "@@ -0,0 +1,5 @@\n+pr: 92640\n+summary: Added new field `rollout_duration_seconds` to fleet-actions\n+area: Infra/Core\n+type: enhancement\n+issues: []"
+        },
+        {
+          "file": "docs/changelog/92687.yaml",
+          "patch": "@@ -0,0 +1,5 @@\n+pr: 92687\n+summary: 'Fix `_bulk` api `dynamic_templates` and explicit `op_type`'\n+area: Mapping\n+type: bug\n+issues: []"
+        },
+        {
+          "file": "rest-api-spec/src/yamlRestTest/resources/rest-api-spec/test/bulk/11_dynamic_templates.yml",
+          "patch": "@@ -24,20 +24,20 @@\n       bulk:\n         refresh: true\n         body:\n-          - index:\n+          - create:\n               _index: test_index\n               _id: id_1\n               dynamic_templates:\n                 location: location\n-          - { \"location\": [ -71.34, 41.12 ]}\n+          - { \"location\": \"41.12,-71.34\"}\n           - index:\n               _index: test_index\n               _id: id_2\n               dynamic_templates:\n                 location: location\n-          - { \"location\": \"41.12,-71.34\"}\n+          - { \"location\": [ -71.34, 41.12 ]}\n   - match: { errors: false }\n-  - match: { items.0.index.result: created }\n+  - match: { items.0.create.result: created }\n   - match: { items.1.index.result: created }\n \n   - do:\n@@ -65,7 +65,7 @@\n               _index: test_index\n               _id: id_3\n           - { \"my_location\": \"41.12,-71.34\" } # matches the field name defined in the `my_location` template\n-          - index:\n+          - create:\n               _index: test_index\n               _id: id_4\n               dynamic_templates:\n@@ -169,3 +169,64 @@\n   - match: { items.0.index.error.reason: \"failed to parse field [foo] of type [keyword] in document with id 'id_11'. Preview of field's value: '{bar=hello world}'\"}\n   - match: { items.1.index.status: 201 }\n   - match: { items.1.index.result: created }\n+\n+---\n+\"Dynamic templates with op_type\":\n+  - skip:\n+      version: \" - 8.6.99\"\n+      reason: \"bug fixed in 8.7.0\"\n+\n+  - do:\n+      indices.create:\n+        index: test_index\n+        body:\n+          mappings:\n+            dynamic_templates:\n+              - location:\n+                  mapping:\n+                    type: geo_point\n+              - my_location:\n+                  match: my*\n+                  mapping:\n+                    type: geo_point\n+              - string:\n+                  mapping:\n+                    type: keyword\n+  - do:\n+      bulk:\n+        refresh: true\n+        body:\n+          - index:\n+              _index: test_index\n+              _id: id_1\n+              op_type: create\n+              dynamic_templates:\n+                location: location\n+          - { \"location\": \"41.12,-71.34\"}\n+          - index:\n+              _index: test_index\n+              _id: id_2\n+              op_type: index\n+              dynamic_templates:\n+                location: location\n+          - { \"location\": [ -71.34, 41.12 ]}\n+  - match: { errors: false }\n+  - match: { items.0.create.result: created }\n+  - match: { items.1.index.result: created }\n+\n+  - do:\n+      search:\n+        index: test_index\n+        body:\n+          query:\n+            geo_bounding_box:\n+              location:\n+                top_left:\n+                  lat: 42\n+                  lon: -72\n+                bottom_right:\n+                  lat: 40\n+                  lon: -74\n+  - match: { hits.total.value: 2 }\n+  - match: { hits.hits.0._id: id_1 }\n+  - match: { hits.hits.1._id: id_2 }"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/action/bulk/BulkRequestParser.java",
+          "patch": "@@ -357,6 +357,7 @@ public void parse(\n                                     .setIfSeqNo(ifSeqNo)\n                                     .setIfPrimaryTerm(ifPrimaryTerm)\n                                     .source(sliceTrimmingCarriageReturn(data, from, nextMarker, xContentType), xContentType)\n+                                    .setDynamicTemplates(dynamicTemplates)\n                                     .setRequireAlias(requireAlias),\n                                 type\n                             );"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/ingest/IngestCtxMap.java",
+          "patch": "@@ -22,7 +22,7 @@\n  * _index, _id and _routing must be a String or null\n  * _version_type must be a lower case VersionType or null\n  * _version must be representable as a long without loss of precision or null\n- * _dyanmic_templates must be a map\n+ * _dynamic_templates must be a map\n  * _if_seq_no must be a long or null\n  * _if_primary_term must be a long or null\n  *"
+        },
+        {
+          "file": "x-pack/plugin/core/src/main/resources/fleet-actions.json",
+          "patch": "@@ -28,6 +28,9 @@\n         \"minimum_execution_duration\": {\n           \"type\": \"integer\"\n         },\n+        \"rollout_duration_seconds\": {\n+          \"type\": \"integer\"\n+        },\n         \"input_type\": {\n           \"type\": \"keyword\"\n         },"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-05T08:38:57Z",
+      "sha": "34e0605cafed1aea283744f2056e7f1af79c730a",
+      "message": "Stricter checks on state identity",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-05T08:38:57Z",
+      "author_date": "2023-01-05T08:38:57Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-05T08:38:57Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java\n@@ -942,10 +942,12 @@ public ClusterState execute(BatchExecutionContext<Task> batchExecutionContext) {\n             }\n         };\n \n+        final var blockedState = new AtomicReference<ClusterState>();\n         final var executionBarrier = new CyclicBarrier(2);\n         final ClusterStateUpdateTask blockMasterTask = new ClusterStateUpdateTask() {\n             @Override\n             public ClusterState execute(ClusterState currentState) throws Exception {\n+                assertTrue(blockedState.compareAndSet(null, currentState));\n                 executionBarrier.await(10, TimeUnit.SECONDS); // notify test thread that the master service is blocked\n                 executionBarrier.await(10, TimeUnit.SECONDS); // wait for test thread to release us\n                 return currentState;\n@@ -963,9 +965,13 @@ public void onFailure(Exception e) {\n \n             masterService.submitUnbatchedStateUpdateTask(\"block\", blockMasterTask);\n             executionBarrier.await(10, TimeUnit.SECONDS); // wait for the master service to be blocked\n+            final var stateBeforeSuccess = blockedState.get();\n+            assertNotNull(stateBeforeSuccess);\n \n             final AtomicReference<ClusterState> publishedState = new AtomicReference<>();\n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n+                assertSame(stateBeforeSuccess, clusterStatePublicationEvent.getOldState());\n+                assertNotSame(stateBeforeSuccess, clusterStatePublicationEvent.getNewState());\n                 assertTrue(publishedState.compareAndSet(null, clusterStatePublicationEvent.getNewState()));\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n                 publishListener.onResponse(null);\n@@ -980,13 +986,16 @@ public void onFailure(Exception e) {\n                     final var testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n                     final var expectFailure = randomBoolean();\n+                    final var taskComplete = new AtomicBoolean();\n                     final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n                             assertFalse(expectFailure);\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertSame(publishedState.get(), clusterState);\n+                            assertNotSame(stateBeforeSuccess, publishedState.get());\n+                            assertTrue(taskComplete.compareAndSet(false, true));\n                             publishSuccessCountdown.countDown();\n                         }\n \n@@ -997,6 +1006,8 @@ public void onFailure(Exception e) {\n                             assertThat(e.getMessage(), equalTo(exceptionMessage));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertNotNull(publishedState.get());\n+                            assertNotSame(stateBeforeSuccess, publishedState.get());\n+                            assertTrue(taskComplete.compareAndSet(false, true));\n                             publishSuccessCountdown.countDown();\n                         }\n                     });\n@@ -1011,10 +1022,17 @@ public void onFailure(Exception e) {\n \n             // failure case: submit some tasks, possibly in different contexts, and verify that the expected listener is completed\n \n+            assertNotNull(blockedState.getAndSet(null));\n+            assertNotNull(publishedState.getAndSet(null));\n             masterService.submitUnbatchedStateUpdateTask(\"block\", blockMasterTask);\n             executionBarrier.await(10, TimeUnit.SECONDS); // wait for the master service to be blocked\n+            final var stateBeforeFailure = blockedState.get();\n+            assertNotNull(stateBeforeFailure);\n \n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n+                assertSame(stateBeforeFailure, clusterStatePublicationEvent.getOldState());\n+                assertNotSame(stateBeforeFailure, clusterStatePublicationEvent.getNewState());\n+                assertTrue(publishedState.compareAndSet(null, clusterStatePublicationEvent.getNewState()));\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n                 publishListener.onFailure(new FailedToCommitClusterStateException(exceptionMessage));\n             });\n@@ -1028,6 +1046,7 @@ public void onFailure(Exception e) {\n                     final String testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n                     final var expectFailure = randomBoolean();\n+                    final var taskComplete = new AtomicBoolean();\n                     final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n@@ -1044,6 +1063,9 @@ public void onFailure(Exception e) {\n                                 assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n                             }\n                             assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertNotNull(publishedState.get());\n+                            assertNotSame(stateBeforeFailure, publishedState.get());\n+                            assertTrue(taskComplete.compareAndSet(false, true));\n                             publishFailureCountdown.countDown();\n                         }\n                     });",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+          "patch": "@@ -942,10 +942,12 @@ public ClusterState execute(BatchExecutionContext<Task> batchExecutionContext) {\n             }\n         };\n \n+        final var blockedState = new AtomicReference<ClusterState>();\n         final var executionBarrier = new CyclicBarrier(2);\n         final ClusterStateUpdateTask blockMasterTask = new ClusterStateUpdateTask() {\n             @Override\n             public ClusterState execute(ClusterState currentState) throws Exception {\n+                assertTrue(blockedState.compareAndSet(null, currentState));\n                 executionBarrier.await(10, TimeUnit.SECONDS); // notify test thread that the master service is blocked\n                 executionBarrier.await(10, TimeUnit.SECONDS); // wait for test thread to release us\n                 return currentState;\n@@ -963,9 +965,13 @@ public void onFailure(Exception e) {\n \n             masterService.submitUnbatchedStateUpdateTask(\"block\", blockMasterTask);\n             executionBarrier.await(10, TimeUnit.SECONDS); // wait for the master service to be blocked\n+            final var stateBeforeSuccess = blockedState.get();\n+            assertNotNull(stateBeforeSuccess);\n \n             final AtomicReference<ClusterState> publishedState = new AtomicReference<>();\n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n+                assertSame(stateBeforeSuccess, clusterStatePublicationEvent.getOldState());\n+                assertNotSame(stateBeforeSuccess, clusterStatePublicationEvent.getNewState());\n                 assertTrue(publishedState.compareAndSet(null, clusterStatePublicationEvent.getNewState()));\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n                 publishListener.onResponse(null);\n@@ -980,13 +986,16 @@ public void onFailure(Exception e) {\n                     final var testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n                     final var expectFailure = randomBoolean();\n+                    final var taskComplete = new AtomicBoolean();\n                     final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n                             assertFalse(expectFailure);\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertSame(publishedState.get(), clusterState);\n+                            assertNotSame(stateBeforeSuccess, publishedState.get());\n+                            assertTrue(taskComplete.compareAndSet(false, true));\n                             publishSuccessCountdown.countDown();\n                         }\n \n@@ -997,6 +1006,8 @@ public void onFailure(Exception e) {\n                             assertThat(e.getMessage(), equalTo(exceptionMessage));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertNotNull(publishedState.get());\n+                            assertNotSame(stateBeforeSuccess, publishedState.get());\n+                            assertTrue(taskComplete.compareAndSet(false, true));\n                             publishSuccessCountdown.countDown();\n                         }\n                     });\n@@ -1011,10 +1022,17 @@ public void onFailure(Exception e) {\n \n             // failure case: submit some tasks, possibly in different contexts, and verify that the expected listener is completed\n \n+            assertNotNull(blockedState.getAndSet(null));\n+            assertNotNull(publishedState.getAndSet(null));\n             masterService.submitUnbatchedStateUpdateTask(\"block\", blockMasterTask);\n             executionBarrier.await(10, TimeUnit.SECONDS); // wait for the master service to be blocked\n+            final var stateBeforeFailure = blockedState.get();\n+            assertNotNull(stateBeforeFailure);\n \n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n+                assertSame(stateBeforeFailure, clusterStatePublicationEvent.getOldState());\n+                assertNotSame(stateBeforeFailure, clusterStatePublicationEvent.getNewState());\n+                assertTrue(publishedState.compareAndSet(null, clusterStatePublicationEvent.getNewState()));\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n                 publishListener.onFailure(new FailedToCommitClusterStateException(exceptionMessage));\n             });\n@@ -1028,6 +1046,7 @@ public void onFailure(Exception e) {\n                     final String testResponseHeaderValue = randomAlphaOfLength(10);\n                     threadContext.putHeader(testContextHeaderName, testContextHeaderValue);\n                     final var expectFailure = randomBoolean();\n+                    final var taskComplete = new AtomicBoolean();\n                     final var task = new Task(expectFailure, testResponseHeaderValue, new ActionListener<>() {\n                         @Override\n                         public void onResponse(ClusterState clusterState) {\n@@ -1044,6 +1063,9 @@ public void onFailure(Exception e) {\n                                 assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n                             }\n                             assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertNotNull(publishedState.get());\n+                            assertNotSame(stateBeforeFailure, publishedState.get());\n+                            assertTrue(taskComplete.compareAndSet(false, true));\n                             publishFailureCountdown.countDown();\n                         }\n                     });"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-05T08:46:01Z",
+      "sha": "4fc44103ddb867100e7b4d05ef17186369c1c50a",
+      "message": "Failing to publish a failed task is a FailedToCommitClusterStateException first",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-05T08:46:01Z",
+      "author_date": "2023-01-05T08:46:01Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-05T08:46:01Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/service/MasterService.java\n@@ -978,6 +978,10 @@ void onClusterStateUnchanged(ClusterState clusterState) {\n \n         void onPublishFailure(FailedToCommitClusterStateException e) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n+                assert failure != null;\n+                var taskFailure = failure;\n+                failure = new FailedToCommitClusterStateException(e.getMessage(), e);\n+                failure.addSuppressed(taskFailure);\n                 notifyFailure();\n                 return;\n             }\nserver/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java\n@@ -77,6 +77,7 @@\n import static org.hamcrest.Matchers.contains;\n import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.equalTo;\n+import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.hasItem;\n import static org.hamcrest.Matchers.hasSize;\n import static org.hamcrest.Matchers.instanceOf;\n@@ -922,7 +923,7 @@ public void onFailure(Exception e) {\n \n         final var testResponseHeaderName = \"test-response-header\";\n \n-        final String exceptionMessage = \"simulated\";\n+        final var taskFailedExceptionMessage = \"simulated task failure\";\n \n         final var executor = new ClusterStateTaskExecutor<Task>() {\n             @Override\n@@ -933,7 +934,7 @@ public ClusterState execute(BatchExecutionContext<Task> batchExecutionContext) {\n                         threadPool.getThreadContext().addResponseHeader(testResponseHeaderName, taskContext.getTask().responseHeaderValue);\n                     }\n                     if (taskContext.getTask().expectFailure) {\n-                        taskContext.onFailure(new ElasticsearchException(exceptionMessage));\n+                        taskContext.onFailure(new ElasticsearchException(taskFailedExceptionMessage));\n                     } else {\n                         taskContext.success(taskContext.getTask().publishListener::onResponse);\n                     }\n@@ -1003,7 +1004,7 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertTrue(expectFailure);\n                             assertThat(e, instanceOf(ElasticsearchException.class));\n-                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertThat(e.getMessage(), equalTo(taskFailedExceptionMessage));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertNotNull(publishedState.get());\n                             assertNotSame(stateBeforeSuccess, publishedState.get());\n@@ -1029,12 +1030,14 @@ public void onFailure(Exception e) {\n             final var stateBeforeFailure = blockedState.get();\n             assertNotNull(stateBeforeFailure);\n \n+            final var publicationFailedExceptionMessage = \"simulated publication failure\";\n+\n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n                 assertSame(stateBeforeFailure, clusterStatePublicationEvent.getOldState());\n                 assertNotSame(stateBeforeFailure, clusterStatePublicationEvent.getNewState());\n                 assertTrue(publishedState.compareAndSet(null, clusterStatePublicationEvent.getNewState()));\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n-                publishListener.onFailure(new FailedToCommitClusterStateException(exceptionMessage));\n+                publishListener.onFailure(new FailedToCommitClusterStateException(publicationFailedExceptionMessage));\n             });\n \n             toSubmit = between(1, 10);\n@@ -1057,12 +1060,14 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n+                            assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            assertThat(e.getMessage(), equalTo(publicationFailedExceptionMessage));\n                             if (expectFailure) {\n-                                assertThat(e, instanceOf(ElasticsearchException.class));\n-                            } else {\n-                                assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                                assertThat(e.getSuppressed().length, greaterThan(0));\n+                                var suppressed = e.getSuppressed()[0];\n+                                assertThat(suppressed, instanceOf(ElasticsearchException.class));\n+                                assertThat(suppressed.getMessage(), equalTo(taskFailedExceptionMessage));\n                             }\n-                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n                             assertNotNull(publishedState.get());\n                             assertNotSame(stateBeforeFailure, publishedState.get());\n                             assertTrue(taskComplete.compareAndSet(false, true));",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/service/MasterService.java",
+          "patch": "@@ -978,6 +978,10 @@ void onClusterStateUnchanged(ClusterState clusterState) {\n \n         void onPublishFailure(FailedToCommitClusterStateException e) {\n             if (publishedStateConsumer == null && onPublicationSuccess == null) {\n+                assert failure != null;\n+                var taskFailure = failure;\n+                failure = new FailedToCommitClusterStateException(e.getMessage(), e);\n+                failure.addSuppressed(taskFailure);\n                 notifyFailure();\n                 return;\n             }"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/service/MasterServiceTests.java",
+          "patch": "@@ -77,6 +77,7 @@\n import static org.hamcrest.Matchers.contains;\n import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.equalTo;\n+import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.hasItem;\n import static org.hamcrest.Matchers.hasSize;\n import static org.hamcrest.Matchers.instanceOf;\n@@ -922,7 +923,7 @@ public void onFailure(Exception e) {\n \n         final var testResponseHeaderName = \"test-response-header\";\n \n-        final String exceptionMessage = \"simulated\";\n+        final var taskFailedExceptionMessage = \"simulated task failure\";\n \n         final var executor = new ClusterStateTaskExecutor<Task>() {\n             @Override\n@@ -933,7 +934,7 @@ public ClusterState execute(BatchExecutionContext<Task> batchExecutionContext) {\n                         threadPool.getThreadContext().addResponseHeader(testResponseHeaderName, taskContext.getTask().responseHeaderValue);\n                     }\n                     if (taskContext.getTask().expectFailure) {\n-                        taskContext.onFailure(new ElasticsearchException(exceptionMessage));\n+                        taskContext.onFailure(new ElasticsearchException(taskFailedExceptionMessage));\n                     } else {\n                         taskContext.success(taskContext.getTask().publishListener::onResponse);\n                     }\n@@ -1003,7 +1004,7 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertTrue(expectFailure);\n                             assertThat(e, instanceOf(ElasticsearchException.class));\n-                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n+                            assertThat(e.getMessage(), equalTo(taskFailedExceptionMessage));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n                             assertNotNull(publishedState.get());\n                             assertNotSame(stateBeforeSuccess, publishedState.get());\n@@ -1029,12 +1030,14 @@ public void onFailure(Exception e) {\n             final var stateBeforeFailure = blockedState.get();\n             assertNotNull(stateBeforeFailure);\n \n+            final var publicationFailedExceptionMessage = \"simulated publication failure\";\n+\n             masterService.setClusterStatePublisher((clusterStatePublicationEvent, publishListener, ackListener) -> {\n                 assertSame(stateBeforeFailure, clusterStatePublicationEvent.getOldState());\n                 assertNotSame(stateBeforeFailure, clusterStatePublicationEvent.getNewState());\n                 assertTrue(publishedState.compareAndSet(null, clusterStatePublicationEvent.getNewState()));\n                 ClusterServiceUtils.setAllElapsedMillis(clusterStatePublicationEvent);\n-                publishListener.onFailure(new FailedToCommitClusterStateException(exceptionMessage));\n+                publishListener.onFailure(new FailedToCommitClusterStateException(publicationFailedExceptionMessage));\n             });\n \n             toSubmit = between(1, 10);\n@@ -1057,12 +1060,14 @@ public void onResponse(ClusterState clusterState) {\n                         public void onFailure(Exception e) {\n                             assertEquals(testContextHeaderValue, threadContext.getHeader(testContextHeaderName));\n                             assertEquals(List.of(testResponseHeaderValue), threadContext.getResponseHeaders().get(testResponseHeaderName));\n+                            assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                            assertThat(e.getMessage(), equalTo(publicationFailedExceptionMessage));\n                             if (expectFailure) {\n-                                assertThat(e, instanceOf(ElasticsearchException.class));\n-                            } else {\n-                                assertThat(e, instanceOf(FailedToCommitClusterStateException.class));\n+                                assertThat(e.getSuppressed().length, greaterThan(0));\n+                                var suppressed = e.getSuppressed()[0];\n+                                assertThat(suppressed, instanceOf(ElasticsearchException.class));\n+                                assertThat(suppressed.getMessage(), equalTo(taskFailedExceptionMessage));\n                             }\n-                            assertThat(e.getMessage(), equalTo(exceptionMessage));\n                             assertNotNull(publishedState.get());\n                             assertNotSame(stateBeforeFailure, publishedState.get());\n                             assertTrue(taskComplete.compareAndSet(false, true));"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1237023499,
+      "created_at": "2023-01-05T08:47:23Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1237024043,
+      "created_at": "2023-01-05T08:47:51Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1237024311,
+      "created_at": "2023-01-05T08:48:04Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-05T09:58:51Z",
+      "sha": "d93ffd94a24dc2c4f52a5cb5d36a0d7f1f687104",
+      "message": "Add note about dirty reads to CSTEx docs",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-05T09:58:51Z",
+      "author_date": "2023-01-05T09:58:51Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-05T09:58:51Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/ClusterStateTaskExecutor.java\n@@ -21,7 +21,8 @@\n  */\n public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n     /**\n-     * Update the cluster state based on the current state and the given tasks. Return the *same instance* if no update should be published.\n+     * Update the cluster state based on the current state and the given tasks. Return {@code batchExecutionContext.initialState()} to avoid\n+     * publishing any update.\n      * <p>\n      * If this method throws an exception then the cluster state is unchanged and every task's {@link ClusterStateTaskListener#onFailure}\n      * method is called.\n@@ -30,6 +31,12 @@ public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n      * This works ok but beware that constructing a whole new {@link ClusterState} can be somewhat expensive, and there may sometimes be\n      * surprisingly many tasks to process in the batch. If it's possible to accumulate the effects of the tasks at a lower level then you\n      * should do that instead.\n+     * <p>\n+     * Returning {@code batchExecutionContext.initialState()} is an important and useful optimisation in most cases, but note that this\n+     * fast-path exposes APIs to the risk of dirty reads in the vicinity of a master failover: a node {@code N} that handles such a no-op\n+     * task batch does not verify with its peers that it's still the master, and if it's not the master then another node {@code M} may\n+     * already have become master and updated the state in a way that would be inconsistent with the response that {@code N} sends back to\n+     * clients.\n      *\n      * @return The resulting cluster state after executing all the tasks. If {code initialState} is returned then no update is published.\n      */",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/ClusterStateTaskExecutor.java",
+          "patch": "@@ -21,7 +21,8 @@\n  */\n public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n     /**\n-     * Update the cluster state based on the current state and the given tasks. Return the *same instance* if no update should be published.\n+     * Update the cluster state based on the current state and the given tasks. Return {@code batchExecutionContext.initialState()} to avoid\n+     * publishing any update.\n      * <p>\n      * If this method throws an exception then the cluster state is unchanged and every task's {@link ClusterStateTaskListener#onFailure}\n      * method is called.\n@@ -30,6 +31,12 @@ public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n      * This works ok but beware that constructing a whole new {@link ClusterState} can be somewhat expensive, and there may sometimes be\n      * surprisingly many tasks to process in the batch. If it's possible to accumulate the effects of the tasks at a lower level then you\n      * should do that instead.\n+     * <p>\n+     * Returning {@code batchExecutionContext.initialState()} is an important and useful optimisation in most cases, but note that this\n+     * fast-path exposes APIs to the risk of dirty reads in the vicinity of a master failover: a node {@code N} that handles such a no-op\n+     * task batch does not verify with its peers that it's still the master, and if it's not the master then another node {@code M} may\n+     * already have become master and updated the state in a way that would be inconsistent with the response that {@code N} sends back to\n+     * clients.\n      *\n      * @return The resulting cluster state after executing all the tasks. If {code initialState} is returned then no update is published.\n      */"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-05T10:01:06Z",
+      "sha": "388a75b245861467f6cd5d5814c7f0cbccc32583",
+      "message": "s/dirty/stale/",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-05T10:01:06Z",
+      "author_date": "2023-01-05T10:01:06Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-05T10:01:06Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/ClusterStateTaskExecutor.java\n@@ -33,7 +33,7 @@ public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n      * should do that instead.\n      * <p>\n      * Returning {@code batchExecutionContext.initialState()} is an important and useful optimisation in most cases, but note that this\n-     * fast-path exposes APIs to the risk of dirty reads in the vicinity of a master failover: a node {@code N} that handles such a no-op\n+     * fast-path exposes APIs to the risk of stale reads in the vicinity of a master failover: a node {@code N} that handles such a no-op\n      * task batch does not verify with its peers that it's still the master, and if it's not the master then another node {@code M} may\n      * already have become master and updated the state in a way that would be inconsistent with the response that {@code N} sends back to\n      * clients.",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/ClusterStateTaskExecutor.java",
+          "patch": "@@ -33,7 +33,7 @@ public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n      * should do that instead.\n      * <p>\n      * Returning {@code batchExecutionContext.initialState()} is an important and useful optimisation in most cases, but note that this\n-     * fast-path exposes APIs to the risk of dirty reads in the vicinity of a master failover: a node {@code N} that handles such a no-op\n+     * fast-path exposes APIs to the risk of stale reads in the vicinity of a master failover: a node {@code N} that handles such a no-op\n      * task batch does not verify with its peers that it's still the master, and if it's not the master then another node {@code M} may\n      * already have become master and updated the state in a way that would be inconsistent with the response that {@code N} sends back to\n      * clients."
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-01-05T10:02:08Z",
+      "sha": "979a2e79b4126d46f1093c5ea8f32d0c94e73d17",
+      "message": "Fix initialState ref",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-01-05T10:02:08Z",
+      "author_date": "2023-01-05T10:02:08Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-01-05T10:02:08Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/ClusterStateTaskExecutor.java\n@@ -38,7 +38,8 @@ public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n      * already have become master and updated the state in a way that would be inconsistent with the response that {@code N} sends back to\n      * clients.\n      *\n-     * @return The resulting cluster state after executing all the tasks. If {code initialState} is returned then no update is published.\n+     * @return The resulting cluster state after executing all the tasks. If {code batchExecutionContext.initialState()} is returned then no\n+     * update is published.\n      */\n     ClusterState execute(BatchExecutionContext<T> batchExecutionContext) throws Exception;\n ",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/ClusterStateTaskExecutor.java",
+          "patch": "@@ -38,7 +38,8 @@ public interface ClusterStateTaskExecutor<T extends ClusterStateTaskListener> {\n      * already have become master and updated the state in a way that would be inconsistent with the response that {@code N} sends back to\n      * clients.\n      *\n-     * @return The resulting cluster state after executing all the tasks. If {code initialState} is returned then no update is published.\n+     * @return The resulting cluster state after executing all the tasks. If {code batchExecutionContext.initialState()} is returned then no\n+     * update is published.\n      */\n     ClusterState execute(BatchExecutionContext<T> batchExecutionContext) throws Exception;\n "
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1237174087,
+      "created_at": "2023-01-05T10:38:45Z",
+      "user": "henningandersen",
+      "state": "APPROVED",
+      "body": "LGTM."
+    }
+  ]
+}

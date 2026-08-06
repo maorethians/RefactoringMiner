@@ -1,0 +1,224 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 64976,
+  "pr_number": 64976,
+  "title": "Makes testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats more robust",
+  "user": "tlrx",
+  "created_at": "2020-11-12T09:22:47Z",
+  "merged_at": "2020-11-12T11:27:26Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">test",
+    ":Distributed/CCR",
+    "Team:Distributed",
+    "v7.11.0",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "71095afe26789d5ec7c78b6dca3b6d063d452690",
+  "merge_commit_sha": "ef5b67214faf7966cebbde5cc8f9073356a2786a",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/64976",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-11-12T09:19:15Z",
+      "sha": "db1ef4e2b0ae7a3163aadd1c5bb5cefbb9aba4dc",
+      "message": "Check snapshot shard sizes within cluster state listener\n\ncloses #64167",
+      "author": "Tanguy Leroux",
+      "author_email": "tlrx.dev@gmail.com",
+      "author_raw_date": "2020-11-12T09:19:15Z",
+      "author_date": "2020-11-12T09:19:15Z",
+      "committer": "Tanguy Leroux",
+      "committer_email": "tlrx.dev@gmail.com",
+      "raw_date": "2020-11-12T09:19:15Z",
+      "diff_text": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java\n@@ -29,6 +29,8 @@\n import org.elasticsearch.cluster.metadata.MappingMetadata;\n import org.elasticsearch.cluster.routing.IndexRoutingTable;\n import org.elasticsearch.cluster.routing.ShardRouting;\n+import org.elasticsearch.cluster.routing.ShardRoutingState;\n+import org.elasticsearch.cluster.routing.UnassignedInfo.AllocationStatus;\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.common.unit.ByteSizeValue;\n@@ -63,12 +65,14 @@\n import java.util.List;\n import java.util.Locale;\n import java.util.Map;\n+import java.util.concurrent.ConcurrentHashMap;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicInteger;\n \n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;\n import static org.hamcrest.Matchers.aMapWithSize;\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.greaterThan;\n@@ -465,12 +469,12 @@ public void testFollowerMappingIsUpdated() throws IOException {\n \n     public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats() throws Exception {\n         final String leaderIndex = \"leader\";\n-        final int numberOfShards = randomIntBetween(1, 2);\n+        final int numberOfShards = randomIntBetween(1, 5);\n         assertAcked(leaderClient().admin().indices().prepareCreate(leaderIndex)\n             .setSource(getIndexSettings(numberOfShards, 0,\n                 Map.of(Store.INDEX_STORE_STATS_REFRESH_INTERVAL_SETTING.getKey(), TimeValue.ZERO.getStringRep())), XContentType.JSON));\n \n-        final int numDocs = scaledRandomIntBetween(0, 1_000);\n+        final int numDocs = scaledRandomIntBetween(0, 500);\n         if (numDocs > 0) {\n             final BulkRequestBuilder bulkRequest = leaderClient().prepareBulk(leaderIndex);\n             for (int i = 0; i < numDocs; i++) {\n@@ -513,69 +517,62 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                 equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n \n-        final CountDownLatch blockCcrRestore = new CountDownLatch(1);\n-\n-        final List<MockTransportService> transportServices = new ArrayList<>();\n-        for (TransportService transportService : getFollowerCluster().getDataOrMasterNodeInstances(TransportService.class)) {\n-            final MockTransportService mockTransportService = (MockTransportService) transportService;\n-            mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {\n-                if (action.equals(PutCcrRestoreSessionAction.NAME)) {\n-                    try {\n-                        blockCcrRestore.await();\n-                    } catch (InterruptedException e) {\n-                        throw new AssertionError(e);\n+        final String followerIndex = \"follower\";\n+        final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n+        final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n+        final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n+\n+        final Map<Integer, Long> fetchedSnapshotShardSizes = new ConcurrentHashMap<>();\n+\n+        final PlainActionFuture<Void> waitForRestoreInProgress = PlainActionFuture.newFuture();\n+        final ClusterStateListener listener = event -> {\n+            RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n+            if (restoreInProgress != null\n+                && restoreInProgress.isEmpty() == false\n+                && event.state().routingTable().hasIndex(followerIndex)) {\n+                final IndexRoutingTable indexRoutingTable = event.state().routingTable().index(followerIndex);\n+                for (ShardRouting shardRouting : indexRoutingTable.shardsWithState(ShardRoutingState.UNASSIGNED)) {\n+                    if (shardRouting.unassignedInfo().getLastAllocationStatus() == AllocationStatus.FETCHING_SHARD_DATA) {\n+                        try {\n+                            assertBusy(() -> {\n+                                final Long snapshotShardSize = snapshotsInfoService.snapshotShardSizes().getShardSize(shardRouting);\n+                                assertThat(snapshotShardSize, notNullValue());\n+                                fetchedSnapshotShardSizes.put(shardRouting.getId(), snapshotShardSize);\n+                            }, 30L, TimeUnit.SECONDS);\n+                        } catch (Exception e) {\n+                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting);\n+                        }\n                     }\n                 }\n-                connection.sendRequest(requestId, action, request, options);\n-            });\n-            transportServices.add(mockTransportService);\n-        }\n-\n-        try {\n-            final String followerIndex = \"follower\";\n-            final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n-            final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n-\n-            final PlainActionFuture<IndexRoutingTable> waitForRestoreInProgress = PlainActionFuture.newFuture();\n-            final ClusterStateListener listener = event -> {\n-                RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n-                if (restoreInProgress != null\n-                    && restoreInProgress.isEmpty() == false\n-                    && event.state().routingTable().hasIndex(followerIndex)) {\n-                    waitForRestoreInProgress.onResponse(event.state().routingTable().index(followerIndex));\n-                }\n-            };\n-            clusterService.addListener(listener);\n-\n-            final RestoreSnapshotRequest restoreRequest = new RestoreSnapshotRequest(leaderCluster, CcrRepository.LATEST)\n-                .indices(leaderIndex).indicesOptions(indicesOptions).renamePattern(\"^(.*)$\")\n-                .renameReplacement(followerIndex)\n-                .masterNodeTimeout(TimeValue.MAX_VALUE)\n-                .indexSettings(Settings.builder()\n-                    .put(IndexMetadata.SETTING_INDEX_PROVIDED_NAME, followerIndex)\n-                    .put(CcrSettings.CCR_FOLLOWING_INDEX_SETTING.getKey(), true));\n-            restoreService.restoreSnapshot(restoreRequest, PlainActionFuture.newFuture());\n-\n-            final IndexRoutingTable indexRoutingTable = waitForRestoreInProgress.get(30L, TimeUnit.SECONDS);\n-            clusterService.removeListener(listener);\n-\n-            final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n-            assertBusy(() -> {\n-                SnapshotShardSizeInfo snapshotShardSizeInfo = snapshotsInfoService.snapshotShardSizes();\n-                for (int shardId = 0; shardId < numberOfShards; shardId++) {\n-                    Long snapshotShardSize = snapshotShardSizeInfo.getShardSize(indexRoutingTable.shard(shardId).primaryShard());\n-                    assertThat(snapshotShardSize,\n-                        equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n+                logger.info(\"[{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);\n+                if (fetchedSnapshotShardSizes.size() == numberOfShards) {\n+                    waitForRestoreInProgress.onResponse(null);\n                 }\n-            }, 60L, TimeUnit.SECONDS);\n+            }\n+        };\n+        clusterService.addListener(listener);\n \n-            blockCcrRestore.countDown();\n-            ensureFollowerGreen(followerIndex);\n+        final RestoreSnapshotRequest restoreRequest = new RestoreSnapshotRequest(leaderCluster, CcrRepository.LATEST)\n+            .indices(leaderIndex).indicesOptions(indicesOptions).renamePattern(\"^(.*)$\")\n+            .renameReplacement(followerIndex)\n+            .masterNodeTimeout(TimeValue.MAX_VALUE)\n+            .indexSettings(Settings.builder()\n+                .put(IndexMetadata.SETTING_INDEX_PROVIDED_NAME, followerIndex)\n+                .put(CcrSettings.CCR_FOLLOWING_INDEX_SETTING.getKey(), true));\n+        restoreService.restoreSnapshot(restoreRequest, PlainActionFuture.newFuture());\n+\n+        waitForRestoreInProgress.get(30L, TimeUnit.SECONDS);\n+        clusterService.removeListener(listener);\n+        ensureFollowerGreen(followerIndex);\n \n-            assertAcked(followerClient().admin().indices().prepareDelete(followerIndex).setMasterNodeTimeout(TimeValue.MAX_VALUE));\n-        } finally {\n-            transportServices.forEach(MockTransportService::clearAllRules);\n+        for (int shardId = 0; shardId < numberOfShards; shardId++) {\n+            assertThat(\"Snapshot shard size fetched for follower shard [\" + shardId + \"] does not match leader store size\",\n+                fetchedSnapshotShardSizes.get(shardId),\n+                equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n+\n+        assertHitCount(followerClient().prepareSearch(followerIndex).setSize(0).get(), numDocs);\n+        assertAcked(followerClient().admin().indices().prepareDelete(followerIndex).setMasterNodeTimeout(TimeValue.MAX_VALUE));\n     }\n \n     public void testCcrRepositoryFailsToFetchSnapshotShardSizes() throws Exception {",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java",
+          "patch": "@@ -29,6 +29,8 @@\n import org.elasticsearch.cluster.metadata.MappingMetadata;\n import org.elasticsearch.cluster.routing.IndexRoutingTable;\n import org.elasticsearch.cluster.routing.ShardRouting;\n+import org.elasticsearch.cluster.routing.ShardRoutingState;\n+import org.elasticsearch.cluster.routing.UnassignedInfo.AllocationStatus;\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.common.unit.ByteSizeValue;\n@@ -63,12 +65,14 @@\n import java.util.List;\n import java.util.Locale;\n import java.util.Map;\n+import java.util.concurrent.ConcurrentHashMap;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicInteger;\n \n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;\n import static org.hamcrest.Matchers.aMapWithSize;\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.greaterThan;\n@@ -465,12 +469,12 @@ public void testFollowerMappingIsUpdated() throws IOException {\n \n     public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats() throws Exception {\n         final String leaderIndex = \"leader\";\n-        final int numberOfShards = randomIntBetween(1, 2);\n+        final int numberOfShards = randomIntBetween(1, 5);\n         assertAcked(leaderClient().admin().indices().prepareCreate(leaderIndex)\n             .setSource(getIndexSettings(numberOfShards, 0,\n                 Map.of(Store.INDEX_STORE_STATS_REFRESH_INTERVAL_SETTING.getKey(), TimeValue.ZERO.getStringRep())), XContentType.JSON));\n \n-        final int numDocs = scaledRandomIntBetween(0, 1_000);\n+        final int numDocs = scaledRandomIntBetween(0, 500);\n         if (numDocs > 0) {\n             final BulkRequestBuilder bulkRequest = leaderClient().prepareBulk(leaderIndex);\n             for (int i = 0; i < numDocs; i++) {\n@@ -513,69 +517,62 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                 equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n \n-        final CountDownLatch blockCcrRestore = new CountDownLatch(1);\n-\n-        final List<MockTransportService> transportServices = new ArrayList<>();\n-        for (TransportService transportService : getFollowerCluster().getDataOrMasterNodeInstances(TransportService.class)) {\n-            final MockTransportService mockTransportService = (MockTransportService) transportService;\n-            mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {\n-                if (action.equals(PutCcrRestoreSessionAction.NAME)) {\n-                    try {\n-                        blockCcrRestore.await();\n-                    } catch (InterruptedException e) {\n-                        throw new AssertionError(e);\n+        final String followerIndex = \"follower\";\n+        final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n+        final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n+        final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n+\n+        final Map<Integer, Long> fetchedSnapshotShardSizes = new ConcurrentHashMap<>();\n+\n+        final PlainActionFuture<Void> waitForRestoreInProgress = PlainActionFuture.newFuture();\n+        final ClusterStateListener listener = event -> {\n+            RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n+            if (restoreInProgress != null\n+                && restoreInProgress.isEmpty() == false\n+                && event.state().routingTable().hasIndex(followerIndex)) {\n+                final IndexRoutingTable indexRoutingTable = event.state().routingTable().index(followerIndex);\n+                for (ShardRouting shardRouting : indexRoutingTable.shardsWithState(ShardRoutingState.UNASSIGNED)) {\n+                    if (shardRouting.unassignedInfo().getLastAllocationStatus() == AllocationStatus.FETCHING_SHARD_DATA) {\n+                        try {\n+                            assertBusy(() -> {\n+                                final Long snapshotShardSize = snapshotsInfoService.snapshotShardSizes().getShardSize(shardRouting);\n+                                assertThat(snapshotShardSize, notNullValue());\n+                                fetchedSnapshotShardSizes.put(shardRouting.getId(), snapshotShardSize);\n+                            }, 30L, TimeUnit.SECONDS);\n+                        } catch (Exception e) {\n+                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting);\n+                        }\n                     }\n                 }\n-                connection.sendRequest(requestId, action, request, options);\n-            });\n-            transportServices.add(mockTransportService);\n-        }\n-\n-        try {\n-            final String followerIndex = \"follower\";\n-            final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n-            final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n-\n-            final PlainActionFuture<IndexRoutingTable> waitForRestoreInProgress = PlainActionFuture.newFuture();\n-            final ClusterStateListener listener = event -> {\n-                RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n-                if (restoreInProgress != null\n-                    && restoreInProgress.isEmpty() == false\n-                    && event.state().routingTable().hasIndex(followerIndex)) {\n-                    waitForRestoreInProgress.onResponse(event.state().routingTable().index(followerIndex));\n-                }\n-            };\n-            clusterService.addListener(listener);\n-\n-            final RestoreSnapshotRequest restoreRequest = new RestoreSnapshotRequest(leaderCluster, CcrRepository.LATEST)\n-                .indices(leaderIndex).indicesOptions(indicesOptions).renamePattern(\"^(.*)$\")\n-                .renameReplacement(followerIndex)\n-                .masterNodeTimeout(TimeValue.MAX_VALUE)\n-                .indexSettings(Settings.builder()\n-                    .put(IndexMetadata.SETTING_INDEX_PROVIDED_NAME, followerIndex)\n-                    .put(CcrSettings.CCR_FOLLOWING_INDEX_SETTING.getKey(), true));\n-            restoreService.restoreSnapshot(restoreRequest, PlainActionFuture.newFuture());\n-\n-            final IndexRoutingTable indexRoutingTable = waitForRestoreInProgress.get(30L, TimeUnit.SECONDS);\n-            clusterService.removeListener(listener);\n-\n-            final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n-            assertBusy(() -> {\n-                SnapshotShardSizeInfo snapshotShardSizeInfo = snapshotsInfoService.snapshotShardSizes();\n-                for (int shardId = 0; shardId < numberOfShards; shardId++) {\n-                    Long snapshotShardSize = snapshotShardSizeInfo.getShardSize(indexRoutingTable.shard(shardId).primaryShard());\n-                    assertThat(snapshotShardSize,\n-                        equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n+                logger.info(\"[{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);\n+                if (fetchedSnapshotShardSizes.size() == numberOfShards) {\n+                    waitForRestoreInProgress.onResponse(null);\n                 }\n-            }, 60L, TimeUnit.SECONDS);\n+            }\n+        };\n+        clusterService.addListener(listener);\n \n-            blockCcrRestore.countDown();\n-            ensureFollowerGreen(followerIndex);\n+        final RestoreSnapshotRequest restoreRequest = new RestoreSnapshotRequest(leaderCluster, CcrRepository.LATEST)\n+            .indices(leaderIndex).indicesOptions(indicesOptions).renamePattern(\"^(.*)$\")\n+            .renameReplacement(followerIndex)\n+            .masterNodeTimeout(TimeValue.MAX_VALUE)\n+            .indexSettings(Settings.builder()\n+                .put(IndexMetadata.SETTING_INDEX_PROVIDED_NAME, followerIndex)\n+                .put(CcrSettings.CCR_FOLLOWING_INDEX_SETTING.getKey(), true));\n+        restoreService.restoreSnapshot(restoreRequest, PlainActionFuture.newFuture());\n+\n+        waitForRestoreInProgress.get(30L, TimeUnit.SECONDS);\n+        clusterService.removeListener(listener);\n+        ensureFollowerGreen(followerIndex);\n \n-            assertAcked(followerClient().admin().indices().prepareDelete(followerIndex).setMasterNodeTimeout(TimeValue.MAX_VALUE));\n-        } finally {\n-            transportServices.forEach(MockTransportService::clearAllRules);\n+        for (int shardId = 0; shardId < numberOfShards; shardId++) {\n+            assertThat(\"Snapshot shard size fetched for follower shard [\" + shardId + \"] does not match leader store size\",\n+                fetchedSnapshotShardSizes.get(shardId),\n+                equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n+\n+        assertHitCount(followerClient().prepareSearch(followerIndex).setSize(0).get(), numDocs);\n+        assertAcked(followerClient().admin().indices().prepareDelete(followerIndex).setMasterNodeTimeout(TimeValue.MAX_VALUE));\n     }\n \n     public void testCcrRepositoryFailsToFetchSnapshotShardSizes() throws Exception {"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-11-12T09:22:47Z",
+      "user": "tlrx",
+      "body": "Today this test fails because the sizes of the snapshot shards are only kept in a very short period of time in the `InternalSnapshotsInfoService` and are not guaranteed to exist once the shards are correctly assigned.\r\n\r\nThis test implements a suggestion from Armin to make the test both simpler and less prone to failures.\r\n\r\ncloses #64167\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 725954118,
+      "created_at": "2020-11-12T09:22:49Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (:Distributed/CCR)"
+    },
+    {
+      "type": "review_comment",
+      "id": 521992834,
+      "created_at": "2020-11-12T10:17:53Z",
+      "user": "original-brownbear",
+      "body": "Should we  remove this listener before we enter the busy assert loop? Otherwise subsequent CS updates will run into it again in the background again and again? (technically probably not a problem because subsequent CS updates will prevent us from getting here but I'd still remove it to have one less thing to worry about when debugging this :)",
+      "path": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java",
+      "diff_hunk": "@@ -513,69 +517,62 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                 equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n \n-        final CountDownLatch blockCcrRestore = new CountDownLatch(1);\n-\n-        final List<MockTransportService> transportServices = new ArrayList<>();\n-        for (TransportService transportService : getFollowerCluster().getDataOrMasterNodeInstances(TransportService.class)) {\n-            final MockTransportService mockTransportService = (MockTransportService) transportService;\n-            mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {\n-                if (action.equals(PutCcrRestoreSessionAction.NAME)) {\n-                    try {\n-                        blockCcrRestore.await();\n-                    } catch (InterruptedException e) {\n-                        throw new AssertionError(e);\n+        final String followerIndex = \"follower\";\n+        final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n+        final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n+        final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n+\n+        final Map<Integer, Long> fetchedSnapshotShardSizes = new ConcurrentHashMap<>();\n+\n+        final PlainActionFuture<Void> waitForRestoreInProgress = PlainActionFuture.newFuture();\n+        final ClusterStateListener listener = event -> {\n+            RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n+            if (restoreInProgress != null\n+                && restoreInProgress.isEmpty() == false\n+                && event.state().routingTable().hasIndex(followerIndex)) {\n+                final IndexRoutingTable indexRoutingTable = event.state().routingTable().index(followerIndex);\n+                for (ShardRouting shardRouting : indexRoutingTable.shardsWithState(ShardRoutingState.UNASSIGNED)) {\n+                    if (shardRouting.unassignedInfo().getLastAllocationStatus() == AllocationStatus.FETCHING_SHARD_DATA) {\n+                        try {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 536,
+      "original_line": 536,
+      "side": "RIGHT",
+      "original_position": 70,
+      "position": 70,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 521999983,
+          "user": "tlrx",
+          "body": "We need to run in it again and again until all unassigned shards are allocated, so it should not be an issue but in case more than 4 shards are created there should be multiple CS updates to allocate all primaries.\r\n\r\nThat's also the reason why the Map<Integer,Long> is outside the scope of the listener.",
+          "created_at": "2020-11-12T10:29:04Z"
+        },
+        {
+          "id": 522000453,
+          "user": "original-brownbear",
+          "body": ":facepalm: right ... nevermind me :) ",
+          "created_at": "2020-11-12T10:29:45Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 521993192,
+      "created_at": "2020-11-12T10:18:28Z",
+      "user": "original-brownbear",
+      "body": "Let's add the exception to the `AssertionError`?",
+      "path": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java",
+      "diff_hunk": "@@ -513,69 +517,62 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                 equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n \n-        final CountDownLatch blockCcrRestore = new CountDownLatch(1);\n-\n-        final List<MockTransportService> transportServices = new ArrayList<>();\n-        for (TransportService transportService : getFollowerCluster().getDataOrMasterNodeInstances(TransportService.class)) {\n-            final MockTransportService mockTransportService = (MockTransportService) transportService;\n-            mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {\n-                if (action.equals(PutCcrRestoreSessionAction.NAME)) {\n-                    try {\n-                        blockCcrRestore.await();\n-                    } catch (InterruptedException e) {\n-                        throw new AssertionError(e);\n+        final String followerIndex = \"follower\";\n+        final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n+        final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n+        final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n+\n+        final Map<Integer, Long> fetchedSnapshotShardSizes = new ConcurrentHashMap<>();\n+\n+        final PlainActionFuture<Void> waitForRestoreInProgress = PlainActionFuture.newFuture();\n+        final ClusterStateListener listener = event -> {\n+            RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n+            if (restoreInProgress != null\n+                && restoreInProgress.isEmpty() == false\n+                && event.state().routingTable().hasIndex(followerIndex)) {\n+                final IndexRoutingTable indexRoutingTable = event.state().routingTable().index(followerIndex);\n+                for (ShardRouting shardRouting : indexRoutingTable.shardsWithState(ShardRoutingState.UNASSIGNED)) {\n+                    if (shardRouting.unassignedInfo().getLastAllocationStatus() == AllocationStatus.FETCHING_SHARD_DATA) {\n+                        try {\n+                            assertBusy(() -> {\n+                                final Long snapshotShardSize = snapshotsInfoService.snapshotShardSizes().getShardSize(shardRouting);\n+                                assertThat(snapshotShardSize, notNullValue());\n+                                fetchedSnapshotShardSizes.put(shardRouting.getId(), snapshotShardSize);\n+                            }, 30L, TimeUnit.SECONDS);\n+                        } catch (Exception e) {\n+                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 543,
+      "side": "RIGHT",
+      "original_position": 77,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 521993538,
+      "created_at": "2020-11-12T10:19:02Z",
+      "user": "original-brownbear",
+      "body": "Let's add a `--> ` prefix to this logging like we have for other test log lines?",
+      "path": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java",
+      "diff_hunk": "@@ -513,69 +517,62 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                 equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n \n-        final CountDownLatch blockCcrRestore = new CountDownLatch(1);\n-\n-        final List<MockTransportService> transportServices = new ArrayList<>();\n-        for (TransportService transportService : getFollowerCluster().getDataOrMasterNodeInstances(TransportService.class)) {\n-            final MockTransportService mockTransportService = (MockTransportService) transportService;\n-            mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {\n-                if (action.equals(PutCcrRestoreSessionAction.NAME)) {\n-                    try {\n-                        blockCcrRestore.await();\n-                    } catch (InterruptedException e) {\n-                        throw new AssertionError(e);\n+        final String followerIndex = \"follower\";\n+        final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n+        final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n+        final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n+\n+        final Map<Integer, Long> fetchedSnapshotShardSizes = new ConcurrentHashMap<>();\n+\n+        final PlainActionFuture<Void> waitForRestoreInProgress = PlainActionFuture.newFuture();\n+        final ClusterStateListener listener = event -> {\n+            RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n+            if (restoreInProgress != null\n+                && restoreInProgress.isEmpty() == false\n+                && event.state().routingTable().hasIndex(followerIndex)) {\n+                final IndexRoutingTable indexRoutingTable = event.state().routingTable().index(followerIndex);\n+                for (ShardRouting shardRouting : indexRoutingTable.shardsWithState(ShardRoutingState.UNASSIGNED)) {\n+                    if (shardRouting.unassignedInfo().getLastAllocationStatus() == AllocationStatus.FETCHING_SHARD_DATA) {\n+                        try {\n+                            assertBusy(() -> {\n+                                final Long snapshotShardSize = snapshotsInfoService.snapshotShardSizes().getShardSize(shardRouting);\n+                                assertThat(snapshotShardSize, notNullValue());\n+                                fetchedSnapshotShardSizes.put(shardRouting.getId(), snapshotShardSize);\n+                            }, 30L, TimeUnit.SECONDS);\n+                        } catch (Exception e) {\n+                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting);\n+                        }\n                     }\n                 }\n-                connection.sendRequest(requestId, action, request, options);\n-            });\n-            transportServices.add(mockTransportService);\n-        }\n-\n-        try {\n-            final String followerIndex = \"follower\";\n-            final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n-            final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n-\n-            final PlainActionFuture<IndexRoutingTable> waitForRestoreInProgress = PlainActionFuture.newFuture();\n-            final ClusterStateListener listener = event -> {\n-                RestoreInProgress restoreInProgress = event.state().custom(RestoreInProgress.TYPE, RestoreInProgress.EMPTY);\n-                if (restoreInProgress != null\n-                    && restoreInProgress.isEmpty() == false\n-                    && event.state().routingTable().hasIndex(followerIndex)) {\n-                    waitForRestoreInProgress.onResponse(event.state().routingTable().index(followerIndex));\n-                }\n-            };\n-            clusterService.addListener(listener);\n-\n-            final RestoreSnapshotRequest restoreRequest = new RestoreSnapshotRequest(leaderCluster, CcrRepository.LATEST)\n-                .indices(leaderIndex).indicesOptions(indicesOptions).renamePattern(\"^(.*)$\")\n-                .renameReplacement(followerIndex)\n-                .masterNodeTimeout(TimeValue.MAX_VALUE)\n-                .indexSettings(Settings.builder()\n-                    .put(IndexMetadata.SETTING_INDEX_PROVIDED_NAME, followerIndex)\n-                    .put(CcrSettings.CCR_FOLLOWING_INDEX_SETTING.getKey(), true));\n-            restoreService.restoreSnapshot(restoreRequest, PlainActionFuture.newFuture());\n-\n-            final IndexRoutingTable indexRoutingTable = waitForRestoreInProgress.get(30L, TimeUnit.SECONDS);\n-            clusterService.removeListener(listener);\n-\n-            final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n-            assertBusy(() -> {\n-                SnapshotShardSizeInfo snapshotShardSizeInfo = snapshotsInfoService.snapshotShardSizes();\n-                for (int shardId = 0; shardId < numberOfShards; shardId++) {\n-                    Long snapshotShardSize = snapshotShardSizeInfo.getShardSize(indexRoutingTable.shard(shardId).primaryShard());\n-                    assertThat(snapshotShardSize,\n-                        equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n+                logger.info(\"[{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 547,
+      "side": "RIGHT",
+      "original_position": 121,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 521994848,
+      "created_at": "2020-11-12T10:21:02Z",
+      "user": "original-brownbear",
+      "body": "Could just make this a PlainActionFuture<Map<Integer, Long>> and return the map from it instead of having it in the outer scope? :) Makes it a little clearer when the map is coming from and you don't have to reason about why there's a CHM when debugging this.",
+      "path": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java",
+      "diff_hunk": "@@ -513,69 +517,62 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                 equalTo(indexStats.getIndexShards().get(shardId).getPrimary().getStore().getSizeInBytes()));\n         }\n \n-        final CountDownLatch blockCcrRestore = new CountDownLatch(1);\n-\n-        final List<MockTransportService> transportServices = new ArrayList<>();\n-        for (TransportService transportService : getFollowerCluster().getDataOrMasterNodeInstances(TransportService.class)) {\n-            final MockTransportService mockTransportService = (MockTransportService) transportService;\n-            mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {\n-                if (action.equals(PutCcrRestoreSessionAction.NAME)) {\n-                    try {\n-                        blockCcrRestore.await();\n-                    } catch (InterruptedException e) {\n-                        throw new AssertionError(e);\n+        final String followerIndex = \"follower\";\n+        final RestoreService restoreService = getFollowerCluster().getCurrentMasterNodeInstance(RestoreService.class);\n+        final ClusterService clusterService = getFollowerCluster().getCurrentMasterNodeInstance(ClusterService.class);\n+        final SnapshotsInfoService snapshotsInfoService = getFollowerCluster().getCurrentMasterNodeInstance(SnapshotsInfoService.class);\n+\n+        final Map<Integer, Long> fetchedSnapshotShardSizes = new ConcurrentHashMap<>();\n+\n+        final PlainActionFuture<Void> waitForRestoreInProgress = PlainActionFuture.newFuture();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 527,
+      "original_line": 527,
+      "side": "RIGHT",
+      "original_position": 61,
+      "position": 61,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 528940147,
+      "created_at": "2020-11-12T10:22:07Z",
+      "user": "original-brownbear",
+      "state": "APPROVED",
+      "body": "LGTM thanks Tanguy! (just a few smaller optional suggested (IMO) simplifications)"
+    },
+    {
+      "type": "review",
+      "id": 528949407,
+      "created_at": "2020-11-12T10:29:04Z",
+      "user": "tlrx",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 528949974,
+      "created_at": "2020-11-12T10:29:45Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2020-11-12T10:29:58Z",
+      "sha": "f9b53cc028527df15d116fcc73f4b239144bb911",
+      "message": "add exception ++ -->",
+      "author": "Tanguy Leroux",
+      "author_email": "tlrx.dev@gmail.com",
+      "author_raw_date": "2020-11-12T10:29:58Z",
+      "author_date": "2020-11-12T10:29:58Z",
+      "committer": "Tanguy Leroux",
+      "committer_email": "tlrx.dev@gmail.com",
+      "raw_date": "2020-11-12T10:29:58Z",
+      "diff_text": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java\n@@ -540,11 +540,11 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                                 fetchedSnapshotShardSizes.put(shardRouting.getId(), snapshotShardSize);\n                             }, 30L, TimeUnit.SECONDS);\n                         } catch (Exception e) {\n-                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting);\n+                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting, e);\n                         }\n                     }\n                 }\n-                logger.info(\"[{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);\n+                logger.info(\"--> [{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);\n                 if (fetchedSnapshotShardSizes.size() == numberOfShards) {\n                     waitForRestoreInProgress.onResponse(null);\n                 }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ccr/src/internalClusterTest/java/org/elasticsearch/xpack/ccr/CcrRepositoryIT.java",
+          "patch": "@@ -540,11 +540,11 @@ public void testCcrRepositoryFetchesSnapshotShardSizeFromIndexShardStoreStats()\n                                 fetchedSnapshotShardSizes.put(shardRouting.getId(), snapshotShardSize);\n                             }, 30L, TimeUnit.SECONDS);\n                         } catch (Exception e) {\n-                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting);\n+                            throw new AssertionError(\"Failed to retrieve snapshot shard size for shard \" + shardRouting, e);\n                         }\n                     }\n                 }\n-                logger.info(\"[{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);\n+                logger.info(\"--> [{}/{}] snapshot shard sizes fetched\", fetchedSnapshotShardSizes.size(), numberOfShards);\n                 if (fetchedSnapshotShardSizes.size() == numberOfShards) {\n                     waitForRestoreInProgress.onResponse(null);\n                 }"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 726019839,
+      "created_at": "2020-11-12T11:27:36Z",
+      "user": "tlrx",
+      "body": "Thanks Armin!"
+    }
+  ]
+}

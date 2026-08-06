@@ -1,0 +1,318 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 70461,
+  "pr_number": 70461,
+  "title": "[Transform] make shouldStopAtCheckpoint more robust",
+  "user": "hendrikmuhs",
+  "created_at": "2021-03-16T14:54:48Z",
+  "merged_at": "2021-03-22T10:28:27Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">refactoring",
+    ":ml/Transform",
+    "Team:ML",
+    "v7.13.0",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "fead5bbb9778b539311e92c49afd9a1fc7f139f4",
+  "merge_commit_sha": "cc28159eb081de762727f29040fc3cd80cd9558f",
+  "commits": 5,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/70461",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-03-16T14:42:23Z",
+      "sha": "fd436b8d4206658c2def917d1b76d6830b1f1cba",
+      "message": "don't call doSaveState if indexer is shutting down and ensure the job stops\nif stopAtCheckpoint has been called in between. This change also fixes a\nlogging problem and ensures a timeout error gets logged.\n\nfixes #70416",
+      "author": "Hendrik Muhs",
+      "author_email": "hendrik.muhs@elastic.co",
+      "author_raw_date": "2021-03-16T14:42:23Z",
+      "author_date": "2021-03-16T14:42:23Z",
+      "committer": "Hendrik Muhs",
+      "committer_email": "hendrik.muhs@elastic.co",
+      "raw_date": "2021-03-16T14:42:23Z",
+      "diff_text": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformContext.java\n@@ -84,8 +84,8 @@ long getCheckpoint() {\n         return currentCheckpoint.get();\n     }\n \n-    long getAndIncrementCheckpoint() {\n-        return currentCheckpoint.getAndIncrement();\n+    long incrementAndGetCheckpoint() {\n+        return currentCheckpoint.incrementAndGet();\n     }\n \n     void setNumFailureRetries(int numFailureRetries) {\nx-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java\n@@ -125,7 +125,7 @@ private enum RunState {\n     private volatile long lastCheckpointCleanup = 0L;\n \n     protected volatile boolean indexerThreadShuttingDown = false;\n-    protected volatile boolean stopCalledDuringIndexerThreadShutdown = false;\n+    protected volatile boolean saveStateCalledDuringIndexerThreadShutdown = false;\n \n     public TransformIndexer(\n         ThreadPool threadPool,\n@@ -490,7 +490,7 @@ private void finalizeCheckpoint(ActionListener<Void> listener) {\n                 changeCollector.clear();\n             }\n \n-            long checkpoint = context.getAndIncrementCheckpoint();\n+            long checkpoint = context.incrementAndGetCheckpoint();\n             lastCheckpoint = getNextCheckpoint();\n             nextCheckpoint = null;\n             // Reset our failure count as we have finished and may start again with a new checkpoint\n@@ -647,7 +647,7 @@ final void setStopAtCheckpoint(boolean shouldStopAtCheckpoint, ActionListener<Vo\n         } catch (InterruptedException e) {\n             logger.error(\n                 new ParameterizedMessage(\n-                    \"[{}] Timed out ({}s) waiting for transform state to be stored.\",\n+                    \"[{}] Interrupt waiting ({}s) for transform state to be stored.\",\n                     getJobId(),\n                     PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC\n                 ),\n@@ -671,6 +671,14 @@ private synchronized boolean addSetStopAtCheckpointListener(\n         boolean shouldStopAtCheckpoint,\n         ActionListener<Void> shouldStopAtCheckpointListener\n     ) throws InterruptedException {\n+\n+        // in case the indexer is already shutting down\n+        if (indexerThreadShuttingDown) {\n+            context.setShouldStopAtCheckpoint(shouldStopAtCheckpoint);\n+            saveStateCalledDuringIndexerThreadShutdown = true;\n+            return false;\n+        }\n+\n         IndexerState state = getState();\n \n         // in case the indexer isn't running, respond immediately\n@@ -680,9 +688,19 @@ private synchronized boolean addSetStopAtCheckpointListener(\n             // because save state is async we need to block the call until state is persisted, so that the job can not\n             // be triggered (ensured by synchronized)\n             CountDownLatch latch = new CountDownLatch(1);\n+            logger.debug(\"[{}] persisiting stop at checkpoint\", getJobId());\n+\n             doSaveState(IndexerState.STARTED, getPosition(), () -> { latch.countDown(); });\n \n-            latch.await(PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC, TimeUnit.SECONDS);\n+            if (latch.await(PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC, TimeUnit.SECONDS) == false) {\n+                logger.error(\n+                    new ParameterizedMessage(\n+                        \"[{}] Timed out ({}s) waiting for transform state to be stored.\",\n+                        getJobId(),\n+                        PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC\n+                    )\n+                );\n+            }\n             return false;\n         }\n \n@@ -719,9 +737,12 @@ private synchronized boolean addSetStopAtCheckpointListener(\n \n     synchronized void stopAndSaveState() {\n         onStop();\n+        IndexerState state = stop();\n+\n         if (indexerThreadShuttingDown) {\n-            stopCalledDuringIndexerThreadShutdown = true;\n-        } else {\n+            saveStateCalledDuringIndexerThreadShutdown = true;\n+            // if stop() returned STOPPED we need to persist state, otherwise the indexer does it for us\n+        } else if (state == IndexerState.STOPPED) {\n             doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n         }\n     }\n@@ -1109,13 +1130,18 @@ private void configurePageSize(Integer newPageSize) {\n \n     private synchronized void startIndexerThreadShutdown() {\n         indexerThreadShuttingDown = true;\n-        stopCalledDuringIndexerThreadShutdown = false;\n+        saveStateCalledDuringIndexerThreadShutdown = false;\n     }\n \n     private synchronized void finishIndexerThreadShutdown() {\n         indexerThreadShuttingDown = false;\n-        if (stopCalledDuringIndexerThreadShutdown) {\n-            doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n+        if (saveStateCalledDuringIndexerThreadShutdown) {\n+            // if stop has been called and set shouldStopAtCheckpoint to true,\n+            // we should stop if we just finished a checkpoint\n+            if (context.shouldStopAtCheckpoint() && nextCheckpoint == null) {\n+                stop();\n+            }\n+            doSaveState(getState(), getPosition(), () -> {});\n         }\n     }\n \nx-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformTask.java\n@@ -363,10 +363,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n         // or has yet to even start one.\n         // Either way, this means that we won't get to have onFinish called down stream (or at least won't for some time).\n             (indexerState == IndexerState.STARTED && getIndexer().initialRun())) {\n-            IndexerState state = getIndexer().stop();\n-            if (state == IndexerState.STOPPED) {\n-                getIndexer().stopAndSaveState();\n-            }\n+            getIndexer().stopAndSaveState();\n         }\n     }\n ",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformContext.java",
+          "patch": "@@ -84,8 +84,8 @@ long getCheckpoint() {\n         return currentCheckpoint.get();\n     }\n \n-    long getAndIncrementCheckpoint() {\n-        return currentCheckpoint.getAndIncrement();\n+    long incrementAndGetCheckpoint() {\n+        return currentCheckpoint.incrementAndGet();\n     }\n \n     void setNumFailureRetries(int numFailureRetries) {"
+        },
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java",
+          "patch": "@@ -125,7 +125,7 @@ private enum RunState {\n     private volatile long lastCheckpointCleanup = 0L;\n \n     protected volatile boolean indexerThreadShuttingDown = false;\n-    protected volatile boolean stopCalledDuringIndexerThreadShutdown = false;\n+    protected volatile boolean saveStateCalledDuringIndexerThreadShutdown = false;\n \n     public TransformIndexer(\n         ThreadPool threadPool,\n@@ -490,7 +490,7 @@ private void finalizeCheckpoint(ActionListener<Void> listener) {\n                 changeCollector.clear();\n             }\n \n-            long checkpoint = context.getAndIncrementCheckpoint();\n+            long checkpoint = context.incrementAndGetCheckpoint();\n             lastCheckpoint = getNextCheckpoint();\n             nextCheckpoint = null;\n             // Reset our failure count as we have finished and may start again with a new checkpoint\n@@ -647,7 +647,7 @@ final void setStopAtCheckpoint(boolean shouldStopAtCheckpoint, ActionListener<Vo\n         } catch (InterruptedException e) {\n             logger.error(\n                 new ParameterizedMessage(\n-                    \"[{}] Timed out ({}s) waiting for transform state to be stored.\",\n+                    \"[{}] Interrupt waiting ({}s) for transform state to be stored.\",\n                     getJobId(),\n                     PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC\n                 ),\n@@ -671,6 +671,14 @@ private synchronized boolean addSetStopAtCheckpointListener(\n         boolean shouldStopAtCheckpoint,\n         ActionListener<Void> shouldStopAtCheckpointListener\n     ) throws InterruptedException {\n+\n+        // in case the indexer is already shutting down\n+        if (indexerThreadShuttingDown) {\n+            context.setShouldStopAtCheckpoint(shouldStopAtCheckpoint);\n+            saveStateCalledDuringIndexerThreadShutdown = true;\n+            return false;\n+        }\n+\n         IndexerState state = getState();\n \n         // in case the indexer isn't running, respond immediately\n@@ -680,9 +688,19 @@ private synchronized boolean addSetStopAtCheckpointListener(\n             // because save state is async we need to block the call until state is persisted, so that the job can not\n             // be triggered (ensured by synchronized)\n             CountDownLatch latch = new CountDownLatch(1);\n+            logger.debug(\"[{}] persisiting stop at checkpoint\", getJobId());\n+\n             doSaveState(IndexerState.STARTED, getPosition(), () -> { latch.countDown(); });\n \n-            latch.await(PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC, TimeUnit.SECONDS);\n+            if (latch.await(PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC, TimeUnit.SECONDS) == false) {\n+                logger.error(\n+                    new ParameterizedMessage(\n+                        \"[{}] Timed out ({}s) waiting for transform state to be stored.\",\n+                        getJobId(),\n+                        PERSIST_STOP_AT_CHECKPOINT_TIMEOUT_SEC\n+                    )\n+                );\n+            }\n             return false;\n         }\n \n@@ -719,9 +737,12 @@ private synchronized boolean addSetStopAtCheckpointListener(\n \n     synchronized void stopAndSaveState() {\n         onStop();\n+        IndexerState state = stop();\n+\n         if (indexerThreadShuttingDown) {\n-            stopCalledDuringIndexerThreadShutdown = true;\n-        } else {\n+            saveStateCalledDuringIndexerThreadShutdown = true;\n+            // if stop() returned STOPPED we need to persist state, otherwise the indexer does it for us\n+        } else if (state == IndexerState.STOPPED) {\n             doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n         }\n     }\n@@ -1109,13 +1130,18 @@ private void configurePageSize(Integer newPageSize) {\n \n     private synchronized void startIndexerThreadShutdown() {\n         indexerThreadShuttingDown = true;\n-        stopCalledDuringIndexerThreadShutdown = false;\n+        saveStateCalledDuringIndexerThreadShutdown = false;\n     }\n \n     private synchronized void finishIndexerThreadShutdown() {\n         indexerThreadShuttingDown = false;\n-        if (stopCalledDuringIndexerThreadShutdown) {\n-            doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n+        if (saveStateCalledDuringIndexerThreadShutdown) {\n+            // if stop has been called and set shouldStopAtCheckpoint to true,\n+            // we should stop if we just finished a checkpoint\n+            if (context.shouldStopAtCheckpoint() && nextCheckpoint == null) {\n+                stop();\n+            }\n+            doSaveState(getState(), getPosition(), () -> {});\n         }\n     }\n "
+        },
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformTask.java",
+          "patch": "@@ -363,10 +363,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n         // or has yet to even start one.\n         // Either way, this means that we won't get to have onFinish called down stream (or at least won't for some time).\n             (indexerState == IndexerState.STARTED && getIndexer().initialRun())) {\n-            IndexerState state = getIndexer().stop();\n-            if (state == IndexerState.STOPPED) {\n-                getIndexer().stopAndSaveState();\n-            }\n+            getIndexer().stopAndSaveState();\n         }\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-03-16T14:54:48Z",
+      "user": "hendrikmuhs",
+      "body": "shouldStopAtCheckpoint tells transform to stop at the next checkpoint, if\r\nthis API is called while a checkpoint is finishing, it can cause a race condition\r\nin state persistence. This is similar to #69551, but this time in a different\r\nplace.\r\n\r\nWith this change `_stop?shouldStopAtCheckpoint=true` does not call doSaveState \r\nif indexer is shutting down. Still it ensures the job stops after the indexer has\r\nshutdown. Apart from that the change fixes: a logging problem, it adds error \r\nhandling in case of a timeout during `_stop?shouldStopAtCheckpoint=true`. Some\r\nlogic has been moved from the task to the indexer.\r\n\r\nfixes #70416"
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-16T14:56:46Z",
+      "sha": "30fa1c2f29759045b3ba560b05be88f8f67b8f3f",
+      "message": "rename variable",
+      "author": "Hendrik Muhs",
+      "author_email": "hendrik.muhs@elastic.co",
+      "author_raw_date": "2021-03-16T14:56:46Z",
+      "author_date": "2021-03-16T14:56:46Z",
+      "committer": "Hendrik Muhs",
+      "committer_email": "hendrik.muhs@elastic.co",
+      "raw_date": "2021-03-16T14:56:46Z",
+      "diff_text": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java\n@@ -125,7 +125,7 @@ private enum RunState {\n     private volatile long lastCheckpointCleanup = 0L;\n \n     protected volatile boolean indexerThreadShuttingDown = false;\n-    protected volatile boolean saveStateCalledDuringIndexerThreadShutdown = false;\n+    protected volatile boolean saveStateRequestedDuringIndexerThreadShutdown = false;\n \n     public TransformIndexer(\n         ThreadPool threadPool,\n@@ -675,7 +675,7 @@ private synchronized boolean addSetStopAtCheckpointListener(\n         // in case the indexer is already shutting down\n         if (indexerThreadShuttingDown) {\n             context.setShouldStopAtCheckpoint(shouldStopAtCheckpoint);\n-            saveStateCalledDuringIndexerThreadShutdown = true;\n+            saveStateRequestedDuringIndexerThreadShutdown = true;\n             return false;\n         }\n \n@@ -740,7 +740,7 @@ synchronized void stopAndSaveState() {\n         IndexerState state = stop();\n \n         if (indexerThreadShuttingDown) {\n-            saveStateCalledDuringIndexerThreadShutdown = true;\n+            saveStateRequestedDuringIndexerThreadShutdown = true;\n             // if stop() returned STOPPED we need to persist state, otherwise the indexer does it for us\n         } else if (state == IndexerState.STOPPED) {\n             doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n@@ -1130,12 +1130,12 @@ private void configurePageSize(Integer newPageSize) {\n \n     private synchronized void startIndexerThreadShutdown() {\n         indexerThreadShuttingDown = true;\n-        saveStateCalledDuringIndexerThreadShutdown = false;\n+        saveStateRequestedDuringIndexerThreadShutdown = false;\n     }\n \n     private synchronized void finishIndexerThreadShutdown() {\n         indexerThreadShuttingDown = false;\n-        if (saveStateCalledDuringIndexerThreadShutdown) {\n+        if (saveStateRequestedDuringIndexerThreadShutdown) {\n             // if stop has been called and set shouldStopAtCheckpoint to true,\n             // we should stop if we just finished a checkpoint\n             if (context.shouldStopAtCheckpoint() && nextCheckpoint == null) {",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java",
+          "patch": "@@ -125,7 +125,7 @@ private enum RunState {\n     private volatile long lastCheckpointCleanup = 0L;\n \n     protected volatile boolean indexerThreadShuttingDown = false;\n-    protected volatile boolean saveStateCalledDuringIndexerThreadShutdown = false;\n+    protected volatile boolean saveStateRequestedDuringIndexerThreadShutdown = false;\n \n     public TransformIndexer(\n         ThreadPool threadPool,\n@@ -675,7 +675,7 @@ private synchronized boolean addSetStopAtCheckpointListener(\n         // in case the indexer is already shutting down\n         if (indexerThreadShuttingDown) {\n             context.setShouldStopAtCheckpoint(shouldStopAtCheckpoint);\n-            saveStateCalledDuringIndexerThreadShutdown = true;\n+            saveStateRequestedDuringIndexerThreadShutdown = true;\n             return false;\n         }\n \n@@ -740,7 +740,7 @@ synchronized void stopAndSaveState() {\n         IndexerState state = stop();\n \n         if (indexerThreadShuttingDown) {\n-            saveStateCalledDuringIndexerThreadShutdown = true;\n+            saveStateRequestedDuringIndexerThreadShutdown = true;\n             // if stop() returned STOPPED we need to persist state, otherwise the indexer does it for us\n         } else if (state == IndexerState.STOPPED) {\n             doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n@@ -1130,12 +1130,12 @@ private void configurePageSize(Integer newPageSize) {\n \n     private synchronized void startIndexerThreadShutdown() {\n         indexerThreadShuttingDown = true;\n-        saveStateCalledDuringIndexerThreadShutdown = false;\n+        saveStateRequestedDuringIndexerThreadShutdown = false;\n     }\n \n     private synchronized void finishIndexerThreadShutdown() {\n         indexerThreadShuttingDown = false;\n-        if (saveStateCalledDuringIndexerThreadShutdown) {\n+        if (saveStateRequestedDuringIndexerThreadShutdown) {\n             // if stop has been called and set shouldStopAtCheckpoint to true,\n             // we should stop if we just finished a checkpoint\n             if (context.shouldStopAtCheckpoint() && nextCheckpoint == null) {"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-18T14:55:41Z",
+      "sha": "15499bece68605846b992f003e6138a1363276aa",
+      "message": "add a test case ensuring clean shutdown",
+      "author": "Hendrik Muhs",
+      "author_email": "hendrik.muhs@elastic.co",
+      "author_raw_date": "2021-03-18T14:55:41Z",
+      "author_date": "2021-03-18T14:55:41Z",
+      "committer": "Hendrik Muhs",
+      "committer_email": "hendrik.muhs@elastic.co",
+      "raw_date": "2021-03-18T14:55:41Z",
+      "diff_text": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java\n@@ -9,6 +9,7 @@\n \n import org.apache.lucene.search.TotalHits;\n import org.elasticsearch.action.ActionListener;\n+import org.elasticsearch.action.LatchedActionListener;\n import org.elasticsearch.action.admin.indices.refresh.RefreshResponse;\n import org.elasticsearch.action.bulk.BulkItemResponse;\n import org.elasticsearch.action.bulk.BulkRequest;\n@@ -53,6 +54,7 @@\n import java.util.Map;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.function.Consumer;\n \n@@ -98,6 +100,9 @@ class MockedTransformIndexer extends TransformIndexer {\n         // used for synchronizing with the test\n         private CountDownLatch searchLatch;\n         private CountDownLatch doProcessLatch;\n+        private CountDownLatch doSaveStateLatch;\n+\n+        private AtomicBoolean saveStateInProgress = new AtomicBoolean(false);\n \n         // how many loops to execute until reporting done\n         private int numberOfLoops;\n@@ -146,6 +151,10 @@ public CountDownLatch createCountDownOnResponseLatch(int count) {\n             return doProcessLatch = new CountDownLatch(count);\n         }\n \n+        public CountDownLatch createAwaitForDoSaveStateLatch(int count) {\n+            return doSaveStateLatch = new CountDownLatch(count);\n+        }\n+\n         @Override\n         void doGetInitialProgress(SearchRequest request, ActionListener<SearchResponse> responseListener) {\n             responseListener.onResponse(ONE_HIT_SEARCH_RESPONSE);\n@@ -214,7 +223,21 @@ protected void doNextBulk(BulkRequest request, ActionListener<BulkResponse> next\n \n         @Override\n         protected void doSaveState(IndexerState state, TransformIndexerPosition position, Runnable next) {\n+            // assert that the indexer does not call doSaveState again, while its still saving state\n+            // this is only useful togehter with the doSaveStateLatch\n+            assertTrue(\"doSaveState called again while still in progress\", saveStateInProgress.compareAndSet(false, true));\n+            if (doSaveStateLatch != null) {\n+                try {\n+                    doSaveStateLatch.await();\n+\n+                } catch (InterruptedException e) {\n+                    throw new IllegalStateException(e);\n+                }\n+            }\n+\n             assert state == IndexerState.STARTED || state == IndexerState.INDEXING || state == IndexerState.STOPPED;\n+\n+            assertTrue(saveStateInProgress.compareAndSet(true, false));\n             next.run();\n         }\n \n@@ -288,7 +311,7 @@ public void testRetentionPolicyExecution() throws Exception {\n             assertTrue(indexer.maybeTriggerAsyncJob(System.currentTimeMillis()));\n             assertThat(indexer.getState(), oneOf(IndexerState.INDEXING, IndexerState.STARTED));\n \n-            assertBusy(() -> assertEquals(1L, indexer.getLastCheckpoint().getCheckpoint()), 5, TimeUnit.HOURS);\n+            assertBusy(() -> assertEquals(1L, indexer.getLastCheckpoint().getCheckpoint()), 5, TimeUnit.SECONDS);\n \n             // delete by query has been executed\n             assertEquals(1, indexer.getDeleteByQueryCallCount());\n@@ -340,6 +363,63 @@ public void testRetentionPolicyExecution() throws Exception {\n         }\n     }\n \n+    /**\n+     * This test ensures correct handling of async behavior during indexer shutdown\n+     *\n+     * Indexer shutdown is not atomic: 1st the state is set back to e.g. STARTED, afterwards state is stored.\n+     * State is stored async and is IO based, there it can take time until this is done.\n+     *\n+     * Between setting the state and storing it, some race condition occurred, this test acts\n+     * as regression test.\n+     */\n+    public void testInterActionWhileIndexerShutsdown() throws Exception {\n+        TransformConfig config = new TransformConfig(\n+            randomAlphaOfLength(10),\n+            randomSourceConfig(),\n+            randomDestConfig(),\n+            null,\n+            new TimeSyncConfig(\"timestamp\", TimeValue.timeValueSeconds(1)),\n+            null,\n+            randomPivotConfig(),\n+            null,\n+            randomBoolean() ? null : randomAlphaOfLengthBetween(1, 1000),\n+            null,\n+            null,\n+            null,\n+            null\n+        );\n+        AtomicReference<IndexerState> state = new AtomicReference<>(IndexerState.STARTED);\n+\n+        TransformContext context = new TransformContext(TransformTaskState.STARTED, \"\", 0, mock(TransformContext.Listener.class));\n+        final MockedTransformIndexer indexer = createMockIndexer(\n+            5,\n+            config,\n+            state,\n+            null,\n+            threadPool,\n+            auditor,\n+            new TransformIndexerStats(),\n+            context\n+        );\n+\n+        // add a latch at doSaveState\n+        CountDownLatch saveStateLatch = indexer.createAwaitForDoSaveStateLatch(1);\n+\n+        indexer.start();\n+        assertTrue(indexer.maybeTriggerAsyncJob(System.currentTimeMillis()));\n+        assertEquals(indexer.getState(), IndexerState.INDEXING);\n+\n+        assertBusy(() -> assertEquals(IndexerState.STARTED, indexer.getState()), 5, TimeUnit.SECONDS);\n+\n+        // the indexer thread is shutting down, the trigger should be ignored\n+        assertFalse(indexer.maybeTriggerAsyncJob(System.currentTimeMillis()));\n+        this.<Void>assertAsync(listener -> setStopAtCheckpoint(indexer, true, listener), v -> {});\n+        saveStateLatch.countDown();\n+\n+        // after the indexer has shutdown, it should check for stop at checkpoint and shutdown\n+        assertBusy(() -> assertEquals(IndexerState.STOPPED, indexer.getState()), 5, TimeUnit.SECONDS);\n+    }\n+\n     private MockedTransformIndexer createMockIndexer(\n         int numberOfLoops,\n         TransformConfig config,\n@@ -370,4 +450,36 @@ private MockedTransformIndexer createMockIndexer(\n         indexer.initialize();\n         return indexer;\n     }\n+\n+    private void setStopAtCheckpoint(\n+        TransformIndexer indexer,\n+        boolean shouldStopAtCheckpoint,\n+        ActionListener<Void> shouldStopAtCheckpointListener\n+    ) {\n+        // we need to simulate that this is called from the task, which offloads it to the generic threadpool\n+        CountDownLatch latch = new CountDownLatch(1);\n+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {\n+            indexer.setStopAtCheckpoint(shouldStopAtCheckpoint, shouldStopAtCheckpointListener);\n+            latch.countDown();\n+        });\n+        try {\n+            assertTrue(\"timed out after 5s\", latch.await(5, TimeUnit.SECONDS));\n+        } catch (InterruptedException e) {\n+            fail(\"timed out after 5s\");\n+        }\n+    }\n+\n+    private <T> void assertAsync(Consumer<ActionListener<T>> function, Consumer<T> furtherTests) throws InterruptedException {\n+        CountDownLatch latch = new CountDownLatch(1);\n+        AtomicBoolean listenerCalled = new AtomicBoolean(false);\n+\n+        LatchedActionListener<T> listener = new LatchedActionListener<>(ActionListener.wrap(r -> {\n+            assertTrue(\"listener called more than once\", listenerCalled.compareAndSet(false, true));\n+            furtherTests.accept(r);\n+        }, e -> { fail(\"got unexpected exception: \" + e); }), latch);\n+\n+        function.accept(listener);\n+        assertTrue(\"timed out after 5s\", latch.await(5, TimeUnit.SECONDS));\n+    }\n+\n }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java",
+          "patch": "@@ -9,6 +9,7 @@\n \n import org.apache.lucene.search.TotalHits;\n import org.elasticsearch.action.ActionListener;\n+import org.elasticsearch.action.LatchedActionListener;\n import org.elasticsearch.action.admin.indices.refresh.RefreshResponse;\n import org.elasticsearch.action.bulk.BulkItemResponse;\n import org.elasticsearch.action.bulk.BulkRequest;\n@@ -53,6 +54,7 @@\n import java.util.Map;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.TimeUnit;\n+import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.function.Consumer;\n \n@@ -98,6 +100,9 @@ class MockedTransformIndexer extends TransformIndexer {\n         // used for synchronizing with the test\n         private CountDownLatch searchLatch;\n         private CountDownLatch doProcessLatch;\n+        private CountDownLatch doSaveStateLatch;\n+\n+        private AtomicBoolean saveStateInProgress = new AtomicBoolean(false);\n \n         // how many loops to execute until reporting done\n         private int numberOfLoops;\n@@ -146,6 +151,10 @@ public CountDownLatch createCountDownOnResponseLatch(int count) {\n             return doProcessLatch = new CountDownLatch(count);\n         }\n \n+        public CountDownLatch createAwaitForDoSaveStateLatch(int count) {\n+            return doSaveStateLatch = new CountDownLatch(count);\n+        }\n+\n         @Override\n         void doGetInitialProgress(SearchRequest request, ActionListener<SearchResponse> responseListener) {\n             responseListener.onResponse(ONE_HIT_SEARCH_RESPONSE);\n@@ -214,7 +223,21 @@ protected void doNextBulk(BulkRequest request, ActionListener<BulkResponse> next\n \n         @Override\n         protected void doSaveState(IndexerState state, TransformIndexerPosition position, Runnable next) {\n+            // assert that the indexer does not call doSaveState again, while its still saving state\n+            // this is only useful togehter with the doSaveStateLatch\n+            assertTrue(\"doSaveState called again while still in progress\", saveStateInProgress.compareAndSet(false, true));\n+            if (doSaveStateLatch != null) {\n+                try {\n+                    doSaveStateLatch.await();\n+\n+                } catch (InterruptedException e) {\n+                    throw new IllegalStateException(e);\n+                }\n+            }\n+\n             assert state == IndexerState.STARTED || state == IndexerState.INDEXING || state == IndexerState.STOPPED;\n+\n+            assertTrue(saveStateInProgress.compareAndSet(true, false));\n             next.run();\n         }\n \n@@ -288,7 +311,7 @@ public void testRetentionPolicyExecution() throws Exception {\n             assertTrue(indexer.maybeTriggerAsyncJob(System.currentTimeMillis()));\n             assertThat(indexer.getState(), oneOf(IndexerState.INDEXING, IndexerState.STARTED));\n \n-            assertBusy(() -> assertEquals(1L, indexer.getLastCheckpoint().getCheckpoint()), 5, TimeUnit.HOURS);\n+            assertBusy(() -> assertEquals(1L, indexer.getLastCheckpoint().getCheckpoint()), 5, TimeUnit.SECONDS);\n \n             // delete by query has been executed\n             assertEquals(1, indexer.getDeleteByQueryCallCount());\n@@ -340,6 +363,63 @@ public void testRetentionPolicyExecution() throws Exception {\n         }\n     }\n \n+    /**\n+     * This test ensures correct handling of async behavior during indexer shutdown\n+     *\n+     * Indexer shutdown is not atomic: 1st the state is set back to e.g. STARTED, afterwards state is stored.\n+     * State is stored async and is IO based, there it can take time until this is done.\n+     *\n+     * Between setting the state and storing it, some race condition occurred, this test acts\n+     * as regression test.\n+     */\n+    public void testInterActionWhileIndexerShutsdown() throws Exception {\n+        TransformConfig config = new TransformConfig(\n+            randomAlphaOfLength(10),\n+            randomSourceConfig(),\n+            randomDestConfig(),\n+            null,\n+            new TimeSyncConfig(\"timestamp\", TimeValue.timeValueSeconds(1)),\n+            null,\n+            randomPivotConfig(),\n+            null,\n+            randomBoolean() ? null : randomAlphaOfLengthBetween(1, 1000),\n+            null,\n+            null,\n+            null,\n+            null\n+        );\n+        AtomicReference<IndexerState> state = new AtomicReference<>(IndexerState.STARTED);\n+\n+        TransformContext context = new TransformContext(TransformTaskState.STARTED, \"\", 0, mock(TransformContext.Listener.class));\n+        final MockedTransformIndexer indexer = createMockIndexer(\n+            5,\n+            config,\n+            state,\n+            null,\n+            threadPool,\n+            auditor,\n+            new TransformIndexerStats(),\n+            context\n+        );\n+\n+        // add a latch at doSaveState\n+        CountDownLatch saveStateLatch = indexer.createAwaitForDoSaveStateLatch(1);\n+\n+        indexer.start();\n+        assertTrue(indexer.maybeTriggerAsyncJob(System.currentTimeMillis()));\n+        assertEquals(indexer.getState(), IndexerState.INDEXING);\n+\n+        assertBusy(() -> assertEquals(IndexerState.STARTED, indexer.getState()), 5, TimeUnit.SECONDS);\n+\n+        // the indexer thread is shutting down, the trigger should be ignored\n+        assertFalse(indexer.maybeTriggerAsyncJob(System.currentTimeMillis()));\n+        this.<Void>assertAsync(listener -> setStopAtCheckpoint(indexer, true, listener), v -> {});\n+        saveStateLatch.countDown();\n+\n+        // after the indexer has shutdown, it should check for stop at checkpoint and shutdown\n+        assertBusy(() -> assertEquals(IndexerState.STOPPED, indexer.getState()), 5, TimeUnit.SECONDS);\n+    }\n+\n     private MockedTransformIndexer createMockIndexer(\n         int numberOfLoops,\n         TransformConfig config,\n@@ -370,4 +450,36 @@ private MockedTransformIndexer createMockIndexer(\n         indexer.initialize();\n         return indexer;\n     }\n+\n+    private void setStopAtCheckpoint(\n+        TransformIndexer indexer,\n+        boolean shouldStopAtCheckpoint,\n+        ActionListener<Void> shouldStopAtCheckpointListener\n+    ) {\n+        // we need to simulate that this is called from the task, which offloads it to the generic threadpool\n+        CountDownLatch latch = new CountDownLatch(1);\n+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {\n+            indexer.setStopAtCheckpoint(shouldStopAtCheckpoint, shouldStopAtCheckpointListener);\n+            latch.countDown();\n+        });\n+        try {\n+            assertTrue(\"timed out after 5s\", latch.await(5, TimeUnit.SECONDS));\n+        } catch (InterruptedException e) {\n+            fail(\"timed out after 5s\");\n+        }\n+    }\n+\n+    private <T> void assertAsync(Consumer<ActionListener<T>> function, Consumer<T> furtherTests) throws InterruptedException {\n+        CountDownLatch latch = new CountDownLatch(1);\n+        AtomicBoolean listenerCalled = new AtomicBoolean(false);\n+\n+        LatchedActionListener<T> listener = new LatchedActionListener<>(ActionListener.wrap(r -> {\n+            assertTrue(\"listener called more than once\", listenerCalled.compareAndSet(false, true));\n+            furtherTests.accept(r);\n+        }, e -> { fail(\"got unexpected exception: \" + e); }), latch);\n+\n+        function.accept(listener);\n+        assertTrue(\"timed out after 5s\", latch.await(5, TimeUnit.SECONDS));\n+    }\n+\n }"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 801996519,
+      "created_at": "2021-03-18T14:57:18Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/ml-core (Team:ML)"
+    },
+    {
+      "type": "review_comment",
+      "id": 596990516,
+      "created_at": "2021-03-18T15:40:26Z",
+      "user": "benwtrent",
+      "body": "This seems like a bad bug :/\r\n\r\nPreviously, even if we were waiting to stop at a checkpoint we would just set the indexer to stopped and save state. No wonder we had two things attempting to save state + a weird race condition \r\n\r\n",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java",
+      "diff_hunk": "@@ -1109,13 +1130,18 @@ private void configurePageSize(Integer newPageSize) {\n \n     private synchronized void startIndexerThreadShutdown() {\n         indexerThreadShuttingDown = true;\n-        stopCalledDuringIndexerThreadShutdown = false;\n+        saveStateRequestedDuringIndexerThreadShutdown = false;\n     }\n \n     private synchronized void finishIndexerThreadShutdown() {\n         indexerThreadShuttingDown = false;\n-        if (stopCalledDuringIndexerThreadShutdown) {\n-            doSaveState(IndexerState.STOPPED, getPosition(), () -> {});\n+        if (saveStateRequestedDuringIndexerThreadShutdown) {\n+            // if stop has been called and set shouldStopAtCheckpoint to true,\n+            // we should stop if we just finished a checkpoint\n+            if (context.shouldStopAtCheckpoint() && nextCheckpoint == null) {\n+                stop();\n+            }\n+            doSaveState(getState(), getPosition(), () -> {});",
+      "start_line": 1117,
+      "original_start_line": 1117,
+      "start_side": "LEFT",
+      "line": 1144,
+      "original_line": 1144,
+      "side": "RIGHT",
+      "original_position": 96,
+      "position": 99,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 596991419,
+      "created_at": "2021-03-18T15:41:33Z",
+      "user": "benwtrent",
+      "body": "I know that this name has been the same for a while.\r\n\r\nBut I think something like `stopAndMaybeSaveState` is better is it will only save state if the indexer is NOT already shutting down + the indexer stopped.",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java",
+      "diff_hunk": "@@ -719,9 +737,12 @@ private synchronized boolean addSetStopAtCheckpointListener(\n \n     synchronized void stopAndSaveState() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 738,
+      "side": "RIGHT",
+      "original_position": 65,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 596992549,
+      "created_at": "2021-03-18T15:42:50Z",
+      "user": "benwtrent",
+      "body": "👍 ",
+      "path": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformTask.java",
+      "diff_hunk": "@@ -363,10 +363,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n         // or has yet to even start one.\n         // Either way, this means that we won't get to have onFinish called down stream (or at least won't for some time).\n             (indexerState == IndexerState.STARTED && getIndexer().initialRun())) {\n-            IndexerState state = getIndexer().stop();\n-            if (state == IndexerState.STOPPED) {\n-                getIndexer().stopAndSaveState();\n-            }\n+            getIndexer().stopAndSaveState();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 366,
+      "side": "RIGHT",
+      "original_position": 8,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 615546626,
+      "created_at": "2021-03-18T15:45:16Z",
+      "user": "benwtrent",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-22T08:05:26Z",
+      "sha": "1604effd597df2357bd1e74546a04e1dc6e84e12",
+      "message": "address review comments",
+      "author": "Hendrik Muhs",
+      "author_email": "hendrik.muhs@elastic.co",
+      "author_raw_date": "2021-03-22T08:05:26Z",
+      "author_date": "2021-03-22T08:05:26Z",
+      "committer": "Hendrik Muhs",
+      "committer_email": "hendrik.muhs@elastic.co",
+      "raw_date": "2021-03-22T08:05:26Z",
+      "diff_text": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java\n@@ -735,7 +735,7 @@ private synchronized boolean addSetStopAtCheckpointListener(\n         return true;\n     }\n \n-    synchronized void stopAndSaveState() {\n+    synchronized void stopAndMaybeSaveState() {\n         onStop();\n         IndexerState state = stop();\n \nx-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformTask.java\n@@ -346,7 +346,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n \n         // If state was in a failed state, we should stop immediately\n         if (wasFailed) {\n-            getIndexer().stopAndSaveState();\n+            getIndexer().stopAndMaybeSaveState();\n             return;\n         }\n \n@@ -363,7 +363,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n         // or has yet to even start one.\n         // Either way, this means that we won't get to have onFinish called down stream (or at least won't for some time).\n             (indexerState == IndexerState.STARTED && getIndexer().initialRun())) {\n-            getIndexer().stopAndSaveState();\n+            getIndexer().stopAndMaybeSaveState();\n         }\n     }\n ",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformIndexer.java",
+          "patch": "@@ -735,7 +735,7 @@ private synchronized boolean addSetStopAtCheckpointListener(\n         return true;\n     }\n \n-    synchronized void stopAndSaveState() {\n+    synchronized void stopAndMaybeSaveState() {\n         onStop();\n         IndexerState state = stop();\n "
+        },
+        {
+          "file": "x-pack/plugin/transform/src/main/java/org/elasticsearch/xpack/transform/transforms/TransformTask.java",
+          "patch": "@@ -346,7 +346,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n \n         // If state was in a failed state, we should stop immediately\n         if (wasFailed) {\n-            getIndexer().stopAndSaveState();\n+            getIndexer().stopAndMaybeSaveState();\n             return;\n         }\n \n@@ -363,7 +363,7 @@ public synchronized void stop(boolean force, boolean shouldStopAtCheckpoint) {\n         // or has yet to even start one.\n         // Either way, this means that we won't get to have onFinish called down stream (or at least won't for some time).\n             (indexerState == IndexerState.STARTED && getIndexer().initialRun())) {\n-            getIndexer().stopAndSaveState();\n+            getIndexer().stopAndMaybeSaveState();\n         }\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 598524601,
+      "created_at": "2021-03-22T08:55:24Z",
+      "user": "przemekwitek",
+      "body": "```suggestion\r\n            // assert that the indexer does not call doSaveState again, while it is still saving state\r\n```",
+      "path": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java",
+      "diff_hunk": "@@ -214,7 +223,21 @@ protected void doNextBulk(BulkRequest request, ActionListener<BulkResponse> next\n \n         @Override\n         protected void doSaveState(IndexerState state, TransformIndexerPosition position, Runnable next) {\n+            // assert that the indexer does not call doSaveState again, while its still saving state",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 226,
+      "side": "RIGHT",
+      "original_position": 41,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 598524831,
+      "created_at": "2021-03-22T08:55:39Z",
+      "user": "przemekwitek",
+      "body": "```suggestion\r\n            // this is only useful together with the doSaveStateLatch\r\n```",
+      "path": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java",
+      "diff_hunk": "@@ -214,7 +223,21 @@ protected void doNextBulk(BulkRequest request, ActionListener<BulkResponse> next\n \n         @Override\n         protected void doSaveState(IndexerState state, TransformIndexerPosition position, Runnable next) {\n+            // assert that the indexer does not call doSaveState again, while its still saving state\n+            // this is only useful togehter with the doSaveStateLatch",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 227,
+      "side": "RIGHT",
+      "original_position": 42,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 598525543,
+      "created_at": "2021-03-22T08:56:41Z",
+      "user": "przemekwitek",
+      "body": "```suggestion\r\n     * State is stored async and is IO based, therefore it can take time until this is done.\r\n```",
+      "path": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java",
+      "diff_hunk": "@@ -340,6 +363,63 @@ public void testRetentionPolicyExecution() throws Exception {\n         }\n     }\n \n+    /**\n+     * This test ensures correct handling of async behavior during indexer shutdown\n+     *\n+     * Indexer shutdown is not atomic: 1st the state is set back to e.g. STARTED, afterwards state is stored.\n+     * State is stored async and is IO based, there it can take time until this is done.",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 370,
+      "side": "RIGHT",
+      "original_position": 76,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 617273367,
+      "created_at": "2021-03-22T08:58:12Z",
+      "user": "przemekwitek",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-22T09:04:13Z",
+      "sha": "94c2ecbccc768f4145c7c353d3b08766fbafe2d0",
+      "message": "Apply suggestions from code review\n\nCo-authored-by: Przemysław Witek <przemyslaw.witek@elastic.co>",
+      "author": "Hendrik Muhs",
+      "author_email": "hendrik.muhs@elastic.co",
+      "author_raw_date": "2021-03-22T09:04:13Z",
+      "author_date": "2021-03-22T09:04:13Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2021-03-22T09:04:13Z",
+      "diff_text": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java\n@@ -223,8 +223,8 @@ protected void doNextBulk(BulkRequest request, ActionListener<BulkResponse> next\n \n         @Override\n         protected void doSaveState(IndexerState state, TransformIndexerPosition position, Runnable next) {\n-            // assert that the indexer does not call doSaveState again, while its still saving state\n-            // this is only useful togehter with the doSaveStateLatch\n+            // assert that the indexer does not call doSaveState again, while it is still saving state\n+            // this is only useful together with the doSaveStateLatch\n             assertTrue(\"doSaveState called again while still in progress\", saveStateInProgress.compareAndSet(false, true));\n             if (doSaveStateLatch != null) {\n                 try {\n@@ -367,7 +367,7 @@ public void testRetentionPolicyExecution() throws Exception {\n      * This test ensures correct handling of async behavior during indexer shutdown\n      *\n      * Indexer shutdown is not atomic: 1st the state is set back to e.g. STARTED, afterwards state is stored.\n-     * State is stored async and is IO based, there it can take time until this is done.\n+     * State is stored async and is IO based, therefore it can take time until this is done.\n      *\n      * Between setting the state and storing it, some race condition occurred, this test acts\n      * as regression test.",
+      "diff": [
+        {
+          "file": "x-pack/plugin/transform/src/test/java/org/elasticsearch/xpack/transform/transforms/TransformIndexerTests.java",
+          "patch": "@@ -223,8 +223,8 @@ protected void doNextBulk(BulkRequest request, ActionListener<BulkResponse> next\n \n         @Override\n         protected void doSaveState(IndexerState state, TransformIndexerPosition position, Runnable next) {\n-            // assert that the indexer does not call doSaveState again, while its still saving state\n-            // this is only useful togehter with the doSaveStateLatch\n+            // assert that the indexer does not call doSaveState again, while it is still saving state\n+            // this is only useful together with the doSaveStateLatch\n             assertTrue(\"doSaveState called again while still in progress\", saveStateInProgress.compareAndSet(false, true));\n             if (doSaveStateLatch != null) {\n                 try {\n@@ -367,7 +367,7 @@ public void testRetentionPolicyExecution() throws Exception {\n      * This test ensures correct handling of async behavior during indexer shutdown\n      *\n      * Indexer shutdown is not atomic: 1st the state is set back to e.g. STARTED, afterwards state is stored.\n-     * State is stored async and is IO based, there it can take time until this is done.\n+     * State is stored async and is IO based, therefore it can take time until this is done.\n      *\n      * Between setting the state and storing it, some race condition occurred, this test acts\n      * as regression test."
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 617335455,
+      "created_at": "2021-03-22T10:01:25Z",
+      "user": "przemekwitek",
+      "state": "APPROVED",
+      "body": "LGTM"
+    }
+  ]
+}

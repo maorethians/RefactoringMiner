@@ -1,0 +1,58 @@
+{
+    "pr_body": "In #77178 a searchable snapshot test failed because a file was still opened when the data node started and tried to clean up that specific file. Investigation shows that the file was a cache file, the filesystem was `WindowFS` and that the node tried to delete the file during the repopulate of the searchable snapshot persistent cache. \r\n\r\nThe cache file was opened because a searchable snapshot shard was being verified for corruption (`index.shard.check_on_startup: true`) right before a full cluster restart. The index check is done during peer recovery and increments a ref on the store and releases it once the check is done. The recovery process also increments a ref on the same store and releases it when the recovery is done or fails.\r\n\r\nBut having the cache file opened during the node restart is an indication that the `Store` and `SearchableSnapshotDirectory` might have not be fully released (a closed directory would have stopped the index check pretty quickly by throwing `AlreadyClosedException`).\r\n\r\nLooking at the logs from the test we can see:\r\n```\r\n[2021-09-02T12:07:59,820][INFO ][o.e.t.InternalTestCluster] [testCreateAndRestorePartialSearchableSnapshot] Stopping and resetting node [node_s1] \r\n[2021-09-02T12:08:00,005][INFO ][o.e.n.Node               ] [testCreateAndRestorePartialSearchableSnapshot] closed\r\n...\r\n[2021-09-02T12:08:00,036][INFO ][o.e.t.InternalTestCluster] [testCreateAndRestorePartialSearchableSnapshot] Stopping and resetting node [node_s2] \r\n[2021-09-02T12:08:00,221][INFO ][o.e.n.Node               ] [testCreateAndRestorePartialSearchableSnapshot] closed\r\n...\r\n[2021-09-02T12:08:10,243][INFO ][o.e.i.r.PeerRecoveryTargetService] [node_s2] recovery of [xovxqrptfc][4] from [{node_s1}{OI5ThPFhSnqgtQNYGYJOlA}{urJj-osHSomzDony-dfbcg}{127.0.0.1}{127.0.0.1:35748}{cdfhilmrstw}{xpack.installed=true}] interrupted by network disconnect, will retry in [5s]; cause: [[node_s1][127.0.0.1:35748] Node not connected]\r\n[2021-09-02T12:08:10,244][INFO ][o.e.i.r.PeerRecoveryTargetService] [node_s2] recovery of [xovxqrptfc][5] from [{node_s1}{OI5ThPFhSnqgtQNYGYJOlA}{urJj-osHSomzDony-dfbcg}{127.0.0.1}{127.0.0.1:35748}{cdfhilmrstw}{xpack.installed=true}] interrupted by network disconnect, will retry in [5s]; cause: [[node_s1][127.0.0.1:35748] Node not connected]\r\n...\r\n[2021-09-02T12:08:10,505][INFO ][o.e.t.InternalTestCluster] [testCreateAndRestorePartialSearchableSnapshot] recreating node [node_s2] \r\n...\r\norg.elasticsearch.ElasticsearchException: java.io.IOException: access denied: /var/lib/jenkins/workspace/elastic+elasticsearch+master+multijob+platform-support-unix/os/centos-7&&immutable/x-pack/plugin/searchable-snapshots/build/testrun/internalClusterTest/temp/org.elasticsearch.xpack.searchablesnapshots.FrozenSearchableSnapshotsIntegTests_56B5E0A9C949E1D2-001/tempDir-002/node_s2/indices/jvnmfpSxTDG5sGhI07FVcg/4/snapshot_cache/-XXiEyMOQrCuPfojK-0R0Q/eOf3tXJeShS38UStFPglOA\r\n```\r\nwhere we can see that the recovery source node `node_s1` is stopped and this is detected by the recovery target `node_s2` that will retry the recovery. But the retry can't be executed as the `node_s2` is being shut down and since a change in #60586 the RecoveryRunner is not failed anymore when the executor is shut down, leaking a store reference not released (the one incremented when the `RecoveryTarget` is instanciated).\r\n\r\nThis pull request allows the RecoveryRunner to be notified of the rejection of the recovery retry during shutdown and therefore release the store, without bringing the annoying logs that were \"muted\" by #60586.\r\n\r\nThe test in #77178 uses internal test cluster and nodes that are all restarted in memory; I tried to look at a way to \"wait for index check\" to be processed/fully released during shutdown but there is no easy way to do that for searchable snapshots shards. I expect the bug fix here to be enough to close #77178  and if that fails again with cache files still opened then we can change the test to wait for cache fetch thread pool to idle.\r\n\r\nNote to reviewers: this is somewhat similar to #77783. Sorry for the long description, I wanted to be sure to capture everything in case the test failed again.",
+    "original_commit_id": "1eb591dc58d3f26bc8b5fa55f9c95ded2d7c2239",
+    "merged": false,
+    "pr_number": 78067,
+    "pr_title": "Fix leaking store ref on peer recovery connection drop at shutdown",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "Hi @tlrx, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-distributed-obsolete (Team:Distributed (Obsolete))",
+        "Pinging @elastic/es-distributed-indexing (Team:Distributed Indexing)"
+    ],
+    "commit_id": "7afc2e69f116266b1140e828169f191289eba3db",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 573,
+            "start_side": null,
+            "start_line": null,
+            "line": 573,
+            "comment_lines": [
+                "[][573]"
+            ],
+            "review_comment": [
+                "I think it's impossible to get here right? Generic only ever rejects when shut down right?"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java",
+            "id": 36243,
+            "created_at": "2021-09-21T14:26:08Z",
+            "original_position": 48,
+            "side": "RIGHT",
+            "position": 48,
+            "original_start_line": null
+        },
+        {
+            "original_line": 553,
+            "start_side": null,
+            "start_line": null,
+            "line": 553,
+            "comment_lines": [
+                "[][553]"
+            ],
+            "review_comment": [
+                "The problem I see here is that we will often just not get this far when the pool shuts down with this thing scheduled to run at some later point in time will we?\r\n\r\nMaybe we do need some lifecycle on `PeerRecoveryTargetService` after all, then track the queued up retries and fail those one stop/close like we have for the source service?",
+                "> The problem I see here is that we will often just not get this far when the pool shuts down with this thing scheduled to run at some later point in time will we?\r\n\r\nYes, I think you're right \ud83e\udd26\ud83c\udffb I somehow managed to not see this obvious point when I created this PR.\r\n\r\n\r\n\r\n> Maybe we do need some lifecycle on `PeerRecoveryTargetService` after all, then track the queued up retries and fail those one stop/close like we have for the source service?\r\n\r\nI also agree - I think this is the only way to ensure that resources are correctly terminated at shutdown. I'll take a look at this and will close this PR if I manage to implement what you suggested."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java",
+            "id": 36244,
+            "created_at": "2021-09-21T14:32:05Z",
+            "original_position": 28,
+            "side": "RIGHT",
+            "position": 28,
+            "original_start_line": null
+        }
+    ]
+}

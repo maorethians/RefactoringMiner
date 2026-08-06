@@ -1,0 +1,196 @@
+{
+  "repo": "netty/netty",
+  "number": 10221,
+  "pr_number": 10221,
+  "title": "Detect CNAME loops in the CNAME cache while trying to resolve",
+  "user": "normanmaurer",
+  "created_at": "2020-04-27T14:22:55Z",
+  "merged_at": "2020-04-28T08:47:10Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "5fa5ce34e1580932c54cde56dd51c207288edde3",
+  "merge_commit_sha": "387e451c8289f05bf553821170bde30052101f8a",
+  "commits": 2,
+  "issue_events": [
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "review_requested",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "milestoned",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "mentioned",
+    "subscribed",
+    "referenced"
+  ],
+  "url": "https://github.com/netty/netty/pull/10221",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-04-27T14:20:36Z",
+      "sha": "7d28b37a1195a2760f49e4dd3b011a3b59b005eb",
+      "message": "Detect CNAME loops in the CNAME cache while trying to resolve\n\nMotivation:\n\nWe need to detect CNAME loops during lookup the DnsCnameCache as otherwise we may try to follow cnames forever.\n\nModifications:\n\n- Correctly detect CNAME loops in the cache\n- Add unit test\n\nResult:\n\nFixes https://github.com/netty/netty/issues/10220",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2020-04-27T14:20:36Z",
+      "author_date": "2020-04-27T14:20:36Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2020-04-27T14:20:36Z",
+      "diff_text": "resolver-dns/src/main/java/io/netty/resolver/dns/DnsResolveContext.java\n@@ -276,15 +276,48 @@ private static String hostnameWithDot(String name) {\n         return name + '.';\n     }\n \n-    private void internalResolve(String name, Promise<List<T>> promise) {\n-        for (;;) {\n-            // Resolve from cnameCache() until there is no more cname entry cached.\n-            String mapping = cnameCache().get(hostnameWithDot(name));\n-            if (mapping == null) {\n+    // Resolve the final name from the CNAME cache until there is nothing to follow anymore. This also\n+    // guards against loops in the cache but early return once a loop is detected.\n+    private String cnameResolveFromCache(String name) {\n+        DnsCnameCache cnameCache = cnameCache();\n+        String first = cnameCache.get(hostnameWithDot(name));\n+        if (first == null) {\n+            // Nothing in the cache at all\n+            return name;\n+        }\n+\n+        String mapping = cnameCache.get(hostnameWithDot(first));\n+        if (mapping == null) {\n+            // Nothing else to follow, return first match.\n+            return first;\n+        }\n+\n+        if (first.equals(mapping)) {\n+            // Loop detected.... early return.\n+            return first;\n+        }\n+\n+        // Detect loops using a HashSet. We use this as last resort implementation to reduce allocations in the most\n+        // common cases.\n+        Set<String> cnames = new HashSet<String>(4);\n+        cnames.add(first);\n+        cnames.add(mapping);\n+\n+        name = mapping;\n+        // Resolve from cnameCache() until there is no more cname entry cached.\n+        while ((mapping = cnameCache.get(hostnameWithDot(name))) != null) {\n+            if (!cnames.add(mapping)) {\n+                // Follow CNAME from cache would loop. Lets break here.\n                 break;\n             }\n             name = mapping;\n         }\n+        return name;\n+    }\n+\n+    private void internalResolve(String name, Promise<List<T>> promise) {\n+        // Resolve from cnameCache() until there is no more cname entry cached.\n+        name = cnameResolveFromCache(name);\n \n         try {\n             DnsServerAddressStream nameServerAddressStream = getNameServers(name);\n@@ -954,24 +987,7 @@ private DnsServerAddressStream getNameServers(String hostname) {\n \n     private void followCname(DnsQuestion question, String cname, DnsQueryLifecycleObserver queryLifecycleObserver,\n                              Promise<List<T>> promise) {\n-        Set<String> cnames = null;\n-        for (;;) {\n-            // Resolve from cnameCache() until there is no more cname entry cached.\n-            String mapping = cnameCache().get(hostnameWithDot(cname));\n-            if (mapping == null) {\n-                break;\n-            }\n-            if (cnames == null) {\n-                // Detect loops.\n-                cnames = new HashSet<String>(2);\n-            }\n-            if (!cnames.add(cname)) {\n-                // Follow CNAME from cache would loop. Lets break here.\n-                break;\n-            }\n-            cname = mapping;\n-        }\n-\n+        cname = cnameResolveFromCache(cname);\n         DnsServerAddressStream stream = getNameServers(cname);\n \n         final DnsQuestion cnameQuestion;\nresolver-dns/src/test/java/io/netty/resolver/dns/DnsNameResolverTest.java\n@@ -2199,6 +2199,32 @@ public Set<ResourceRecord> getRecords(QuestionRecord question) {\n         }\n     }\n \n+    @Test\n+    public void testCNAMELoopInCache() {\n+        expectedException.expect(UnknownHostException.class);\n+        DnsNameResolver resolver = null;\n+        try {\n+            DnsNameResolverBuilder builder = newResolver()\n+                    .recursionDesired(false)\n+                    .resolvedAddressTypes(ResolvedAddressTypes.IPV4_ONLY)\n+                    .maxQueriesPerResolve(16)\n+                    .nameServerProvider(new SingletonDnsServerAddressStreamProvider(dnsServer.localAddress()));\n+\n+            resolver = builder.build();\n+            // Add a CNAME loop into the cache\n+            String name = \"somehost.netty.io.\";\n+            String name2 = \"cname.netty.io.\";\n+\n+            resolver.cnameCache().cache(name, name2, Long.MAX_VALUE, resolver.executor());\n+            resolver.cnameCache().cache(name2, name, Long.MAX_VALUE, resolver.executor());\n+            resolver.resolve(name).syncUninterruptibly().getNow();\n+        } finally {\n+            if (resolver != null) {\n+                resolver.close();\n+            }\n+        }\n+    }\n+\n     @Test\n     public void testSearchDomainQueryFailureForSingleAddressTypeCompletes() {\n         expectedException.expect(UnknownHostException.class);",
+      "diff": [
+        {
+          "file": "resolver-dns/src/main/java/io/netty/resolver/dns/DnsResolveContext.java",
+          "patch": "@@ -276,15 +276,48 @@ private static String hostnameWithDot(String name) {\n         return name + '.';\n     }\n \n-    private void internalResolve(String name, Promise<List<T>> promise) {\n-        for (;;) {\n-            // Resolve from cnameCache() until there is no more cname entry cached.\n-            String mapping = cnameCache().get(hostnameWithDot(name));\n-            if (mapping == null) {\n+    // Resolve the final name from the CNAME cache until there is nothing to follow anymore. This also\n+    // guards against loops in the cache but early return once a loop is detected.\n+    private String cnameResolveFromCache(String name) {\n+        DnsCnameCache cnameCache = cnameCache();\n+        String first = cnameCache.get(hostnameWithDot(name));\n+        if (first == null) {\n+            // Nothing in the cache at all\n+            return name;\n+        }\n+\n+        String mapping = cnameCache.get(hostnameWithDot(first));\n+        if (mapping == null) {\n+            // Nothing else to follow, return first match.\n+            return first;\n+        }\n+\n+        if (first.equals(mapping)) {\n+            // Loop detected.... early return.\n+            return first;\n+        }\n+\n+        // Detect loops using a HashSet. We use this as last resort implementation to reduce allocations in the most\n+        // common cases.\n+        Set<String> cnames = new HashSet<String>(4);\n+        cnames.add(first);\n+        cnames.add(mapping);\n+\n+        name = mapping;\n+        // Resolve from cnameCache() until there is no more cname entry cached.\n+        while ((mapping = cnameCache.get(hostnameWithDot(name))) != null) {\n+            if (!cnames.add(mapping)) {\n+                // Follow CNAME from cache would loop. Lets break here.\n                 break;\n             }\n             name = mapping;\n         }\n+        return name;\n+    }\n+\n+    private void internalResolve(String name, Promise<List<T>> promise) {\n+        // Resolve from cnameCache() until there is no more cname entry cached.\n+        name = cnameResolveFromCache(name);\n \n         try {\n             DnsServerAddressStream nameServerAddressStream = getNameServers(name);\n@@ -954,24 +987,7 @@ private DnsServerAddressStream getNameServers(String hostname) {\n \n     private void followCname(DnsQuestion question, String cname, DnsQueryLifecycleObserver queryLifecycleObserver,\n                              Promise<List<T>> promise) {\n-        Set<String> cnames = null;\n-        for (;;) {\n-            // Resolve from cnameCache() until there is no more cname entry cached.\n-            String mapping = cnameCache().get(hostnameWithDot(cname));\n-            if (mapping == null) {\n-                break;\n-            }\n-            if (cnames == null) {\n-                // Detect loops.\n-                cnames = new HashSet<String>(2);\n-            }\n-            if (!cnames.add(cname)) {\n-                // Follow CNAME from cache would loop. Lets break here.\n-                break;\n-            }\n-            cname = mapping;\n-        }\n-\n+        cname = cnameResolveFromCache(cname);\n         DnsServerAddressStream stream = getNameServers(cname);\n \n         final DnsQuestion cnameQuestion;"
+        },
+        {
+          "file": "resolver-dns/src/test/java/io/netty/resolver/dns/DnsNameResolverTest.java",
+          "patch": "@@ -2199,6 +2199,32 @@ public Set<ResourceRecord> getRecords(QuestionRecord question) {\n         }\n     }\n \n+    @Test\n+    public void testCNAMELoopInCache() {\n+        expectedException.expect(UnknownHostException.class);\n+        DnsNameResolver resolver = null;\n+        try {\n+            DnsNameResolverBuilder builder = newResolver()\n+                    .recursionDesired(false)\n+                    .resolvedAddressTypes(ResolvedAddressTypes.IPV4_ONLY)\n+                    .maxQueriesPerResolve(16)\n+                    .nameServerProvider(new SingletonDnsServerAddressStreamProvider(dnsServer.localAddress()));\n+\n+            resolver = builder.build();\n+            // Add a CNAME loop into the cache\n+            String name = \"somehost.netty.io.\";\n+            String name2 = \"cname.netty.io.\";\n+\n+            resolver.cnameCache().cache(name, name2, Long.MAX_VALUE, resolver.executor());\n+            resolver.cnameCache().cache(name2, name, Long.MAX_VALUE, resolver.executor());\n+            resolver.resolve(name).syncUninterruptibly().getNow();\n+        } finally {\n+            if (resolver != null) {\n+                resolver.close();\n+            }\n+        }\n+    }\n+\n     @Test\n     public void testSearchDomainQueryFailureForSingleAddressTypeCompletes() {\n         expectedException.expect(UnknownHostException.class);"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-04-27T14:22:55Z",
+      "user": "normanmaurer",
+      "body": "Motivation:\r\n\r\nWe need to detect CNAME loops during lookup the DnsCnameCache as otherwise we may try to follow cnames forever.\r\n\r\nModifications:\r\n\r\n- Correctly detect CNAME loops in the cache\r\n- Add unit test\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/10220"
+    },
+    {
+      "type": "comment",
+      "id": 620019943,
+      "created_at": "2020-04-27T14:23:20Z",
+      "user": "normanmaurer",
+      "body": "/cc @igor-lukyanov"
+    },
+    {
+      "type": "review_comment",
+      "id": 415864852,
+      "created_at": "2020-04-27T14:33:21Z",
+      "user": "franz1981",
+      "body": "Just code style, so not necessary: I would pack this \"uncommon case\" in a separate method",
+      "path": "resolver-dns/src/main/java/io/netty/resolver/dns/DnsResolveContext.java",
+      "diff_hunk": "@@ -276,15 +276,48 @@ private static String hostnameWithDot(String name) {\n         return name + '.';\n     }\n \n-    private void internalResolve(String name, Promise<List<T>> promise) {\n-        for (;;) {\n-            // Resolve from cnameCache() until there is no more cname entry cached.\n-            String mapping = cnameCache().get(hostnameWithDot(name));\n-            if (mapping == null) {\n+    // Resolve the final name from the CNAME cache until there is nothing to follow anymore. This also\n+    // guards against loops in the cache but early return once a loop is detected.\n+    private String cnameResolveFromCache(String name) {\n+        DnsCnameCache cnameCache = cnameCache();\n+        String first = cnameCache.get(hostnameWithDot(name));\n+        if (first == null) {\n+            // Nothing in the cache at all\n+            return name;\n+        }\n+\n+        String mapping = cnameCache.get(hostnameWithDot(first));\n+        if (mapping == null) {\n+            // Nothing else to follow, return first match.\n+            return first;\n+        }\n+\n+        if (first.equals(mapping)) {\n+            // Loop detected.... early return.\n+            return first;\n+        }\n+\n+        // Detect loops using a HashSet. We use this as last resort implementation to reduce allocations in the most",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 304,
+      "original_line": 300,
+      "side": "RIGHT",
+      "original_position": 30,
+      "position": 34,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 415937709,
+          "user": "normanmaurer",
+          "body": "@franz1981 done... PTAL again ",
+          "created_at": "2020-04-27T15:56:34Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 401012559,
+      "created_at": "2020-04-27T14:34:07Z",
+      "user": "franz1981",
+      "state": "APPROVED",
+      "body": "LGTM just that small code change, but I'm already happy"
+    },
+    {
+      "type": "review",
+      "id": 401022968,
+      "created_at": "2020-04-27T14:43:51Z",
+      "user": "slandelle",
+      "state": "CHANGES_REQUESTED",
+      "body": "Please correct me if I'm wrong, but I think this is not sufficient.\r\n\r\nI had a similar issue in Gatling, regarding HTTP permanent redirect cache.\r\nIt turned out the user had misconfigured his rewrite rules and ended up with circular redirects:\r\n\r\nA -> B -> C -> A\r\n\r\nI recommend adding a max redirect chain depth to the while loop.\r\nBetter safe than sorry."
+    },
+    {
+      "type": "comment",
+      "id": 620038618,
+      "created_at": "2020-04-27T14:55:21Z",
+      "user": "normanmaurer",
+      "body": "@slandelle I think it should be good enough as `A` would be in the `Set` and so we would break. What I am missing ?"
+    },
+    {
+      "type": "comment",
+      "id": 620042598,
+      "created_at": "2020-04-27T15:02:20Z",
+      "user": "slandelle",
+      "body": "My bad, indeed, I had missed the check on the boolean returned by add."
+    },
+    {
+      "type": "comment",
+      "id": 620044522,
+      "created_at": "2020-04-27T15:05:36Z",
+      "user": "slandelle",
+      "body": "Then, your call: perfect solution at the cost of extra HashSet allocation vs loop limit without extra allocation?"
+    },
+    {
+      "type": "comment",
+      "id": 620048793,
+      "created_at": "2020-04-27T15:13:04Z",
+      "user": "normanmaurer",
+      "body": "@slandelle lets keep the set for now...we can add extra options later on. We only need the set if we have more then 2 links in the chain anyway"
+    },
+    {
+      "type": "commit",
+      "date": "2020-04-27T15:56:09Z",
+      "sha": "3c0de1ac4c30c4e4975996f92f0d8247aa48bacc",
+      "message": "Move slow code to extra method",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2020-04-27T15:56:09Z",
+      "author_date": "2020-04-27T15:56:09Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2020-04-27T15:56:09Z",
+      "diff_text": "resolver-dns/src/main/java/io/netty/resolver/dns/DnsResolveContext.java\n@@ -286,24 +286,28 @@ private String cnameResolveFromCache(String name) {\n             return name;\n         }\n \n-        String mapping = cnameCache.get(hostnameWithDot(first));\n-        if (mapping == null) {\n+        String second = cnameCache.get(hostnameWithDot(first));\n+        if (second == null) {\n             // Nothing else to follow, return first match.\n             return first;\n         }\n \n-        if (first.equals(mapping)) {\n+        if (first.equals(second)) {\n             // Loop detected.... early return.\n             return first;\n         }\n \n+        return cnameResolveFromCacheLoop(cnameCache, first, second);\n+    }\n+\n+    private String cnameResolveFromCacheLoop(DnsCnameCache cnameCache, String first, String mapping) {\n         // Detect loops using a HashSet. We use this as last resort implementation to reduce allocations in the most\n         // common cases.\n         Set<String> cnames = new HashSet<String>(4);\n         cnames.add(first);\n         cnames.add(mapping);\n \n-        name = mapping;\n+        String name = mapping;\n         // Resolve from cnameCache() until there is no more cname entry cached.\n         while ((mapping = cnameCache.get(hostnameWithDot(name))) != null) {\n             if (!cnames.add(mapping)) {",
+      "diff": [
+        {
+          "file": "resolver-dns/src/main/java/io/netty/resolver/dns/DnsResolveContext.java",
+          "patch": "@@ -286,24 +286,28 @@ private String cnameResolveFromCache(String name) {\n             return name;\n         }\n \n-        String mapping = cnameCache.get(hostnameWithDot(first));\n-        if (mapping == null) {\n+        String second = cnameCache.get(hostnameWithDot(first));\n+        if (second == null) {\n             // Nothing else to follow, return first match.\n             return first;\n         }\n \n-        if (first.equals(mapping)) {\n+        if (first.equals(second)) {\n             // Loop detected.... early return.\n             return first;\n         }\n \n+        return cnameResolveFromCacheLoop(cnameCache, first, second);\n+    }\n+\n+    private String cnameResolveFromCacheLoop(DnsCnameCache cnameCache, String first, String mapping) {\n         // Detect loops using a HashSet. We use this as last resort implementation to reduce allocations in the most\n         // common cases.\n         Set<String> cnames = new HashSet<String>(4);\n         cnames.add(first);\n         cnames.add(mapping);\n \n-        name = mapping;\n+        String name = mapping;\n         // Resolve from cnameCache() until there is no more cname entry cached.\n         while ((mapping = cnameCache.get(hostnameWithDot(name))) != null) {\n             if (!cnames.add(mapping)) {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 401094305,
+      "created_at": "2020-04-27T15:56:35Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 401471570,
+      "created_at": "2020-04-28T03:24:46Z",
+      "user": "carl-mastrangelo",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 628399060,
+      "created_at": "2020-05-14T05:39:42Z",
+      "user": "Bennett-Lynch",
+      "body": "Can also consider this loop detection algorithm: https://github.com/google/guava/blob/48c7cfd5e38c8492e4356aab5c633254d1ce43be/guava/src/com/google/common/base/Throwables.java#L255"
+    },
+    {
+      "type": "comment",
+      "id": 628439235,
+      "created_at": "2020-05-14T07:16:11Z",
+      "user": "normanmaurer",
+      "body": "@Bennett-Lynch thats a neat trick..."
+    }
+  ]
+}

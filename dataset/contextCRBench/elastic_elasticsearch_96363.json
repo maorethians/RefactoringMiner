@@ -1,0 +1,109 @@
+{
+    "pr_body": "Early in shutdown, stop listening for HTTP requests and gracefully close all HTTP connections.\r\n\r\nAdds `http.shutdown_grace_period` setting, the maximum amount of time to wait for in-flight HTTP requests to finish.  After that time, the http channels are all closed.\r\n\r\nGraceful shutdown procedure:\r\n1) Stop listening for new HTTP connections\r\n2) Tell all new requests to add `Connection: close` response header and close the channel after the request.\r\n3) Wait up to the grace period for all open connections to close\r\n4) If grace period expired, close all remaining connections\r\n\r\nFixes: #96147",
+    "original_commit_id": "846d640ddf2747ee1750ba99595c6ec09eba8977",
+    "merged": true,
+    "pr_number": 96363,
+    "pr_title": "Gracefully shutdown elasticsearch",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "The approach seems sound to me. Just a few minor clarifications (without looking too deeply at the code)\r\n\r\n> 1. Stop listening for new HTTP connections\r\n\r\n\ud83d\udc4d \r\n> 2. Tell all new requests to add Connection: close response header and close the channel after the request.\r\n\r\nSince the listening socket has been closed there are no _new request_. This is _all_ outstanding in-flight requests, correct? If so, then that makes perfect sense to me.\r\n\r\n> 3. Wait up to the grace period for all open connections to close\r\n> 4. If grace period expired, close all remaining connections\r\n\r\n\ud83d\udc4d .. and I assume that terminates outstanding requests in a forceful way, i.e. the TCP socket just gets closed. Good.",
+        "> Since the listening socket has been closed there are no new request. This is all outstanding in-flight requests, correct? \r\n\r\nThere's some subtlety based on the actual implementation. \r\n\r\nAfter 1, no new TCP connections can be established.  \r\n\r\nAll new HTTP requests must come in on **established** connections.\r\n\r\nIf we've started handling a request before getting shut down, we will not close on that request as `DefaultRestChannel` has already been created.  \r\n\r\nThe **next** request will get a new `DefaultRestChannel` that will close the connection after *that* request.\r\n\r\nWe could do slightly better so long as we had not finished sending the HTTP headers but I don't think it's worth the complexity.\r\n\r\n> .. and I assume that terminates outstanding requests in a forceful way, i.e. the TCP socket just gets closed. Good.\r\n\r\nYup.",
+        "Thanks for the explanation @stu-elastic \ud83d\udc4d ",
+        "Ok, looks like this is a good approach.  I will add some tests, remove RFC from the title and remove the `WIP` label and we can proceed with review.",
+        "Hi @stu-elastic, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-core-infra (Team:Core/Infra)",
+        "@rjernst (and other interested reviewers) I've added tests, please take another pass.",
+        ">  the expected behavior would be in the following scenario:\r\n>    connection is opened\r\n>    request sent and returned\r\n>    stop is called\r\n\r\n> Will stop return quickly, or wait for the timeout? I think the latter, which is IMO a problem.\r\n\r\nThere is a timeout for the entire shutdown process and a different timeout for shutting down the http server `http.shutdown_grace_period`. \r\n\r\nIn the case outlined above, we will wait for the `http.shutdown_grace_period` to shutdown the server and the rest of the shutdown, shuffling shards, etc will continue until it finishes or the (presumably much longer) timeout for the entire shutdown expires.\r\n\r\n> The shutdown timeout could be long (lots of io could be necessary to move shards around).\r\n\r\nThat is a different timeout, which is for the entire process.",
+        "While it's true that this is a separate timeout, it still must be configured as at least the maximum time allowed for a single request. Let's say that is 5 minutes (which seems small, since we have async searches). There could conceivably be little shard migration work to do (eg slow indexing rate so not much to push/pull on the old/new primary). Yet having to wait this timeout means each node must wait at least that long to shutdown.\r\n\r\nI'm wondering if there a way to reject the next requests on open channels after current requests finish. Another possibility might be a separate, smaller timeout, to wait after the current request finishes. I'm sure there are other possibilities too.",
+        "> Let's say that is 5 minutes (which seems small, since we have async searches). There could conceivably be little shard migration work to do (eg slow indexing rate so not much to push/pull on the old/new primary). Yet having to wait this timeout means each node must wait at least that long to shutdown.\r\n\r\nIt's not clear to me that this is different from a request that just started that takes five minutes.",
+        "> I'm wondering if there a way to reject the next requests on open channels after current requests finish. Another possibility might be a separate, smaller timeout, to wait after the current request finishes. I'm sure there are other possibilities too.\r\n\r\nWe could introduce a barrier that is checked before every request on the channel.  However, that is necessarily more expensive than today (new memory barrier per request) and it's not clear that there is much benefit.\r\n\r\nGiven that we have already agreed to this approach, I suggest any functionality of that sort be discussed and implemented as a follow up."
+    ],
+    "commit_id": "afe71545066d30e37daf850652d478e911378f8d",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 965,
+            "start_side": null,
+            "start_line": null,
+            "line": 965,
+            "comment_lines": [
+                "[][965]"
+            ],
+            "review_comment": [
+                "nit - this technically breaks the contract of `Closeable`, which says that close can be called multiple times...",
+                "Opened https://github.com/elastic/elasticsearch/pull/96564 for discussion to change this.",
+                "@thecoop is there any action in this PR?"
+            ],
+            "path": "server/src/test/java/org/elasticsearch/http/AbstractHttpServerTransportTests.java",
+            "id": 35533,
+            "created_at": "2023-06-05T09:53:34Z",
+            "original_position": 116,
+            "side": "RIGHT",
+            "position": 116,
+            "original_start_line": null
+        },
+        {
+            "original_line": 993,
+            "start_side": null,
+            "start_line": null,
+            "line": 993,
+            "comment_lines": [
+                "[][993]"
+            ],
+            "review_comment": [
+                "nit: isn't this an in flight request, not an idle connection?",
+                "After `transport.incomingRequest(httpRequest, httpChannel);` returns, the httpChannel is idle.  We'd need to block in the Transport Dispatcher's `dispatchRequest` for the httpChannel to be active.",
+                "I added `testStopForceClosesConnectionDuringRequest` to perform that test."
+            ],
+            "path": "server/src/test/java/org/elasticsearch/http/AbstractHttpServerTransportTests.java",
+            "id": 35530,
+            "created_at": "2023-06-03T04:15:26Z",
+            "original_position": 144,
+            "side": "RIGHT",
+            "position": 144,
+            "original_start_line": null
+        },
+        {
+            "original_line": 1014,
+            "start_side": null,
+            "start_line": null,
+            "line": 1064,
+            "comment_lines": [
+                "[][1064]"
+            ],
+            "review_comment": [
+                "nit: same comment as before, this channel has an open request, it's not sitting idle (no in flight requests)?",
+                "Same as above, after `incomingRequest` completes, the channel is idle."
+            ],
+            "path": "server/src/test/java/org/elasticsearch/http/AbstractHttpServerTransportTests.java",
+            "id": 35531,
+            "created_at": "2023-06-03T04:20:50Z",
+            "original_position": 165,
+            "side": "RIGHT",
+            "position": 215,
+            "original_start_line": null
+        },
+        {
+            "original_line": 1715,
+            "start_side": null,
+            "start_line": null,
+            "line": 1715,
+            "comment_lines": [
+                "[][1715]"
+            ],
+            "review_comment": [
+                "Presumably there's no chance of this being interrupted & leaving the thread hanging open?",
+                "Shutting down the http transport will proceed and eventually that thread will close when either the stop completes or the graceperiod expires.",
+                "Looks like its always run from a JVM thread, so we dont need to worry too much about this"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/node/Node.java",
+            "id": 35532,
+            "created_at": "2023-06-05T09:50:41Z",
+            "original_position": 24,
+            "side": "RIGHT",
+            "position": 24,
+            "original_start_line": null
+        }
+    ]
+}

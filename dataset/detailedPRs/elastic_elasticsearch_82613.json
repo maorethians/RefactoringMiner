@@ -1,0 +1,190 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 82613,
+  "pr_number": 82613,
+  "title": "ILM step retry safe refresh of the cached phase",
+  "user": "andreidan",
+  "created_at": "2022-01-14T14:08:26Z",
+  "merged_at": "2022-01-17T11:46:05Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Data Management/ILM+SLM",
+    "v8.0.0",
+    "Team:Data Management (obsolete)",
+    "v8.1.0",
+    "v7.17.0"
+  ],
+  "base_commit": "b8b69bfaef746dbbfaf6f023b6ea68c9d3c8eca9",
+  "merge_commit_sha": "e456eb7f9f89a68929551510ac4f1d50f4f96ea2",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "labeled",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/82613",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-01-14T14:02:42Z",
+      "sha": "36911bb7423266a49bac91476794da3f007ffe25",
+      "message": "ILM step retry safe refresh of the cached phase\n\nWhen ILM retries a step (moving from the ERROR step back to the\nfailed_step) we always refreshed the ILM cached phase (the use case here\nwas that the policy might've been changed for an index due to\naccidentally configuring the wrong policy).\n\nIn the case when the `failed_step` doesn't exit in the policy though,\nrefreshing the cached phase would block ILM as the retried step (the\n`failed_step`) would not be recognized anymore.\n\nThis commit changes retrying an ILM step to only refresh the cached\nphase if the failed_step's action and phase are still present in the\npolicy. If the action or even phase were removed, ILM will honour the\ncached phase.",
+      "author": "Andrei Dan",
+      "author_email": "andrei.dan@elastic.co",
+      "author_raw_date": "2022-01-14T14:02:22Z",
+      "author_date": "2022-01-14T14:02:22Z",
+      "committer": "Andrei Dan",
+      "committer_email": "andrei.dan@elastic.co",
+      "raw_date": "2022-01-14T14:02:42Z",
+      "diff_text": "x-pack/plugin/ilm/qa/multi-node/src/javaRestTest/java/org/elasticsearch/xpack/ilm/TimeSeriesLifecycleActionsIT.java\n@@ -156,6 +156,37 @@ public void testRetryFailedDeleteAction() throws Exception {\n         assertBusy(() -> assertFalse(indexExists(index)));\n     }\n \n+    public void testUpdatePolicyToNotContainFailedStep() throws Exception {\n+        createNewSingletonPolicy(client(), policy, \"delete\", DeleteAction.WITH_SNAPSHOT_DELETE);\n+        createIndexWithSettings(\n+            client(),\n+            index,\n+            alias,\n+            Settings.builder()\n+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)\n+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)\n+                .put(IndexMetadata.SETTING_READ_ONLY, true)\n+                .put(\"index.lifecycle.name\", policy)\n+        );\n+\n+        assertBusy(\n+            () -> assertThat((Integer) explainIndex(client(), index).get(FAILED_STEP_RETRY_COUNT_FIELD), greaterThanOrEqualTo(1)),\n+            30,\n+            TimeUnit.SECONDS\n+        );\n+        assertTrue(indexExists(index));\n+\n+        // updating the policy to not contain the delete phase at all\n+        createNewSingletonPolicy(client(), policy, \"hot\", new RolloverAction(null, null, null, 1L));\n+\n+        // ILM must honour the cached delete phase and eventually delete the index\n+        Request request = new Request(\"PUT\", index + \"/_settings\");\n+        request.setJsonEntity(\"{\\\"index.blocks.read_only\\\":false}\");\n+        assertOK(client().performRequest(request));\n+\n+        assertBusy(() -> assertFalse(indexExists(index)));\n+    }\n+\n     public void testFreezeNoop() throws Exception {\n         createNewSingletonPolicy(client(), policy, \"cold\", FreezeAction.INSTANCE);\n \nx-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java\n@@ -41,6 +41,7 @@\n import java.io.IOException;\n import java.util.Collections;\n import java.util.List;\n+import java.util.Map;\n import java.util.Objects;\n import java.util.Optional;\n import java.util.Set;\n@@ -246,13 +247,30 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n \n             LifecyclePolicyMetadata policyMetadata = ilmMeta.getPolicyMetadatas()\n                 .get(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexMetadata.getSettings()));\n-            LifecycleExecutionState nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                policyMetadata,\n-                lifecycleState,\n-                nextStepKey,\n-                nowSupplier,\n-                true\n-            );\n+\n+            Map<String, Phase> policyPhases = policyMetadata.getPolicy().getPhases();\n+            final LifecycleExecutionState nextStepState;\n+            if (policyPhases.get(nextStepKey.getPhase()) == null\n+                || policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) == null) {\n+                // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n+                // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n+                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+                    policyMetadata,\n+                    lifecycleState,\n+                    nextStepKey,\n+                    nowSupplier,\n+                    false\n+                );\n+            } else {\n+                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+                    policyMetadata,\n+                    lifecycleState,\n+                    nextStepKey,\n+                    nowSupplier,\n+                    true\n+                );\n+            }\n+\n             LifecycleExecutionState.Builder retryStepState = LifecycleExecutionState.builder(nextStepState);\n             retryStepState.setIsAutoRetryableError(lifecycleState.isAutoRetryableError());\n             Integer currentRetryCount = lifecycleState.getFailedStepRetryCount();\nx-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransitionTests.java\n@@ -812,6 +812,74 @@ public void testMoveClusterStateToPreviouslyFailedStepAsAutomaticRetry() {\n         assertThat(executionState.getFailedStepRetryCount(), is(1));\n     }\n \n+    public void testMoveToFailedStepDoesntRefreshCachedPhaseWhenUnsafe() {\n+        String initialPhaseDefinition = \"\"\"\n+            {\n+                    \"policy\" : \"my-policy\",\n+                    \"phase_definition\" : {\n+                      \"min_age\" : \"20m\",\n+                      \"actions\" : {\n+                        \"rollover\" : {\n+                          \"max_age\" : \"5s\"\n+                        },\n+                        \"set_priority\" : {\n+                          \"priority\" : 150\n+                        }\n+                      }\n+                    },\n+                    \"version\" : 1,\n+                    \"modified_date_in_millis\" : 1578521007076\n+                  }\"\"\";\n+        String failedStep = \"check-rollover-ready\";\n+        LifecycleExecutionState.Builder currentExecutionState = LifecycleExecutionState.builder()\n+            .setPhase(\"hot\")\n+            .setAction(\"rollover\")\n+            .setStep(ErrorStep.NAME)\n+            .setFailedStep(failedStep)\n+            // the phase definition contains the rollover action, but the actual policy does not contain rollover anymore\n+            .setPhaseDefinition(initialPhaseDefinition);\n+\n+        IndexMetadata meta = buildIndexMetadata(\"my-policy\", currentExecutionState);\n+        String indexName = meta.getIndex().getName();\n+\n+        Map<String, LifecycleAction> actions = new HashMap<>();\n+        actions.put(\"set_priority\", new SetPriorityAction(100));\n+        Phase hotPhase = new Phase(\"hot\", TimeValue.ZERO, actions);\n+        Map<String, Phase> phases = Collections.singletonMap(\"hot\", hotPhase);\n+        LifecyclePolicy currentPolicy = new LifecyclePolicy(\"my-policy\", phases);\n+\n+        List<LifecyclePolicyMetadata> policyMetadatas = new ArrayList<>();\n+        policyMetadatas.add(\n+            new LifecyclePolicyMetadata(currentPolicy, Collections.emptyMap(), randomNonNegativeLong(), randomNonNegativeLong())\n+        );\n+\n+        Step.StepKey errorStepKey = new Step.StepKey(\"hot\", RolloverAction.NAME, ErrorStep.NAME);\n+        PolicyStepsRegistry stepsRegistry = createOneStepPolicyStepRegistry(\"my-policy\", new ErrorStep(errorStepKey));\n+\n+        ClusterState clusterState = buildClusterState(\n+            indexName,\n+            Settings.builder().put(LifecycleSettings.LIFECYCLE_NAME, \"my-policy\"),\n+            currentExecutionState.build(),\n+            policyMetadatas\n+        );\n+        ClusterState newState = IndexLifecycleTransition.moveClusterStateToPreviouslyFailedStep(\n+            clusterState,\n+            indexName,\n+            ESTestCase::randomNonNegativeLong,\n+            stepsRegistry,\n+            false\n+        );\n+\n+        IndexMetadata indexMetadata = newState.metadata().index(indexName);\n+        LifecycleExecutionState nextLifecycleExecutionState = LifecycleExecutionState.fromIndexMetadata(indexMetadata);\n+        assertThat(\n+            \"we musn't refresh the cache definition if the failed step is not part of the real policy anymore\",\n+            nextLifecycleExecutionState.getPhaseDefinition(),\n+            is(initialPhaseDefinition)\n+        );\n+        assertThat(nextLifecycleExecutionState.getStep(), is(failedStep));\n+    }\n+\n     public void testRefreshPhaseJson() throws IOException {\n         LifecycleExecutionState.Builder exState = LifecycleExecutionState.builder()\n             .setPhase(\"hot\")",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ilm/qa/multi-node/src/javaRestTest/java/org/elasticsearch/xpack/ilm/TimeSeriesLifecycleActionsIT.java",
+          "patch": "@@ -156,6 +156,37 @@ public void testRetryFailedDeleteAction() throws Exception {\n         assertBusy(() -> assertFalse(indexExists(index)));\n     }\n \n+    public void testUpdatePolicyToNotContainFailedStep() throws Exception {\n+        createNewSingletonPolicy(client(), policy, \"delete\", DeleteAction.WITH_SNAPSHOT_DELETE);\n+        createIndexWithSettings(\n+            client(),\n+            index,\n+            alias,\n+            Settings.builder()\n+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)\n+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)\n+                .put(IndexMetadata.SETTING_READ_ONLY, true)\n+                .put(\"index.lifecycle.name\", policy)\n+        );\n+\n+        assertBusy(\n+            () -> assertThat((Integer) explainIndex(client(), index).get(FAILED_STEP_RETRY_COUNT_FIELD), greaterThanOrEqualTo(1)),\n+            30,\n+            TimeUnit.SECONDS\n+        );\n+        assertTrue(indexExists(index));\n+\n+        // updating the policy to not contain the delete phase at all\n+        createNewSingletonPolicy(client(), policy, \"hot\", new RolloverAction(null, null, null, 1L));\n+\n+        // ILM must honour the cached delete phase and eventually delete the index\n+        Request request = new Request(\"PUT\", index + \"/_settings\");\n+        request.setJsonEntity(\"{\\\"index.blocks.read_only\\\":false}\");\n+        assertOK(client().performRequest(request));\n+\n+        assertBusy(() -> assertFalse(indexExists(index)));\n+    }\n+\n     public void testFreezeNoop() throws Exception {\n         createNewSingletonPolicy(client(), policy, \"cold\", FreezeAction.INSTANCE);\n "
+        },
+        {
+          "file": "x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java",
+          "patch": "@@ -41,6 +41,7 @@\n import java.io.IOException;\n import java.util.Collections;\n import java.util.List;\n+import java.util.Map;\n import java.util.Objects;\n import java.util.Optional;\n import java.util.Set;\n@@ -246,13 +247,30 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n \n             LifecyclePolicyMetadata policyMetadata = ilmMeta.getPolicyMetadatas()\n                 .get(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexMetadata.getSettings()));\n-            LifecycleExecutionState nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                policyMetadata,\n-                lifecycleState,\n-                nextStepKey,\n-                nowSupplier,\n-                true\n-            );\n+\n+            Map<String, Phase> policyPhases = policyMetadata.getPolicy().getPhases();\n+            final LifecycleExecutionState nextStepState;\n+            if (policyPhases.get(nextStepKey.getPhase()) == null\n+                || policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) == null) {\n+                // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n+                // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n+                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+                    policyMetadata,\n+                    lifecycleState,\n+                    nextStepKey,\n+                    nowSupplier,\n+                    false\n+                );\n+            } else {\n+                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+                    policyMetadata,\n+                    lifecycleState,\n+                    nextStepKey,\n+                    nowSupplier,\n+                    true\n+                );\n+            }\n+\n             LifecycleExecutionState.Builder retryStepState = LifecycleExecutionState.builder(nextStepState);\n             retryStepState.setIsAutoRetryableError(lifecycleState.isAutoRetryableError());\n             Integer currentRetryCount = lifecycleState.getFailedStepRetryCount();"
+        },
+        {
+          "file": "x-pack/plugin/ilm/src/test/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransitionTests.java",
+          "patch": "@@ -812,6 +812,74 @@ public void testMoveClusterStateToPreviouslyFailedStepAsAutomaticRetry() {\n         assertThat(executionState.getFailedStepRetryCount(), is(1));\n     }\n \n+    public void testMoveToFailedStepDoesntRefreshCachedPhaseWhenUnsafe() {\n+        String initialPhaseDefinition = \"\"\"\n+            {\n+                    \"policy\" : \"my-policy\",\n+                    \"phase_definition\" : {\n+                      \"min_age\" : \"20m\",\n+                      \"actions\" : {\n+                        \"rollover\" : {\n+                          \"max_age\" : \"5s\"\n+                        },\n+                        \"set_priority\" : {\n+                          \"priority\" : 150\n+                        }\n+                      }\n+                    },\n+                    \"version\" : 1,\n+                    \"modified_date_in_millis\" : 1578521007076\n+                  }\"\"\";\n+        String failedStep = \"check-rollover-ready\";\n+        LifecycleExecutionState.Builder currentExecutionState = LifecycleExecutionState.builder()\n+            .setPhase(\"hot\")\n+            .setAction(\"rollover\")\n+            .setStep(ErrorStep.NAME)\n+            .setFailedStep(failedStep)\n+            // the phase definition contains the rollover action, but the actual policy does not contain rollover anymore\n+            .setPhaseDefinition(initialPhaseDefinition);\n+\n+        IndexMetadata meta = buildIndexMetadata(\"my-policy\", currentExecutionState);\n+        String indexName = meta.getIndex().getName();\n+\n+        Map<String, LifecycleAction> actions = new HashMap<>();\n+        actions.put(\"set_priority\", new SetPriorityAction(100));\n+        Phase hotPhase = new Phase(\"hot\", TimeValue.ZERO, actions);\n+        Map<String, Phase> phases = Collections.singletonMap(\"hot\", hotPhase);\n+        LifecyclePolicy currentPolicy = new LifecyclePolicy(\"my-policy\", phases);\n+\n+        List<LifecyclePolicyMetadata> policyMetadatas = new ArrayList<>();\n+        policyMetadatas.add(\n+            new LifecyclePolicyMetadata(currentPolicy, Collections.emptyMap(), randomNonNegativeLong(), randomNonNegativeLong())\n+        );\n+\n+        Step.StepKey errorStepKey = new Step.StepKey(\"hot\", RolloverAction.NAME, ErrorStep.NAME);\n+        PolicyStepsRegistry stepsRegistry = createOneStepPolicyStepRegistry(\"my-policy\", new ErrorStep(errorStepKey));\n+\n+        ClusterState clusterState = buildClusterState(\n+            indexName,\n+            Settings.builder().put(LifecycleSettings.LIFECYCLE_NAME, \"my-policy\"),\n+            currentExecutionState.build(),\n+            policyMetadatas\n+        );\n+        ClusterState newState = IndexLifecycleTransition.moveClusterStateToPreviouslyFailedStep(\n+            clusterState,\n+            indexName,\n+            ESTestCase::randomNonNegativeLong,\n+            stepsRegistry,\n+            false\n+        );\n+\n+        IndexMetadata indexMetadata = newState.metadata().index(indexName);\n+        LifecycleExecutionState nextLifecycleExecutionState = LifecycleExecutionState.fromIndexMetadata(indexMetadata);\n+        assertThat(\n+            \"we musn't refresh the cache definition if the failed step is not part of the real policy anymore\",\n+            nextLifecycleExecutionState.getPhaseDefinition(),\n+            is(initialPhaseDefinition)\n+        );\n+        assertThat(nextLifecycleExecutionState.getStep(), is(failedStep));\n+    }\n+\n     public void testRefreshPhaseJson() throws IOException {\n         LifecycleExecutionState.Builder exState = LifecycleExecutionState.builder()\n             .setPhase(\"hot\")"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-01-14T14:08:26Z",
+      "user": "andreidan",
+      "body": "When ILM retries a step (moving from the ERROR step back to the\r\nfailed_step) we always refreshed the ILM cached phase (the use case here\r\nwas that the policy might've been changed for an index due to\r\naccidentally configuring the wrong policy).\r\n\r\nIn the case when the `failed_step` doesn't exit in the policy though,\r\nrefreshing the cached phase would block ILM as the retried step (the\r\n`failed_step`) would not be recognized anymore.\r\n\r\nThis commit changes retrying an ILM step to only refresh the cached\r\nphase if the failed_step's action and phase are still present in the\r\npolicy. If the action or even phase were removed, ILM will honour the\r\ncached phase.\r\n\r\nFixes #81921 \r\n"
+    },
+    {
+      "type": "comment",
+      "id": 1013147910,
+      "created_at": "2022-01-14T14:08:29Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-data-management (Team:Data Management)"
+    },
+    {
+      "type": "review",
+      "id": 853122283,
+      "created_at": "2022-01-14T16:32:18Z",
+      "user": "joegallo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 784986769,
+      "created_at": "2022-01-14T16:32:18Z",
+      "user": "joegallo",
+      "body": "If the only difference between the two branches of the if/else is the boolean that's being passed through, would it be more readable to extract that as a variable and then pass the variable (with no if/else)?",
+      "path": "x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java",
+      "diff_hunk": "@@ -246,13 +247,30 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n \n             LifecyclePolicyMetadata policyMetadata = ilmMeta.getPolicyMetadatas()\n                 .get(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexMetadata.getSettings()));\n-            LifecycleExecutionState nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                policyMetadata,\n-                lifecycleState,\n-                nextStepKey,\n-                nowSupplier,\n-                true\n-            );\n+",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 250,
+      "original_line": 250,
+      "side": "RIGHT",
+      "original_position": 19,
+      "position": 13,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 1013276080,
+      "created_at": "2022-01-14T16:33:07Z",
+      "user": "joegallo",
+      "body": "Love that lines of `test/` to lines of `src/` ratio. ❤️  "
+    },
+    {
+      "type": "review",
+      "id": 853462663,
+      "created_at": "2022-01-14T23:35:30Z",
+      "user": "dakrone",
+      "state": "APPROVED",
+      "body": "LGTM, I agree on Joe's comment about making it a variable also. Thanks for fixing this Andrei!"
+    },
+    {
+      "type": "review",
+      "id": 853705916,
+      "created_at": "2022-01-16T18:13:27Z",
+      "user": "kirakoki",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2022-01-17T09:16:19Z",
+      "sha": "134a03ec2b1605f34bf89bff42fcfa6a609ae402",
+      "message": "Simplify if statement",
+      "author": "Andrei Dan",
+      "author_email": "andrei.dan@elastic.co",
+      "author_raw_date": "2022-01-17T09:16:19Z",
+      "author_date": "2022-01-17T09:16:19Z",
+      "committer": "Andrei Dan",
+      "committer_email": "andrei.dan@elastic.co",
+      "raw_date": "2022-01-17T09:16:19Z",
+      "diff_text": "x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java\n@@ -250,26 +250,19 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n \n             Map<String, Phase> policyPhases = policyMetadata.getPolicy().getPhases();\n             final LifecycleExecutionState nextStepState;\n-            if (policyPhases.get(nextStepKey.getPhase()) == null\n-                || policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) == null) {\n-                // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n-                // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n-                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                    policyMetadata,\n-                    lifecycleState,\n-                    nextStepKey,\n-                    nowSupplier,\n-                    false\n-                );\n-            } else {\n-                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                    policyMetadata,\n-                    lifecycleState,\n-                    nextStepKey,\n-                    nowSupplier,\n-                    true\n-                );\n-            }\n+\n+            // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n+            // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n+            boolean forcePhaseDefinitionRefresh = policyPhases.get(nextStepKey.getPhase()) != null\n+                && policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) != null;\n+\n+            nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+                policyMetadata,\n+                lifecycleState,\n+                nextStepKey,\n+                nowSupplier,\n+                forcePhaseDefinitionRefresh\n+            );\n \n             LifecycleExecutionState.Builder retryStepState = LifecycleExecutionState.builder(nextStepState);\n             retryStepState.setIsAutoRetryableError(lifecycleState.isAutoRetryableError());",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java",
+          "patch": "@@ -250,26 +250,19 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n \n             Map<String, Phase> policyPhases = policyMetadata.getPolicy().getPhases();\n             final LifecycleExecutionState nextStepState;\n-            if (policyPhases.get(nextStepKey.getPhase()) == null\n-                || policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) == null) {\n-                // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n-                // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n-                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                    policyMetadata,\n-                    lifecycleState,\n-                    nextStepKey,\n-                    nowSupplier,\n-                    false\n-                );\n-            } else {\n-                nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n-                    policyMetadata,\n-                    lifecycleState,\n-                    nextStepKey,\n-                    nowSupplier,\n-                    true\n-                );\n-            }\n+\n+            // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n+            // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n+            boolean forcePhaseDefinitionRefresh = policyPhases.get(nextStepKey.getPhase()) != null\n+                && policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) != null;\n+\n+            nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+                policyMetadata,\n+                lifecycleState,\n+                nextStepKey,\n+                nowSupplier,\n+                forcePhaseDefinitionRefresh\n+            );\n \n             LifecycleExecutionState.Builder retryStepState = LifecycleExecutionState.builder(nextStepState);\n             retryStepState.setIsAutoRetryableError(lifecycleState.isAutoRetryableError());"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-01-17T10:45:17Z",
+      "sha": "c431377abbb45f00efd0d42bb6223a97249b6507",
+      "message": "Doc update and cosmetics",
+      "author": "Andrei Dan",
+      "author_email": "andrei.dan@elastic.co",
+      "author_raw_date": "2022-01-17T10:45:17Z",
+      "author_date": "2022-01-17T10:45:17Z",
+      "committer": "Andrei Dan",
+      "committer_email": "andrei.dan@elastic.co",
+      "raw_date": "2022-01-17T10:45:17Z",
+      "diff_text": "x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java\n@@ -249,14 +249,14 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n                 .get(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexMetadata.getSettings()));\n \n             Map<String, Phase> policyPhases = policyMetadata.getPolicy().getPhases();\n-            final LifecycleExecutionState nextStepState;\n \n-            // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n-            // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n+            // we only refresh the cached phase if the failed step's action is still present in the underlying policy\n+            // as otherwise ILM would block due to not recognizing the next step as part of the policy.\n+            // if the policy was updated to not contain the action or even phase, we honour the cached phase as it is and do not refresh it\n             boolean forcePhaseDefinitionRefresh = policyPhases.get(nextStepKey.getPhase()) != null\n                 && policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) != null;\n \n-            nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+            final LifecycleExecutionState nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n                 policyMetadata,\n                 lifecycleState,\n                 nextStepKey,",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/ilm/IndexLifecycleTransition.java",
+          "patch": "@@ -249,14 +249,14 @@ static ClusterState moveClusterStateToPreviouslyFailedStep(\n                 .get(LifecycleSettings.LIFECYCLE_NAME_SETTING.get(indexMetadata.getSettings()));\n \n             Map<String, Phase> policyPhases = policyMetadata.getPolicy().getPhases();\n-            final LifecycleExecutionState nextStepState;\n \n-            // the failed step's phase or action doesn't exist in the \"real\" policy anymore so don't refresh the cached phase as that\n-            // would block due to not recognizing the new step as part of the policy. we'll honour the cached phase in this case.\n+            // we only refresh the cached phase if the failed step's action is still present in the underlying policy\n+            // as otherwise ILM would block due to not recognizing the next step as part of the policy.\n+            // if the policy was updated to not contain the action or even phase, we honour the cached phase as it is and do not refresh it\n             boolean forcePhaseDefinitionRefresh = policyPhases.get(nextStepKey.getPhase()) != null\n                 && policyPhases.get(nextStepKey.getPhase()).getActions().get(nextStepKey.getAction()) != null;\n \n-            nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n+            final LifecycleExecutionState nextStepState = IndexLifecycleTransition.updateExecutionStateToStep(\n                 policyMetadata,\n                 lifecycleState,\n                 nextStepKey,"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1014433200,
+      "created_at": "2022-01-17T11:47:24Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💔 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [8.0](https://github.com/elastic/elasticsearch/pull/82662)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/82662\">](https://github.com/elastic/elasticsearch/pull/82662) |\n| ❌ |  7.17  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 82613`"
+    }
+  ]
+}

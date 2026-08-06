@@ -1,0 +1,220 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 70579,
+  "pr_number": 70579,
+  "title": "Speed up top_metrics on hot shards",
+  "user": "nik9000",
+  "created_at": "2021-03-18T18:18:53Z",
+  "merged_at": "2021-03-22T20:15:42Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">enhancement",
+    ":Analytics/Aggregations",
+    "Team:Analytics",
+    "v7.13.0",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "165c0ddaebbbc29f1c3cd8f2dc8dc428bd5d365c",
+  "merge_commit_sha": "cd0778a523cf81b83cb70e09782327c5b0924210",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/70579",
+  "timeline": [
+    {
+      "type": "description",
+      "created_at": "2021-03-18T18:18:53Z",
+      "user": "nik9000",
+      "body": "This moves `top_metrics` from global ordinals to segment ordinals which\r\nshould should speed it up a ton on shards receiving a lot of writes at\r\nthe cost of a little speed on shards that aren't receiving many writes.\r\n\r\nThe rally tests on hot shards so the performance cost is between .5% and\r\n5%:\r\n```\r\n|                               |  before |  after  |   diff   |    |\r\n|  50th percentile service time | 706.406 | 716.434 |  10.0277 | ms |\r\n|  90th percentile service time | 738.705 | 742.636 |   3.9311 | ms |\r\n| 100th percentile service time | 773.643 | 812.476 |  38.8331 | ms |\r\n```\r\n\r\nThat seems worth it for 0 startup cost on hot shards.\r\n\r\nCloses #70453\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 802180516,
+      "created_at": "2021-03-18T18:18:56Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-analytics-geo (Team:Analytics)"
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-18T18:20:46Z",
+      "sha": "eab894a1ec2a9a0586c8b38691445e58e8f6d466",
+      "message": "Speed up top_metrics on hot shards\n\nThis moves `top_metrics` from global ordinals to segment ordinals which\nshould should speed it up a ton on shards receiving a lot of writes at\nthe cost of a little speed on shards that aren't receiving many writes.\n\nThe rally tests on hot shards so the performance cost is between .5% and\n5%:\n```\n|                               |  before |  after  |   diff   |    |\n|  50th percentile service time | 706.406 | 716.434 |  10.0277 | ms |\n|  90th percentile service time | 738.705 | 742.636 |   3.9311 | ms |\n| 100th percentile service time | 773.643 | 812.476 |  38.8331 | ms |\n```\n\nThat seems worth it for 0 startup cost on hot shards.\n\nCloses #70453",
+      "author": "Nik Everett",
+      "author_email": "nik9000@gmail.com",
+      "author_raw_date": "2021-03-18T15:18:32Z",
+      "author_date": "2021-03-18T15:18:32Z",
+      "committer": "Nik Everett",
+      "committer_email": "nik9000@gmail.com",
+      "raw_date": "2021-03-18T18:20:46Z",
+      "diff_text": "x-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregationBuilder.java\n@@ -58,7 +58,7 @@ public static void registerAggregators(ValuesSourceRegistry.Builder registry) {\n         registry.register(\n             REGISTRY_KEY,\n             List.of(CoreValuesSourceType.KEYWORD, CoreValuesSourceType.IP),\n-            TopMetricsAggregator.GlobalOrdsValues::new,\n+            TopMetricsAggregator.SegmentOrdsValues::new,\n             false\n         );\n     }\nx-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregator.java\n@@ -10,6 +10,7 @@\n import org.apache.lucene.index.LeafReaderContext;\n import org.apache.lucene.index.NumericDocValues;\n import org.apache.lucene.index.SortedSetDocValues;\n+import org.apache.lucene.index.TermsEnum;\n import org.apache.lucene.search.Scorable;\n import org.apache.lucene.search.ScoreMode;\n import org.apache.lucene.util.BytesRef;\n@@ -19,6 +20,7 @@\n import org.elasticsearch.common.util.BitArray;\n import org.elasticsearch.common.util.DoubleArray;\n import org.elasticsearch.common.util.LongArray;\n+import org.elasticsearch.common.util.ObjectArray;\n import org.elasticsearch.index.fielddata.NumericDoubleValues;\n import org.elasticsearch.search.DocValueFormat;\n import org.elasticsearch.search.MultiValueMode;\n@@ -33,8 +35,8 @@\n import org.elasticsearch.search.sort.BucketedSort;\n import org.elasticsearch.search.sort.SortBuilder;\n import org.elasticsearch.search.sort.SortValue;\n-import org.elasticsearch.xpack.core.common.search.aggregations.MissingHelper;\n import org.elasticsearch.xpack.analytics.topmetrics.InternalTopMetrics.MetricValue;\n+import org.elasticsearch.xpack.core.common.search.aggregations.MissingHelper;\n \n import java.io.IOException;\n import java.util.ArrayList;\n@@ -398,20 +400,32 @@ public void close() {\n     }\n \n     /**\n-     * Loads metrics for whole numbers.\n+     * Loads metrics fields with segment ordinals.\n      */\n-    static class GlobalOrdsValues extends CollectingMetricValues {\n+    static class SegmentOrdsValues extends CollectingMetricValues {\n         private final ValuesSource.Bytes.WithOrdinals valuesSource;\n-        private SortedSetDocValues globalOrds;\n-        private LongArray values;\n+        /**\n+         * Reference to the segment's doc values so we can convert the\n+         * {@link #segmentOrds} into strings on the way out.\n+         */\n+        private ObjectArray<SortedSetDocValues> segmentResolve;\n+        /**\n+         * Terms ordinal in the segment.\n+         */\n+        private LongArray segmentOrds;\n \n-        GlobalOrdsValues(int size, BigArrays bigArrays, String name, ValuesSourceConfig config) {\n+        SegmentOrdsValues(int size, BigArrays bigArrays, String name, ValuesSourceConfig config) {\n             super(bigArrays, name, config);\n-            if (false == config.hasGlobalOrdinals()) {\n-                throw new IllegalArgumentException(\"top_metrics can only collect bytes that have global ordinals\");\n+            try {\n+                valuesSource = (ValuesSource.Bytes.WithOrdinals) config.getValuesSource();\n+            } catch (ClassCastException e) {\n+                throw new IllegalArgumentException(\n+                    \"top_metrics can only collect bytes that have segment ordinals but \" + config.getDescription() + \" does not\",\n+                    e\n+                );\n             }\n-            this.valuesSource = (ValuesSource.Bytes.WithOrdinals) config.getValuesSource();\n-            values = bigArrays.newLongArray(size, false);\n+            segmentResolve = bigArrays.newObjectArray(size);\n+            segmentOrds = bigArrays.newLongArray(size, false);\n         }\n \n         @Override\n@@ -421,43 +435,48 @@ public double doubleValue(long index) {\n \n         @Override\n         public MetricValue metricValue(long index) throws IOException {\n-            if (globalOrds == null) {\n-                // We didn't collect a single segment.\n-                return null;\n-            }\n-            long ord = values.get(index);\n+            long ord = segmentOrds.get(index);\n             if (ord == -1) {\n                 return null;\n             }\n-            return new MetricValue(config.format(), SortValue.from(BytesRef.deepCopyOf(globalOrds.lookupOrd(ord))));\n+            SortedSetDocValues resolve = segmentResolve.get(index);\n+            return new MetricValue(config.format(), SortValue.from(BytesRef.deepCopyOf(resolve.lookupOrd(ord))));\n         }\n \n         @Override\n         public void swap(long lhs, long rhs) {\n-            long tmp = values.get(lhs);\n-            values.set(lhs, values.get(rhs));\n-            values.set(rhs, tmp);\n+            SortedSetDocValues tempSegmentResolve = segmentResolve.get(lhs);\n+            segmentResolve.set(lhs, segmentResolve.get(rhs));\n+            segmentResolve.set(rhs, tempSegmentResolve);\n+            long tmpSegmentOrd = segmentOrds.get(lhs);\n+            segmentOrds.set(lhs, segmentOrds.get(rhs));\n+            segmentOrds.set(rhs, tmpSegmentOrd);\n         }\n \n         @Override\n         public Loader loader(LeafReaderContext ctx) throws IOException {\n-            globalOrds = valuesSource.globalOrdinalsValues(ctx);\n+            SortedSetDocValues segmentOrdValues = valuesSource.ordinalsValues(ctx);\n             // For now just return the value that sorts first.\n             return (index, doc) -> {\n-                if (false == globalOrds.advanceExact(doc)) {\n-                    values.set(index, -1);\n-                    return;\n+                if (index >= segmentResolve.size()) {\n+                    segmentResolve = bigArrays.grow(segmentResolve, index + 1);\n                 }\n-                if (index >= values.size()) {\n-                    values = bigArrays.grow(values, index + 1);\n+                if (index >= segmentOrds.size()) {\n+                    segmentOrds = bigArrays.grow(segmentOrds, index + 1);\n                 }\n-                values.set(index, globalOrds.nextOrd());\n+                if (false == segmentOrdValues.advanceExact(doc)) {\n+                    segmentResolve.set(index, null);\n+                    segmentOrds.set(index, -1);\n+                    return;\n+                }\n+                segmentResolve.set(index, segmentOrdValues);\n+                segmentOrds.set(index, segmentOrdValues.nextOrd());\n             };\n         }\n \n         @Override\n         public void close() {\n-            Releasables.close(values);\n+            Releasables.close(segmentResolve, segmentOrds);\n         }\n     }\n \nx-pack/plugin/analytics/src/test/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregatorMetricsTests.java\n@@ -227,9 +227,9 @@ private ValuesSourceConfig toConfig(SortedNumericDoubleValues values) throws IOE\n \n     private ValuesSourceConfig toConfig(SortedSetDocValues values) throws IOException {\n         ValuesSource.Bytes.WithOrdinals source = mock(ValuesSource.Bytes.WithOrdinals.class);\n-        when(source.globalOrdinalsValues(null)).thenReturn(values);\n+        when(source.ordinalsValues(null)).thenReturn(values);\n         ValuesSourceConfig config = toConfig(source, CoreValuesSourceType.KEYWORD, DocValueFormat.RAW, true);\n-        when(config.hasGlobalOrdinals()).thenReturn(true);\n+        when(config.hasGlobalOrdinals()).thenReturn(false); // We don't need global orindals. Only segment ordinals.\n         return config;\n     }\n \nx-pack/plugin/src/test/resources/rest-api-spec/test/analytics/top_metrics.yml\n@@ -583,3 +583,36 @@\n   - match: { aggregations.tm.top.1.sort: [2] }\n   - match: { aggregations.tm.top.2.metrics.animal\\.keyword: chicken}\n   - match: { aggregations.tm.top.2.sort: [3] }\n+\n+---\n+\"fetch runtime keyword fails with nice error message\":\n+  - do:\n+      bulk:\n+        index: test\n+        refresh: true\n+        body:\n+          - '{\"index\": {}}'\n+          - '{\"s\": 1, \"animal\": \"cat\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 2, \"animal\": \"dog\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 3, \"animal\": \"chicken\"}'\n+\n+  - do:\n+      catch: /top_metrics can only collect bytes that have segment ordinals but Field \\[species\\] of type \\[keyword\\] does not/\n+      search:\n+        size: 0\n+        body:\n+          runtime_mappings:\n+            species:\n+              type: keyword\n+              script: |\n+                emit(doc['animal.keyword'].value)\n+          aggs:\n+            tm:\n+              top_metrics:\n+                metrics:\n+                  field: species\n+                sort:\n+                  s: asc\n+                size: 3",
+      "diff": [
+        {
+          "file": "x-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregationBuilder.java",
+          "patch": "@@ -58,7 +58,7 @@ public static void registerAggregators(ValuesSourceRegistry.Builder registry) {\n         registry.register(\n             REGISTRY_KEY,\n             List.of(CoreValuesSourceType.KEYWORD, CoreValuesSourceType.IP),\n-            TopMetricsAggregator.GlobalOrdsValues::new,\n+            TopMetricsAggregator.SegmentOrdsValues::new,\n             false\n         );\n     }"
+        },
+        {
+          "file": "x-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregator.java",
+          "patch": "@@ -10,6 +10,7 @@\n import org.apache.lucene.index.LeafReaderContext;\n import org.apache.lucene.index.NumericDocValues;\n import org.apache.lucene.index.SortedSetDocValues;\n+import org.apache.lucene.index.TermsEnum;\n import org.apache.lucene.search.Scorable;\n import org.apache.lucene.search.ScoreMode;\n import org.apache.lucene.util.BytesRef;\n@@ -19,6 +20,7 @@\n import org.elasticsearch.common.util.BitArray;\n import org.elasticsearch.common.util.DoubleArray;\n import org.elasticsearch.common.util.LongArray;\n+import org.elasticsearch.common.util.ObjectArray;\n import org.elasticsearch.index.fielddata.NumericDoubleValues;\n import org.elasticsearch.search.DocValueFormat;\n import org.elasticsearch.search.MultiValueMode;\n@@ -33,8 +35,8 @@\n import org.elasticsearch.search.sort.BucketedSort;\n import org.elasticsearch.search.sort.SortBuilder;\n import org.elasticsearch.search.sort.SortValue;\n-import org.elasticsearch.xpack.core.common.search.aggregations.MissingHelper;\n import org.elasticsearch.xpack.analytics.topmetrics.InternalTopMetrics.MetricValue;\n+import org.elasticsearch.xpack.core.common.search.aggregations.MissingHelper;\n \n import java.io.IOException;\n import java.util.ArrayList;\n@@ -398,20 +400,32 @@ public void close() {\n     }\n \n     /**\n-     * Loads metrics for whole numbers.\n+     * Loads metrics fields with segment ordinals.\n      */\n-    static class GlobalOrdsValues extends CollectingMetricValues {\n+    static class SegmentOrdsValues extends CollectingMetricValues {\n         private final ValuesSource.Bytes.WithOrdinals valuesSource;\n-        private SortedSetDocValues globalOrds;\n-        private LongArray values;\n+        /**\n+         * Reference to the segment's doc values so we can convert the\n+         * {@link #segmentOrds} into strings on the way out.\n+         */\n+        private ObjectArray<SortedSetDocValues> segmentResolve;\n+        /**\n+         * Terms ordinal in the segment.\n+         */\n+        private LongArray segmentOrds;\n \n-        GlobalOrdsValues(int size, BigArrays bigArrays, String name, ValuesSourceConfig config) {\n+        SegmentOrdsValues(int size, BigArrays bigArrays, String name, ValuesSourceConfig config) {\n             super(bigArrays, name, config);\n-            if (false == config.hasGlobalOrdinals()) {\n-                throw new IllegalArgumentException(\"top_metrics can only collect bytes that have global ordinals\");\n+            try {\n+                valuesSource = (ValuesSource.Bytes.WithOrdinals) config.getValuesSource();\n+            } catch (ClassCastException e) {\n+                throw new IllegalArgumentException(\n+                    \"top_metrics can only collect bytes that have segment ordinals but \" + config.getDescription() + \" does not\",\n+                    e\n+                );\n             }\n-            this.valuesSource = (ValuesSource.Bytes.WithOrdinals) config.getValuesSource();\n-            values = bigArrays.newLongArray(size, false);\n+            segmentResolve = bigArrays.newObjectArray(size);\n+            segmentOrds = bigArrays.newLongArray(size, false);\n         }\n \n         @Override\n@@ -421,43 +435,48 @@ public double doubleValue(long index) {\n \n         @Override\n         public MetricValue metricValue(long index) throws IOException {\n-            if (globalOrds == null) {\n-                // We didn't collect a single segment.\n-                return null;\n-            }\n-            long ord = values.get(index);\n+            long ord = segmentOrds.get(index);\n             if (ord == -1) {\n                 return null;\n             }\n-            return new MetricValue(config.format(), SortValue.from(BytesRef.deepCopyOf(globalOrds.lookupOrd(ord))));\n+            SortedSetDocValues resolve = segmentResolve.get(index);\n+            return new MetricValue(config.format(), SortValue.from(BytesRef.deepCopyOf(resolve.lookupOrd(ord))));\n         }\n \n         @Override\n         public void swap(long lhs, long rhs) {\n-            long tmp = values.get(lhs);\n-            values.set(lhs, values.get(rhs));\n-            values.set(rhs, tmp);\n+            SortedSetDocValues tempSegmentResolve = segmentResolve.get(lhs);\n+            segmentResolve.set(lhs, segmentResolve.get(rhs));\n+            segmentResolve.set(rhs, tempSegmentResolve);\n+            long tmpSegmentOrd = segmentOrds.get(lhs);\n+            segmentOrds.set(lhs, segmentOrds.get(rhs));\n+            segmentOrds.set(rhs, tmpSegmentOrd);\n         }\n \n         @Override\n         public Loader loader(LeafReaderContext ctx) throws IOException {\n-            globalOrds = valuesSource.globalOrdinalsValues(ctx);\n+            SortedSetDocValues segmentOrdValues = valuesSource.ordinalsValues(ctx);\n             // For now just return the value that sorts first.\n             return (index, doc) -> {\n-                if (false == globalOrds.advanceExact(doc)) {\n-                    values.set(index, -1);\n-                    return;\n+                if (index >= segmentResolve.size()) {\n+                    segmentResolve = bigArrays.grow(segmentResolve, index + 1);\n                 }\n-                if (index >= values.size()) {\n-                    values = bigArrays.grow(values, index + 1);\n+                if (index >= segmentOrds.size()) {\n+                    segmentOrds = bigArrays.grow(segmentOrds, index + 1);\n                 }\n-                values.set(index, globalOrds.nextOrd());\n+                if (false == segmentOrdValues.advanceExact(doc)) {\n+                    segmentResolve.set(index, null);\n+                    segmentOrds.set(index, -1);\n+                    return;\n+                }\n+                segmentResolve.set(index, segmentOrdValues);\n+                segmentOrds.set(index, segmentOrdValues.nextOrd());\n             };\n         }\n \n         @Override\n         public void close() {\n-            Releasables.close(values);\n+            Releasables.close(segmentResolve, segmentOrds);\n         }\n     }\n "
+        },
+        {
+          "file": "x-pack/plugin/analytics/src/test/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregatorMetricsTests.java",
+          "patch": "@@ -227,9 +227,9 @@ private ValuesSourceConfig toConfig(SortedNumericDoubleValues values) throws IOE\n \n     private ValuesSourceConfig toConfig(SortedSetDocValues values) throws IOException {\n         ValuesSource.Bytes.WithOrdinals source = mock(ValuesSource.Bytes.WithOrdinals.class);\n-        when(source.globalOrdinalsValues(null)).thenReturn(values);\n+        when(source.ordinalsValues(null)).thenReturn(values);\n         ValuesSourceConfig config = toConfig(source, CoreValuesSourceType.KEYWORD, DocValueFormat.RAW, true);\n-        when(config.hasGlobalOrdinals()).thenReturn(true);\n+        when(config.hasGlobalOrdinals()).thenReturn(false); // We don't need global orindals. Only segment ordinals.\n         return config;\n     }\n "
+        },
+        {
+          "file": "x-pack/plugin/src/test/resources/rest-api-spec/test/analytics/top_metrics.yml",
+          "patch": "@@ -583,3 +583,36 @@\n   - match: { aggregations.tm.top.1.sort: [2] }\n   - match: { aggregations.tm.top.2.metrics.animal\\.keyword: chicken}\n   - match: { aggregations.tm.top.2.sort: [3] }\n+\n+---\n+\"fetch runtime keyword fails with nice error message\":\n+  - do:\n+      bulk:\n+        index: test\n+        refresh: true\n+        body:\n+          - '{\"index\": {}}'\n+          - '{\"s\": 1, \"animal\": \"cat\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 2, \"animal\": \"dog\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 3, \"animal\": \"chicken\"}'\n+\n+  - do:\n+      catch: /top_metrics can only collect bytes that have segment ordinals but Field \\[species\\] of type \\[keyword\\] does not/\n+      search:\n+        size: 0\n+        body:\n+          runtime_mappings:\n+            species:\n+              type: keyword\n+              script: |\n+                emit(doc['animal.keyword'].value)\n+          aggs:\n+            tm:\n+              top_metrics:\n+                metrics:\n+                  field: species\n+                sort:\n+                  s: asc\n+                size: 3"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-18T18:27:05Z",
+      "sha": "9d8ffc1d014e5d022e0a6baa831e434ef2ccf38e",
+      "message": "another test",
+      "author": "Nik Everett",
+      "author_email": "nik9000@gmail.com",
+      "author_raw_date": "2021-03-18T18:27:05Z",
+      "author_date": "2021-03-18T18:27:05Z",
+      "committer": "Nik Everett",
+      "committer_email": "nik9000@gmail.com",
+      "raw_date": "2021-03-18T18:27:05Z",
+      "diff_text": "x-pack/plugin/src/test/resources/rest-api-spec/test/analytics/top_metrics.yml\n@@ -616,3 +616,36 @@\n                 sort:\n                   s: asc\n                 size: 3\n+\n+---\n+\"fetch keyword fields with some missing\":\n+  - do:\n+      bulk:\n+        index: test\n+        refresh: true\n+        body:\n+          - '{\"index\": {}}'\n+          - '{\"s\": 1, \"animal\": \"cat\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 2, \"animal\": \"dog\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 3}'\n+\n+  - do:\n+      search:\n+        size: 0\n+        body:\n+          aggs:\n+            tm:\n+              top_metrics:\n+                metrics:\n+                  field: animal.keyword\n+                sort:\n+                  s: asc\n+                size: 3\n+  - match: { aggregations.tm.top.0.metrics.animal\\.keyword: cat}\n+  - match: { aggregations.tm.top.0.sort: [1] }\n+  - match: { aggregations.tm.top.1.metrics.animal\\.keyword: dog}\n+  - match: { aggregations.tm.top.1.sort: [2] }\n+  - match: { aggregations.tm.top.2.metrics.animal\\.keyword: null}\n+  - match: { aggregations.tm.top.2.sort: [3] }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/src/test/resources/rest-api-spec/test/analytics/top_metrics.yml",
+          "patch": "@@ -616,3 +616,36 @@\n                 sort:\n                   s: asc\n                 size: 3\n+\n+---\n+\"fetch keyword fields with some missing\":\n+  - do:\n+      bulk:\n+        index: test\n+        refresh: true\n+        body:\n+          - '{\"index\": {}}'\n+          - '{\"s\": 1, \"animal\": \"cat\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 2, \"animal\": \"dog\"}'\n+          - '{\"index\": {}}'\n+          - '{\"s\": 3}'\n+\n+  - do:\n+      search:\n+        size: 0\n+        body:\n+          aggs:\n+            tm:\n+              top_metrics:\n+                metrics:\n+                  field: animal.keyword\n+                sort:\n+                  s: asc\n+                size: 3\n+  - match: { aggregations.tm.top.0.metrics.animal\\.keyword: cat}\n+  - match: { aggregations.tm.top.0.sort: [1] }\n+  - match: { aggregations.tm.top.1.metrics.animal\\.keyword: dog}\n+  - match: { aggregations.tm.top.1.sort: [2] }\n+  - match: { aggregations.tm.top.2.metrics.animal\\.keyword: null}\n+  - match: { aggregations.tm.top.2.sort: [3] }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2021-03-18T18:31:45Z",
+      "sha": "65f1fe59889c77548b953a7a84dd5448356eeb30",
+      "message": "unused import",
+      "author": "Nik Everett",
+      "author_email": "nik9000@gmail.com",
+      "author_raw_date": "2021-03-18T18:31:45Z",
+      "author_date": "2021-03-18T18:31:45Z",
+      "committer": "Nik Everett",
+      "committer_email": "nik9000@gmail.com",
+      "raw_date": "2021-03-18T18:31:45Z",
+      "diff_text": "x-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregator.java\n@@ -10,7 +10,6 @@\n import org.apache.lucene.index.LeafReaderContext;\n import org.apache.lucene.index.NumericDocValues;\n import org.apache.lucene.index.SortedSetDocValues;\n-import org.apache.lucene.index.TermsEnum;\n import org.apache.lucene.search.Scorable;\n import org.apache.lucene.search.ScoreMode;\n import org.apache.lucene.util.BytesRef;",
+      "diff": [
+        {
+          "file": "x-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregator.java",
+          "patch": "@@ -10,7 +10,6 @@\n import org.apache.lucene.index.LeafReaderContext;\n import org.apache.lucene.index.NumericDocValues;\n import org.apache.lucene.index.SortedSetDocValues;\n-import org.apache.lucene.index.TermsEnum;\n import org.apache.lucene.search.Scorable;\n import org.apache.lucene.search.ScoreMode;\n import org.apache.lucene.util.BytesRef;"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 802200981,
+      "created_at": "2021-03-18T18:45:51Z",
+      "user": "nik9000",
+      "body": "run elasticsearch-ci/2"
+    },
+    {
+      "type": "comment",
+      "id": 802211435,
+      "created_at": "2021-03-18T19:02:38Z",
+      "user": "talevy",
+      "body": "Hey Nik, sorry for the test failure. unmuted the test to collect more debugging information"
+    },
+    {
+      "type": "comment",
+      "id": 804041665,
+      "created_at": "2021-03-22T12:59:57Z",
+      "user": "nik9000",
+      "body": "> Hey Nik, sorry for the test failure. unmuted the test to collect more debugging information\r\n\r\nNot at all!"
+    },
+    {
+      "type": "review_comment",
+      "id": 598758468,
+      "created_at": "2021-03-22T14:21:07Z",
+      "user": "not-napoleon",
+      "body": "Although this isn't literally an `instanceof` check, it's still relying on the class type to convey capabilities.  I wonder if we should add a `ValuesSource#hasSegmentOrdinals()` method to parallel the `hasGlobalOrdinals()` method we were using before this change?  ",
+      "path": "x-pack/plugin/analytics/src/main/java/org/elasticsearch/xpack/analytics/topmetrics/TopMetricsAggregator.java",
+      "diff_hunk": "@@ -398,20 +399,32 @@ public void close() {\n     }\n \n     /**\n-     * Loads metrics for whole numbers.\n+     * Loads metrics fields with segment ordinals.\n      */\n-    static class GlobalOrdsValues extends CollectingMetricValues {\n+    static class SegmentOrdsValues extends CollectingMetricValues {\n         private final ValuesSource.Bytes.WithOrdinals valuesSource;\n-        private SortedSetDocValues globalOrds;\n-        private LongArray values;\n+        /**\n+         * Reference to the segment's doc values so we can convert the\n+         * {@link #segmentOrds} into strings on the way out.\n+         */\n+        private ObjectArray<SortedSetDocValues> segmentResolve;\n+        /**\n+         * Terms ordinal in the segment.\n+         */\n+        private LongArray segmentOrds;\n \n-        GlobalOrdsValues(int size, BigArrays bigArrays, String name, ValuesSourceConfig config) {\n+        SegmentOrdsValues(int size, BigArrays bigArrays, String name, ValuesSourceConfig config) {\n             super(bigArrays, name, config);\n-            if (false == config.hasGlobalOrdinals()) {\n-                throw new IllegalArgumentException(\"top_metrics can only collect bytes that have global ordinals\");\n+            try {\n+                valuesSource = (ValuesSource.Bytes.WithOrdinals) config.getValuesSource();\n+            } catch (ClassCastException e) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 420,
+      "original_line": 420,
+      "side": "RIGHT",
+      "original_position": 47,
+      "position": 47,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 598771830,
+          "user": "nik9000",
+          "body": "It probably is, yeah.",
+          "created_at": "2021-03-22T14:35:32Z"
+        },
+        {
+          "id": 599043537,
+          "user": "nik9000",
+          "body": "I'll open up a follow up.",
+          "created_at": "2021-03-22T20:15:38Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 617580096,
+      "created_at": "2021-03-22T14:27:07Z",
+      "user": "not-napoleon",
+      "state": "APPROVED",
+      "body": "This looks good.  I wonder if down the road it's worth having both segment and global ordinals modes, with an execution hint?  IIRC, that's what we do in Terms family."
+    },
+    {
+      "type": "review",
+      "id": 617598003,
+      "created_at": "2021-03-22T14:35:32Z",
+      "user": "nik9000",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 804113172,
+      "created_at": "2021-03-22T14:37:29Z",
+      "user": "nik9000",
+      "body": "> This looks good. I wonder if down the road it's worth having both segment and global ordinals modes, with an execution hint? IIRC, that's what we do in Terms family.\r\n\r\nI don't think it's worth having a hint. At least, I hope it isn't. Its a bunch of extra code just to parse it and stuff. I was hoping we could get away without global ords at all here. But we need them I think we'd be better off with a heuristic to pick when the use them."
+    },
+    {
+      "type": "review",
+      "id": 617942476,
+      "created_at": "2021-03-22T20:15:38Z",
+      "user": "nik9000",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

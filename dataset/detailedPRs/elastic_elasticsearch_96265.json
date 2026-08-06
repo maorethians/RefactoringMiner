@@ -1,0 +1,285 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 96265,
+  "pr_number": 96265,
+  "title": "QL: Reduce nesting of same bool queries",
+  "user": "costin",
+  "created_at": "2023-05-22T23:20:08Z",
+  "merged_at": "2023-05-24T07:40:57Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">enhancement",
+    ":Analytics/SQL",
+    ":Analytics/EQL",
+    "Team:QL (Deprecated)",
+    "v8.8.1",
+    "v8.9.0"
+  ],
+  "base_commit": "301ebc54047a8ca27d60fcd3e7c67bcbdca4bdc7",
+  "merge_commit_sha": "98bc34a689cd83a43ad8c01085ef4a91295695bd",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "labeled",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/96265",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-05-22T23:17:57Z",
+      "sha": "2832fae073528cf7ca3949be62d0bd4ce68e936f",
+      "message": "QL: Reduce nesting of same bool queries\n\nImprove transpilation of chained OR and AND queries by replacing\n boolQuery wrapping with extension of the queries inside the bool clause\n\nFix #96236",
+      "author": "Costin Leau",
+      "author_email": "costin.leau@gmail.com",
+      "author_raw_date": "2023-05-22T23:04:21Z",
+      "author_date": "2023-05-22T23:04:21Z",
+      "committer": "Costin Leau",
+      "committer_email": "costin.leau@gmail.com",
+      "raw_date": "2023-05-22T23:17:57Z",
+      "diff_text": "x-pack/plugin/eql/src/test/resources/querytranslator_tests.txt\n@@ -208,14 +208,14 @@ twoFunctionsEqualsBooleanLiterals-caseSensitive\n process where endsWith(process_path, \"x\") == true and endsWith(process_path, \"yx\") != true\n ;\n {\"bool\":{\"must\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*x\",\"boost\":1.0}}},\n-{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"boost\":1.0}}}],\"boost\":1.0}}\n ;\n \n twoFunctionsEqualsBooleanLiterals-insensitive\n process where endsWith~(process_path, \"x\") == true and endsWith~(process_path, \"yx\") != true\n ;\n {\"bool\":{\"must\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*x\",\"case_insensitive\":true,\"boost\":1.0}}},\n-{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"case_insensitive\":true,\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"case_insensitive\":true,\"boost\":1.0}}}],\"boost\":1.0}}\n ;\n \n endsWithKeywordFieldFunction-caseSensitive\nx-pack/plugin/ql/src/main/java/org/elasticsearch/xpack/ql/planner/ExpressionTranslators.java\n@@ -53,12 +53,14 @@\n import org.elasticsearch.xpack.ql.tree.Source;\n import org.elasticsearch.xpack.ql.type.DataTypes;\n import org.elasticsearch.xpack.ql.util.Check;\n+import org.elasticsearch.xpack.ql.util.CollectionUtils;\n \n import java.time.OffsetTime;\n import java.time.ZoneId;\n import java.time.ZonedDateTime;\n import java.time.temporal.TemporalAccessor;\n import java.util.ArrayList;\n+import java.util.Arrays;\n import java.util.LinkedHashSet;\n import java.util.List;\n import java.util.Set;\n@@ -464,6 +466,15 @@ private static Query boolQuery(Source source, Query left, Query right, boolean i\n         if (right == null) {\n             return left;\n         }\n-        return new BoolQuery(source, isAnd, left, right);\n+        List<Query> queries;\n+        // check if either side is already a bool query to an extra bool query\n+        if (left instanceof BoolQuery bool && bool.isAnd() == isAnd) {\n+            queries = CollectionUtils.combine(bool.queries(), right);\n+        } else if (right instanceof BoolQuery bool && bool.isAnd() == isAnd) {\n+            queries = CollectionUtils.combine(bool.queries(), left);\n+        } else {\n+            queries = Arrays.asList(left, right);\n+        }\n+        return new BoolQuery(source, isAnd, queries);\n     }\n }\nx-pack/plugin/ql/src/main/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQuery.java\n@@ -9,9 +9,15 @@\n import org.elasticsearch.index.query.BoolQueryBuilder;\n import org.elasticsearch.index.query.QueryBuilder;\n import org.elasticsearch.search.sort.NestedSortBuilder;\n+import org.elasticsearch.xpack.ql.QlIllegalArgumentException;\n import org.elasticsearch.xpack.ql.tree.Source;\n+import org.elasticsearch.xpack.ql.util.CollectionUtils;\n \n+import java.util.ArrayList;\n+import java.util.Arrays;\n+import java.util.List;\n import java.util.Objects;\n+import java.util.StringJoiner;\n \n import static org.elasticsearch.index.query.QueryBuilders.boolQuery;\n \n@@ -23,52 +29,59 @@ public class BoolQuery extends Query {\n      * {@code true} for boolean {@code AND}, {@code false} for boolean {@code OR}.\n      */\n     private final boolean isAnd;\n-    private final Query left;\n-    private final Query right;\n+    private final List<Query> queries;\n \n     public BoolQuery(Source source, boolean isAnd, Query left, Query right) {\n+        this(source, isAnd, Arrays.asList(left, right));\n+    }\n+\n+    public BoolQuery(Source source, boolean isAnd, List<Query> queries) {\n         super(source);\n-        if (left == null) {\n-            throw new IllegalArgumentException(\"left is required\");\n-        }\n-        if (right == null) {\n-            throw new IllegalArgumentException(\"right is required\");\n+        if (CollectionUtils.isEmpty(queries) || queries.size() < 2) {\n+            throw new QlIllegalArgumentException(\"At least two queries required by bool query\");\n         }\n         this.isAnd = isAnd;\n-        this.left = left;\n-        this.right = right;\n+        this.queries = queries;\n     }\n \n     @Override\n     public boolean containsNestedField(String path, String field) {\n-        return left.containsNestedField(path, field) || right.containsNestedField(path, field);\n+        for (Query query : queries) {\n+            if (query.containsNestedField(path, field)) {\n+                return true;\n+            }\n+        }\n+        return false;\n     }\n \n     @Override\n     public Query addNestedField(String path, String field, String format, boolean hasDocValues) {\n-        Query rewrittenLeft = left.addNestedField(path, field, format, hasDocValues);\n-        Query rewrittenRight = right.addNestedField(path, field, format, hasDocValues);\n-        if (rewrittenLeft == left && rewrittenRight == right) {\n-            return this;\n+        boolean unchanged = true;\n+        List<Query> rewritten = new ArrayList<>(queries.size());\n+        for (Query query : queries) {\n+            var rewrittenQuery = query.addNestedField(path, field, format, hasDocValues);\n+            unchanged &= rewrittenQuery == query;\n+            rewritten.add(rewrittenQuery);\n         }\n-        return new BoolQuery(source(), isAnd, rewrittenLeft, rewrittenRight);\n+        return unchanged ? this : new BoolQuery(source(), isAnd, rewritten);\n     }\n \n     @Override\n     public void enrichNestedSort(NestedSortBuilder sort) {\n-        left.enrichNestedSort(sort);\n-        right.enrichNestedSort(sort);\n+        for (Query query : queries) {\n+            query.enrichNestedSort(sort);\n+        }\n     }\n \n     @Override\n     public QueryBuilder asBuilder() {\n         BoolQueryBuilder boolQuery = boolQuery();\n-        if (isAnd) {\n-            boolQuery.must(left.asBuilder());\n-            boolQuery.must(right.asBuilder());\n-        } else {\n-            boolQuery.should(left.asBuilder());\n-            boolQuery.should(right.asBuilder());\n+        for (Query query : queries) {\n+            if (isAnd) {\n+                boolQuery.must(query.asBuilder());\n+            } else {\n+                boolQuery.should(query.asBuilder());\n+            }\n         }\n         return boolQuery;\n     }\n@@ -77,17 +90,13 @@ public boolean isAnd() {\n         return isAnd;\n     }\n \n-    public Query left() {\n-        return left;\n-    }\n-\n-    public Query right() {\n-        return right;\n+    public List<Query> queries() {\n+        return queries;\n     }\n \n     @Override\n     public int hashCode() {\n-        return Objects.hash(super.hashCode(), isAnd, left, right);\n+        return Objects.hash(super.hashCode(), isAnd, queries);\n     }\n \n     @Override\n@@ -96,11 +105,15 @@ public boolean equals(Object obj) {\n             return false;\n         }\n         BoolQuery other = (BoolQuery) obj;\n-        return isAnd == other.isAnd && left.equals(other.left) && right.equals(other.right);\n+        return isAnd == other.isAnd && queries.equals(other.queries);\n     }\n \n     @Override\n     protected String innerToString() {\n-        return left + (isAnd ? \" AND \" : \" OR \") + right;\n+        StringJoiner sb = new StringJoiner(isAnd ? \" AND \" : \" OR \");\n+        for (Query query : queries) {\n+            sb.add(query.toString());\n+        }\n+        return sb.toString();\n     }\n }\nx-pack/plugin/ql/src/test/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQueryTests.java\n@@ -19,6 +19,8 @@\n \n import static java.util.Collections.singletonMap;\n import static org.elasticsearch.test.EqualsHashCodeTestUtils.checkEqualsAndHashCode;\n+import static org.hamcrest.Matchers.greaterThanOrEqualTo;\n+import static org.hamcrest.Matchers.hasSize;\n \n public class BoolQueryTests extends ESTestCase {\n     static BoolQuery randomBoolQuery(int depth) {\n@@ -35,15 +37,15 @@ public void testEqualsAndHashCode() {\n     }\n \n     private static BoolQuery copy(BoolQuery query) {\n-        return new BoolQuery(query.source(), query.isAnd(), query.left(), query.right());\n+        return new BoolQuery(query.source(), query.isAnd(), left(query), right(query));\n     }\n \n     private static BoolQuery mutate(BoolQuery query) {\n         List<Function<BoolQuery, BoolQuery>> options = Arrays.asList(\n-            q -> new BoolQuery(SourceTests.mutate(q.source()), q.isAnd(), q.left(), q.right()),\n-            q -> new BoolQuery(q.source(), false == q.isAnd(), q.left(), q.right()),\n-            q -> new BoolQuery(q.source(), q.isAnd(), randomValueOtherThan(q.left(), () -> NestedQueryTests.randomQuery(5)), q.right()),\n-            q -> new BoolQuery(q.source(), q.isAnd(), q.left(), randomValueOtherThan(q.right(), () -> NestedQueryTests.randomQuery(5)))\n+            q -> new BoolQuery(SourceTests.mutate(q.source()), q.isAnd(), left(q), right(q)),\n+            q -> new BoolQuery(q.source(), false == q.isAnd(), left(q), right(q)),\n+            q -> new BoolQuery(q.source(), q.isAnd(), randomValueOtherThan(left(q), () -> NestedQueryTests.randomQuery(5)), right(q)),\n+            q -> new BoolQuery(q.source(), q.isAnd(), left(q), randomValueOtherThan(right(q), () -> NestedQueryTests.randomQuery(5)))\n         );\n         return randomFrom(options).apply(query);\n     }\n@@ -124,4 +126,19 @@ public void testToString() {\n             ).toString()\n         );\n     }\n+\n+    public static Query left(BoolQuery bool) {\n+        return indexOf(bool, 0);\n+    }\n+\n+    public static Query right(BoolQuery bool) {\n+        return indexOf(bool, 1);\n+    }\n+\n+    private static Query indexOf(BoolQuery bool, int index) {\n+        List<Query> queries = bool.queries();\n+        assertThat(queries, hasSize(greaterThanOrEqualTo(2)));\n+        return queries.get(index);\n+    }\n+\n }\nx-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/planner/QueryTranslatorTests.java\n@@ -95,6 +95,8 @@\n \n import static java.util.Arrays.asList;\n import static org.elasticsearch.xpack.ql.expression.Literal.TRUE;\n+import static org.elasticsearch.xpack.ql.querydsl.query.BoolQueryTests.left;\n+import static org.elasticsearch.xpack.ql.querydsl.query.BoolQueryTests.right;\n import static org.elasticsearch.xpack.ql.type.DataTypes.DATETIME;\n import static org.elasticsearch.xpack.ql.type.DataTypes.DOUBLE;\n import static org.elasticsearch.xpack.ql.type.DataTypes.INTEGER;\n@@ -111,6 +113,7 @@\n import static org.hamcrest.Matchers.endsWith;\n import static org.hamcrest.Matchers.everyItem;\n import static org.hamcrest.Matchers.greaterThanOrEqualTo;\n+import static org.hamcrest.Matchers.hasSize;\n import static org.hamcrest.Matchers.instanceOf;\n import static org.hamcrest.Matchers.startsWith;\n \n@@ -740,11 +743,11 @@ public void testInExpressionWhereClauseDatetime() {\n         assertTrue(query instanceof BoolQuery);\n         BoolQuery bq = (BoolQuery) query;\n         assertFalse(bq.isAnd());\n-        assertTrue(bq.left() instanceof RangeQuery);\n-        assertTrue(bq.right() instanceof RangeQuery);\n+        assertTrue(left(bq) instanceof RangeQuery);\n+        assertTrue(right(bq) instanceof RangeQuery);\n         List<Tuple<String, RangeQuery>> tuples = asList(\n-            new Tuple<>(dates[0], (RangeQuery) bq.left()),\n-            new Tuple<>(dates[1], (RangeQuery) bq.right())\n+            new Tuple<>(dates[0], (RangeQuery) left(bq)),\n+            new Tuple<>(dates[1], (RangeQuery) right(bq))\n         );\n \n         for (Tuple<String, RangeQuery> t : tuples) {\n@@ -834,12 +837,12 @@ public void testDifferentLikeAndNotLikePatterns() {\n         assertEquals(BoolQuery.class, qt.query.getClass());\n         BoolQuery bq = ((BoolQuery) qt.query);\n         assertTrue(bq.isAnd());\n-        assertTrue(bq.left() instanceof WildcardQuery);\n-        assertTrue(bq.right() instanceof NotQuery);\n+        assertTrue(left(bq) instanceof WildcardQuery);\n+        assertTrue(right(bq) instanceof NotQuery);\n \n-        NotQuery nq = (NotQuery) bq.right();\n+        NotQuery nq = (NotQuery) right(bq);\n         assertTrue(nq.child() instanceof WildcardQuery);\n-        WildcardQuery lqsq = (WildcardQuery) bq.left();\n+        WildcardQuery lqsq = (WildcardQuery) left(bq);\n         WildcardQuery rqsq = (WildcardQuery) nq.child();\n \n         assertEquals(\"X*\", lqsq.query());\n@@ -879,12 +882,12 @@ private void assertDifferentRLikeAndNotRLikePatterns(String firstPattern, String\n         assertEquals(BoolQuery.class, qt.query.getClass());\n         BoolQuery bq = ((BoolQuery) qt.query);\n         assertTrue(bq.isAnd());\n-        assertTrue(bq.left() instanceof RegexQuery);\n-        assertTrue(bq.right() instanceof NotQuery);\n+        assertTrue(left(bq) instanceof RegexQuery);\n+        assertTrue(right(bq) instanceof NotQuery);\n \n-        NotQuery nq = (NotQuery) bq.right();\n+        NotQuery nq = (NotQuery) right(bq);\n         assertTrue(nq.child() instanceof RegexQuery);\n-        RegexQuery lqsq = (RegexQuery) bq.left();\n+        RegexQuery lqsq = (RegexQuery) left(bq);\n         RegexQuery rqsq = (RegexQuery) nq.child();\n \n         assertEquals(firstPattern, lqsq.regex());\n@@ -906,14 +909,14 @@ public void testStartsWithUsesPrefixQuery() {\n         BoolQuery bq = (BoolQuery) translation.query;\n \n         assertFalse(bq.isAnd());\n-        assertTrue(bq.left() instanceof PrefixQuery);\n-        assertTrue(bq.right() instanceof PrefixQuery);\n+        assertTrue(left(bq) instanceof PrefixQuery);\n+        assertTrue(right(bq) instanceof PrefixQuery);\n \n-        PrefixQuery pqr = (PrefixQuery) bq.right();\n+        PrefixQuery pqr = (PrefixQuery) right(bq);\n         assertEquals(\"keyword\", pqr.field());\n         assertEquals(\"y\", pqr.query());\n \n-        PrefixQuery pql = (PrefixQuery) bq.left();\n+        PrefixQuery pql = (PrefixQuery) left(bq);\n         assertEquals(\"keyword\", pql.field());\n         assertEquals(\"x\", pql.query());\n     }\n@@ -934,20 +937,21 @@ public void testStartsWithUsesPrefixQueryAndScript() {\n         BoolQuery bq = (BoolQuery) translation.query;\n \n         assertTrue(bq.isAnd());\n-        assertTrue(bq.left() instanceof BoolQuery);\n-        assertTrue(bq.right() instanceof ScriptQuery);\n+        List<Query> queries = bq.queries();\n+        assertThat(queries, hasSize(3));\n+        assertTrue(queries.get(0) instanceof PrefixQuery);\n+        assertTrue(queries.get(1) instanceof PrefixQuery);\n+        assertTrue(queries.get(2) instanceof ScriptQuery);\n \n-        BoolQuery bbq = (BoolQuery) bq.left();\n-        assertTrue(bbq.isAnd());\n-        PrefixQuery pqr = (PrefixQuery) bbq.right();\n+        PrefixQuery pqr = (PrefixQuery) queries.get(0);\n         assertEquals(\"keyword\", pqr.field());\n-        assertEquals(\"xy\", pqr.query());\n+        assertEquals(\"x\", pqr.query());\n \n-        PrefixQuery pql = (PrefixQuery) bbq.left();\n+        PrefixQuery pql = (PrefixQuery) queries.get(1);\n         assertEquals(\"keyword\", pql.field());\n-        assertEquals(\"x\", pql.query());\n+        assertEquals(\"xy\", pql.query());\n \n-        ScriptQuery sq = (ScriptQuery) bq.right();\n+        ScriptQuery sq = (ScriptQuery) queries.get(2);\n         assertEquals(\n             \"InternalQlScriptUtils.nullSafeFilter(InternalQlScriptUtils.startsWith(\"\n                 + \"InternalSqlScriptUtils.lcase(InternalQlScriptUtils.docValue(doc,params.v0)), \"\nx-pack/plugin/sql/src/test/resources/org/elasticsearch/xpack/sql/planner/querytranslator_tests.txt\n@@ -350,6 +350,11 @@ SELECT * FROM test WHERE some.string LIKE '%a%';\n \"query\":{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\n ;\n \n+LikeOnInexactWithOR\n+SELECT * FROM test WHERE some.string LIKE '%a%' OR some.string LIKE '%b%' OR some.string LIKE '%c%';\n+{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}}],\"boost\":1.0}}\n+;\n+\n RLikeOnInexact\n SELECT * FROM test WHERE some.string RLIKE '.*a.*';\n \"query\":{\"regexp\":{\"some.string.typical\":{\"value\":\".*a.*\",",
+      "diff": [
+        {
+          "file": "x-pack/plugin/eql/src/test/resources/querytranslator_tests.txt",
+          "patch": "@@ -208,14 +208,14 @@ twoFunctionsEqualsBooleanLiterals-caseSensitive\n process where endsWith(process_path, \"x\") == true and endsWith(process_path, \"yx\") != true\n ;\n {\"bool\":{\"must\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*x\",\"boost\":1.0}}},\n-{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"boost\":1.0}}}],\"boost\":1.0}}\n ;\n \n twoFunctionsEqualsBooleanLiterals-insensitive\n process where endsWith~(process_path, \"x\") == true and endsWith~(process_path, \"yx\") != true\n ;\n {\"bool\":{\"must\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*x\",\"case_insensitive\":true,\"boost\":1.0}}},\n-{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"case_insensitive\":true,\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"case_insensitive\":true,\"boost\":1.0}}}],\"boost\":1.0}}\n ;\n \n endsWithKeywordFieldFunction-caseSensitive"
+        },
+        {
+          "file": "x-pack/plugin/ql/src/main/java/org/elasticsearch/xpack/ql/planner/ExpressionTranslators.java",
+          "patch": "@@ -53,12 +53,14 @@\n import org.elasticsearch.xpack.ql.tree.Source;\n import org.elasticsearch.xpack.ql.type.DataTypes;\n import org.elasticsearch.xpack.ql.util.Check;\n+import org.elasticsearch.xpack.ql.util.CollectionUtils;\n \n import java.time.OffsetTime;\n import java.time.ZoneId;\n import java.time.ZonedDateTime;\n import java.time.temporal.TemporalAccessor;\n import java.util.ArrayList;\n+import java.util.Arrays;\n import java.util.LinkedHashSet;\n import java.util.List;\n import java.util.Set;\n@@ -464,6 +466,15 @@ private static Query boolQuery(Source source, Query left, Query right, boolean i\n         if (right == null) {\n             return left;\n         }\n-        return new BoolQuery(source, isAnd, left, right);\n+        List<Query> queries;\n+        // check if either side is already a bool query to an extra bool query\n+        if (left instanceof BoolQuery bool && bool.isAnd() == isAnd) {\n+            queries = CollectionUtils.combine(bool.queries(), right);\n+        } else if (right instanceof BoolQuery bool && bool.isAnd() == isAnd) {\n+            queries = CollectionUtils.combine(bool.queries(), left);\n+        } else {\n+            queries = Arrays.asList(left, right);\n+        }\n+        return new BoolQuery(source, isAnd, queries);\n     }\n }"
+        },
+        {
+          "file": "x-pack/plugin/ql/src/main/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQuery.java",
+          "patch": "@@ -9,9 +9,15 @@\n import org.elasticsearch.index.query.BoolQueryBuilder;\n import org.elasticsearch.index.query.QueryBuilder;\n import org.elasticsearch.search.sort.NestedSortBuilder;\n+import org.elasticsearch.xpack.ql.QlIllegalArgumentException;\n import org.elasticsearch.xpack.ql.tree.Source;\n+import org.elasticsearch.xpack.ql.util.CollectionUtils;\n \n+import java.util.ArrayList;\n+import java.util.Arrays;\n+import java.util.List;\n import java.util.Objects;\n+import java.util.StringJoiner;\n \n import static org.elasticsearch.index.query.QueryBuilders.boolQuery;\n \n@@ -23,52 +29,59 @@ public class BoolQuery extends Query {\n      * {@code true} for boolean {@code AND}, {@code false} for boolean {@code OR}.\n      */\n     private final boolean isAnd;\n-    private final Query left;\n-    private final Query right;\n+    private final List<Query> queries;\n \n     public BoolQuery(Source source, boolean isAnd, Query left, Query right) {\n+        this(source, isAnd, Arrays.asList(left, right));\n+    }\n+\n+    public BoolQuery(Source source, boolean isAnd, List<Query> queries) {\n         super(source);\n-        if (left == null) {\n-            throw new IllegalArgumentException(\"left is required\");\n-        }\n-        if (right == null) {\n-            throw new IllegalArgumentException(\"right is required\");\n+        if (CollectionUtils.isEmpty(queries) || queries.size() < 2) {\n+            throw new QlIllegalArgumentException(\"At least two queries required by bool query\");\n         }\n         this.isAnd = isAnd;\n-        this.left = left;\n-        this.right = right;\n+        this.queries = queries;\n     }\n \n     @Override\n     public boolean containsNestedField(String path, String field) {\n-        return left.containsNestedField(path, field) || right.containsNestedField(path, field);\n+        for (Query query : queries) {\n+            if (query.containsNestedField(path, field)) {\n+                return true;\n+            }\n+        }\n+        return false;\n     }\n \n     @Override\n     public Query addNestedField(String path, String field, String format, boolean hasDocValues) {\n-        Query rewrittenLeft = left.addNestedField(path, field, format, hasDocValues);\n-        Query rewrittenRight = right.addNestedField(path, field, format, hasDocValues);\n-        if (rewrittenLeft == left && rewrittenRight == right) {\n-            return this;\n+        boolean unchanged = true;\n+        List<Query> rewritten = new ArrayList<>(queries.size());\n+        for (Query query : queries) {\n+            var rewrittenQuery = query.addNestedField(path, field, format, hasDocValues);\n+            unchanged &= rewrittenQuery == query;\n+            rewritten.add(rewrittenQuery);\n         }\n-        return new BoolQuery(source(), isAnd, rewrittenLeft, rewrittenRight);\n+        return unchanged ? this : new BoolQuery(source(), isAnd, rewritten);\n     }\n \n     @Override\n     public void enrichNestedSort(NestedSortBuilder sort) {\n-        left.enrichNestedSort(sort);\n-        right.enrichNestedSort(sort);\n+        for (Query query : queries) {\n+            query.enrichNestedSort(sort);\n+        }\n     }\n \n     @Override\n     public QueryBuilder asBuilder() {\n         BoolQueryBuilder boolQuery = boolQuery();\n-        if (isAnd) {\n-            boolQuery.must(left.asBuilder());\n-            boolQuery.must(right.asBuilder());\n-        } else {\n-            boolQuery.should(left.asBuilder());\n-            boolQuery.should(right.asBuilder());\n+        for (Query query : queries) {\n+            if (isAnd) {\n+                boolQuery.must(query.asBuilder());\n+            } else {\n+                boolQuery.should(query.asBuilder());\n+            }\n         }\n         return boolQuery;\n     }\n@@ -77,17 +90,13 @@ public boolean isAnd() {\n         return isAnd;\n     }\n \n-    public Query left() {\n-        return left;\n-    }\n-\n-    public Query right() {\n-        return right;\n+    public List<Query> queries() {\n+        return queries;\n     }\n \n     @Override\n     public int hashCode() {\n-        return Objects.hash(super.hashCode(), isAnd, left, right);\n+        return Objects.hash(super.hashCode(), isAnd, queries);\n     }\n \n     @Override\n@@ -96,11 +105,15 @@ public boolean equals(Object obj) {\n             return false;\n         }\n         BoolQuery other = (BoolQuery) obj;\n-        return isAnd == other.isAnd && left.equals(other.left) && right.equals(other.right);\n+        return isAnd == other.isAnd && queries.equals(other.queries);\n     }\n \n     @Override\n     protected String innerToString() {\n-        return left + (isAnd ? \" AND \" : \" OR \") + right;\n+        StringJoiner sb = new StringJoiner(isAnd ? \" AND \" : \" OR \");\n+        for (Query query : queries) {\n+            sb.add(query.toString());\n+        }\n+        return sb.toString();\n     }\n }"
+        },
+        {
+          "file": "x-pack/plugin/ql/src/test/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQueryTests.java",
+          "patch": "@@ -19,6 +19,8 @@\n \n import static java.util.Collections.singletonMap;\n import static org.elasticsearch.test.EqualsHashCodeTestUtils.checkEqualsAndHashCode;\n+import static org.hamcrest.Matchers.greaterThanOrEqualTo;\n+import static org.hamcrest.Matchers.hasSize;\n \n public class BoolQueryTests extends ESTestCase {\n     static BoolQuery randomBoolQuery(int depth) {\n@@ -35,15 +37,15 @@ public void testEqualsAndHashCode() {\n     }\n \n     private static BoolQuery copy(BoolQuery query) {\n-        return new BoolQuery(query.source(), query.isAnd(), query.left(), query.right());\n+        return new BoolQuery(query.source(), query.isAnd(), left(query), right(query));\n     }\n \n     private static BoolQuery mutate(BoolQuery query) {\n         List<Function<BoolQuery, BoolQuery>> options = Arrays.asList(\n-            q -> new BoolQuery(SourceTests.mutate(q.source()), q.isAnd(), q.left(), q.right()),\n-            q -> new BoolQuery(q.source(), false == q.isAnd(), q.left(), q.right()),\n-            q -> new BoolQuery(q.source(), q.isAnd(), randomValueOtherThan(q.left(), () -> NestedQueryTests.randomQuery(5)), q.right()),\n-            q -> new BoolQuery(q.source(), q.isAnd(), q.left(), randomValueOtherThan(q.right(), () -> NestedQueryTests.randomQuery(5)))\n+            q -> new BoolQuery(SourceTests.mutate(q.source()), q.isAnd(), left(q), right(q)),\n+            q -> new BoolQuery(q.source(), false == q.isAnd(), left(q), right(q)),\n+            q -> new BoolQuery(q.source(), q.isAnd(), randomValueOtherThan(left(q), () -> NestedQueryTests.randomQuery(5)), right(q)),\n+            q -> new BoolQuery(q.source(), q.isAnd(), left(q), randomValueOtherThan(right(q), () -> NestedQueryTests.randomQuery(5)))\n         );\n         return randomFrom(options).apply(query);\n     }\n@@ -124,4 +126,19 @@ public void testToString() {\n             ).toString()\n         );\n     }\n+\n+    public static Query left(BoolQuery bool) {\n+        return indexOf(bool, 0);\n+    }\n+\n+    public static Query right(BoolQuery bool) {\n+        return indexOf(bool, 1);\n+    }\n+\n+    private static Query indexOf(BoolQuery bool, int index) {\n+        List<Query> queries = bool.queries();\n+        assertThat(queries, hasSize(greaterThanOrEqualTo(2)));\n+        return queries.get(index);\n+    }\n+\n }"
+        },
+        {
+          "file": "x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/planner/QueryTranslatorTests.java",
+          "patch": "@@ -95,6 +95,8 @@\n \n import static java.util.Arrays.asList;\n import static org.elasticsearch.xpack.ql.expression.Literal.TRUE;\n+import static org.elasticsearch.xpack.ql.querydsl.query.BoolQueryTests.left;\n+import static org.elasticsearch.xpack.ql.querydsl.query.BoolQueryTests.right;\n import static org.elasticsearch.xpack.ql.type.DataTypes.DATETIME;\n import static org.elasticsearch.xpack.ql.type.DataTypes.DOUBLE;\n import static org.elasticsearch.xpack.ql.type.DataTypes.INTEGER;\n@@ -111,6 +113,7 @@\n import static org.hamcrest.Matchers.endsWith;\n import static org.hamcrest.Matchers.everyItem;\n import static org.hamcrest.Matchers.greaterThanOrEqualTo;\n+import static org.hamcrest.Matchers.hasSize;\n import static org.hamcrest.Matchers.instanceOf;\n import static org.hamcrest.Matchers.startsWith;\n \n@@ -740,11 +743,11 @@ public void testInExpressionWhereClauseDatetime() {\n         assertTrue(query instanceof BoolQuery);\n         BoolQuery bq = (BoolQuery) query;\n         assertFalse(bq.isAnd());\n-        assertTrue(bq.left() instanceof RangeQuery);\n-        assertTrue(bq.right() instanceof RangeQuery);\n+        assertTrue(left(bq) instanceof RangeQuery);\n+        assertTrue(right(bq) instanceof RangeQuery);\n         List<Tuple<String, RangeQuery>> tuples = asList(\n-            new Tuple<>(dates[0], (RangeQuery) bq.left()),\n-            new Tuple<>(dates[1], (RangeQuery) bq.right())\n+            new Tuple<>(dates[0], (RangeQuery) left(bq)),\n+            new Tuple<>(dates[1], (RangeQuery) right(bq))\n         );\n \n         for (Tuple<String, RangeQuery> t : tuples) {\n@@ -834,12 +837,12 @@ public void testDifferentLikeAndNotLikePatterns() {\n         assertEquals(BoolQuery.class, qt.query.getClass());\n         BoolQuery bq = ((BoolQuery) qt.query);\n         assertTrue(bq.isAnd());\n-        assertTrue(bq.left() instanceof WildcardQuery);\n-        assertTrue(bq.right() instanceof NotQuery);\n+        assertTrue(left(bq) instanceof WildcardQuery);\n+        assertTrue(right(bq) instanceof NotQuery);\n \n-        NotQuery nq = (NotQuery) bq.right();\n+        NotQuery nq = (NotQuery) right(bq);\n         assertTrue(nq.child() instanceof WildcardQuery);\n-        WildcardQuery lqsq = (WildcardQuery) bq.left();\n+        WildcardQuery lqsq = (WildcardQuery) left(bq);\n         WildcardQuery rqsq = (WildcardQuery) nq.child();\n \n         assertEquals(\"X*\", lqsq.query());\n@@ -879,12 +882,12 @@ private void assertDifferentRLikeAndNotRLikePatterns(String firstPattern, String\n         assertEquals(BoolQuery.class, qt.query.getClass());\n         BoolQuery bq = ((BoolQuery) qt.query);\n         assertTrue(bq.isAnd());\n-        assertTrue(bq.left() instanceof RegexQuery);\n-        assertTrue(bq.right() instanceof NotQuery);\n+        assertTrue(left(bq) instanceof RegexQuery);\n+        assertTrue(right(bq) instanceof NotQuery);\n \n-        NotQuery nq = (NotQuery) bq.right();\n+        NotQuery nq = (NotQuery) right(bq);\n         assertTrue(nq.child() instanceof RegexQuery);\n-        RegexQuery lqsq = (RegexQuery) bq.left();\n+        RegexQuery lqsq = (RegexQuery) left(bq);\n         RegexQuery rqsq = (RegexQuery) nq.child();\n \n         assertEquals(firstPattern, lqsq.regex());\n@@ -906,14 +909,14 @@ public void testStartsWithUsesPrefixQuery() {\n         BoolQuery bq = (BoolQuery) translation.query;\n \n         assertFalse(bq.isAnd());\n-        assertTrue(bq.left() instanceof PrefixQuery);\n-        assertTrue(bq.right() instanceof PrefixQuery);\n+        assertTrue(left(bq) instanceof PrefixQuery);\n+        assertTrue(right(bq) instanceof PrefixQuery);\n \n-        PrefixQuery pqr = (PrefixQuery) bq.right();\n+        PrefixQuery pqr = (PrefixQuery) right(bq);\n         assertEquals(\"keyword\", pqr.field());\n         assertEquals(\"y\", pqr.query());\n \n-        PrefixQuery pql = (PrefixQuery) bq.left();\n+        PrefixQuery pql = (PrefixQuery) left(bq);\n         assertEquals(\"keyword\", pql.field());\n         assertEquals(\"x\", pql.query());\n     }\n@@ -934,20 +937,21 @@ public void testStartsWithUsesPrefixQueryAndScript() {\n         BoolQuery bq = (BoolQuery) translation.query;\n \n         assertTrue(bq.isAnd());\n-        assertTrue(bq.left() instanceof BoolQuery);\n-        assertTrue(bq.right() instanceof ScriptQuery);\n+        List<Query> queries = bq.queries();\n+        assertThat(queries, hasSize(3));\n+        assertTrue(queries.get(0) instanceof PrefixQuery);\n+        assertTrue(queries.get(1) instanceof PrefixQuery);\n+        assertTrue(queries.get(2) instanceof ScriptQuery);\n \n-        BoolQuery bbq = (BoolQuery) bq.left();\n-        assertTrue(bbq.isAnd());\n-        PrefixQuery pqr = (PrefixQuery) bbq.right();\n+        PrefixQuery pqr = (PrefixQuery) queries.get(0);\n         assertEquals(\"keyword\", pqr.field());\n-        assertEquals(\"xy\", pqr.query());\n+        assertEquals(\"x\", pqr.query());\n \n-        PrefixQuery pql = (PrefixQuery) bbq.left();\n+        PrefixQuery pql = (PrefixQuery) queries.get(1);\n         assertEquals(\"keyword\", pql.field());\n-        assertEquals(\"x\", pql.query());\n+        assertEquals(\"xy\", pql.query());\n \n-        ScriptQuery sq = (ScriptQuery) bq.right();\n+        ScriptQuery sq = (ScriptQuery) queries.get(2);\n         assertEquals(\n             \"InternalQlScriptUtils.nullSafeFilter(InternalQlScriptUtils.startsWith(\"\n                 + \"InternalSqlScriptUtils.lcase(InternalQlScriptUtils.docValue(doc,params.v0)), \""
+        },
+        {
+          "file": "x-pack/plugin/sql/src/test/resources/org/elasticsearch/xpack/sql/planner/querytranslator_tests.txt",
+          "patch": "@@ -350,6 +350,11 @@ SELECT * FROM test WHERE some.string LIKE '%a%';\n \"query\":{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\n ;\n \n+LikeOnInexactWithOR\n+SELECT * FROM test WHERE some.string LIKE '%a%' OR some.string LIKE '%b%' OR some.string LIKE '%c%';\n+{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}}],\"boost\":1.0}}\n+;\n+\n RLikeOnInexact\n SELECT * FROM test WHERE some.string RLIKE '.*a.*';\n \"query\":{\"regexp\":{\"some.string.typical\":{\"value\":\".*a.*\","
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-05-22T23:20:08Z",
+      "user": "costin",
+      "body": "Improve transpilation of chained OR and AND queries by replacing\r\n boolQuery wrapping with extension of the queries inside the bool clause\r\n\r\nFix #96236"
+    },
+    {
+      "type": "comment",
+      "id": 1558177708,
+      "created_at": "2023-05-22T23:20:32Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-ql (Team:QL)"
+    },
+    {
+      "type": "commit",
+      "date": "2023-05-22T23:23:53Z",
+      "sha": "3dce6578b36f7455103fa07c441b5c5057d8490a",
+      "message": "Update docs/changelog/96265.yaml",
+      "author": "Costin Leau",
+      "author_email": "costin@users.noreply.github.com",
+      "author_raw_date": "2023-05-22T23:23:53Z",
+      "author_date": "2023-05-22T23:23:53Z",
+      "committer": "Costin Leau",
+      "committer_email": "costin@users.noreply.github.com",
+      "raw_date": "2023-05-22T23:23:53Z",
+      "diff_text": "docs/changelog/96265.yaml\n@@ -0,0 +1,6 @@\n+pr: 96265\n+summary: Reduce nesting of same bool queries\n+area: Query Languages\n+type: enhancement\n+issues:\n+ - 96236",
+      "diff": [
+        {
+          "file": "docs/changelog/96265.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 96265\n+summary: Reduce nesting of same bool queries\n+area: Query Languages\n+type: enhancement\n+issues:\n+ - 96236"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1558182932,
+      "created_at": "2023-05-22T23:23:53Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @costin, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review",
+      "id": 1438767847,
+      "created_at": "2023-05-23T06:55:06Z",
+      "user": "luigidellaquila",
+      "state": "APPROVED",
+      "body": "LGTM\r\nI'd just add one or two unit tests with multiple conditions and mixed AND/OR"
+    },
+    {
+      "type": "review_comment",
+      "id": 1202168945,
+      "created_at": "2023-05-23T11:55:54Z",
+      "user": "astefan",
+      "body": "I'm wondering if this change is not affecting the score of a query that uses `bool`s and returns the `SCORE()` as well.",
+      "path": "x-pack/plugin/eql/src/test/resources/querytranslator_tests.txt",
+      "diff_hunk": "@@ -208,14 +208,14 @@ twoFunctionsEqualsBooleanLiterals-caseSensitive\n process where endsWith(process_path, \"x\") == true and endsWith(process_path, \"yx\") != true\n ;\n {\"bool\":{\"must\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*x\",\"boost\":1.0}}},\n-{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+{\"bool\":{\"must_not\":[{\"wildcard\":{\"process_path\":{\"wildcard\":\"*yx\",\"boost\":1.0}}}],\"boost\":1.0}}",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 211,
+      "original_line": 211,
+      "side": "RIGHT",
+      "original_position": 5,
+      "position": 5,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1202726836,
+          "user": "costin",
+          "body": "Confirmed with the search team that the two types of queries are equivalent as Lucene normalizes them to the same query (the one created above) when `minimum_should_query` is the default (1 - which it is).",
+          "created_at": "2023-05-23T17:06:13Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1202305937,
+      "created_at": "2023-05-23T13:11:34Z",
+      "user": "astefan",
+      "body": "Imo, this change is a bit forced, conceptually speaking. A boolean query by definition is a boolean operation between two expressions, just like a math operation is. Having multiple expressions ALL linked together by either OR or AND seems like a specialized boolean query, MultiBoolQuery if you want. The BoolQueryBuilder in ES is built similarly, but is generalized: a list of must, a list of should, a list of filters etc.\r\n\r\nI would have expected a solution around \"flattening\" the bool statements, but not touching the BoolQuery in this way.",
+      "path": "x-pack/plugin/ql/src/main/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQuery.java",
+      "diff_hunk": "@@ -23,52 +29,59 @@ public class BoolQuery extends Query {\n      * {@code true} for boolean {@code AND}, {@code false} for boolean {@code OR}.\n      */\n     private final boolean isAnd;\n-    private final Query left;\n-    private final Query right;\n+    private final List<Query> queries;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 32,
+      "original_line": 32,
+      "side": "RIGHT",
+      "original_position": 22,
+      "position": 22,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1202606369,
+          "user": "costin",
+          "body": "Balancing the tree would have been another alternative but I opted for the above because it simplifies the Lucene query which is what triggers the exception in the first place.\r\nBased on napkin math a balanced tree has n-2 intermediate nodes (3 ORs - 1 intermediate node, 4 ORs - 2, 5 ORs - 3, etc..). This implementation truly flattens the OR to just 1 node regardless of how many clauses there are.",
+          "created_at": "2023-05-23T15:52:58Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1202308389,
+      "created_at": "2023-05-23T13:13:04Z",
+      "user": "astefan",
+      "body": "This test doesn't fully reflect the changes in this PR, but I'm ok with it.",
+      "path": "x-pack/plugin/ql/src/test/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQueryTests.java",
+      "diff_hunk": "@@ -35,15 +37,15 @@ public void testEqualsAndHashCode() {\n     }\n \n     private static BoolQuery copy(BoolQuery query) {\n-        return new BoolQuery(query.source(), query.isAnd(), query.left(), query.right());\n+        return new BoolQuery(query.source(), query.isAnd(), left(query), right(query));\n     }\n \n     private static BoolQuery mutate(BoolQuery query) {\n         List<Function<BoolQuery, BoolQuery>> options = Arrays.asList(",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 44,
+      "original_line": 44,
+      "side": "RIGHT",
+      "original_position": 18,
+      "position": 18,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1202795674,
+          "user": "costin",
+          "body": "Fixed it nevertheless.",
+          "created_at": "2023-05-23T18:01:21Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1439492345,
+      "created_at": "2023-05-23T13:15:14Z",
+      "user": "astefan",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1440068260,
+      "created_at": "2023-05-23T15:52:58Z",
+      "user": "costin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1440216619,
+      "created_at": "2023-05-23T17:06:13Z",
+      "user": "costin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2023-05-23T17:59:20Z",
+      "sha": "b817aa283ce09f649e7492eeb653e60eb0caf2cb",
+      "message": "Improve tests",
+      "author": "Costin Leau",
+      "author_email": "costin.leau@gmail.com",
+      "author_raw_date": "2023-05-23T17:58:57Z",
+      "author_date": "2023-05-23T17:58:57Z",
+      "committer": "Costin Leau",
+      "committer_email": "costin.leau@gmail.com",
+      "raw_date": "2023-05-23T17:59:20Z",
+      "diff_text": "x-pack/plugin/ql/src/test/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQueryTests.java\n@@ -37,7 +37,7 @@ public void testEqualsAndHashCode() {\n     }\n \n     private static BoolQuery copy(BoolQuery query) {\n-        return new BoolQuery(query.source(), query.isAnd(), left(query), right(query));\n+        return new BoolQuery(query.source(), query.isAnd(), query.queries());\n     }\n \n     private static BoolQuery mutate(BoolQuery query) {\nx-pack/plugin/sql/src/test/resources/org/elasticsearch/xpack/sql/planner/querytranslator_tests.txt\n@@ -355,6 +355,16 @@ SELECT * FROM test WHERE some.string LIKE '%a%' OR some.string LIKE '%b%' OR som\n {\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}}],\"boost\":1.0}}\n ;\n \n+LikeOnInexactWithORandAND\n+SELECT * FROM test WHERE some.string LIKE '%a%' OR some.string LIKE '%b%' AND some.string LIKE '%c%' OR some.string LIKE '%d%' OR some.string LIKE '%e%';\n+{\"bool\":{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"bool\":{\"must\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}}],\"boost\":1.0}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*d*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*e*\",\"boost\":1.0}}}],\"boost\":1.0}}\n+;\n+\n+LikeOnInexactWithANDandGroupedOR\n+SELECT * FROM test WHERE (some.string LIKE '%a%' OR some.string LIKE '%b%') AND (some.string LIKE '%c%' OR some.string LIKE '%d%' OR some.string LIKE '%e%');\n+{\"bool\":{\"must\":[{\"bool\":{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}}],\"boost\":1.0}},{\"bool\":{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*d*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*e*\",\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+;\n+\n RLikeOnInexact\n SELECT * FROM test WHERE some.string RLIKE '.*a.*';\n \"query\":{\"regexp\":{\"some.string.typical\":{\"value\":\".*a.*\",",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ql/src/test/java/org/elasticsearch/xpack/ql/querydsl/query/BoolQueryTests.java",
+          "patch": "@@ -37,7 +37,7 @@ public void testEqualsAndHashCode() {\n     }\n \n     private static BoolQuery copy(BoolQuery query) {\n-        return new BoolQuery(query.source(), query.isAnd(), left(query), right(query));\n+        return new BoolQuery(query.source(), query.isAnd(), query.queries());\n     }\n \n     private static BoolQuery mutate(BoolQuery query) {"
+        },
+        {
+          "file": "x-pack/plugin/sql/src/test/resources/org/elasticsearch/xpack/sql/planner/querytranslator_tests.txt",
+          "patch": "@@ -355,6 +355,16 @@ SELECT * FROM test WHERE some.string LIKE '%a%' OR some.string LIKE '%b%' OR som\n {\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}}],\"boost\":1.0}}\n ;\n \n+LikeOnInexactWithORandAND\n+SELECT * FROM test WHERE some.string LIKE '%a%' OR some.string LIKE '%b%' AND some.string LIKE '%c%' OR some.string LIKE '%d%' OR some.string LIKE '%e%';\n+{\"bool\":{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"bool\":{\"must\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}}],\"boost\":1.0}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*d*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*e*\",\"boost\":1.0}}}],\"boost\":1.0}}\n+;\n+\n+LikeOnInexactWithANDandGroupedOR\n+SELECT * FROM test WHERE (some.string LIKE '%a%' OR some.string LIKE '%b%') AND (some.string LIKE '%c%' OR some.string LIKE '%d%' OR some.string LIKE '%e%');\n+{\"bool\":{\"must\":[{\"bool\":{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*a*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*b*\",\"boost\":1.0}}}],\"boost\":1.0}},{\"bool\":{\"should\":[{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*c*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*d*\",\"boost\":1.0}}},{\"wildcard\":{\"some.string.typical\":{\"wildcard\":\"*e*\",\"boost\":1.0}}}],\"boost\":1.0}}],\"boost\":1.0}}\n+;\n+\n RLikeOnInexact\n SELECT * FROM test WHERE some.string RLIKE '.*a.*';\n \"query\":{\"regexp\":{\"some.string.typical\":{\"value\":\".*a.*\","
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1559904613,
+      "created_at": "2023-05-23T18:01:05Z",
+      "user": "costin",
+      "body": "> LGTM I'd just add one or two unit tests with multiple conditions and mixed AND/OR\r\n\r\nI've added two more tests - OR OR AND OR OR plus (OR OR) AND (OR OR OR)"
+    },
+    {
+      "type": "review",
+      "id": 1440298351,
+      "created_at": "2023-05-23T18:01:22Z",
+      "user": "costin",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1560610197,
+      "created_at": "2023-05-24T07:42:34Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💚 Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [8.8](https://github.com/elastic/elasticsearch/pull/96312)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/96312\">](https://github.com/elastic/elasticsearch/pull/96312) |"
+    }
+  ]
+}

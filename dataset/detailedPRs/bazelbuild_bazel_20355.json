@@ -1,0 +1,197 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 20355,
+  "pr_number": 20355,
+  "title": "Don't issue GetCapabilities calls if the requirement is NONE",
+  "user": "coeuvre",
+  "created_at": "2023-11-29T12:32:06Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "team-Remote-Exec"
+  ],
+  "base_commit": "18b9da96a6572a71857b99b2f2b45716bc27b649",
+  "merge_commit_sha": "7ed04cc7b648f472238d0b7203ea346772522983",
+  "commits": 3,
+  "issue_events": [
+    "ready_for_review",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "labeled",
+    "closed",
+    "unlabeled",
+    "referenced",
+    "referenced",
+    "head_ref_deleted",
+    "referenced"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/20355",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-11-29T12:30:39Z",
+      "sha": "5a92d0d5af36620a281513fb239fcc4def6abece",
+      "message": "Don't issue GetCapabilities calls if the requirement is NONE",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2023-11-29T12:30:39Z",
+      "author_date": "2023-11-29T12:30:39Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2023-11-29T12:30:39Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/ChannelConnectionWithServerCapabilitiesFactory.java\n@@ -28,15 +28,15 @@ public interface ChannelConnectionWithServerCapabilitiesFactory extends ChannelC\n \n   /** A {@link ChannelConnection} that provides {@link ServerCapabilities}. */\n   class ChannelConnectionWithServerCapabilities extends ChannelConnection {\n-    private final ServerCapabilities serverCapabilities;\n+    private final Single<ServerCapabilities> serverCapabilities;\n \n     public ChannelConnectionWithServerCapabilities(\n-        ManagedChannel channel, ServerCapabilities serverCapabilities) {\n+        ManagedChannel channel, Single<ServerCapabilities> serverCapabilities) {\n       super(channel);\n       this.serverCapabilities = serverCapabilities;\n     }\n \n-    public ServerCapabilities getServerCapabilities() {\n+    public Single<ServerCapabilities> getServerCapabilities() {\n       return serverCapabilities;\n     }\n   }\nsrc/main/java/com/google/devtools/build/lib/remote/GoogleChannelConnectionFactory.java\n@@ -94,12 +94,21 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n     return Single.fromCallable(\n             () -> channelFactory.newChannel(target, proxy, options, interceptors))\n         .flatMap(\n-            channel ->\n-                RxFutures.toSingle(() -> getAndVerifyServerCapabilities(channel), directExecutor())\n-                    .map(\n-                        serverCapabilities ->\n-                            new ChannelConnectionWithServerCapabilities(\n-                                channel, serverCapabilities)));\n+            channel -> {\n+              var serverCapabilitiesSingle =\n+                  RxFutures.toSingle(\n+                      () -> getAndVerifyServerCapabilities(channel), directExecutor());\n+\n+              // Don't issue GetCapabilities calls if the requirement is NONE because some endpoint,\n+              // e.g. Remote Asset API, might not implement the API. See #20342.\n+              if (requirement == ServerCapabilitiesRequirement.NONE) {\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(channel, serverCapabilitiesSingle));\n+              }\n+\n+              return serverCapabilitiesSingle.map(\n+                  sc -> new ChannelConnectionWithServerCapabilities(channel, Single.just(sc)));\n+            });\n   }\n \n   private ListenableFuture<ServerCapabilities> getAndVerifyServerCapabilities(\nsrc/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannel.java\n@@ -78,7 +78,7 @@ public ServerCapabilities getServerCapabilities() throws IOException {\n     try (var s = Profiler.instance().profile(\"getServerCapabilities\")) {\n       return blockingGet(\n           withChannelConnection(\n-              channelConnection -> Single.just(channelConnection.getServerCapabilities())));\n+              ChannelConnectionWithServerCapabilities::getServerCapabilities));\n     } catch (ExecutionException e) {\n       throw new IOException(e);\n     } catch (InterruptedException e) {\nsrc/test/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderTest.java\n@@ -131,7 +131,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n             return Single.just(\n                 new ChannelConnectionWithServerCapabilities(\n                     InProcessChannelBuilder.forName(serverName).build(),\n-                    ServerCapabilities.getDefaultInstance()));\n+                    Single.just(ServerCapabilities.getDefaultInstance())));\n           }\n \n           @Override\nsrc/test/java/com/google/devtools/build/lib/remote/ByteStreamUploaderTest.java\n@@ -127,7 +127,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                 return Single.just(\n                     new ChannelConnectionWithServerCapabilities(\n                         InProcessChannelBuilder.forName(serverName).build(),\n-                        ServerCapabilities.getDefaultInstance()));\n+                        Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override\n@@ -1069,7 +1069,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         InProcessChannelBuilder.forName(serverName)\n                             .intercept(MetadataUtils.newAttachHeadersInterceptor(metadata))\n                             .build(),\n-                        ServerCapabilities.getDefaultInstance()));\n+                        Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override\nsrc/test/java/com/google/devtools/build/lib/remote/GrpcCacheClientTest.java\n@@ -195,7 +195,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         .build();\n                 return Single.just(\n                     new ChannelConnectionWithServerCapabilities(\n-                        ch, ServerCapabilities.getDefaultInstance()));\n+                        ch, Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override\nsrc/test/java/com/google/devtools/build/lib/remote/GrpcRemoteExecutorTestBase.java\n@@ -117,7 +117,8 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         .setExecutionCapabilities(\n                             ExecutionCapabilities.newBuilder().setExecEnabled(true).build())\n                         .build();\n-                return Single.just(new ChannelConnectionWithServerCapabilities(ch, caps));\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(ch, Single.just(caps)));\n               }\n \n               @Override\nsrc/test/java/com/google/devtools/build/lib/remote/RemoteSpawnRunnerWithGrpcRemoteExecutorTest.java\n@@ -313,7 +313,8 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         .setExecutionCapabilities(\n                             ExecutionCapabilities.newBuilder().setExecEnabled(true).build())\n                         .build();\n-                return Single.just(new ChannelConnectionWithServerCapabilities(ch, caps));\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(ch, Single.just(caps)));\n               }\n \n               @Override\nsrc/test/java/com/google/devtools/build/lib/remote/downloader/GrpcRemoteDownloaderTest.java\n@@ -145,7 +145,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                     InProcessChannelBuilder.forName(fakeServerName).directExecutor().build();\n                 return Single.just(\n                     new ChannelConnectionWithServerCapabilities(\n-                        ch, ServerCapabilities.getDefaultInstance()));\n+                        ch, Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ChannelConnectionWithServerCapabilitiesFactory.java",
+          "patch": "@@ -28,15 +28,15 @@ public interface ChannelConnectionWithServerCapabilitiesFactory extends ChannelC\n \n   /** A {@link ChannelConnection} that provides {@link ServerCapabilities}. */\n   class ChannelConnectionWithServerCapabilities extends ChannelConnection {\n-    private final ServerCapabilities serverCapabilities;\n+    private final Single<ServerCapabilities> serverCapabilities;\n \n     public ChannelConnectionWithServerCapabilities(\n-        ManagedChannel channel, ServerCapabilities serverCapabilities) {\n+        ManagedChannel channel, Single<ServerCapabilities> serverCapabilities) {\n       super(channel);\n       this.serverCapabilities = serverCapabilities;\n     }\n \n-    public ServerCapabilities getServerCapabilities() {\n+    public Single<ServerCapabilities> getServerCapabilities() {\n       return serverCapabilities;\n     }\n   }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/GoogleChannelConnectionFactory.java",
+          "patch": "@@ -94,12 +94,21 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n     return Single.fromCallable(\n             () -> channelFactory.newChannel(target, proxy, options, interceptors))\n         .flatMap(\n-            channel ->\n-                RxFutures.toSingle(() -> getAndVerifyServerCapabilities(channel), directExecutor())\n-                    .map(\n-                        serverCapabilities ->\n-                            new ChannelConnectionWithServerCapabilities(\n-                                channel, serverCapabilities)));\n+            channel -> {\n+              var serverCapabilitiesSingle =\n+                  RxFutures.toSingle(\n+                      () -> getAndVerifyServerCapabilities(channel), directExecutor());\n+\n+              // Don't issue GetCapabilities calls if the requirement is NONE because some endpoint,\n+              // e.g. Remote Asset API, might not implement the API. See #20342.\n+              if (requirement == ServerCapabilitiesRequirement.NONE) {\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(channel, serverCapabilitiesSingle));\n+              }\n+\n+              return serverCapabilitiesSingle.map(\n+                  sc -> new ChannelConnectionWithServerCapabilities(channel, Single.just(sc)));\n+            });\n   }\n \n   private ListenableFuture<ServerCapabilities> getAndVerifyServerCapabilities("
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ReferenceCountedChannel.java",
+          "patch": "@@ -78,7 +78,7 @@ public ServerCapabilities getServerCapabilities() throws IOException {\n     try (var s = Profiler.instance().profile(\"getServerCapabilities\")) {\n       return blockingGet(\n           withChannelConnection(\n-              channelConnection -> Single.just(channelConnection.getServerCapabilities())));\n+              ChannelConnectionWithServerCapabilities::getServerCapabilities));\n     } catch (ExecutionException e) {\n       throw new IOException(e);\n     } catch (InterruptedException e) {"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderTest.java",
+          "patch": "@@ -131,7 +131,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n             return Single.just(\n                 new ChannelConnectionWithServerCapabilities(\n                     InProcessChannelBuilder.forName(serverName).build(),\n-                    ServerCapabilities.getDefaultInstance()));\n+                    Single.just(ServerCapabilities.getDefaultInstance())));\n           }\n \n           @Override"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/ByteStreamUploaderTest.java",
+          "patch": "@@ -127,7 +127,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                 return Single.just(\n                     new ChannelConnectionWithServerCapabilities(\n                         InProcessChannelBuilder.forName(serverName).build(),\n-                        ServerCapabilities.getDefaultInstance()));\n+                        Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override\n@@ -1069,7 +1069,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         InProcessChannelBuilder.forName(serverName)\n                             .intercept(MetadataUtils.newAttachHeadersInterceptor(metadata))\n                             .build(),\n-                        ServerCapabilities.getDefaultInstance()));\n+                        Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/GrpcCacheClientTest.java",
+          "patch": "@@ -195,7 +195,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         .build();\n                 return Single.just(\n                     new ChannelConnectionWithServerCapabilities(\n-                        ch, ServerCapabilities.getDefaultInstance()));\n+                        ch, Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/GrpcRemoteExecutorTestBase.java",
+          "patch": "@@ -117,7 +117,8 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         .setExecutionCapabilities(\n                             ExecutionCapabilities.newBuilder().setExecEnabled(true).build())\n                         .build();\n-                return Single.just(new ChannelConnectionWithServerCapabilities(ch, caps));\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(ch, Single.just(caps)));\n               }\n \n               @Override"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/RemoteSpawnRunnerWithGrpcRemoteExecutorTest.java",
+          "patch": "@@ -313,7 +313,8 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                         .setExecutionCapabilities(\n                             ExecutionCapabilities.newBuilder().setExecEnabled(true).build())\n                         .build();\n-                return Single.just(new ChannelConnectionWithServerCapabilities(ch, caps));\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(ch, Single.just(caps)));\n               }\n \n               @Override"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/downloader/GrpcRemoteDownloaderTest.java",
+          "patch": "@@ -145,7 +145,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                     InProcessChannelBuilder.forName(fakeServerName).directExecutor().build();\n                 return Single.just(\n                     new ChannelConnectionWithServerCapabilities(\n-                        ch, ServerCapabilities.getDefaultInstance()));\n+                        ch, Single.just(ServerCapabilities.getDefaultInstance())));\n               }\n \n               @Override"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-11-29T12:32:06Z",
+      "user": "coeuvre",
+      "body": "Because the endpoint might not implement the `GetCapabilities` API,  e.g. Remote Asset API.\r\n\r\nFixes #20342."
+    },
+    {
+      "type": "commit",
+      "date": "2023-11-29T13:09:44Z",
+      "sha": "1d99665f3553ca89e702b32a6eff6f629fcd9c15",
+      "message": "Add test",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2023-11-29T13:09:44Z",
+      "author_date": "2023-11-29T13:09:44Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2023-11-29T13:09:44Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -1132,4 +1132,9 @@ static Credentials createCredentials(\n \n     return credentials;\n   }\n+\n+  @VisibleForTesting\n+  MutableSupplier<Downloader> getRemoteDownloaderSupplier() {\n+    return remoteDownloaderSupplier;\n+  }\n }\nsrc/main/java/com/google/devtools/build/lib/remote/downloader/GrpcRemoteDownloader.java\n@@ -199,4 +199,9 @@ private OutputStream newOutputStream(Path destination, Optional<Checksum> checks\n     }\n     return out;\n   }\n+\n+  @VisibleForTesting\n+  public ReferenceCountedChannel getChannel() {\n+    return channel;\n+  }\n }\nsrc/test/java/com/google/devtools/build/lib/remote/BUILD\n@@ -104,6 +104,7 @@ java_library(\n         \"//src/main/java/com/google/devtools/build/lib/remote/common:bulk_transfer_exception\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/common:cache_not_found_exception\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/disk\",\n+        \"//src/main/java/com/google/devtools/build/lib/remote/downloader\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/http\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/merkletree\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/options\",\nsrc/test/java/com/google/devtools/build/lib/remote/RemoteModuleTest.java\n@@ -43,6 +43,7 @@\n import com.google.devtools.build.lib.exec.ExecutionOptions;\n import com.google.devtools.build.lib.pkgcache.PackageOptions;\n import com.google.devtools.build.lib.remote.circuitbreaker.FailureCircuitBreaker;\n+import com.google.devtools.build.lib.remote.downloader.GrpcRemoteDownloader;\n import com.google.devtools.build.lib.remote.options.RemoteOptions;\n import com.google.devtools.build.lib.runtime.BlazeRuntime;\n import com.google.devtools.build.lib.runtime.BlazeServerStartupOptions;\n@@ -221,6 +222,40 @@ public void initialize() {\n     remoteOptions = Options.getDefaults(RemoteOptions.class);\n   }\n \n+  @Test\n+  public void testVerifyCapabilities_none() throws Exception {\n+    CapabilitiesImpl executionServerCapabilitiesImpl = new CapabilitiesImpl(EXEC_AND_CACHE_CAPS);\n+    Server executionServer =\n+        createFakeServer(EXECUTION_SERVER_NAME, executionServerCapabilitiesImpl);\n+    executionServer.start();\n+\n+    CapabilitiesImpl cacheCapabilitiesImpl = new CapabilitiesImpl(CACHE_ONLY_CAPS);\n+    Server cacheServer = createFakeServer(CACHE_SERVER_NAME, cacheCapabilitiesImpl);\n+    cacheServer.start();\n+\n+    try {\n+      remoteOptions.remoteExecutor = EXECUTION_SERVER_NAME;\n+      remoteOptions.remoteDownloader = CACHE_SERVER_NAME;\n+\n+      beforeCommand();\n+\n+      // Wait for the channel to be connected.\n+      var downloader = (GrpcRemoteDownloader) remoteModule.getRemoteDownloaderSupplier().get();\n+      var unused = downloader.getChannel().withChannelBlocking(ch -> new Object());\n+\n+      // Remote downloader uses Remote Asset API, and Bazel doesn't have any capability requirement\n+      // on the endpoint. Expecting the request count is 0.\n+      assertThat(cacheCapabilitiesImpl.getRequestCount()).isEqualTo(0);\n+      assertCircuitBreakerInstance();\n+    } finally {\n+      executionServer.shutdownNow();\n+      cacheServer.shutdownNow();\n+\n+      executionServer.awaitTermination();\n+      cacheServer.awaitTermination();\n+    }\n+  }\n+\n   @Test\n   public void testVerifyCapabilities_executionAndCacheForSingleEndpoint() throws Exception {\n     CapabilitiesImpl executionServerCapabilitiesImpl = new CapabilitiesImpl(EXEC_AND_CACHE_CAPS);",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -1132,4 +1132,9 @@ static Credentials createCredentials(\n \n     return credentials;\n   }\n+\n+  @VisibleForTesting\n+  MutableSupplier<Downloader> getRemoteDownloaderSupplier() {\n+    return remoteDownloaderSupplier;\n+  }\n }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/downloader/GrpcRemoteDownloader.java",
+          "patch": "@@ -199,4 +199,9 @@ private OutputStream newOutputStream(Path destination, Optional<Checksum> checks\n     }\n     return out;\n   }\n+\n+  @VisibleForTesting\n+  public ReferenceCountedChannel getChannel() {\n+    return channel;\n+  }\n }"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/BUILD",
+          "patch": "@@ -104,6 +104,7 @@ java_library(\n         \"//src/main/java/com/google/devtools/build/lib/remote/common:bulk_transfer_exception\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/common:cache_not_found_exception\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/disk\",\n+        \"//src/main/java/com/google/devtools/build/lib/remote/downloader\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/http\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/merkletree\",\n         \"//src/main/java/com/google/devtools/build/lib/remote/options\","
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/RemoteModuleTest.java",
+          "patch": "@@ -43,6 +43,7 @@\n import com.google.devtools.build.lib.exec.ExecutionOptions;\n import com.google.devtools.build.lib.pkgcache.PackageOptions;\n import com.google.devtools.build.lib.remote.circuitbreaker.FailureCircuitBreaker;\n+import com.google.devtools.build.lib.remote.downloader.GrpcRemoteDownloader;\n import com.google.devtools.build.lib.remote.options.RemoteOptions;\n import com.google.devtools.build.lib.runtime.BlazeRuntime;\n import com.google.devtools.build.lib.runtime.BlazeServerStartupOptions;\n@@ -221,6 +222,40 @@ public void initialize() {\n     remoteOptions = Options.getDefaults(RemoteOptions.class);\n   }\n \n+  @Test\n+  public void testVerifyCapabilities_none() throws Exception {\n+    CapabilitiesImpl executionServerCapabilitiesImpl = new CapabilitiesImpl(EXEC_AND_CACHE_CAPS);\n+    Server executionServer =\n+        createFakeServer(EXECUTION_SERVER_NAME, executionServerCapabilitiesImpl);\n+    executionServer.start();\n+\n+    CapabilitiesImpl cacheCapabilitiesImpl = new CapabilitiesImpl(CACHE_ONLY_CAPS);\n+    Server cacheServer = createFakeServer(CACHE_SERVER_NAME, cacheCapabilitiesImpl);\n+    cacheServer.start();\n+\n+    try {\n+      remoteOptions.remoteExecutor = EXECUTION_SERVER_NAME;\n+      remoteOptions.remoteDownloader = CACHE_SERVER_NAME;\n+\n+      beforeCommand();\n+\n+      // Wait for the channel to be connected.\n+      var downloader = (GrpcRemoteDownloader) remoteModule.getRemoteDownloaderSupplier().get();\n+      var unused = downloader.getChannel().withChannelBlocking(ch -> new Object());\n+\n+      // Remote downloader uses Remote Asset API, and Bazel doesn't have any capability requirement\n+      // on the endpoint. Expecting the request count is 0.\n+      assertThat(cacheCapabilitiesImpl.getRequestCount()).isEqualTo(0);\n+      assertCircuitBreakerInstance();\n+    } finally {\n+      executionServer.shutdownNow();\n+      cacheServer.shutdownNow();\n+\n+      executionServer.awaitTermination();\n+      cacheServer.awaitTermination();\n+    }\n+  }\n+\n   @Test\n   public void testVerifyCapabilities_executionAndCacheForSingleEndpoint() throws Exception {\n     CapabilitiesImpl executionServerCapabilitiesImpl = new CapabilitiesImpl(EXEC_AND_CACHE_CAPS);"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-11-29T13:12:44Z",
+      "sha": "51f46e6b2ec67ebf3d3149ed5fdf207563ea9e22",
+      "message": "Update comments",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2023-11-29T13:12:44Z",
+      "author_date": "2023-11-29T13:12:44Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2023-11-29T13:12:44Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/GoogleChannelConnectionFactory.java\n@@ -99,7 +99,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                   RxFutures.toSingle(\n                       () -> getAndVerifyServerCapabilities(channel), directExecutor());\n \n-              // Don't issue GetCapabilities calls if the requirement is NONE because some endpoint,\n+              // Don't issue GetCapabilities calls if the requirement is NONE because the endpoint,\n               // e.g. Remote Asset API, might not implement the API. See #20342.\n               if (requirement == ServerCapabilitiesRequirement.NONE) {\n                 return Single.just(\nsrc/test/java/com/google/devtools/build/lib/remote/RemoteModuleTest.java\n@@ -224,6 +224,8 @@ public void initialize() {\n \n   @Test\n   public void testVerifyCapabilities_none() throws Exception {\n+    // Test that Bazel doesn't issue GetCapabilities calls if the requirement is NONE.\n+    // Regression test for https://github.com/bazelbuild/bazel/issues/20342.\n     CapabilitiesImpl executionServerCapabilitiesImpl = new CapabilitiesImpl(EXEC_AND_CACHE_CAPS);\n     Server executionServer =\n         createFakeServer(EXECUTION_SERVER_NAME, executionServerCapabilitiesImpl);",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/GoogleChannelConnectionFactory.java",
+          "patch": "@@ -99,7 +99,7 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n                   RxFutures.toSingle(\n                       () -> getAndVerifyServerCapabilities(channel), directExecutor());\n \n-              // Don't issue GetCapabilities calls if the requirement is NONE because some endpoint,\n+              // Don't issue GetCapabilities calls if the requirement is NONE because the endpoint,\n               // e.g. Remote Asset API, might not implement the API. See #20342.\n               if (requirement == ServerCapabilitiesRequirement.NONE) {\n                 return Single.just("
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/RemoteModuleTest.java",
+          "patch": "@@ -224,6 +224,8 @@ public void initialize() {\n \n   @Test\n   public void testVerifyCapabilities_none() throws Exception {\n+    // Test that Bazel doesn't issue GetCapabilities calls if the requirement is NONE.\n+    // Regression test for https://github.com/bazelbuild/bazel/issues/20342.\n     CapabilitiesImpl executionServerCapabilitiesImpl = new CapabilitiesImpl(EXEC_AND_CACHE_CAPS);\n     Server executionServer =\n         createFakeServer(EXECUTION_SERVER_NAME, executionServerCapabilitiesImpl);"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1409273804,
+      "created_at": "2023-11-29T13:21:24Z",
+      "user": "tjgq",
+      "body": "Is the logic reversed? This to me reads as \"if the requirement is NONE, then call getAndVerifyServerCapabilities\".",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/GoogleChannelConnectionFactory.java",
+      "diff_hunk": "@@ -94,12 +94,21 @@ public Single<ChannelConnectionWithServerCapabilities> create() {\n     return Single.fromCallable(\n             () -> channelFactory.newChannel(target, proxy, options, interceptors))\n         .flatMap(\n-            channel ->\n-                RxFutures.toSingle(() -> getAndVerifyServerCapabilities(channel), directExecutor())\n-                    .map(\n-                        serverCapabilities ->\n-                            new ChannelConnectionWithServerCapabilities(\n-                                channel, serverCapabilities)));\n+            channel -> {\n+              var serverCapabilitiesSingle =\n+                  RxFutures.toSingle(\n+                      () -> getAndVerifyServerCapabilities(channel), directExecutor());\n+\n+              // Don't issue GetCapabilities calls if the requirement is NONE because the endpoint,\n+              // e.g. Remote Asset API, might not implement the API. See #20342.\n+              if (requirement == ServerCapabilitiesRequirement.NONE) {\n+                return Single.just(\n+                    new ChannelConnectionWithServerCapabilities(channel, serverCapabilitiesSingle));",
+      "start_line": 102,
+      "original_start_line": 102,
+      "start_side": "RIGHT",
+      "line": 106,
+      "original_line": 106,
+      "side": "RIGHT",
+      "original_position": 19,
+      "position": 19,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1410212828,
+          "user": "coeuvre",
+          "body": "No. `serverCapabilitiesSingle` is a lazy evaluation of `getAndVerifyServerCapabilities`.\r\n\r\nIf the requirement is NONE, we store it and call `getAndVerifyServerCapabilities` only when `ChannelConnectionWithServerCapabilities#getCapabilities` is called.\r\n\r\nOtherwise, we evaluate the single now which calls `getAndVerifyServerCapabilities` immediately.",
+          "created_at": "2023-11-30T06:31:29Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1755253244,
+      "created_at": "2023-11-29T13:23:16Z",
+      "user": "tjgq",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1756730291,
+      "created_at": "2023-11-30T06:31:29Z",
+      "user": "coeuvre",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1757143222,
+      "created_at": "2023-11-30T10:38:06Z",
+      "user": "tjgq",
+      "state": "APPROVED",
+      "body": ""
+    }
+  ]
+}

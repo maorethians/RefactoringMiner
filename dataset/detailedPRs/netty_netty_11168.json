@@ -1,0 +1,159 @@
+{
+  "repo": "netty/netty",
+  "number": 11168,
+  "pr_number": 11168,
+  "title": "SimpleChannelPromiseAggregator use first exception instead of last",
+  "user": "Scottmitch",
+  "created_at": "2021-04-19T19:04:23Z",
+  "merged_at": "2021-04-22T10:17:47Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "e2daae9ac8e4b5c0a04f47b163157445915b949a",
+  "merge_commit_sha": "75c1134c0d33becb0b746155472e6076e9005340",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "milestoned",
+    "referenced",
+    "head_ref_deleted",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/netty/netty/pull/11168",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-04-19T19:01:18Z",
+      "sha": "a7aaf1263a49d639713780e20bfc614921d28ef4",
+      "message": "SimpleChannelPromiseAggregator use first exception instead of last\n\nMotivation:\nSimpleChannelPromiseAggregator implements the promise API and allows for\nmultiple operations to share a common promise. It currently propagates\nthe last exception to occur, but this may mask the original exception\nwhich lead to the last exception and make debugging more difficult.\n\nModifications:\n- SimpleChannelPromiseAggregator propagates the first exception instead\n  of the last exception.\n\nResult:\nFixes https://github.com/netty/netty/issues/11161.",
+      "author": "Scott Mitchell",
+      "author_email": "scott_mitchell@apple.com",
+      "author_raw_date": "2021-04-19T19:01:16Z",
+      "author_date": "2021-04-19T19:01:16Z",
+      "committer": "Scott Mitchell",
+      "committer_email": "scott_mitchell@apple.com",
+      "raw_date": "2021-04-19T19:01:18Z",
+      "diff_text": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2CodecUtil.java\n@@ -262,7 +262,7 @@ static final class SimpleChannelPromiseAggregator extends DefaultChannelPromise\n         private final ChannelPromise promise;\n         private int expectedCount;\n         private int doneCount;\n-        private Throwable lastFailure;\n+        private Throwable aggregateFailure;\n         private boolean doneAllocating;\n \n         SimpleChannelPromiseAggregator(ChannelPromise promise, Channel c, EventExecutor e) {\n@@ -301,7 +301,7 @@ public ChannelPromise doneAllocatingPromises() {\n         public boolean tryFailure(Throwable cause) {\n             if (allowFailure()) {\n                 ++doneCount;\n-                lastFailure = cause;\n+                setAggregateFailure(cause);\n                 if (allPromisesDone()) {\n                     return tryPromise();\n                 }\n@@ -322,7 +322,7 @@ public boolean tryFailure(Throwable cause) {\n         public ChannelPromise setFailure(Throwable cause) {\n             if (allowFailure()) {\n                 ++doneCount;\n-                lastFailure = cause;\n+                setAggregateFailure(cause);\n                 if (allPromisesDone()) {\n                     return setPromise();\n                 }\n@@ -368,22 +368,28 @@ private boolean allPromisesDone() {\n         }\n \n         private ChannelPromise setPromise() {\n-            if (lastFailure == null) {\n+            if (aggregateFailure == null) {\n                 promise.setSuccess();\n                 return super.setSuccess(null);\n             } else {\n-                promise.setFailure(lastFailure);\n-                return super.setFailure(lastFailure);\n+                promise.setFailure(aggregateFailure);\n+                return super.setFailure(aggregateFailure);\n             }\n         }\n \n         private boolean tryPromise() {\n-            if (lastFailure == null) {\n+            if (aggregateFailure == null) {\n                 promise.trySuccess();\n                 return super.trySuccess(null);\n             } else {\n-                promise.tryFailure(lastFailure);\n-                return super.tryFailure(lastFailure);\n+                promise.tryFailure(aggregateFailure);\n+                return super.tryFailure(aggregateFailure);\n+            }\n+        }\n+\n+        private void setAggregateFailure(Throwable cause) {\n+            if (aggregateFailure == null) {\n+                aggregateFailure = cause;\n             }\n         }\n     }\ncodec-http2/src/test/java/io/netty/handler/codec/http2/HttpToHttp2ConnectionHandlerTest.java\n@@ -63,8 +63,11 @@\n import static io.netty.handler.codec.http2.Http2TestUtil.of;\n import static io.netty.util.CharsetUtil.UTF_8;\n import static java.util.concurrent.TimeUnit.SECONDS;\n+import static org.hamcrest.MatcherAssert.assertThat;\n+import static org.hamcrest.Matchers.instanceOf;\n import static org.junit.Assert.assertEquals;\n import static org.junit.Assert.assertFalse;\n+import static org.junit.Assert.assertNotEquals;\n import static org.junit.Assert.assertTrue;\n import static org.mockito.Mockito.any;\n import static org.mockito.Mockito.anyBoolean;\n@@ -356,6 +359,30 @@ public void testNoSchemeRequestTargetHandled() throws Exception {\n         assertFalse(writeFuture.isSuccess());\n     }\n \n+    @Test\n+    public void testInvalidStreamId() throws Exception {\n+        bootstrapEnv(2, 1, 0);\n+        final FullHttpRequest request = new DefaultFullHttpRequest(HTTP_1_1, POST, \"/foo\",\n+                Unpooled.copiedBuffer(\"foobar\", UTF_8));\n+        final HttpHeaders httpHeaders = request.headers();\n+        httpHeaders.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(), -1);\n+        httpHeaders.set(HttpConversionUtil.ExtensionHeaderNames.SCHEME.text(), \"http\");\n+        httpHeaders.set(HttpHeaderNames.HOST, \"localhost\");\n+        ChannelPromise writePromise = newPromise();\n+        ChannelFuture writeFuture = clientChannel.writeAndFlush(request, writePromise);\n+\n+        assertTrue(writePromise.awaitUninterruptibly(WAIT_TIME_SECONDS, SECONDS));\n+        assertTrue(writePromise.isDone());\n+        assertFalse(writePromise.isSuccess());\n+        Throwable cause = writePromise.cause();\n+        assertThat(cause, instanceOf(Http2NoMoreStreamIdsException.class));\n+\n+        assertTrue(writeFuture.isDone());\n+        assertFalse(writeFuture.isSuccess());\n+        cause = writeFuture.cause();\n+        assertThat(cause, instanceOf(Http2NoMoreStreamIdsException.class));\n+    }\n+\n     @Test\n     public void testRequestWithBody() throws Exception {\n         final String text = \"foooooogoooo\";",
+      "diff": [
+        {
+          "file": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2CodecUtil.java",
+          "patch": "@@ -262,7 +262,7 @@ static final class SimpleChannelPromiseAggregator extends DefaultChannelPromise\n         private final ChannelPromise promise;\n         private int expectedCount;\n         private int doneCount;\n-        private Throwable lastFailure;\n+        private Throwable aggregateFailure;\n         private boolean doneAllocating;\n \n         SimpleChannelPromiseAggregator(ChannelPromise promise, Channel c, EventExecutor e) {\n@@ -301,7 +301,7 @@ public ChannelPromise doneAllocatingPromises() {\n         public boolean tryFailure(Throwable cause) {\n             if (allowFailure()) {\n                 ++doneCount;\n-                lastFailure = cause;\n+                setAggregateFailure(cause);\n                 if (allPromisesDone()) {\n                     return tryPromise();\n                 }\n@@ -322,7 +322,7 @@ public boolean tryFailure(Throwable cause) {\n         public ChannelPromise setFailure(Throwable cause) {\n             if (allowFailure()) {\n                 ++doneCount;\n-                lastFailure = cause;\n+                setAggregateFailure(cause);\n                 if (allPromisesDone()) {\n                     return setPromise();\n                 }\n@@ -368,22 +368,28 @@ private boolean allPromisesDone() {\n         }\n \n         private ChannelPromise setPromise() {\n-            if (lastFailure == null) {\n+            if (aggregateFailure == null) {\n                 promise.setSuccess();\n                 return super.setSuccess(null);\n             } else {\n-                promise.setFailure(lastFailure);\n-                return super.setFailure(lastFailure);\n+                promise.setFailure(aggregateFailure);\n+                return super.setFailure(aggregateFailure);\n             }\n         }\n \n         private boolean tryPromise() {\n-            if (lastFailure == null) {\n+            if (aggregateFailure == null) {\n                 promise.trySuccess();\n                 return super.trySuccess(null);\n             } else {\n-                promise.tryFailure(lastFailure);\n-                return super.tryFailure(lastFailure);\n+                promise.tryFailure(aggregateFailure);\n+                return super.tryFailure(aggregateFailure);\n+            }\n+        }\n+\n+        private void setAggregateFailure(Throwable cause) {\n+            if (aggregateFailure == null) {\n+                aggregateFailure = cause;\n             }\n         }\n     }"
+        },
+        {
+          "file": "codec-http2/src/test/java/io/netty/handler/codec/http2/HttpToHttp2ConnectionHandlerTest.java",
+          "patch": "@@ -63,8 +63,11 @@\n import static io.netty.handler.codec.http2.Http2TestUtil.of;\n import static io.netty.util.CharsetUtil.UTF_8;\n import static java.util.concurrent.TimeUnit.SECONDS;\n+import static org.hamcrest.MatcherAssert.assertThat;\n+import static org.hamcrest.Matchers.instanceOf;\n import static org.junit.Assert.assertEquals;\n import static org.junit.Assert.assertFalse;\n+import static org.junit.Assert.assertNotEquals;\n import static org.junit.Assert.assertTrue;\n import static org.mockito.Mockito.any;\n import static org.mockito.Mockito.anyBoolean;\n@@ -356,6 +359,30 @@ public void testNoSchemeRequestTargetHandled() throws Exception {\n         assertFalse(writeFuture.isSuccess());\n     }\n \n+    @Test\n+    public void testInvalidStreamId() throws Exception {\n+        bootstrapEnv(2, 1, 0);\n+        final FullHttpRequest request = new DefaultFullHttpRequest(HTTP_1_1, POST, \"/foo\",\n+                Unpooled.copiedBuffer(\"foobar\", UTF_8));\n+        final HttpHeaders httpHeaders = request.headers();\n+        httpHeaders.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(), -1);\n+        httpHeaders.set(HttpConversionUtil.ExtensionHeaderNames.SCHEME.text(), \"http\");\n+        httpHeaders.set(HttpHeaderNames.HOST, \"localhost\");\n+        ChannelPromise writePromise = newPromise();\n+        ChannelFuture writeFuture = clientChannel.writeAndFlush(request, writePromise);\n+\n+        assertTrue(writePromise.awaitUninterruptibly(WAIT_TIME_SECONDS, SECONDS));\n+        assertTrue(writePromise.isDone());\n+        assertFalse(writePromise.isSuccess());\n+        Throwable cause = writePromise.cause();\n+        assertThat(cause, instanceOf(Http2NoMoreStreamIdsException.class));\n+\n+        assertTrue(writeFuture.isDone());\n+        assertFalse(writeFuture.isSuccess());\n+        cause = writeFuture.cause();\n+        assertThat(cause, instanceOf(Http2NoMoreStreamIdsException.class));\n+    }\n+\n     @Test\n     public void testRequestWithBody() throws Exception {\n         final String text = \"foooooogoooo\";"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-04-19T19:04:23Z",
+      "user": "Scottmitch",
+      "body": "Motivation:\r\nSimpleChannelPromiseAggregator implements the promise API and allows for\r\nmultiple operations to share a common promise. It currently propagates\r\nthe last exception to occur, but this may mask the original exception\r\nwhich lead to the last exception and make debugging more difficult.\r\n\r\nModifications:\r\n- SimpleChannelPromiseAggregator propagates the first exception instead\r\n  of the last exception.\r\n\r\nResult:\r\nFixes https://github.com/netty/netty/issues/11161."
+    },
+    {
+      "type": "review_comment",
+      "id": 616122698,
+      "created_at": "2021-04-19T19:31:10Z",
+      "user": "normanmaurer",
+      "body": "Should we try to add it as suppressed via ThrowableUtil if we already have one stored ?",
+      "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2CodecUtil.java",
+      "diff_hunk": "@@ -368,22 +368,28 @@ private boolean allPromisesDone() {\n         }\n \n         private ChannelPromise setPromise() {\n-            if (lastFailure == null) {\n+            if (aggregateFailure == null) {\n                 promise.setSuccess();\n                 return super.setSuccess(null);\n             } else {\n-                promise.setFailure(lastFailure);\n-                return super.setFailure(lastFailure);\n+                promise.setFailure(aggregateFailure);\n+                return super.setFailure(aggregateFailure);\n             }\n         }\n \n         private boolean tryPromise() {\n-            if (lastFailure == null) {\n+            if (aggregateFailure == null) {\n                 promise.trySuccess();\n                 return super.trySuccess(null);\n             } else {\n-                promise.tryFailure(lastFailure);\n-                return super.tryFailure(lastFailure);\n+                promise.tryFailure(aggregateFailure);\n+                return super.tryFailure(aggregateFailure);\n+            }\n+        }\n+\n+        private void setAggregateFailure(Throwable cause) {\n+            if (aggregateFailure == null) {\n+                aggregateFailure = cause;\n             }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 387,
+      "original_line": 387,
+      "side": "LEFT",
+      "original_position": 59,
+      "position": 59,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 616263309,
+          "user": "Scottmitch",
+          "body": "first exception should be sufficient but we can do this if you think it adds value. `addSuppressed` will cause issues with static exceptions (e.g memory leak) and self-references (throws synchronously) so care is required when using this API (e.g. consider enhancing `ThrowableUtils` to avoid adding self-references).",
+          "created_at": "2021-04-20T00:33:02Z"
+        },
+        {
+          "id": 616367543,
+          "user": "normanmaurer",
+          "body": "@slandelle WDYT ?",
+          "created_at": "2021-04-20T06:02:01Z"
+        },
+        {
+          "id": 616380704,
+          "user": "normanmaurer",
+          "body": "@Scottmitch trying to add a self-reference will throw as Throwable itself guard against it. So I think there is nothing to do in `ThrowableUtil` for us here... I am missing anything ?",
+          "created_at": "2021-04-20T06:30:29Z"
+        },
+        {
+          "id": 616765250,
+          "user": "Scottmitch",
+          "body": "> Throwable itself guard against it.\r\n\r\nThat is what I mean. Throwable's \"guard\" is to throw in this case, but we generally don't know if the same reference is being used or not. If the same reference in being used and we allow a throw here the async control flow may not  complete (e.g. `Promise.setSuccess` throws before it notifies listeners). For our usages where we don't control the exceptions and need to complete async control flow we should prevent passing a self-reference to `addSuppressed`.",
+          "created_at": "2021-04-20T14:56:18Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 639235844,
+      "created_at": "2021-04-19T19:31:20Z",
+      "user": "normanmaurer",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 822880647,
+      "created_at": "2021-04-20T00:27:05Z",
+      "user": "Scottmitch",
+      "body": "build failure attributed to https://github.com/netty/netty/issues/11169"
+    },
+    {
+      "type": "review",
+      "id": 639410469,
+      "created_at": "2021-04-20T00:33:03Z",
+      "user": "Scottmitch",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 639532206,
+      "created_at": "2021-04-20T06:02:01Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 639549132,
+      "created_at": "2021-04-20T06:30:29Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 640061294,
+      "created_at": "2021-04-20T14:56:19Z",
+      "user": "Scottmitch",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 642024588,
+      "created_at": "2021-04-22T10:17:37Z",
+      "user": "normanmaurer",
+      "state": "APPROVED",
+      "body": ""
+    }
+  ]
+}

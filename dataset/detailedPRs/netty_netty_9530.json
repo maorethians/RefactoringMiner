@@ -1,0 +1,170 @@
+{
+  "repo": "netty/netty",
+  "number": 9530,
+  "pr_number": 9530,
+  "title": "Correctly protect DefaultChannelPipeline nodes when concurrent remova…",
+  "user": "normanmaurer",
+  "created_at": "2019-09-02T13:00:15Z",
+  "merged_at": "2019-09-03T06:35:11Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "1039f69e53792ff58f3f61f5ab6f7b89ef1fecf0",
+  "merge_commit_sha": "affbdf712501203696d9c7a9657c74127043a7d2",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "review_requested",
+    "milestoned",
+    "head_ref_force_pushed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "demilestoned",
+    "milestoned"
+  ],
+  "url": "https://github.com/netty/netty/pull/9530",
+  "timeline": [
+    {
+      "type": "description",
+      "created_at": "2019-09-02T13:00:15Z",
+      "user": "normanmaurer",
+      "body": "…ls happen due handlerAdded(...) throwing\r\n\r\nMotivation:\r\n\r\nWe need to update the doubly-linked list nodes while holding a lock via synchronized in all cases as otherwise we may end-up with a corrupted pipeline. We missed this when calling remove0(...) due handlerAdded(...) throwing an exception.\r\n\r\nModifications:\r\n\r\n- Correctly hold lock while update node\r\n- Add assert\r\n- Add unit test\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/9528"
+    },
+    {
+      "type": "commit",
+      "date": "2019-09-02T15:05:11Z",
+      "sha": "e8ed57c748cfabe3aa50984acfd7690c0b1a705c",
+      "message": "Correctly protect DefaultChannelPipeline nodes when concurrent removals happen due handlerAdded(...) throwing\n\nMotivation:\n\nWe need to update the doubly-linked list nodes while holding a lock via synchronized in all cases as otherwise we may end-up with a corrupted pipeline. We missed this when calling remove0(...) due handlerAdded(...) throwing an exception.\n\nModifications:\n\n- Correctly hold lock while update node\n- Add assert\n- Add unit test\n\nResult:\n\nFixes https://github.com/netty/netty/issues/9528",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2019-09-02T15:05:11Z",
+      "author_date": "2019-09-02T15:05:11Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2019-09-02T15:05:11Z",
+      "diff_text": "transport/src/main/java/io/netty/channel/DefaultChannelPipeline.java\n@@ -482,7 +482,8 @@ public void run() {\n         return ctx;\n     }\n \n-    private static void remove0(AbstractChannelHandlerContext ctx) {\n+    private void remove0(AbstractChannelHandlerContext ctx) {\n+        assert Thread.holdsLock(this);\n         AbstractChannelHandlerContext prev = ctx.prev;\n         AbstractChannelHandlerContext next = ctx.next;\n         prev.next = next;\n@@ -611,7 +612,9 @@ private void callHandlerAdded0(final AbstractChannelHandlerContext ctx) {\n         } catch (Throwable t) {\n             boolean removed = false;\n             try {\n-                remove0(ctx);\n+                synchronized (this) {\n+                    remove0(ctx);\n+                }\n                 ctx.callHandlerRemoved();\n                 removed = true;\n             } catch (Throwable t2) {\n@@ -1481,7 +1484,9 @@ void execute() {\n                                 \"Can't invoke handlerAdded() as the EventExecutor {} rejected it, removing handler {}.\",\n                                 executor, ctx.name(), e);\n                     }\n-                    remove0(ctx);\n+                    synchronized (this) {\n+                        remove0(ctx);\n+                    }\n                     ctx.setRemoved();\n                 }\n             }\ntransport/src/test/java/io/netty/channel/DefaultChannelPipelineTest.java\n@@ -43,6 +43,7 @@\n import io.netty.util.concurrent.UnorderedThreadPoolEventExecutor;\n import org.junit.After;\n import org.junit.AfterClass;\n+import org.junit.BeforeClass;\n import org.junit.Test;\n \n import java.net.SocketAddress;\n@@ -73,11 +74,16 @@\n \n public class DefaultChannelPipelineTest {\n \n-    private static final EventLoopGroup group = new DefaultEventLoopGroup(1);\n+    private static EventLoopGroup group;\n \n     private Channel self;\n     private Channel peer;\n \n+    @BeforeClass\n+    public static void beforeClass() throws Exception {\n+        group = new DefaultEventLoopGroup(1);\n+    }\n+\n     @AfterClass\n     public static void afterClass() throws Exception {\n         group.shutdownGracefully().sync();\n@@ -1637,6 +1643,67 @@ public ReferenceCounted touch(Object hint) {\n         channel2.close().syncUninterruptibly();\n     }\n \n+    @Test(timeout = 5000)\n+    public void testHandlerAddedFailedButHandlerStillRemoved() throws InterruptedException {\n+        testHandlerAddedFailedButHandlerStillRemoved0(false);\n+    }\n+\n+    @Test(timeout = 5000)\n+    public void testHandlerAddedFailedButHandlerStillRemovedWithLaterRegister() throws InterruptedException {\n+        testHandlerAddedFailedButHandlerStillRemoved0(true);\n+    }\n+\n+    private static void testHandlerAddedFailedButHandlerStillRemoved0(boolean lateRegister)\n+            throws InterruptedException {\n+        EventExecutorGroup executorGroup = new DefaultEventExecutorGroup(16);\n+        final int numHandlers = 32;\n+        try {\n+            Channel channel = new LocalChannel();\n+            channel.config().setOption(ChannelOption.SINGLE_EVENTEXECUTOR_PER_GROUP, false);\n+            if (!lateRegister) {\n+                group.register(channel).sync();\n+            }\n+            channel.pipeline().addFirst(newHandler());\n+\n+            List<CountDownLatch> latchList = new ArrayList<CountDownLatch>(numHandlers);\n+            for (int i = 0; i < numHandlers; i++) {\n+                CountDownLatch latch = new CountDownLatch(1);\n+                channel.pipeline().addFirst(executorGroup, \"h\" + i, new BadChannelHandler(latch));\n+                latchList.add(latch);\n+            }\n+            if (lateRegister) {\n+                group.register(channel).sync();\n+            }\n+\n+            for (int i = 0; i < numHandlers; i++) {\n+                // Wait until the latch was countDown which means handlerRemoved(...) was called.\n+                latchList.get(i).await();\n+                assertNull(channel.pipeline().get(\"h\" + i));\n+            }\n+        } finally {\n+            executorGroup.shutdownGracefully();\n+        }\n+    }\n+\n+    private static final class BadChannelHandler extends ChannelHandlerAdapter {\n+        private final CountDownLatch latch;\n+\n+        BadChannelHandler(CountDownLatch latch) {\n+            this.latch = latch;\n+        }\n+\n+        @Override\n+        public void handlerAdded(ChannelHandlerContext ctx) throws Exception {\n+            TimeUnit.MILLISECONDS.sleep(10);\n+            throw new RuntimeException();\n+        }\n+\n+        @Override\n+        public void handlerRemoved(ChannelHandlerContext ctx) {\n+            latch.countDown();\n+        }\n+    }\n+\n     @Test(timeout = 5000)\n     public void handlerAddedStateUpdatedBeforeHandlerAddedDoneForceEventLoop() throws InterruptedException {\n         handlerAddedStateUpdatedBeforeHandlerAddedDone(true);",
+      "diff": [
+        {
+          "file": "transport/src/main/java/io/netty/channel/DefaultChannelPipeline.java",
+          "patch": "@@ -482,7 +482,8 @@ public void run() {\n         return ctx;\n     }\n \n-    private static void remove0(AbstractChannelHandlerContext ctx) {\n+    private void remove0(AbstractChannelHandlerContext ctx) {\n+        assert Thread.holdsLock(this);\n         AbstractChannelHandlerContext prev = ctx.prev;\n         AbstractChannelHandlerContext next = ctx.next;\n         prev.next = next;\n@@ -611,7 +612,9 @@ private void callHandlerAdded0(final AbstractChannelHandlerContext ctx) {\n         } catch (Throwable t) {\n             boolean removed = false;\n             try {\n-                remove0(ctx);\n+                synchronized (this) {\n+                    remove0(ctx);\n+                }\n                 ctx.callHandlerRemoved();\n                 removed = true;\n             } catch (Throwable t2) {\n@@ -1481,7 +1484,9 @@ void execute() {\n                                 \"Can't invoke handlerAdded() as the EventExecutor {} rejected it, removing handler {}.\",\n                                 executor, ctx.name(), e);\n                     }\n-                    remove0(ctx);\n+                    synchronized (this) {\n+                        remove0(ctx);\n+                    }\n                     ctx.setRemoved();\n                 }\n             }"
+        },
+        {
+          "file": "transport/src/test/java/io/netty/channel/DefaultChannelPipelineTest.java",
+          "patch": "@@ -43,6 +43,7 @@\n import io.netty.util.concurrent.UnorderedThreadPoolEventExecutor;\n import org.junit.After;\n import org.junit.AfterClass;\n+import org.junit.BeforeClass;\n import org.junit.Test;\n \n import java.net.SocketAddress;\n@@ -73,11 +74,16 @@\n \n public class DefaultChannelPipelineTest {\n \n-    private static final EventLoopGroup group = new DefaultEventLoopGroup(1);\n+    private static EventLoopGroup group;\n \n     private Channel self;\n     private Channel peer;\n \n+    @BeforeClass\n+    public static void beforeClass() throws Exception {\n+        group = new DefaultEventLoopGroup(1);\n+    }\n+\n     @AfterClass\n     public static void afterClass() throws Exception {\n         group.shutdownGracefully().sync();\n@@ -1637,6 +1643,67 @@ public ReferenceCounted touch(Object hint) {\n         channel2.close().syncUninterruptibly();\n     }\n \n+    @Test(timeout = 5000)\n+    public void testHandlerAddedFailedButHandlerStillRemoved() throws InterruptedException {\n+        testHandlerAddedFailedButHandlerStillRemoved0(false);\n+    }\n+\n+    @Test(timeout = 5000)\n+    public void testHandlerAddedFailedButHandlerStillRemovedWithLaterRegister() throws InterruptedException {\n+        testHandlerAddedFailedButHandlerStillRemoved0(true);\n+    }\n+\n+    private static void testHandlerAddedFailedButHandlerStillRemoved0(boolean lateRegister)\n+            throws InterruptedException {\n+        EventExecutorGroup executorGroup = new DefaultEventExecutorGroup(16);\n+        final int numHandlers = 32;\n+        try {\n+            Channel channel = new LocalChannel();\n+            channel.config().setOption(ChannelOption.SINGLE_EVENTEXECUTOR_PER_GROUP, false);\n+            if (!lateRegister) {\n+                group.register(channel).sync();\n+            }\n+            channel.pipeline().addFirst(newHandler());\n+\n+            List<CountDownLatch> latchList = new ArrayList<CountDownLatch>(numHandlers);\n+            for (int i = 0; i < numHandlers; i++) {\n+                CountDownLatch latch = new CountDownLatch(1);\n+                channel.pipeline().addFirst(executorGroup, \"h\" + i, new BadChannelHandler(latch));\n+                latchList.add(latch);\n+            }\n+            if (lateRegister) {\n+                group.register(channel).sync();\n+            }\n+\n+            for (int i = 0; i < numHandlers; i++) {\n+                // Wait until the latch was countDown which means handlerRemoved(...) was called.\n+                latchList.get(i).await();\n+                assertNull(channel.pipeline().get(\"h\" + i));\n+            }\n+        } finally {\n+            executorGroup.shutdownGracefully();\n+        }\n+    }\n+\n+    private static final class BadChannelHandler extends ChannelHandlerAdapter {\n+        private final CountDownLatch latch;\n+\n+        BadChannelHandler(CountDownLatch latch) {\n+            this.latch = latch;\n+        }\n+\n+        @Override\n+        public void handlerAdded(ChannelHandlerContext ctx) throws Exception {\n+            TimeUnit.MILLISECONDS.sleep(10);\n+            throw new RuntimeException();\n+        }\n+\n+        @Override\n+        public void handlerRemoved(ChannelHandlerContext ctx) {\n+            latch.countDown();\n+        }\n+    }\n+\n     @Test(timeout = 5000)\n     public void handlerAddedStateUpdatedBeforeHandlerAddedDoneForceEventLoop() throws InterruptedException {\n         handlerAddedStateUpdatedBeforeHandlerAddedDone(true);"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 282681520,
+      "created_at": "2019-09-02T17:56:08Z",
+      "user": "franz1981",
+      "state": "COMMENTED",
+      "body": "Code-wise seems fine, need to run the test and LGTM"
+    },
+    {
+      "type": "review",
+      "id": 282829866,
+      "created_at": "2019-09-03T08:17:26Z",
+      "user": "nitsanw",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 320144231,
+      "created_at": "2019-09-03T08:17:26Z",
+      "user": "nitsanw",
+      "body": "Doesn't this imply that `remove0` should be `synchronized`?",
+      "path": "transport/src/main/java/io/netty/channel/DefaultChannelPipeline.java",
+      "diff_hunk": "@@ -482,7 +482,8 @@ public void run() {\n         return ctx;\n     }\n \n-    private static void remove0(AbstractChannelHandlerContext ctx) {\n+    private void remove0(AbstractChannelHandlerContext ctx) {\n+        assert Thread.holdsLock(this);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 486,
+      "original_line": 486,
+      "side": "RIGHT",
+      "original_position": 6,
+      "position": 6,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 320146238,
+          "user": "normanmaurer",
+          "body": "@nitsanw it imply that `remove0` should only be called from a scope which is `synchronized(this)`",
+          "created_at": "2019-09-03T08:22:15Z"
+        },
+        {
+          "id": 320167747,
+          "user": "nitsanw",
+          "body": "Isn't that exactly what a `synchronized` method does?",
+          "created_at": "2019-09-03T09:09:24Z"
+        },
+        {
+          "id": 320174563,
+          "user": "normanmaurer",
+          "body": "sure but why mark it `synchonized` when it is always called from a `synchronized` scope anyway ? If it is not called from a `synchronized` scope its a bug... Like here ;)",
+          "created_at": "2019-09-03T09:24:55Z"
+        },
+        {
+          "id": 320181463,
+          "user": "nitsanw",
+          "body": "I understand this used to be a static method, and therefore you could not mark it as `synchronized`, but now that you can it would AFAICT prevent this bug far less verbosely (it would make the old code correct, make the assertion redundant). Is there a reason not to use `synchronized` here? :-)",
+          "created_at": "2019-09-03T09:39:56Z"
+        },
+        {
+          "id": 320182130,
+          "user": "normanmaurer",
+          "body": "@nitsanw I am not sure :) In many cases the synchronized need to not only have this code in but much more so I kind of preferred it to not have it on the method only and so make it more \"verbose\".",
+          "created_at": "2019-09-03T09:41:32Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 282832432,
+      "created_at": "2019-09-03T08:22:15Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 282859587,
+      "created_at": "2019-09-03T09:09:24Z",
+      "user": "nitsanw",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 282868424,
+      "created_at": "2019-09-03T09:24:55Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 282877224,
+      "created_at": "2019-09-03T09:39:57Z",
+      "user": "nitsanw",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 282878095,
+      "created_at": "2019-09-03T09:41:33Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

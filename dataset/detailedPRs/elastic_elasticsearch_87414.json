@@ -1,0 +1,234 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 87414,
+  "pr_number": 87414,
+  "title": "Handle ordering in plain highlighter for multiple inputs",
+  "user": "romseygeek",
+  "created_at": "2022-06-06T11:20:04Z",
+  "merged_at": "2022-06-07T12:58:15Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Search Relevance/Highlighting",
+    "Team:Search",
+    "v8.4.0"
+  ],
+  "base_commit": "048fa422c26cc02cfd327dfe80bf3064feff24c1",
+  "merge_commit_sha": "de2b2ddd674ff92d77deb4b5973d8a96e093a876",
+  "commits": 4,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "assigned",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/87414",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-06-06T11:17:43Z",
+      "sha": "f2a21009ddfb82a8c49960378702d5d0137fb721",
+      "message": "Handle ordering in plain highlighter for multiple inputs",
+      "author": "Alan Woodward",
+      "author_email": "romseygeek@apache.org",
+      "author_raw_date": "2022-06-06T11:17:43Z",
+      "author_date": "2022-06-06T11:17:43Z",
+      "committer": "Alan Woodward",
+      "committer_email": "romseygeek@apache.org",
+      "raw_date": "2022-06-06T11:17:43Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighter.java\n@@ -22,7 +22,6 @@\n import org.apache.lucene.search.highlight.SimpleSpanFragmenter;\n import org.apache.lucene.search.highlight.TextFragment;\n import org.apache.lucene.util.BytesRefHash;\n-import org.apache.lucene.util.CollectionUtil;\n import org.elasticsearch.common.lucene.Lucene;\n import org.elasticsearch.common.text.Text;\n import org.elasticsearch.index.IndexSettings;\n@@ -32,6 +31,7 @@\n \n import java.io.IOException;\n import java.util.ArrayList;\n+import java.util.Comparator;\n import java.util.HashMap;\n import java.util.List;\n import java.util.Map;\n@@ -42,6 +42,17 @@\n public class PlainHighlighter implements Highlighter {\n     private static final String CACHE_KEY = \"highlight-plain\";\n \n+    private record OrderedTextFragment(TextFragment textFragment, int fragNum) {\n+        float score() {\n+            return textFragment.getScore();\n+        }\n+\n+        @Override\n+        public String toString() {\n+            return textFragment.toString();\n+        }\n+    }\n+\n     @Override\n     public HighlightField highlight(FieldHighlightContext fieldContext) throws IOException {\n         SearchHighlightContext.Field field = fieldContext.field;\n@@ -92,7 +103,7 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n \n         // a HACK to make highlighter do highlighting, even though its using the single frag list builder\n         int numberOfFragments = field.fieldOptions().numberOfFragments() == 0 ? 1 : field.fieldOptions().numberOfFragments();\n-        ArrayList<TextFragment> fragsList = new ArrayList<>();\n+        ArrayList<OrderedTextFragment> fragsList = new ArrayList<>();\n         List<Object> textsToHighlight;\n         final int maxAnalyzedOffset = context.getSearchExecutionContext().getIndexSettings().getHighlightMaxAnalyzedOffset();\n         Integer queryMaxAnalyzedOffset = fieldContext.field.fieldOptions().maxAnalyzedOffset();\n@@ -108,6 +119,7 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             fieldContext.forceSource\n         );\n \n+        int fragNumBase = 0;\n         for (Object textToHighlight : textsToHighlight) {\n             String text = convertFieldValue(fieldType, textToHighlight);\n             int textLength = text.length();\n@@ -144,9 +156,10 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n                 TextFragment[] bestTextFragments = entry.getBestTextFragments(tokenStream, text, false, numberOfFragments);\n                 for (TextFragment bestTextFragment : bestTextFragments) {\n                     if (bestTextFragment != null && bestTextFragment.getScore() > 0) {\n-                        fragsList.add(bestTextFragment);\n+                        fragsList.add(new OrderedTextFragment(bestTextFragment, bestTextFragment.getFragNum() + fragNumBase));\n                     }\n                 }\n+                fragNumBase += bestTextFragments.length;\n             } catch (BytesRefHash.MaxBytesLengthExceededException e) {\n                 // this can happen if for example a field is not_analyzed and ignore_above option is set.\n                 // the field will be ignored when indexing but the huge term is still in the source and\n@@ -157,10 +170,15 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             }\n         }\n \n-        // fragments are ordered by score by default since we add them in best\n-        if (field.fieldOptions().scoreOrdered() == false) {\n-            CollectionUtil.introSort(fragsList, (o1, o2) -> o1.getFragNum() - o2.getFragNum());\n+        // For single text inputs, the fragments are already ordered by score.  If we have multiple\n+        // inputs, or if we are ordering by fragment number, then we need to resort the output list\n+        if (textsToHighlight.size() > 1 || field.fieldOptions().scoreOrdered() == false) {\n+            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered() ?\n+                Comparator.comparingDouble(OrderedTextFragment::score).reversed() :\n+                Comparator.comparingInt(OrderedTextFragment::fragNum);\n+            fragsList.sort(comparator);\n         }\n+\n         String[] fragments;\n         // number_of_fragments is set to 0 but we have a multivalued field\n         if (field.fieldOptions().numberOfFragments() == 0 && textsToHighlight.size() > 1 && fragsList.size() > 0) {\nserver/src/test/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighterTests.java\n@@ -13,9 +13,15 @@\n import org.apache.lucene.search.Query;\n import org.apache.lucene.search.highlight.QueryScorer;\n import org.apache.lucene.tests.analysis.MockAnalyzer;\n-import org.apache.lucene.tests.util.LuceneTestCase;\n+import org.elasticsearch.index.mapper.MapperService;\n+import org.elasticsearch.index.mapper.ParsedDocument;\n+import org.elasticsearch.index.query.QueryBuilders;\n+import org.elasticsearch.search.builder.SearchSourceBuilder;\n+import org.elasticsearch.search.fetch.HighlighterTestCase;\n \n-public class PlainHighlighterTests extends LuceneTestCase {\n+import java.util.Map;\n+\n+public class PlainHighlighterTests extends HighlighterTestCase {\n \n     public void testHighlightPhrase() throws Exception {\n         Query query = new PhraseQuery.Builder().add(new Term(\"field\", \"foo\")).add(new Term(\"field\", \"bar\")).build();\n@@ -24,4 +30,63 @@ public void testHighlightPhrase() throws Exception {\n         String[] frags = highlighter.getBestFragments(new MockAnalyzer(random()), \"field\", \"bar foo bar foo\", 10);\n         assertArrayEquals(new String[] { \"bar <B>foo</B> <B>bar</B> foo\" }, frags);\n     }\n+\n+    public void testOrdering() throws Exception {\n+\n+        MapperService mapperService = createMapperService(\"\"\"\n+            { \"_doc\" : { \"properties\" : {\n+                \"description\" : { \"type\" : \"text\" }\n+            }}}\n+            \"\"\");\n+\n+        ParsedDocument doc = mapperService.documentMapper().parse(source(\"\"\"\n+            {\n+              \"description\": [\n+                \"Lorem Ipsum string Generator that helps to create dummy text for all layout needs.\",\n+                \"It has roots in a piece of classical Latin literature from 45 BC, making it search string over 2000 years old.\"\n+              ]\n+            }\n+            \"\"\"));\n+\n+        {\n+\n+            SearchSourceBuilder search = new SearchSourceBuilder()\n+                .query(QueryBuilders.matchQuery(\"description\", \"search string\"))\n+                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n+\n+            Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n+            assertHighlights(highlights, \"description\",\n+                \" literature from 45 BC, making it <em>search</em> <em>string</em> over 2000 years old.\",\n+                \"Lorem Ipsum <em>string</em> Generator that helps to create\");\n+\n+        }\n+\n+        {\n+\n+            SearchSourceBuilder search = new SearchSourceBuilder()\n+                .query(QueryBuilders.matchQuery(\"description\", \"string generator\"))\n+                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n+\n+            Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n+            assertHighlights(highlights, \"description\",\n+                \"Lorem Ipsum <em>string</em> <em>Generator</em> that helps to create\",\n+                \" literature from 45 BC, making it search <em>string</em> over 2000 years old.\");\n+\n+        }\n+\n+        {\n+\n+            SearchSourceBuilder search = new SearchSourceBuilder()\n+                .query(QueryBuilders.matchQuery(\"description\", \"lorem layout needs roots years\"))\n+                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").fragmentSize(20));\n+\n+            Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n+            assertHighlights(highlights, \"description\",\n+                \"<em>Lorem</em> Ipsum string\",\n+                \" text for all <em>layout</em> <em>needs</em>.\",\n+                \"It has <em>roots</em> in a\",\n+                \" search string over 2000 <em>years</em> old.\");\n+\n+        }\n+    }\n }\ntest/framework/src/main/java/org/elasticsearch/search/fetch/HighlighterTestCase.java\n@@ -27,8 +27,8 @@\n import java.io.IOException;\n import java.util.Arrays;\n import java.util.HashMap;\n+import java.util.List;\n import java.util.Map;\n-import java.util.Set;\n import java.util.stream.Collectors;\n \n import static org.mockito.Mockito.mock;\n@@ -72,8 +72,8 @@ protected final Map<String, HighlightField> highlight(MapperService mapperServic\n      */\n     protected static void assertHighlights(Map<String, HighlightField> highlights, String field, String... fragments) {\n         assertNotNull(\"No highlights reported for field [\" + field + \"]\", highlights.get(field));\n-        Set<String> actualFragments = Arrays.stream(highlights.get(field).getFragments()).map(Text::toString).collect(Collectors.toSet());\n-        Set<String> expectedFragments = Set.of(fragments);\n+        List<String> actualFragments = Arrays.stream(highlights.get(field).getFragments()).map(Text::toString).collect(Collectors.toList());\n+        List<String> expectedFragments = List.of(fragments);\n         assertEquals(expectedFragments, actualFragments);\n     }\n ",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighter.java",
+          "patch": "@@ -22,7 +22,6 @@\n import org.apache.lucene.search.highlight.SimpleSpanFragmenter;\n import org.apache.lucene.search.highlight.TextFragment;\n import org.apache.lucene.util.BytesRefHash;\n-import org.apache.lucene.util.CollectionUtil;\n import org.elasticsearch.common.lucene.Lucene;\n import org.elasticsearch.common.text.Text;\n import org.elasticsearch.index.IndexSettings;\n@@ -32,6 +31,7 @@\n \n import java.io.IOException;\n import java.util.ArrayList;\n+import java.util.Comparator;\n import java.util.HashMap;\n import java.util.List;\n import java.util.Map;\n@@ -42,6 +42,17 @@\n public class PlainHighlighter implements Highlighter {\n     private static final String CACHE_KEY = \"highlight-plain\";\n \n+    private record OrderedTextFragment(TextFragment textFragment, int fragNum) {\n+        float score() {\n+            return textFragment.getScore();\n+        }\n+\n+        @Override\n+        public String toString() {\n+            return textFragment.toString();\n+        }\n+    }\n+\n     @Override\n     public HighlightField highlight(FieldHighlightContext fieldContext) throws IOException {\n         SearchHighlightContext.Field field = fieldContext.field;\n@@ -92,7 +103,7 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n \n         // a HACK to make highlighter do highlighting, even though its using the single frag list builder\n         int numberOfFragments = field.fieldOptions().numberOfFragments() == 0 ? 1 : field.fieldOptions().numberOfFragments();\n-        ArrayList<TextFragment> fragsList = new ArrayList<>();\n+        ArrayList<OrderedTextFragment> fragsList = new ArrayList<>();\n         List<Object> textsToHighlight;\n         final int maxAnalyzedOffset = context.getSearchExecutionContext().getIndexSettings().getHighlightMaxAnalyzedOffset();\n         Integer queryMaxAnalyzedOffset = fieldContext.field.fieldOptions().maxAnalyzedOffset();\n@@ -108,6 +119,7 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             fieldContext.forceSource\n         );\n \n+        int fragNumBase = 0;\n         for (Object textToHighlight : textsToHighlight) {\n             String text = convertFieldValue(fieldType, textToHighlight);\n             int textLength = text.length();\n@@ -144,9 +156,10 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n                 TextFragment[] bestTextFragments = entry.getBestTextFragments(tokenStream, text, false, numberOfFragments);\n                 for (TextFragment bestTextFragment : bestTextFragments) {\n                     if (bestTextFragment != null && bestTextFragment.getScore() > 0) {\n-                        fragsList.add(bestTextFragment);\n+                        fragsList.add(new OrderedTextFragment(bestTextFragment, bestTextFragment.getFragNum() + fragNumBase));\n                     }\n                 }\n+                fragNumBase += bestTextFragments.length;\n             } catch (BytesRefHash.MaxBytesLengthExceededException e) {\n                 // this can happen if for example a field is not_analyzed and ignore_above option is set.\n                 // the field will be ignored when indexing but the huge term is still in the source and\n@@ -157,10 +170,15 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             }\n         }\n \n-        // fragments are ordered by score by default since we add them in best\n-        if (field.fieldOptions().scoreOrdered() == false) {\n-            CollectionUtil.introSort(fragsList, (o1, o2) -> o1.getFragNum() - o2.getFragNum());\n+        // For single text inputs, the fragments are already ordered by score.  If we have multiple\n+        // inputs, or if we are ordering by fragment number, then we need to resort the output list\n+        if (textsToHighlight.size() > 1 || field.fieldOptions().scoreOrdered() == false) {\n+            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered() ?\n+                Comparator.comparingDouble(OrderedTextFragment::score).reversed() :\n+                Comparator.comparingInt(OrderedTextFragment::fragNum);\n+            fragsList.sort(comparator);\n         }\n+\n         String[] fragments;\n         // number_of_fragments is set to 0 but we have a multivalued field\n         if (field.fieldOptions().numberOfFragments() == 0 && textsToHighlight.size() > 1 && fragsList.size() > 0) {"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighterTests.java",
+          "patch": "@@ -13,9 +13,15 @@\n import org.apache.lucene.search.Query;\n import org.apache.lucene.search.highlight.QueryScorer;\n import org.apache.lucene.tests.analysis.MockAnalyzer;\n-import org.apache.lucene.tests.util.LuceneTestCase;\n+import org.elasticsearch.index.mapper.MapperService;\n+import org.elasticsearch.index.mapper.ParsedDocument;\n+import org.elasticsearch.index.query.QueryBuilders;\n+import org.elasticsearch.search.builder.SearchSourceBuilder;\n+import org.elasticsearch.search.fetch.HighlighterTestCase;\n \n-public class PlainHighlighterTests extends LuceneTestCase {\n+import java.util.Map;\n+\n+public class PlainHighlighterTests extends HighlighterTestCase {\n \n     public void testHighlightPhrase() throws Exception {\n         Query query = new PhraseQuery.Builder().add(new Term(\"field\", \"foo\")).add(new Term(\"field\", \"bar\")).build();\n@@ -24,4 +30,63 @@ public void testHighlightPhrase() throws Exception {\n         String[] frags = highlighter.getBestFragments(new MockAnalyzer(random()), \"field\", \"bar foo bar foo\", 10);\n         assertArrayEquals(new String[] { \"bar <B>foo</B> <B>bar</B> foo\" }, frags);\n     }\n+\n+    public void testOrdering() throws Exception {\n+\n+        MapperService mapperService = createMapperService(\"\"\"\n+            { \"_doc\" : { \"properties\" : {\n+                \"description\" : { \"type\" : \"text\" }\n+            }}}\n+            \"\"\");\n+\n+        ParsedDocument doc = mapperService.documentMapper().parse(source(\"\"\"\n+            {\n+              \"description\": [\n+                \"Lorem Ipsum string Generator that helps to create dummy text for all layout needs.\",\n+                \"It has roots in a piece of classical Latin literature from 45 BC, making it search string over 2000 years old.\"\n+              ]\n+            }\n+            \"\"\"));\n+\n+        {\n+\n+            SearchSourceBuilder search = new SearchSourceBuilder()\n+                .query(QueryBuilders.matchQuery(\"description\", \"search string\"))\n+                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n+\n+            Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n+            assertHighlights(highlights, \"description\",\n+                \" literature from 45 BC, making it <em>search</em> <em>string</em> over 2000 years old.\",\n+                \"Lorem Ipsum <em>string</em> Generator that helps to create\");\n+\n+        }\n+\n+        {\n+\n+            SearchSourceBuilder search = new SearchSourceBuilder()\n+                .query(QueryBuilders.matchQuery(\"description\", \"string generator\"))\n+                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n+\n+            Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n+            assertHighlights(highlights, \"description\",\n+                \"Lorem Ipsum <em>string</em> <em>Generator</em> that helps to create\",\n+                \" literature from 45 BC, making it search <em>string</em> over 2000 years old.\");\n+\n+        }\n+\n+        {\n+\n+            SearchSourceBuilder search = new SearchSourceBuilder()\n+                .query(QueryBuilders.matchQuery(\"description\", \"lorem layout needs roots years\"))\n+                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").fragmentSize(20));\n+\n+            Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n+            assertHighlights(highlights, \"description\",\n+                \"<em>Lorem</em> Ipsum string\",\n+                \" text for all <em>layout</em> <em>needs</em>.\",\n+                \"It has <em>roots</em> in a\",\n+                \" search string over 2000 <em>years</em> old.\");\n+\n+        }\n+    }\n }"
+        },
+        {
+          "file": "test/framework/src/main/java/org/elasticsearch/search/fetch/HighlighterTestCase.java",
+          "patch": "@@ -27,8 +27,8 @@\n import java.io.IOException;\n import java.util.Arrays;\n import java.util.HashMap;\n+import java.util.List;\n import java.util.Map;\n-import java.util.Set;\n import java.util.stream.Collectors;\n \n import static org.mockito.Mockito.mock;\n@@ -72,8 +72,8 @@ protected final Map<String, HighlightField> highlight(MapperService mapperServic\n      */\n     protected static void assertHighlights(Map<String, HighlightField> highlights, String field, String... fragments) {\n         assertNotNull(\"No highlights reported for field [\" + field + \"]\", highlights.get(field));\n-        Set<String> actualFragments = Arrays.stream(highlights.get(field).getFragments()).map(Text::toString).collect(Collectors.toSet());\n-        Set<String> expectedFragments = Set.of(fragments);\n+        List<String> actualFragments = Arrays.stream(highlights.get(field).getFragments()).map(Text::toString).collect(Collectors.toList());\n+        List<String> expectedFragments = List.of(fragments);\n         assertEquals(expectedFragments, actualFragments);\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-06-06T11:20:04Z",
+      "user": "romseygeek",
+      "body": "The ordering logic in the plain highlighter only worked for single-valued\r\ninputs.  If you had multiple inputs, then order-by-score would only do this\r\nordering for fragments within each input, and order-by-position would \r\ninterleave fragments from the different inputs.  This commit fixes both\r\nissues.\r\n\r\nFixes #87210 "
+    },
+    {
+      "type": "comment",
+      "id": 1147339140,
+      "created_at": "2022-06-06T11:20:08Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-search (Team:Search)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-06-06T11:20:28Z",
+      "sha": "091d14767334bb617e4ba2f430eeb7f94489f5d5",
+      "message": "Update docs/changelog/87414.yaml",
+      "author": "Alan Woodward",
+      "author_email": "romseygeek@gmail.com",
+      "author_raw_date": "2022-06-06T11:20:28Z",
+      "author_date": "2022-06-06T11:20:28Z",
+      "committer": "Alan Woodward",
+      "committer_email": "romseygeek@gmail.com",
+      "raw_date": "2022-06-06T11:20:28Z",
+      "diff_text": "docs/changelog/87414.yaml\n@@ -0,0 +1,6 @@\n+pr: 87414\n+summary: Handle ordering in plain highlighter for multiple inputs\n+area: Highlighting\n+type: bug\n+issues:\n+ - 87210",
+      "diff": [
+        {
+          "file": "docs/changelog/87414.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 87414\n+summary: Handle ordering in plain highlighter for multiple inputs\n+area: Highlighting\n+type: bug\n+issues:\n+ - 87210"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1147339426,
+      "created_at": "2022-06-06T11:20:28Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @romseygeek, I've created a changelog YAML for you."
+    },
+    {
+      "type": "commit",
+      "date": "2022-06-06T11:35:01Z",
+      "sha": "25584c1a320e2f7c6d5cf5d89139f7035ca3931a",
+      "message": "spotless",
+      "author": "Alan Woodward",
+      "author_email": "romseygeek@apache.org",
+      "author_raw_date": "2022-06-06T11:35:01Z",
+      "author_date": "2022-06-06T11:35:01Z",
+      "committer": "Alan Woodward",
+      "committer_email": "romseygeek@apache.org",
+      "raw_date": "2022-06-06T11:35:01Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighter.java\n@@ -170,12 +170,12 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             }\n         }\n \n-        // For single text inputs, the fragments are already ordered by score.  If we have multiple\n+        // For single text inputs, the fragments are already ordered by score. If we have multiple\n         // inputs, or if we are ordering by fragment number, then we need to resort the output list\n         if (textsToHighlight.size() > 1 || field.fieldOptions().scoreOrdered() == false) {\n-            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered() ?\n-                Comparator.comparingDouble(OrderedTextFragment::score).reversed() :\n-                Comparator.comparingInt(OrderedTextFragment::fragNum);\n+            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered()\n+                ? Comparator.comparingDouble(OrderedTextFragment::score).reversed()\n+                : Comparator.comparingInt(OrderedTextFragment::fragNum);\n             fragsList.sort(comparator);\n         }\n \nserver/src/test/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighterTests.java\n@@ -50,42 +50,49 @@ public void testOrdering() throws Exception {\n \n         {\n \n-            SearchSourceBuilder search = new SearchSourceBuilder()\n-                .query(QueryBuilders.matchQuery(\"description\", \"search string\"))\n+            SearchSourceBuilder search = new SearchSourceBuilder().query(QueryBuilders.matchQuery(\"description\", \"search string\"))\n                 .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n \n             Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n-            assertHighlights(highlights, \"description\",\n+            assertHighlights(\n+                highlights,\n+                \"description\",\n                 \" literature from 45 BC, making it <em>search</em> <em>string</em> over 2000 years old.\",\n-                \"Lorem Ipsum <em>string</em> Generator that helps to create\");\n+                \"Lorem Ipsum <em>string</em> Generator that helps to create\"\n+            );\n \n         }\n \n         {\n \n-            SearchSourceBuilder search = new SearchSourceBuilder()\n-                .query(QueryBuilders.matchQuery(\"description\", \"string generator\"))\n+            SearchSourceBuilder search = new SearchSourceBuilder().query(QueryBuilders.matchQuery(\"description\", \"string generator\"))\n                 .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n \n             Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n-            assertHighlights(highlights, \"description\",\n+            assertHighlights(\n+                highlights,\n+                \"description\",\n                 \"Lorem Ipsum <em>string</em> <em>Generator</em> that helps to create\",\n-                \" literature from 45 BC, making it search <em>string</em> over 2000 years old.\");\n+                \" literature from 45 BC, making it search <em>string</em> over 2000 years old.\"\n+            );\n \n         }\n \n         {\n \n-            SearchSourceBuilder search = new SearchSourceBuilder()\n-                .query(QueryBuilders.matchQuery(\"description\", \"lorem layout needs roots years\"))\n-                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").fragmentSize(20));\n+            SearchSourceBuilder search = new SearchSourceBuilder().query(\n+                QueryBuilders.matchQuery(\"description\", \"lorem layout needs roots years\")\n+            ).highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").fragmentSize(20));\n \n             Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n-            assertHighlights(highlights, \"description\",\n+            assertHighlights(\n+                highlights,\n+                \"description\",\n                 \"<em>Lorem</em> Ipsum string\",\n                 \" text for all <em>layout</em> <em>needs</em>.\",\n                 \"It has <em>roots</em> in a\",\n-                \" search string over 2000 <em>years</em> old.\");\n+                \" search string over 2000 <em>years</em> old.\"\n+            );\n \n         }\n     }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighter.java",
+          "patch": "@@ -170,12 +170,12 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             }\n         }\n \n-        // For single text inputs, the fragments are already ordered by score.  If we have multiple\n+        // For single text inputs, the fragments are already ordered by score. If we have multiple\n         // inputs, or if we are ordering by fragment number, then we need to resort the output list\n         if (textsToHighlight.size() > 1 || field.fieldOptions().scoreOrdered() == false) {\n-            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered() ?\n-                Comparator.comparingDouble(OrderedTextFragment::score).reversed() :\n-                Comparator.comparingInt(OrderedTextFragment::fragNum);\n+            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered()\n+                ? Comparator.comparingDouble(OrderedTextFragment::score).reversed()\n+                : Comparator.comparingInt(OrderedTextFragment::fragNum);\n             fragsList.sort(comparator);\n         }\n "
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighterTests.java",
+          "patch": "@@ -50,42 +50,49 @@ public void testOrdering() throws Exception {\n \n         {\n \n-            SearchSourceBuilder search = new SearchSourceBuilder()\n-                .query(QueryBuilders.matchQuery(\"description\", \"search string\"))\n+            SearchSourceBuilder search = new SearchSourceBuilder().query(QueryBuilders.matchQuery(\"description\", \"search string\"))\n                 .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n \n             Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n-            assertHighlights(highlights, \"description\",\n+            assertHighlights(\n+                highlights,\n+                \"description\",\n                 \" literature from 45 BC, making it <em>search</em> <em>string</em> over 2000 years old.\",\n-                \"Lorem Ipsum <em>string</em> Generator that helps to create\");\n+                \"Lorem Ipsum <em>string</em> Generator that helps to create\"\n+            );\n \n         }\n \n         {\n \n-            SearchSourceBuilder search = new SearchSourceBuilder()\n-                .query(QueryBuilders.matchQuery(\"description\", \"string generator\"))\n+            SearchSourceBuilder search = new SearchSourceBuilder().query(QueryBuilders.matchQuery(\"description\", \"string generator\"))\n                 .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").order(\"score\").fragmentSize(50));\n \n             Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n-            assertHighlights(highlights, \"description\",\n+            assertHighlights(\n+                highlights,\n+                \"description\",\n                 \"Lorem Ipsum <em>string</em> <em>Generator</em> that helps to create\",\n-                \" literature from 45 BC, making it search <em>string</em> over 2000 years old.\");\n+                \" literature from 45 BC, making it search <em>string</em> over 2000 years old.\"\n+            );\n \n         }\n \n         {\n \n-            SearchSourceBuilder search = new SearchSourceBuilder()\n-                .query(QueryBuilders.matchQuery(\"description\", \"lorem layout needs roots years\"))\n-                .highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").fragmentSize(20));\n+            SearchSourceBuilder search = new SearchSourceBuilder().query(\n+                QueryBuilders.matchQuery(\"description\", \"lorem layout needs roots years\")\n+            ).highlighter(new HighlightBuilder().field(\"description\").highlighterType(\"plain\").fragmentSize(20));\n \n             Map<String, HighlightField> highlights = highlight(mapperService, doc, search);\n-            assertHighlights(highlights, \"description\",\n+            assertHighlights(\n+                highlights,\n+                \"description\",\n                 \"<em>Lorem</em> Ipsum string\",\n                 \" text for all <em>layout</em> <em>needs</em>.\",\n                 \"It has <em>roots</em> in a\",\n-                \" search string over 2000 <em>years</em> old.\");\n+                \" search string over 2000 <em>years</em> old.\"\n+            );\n \n         }\n     }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-06-06T11:58:54Z",
+      "sha": "a7260473474fbdd8df8d4f7f8b810c882770baaa",
+      "message": "Merge remote-tracking branch 'romseygeek/highlight/plain-score-ordered' into highlight/plain-score-ordered",
+      "author": "Alan Woodward",
+      "author_email": "romseygeek@apache.org",
+      "author_raw_date": "2022-06-06T11:58:54Z",
+      "author_date": "2022-06-06T11:58:54Z",
+      "committer": "Alan Woodward",
+      "committer_email": "romseygeek@apache.org",
+      "raw_date": "2022-06-06T11:58:54Z",
+      "diff_text": "docs/changelog/87414.yaml\n@@ -0,0 +1,6 @@\n+pr: 87414\n+summary: Handle ordering in plain highlighter for multiple inputs\n+area: Highlighting\n+type: bug\n+issues:\n+ - 87210",
+      "diff": [
+        {
+          "file": "docs/changelog/87414.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 87414\n+summary: Handle ordering in plain highlighter for multiple inputs\n+area: Highlighting\n+type: bug\n+issues:\n+ - 87210"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 891160965,
+      "created_at": "2022-06-07T12:31:34Z",
+      "user": "cbuescher",
+      "body": "Just out of curiosity, did you consider making the list sorted from the start or would this have major drawbacks? I didn't clearly check whether sorting is always done here, maybe not and thats the reason why we don't need a sorted list from the start... ",
+      "path": "server/src/main/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighter.java",
+      "diff_hunk": "@@ -157,10 +170,15 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             }\n         }\n \n-        // fragments are ordered by score by default since we add them in best\n-        if (field.fieldOptions().scoreOrdered() == false) {\n-            CollectionUtil.introSort(fragsList, (o1, o2) -> o1.getFragNum() - o2.getFragNum());\n+        // For single text inputs, the fragments are already ordered by score. If we have multiple\n+        // inputs, or if we are ordering by fragment number, then we need to resort the output list\n+        if (textsToHighlight.size() > 1 || field.fieldOptions().scoreOrdered() == false) {\n+            Comparator<OrderedTextFragment> comparator = field.fieldOptions().scoreOrdered()\n+                ? Comparator.comparingDouble(OrderedTextFragment::score).reversed()\n+                : Comparator.comparingInt(OrderedTextFragment::fragNum);\n+            fragsList.sort(comparator);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 179,
+      "original_line": 179,
+      "side": "RIGHT",
+      "original_position": 76,
+      "position": 76,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 891187422,
+          "user": "romseygeek",
+          "body": "The highlighter outputs fragments sorted by score, so if we only have a single input and we want score order then there's no need to do anything.  Otherwise we need to re-sort",
+          "created_at": "2022-06-07T12:56:35Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 891168200,
+      "created_at": "2022-06-07T12:37:43Z",
+      "user": "cbuescher",
+      "body": "Also just curious about the switch from Lucene CollectionUtil to plain list sort here, any pros / cons about the former? ",
+      "path": "server/src/main/java/org/elasticsearch/search/fetch/subphase/highlight/PlainHighlighter.java",
+      "diff_hunk": "@@ -157,10 +170,15 @@ public HighlightField highlight(FieldHighlightContext fieldContext) throws IOExc\n             }\n         }\n \n-        // fragments are ordered by score by default since we add them in best\n-        if (field.fieldOptions().scoreOrdered() == false) {\n-            CollectionUtil.introSort(fragsList, (o1, o2) -> o1.getFragNum() - o2.getFragNum());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 162,
+      "original_line": 162,
+      "side": "LEFT",
+      "original_position": 69,
+      "position": 69,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 891190078,
+          "user": "romseygeek",
+          "body": "Just that it means we get to use built-in collections; it's possible that lucene's introSort is slightly more efficient, but we're talking tiny lists and small sets of results so I thought clarity was more important.",
+          "created_at": "2022-06-07T12:57:57Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 998059030,
+      "created_at": "2022-06-07T12:40:16Z",
+      "user": "cbuescher",
+      "state": "APPROVED",
+      "body": "Left to questions for my own education, otherwise LGTM"
+    },
+    {
+      "type": "review",
+      "id": 998096026,
+      "created_at": "2022-06-07T12:56:35Z",
+      "user": "romseygeek",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 998100509,
+      "created_at": "2022-06-07T12:57:57Z",
+      "user": "romseygeek",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

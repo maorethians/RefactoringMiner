@@ -1,0 +1,277 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 109534,
+  "pr_number": 109534,
+  "title": "[ML] Propagate accurate deployment timeout",
+  "user": "prwhelan",
+  "created_at": "2024-06-10T13:45:10Z",
+  "merged_at": "2024-06-13T15:55:37Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":ml",
+    "Team:ML",
+    "v8.15.0"
+  ],
+  "base_commit": "eedc2b9354b556799073de655e3904d599017aaa",
+  "merge_commit_sha": "d783a1493f29ffe54dd67adf1b6570d7e1fb6402",
+  "commits": 5,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "ready_for_review",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "merged",
+    "closed",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/109534",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-06-10T13:41:15Z",
+      "sha": "2c78edad38a073b9616c13641af91fbf7a0f1582",
+      "message": "[ML] Propagate accurate deployment timeout\n\nWhen a user sets a request timeout, reduce the timeout for each\nconsumption of that value so that the end-to-end time is more acurately\nclose to that value.\n\nFix #109407",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-06-10T13:37:08Z",
+      "author_date": "2024-06-10T13:37:08Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-06-10T13:41:15Z",
+      "diff_text": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/common/time/RemainingTime.java\n@@ -0,0 +1,25 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.core.common.time;\n+\n+import org.elasticsearch.core.TimeValue;\n+\n+import java.time.Instant;\n+import java.time.temporal.ChronoUnit;\n+import java.util.function.Supplier;\n+\n+public interface RemainingTime extends Supplier<TimeValue> {\n+    static RemainingTime from(Supplier<Instant> currentTime, TimeValue remainingTime) {\n+        var timeout = currentTime.get().plus(remainingTime.duration(), remainingTime.timeUnit().toChronoUnit());\n+        var maxRemainingTime = remainingTime.nanos();\n+        return () -> {\n+            var remainingNanos = ChronoUnit.NANOS.between(currentTime.get(), timeout);\n+            return TimeValue.timeValueNanos(Math.max(0, Math.min(remainingNanos, maxRemainingTime)));\n+        };\n+    }\n+}\nx-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java\n@@ -0,0 +1,42 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.core.common.time;\n+\n+import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.test.ESTestCase;\n+import org.hamcrest.Matchers;\n+\n+import java.time.Instant;\n+import java.util.Arrays;\n+import java.util.function.Supplier;\n+import java.util.stream.Stream;\n+\n+public class RemainingTimeTests extends ESTestCase {\n+    public void testRemainingTime() {\n+        var remainingTime = RemainingTime.from(\n+            times(Instant.now(), Instant.now().plusSeconds(60)),\n+            TimeValue.timeValueSeconds(30)\n+        );\n+        assertThat(remainingTime.get(), Matchers.greaterThan(TimeValue.ZERO));\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n+    }\n+\n+    public void testRemainingTimeMaxValue() {\n+        var remainingTime = RemainingTime.from(\n+            times(Instant.now().minusSeconds(60), Instant.now().plusSeconds(60)),\n+            TimeValue.timeValueSeconds(30)\n+        );\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.timeValueSeconds(30)));\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n+    }\n+\n+    // always add the first value, which is read when RemainingTime.from is called, then add the test values\n+    private Supplier<Instant> times(Instant... instants) {\n+        return Stream.concat(Stream.of(Instant.now()), Arrays.stream(instants)).iterator()::next;\n+    }\n+}\nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartTrainedModelDeploymentAction.java\n@@ -45,6 +45,7 @@\n import org.elasticsearch.threadpool.ThreadPool;\n import org.elasticsearch.transport.TransportService;\n import org.elasticsearch.xpack.core.XPackField;\n+import org.elasticsearch.xpack.core.common.time.RemainingTime;\n import org.elasticsearch.xpack.core.inference.action.GetInferenceModelAction;\n import org.elasticsearch.xpack.core.ml.MachineLearningField;\n import org.elasticsearch.xpack.core.ml.action.CreateTrainedModelAssignmentAction;\n@@ -70,6 +71,7 @@\n import org.elasticsearch.xpack.ml.process.MlMemoryTracker;\n import org.elasticsearch.xpack.ml.utils.TaskRetriever;\n \n+import java.time.Instant;\n import java.util.Collection;\n import java.util.HashMap;\n import java.util.HashSet;\n@@ -137,6 +139,7 @@ protected void masterOperation(\n         ClusterState state,\n         ActionListener<CreateTrainedModelAssignmentAction.Response> listener\n     ) throws Exception {\n+        var remainingTime = RemainingTime.from(Instant::now, request.getTimeout());\n         logger.debug(() -> \"[\" + request.getDeploymentId() + \"] received deploy request for model [\" + request.getModelId() + \"]\");\n         if (MachineLearningField.ML_API_FEATURE.check(licenseState) == false) {\n             listener.onFailure(LicenseUtils.newComplianceException(XPackField.MACHINE_LEARNING));\n@@ -181,7 +184,7 @@ protected void masterOperation(\n         AtomicLong perAllocationMemoryBytes = new AtomicLong();\n \n         ActionListener<CreateTrainedModelAssignmentAction.Response> waitForDeploymentToStart = ActionListener.wrap(\n-            modelAssignment -> waitForDeploymentState(request.getDeploymentId(), request.getTimeout(), request.getWaitForState(), listener),\n+            modelAssignment -> waitForDeploymentState(request, remainingTime.get(), listener),\n             e -> {\n                 logger.warn(\n                     () -> \"[\" + request.getDeploymentId() + \"] creating new assignment for model [\" + request.getModelId() + \"] failed\",\n@@ -268,7 +271,7 @@ protected void masterOperation(\n                 error -> {\n                     if (ExceptionsHelper.unwrapCause(error) instanceof ResourceNotFoundException) {\n                         // no name clash, continue with the deployment\n-                        checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, request.getTimeout(), modelSizeListener);\n+                        checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, remainingTime.get(), modelSizeListener);\n                     } else {\n                         listener.onFailure(error);\n                     }\n@@ -280,7 +283,7 @@ protected void masterOperation(\n             if (request.getModelId().equals(request.getDeploymentId()) == false) {\n                 client.execute(GetTrainedModelsAction.INSTANCE, getModelWithDeploymentId, checkDeploymentIdDoesntAlreadyExist);\n             } else {\n-                checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, request.getTimeout(), modelSizeListener);\n+                checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, remainingTime.get(), modelSizeListener);\n             }\n \n         }, listener::onFailure);\n@@ -315,16 +318,16 @@ private void getTrainedModelRequestExecution(\n     }\n \n     private void waitForDeploymentState(\n-        String deploymentId,\n-        TimeValue timeout,\n-        AllocationStatus.State state,\n+        StartTrainedModelDeploymentAction.Request request,\n+        TimeValue remainingTime,\n         ActionListener<CreateTrainedModelAssignmentAction.Response> listener\n     ) {\n-        DeploymentStartedPredicate predicate = new DeploymentStartedPredicate(deploymentId, state);\n+        var deploymentId = request.getDeploymentId();\n+        DeploymentStartedPredicate predicate = new DeploymentStartedPredicate(deploymentId, request.getWaitForState());\n         trainedModelAssignmentService.waitForAssignmentCondition(\n             deploymentId,\n             predicate,\n-            timeout,\n+            remainingTime,\n             new TrainedModelAssignmentService.WaitForAssignmentListener() {\n                 @Override\n                 public void onResponse(TrainedModelAssignment assignment) {\n@@ -340,6 +343,18 @@ public void onResponse(TrainedModelAssignment assignment) {\n                 public void onFailure(Exception e) {\n                     listener.onFailure(e);\n                 }\n+\n+                @Override\n+                public void onTimeout(TimeValue timeout) {\n+                    onFailure(\n+                        new ElasticsearchStatusException(\n+                            \"Timed out after [{}] waiting for model deployment to finish. \"\n+                                + \"Use the trained model stats API to track the state of the deployment.\",\n+                            RestStatus.REQUEST_TIMEOUT,\n+                            request.getTimeout() // use the full request timeout in the error message\n+                        )\n+                    );\n+                }\n             }\n         );\n     }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/common/time/RemainingTime.java",
+          "patch": "@@ -0,0 +1,25 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.core.common.time;\n+\n+import org.elasticsearch.core.TimeValue;\n+\n+import java.time.Instant;\n+import java.time.temporal.ChronoUnit;\n+import java.util.function.Supplier;\n+\n+public interface RemainingTime extends Supplier<TimeValue> {\n+    static RemainingTime from(Supplier<Instant> currentTime, TimeValue remainingTime) {\n+        var timeout = currentTime.get().plus(remainingTime.duration(), remainingTime.timeUnit().toChronoUnit());\n+        var maxRemainingTime = remainingTime.nanos();\n+        return () -> {\n+            var remainingNanos = ChronoUnit.NANOS.between(currentTime.get(), timeout);\n+            return TimeValue.timeValueNanos(Math.max(0, Math.min(remainingNanos, maxRemainingTime)));\n+        };\n+    }\n+}"
+        },
+        {
+          "file": "x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java",
+          "patch": "@@ -0,0 +1,42 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.core.common.time;\n+\n+import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.test.ESTestCase;\n+import org.hamcrest.Matchers;\n+\n+import java.time.Instant;\n+import java.util.Arrays;\n+import java.util.function.Supplier;\n+import java.util.stream.Stream;\n+\n+public class RemainingTimeTests extends ESTestCase {\n+    public void testRemainingTime() {\n+        var remainingTime = RemainingTime.from(\n+            times(Instant.now(), Instant.now().plusSeconds(60)),\n+            TimeValue.timeValueSeconds(30)\n+        );\n+        assertThat(remainingTime.get(), Matchers.greaterThan(TimeValue.ZERO));\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n+    }\n+\n+    public void testRemainingTimeMaxValue() {\n+        var remainingTime = RemainingTime.from(\n+            times(Instant.now().minusSeconds(60), Instant.now().plusSeconds(60)),\n+            TimeValue.timeValueSeconds(30)\n+        );\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.timeValueSeconds(30)));\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n+    }\n+\n+    // always add the first value, which is read when RemainingTime.from is called, then add the test values\n+    private Supplier<Instant> times(Instant... instants) {\n+        return Stream.concat(Stream.of(Instant.now()), Arrays.stream(instants)).iterator()::next;\n+    }\n+}"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartTrainedModelDeploymentAction.java",
+          "patch": "@@ -45,6 +45,7 @@\n import org.elasticsearch.threadpool.ThreadPool;\n import org.elasticsearch.transport.TransportService;\n import org.elasticsearch.xpack.core.XPackField;\n+import org.elasticsearch.xpack.core.common.time.RemainingTime;\n import org.elasticsearch.xpack.core.inference.action.GetInferenceModelAction;\n import org.elasticsearch.xpack.core.ml.MachineLearningField;\n import org.elasticsearch.xpack.core.ml.action.CreateTrainedModelAssignmentAction;\n@@ -70,6 +71,7 @@\n import org.elasticsearch.xpack.ml.process.MlMemoryTracker;\n import org.elasticsearch.xpack.ml.utils.TaskRetriever;\n \n+import java.time.Instant;\n import java.util.Collection;\n import java.util.HashMap;\n import java.util.HashSet;\n@@ -137,6 +139,7 @@ protected void masterOperation(\n         ClusterState state,\n         ActionListener<CreateTrainedModelAssignmentAction.Response> listener\n     ) throws Exception {\n+        var remainingTime = RemainingTime.from(Instant::now, request.getTimeout());\n         logger.debug(() -> \"[\" + request.getDeploymentId() + \"] received deploy request for model [\" + request.getModelId() + \"]\");\n         if (MachineLearningField.ML_API_FEATURE.check(licenseState) == false) {\n             listener.onFailure(LicenseUtils.newComplianceException(XPackField.MACHINE_LEARNING));\n@@ -181,7 +184,7 @@ protected void masterOperation(\n         AtomicLong perAllocationMemoryBytes = new AtomicLong();\n \n         ActionListener<CreateTrainedModelAssignmentAction.Response> waitForDeploymentToStart = ActionListener.wrap(\n-            modelAssignment -> waitForDeploymentState(request.getDeploymentId(), request.getTimeout(), request.getWaitForState(), listener),\n+            modelAssignment -> waitForDeploymentState(request, remainingTime.get(), listener),\n             e -> {\n                 logger.warn(\n                     () -> \"[\" + request.getDeploymentId() + \"] creating new assignment for model [\" + request.getModelId() + \"] failed\",\n@@ -268,7 +271,7 @@ protected void masterOperation(\n                 error -> {\n                     if (ExceptionsHelper.unwrapCause(error) instanceof ResourceNotFoundException) {\n                         // no name clash, continue with the deployment\n-                        checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, request.getTimeout(), modelSizeListener);\n+                        checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, remainingTime.get(), modelSizeListener);\n                     } else {\n                         listener.onFailure(error);\n                     }\n@@ -280,7 +283,7 @@ protected void masterOperation(\n             if (request.getModelId().equals(request.getDeploymentId()) == false) {\n                 client.execute(GetTrainedModelsAction.INSTANCE, getModelWithDeploymentId, checkDeploymentIdDoesntAlreadyExist);\n             } else {\n-                checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, request.getTimeout(), modelSizeListener);\n+                checkFullModelDefinitionIsPresent(client, trainedModelConfig, true, remainingTime.get(), modelSizeListener);\n             }\n \n         }, listener::onFailure);\n@@ -315,16 +318,16 @@ private void getTrainedModelRequestExecution(\n     }\n \n     private void waitForDeploymentState(\n-        String deploymentId,\n-        TimeValue timeout,\n-        AllocationStatus.State state,\n+        StartTrainedModelDeploymentAction.Request request,\n+        TimeValue remainingTime,\n         ActionListener<CreateTrainedModelAssignmentAction.Response> listener\n     ) {\n-        DeploymentStartedPredicate predicate = new DeploymentStartedPredicate(deploymentId, state);\n+        var deploymentId = request.getDeploymentId();\n+        DeploymentStartedPredicate predicate = new DeploymentStartedPredicate(deploymentId, request.getWaitForState());\n         trainedModelAssignmentService.waitForAssignmentCondition(\n             deploymentId,\n             predicate,\n-            timeout,\n+            remainingTime,\n             new TrainedModelAssignmentService.WaitForAssignmentListener() {\n                 @Override\n                 public void onResponse(TrainedModelAssignment assignment) {\n@@ -340,6 +343,18 @@ public void onResponse(TrainedModelAssignment assignment) {\n                 public void onFailure(Exception e) {\n                     listener.onFailure(e);\n                 }\n+\n+                @Override\n+                public void onTimeout(TimeValue timeout) {\n+                    onFailure(\n+                        new ElasticsearchStatusException(\n+                            \"Timed out after [{}] waiting for model deployment to finish. \"\n+                                + \"Use the trained model stats API to track the state of the deployment.\",\n+                            RestStatus.REQUEST_TIMEOUT,\n+                            request.getTimeout() // use the full request timeout in the error message\n+                        )\n+                    );\n+                }\n             }\n         );\n     }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-06-10T13:45:10Z",
+      "user": "prwhelan",
+      "body": "When a user sets a request timeout, reduce the timeout for each consumption of that value so that the end-to-end time is more accurate to that value.\r\n\r\nFix #109407\r\n"
+    },
+    {
+      "type": "commit",
+      "date": "2024-06-10T13:45:56Z",
+      "sha": "3502a2ac3d7d4f7dac3a8e70276c063dc95206f0",
+      "message": "Update docs/changelog/109534.yaml",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-06-10T13:45:56Z",
+      "author_date": "2024-06-10T13:45:56Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-06-10T13:45:56Z",
+      "diff_text": "docs/changelog/109534.yaml\n@@ -0,0 +1,6 @@\n+pr: 109534\n+summary: Propagate accurate deployment timeout\n+area: Machine Learning\n+type: bug\n+issues:\n+ - 109407",
+      "diff": [
+        {
+          "file": "docs/changelog/109534.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 109534\n+summary: Propagate accurate deployment timeout\n+area: Machine Learning\n+type: bug\n+issues:\n+ - 109407"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2158424030,
+      "created_at": "2024-06-10T13:45:56Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @prwhelan, I've created a changelog YAML for you."
+    },
+    {
+      "type": "commit",
+      "date": "2024-06-10T14:41:21Z",
+      "sha": "ca53bdb27017fa9e5b5e0606ff0beeca8ed741d8",
+      "message": "I forgot spotless apply on core",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-06-10T14:41:21Z",
+      "author_date": "2024-06-10T14:41:21Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-06-10T14:41:21Z",
+      "diff_text": "x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java\n@@ -18,10 +18,7 @@\n \n public class RemainingTimeTests extends ESTestCase {\n     public void testRemainingTime() {\n-        var remainingTime = RemainingTime.from(\n-            times(Instant.now(), Instant.now().plusSeconds(60)),\n-            TimeValue.timeValueSeconds(30)\n-        );\n+        var remainingTime = RemainingTime.from(times(Instant.now(), Instant.now().plusSeconds(60)), TimeValue.timeValueSeconds(30));\n         assertThat(remainingTime.get(), Matchers.greaterThan(TimeValue.ZERO));\n         assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n     }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java",
+          "patch": "@@ -18,10 +18,7 @@\n \n public class RemainingTimeTests extends ESTestCase {\n     public void testRemainingTime() {\n-        var remainingTime = RemainingTime.from(\n-            times(Instant.now(), Instant.now().plusSeconds(60)),\n-            TimeValue.timeValueSeconds(30)\n-        );\n+        var remainingTime = RemainingTime.from(times(Instant.now(), Instant.now().plusSeconds(60)), TimeValue.timeValueSeconds(30));\n         assertThat(remainingTime.get(), Matchers.greaterThan(TimeValue.ZERO));\n         assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n     }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-06-10T15:04:35Z",
+      "sha": "080aa8e4159074fa5121741cc08571472a72845d",
+      "message": "Add javadocs to explain what we're doing",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-06-10T15:04:35Z",
+      "author_date": "2024-06-10T15:04:35Z",
+      "committer": "Pat Whelan",
+      "committer_email": "pat.whelan@elastic.co",
+      "raw_date": "2024-06-10T15:04:35Z",
+      "diff_text": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/common/time/RemainingTime.java\n@@ -14,6 +14,11 @@\n import java.util.function.Supplier;\n \n public interface RemainingTime extends Supplier<TimeValue> {\n+    /**\n+     * Create a {@link Supplier} that returns a decreasing {@link TimeValue} on each invocation, representing the amount of time until\n+     * the call times out.  The timer starts when this method is called and counts down from remainingTime to 0.\n+     * currentTime should return the most up-to-date system time, for example Instant.now() or Clock.instant().\n+     */\n     static RemainingTime from(Supplier<Instant> currentTime, TimeValue remainingTime) {\n         var timeout = currentTime.get().plus(remainingTime.duration(), remainingTime.timeUnit().toChronoUnit());\n         var maxRemainingTime = remainingTime.nanos();\nx-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java\n@@ -34,6 +34,7 @@ public void testRemainingTimeMaxValue() {\n \n     // always add the first value, which is read when RemainingTime.from is called, then add the test values\n     private Supplier<Instant> times(Instant... instants) {\n-        return Stream.concat(Stream.of(Instant.now()), Arrays.stream(instants)).iterator()::next;\n+        var startTime = Stream.of(Instant.now());\n+        return Stream.concat(startTime, Arrays.stream(instants)).iterator()::next;\n     }\n }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/common/time/RemainingTime.java",
+          "patch": "@@ -14,6 +14,11 @@\n import java.util.function.Supplier;\n \n public interface RemainingTime extends Supplier<TimeValue> {\n+    /**\n+     * Create a {@link Supplier} that returns a decreasing {@link TimeValue} on each invocation, representing the amount of time until\n+     * the call times out.  The timer starts when this method is called and counts down from remainingTime to 0.\n+     * currentTime should return the most up-to-date system time, for example Instant.now() or Clock.instant().\n+     */\n     static RemainingTime from(Supplier<Instant> currentTime, TimeValue remainingTime) {\n         var timeout = currentTime.get().plus(remainingTime.duration(), remainingTime.timeUnit().toChronoUnit());\n         var maxRemainingTime = remainingTime.nanos();"
+        },
+        {
+          "file": "x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java",
+          "patch": "@@ -34,6 +34,7 @@ public void testRemainingTimeMaxValue() {\n \n     // always add the first value, which is read when RemainingTime.from is called, then add the test values\n     private Supplier<Instant> times(Instant... instants) {\n-        return Stream.concat(Stream.of(Instant.now()), Arrays.stream(instants)).iterator()::next;\n+        var startTime = Stream.of(Instant.now());\n+        return Stream.concat(startTime, Arrays.stream(instants)).iterator()::next;\n     }\n }"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2158750635,
+      "created_at": "2024-06-10T15:59:26Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/ml-core (Team:ML)"
+    },
+    {
+      "type": "review",
+      "id": 2109863056,
+      "created_at": "2024-06-11T09:20:28Z",
+      "user": "davidkyle",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1634505660,
+      "created_at": "2024-06-11T09:20:28Z",
+      "user": "davidkyle",
+      "body": "```suggestion\r\n                            \"Timed out after [{}] waiting for model deployment to start. \"\r\n```",
+      "path": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartTrainedModelDeploymentAction.java",
+      "diff_hunk": "@@ -340,6 +343,18 @@ public void onResponse(TrainedModelAssignment assignment) {\n                 public void onFailure(Exception e) {\n                     listener.onFailure(e);\n                 }\n+\n+                @Override\n+                public void onTimeout(TimeValue timeout) {\n+                    onFailure(\n+                        new ElasticsearchStatusException(\n+                            \"Timed out after [{}] waiting for model deployment to finish. \"",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 351,
+      "side": "RIGHT",
+      "original_position": 82,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1634506184,
+      "created_at": "2024-06-11T09:20:55Z",
+      "user": "davidkyle",
+      "body": "Ooo clever I will copy this in future ",
+      "path": "x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/common/time/RemainingTimeTests.java",
+      "diff_hunk": "@@ -0,0 +1,40 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.core.common.time;\n+\n+import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.test.ESTestCase;\n+import org.hamcrest.Matchers;\n+\n+import java.time.Instant;\n+import java.util.Arrays;\n+import java.util.function.Supplier;\n+import java.util.stream.Stream;\n+\n+public class RemainingTimeTests extends ESTestCase {\n+    public void testRemainingTime() {\n+        var remainingTime = RemainingTime.from(times(Instant.now(), Instant.now().plusSeconds(60)), TimeValue.timeValueSeconds(30));\n+        assertThat(remainingTime.get(), Matchers.greaterThan(TimeValue.ZERO));\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n+    }\n+\n+    public void testRemainingTimeMaxValue() {\n+        var remainingTime = RemainingTime.from(\n+            times(Instant.now().minusSeconds(60), Instant.now().plusSeconds(60)),\n+            TimeValue.timeValueSeconds(30)\n+        );\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.timeValueSeconds(30)));\n+        assertThat(remainingTime.get(), Matchers.equalTo(TimeValue.ZERO));\n+    }\n+\n+    // always add the first value, which is read when RemainingTime.from is called, then add the test values\n+    private Supplier<Instant> times(Instant... instants) {\n+        var startTime = Stream.of(Instant.now());\n+        return Stream.concat(startTime, Arrays.stream(instants)).iterator()::next;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 38,
+      "original_line": 38,
+      "side": "RIGHT",
+      "original_position": 38,
+      "position": 38,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1634515063,
+      "created_at": "2024-06-11T09:25:44Z",
+      "user": "davidkyle",
+      "body": "Is the logic with `maxRemainingTime` necessary when `maxRemainingTime == remainingNanos`?\r\nIs it to handle the case where `currentTime` goes backwards?",
+      "path": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/common/time/RemainingTime.java",
+      "diff_hunk": "@@ -0,0 +1,30 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.core.common.time;\n+\n+import org.elasticsearch.core.TimeValue;\n+\n+import java.time.Instant;\n+import java.time.temporal.ChronoUnit;\n+import java.util.function.Supplier;\n+\n+public interface RemainingTime extends Supplier<TimeValue> {\n+    /**\n+     * Create a {@link Supplier} that returns a decreasing {@link TimeValue} on each invocation, representing the amount of time until\n+     * the call times out.  The timer starts when this method is called and counts down from remainingTime to 0.\n+     * currentTime should return the most up-to-date system time, for example Instant.now() or Clock.instant().\n+     */\n+    static RemainingTime from(Supplier<Instant> currentTime, TimeValue remainingTime) {\n+        var timeout = currentTime.get().plus(remainingTime.duration(), remainingTime.timeUnit().toChronoUnit());\n+        var maxRemainingTime = remainingTime.nanos();\n+        return () -> {\n+            var remainingNanos = ChronoUnit.NANOS.between(currentTime.get(), timeout);\n+            return TimeValue.timeValueNanos(Math.max(0, Math.min(remainingNanos, maxRemainingTime)));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 27,
+      "original_line": 27,
+      "side": "RIGHT",
+      "original_position": 27,
+      "position": 27,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1634947661,
+          "user": "prwhelan",
+          "body": "I saw one case where `currentTime` went backwards.  There's a monotonic clock in Transforms that we could move to commons to help prevent this, but for now I just set a max time in hopes that it doesn't happen that often :crossed_fingers:  ",
+          "created_at": "2024-06-11T13:59:42Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2109864740,
+      "created_at": "2024-06-11T09:25:47Z",
+      "user": "davidkyle",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-06-11T13:57:57Z",
+      "sha": "e9f15c50201d3aba1cccbc5ee73e24fac0c5c8de",
+      "message": "Update x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartTrainedModelDeploymentAction.java\n\nCo-authored-by: David Kyle <david.kyle@elastic.co>",
+      "author": "Pat Whelan",
+      "author_email": "pat.whelan@elastic.co",
+      "author_raw_date": "2024-06-11T13:57:57Z",
+      "author_date": "2024-06-11T13:57:57Z",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "raw_date": "2024-06-11T13:57:57Z",
+      "diff_text": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartTrainedModelDeploymentAction.java\n@@ -348,7 +348,7 @@ public void onFailure(Exception e) {\n                 public void onTimeout(TimeValue timeout) {\n                     onFailure(\n                         new ElasticsearchStatusException(\n-                            \"Timed out after [{}] waiting for model deployment to finish. \"\n+                            \"Timed out after [{}] waiting for model deployment to start. \"\n                                 + \"Use the trained model stats API to track the state of the deployment.\",\n                             RestStatus.REQUEST_TIMEOUT,\n                             request.getTimeout() // use the full request timeout in the error message",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportStartTrainedModelDeploymentAction.java",
+          "patch": "@@ -348,7 +348,7 @@ public void onFailure(Exception e) {\n                 public void onTimeout(TimeValue timeout) {\n                     onFailure(\n                         new ElasticsearchStatusException(\n-                            \"Timed out after [{}] waiting for model deployment to finish. \"\n+                            \"Timed out after [{}] waiting for model deployment to start. \"\n                                 + \"Use the trained model stats API to track the state of the deployment.\",\n                             RestStatus.REQUEST_TIMEOUT,\n                             request.getTimeout() // use the full request timeout in the error message"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2110565644,
+      "created_at": "2024-06-11T13:59:42Z",
+      "user": "prwhelan",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2113045842,
+      "created_at": "2024-06-12T13:35:13Z",
+      "user": "davidkyle",
+      "state": "APPROVED",
+      "body": "LGTM"
+    }
+  ]
+}

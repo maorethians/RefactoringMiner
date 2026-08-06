@@ -1,0 +1,256 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 74291,
+  "pr_number": 74291,
+  "title": "Fix Snapshots Recording Incorrect Max. Segment Counts",
+  "user": "original-brownbear",
+  "created_at": "2021-06-18T10:12:45Z",
+  "merged_at": "2021-06-18T12:20:06Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v7.14.0",
+    "v7.13.3",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "b6168e2f931444725268ff223c8d4f966f6f197c",
+  "merge_commit_sha": "4e19f54dfd1a122a6f00cea1ed7a07a9e3060a2b",
+  "commits": 4,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "head_ref_restored"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/74291",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-06-18T10:08:22Z",
+      "sha": "4b3d5318f8aa0dd5fed1fa2e83f2059219248c9b",
+      "message": "Fix Snapshots Recording Incorrect Max. Segment Counts\n\nIf sequence numbers are equal across snapshots (and thus no files get written to the repository)\nthe segment count in the index commit is not reliable as it may have changed due to background merges.\n=> fixed by always using the segment count determined from the file names in the snapshot instead\n\ncloses #74249",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-06-18T10:08:22Z",
+      "author_date": "2021-06-18T10:08:22Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-06-18T10:08:22Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java\n@@ -13,21 +13,30 @@\n import org.elasticsearch.action.admin.cluster.snapshots.status.SnapshotStatus;\n import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeResponse;\n import org.elasticsearch.action.admin.indices.stats.IndexStats;\n+import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;\n import org.elasticsearch.action.bulk.BulkItemResponse;\n import org.elasticsearch.action.bulk.BulkRequest;\n+import org.elasticsearch.action.bulk.BulkRequestBuilder;\n import org.elasticsearch.action.bulk.BulkResponse;\n import org.elasticsearch.action.index.IndexRequest;\n+import org.elasticsearch.client.Requests;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.index.MergePolicyConfig;\n+import org.elasticsearch.index.MergeSchedulerConfig;\n import org.elasticsearch.test.ESIntegTestCase;\n \n import java.io.IOException;\n import java.util.ArrayList;\n import java.util.Collection;\n import java.util.Collections;\n import java.util.concurrent.ExecutionException;\n+import java.util.concurrent.TimeUnit;\n \n+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;\n import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.is;\n \n@@ -166,6 +175,71 @@ public void testForceMergeCausesFullSnapshot() throws Exception {\n         assertThat(secondSnapshotShardStatus.getIncrementalFileCount(), greaterThan(0));\n     }\n \n+    public void testMergesHappening() throws Exception {\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"fs\");\n+\n+        final String indexName = \"test\";\n+        // just use one shard no replicas and slow down merges as much as possible\n+        assertAcked(\n+            prepareCreate(indexName).setSettings(\n+                indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE_SETTING.getKey(), \"2\")\n+                    .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")\n+                    .put(MergeSchedulerConfig.MAX_THREAD_COUNT_SETTING.getKey(), \"1\")\n+                    .put(MergeSchedulerConfig.MAX_MERGE_COUNT_SETTING.getKey(), \"1\")\n+                    .build()\n+            )\n+        );\n+\n+        // create an empty snapshot so that later snapshots run as quickly as possible\n+        createFullSnapshot(repoName, \"empty\");\n+\n+        // create a situation where we temporarily have a bunch of segments until the merges can catch up\n+        long id = 0;\n+        final int rounds = scaledRandomIntBetween(50, 300);\n+        for (int i = 0; i < rounds; ++i) {\n+            final int numDocs = scaledRandomIntBetween(100, 1000);\n+            BulkRequestBuilder request = client().prepareBulk();\n+            for (int j = 0; j < numDocs; ++j) {\n+                request.add(\n+                    Requests.indexRequest(indexName)\n+                        .id(Long.toString(id++))\n+                        .source(jsonBuilder().startObject().field(\"l\", randomLong()).endObject())\n+                );\n+            }\n+            BulkResponse response = request.execute().actionGet();\n+            assertNoFailures(response);\n+            refresh();\n+        }\n+\n+        // snapshot while merges are likely still running in the background\n+        final SnapshotInfo before = createFullSnapshot(repoName, \"snapshot-before\");\n+\n+        // wait for merges to settle down\n+        assertBusy(() -> {\n+            IndicesStatsResponse stats = client().admin().indices().prepareStats(indexName).setMerge(true).get();\n+            assertEquals(0L, stats.getIndex(indexName).getPrimaries().getMerge().getCurrent());\n+        }, 30L, TimeUnit.SECONDS);\n+\n+        final SnapshotInfo after = createFullSnapshot(repoName, \"snapshot-after\");\n+        final int incrementalFileCount = clusterAdmin().prepareSnapshotStatus()\n+            .setRepository(repoName)\n+            .setSnapshots(after.snapshotId().getName())\n+            .get()\n+            .getSnapshots()\n+            .get(0)\n+            .getStats()\n+            .getIncrementalFileCount();\n+        if (incrementalFileCount == 0) {\n+            final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n+            final SnapshotInfo.IndexSnapshotDetails afterIndexDetails = after.indexSnapshotDetails().get(indexName);\n+            logger.info(\"--> no files have changed between snapshots, asserting that segment counts are constant as well\");\n+            assertEquals(beforeIndexDetails.getMaxSegmentsPerShard(), afterIndexDetails.getMaxSegmentsPerShard());\n+        } else {\n+            logger.info(\"--> files have changed between snapshots\");\n+        }\n+    }\n+\n     private void assertCountInIndexThenDelete(String index, long expectedCount) {\n         logger.info(\"--> asserting that index [{}] contains [{}] documents\", index, expectedCount);\n         assertDocCount(index, expectedCount);\nserver/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\n@@ -2773,7 +2773,7 @@ public void snapshotShard(SnapshotShardContext context) {\n                 final ShardSnapshotResult shardSnapshotResult = new ShardSnapshotResult(\n                     indexGeneration,\n                     ByteSizeValue.ofBytes(blobStoreIndexShardSnapshot.totalSize()),\n-                    snapshotIndexCommit.getSegmentCount()\n+                    getSegmentInfoFileCount(blobStoreIndexShardSnapshot.indexFiles())\n                 );\n                 snapshotStatus.moveToDone(threadPool.absoluteTimeInMillis(), shardSnapshotResult);\n                 context.onResponse(shardSnapshotResult);",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java",
+          "patch": "@@ -13,21 +13,30 @@\n import org.elasticsearch.action.admin.cluster.snapshots.status.SnapshotStatus;\n import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeResponse;\n import org.elasticsearch.action.admin.indices.stats.IndexStats;\n+import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;\n import org.elasticsearch.action.bulk.BulkItemResponse;\n import org.elasticsearch.action.bulk.BulkRequest;\n+import org.elasticsearch.action.bulk.BulkRequestBuilder;\n import org.elasticsearch.action.bulk.BulkResponse;\n import org.elasticsearch.action.index.IndexRequest;\n+import org.elasticsearch.client.Requests;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.index.MergePolicyConfig;\n+import org.elasticsearch.index.MergeSchedulerConfig;\n import org.elasticsearch.test.ESIntegTestCase;\n \n import java.io.IOException;\n import java.util.ArrayList;\n import java.util.Collection;\n import java.util.Collections;\n import java.util.concurrent.ExecutionException;\n+import java.util.concurrent.TimeUnit;\n \n+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;\n import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.is;\n \n@@ -166,6 +175,71 @@ public void testForceMergeCausesFullSnapshot() throws Exception {\n         assertThat(secondSnapshotShardStatus.getIncrementalFileCount(), greaterThan(0));\n     }\n \n+    public void testMergesHappening() throws Exception {\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"fs\");\n+\n+        final String indexName = \"test\";\n+        // just use one shard no replicas and slow down merges as much as possible\n+        assertAcked(\n+            prepareCreate(indexName).setSettings(\n+                indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE_SETTING.getKey(), \"2\")\n+                    .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")\n+                    .put(MergeSchedulerConfig.MAX_THREAD_COUNT_SETTING.getKey(), \"1\")\n+                    .put(MergeSchedulerConfig.MAX_MERGE_COUNT_SETTING.getKey(), \"1\")\n+                    .build()\n+            )\n+        );\n+\n+        // create an empty snapshot so that later snapshots run as quickly as possible\n+        createFullSnapshot(repoName, \"empty\");\n+\n+        // create a situation where we temporarily have a bunch of segments until the merges can catch up\n+        long id = 0;\n+        final int rounds = scaledRandomIntBetween(50, 300);\n+        for (int i = 0; i < rounds; ++i) {\n+            final int numDocs = scaledRandomIntBetween(100, 1000);\n+            BulkRequestBuilder request = client().prepareBulk();\n+            for (int j = 0; j < numDocs; ++j) {\n+                request.add(\n+                    Requests.indexRequest(indexName)\n+                        .id(Long.toString(id++))\n+                        .source(jsonBuilder().startObject().field(\"l\", randomLong()).endObject())\n+                );\n+            }\n+            BulkResponse response = request.execute().actionGet();\n+            assertNoFailures(response);\n+            refresh();\n+        }\n+\n+        // snapshot while merges are likely still running in the background\n+        final SnapshotInfo before = createFullSnapshot(repoName, \"snapshot-before\");\n+\n+        // wait for merges to settle down\n+        assertBusy(() -> {\n+            IndicesStatsResponse stats = client().admin().indices().prepareStats(indexName).setMerge(true).get();\n+            assertEquals(0L, stats.getIndex(indexName).getPrimaries().getMerge().getCurrent());\n+        }, 30L, TimeUnit.SECONDS);\n+\n+        final SnapshotInfo after = createFullSnapshot(repoName, \"snapshot-after\");\n+        final int incrementalFileCount = clusterAdmin().prepareSnapshotStatus()\n+            .setRepository(repoName)\n+            .setSnapshots(after.snapshotId().getName())\n+            .get()\n+            .getSnapshots()\n+            .get(0)\n+            .getStats()\n+            .getIncrementalFileCount();\n+        if (incrementalFileCount == 0) {\n+            final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n+            final SnapshotInfo.IndexSnapshotDetails afterIndexDetails = after.indexSnapshotDetails().get(indexName);\n+            logger.info(\"--> no files have changed between snapshots, asserting that segment counts are constant as well\");\n+            assertEquals(beforeIndexDetails.getMaxSegmentsPerShard(), afterIndexDetails.getMaxSegmentsPerShard());\n+        } else {\n+            logger.info(\"--> files have changed between snapshots\");\n+        }\n+    }\n+\n     private void assertCountInIndexThenDelete(String index, long expectedCount) {\n         logger.info(\"--> asserting that index [{}] contains [{}] documents\", index, expectedCount);\n         assertDocCount(index, expectedCount);"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java",
+          "patch": "@@ -2773,7 +2773,7 @@ public void snapshotShard(SnapshotShardContext context) {\n                 final ShardSnapshotResult shardSnapshotResult = new ShardSnapshotResult(\n                     indexGeneration,\n                     ByteSizeValue.ofBytes(blobStoreIndexShardSnapshot.totalSize()),\n-                    snapshotIndexCommit.getSegmentCount()\n+                    getSegmentInfoFileCount(blobStoreIndexShardSnapshot.indexFiles())\n                 );\n                 snapshotStatus.moveToDone(threadPool.absoluteTimeInMillis(), shardSnapshotResult);\n                 context.onResponse(shardSnapshotResult);"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-06-18T10:12:45Z",
+      "user": "original-brownbear",
+      "body": "If sequence numbers are equal across snapshots (and thus no files get written to the repository)\r\nthe segment count in the index commit is not reliable as it may have changed due to background merges.\r\n=> fixed by always using the segment count determined from the file names in the snapshot instead\r\n\r\ncloses #74249\r\n\r\nI'm not the biggest fan of my test here to be honest, but I couldn't find a way to have more fine grained control over background merges  so I went with this rather brute force approach (alternative test suggestions very welcome :)). The test does however reproduce the problem reliable in 100% of runs for me."
+    },
+    {
+      "type": "comment",
+      "id": 863927015,
+      "created_at": "2021-06-18T10:12:48Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "comment",
+      "id": 863941153,
+      "created_at": "2021-06-18T10:35:43Z",
+      "user": "DaveCTurner",
+      "body": "Could we set `index.merge.enabled: false` to block merges for the first snapshot, and then remove that setting (close & reopen the index) for the second snapshot. Might need to force-merge after reopening to trigger a merge, but that won't update the force-merge ID if `maxNumSegments` ≤ 0."
+    },
+    {
+      "type": "commit",
+      "date": "2021-06-18T11:12:04Z",
+      "sha": "97ceec75d9faeead705fec01cfdf5703000113d3",
+      "message": "disable merges :)",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-06-18T11:12:04Z",
+      "author_date": "2021-06-18T11:12:04Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-06-18T11:12:04Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java\n@@ -23,9 +23,11 @@\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n import org.elasticsearch.index.MergePolicyConfig;\n-import org.elasticsearch.index.MergeSchedulerConfig;\n+import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalSettingsPlugin;\n \n import java.io.IOException;\n import java.util.ArrayList;\n@@ -39,10 +41,16 @@\n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;\n import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.is;\n+import static org.hamcrest.Matchers.lessThan;\n \n @ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 0)\n public class BlobStoreIncrementalityIT extends AbstractSnapshotIntegTestCase {\n \n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), InternalSettingsPlugin.class);\n+    }\n+\n     public void testIncrementalBehaviorOnPrimaryFailover() throws InterruptedException, ExecutionException, IOException {\n         internalCluster().startMasterOnlyNode();\n         final String primaryNode = internalCluster().startDataOnlyNode();\n@@ -175,21 +183,13 @@ public void testForceMergeCausesFullSnapshot() throws Exception {\n         assertThat(secondSnapshotShardStatus.getIncrementalFileCount(), greaterThan(0));\n     }\n \n-    public void testMergesHappening() throws Exception {\n+    public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exception {\n         final String repoName = \"test-repo\";\n         createRepository(repoName, \"fs\");\n \n         final String indexName = \"test\";\n-        // just use one shard no replicas and slow down merges as much as possible\n-        assertAcked(\n-            prepareCreate(indexName).setSettings(\n-                indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE_SETTING.getKey(), \"2\")\n-                    .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")\n-                    .put(MergeSchedulerConfig.MAX_THREAD_COUNT_SETTING.getKey(), \"1\")\n-                    .put(MergeSchedulerConfig.MAX_MERGE_COUNT_SETTING.getKey(), \"1\")\n-                    .build()\n-            )\n-        );\n+        // disable merges\n+        assertAcked(prepareCreate(indexName).setSettings(indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_ENABLED, \"false\")));\n \n         // create an empty snapshot so that later snapshots run as quickly as possible\n         createFullSnapshot(repoName, \"empty\");\n@@ -207,18 +207,33 @@ public void testMergesHappening() throws Exception {\n                         .source(jsonBuilder().startObject().field(\"l\", randomLong()).endObject())\n                 );\n             }\n-            BulkResponse response = request.execute().actionGet();\n-            assertNoFailures(response);\n+            assertNoFailures(request.get());\n             refresh();\n         }\n \n-        // snapshot while merges are likely still running in the background\n+        // snapshot with a bunch of unmerged segments\n         final SnapshotInfo before = createFullSnapshot(repoName, \"snapshot-before\");\n+        final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n+        final long beforeSegmentCount = beforeIndexDetails.getMaxSegmentsPerShard();\n \n-        // wait for merges to settle down\n+        // reactivate merges\n+        assertAcked(admin().indices().prepareClose(indexName).get());\n+        assertAcked(\n+            admin().indices()\n+                .prepareUpdateSettings(indexName)\n+                .setSettings(\n+                    Settings.builder()\n+                        .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")\n+                        .put(MergePolicyConfig.INDEX_MERGE_ENABLED, \"true\")\n+                )\n+        );\n+        assertAcked(admin().indices().prepareOpen(indexName).get());\n+        assertEquals(0, admin().indices().prepareForceMerge(indexName).setFlush(true).get().getFailedShards());\n+\n+        // wait for merges to reduce segment count\n         assertBusy(() -> {\n-            IndicesStatsResponse stats = client().admin().indices().prepareStats(indexName).setMerge(true).get();\n-            assertEquals(0L, stats.getIndex(indexName).getPrimaries().getMerge().getCurrent());\n+            IndicesStatsResponse stats = client().admin().indices().prepareStats(indexName).setSegments(true).get();\n+            assertThat(stats.getIndex(indexName).getPrimaries().getSegments().getCount(), lessThan(beforeSegmentCount));\n         }, 30L, TimeUnit.SECONDS);\n \n         final SnapshotInfo after = createFullSnapshot(repoName, \"snapshot-after\");\n@@ -230,14 +245,10 @@ public void testMergesHappening() throws Exception {\n             .get(0)\n             .getStats()\n             .getIncrementalFileCount();\n-        if (incrementalFileCount == 0) {\n-            final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n-            final SnapshotInfo.IndexSnapshotDetails afterIndexDetails = after.indexSnapshotDetails().get(indexName);\n-            logger.info(\"--> no files have changed between snapshots, asserting that segment counts are constant as well\");\n-            assertEquals(beforeIndexDetails.getMaxSegmentsPerShard(), afterIndexDetails.getMaxSegmentsPerShard());\n-        } else {\n-            logger.info(\"--> files have changed between snapshots\");\n-        }\n+        assertEquals(0, incrementalFileCount);\n+        logger.info(\"--> no files have changed between snapshots, asserting that segment counts are constant as well\");\n+        final SnapshotInfo.IndexSnapshotDetails afterIndexDetails = after.indexSnapshotDetails().get(indexName);\n+        assertEquals(beforeSegmentCount, afterIndexDetails.getMaxSegmentsPerShard());\n     }\n \n     private void assertCountInIndexThenDelete(String index, long expectedCount) {",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java",
+          "patch": "@@ -23,9 +23,11 @@\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n import org.elasticsearch.index.MergePolicyConfig;\n-import org.elasticsearch.index.MergeSchedulerConfig;\n+import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalSettingsPlugin;\n \n import java.io.IOException;\n import java.util.ArrayList;\n@@ -39,10 +41,16 @@\n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;\n import static org.hamcrest.Matchers.greaterThan;\n import static org.hamcrest.Matchers.is;\n+import static org.hamcrest.Matchers.lessThan;\n \n @ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 0)\n public class BlobStoreIncrementalityIT extends AbstractSnapshotIntegTestCase {\n \n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), InternalSettingsPlugin.class);\n+    }\n+\n     public void testIncrementalBehaviorOnPrimaryFailover() throws InterruptedException, ExecutionException, IOException {\n         internalCluster().startMasterOnlyNode();\n         final String primaryNode = internalCluster().startDataOnlyNode();\n@@ -175,21 +183,13 @@ public void testForceMergeCausesFullSnapshot() throws Exception {\n         assertThat(secondSnapshotShardStatus.getIncrementalFileCount(), greaterThan(0));\n     }\n \n-    public void testMergesHappening() throws Exception {\n+    public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exception {\n         final String repoName = \"test-repo\";\n         createRepository(repoName, \"fs\");\n \n         final String indexName = \"test\";\n-        // just use one shard no replicas and slow down merges as much as possible\n-        assertAcked(\n-            prepareCreate(indexName).setSettings(\n-                indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE_SETTING.getKey(), \"2\")\n-                    .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")\n-                    .put(MergeSchedulerConfig.MAX_THREAD_COUNT_SETTING.getKey(), \"1\")\n-                    .put(MergeSchedulerConfig.MAX_MERGE_COUNT_SETTING.getKey(), \"1\")\n-                    .build()\n-            )\n-        );\n+        // disable merges\n+        assertAcked(prepareCreate(indexName).setSettings(indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_ENABLED, \"false\")));\n \n         // create an empty snapshot so that later snapshots run as quickly as possible\n         createFullSnapshot(repoName, \"empty\");\n@@ -207,18 +207,33 @@ public void testMergesHappening() throws Exception {\n                         .source(jsonBuilder().startObject().field(\"l\", randomLong()).endObject())\n                 );\n             }\n-            BulkResponse response = request.execute().actionGet();\n-            assertNoFailures(response);\n+            assertNoFailures(request.get());\n             refresh();\n         }\n \n-        // snapshot while merges are likely still running in the background\n+        // snapshot with a bunch of unmerged segments\n         final SnapshotInfo before = createFullSnapshot(repoName, \"snapshot-before\");\n+        final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n+        final long beforeSegmentCount = beforeIndexDetails.getMaxSegmentsPerShard();\n \n-        // wait for merges to settle down\n+        // reactivate merges\n+        assertAcked(admin().indices().prepareClose(indexName).get());\n+        assertAcked(\n+            admin().indices()\n+                .prepareUpdateSettings(indexName)\n+                .setSettings(\n+                    Settings.builder()\n+                        .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")\n+                        .put(MergePolicyConfig.INDEX_MERGE_ENABLED, \"true\")\n+                )\n+        );\n+        assertAcked(admin().indices().prepareOpen(indexName).get());\n+        assertEquals(0, admin().indices().prepareForceMerge(indexName).setFlush(true).get().getFailedShards());\n+\n+        // wait for merges to reduce segment count\n         assertBusy(() -> {\n-            IndicesStatsResponse stats = client().admin().indices().prepareStats(indexName).setMerge(true).get();\n-            assertEquals(0L, stats.getIndex(indexName).getPrimaries().getMerge().getCurrent());\n+            IndicesStatsResponse stats = client().admin().indices().prepareStats(indexName).setSegments(true).get();\n+            assertThat(stats.getIndex(indexName).getPrimaries().getSegments().getCount(), lessThan(beforeSegmentCount));\n         }, 30L, TimeUnit.SECONDS);\n \n         final SnapshotInfo after = createFullSnapshot(repoName, \"snapshot-after\");\n@@ -230,14 +245,10 @@ public void testMergesHappening() throws Exception {\n             .get(0)\n             .getStats()\n             .getIncrementalFileCount();\n-        if (incrementalFileCount == 0) {\n-            final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n-            final SnapshotInfo.IndexSnapshotDetails afterIndexDetails = after.indexSnapshotDetails().get(indexName);\n-            logger.info(\"--> no files have changed between snapshots, asserting that segment counts are constant as well\");\n-            assertEquals(beforeIndexDetails.getMaxSegmentsPerShard(), afterIndexDetails.getMaxSegmentsPerShard());\n-        } else {\n-            logger.info(\"--> files have changed between snapshots\");\n-        }\n+        assertEquals(0, incrementalFileCount);\n+        logger.info(\"--> no files have changed between snapshots, asserting that segment counts are constant as well\");\n+        final SnapshotInfo.IndexSnapshotDetails afterIndexDetails = after.indexSnapshotDetails().get(indexName);\n+        assertEquals(beforeSegmentCount, afterIndexDetails.getMaxSegmentsPerShard());\n     }\n \n     private void assertCountInIndexThenDelete(String index, long expectedCount) {"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2021-06-18T11:12:24Z",
+      "sha": "e14c2406c9f30a17a723ecc31b8ecef2e7aa88b2",
+      "message": "Merge remote-tracking branch 'elastic/master' into 74249",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-06-18T11:12:24Z",
+      "author_date": "2021-06-18T11:12:24Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-06-18T11:12:24Z",
+      "diff_text": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ilm/MountSnapshotStep.java\n@@ -16,7 +16,6 @@\n import org.elasticsearch.common.Strings;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n-import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.rest.RestStatus;\n import org.elasticsearch.xpack.cluster.routing.allocation.DataTierAllocationDecider;\n import org.elasticsearch.xpack.core.DataTier;\n@@ -104,8 +103,7 @@ void performDuringNoSnapshot(IndexMetadata indexMetadata, ClusterState currentCl\n             indexName = snapshotIndexName;\n         }\n \n-        Settings.Builder settingsBuilder = Settings.builder();\n-        settingsBuilder.put(IndexSettings.INDEX_CHECK_ON_STARTUP.getKey(), Boolean.FALSE.toString());\n+        final Settings.Builder settingsBuilder = Settings.builder();\n         // if we are mounting a searchable snapshot in the hot phase, then the index should be pinned to the hot nodes\n         if (TimeseriesLifecycleType.HOT_PHASE.equals(this.getKey().getPhase())) {\n             settingsBuilder.put(DataTierAllocationDecider.INDEX_ROUTING_PREFER, DataTier.DATA_HOT);\nx-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/FrozenSearchableSnapshotsIntegTests.java\n@@ -291,7 +291,7 @@ public void testCreateAndRestorePartialSearchableSnapshot() throws Exception {\n         assertThat(DataTierAllocationDecider.INDEX_ROUTING_PREFER_SETTING.get(settings), equalTo(expectedDataTiersPreference));\n         assertTrue(SearchableSnapshotsConstants.SNAPSHOT_PARTIAL_SETTING.get(settings));\n         assertTrue(DiskThresholdDecider.SETTING_IGNORE_DISK_WATERMARKS.get(settings));\n-        assertThat(IndexSettings.INDEX_CHECK_ON_STARTUP.get(settings), equalTo(\"false\"));\n+        assertThat(IndexSettings.INDEX_CHECK_ON_STARTUP.get(settings), equalTo(indexCheckOnStartup));\n \n         checkSoftDeletesNotEagerlyLoaded(restoredIndexName);\n         assertTotalHits(restoredIndexName, originalAllHits, originalBarHits);",
+      "diff": [
+        {
+          "file": "x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/core/ilm/MountSnapshotStep.java",
+          "patch": "@@ -16,7 +16,6 @@\n import org.elasticsearch.common.Strings;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n-import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.rest.RestStatus;\n import org.elasticsearch.xpack.cluster.routing.allocation.DataTierAllocationDecider;\n import org.elasticsearch.xpack.core.DataTier;\n@@ -104,8 +103,7 @@ void performDuringNoSnapshot(IndexMetadata indexMetadata, ClusterState currentCl\n             indexName = snapshotIndexName;\n         }\n \n-        Settings.Builder settingsBuilder = Settings.builder();\n-        settingsBuilder.put(IndexSettings.INDEX_CHECK_ON_STARTUP.getKey(), Boolean.FALSE.toString());\n+        final Settings.Builder settingsBuilder = Settings.builder();\n         // if we are mounting a searchable snapshot in the hot phase, then the index should be pinned to the hot nodes\n         if (TimeseriesLifecycleType.HOT_PHASE.equals(this.getKey().getPhase())) {\n             settingsBuilder.put(DataTierAllocationDecider.INDEX_ROUTING_PREFER, DataTier.DATA_HOT);"
+        },
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/FrozenSearchableSnapshotsIntegTests.java",
+          "patch": "@@ -291,7 +291,7 @@ public void testCreateAndRestorePartialSearchableSnapshot() throws Exception {\n         assertThat(DataTierAllocationDecider.INDEX_ROUTING_PREFER_SETTING.get(settings), equalTo(expectedDataTiersPreference));\n         assertTrue(SearchableSnapshotsConstants.SNAPSHOT_PARTIAL_SETTING.get(settings));\n         assertTrue(DiskThresholdDecider.SETTING_IGNORE_DISK_WATERMARKS.get(settings));\n-        assertThat(IndexSettings.INDEX_CHECK_ON_STARTUP.get(settings), equalTo(\"false\"));\n+        assertThat(IndexSettings.INDEX_CHECK_ON_STARTUP.get(settings), equalTo(indexCheckOnStartup));\n \n         checkSoftDeletesNotEagerlyLoaded(restoredIndexName);\n         assertTotalHits(restoredIndexName, originalAllHits, originalBarHits);"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 863961206,
+      "created_at": "2021-06-18T11:12:49Z",
+      "user": "original-brownbear",
+      "body": "> Could we set index.merge.enabled: false to block merges for the first snapshot,\r\n\r\nDone, so much cuter :) Thanks!"
+    },
+    {
+      "type": "review_comment",
+      "id": 654349706,
+      "created_at": "2021-06-18T11:17:53Z",
+      "user": "DaveCTurner",
+      "body": "I think it'd be better to refresh on each bulk to force a segment to be written:\r\n\r\n```suggestion\r\n            BulkRequestBuilder request = client().prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);\r\n```\r\n\r\nI suspect if we did that we wouldn't need so many rounds.",
+      "path": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java",
+      "diff_hunk": "@@ -166,6 +183,74 @@ public void testForceMergeCausesFullSnapshot() throws Exception {\n         assertThat(secondSnapshotShardStatus.getIncrementalFileCount(), greaterThan(0));\n     }\n \n+    public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exception {\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"fs\");\n+\n+        final String indexName = \"test\";\n+        // disable merges\n+        assertAcked(prepareCreate(indexName).setSettings(indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_ENABLED, \"false\")));\n+\n+        // create an empty snapshot so that later snapshots run as quickly as possible\n+        createFullSnapshot(repoName, \"empty\");\n+\n+        // create a situation where we temporarily have a bunch of segments until the merges can catch up\n+        long id = 0;\n+        final int rounds = scaledRandomIntBetween(50, 300);\n+        for (int i = 0; i < rounds; ++i) {\n+            final int numDocs = scaledRandomIntBetween(100, 1000);\n+            BulkRequestBuilder request = client().prepareBulk();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 202,
+      "side": "RIGHT",
+      "original_position": 65,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 654353485,
+          "user": "original-brownbear",
+          "body": "++ right done in d629c74 ",
+          "created_at": "2021-06-18T11:24:46Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 687301006,
+      "created_at": "2021-06-18T11:18:23Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2021-06-18T11:24:15Z",
+      "sha": "d629c741d67e385bb1e37bc366f5abb9014754a3",
+      "message": "refresh right away",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-06-18T11:24:15Z",
+      "author_date": "2021-06-18T11:24:15Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-06-18T11:24:15Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java\n@@ -19,6 +19,7 @@\n import org.elasticsearch.action.bulk.BulkRequestBuilder;\n import org.elasticsearch.action.bulk.BulkResponse;\n import org.elasticsearch.action.index.IndexRequest;\n+import org.elasticsearch.action.support.WriteRequest;\n import org.elasticsearch.client.Requests;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n@@ -196,10 +197,10 @@ public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exceptio\n \n         // create a situation where we temporarily have a bunch of segments until the merges can catch up\n         long id = 0;\n-        final int rounds = scaledRandomIntBetween(50, 300);\n+        final int rounds = scaledRandomIntBetween(3, 5);\n         for (int i = 0; i < rounds; ++i) {\n             final int numDocs = scaledRandomIntBetween(100, 1000);\n-            BulkRequestBuilder request = client().prepareBulk();\n+            BulkRequestBuilder request = client().prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);\n             for (int j = 0; j < numDocs; ++j) {\n                 request.add(\n                     Requests.indexRequest(indexName)\n@@ -208,7 +209,6 @@ public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exceptio\n                 );\n             }\n             assertNoFailures(request.get());\n-            refresh();\n         }\n \n         // snapshot with a bunch of unmerged segments",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java",
+          "patch": "@@ -19,6 +19,7 @@\n import org.elasticsearch.action.bulk.BulkRequestBuilder;\n import org.elasticsearch.action.bulk.BulkResponse;\n import org.elasticsearch.action.index.IndexRequest;\n+import org.elasticsearch.action.support.WriteRequest;\n import org.elasticsearch.client.Requests;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n@@ -196,10 +197,10 @@ public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exceptio\n \n         // create a situation where we temporarily have a bunch of segments until the merges can catch up\n         long id = 0;\n-        final int rounds = scaledRandomIntBetween(50, 300);\n+        final int rounds = scaledRandomIntBetween(3, 5);\n         for (int i = 0; i < rounds; ++i) {\n             final int numDocs = scaledRandomIntBetween(100, 1000);\n-            BulkRequestBuilder request = client().prepareBulk();\n+            BulkRequestBuilder request = client().prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);\n             for (int j = 0; j < numDocs; ++j) {\n                 request.add(\n                     Requests.indexRequest(indexName)\n@@ -208,7 +209,6 @@ public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exceptio\n                 );\n             }\n             assertNoFailures(request.get());\n-            refresh();\n         }\n \n         // snapshot with a bunch of unmerged segments"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 687305893,
+      "created_at": "2021-06-18T11:24:46Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 654364052,
+      "created_at": "2021-06-18T11:44:09Z",
+      "user": "DaveCTurner",
+      "body": "👍  we know we did ≥3 rounds, each of which made ≥1 segment, and they're all pretty small (≤2MB) so this guarantees a merge IIUC.",
+      "path": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/BlobStoreIncrementalityIT.java",
+      "diff_hunk": "@@ -166,6 +184,73 @@ public void testForceMergeCausesFullSnapshot() throws Exception {\n         assertThat(secondSnapshotShardStatus.getIncrementalFileCount(), greaterThan(0));\n     }\n \n+    public void testRecordCorrectSegmentCountsWithBackgroundMerges() throws Exception {\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"fs\");\n+\n+        final String indexName = \"test\";\n+        // disable merges\n+        assertAcked(prepareCreate(indexName).setSettings(indexSettingsNoReplicas(1).put(MergePolicyConfig.INDEX_MERGE_ENABLED, \"false\")));\n+\n+        // create an empty snapshot so that later snapshots run as quickly as possible\n+        createFullSnapshot(repoName, \"empty\");\n+\n+        // create a situation where we temporarily have a bunch of segments until the merges can catch up\n+        long id = 0;\n+        final int rounds = scaledRandomIntBetween(3, 5);\n+        for (int i = 0; i < rounds; ++i) {\n+            final int numDocs = scaledRandomIntBetween(100, 1000);\n+            BulkRequestBuilder request = client().prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);\n+            for (int j = 0; j < numDocs; ++j) {\n+                request.add(\n+                    Requests.indexRequest(indexName)\n+                        .id(Long.toString(id++))\n+                        .source(jsonBuilder().startObject().field(\"l\", randomLong()).endObject())\n+                );\n+            }\n+            assertNoFailures(request.get());\n+        }\n+\n+        // snapshot with a bunch of unmerged segments\n+        final SnapshotInfo before = createFullSnapshot(repoName, \"snapshot-before\");\n+        final SnapshotInfo.IndexSnapshotDetails beforeIndexDetails = before.indexSnapshotDetails().get(indexName);\n+        final long beforeSegmentCount = beforeIndexDetails.getMaxSegmentsPerShard();\n+\n+        // reactivate merges\n+        assertAcked(admin().indices().prepareClose(indexName).get());\n+        assertAcked(\n+            admin().indices()\n+                .prepareUpdateSettings(indexName)\n+                .setSettings(\n+                    Settings.builder()\n+                        .put(MergePolicyConfig.INDEX_MERGE_POLICY_SEGMENTS_PER_TIER_SETTING.getKey(), \"2\")",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 226,
+      "original_line": 226,
+      "side": "RIGHT",
+      "original_position": 89,
+      "position": 89,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 654364702,
+          "user": "original-brownbear",
+          "body": "++ that was assumption here. Also ran a few hundred rounds of this to verify and it seems to hold :crossed_fingers: ",
+          "created_at": "2021-06-18T11:45:17Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 687319552,
+      "created_at": "2021-06-18T11:44:15Z",
+      "user": "DaveCTurner",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "review",
+      "id": 687320395,
+      "created_at": "2021-06-18T11:45:17Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 863997790,
+      "created_at": "2021-06-18T12:19:57Z",
+      "user": "original-brownbear",
+      "body": "Thanks David! "
+    }
+  ]
+}

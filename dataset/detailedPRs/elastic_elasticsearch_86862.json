@@ -1,0 +1,247 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 86862,
+  "pr_number": 86862,
+  "title": "Do not hold the lock during flush in BulkProcessor",
+  "user": "fcofdez",
+  "created_at": "2022-05-17T14:59:50Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    "Team:Clients",
+    "v8.7.0"
+  ],
+  "base_commit": "1eb591dc58d3f26bc8b5fa55f9c95ded2d7c2239",
+  "merge_commit_sha": "f613f379e437709b07055c399f026ea4b6160757",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "unlabeled",
+    "labeled",
+    "base_ref_changed",
+    "unlabeled",
+    "labeled",
+    "review_requested",
+    "review_request_removed",
+    "review_requested",
+    "unlabeled",
+    "labeled",
+    "unlabeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/86862",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-05-17T14:58:25Z",
+      "sha": "82a8026b9cca51ec64965155d0518efc152dc420",
+      "message": "Do not hold the lock during flush in BulkProcessor\n\nThis commit releases the BulkProcessor lock after a new bulk request\nis created during flush instead of waiting until the request is\ndispatched. This prevents a deadlock when the GENERIC threadpool\nis saturated with tasks adding new items to the BulkProcessor\nwaiting to obtain the lock, this might prevent the original\nBulkRequest of making progress in certain scenarios, as some\nretry operations might be dispatched in the GENERIC threadpool.\n\nCloses #68468",
+      "author": "Francisco Fernández Castaño",
+      "author_email": "francisco.fernandez.castano@gmail.com",
+      "author_raw_date": "2022-05-17T14:44:48Z",
+      "author_date": "2022-05-17T14:44:48Z",
+      "committer": "Francisco Fernández Castaño",
+      "committer_email": "francisco.fernandez.castano@gmail.com",
+      "raw_date": "2022-05-17T14:58:25Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/action/bulk/BulkProcessorIT.java\n@@ -20,10 +20,17 @@\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.common.unit.ByteSizeUnit;\n import org.elasticsearch.common.unit.ByteSizeValue;\n+import org.elasticsearch.common.util.concurrent.EsThreadPoolExecutor;\n import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.transport.MockTransportService;\n+import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.ConnectTransportException;\n+import org.elasticsearch.transport.TransportService;\n \n import java.util.Arrays;\n+import java.util.Collection;\n import java.util.HashSet;\n import java.util.List;\n import java.util.Set;\n@@ -44,6 +51,11 @@\n \n public class BulkProcessorIT extends ESIntegTestCase {\n \n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return List.of(MockTransportService.TestPlugin.class);\n+    }\n+\n     public void testThatBulkProcessorCountIsCorrect() throws Exception {\n         final CountDownLatch latch = new CountDownLatch(1);\n         BulkProcessorTestListener listener = new BulkProcessorTestListener(latch);\n@@ -305,6 +317,109 @@ public void testBulkProcessorConcurrentRequestsReadOnlyIndex() throws Exception\n         assertMultiGetResponse(multiGetRequestBuilder.get(), testDocs);\n     }\n \n+    public void testSaturatingGenericThreadPoolDoNotProduceADeadlock() throws Exception {\n+        final var dataNode = internalCluster().startDataOnlyNode();\n+\n+        final var client = internalCluster().client(internalCluster().getMasterName());\n+        final var threadPool = internalCluster().getCurrentMasterNodeInstance(ThreadPool.class);\n+        final var maxGenericPoolSize = ((EsThreadPoolExecutor) threadPool.executor(ThreadPool.Names.GENERIC)).getMaximumPoolSize();\n+\n+        final var index = \"my-index\";\n+        assertAcked(\n+            client().admin()\n+                .indices()\n+                .prepareCreate(index)\n+                .setMapping(\"field\", \"type=text,analyzer=keyword\")\n+                .setSettings(\n+                    Settings.builder()\n+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)\n+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)\n+                        .put(\"index.routing.allocation.require._name\", dataNode)\n+                        .build()\n+                )\n+        );\n+\n+        final var masterTransportService = (MockTransportService) internalCluster().getInstance(\n+            TransportService.class,\n+            internalCluster().getMasterName()\n+        );\n+        final var dataNodeTransportService = internalCluster().getInstance(TransportService.class, dataNode);\n+        final var inFlightBulkRequest = new CountDownLatch(1);\n+        final var firstBulkRequestSent = new AtomicBoolean();\n+        masterTransportService.addSendBehavior(dataNodeTransportService, (connection, requestId, action, request, options) -> {\n+            if (action.equals(\"indices:data/write/bulk[s]\")) {\n+                if (firstBulkRequestSent.compareAndSet(false, true)) {\n+                    inFlightBulkRequest.countDown();\n+                    // During network issues the bulk request would be retried eventually\n+                    // and the retry can end up dispatched in the GENERIC thread pool\n+                    throw new ConnectTransportException(connection.getNode(), \"DISCONNECT: simulated\");\n+                }\n+            }\n+            connection.sendRequest(requestId, action, request, options);\n+        });\n+\n+        final var concurrentFlushRunning = new CountDownLatch(2);\n+        final var expectedSuccessfulBulkRequests = new CountDownLatch(3);\n+        final var listener = new BulkProcessor.Listener() {\n+            @Override\n+            public void beforeBulk(long executionId, BulkRequest request) {\n+\n+            }\n+\n+            @Override\n+            public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {\n+                expectedSuccessfulBulkRequests.countDown();\n+            }\n+\n+            @Override\n+            public void afterBulk(long executionId, BulkRequest request, Throwable failure) {\n+                assert false : \"Unexpected failure \" + failure;\n+            }\n+        };\n+        try (\n+            var processor = BulkProcessor.builder(client::bulk, listener, \"BulkProcessorIT\")\n+                .setConcurrentRequests(1)\n+                .setBulkActions(-1)\n+                .setFlushInterval(TimeValue.timeValueMillis(200))\n+                .setBulkSize(new ByteSizeValue(5, ByteSizeUnit.MB))\n+                .setFlushCondition(() -> {\n+                    concurrentFlushRunning.countDown();\n+                    return true;\n+                })\n+                .build()\n+        ) {\n+            processor.add(\n+                new IndexRequest(index).source(Requests.INDEX_CONTENT_TYPE, \"field\", randomRealisticUnicodeOfLengthBetween(1, 30))\n+            );\n+\n+            inFlightBulkRequest.await();\n+\n+            processor.add(\n+                new IndexRequest(index).source(Requests.INDEX_CONTENT_TYPE, \"field\", randomRealisticUnicodeOfLengthBetween(1, 30))\n+            );\n+\n+            concurrentFlushRunning.await();\n+\n+            // Saturate the GENERIC thread pool with BulkProcessor#add tasks\n+            for (int i = 0; i < maxGenericPoolSize; i++) {\n+                threadPool.executor(ThreadPool.Names.GENERIC)\n+                    .submit(\n+                        () -> {\n+                            processor.add(\n+                                new IndexRequest(index).source(\n+                                    Requests.INDEX_CONTENT_TYPE,\n+                                    \"field\",\n+                                    randomRealisticUnicodeOfLengthBetween(1, 30)\n+                                )\n+                            );\n+                        }\n+                    );\n+            }\n+\n+            expectedSuccessfulBulkRequests.await();\n+        }\n+    }\n+\n     private static MultiGetRequestBuilder indexDocs(Client client, BulkProcessor processor, int numDocs) throws Exception {\n         MultiGetRequestBuilder multiGetRequestBuilder = client.prepareMultiGet();\n         for (int i = 1; i <= numDocs; i++) {\nserver/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java\n@@ -396,6 +396,7 @@ public void close() {\n      */\n     public boolean awaitClose(long timeout, TimeUnit unit) throws InterruptedException {\n         lock.lock();\n+        Tuple<BulkRequest, Long> bulkRequestToExecute;\n         try {\n             if (closed) {\n                 return true;\n@@ -404,17 +405,20 @@ public boolean awaitClose(long timeout, TimeUnit unit) throws InterruptedExcepti\n \n             this.cancellableFlushTask.cancel();\n \n-            if (bulkRequest.numberOfActions() > 0) {\n-                execute();\n-            }\n-            try {\n-                return this.bulkRequestHandler.awaitClose(timeout, unit);\n-            } finally {\n-                onClose.run();\n-            }\n+            bulkRequestToExecute = maybeGetBulkRequestForFlush();\n         } finally {\n             lock.unlock();\n         }\n+\n+        if (bulkRequestToExecute != null) {\n+            execute(bulkRequestToExecute.v1(), bulkRequestToExecute.v2());\n+        }\n+\n+        try {\n+            return this.bulkRequestHandler.awaitClose(timeout, unit);\n+        } finally {\n+            onClose.run();\n+        }\n     }\n \n     /**\n@@ -512,6 +516,7 @@ public boolean isCancelled() {\n \n     // needs to be executed under a lock\n     private Tuple<BulkRequest, Long> newBulkRequestIfNeeded() {\n+        assert lock.isHeldByCurrentThread();\n         ensureOpen();\n         if (isOverTheLimit() == false) {\n             return null;\n@@ -526,19 +531,20 @@ private void execute(BulkRequest bulkRequest, long executionId) {\n         this.bulkRequestHandler.execute(bulkRequest, executionId);\n     }\n \n-    // needs to be executed under a lock\n-    private void execute() {\n-        if (flushSupplier.get()) {\n-            final BulkRequest bulkRequest = this.bulkRequest;\n-            final long executionId = executionIdGen.incrementAndGet();\n-\n-            this.bulkRequest = bulkRequestSupplier.get();\n-            execute(bulkRequest, executionId);\n+    @Nullable\n+    private Tuple<BulkRequest, Long> maybeGetBulkRequestForFlush() {\n+        assert lock.isHeldByCurrentThread();\n+        if (flushSupplier.get() == false || bulkRequest.numberOfActions() == 0) {\n+            return null;\n         }\n+        final BulkRequest bulkRequest = this.bulkRequest;\n+        this.bulkRequest = bulkRequestSupplier.get();\n+        return new Tuple<>(bulkRequest, executionIdGen.incrementAndGet());\n     }\n \n-    // needs to be executed under a lock\n     private boolean isOverTheLimit() {\n+        assert lock.isHeldByCurrentThread();\n+\n         if (bulkActions != -1 && bulkRequest.numberOfActions() >= bulkActions) {\n             return true;\n         }\n@@ -553,31 +559,37 @@ private boolean isOverTheLimit() {\n      */\n     public void flush() {\n         lock.lock();\n+\n+        final Tuple<BulkRequest, Long> bulkRequestToExecute;\n         try {\n             ensureOpen();\n-            if (bulkRequest.numberOfActions() > 0) {\n-                execute();\n-            }\n+            bulkRequestToExecute = maybeGetBulkRequestForFlush();\n         } finally {\n             lock.unlock();\n         }\n+\n+        if (bulkRequestToExecute != null) {\n+            execute(bulkRequestToExecute.v1(), bulkRequestToExecute.v2());\n+        }\n     }\n \n     class Flush implements Runnable {\n         @Override\n         public void run() {\n             lock.lock();\n+            final Tuple<BulkRequest, Long> bulkRequestToExecute;\n             try {\n                 if (closed) {\n                     return;\n                 }\n-                if (bulkRequest.numberOfActions() == 0) {\n-                    return;\n-                }\n-                execute();\n+                bulkRequestToExecute = maybeGetBulkRequestForFlush();\n             } finally {\n                 lock.unlock();\n             }\n+\n+            if (bulkRequestToExecute != null) {\n+                execute(bulkRequestToExecute.v1(), bulkRequestToExecute.v2());\n+            }\n         }\n     }\n }",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/action/bulk/BulkProcessorIT.java",
+          "patch": "@@ -20,10 +20,17 @@\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.common.unit.ByteSizeUnit;\n import org.elasticsearch.common.unit.ByteSizeValue;\n+import org.elasticsearch.common.util.concurrent.EsThreadPoolExecutor;\n import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.transport.MockTransportService;\n+import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.ConnectTransportException;\n+import org.elasticsearch.transport.TransportService;\n \n import java.util.Arrays;\n+import java.util.Collection;\n import java.util.HashSet;\n import java.util.List;\n import java.util.Set;\n@@ -44,6 +51,11 @@\n \n public class BulkProcessorIT extends ESIntegTestCase {\n \n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return List.of(MockTransportService.TestPlugin.class);\n+    }\n+\n     public void testThatBulkProcessorCountIsCorrect() throws Exception {\n         final CountDownLatch latch = new CountDownLatch(1);\n         BulkProcessorTestListener listener = new BulkProcessorTestListener(latch);\n@@ -305,6 +317,109 @@ public void testBulkProcessorConcurrentRequestsReadOnlyIndex() throws Exception\n         assertMultiGetResponse(multiGetRequestBuilder.get(), testDocs);\n     }\n \n+    public void testSaturatingGenericThreadPoolDoNotProduceADeadlock() throws Exception {\n+        final var dataNode = internalCluster().startDataOnlyNode();\n+\n+        final var client = internalCluster().client(internalCluster().getMasterName());\n+        final var threadPool = internalCluster().getCurrentMasterNodeInstance(ThreadPool.class);\n+        final var maxGenericPoolSize = ((EsThreadPoolExecutor) threadPool.executor(ThreadPool.Names.GENERIC)).getMaximumPoolSize();\n+\n+        final var index = \"my-index\";\n+        assertAcked(\n+            client().admin()\n+                .indices()\n+                .prepareCreate(index)\n+                .setMapping(\"field\", \"type=text,analyzer=keyword\")\n+                .setSettings(\n+                    Settings.builder()\n+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)\n+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)\n+                        .put(\"index.routing.allocation.require._name\", dataNode)\n+                        .build()\n+                )\n+        );\n+\n+        final var masterTransportService = (MockTransportService) internalCluster().getInstance(\n+            TransportService.class,\n+            internalCluster().getMasterName()\n+        );\n+        final var dataNodeTransportService = internalCluster().getInstance(TransportService.class, dataNode);\n+        final var inFlightBulkRequest = new CountDownLatch(1);\n+        final var firstBulkRequestSent = new AtomicBoolean();\n+        masterTransportService.addSendBehavior(dataNodeTransportService, (connection, requestId, action, request, options) -> {\n+            if (action.equals(\"indices:data/write/bulk[s]\")) {\n+                if (firstBulkRequestSent.compareAndSet(false, true)) {\n+                    inFlightBulkRequest.countDown();\n+                    // During network issues the bulk request would be retried eventually\n+                    // and the retry can end up dispatched in the GENERIC thread pool\n+                    throw new ConnectTransportException(connection.getNode(), \"DISCONNECT: simulated\");\n+                }\n+            }\n+            connection.sendRequest(requestId, action, request, options);\n+        });\n+\n+        final var concurrentFlushRunning = new CountDownLatch(2);\n+        final var expectedSuccessfulBulkRequests = new CountDownLatch(3);\n+        final var listener = new BulkProcessor.Listener() {\n+            @Override\n+            public void beforeBulk(long executionId, BulkRequest request) {\n+\n+            }\n+\n+            @Override\n+            public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {\n+                expectedSuccessfulBulkRequests.countDown();\n+            }\n+\n+            @Override\n+            public void afterBulk(long executionId, BulkRequest request, Throwable failure) {\n+                assert false : \"Unexpected failure \" + failure;\n+            }\n+        };\n+        try (\n+            var processor = BulkProcessor.builder(client::bulk, listener, \"BulkProcessorIT\")\n+                .setConcurrentRequests(1)\n+                .setBulkActions(-1)\n+                .setFlushInterval(TimeValue.timeValueMillis(200))\n+                .setBulkSize(new ByteSizeValue(5, ByteSizeUnit.MB))\n+                .setFlushCondition(() -> {\n+                    concurrentFlushRunning.countDown();\n+                    return true;\n+                })\n+                .build()\n+        ) {\n+            processor.add(\n+                new IndexRequest(index).source(Requests.INDEX_CONTENT_TYPE, \"field\", randomRealisticUnicodeOfLengthBetween(1, 30))\n+            );\n+\n+            inFlightBulkRequest.await();\n+\n+            processor.add(\n+                new IndexRequest(index).source(Requests.INDEX_CONTENT_TYPE, \"field\", randomRealisticUnicodeOfLengthBetween(1, 30))\n+            );\n+\n+            concurrentFlushRunning.await();\n+\n+            // Saturate the GENERIC thread pool with BulkProcessor#add tasks\n+            for (int i = 0; i < maxGenericPoolSize; i++) {\n+                threadPool.executor(ThreadPool.Names.GENERIC)\n+                    .submit(\n+                        () -> {\n+                            processor.add(\n+                                new IndexRequest(index).source(\n+                                    Requests.INDEX_CONTENT_TYPE,\n+                                    \"field\",\n+                                    randomRealisticUnicodeOfLengthBetween(1, 30)\n+                                )\n+                            );\n+                        }\n+                    );\n+            }\n+\n+            expectedSuccessfulBulkRequests.await();\n+        }\n+    }\n+\n     private static MultiGetRequestBuilder indexDocs(Client client, BulkProcessor processor, int numDocs) throws Exception {\n         MultiGetRequestBuilder multiGetRequestBuilder = client.prepareMultiGet();\n         for (int i = 1; i <= numDocs; i++) {"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+          "patch": "@@ -396,6 +396,7 @@ public void close() {\n      */\n     public boolean awaitClose(long timeout, TimeUnit unit) throws InterruptedException {\n         lock.lock();\n+        Tuple<BulkRequest, Long> bulkRequestToExecute;\n         try {\n             if (closed) {\n                 return true;\n@@ -404,17 +405,20 @@ public boolean awaitClose(long timeout, TimeUnit unit) throws InterruptedExcepti\n \n             this.cancellableFlushTask.cancel();\n \n-            if (bulkRequest.numberOfActions() > 0) {\n-                execute();\n-            }\n-            try {\n-                return this.bulkRequestHandler.awaitClose(timeout, unit);\n-            } finally {\n-                onClose.run();\n-            }\n+            bulkRequestToExecute = maybeGetBulkRequestForFlush();\n         } finally {\n             lock.unlock();\n         }\n+\n+        if (bulkRequestToExecute != null) {\n+            execute(bulkRequestToExecute.v1(), bulkRequestToExecute.v2());\n+        }\n+\n+        try {\n+            return this.bulkRequestHandler.awaitClose(timeout, unit);\n+        } finally {\n+            onClose.run();\n+        }\n     }\n \n     /**\n@@ -512,6 +516,7 @@ public boolean isCancelled() {\n \n     // needs to be executed under a lock\n     private Tuple<BulkRequest, Long> newBulkRequestIfNeeded() {\n+        assert lock.isHeldByCurrentThread();\n         ensureOpen();\n         if (isOverTheLimit() == false) {\n             return null;\n@@ -526,19 +531,20 @@ private void execute(BulkRequest bulkRequest, long executionId) {\n         this.bulkRequestHandler.execute(bulkRequest, executionId);\n     }\n \n-    // needs to be executed under a lock\n-    private void execute() {\n-        if (flushSupplier.get()) {\n-            final BulkRequest bulkRequest = this.bulkRequest;\n-            final long executionId = executionIdGen.incrementAndGet();\n-\n-            this.bulkRequest = bulkRequestSupplier.get();\n-            execute(bulkRequest, executionId);\n+    @Nullable\n+    private Tuple<BulkRequest, Long> maybeGetBulkRequestForFlush() {\n+        assert lock.isHeldByCurrentThread();\n+        if (flushSupplier.get() == false || bulkRequest.numberOfActions() == 0) {\n+            return null;\n         }\n+        final BulkRequest bulkRequest = this.bulkRequest;\n+        this.bulkRequest = bulkRequestSupplier.get();\n+        return new Tuple<>(bulkRequest, executionIdGen.incrementAndGet());\n     }\n \n-    // needs to be executed under a lock\n     private boolean isOverTheLimit() {\n+        assert lock.isHeldByCurrentThread();\n+\n         if (bulkActions != -1 && bulkRequest.numberOfActions() >= bulkActions) {\n             return true;\n         }\n@@ -553,31 +559,37 @@ private boolean isOverTheLimit() {\n      */\n     public void flush() {\n         lock.lock();\n+\n+        final Tuple<BulkRequest, Long> bulkRequestToExecute;\n         try {\n             ensureOpen();\n-            if (bulkRequest.numberOfActions() > 0) {\n-                execute();\n-            }\n+            bulkRequestToExecute = maybeGetBulkRequestForFlush();\n         } finally {\n             lock.unlock();\n         }\n+\n+        if (bulkRequestToExecute != null) {\n+            execute(bulkRequestToExecute.v1(), bulkRequestToExecute.v2());\n+        }\n     }\n \n     class Flush implements Runnable {\n         @Override\n         public void run() {\n             lock.lock();\n+            final Tuple<BulkRequest, Long> bulkRequestToExecute;\n             try {\n                 if (closed) {\n                     return;\n                 }\n-                if (bulkRequest.numberOfActions() == 0) {\n-                    return;\n-                }\n-                execute();\n+                bulkRequestToExecute = maybeGetBulkRequestForFlush();\n             } finally {\n                 lock.unlock();\n             }\n+\n+            if (bulkRequestToExecute != null) {\n+                execute(bulkRequestToExecute.v1(), bulkRequestToExecute.v2());\n+            }\n         }\n     }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-05-17T14:59:50Z",
+      "user": "fcofdez",
+      "body": "This commit releases the BulkProcessor lock after a new bulk request\r\nis created during flush instead of waiting until the request is\r\ndispatched. This prevents a deadlock when the GENERIC thread pool\r\nis saturated with tasks adding new items to the BulkProcessor\r\nwaiting to obtain the lock, this might prevent the original\r\nBulkRequest of making progress in certain scenarios, as some\r\nretry operations might be dispatched in the GENERIC thread pool.\r\n\r\nCloses #68468"
+    },
+    {
+      "type": "comment",
+      "id": 1128980151,
+      "created_at": "2022-05-17T14:59:55Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/clients-team (Team:Clients)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-05-17T15:00:21Z",
+      "sha": "8519c42edf435d00c458672aea5dd82394a205f9",
+      "message": "Update docs/changelog/86862.yaml",
+      "author": "Francisco Fernández Castaño",
+      "author_email": "francisco.fernandez.castano@gmail.com",
+      "author_raw_date": "2022-05-17T15:00:21Z",
+      "author_date": "2022-05-17T15:00:21Z",
+      "committer": "Francisco Fernández Castaño",
+      "committer_email": "francisco.fernandez.castano@gmail.com",
+      "raw_date": "2022-05-17T15:00:21Z",
+      "diff_text": "docs/changelog/86862.yaml\n@@ -0,0 +1,6 @@\n+pr: 86862\n+summary: Do not hold the lock during flush in `BulkProcessor`\n+area: Java High Level REST Client\n+type: bug\n+issues:\n+ - 68468",
+      "diff": [
+        {
+          "file": "docs/changelog/86862.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 86862\n+summary: Do not hold the lock during flush in `BulkProcessor`\n+area: Java High Level REST Client\n+type: bug\n+issues:\n+ - 68468"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1128980674,
+      "created_at": "2022-05-17T15:00:21Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @fcofdez, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1128982131,
+      "created_at": "2022-05-17T15:01:42Z",
+      "user": "fcofdez",
+      "body": "I'm not sure if these are the correct labels, I was reviewing this comment https://github.com/elastic/elasticsearch/pull/85490#discussion_r868421363 and I decided to try to reproduce this issue and fix it. Maybe it makes sense to solve it differently, but I guess that having the test reproducing the issue is still valuable."
+    },
+    {
+      "type": "comment",
+      "id": 1129021434,
+      "created_at": "2022-05-17T15:36:15Z",
+      "user": "fcofdez",
+      "body": "@elasticmachine run elasticsearch-ci/part-2\r\nUnrelated test failure `org.elasticsearch.xpack.ml.integration.TestFeatureLicenseTrackingIT`"
+    },
+    {
+      "type": "review",
+      "id": 976544583,
+      "created_at": "2022-05-18T08:18:22Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": "One effect of the lock here is to apply backpressure on the writing threads if indexing is slow. I think this change removes that backpressure which could lead to building up an unbounded number of pending items.\r\n\r\nIn the case of the ILM history store there was some discomfort about dropping entries from history in the face of such backpressure, but the only alternative is to slow down ILM itself which also significant drawbacks. I don't know that we made a decision on this topic yet."
+    },
+    {
+      "type": "comment",
+      "id": 1129729212,
+      "created_at": "2022-05-18T08:34:47Z",
+      "user": "fcofdez",
+      "body": "> One effect of the lock here is to apply backpressure on the writing threads if indexing is slow. I think this change removes that backpressure which could lead to building up an unbounded number of pending items.\r\n\r\nI see your point but that backpressure is not guaranteed if the bulk request is flushed after the maximum size / number of docs is reached as the lock is released before sending the request. Additionally, in the ILM history context we're effectively queing an unlimited number of documents since we dispatch the `BulkProcessor#add` to the `GENERIC` thread pool, right? I guess it would make sense to clarify what's the expected behaviour of this class and rewrite it to handle better these scenarios."
+    },
+    {
+      "type": "comment",
+      "id": 1129767574,
+      "created_at": "2022-05-18T09:12:54Z",
+      "user": "DaveCTurner",
+      "body": "Yes that's right, we are not really respecting backpressure with ILM history entries anyway thanks to the unbounded queue on the `GENERIC` threadpool. It'd be great to make that queue bounded too, but that's a separate (and much bigger) project. Still, I think it would be better not to introduce a new (and hidden) unbounded queue here."
+    },
+    {
+      "type": "review_comment",
+      "id": 876394883,
+      "created_at": "2022-05-18T21:24:09Z",
+      "user": "jakelandis",
+      "body": "nit: remove this comment. ",
+      "path": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+      "diff_hunk": "@@ -512,6 +516,7 @@ public boolean isCancelled() {\n \n     // needs to be executed under a lock",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 517,
+      "original_line": 517,
+      "side": "RIGHT",
+      "original_position": 39,
+      "position": 39,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 876395869,
+      "created_at": "2022-05-18T21:25:45Z",
+      "user": "jakelandis",
+      "body": "nit: (on the line above) assert lock.isLocked() == false //the bulkRequestHandler handles the concurrency",
+      "path": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+      "diff_hunk": "@@ -526,19 +531,20 @@ private void execute(BulkRequest bulkRequest, long executionId) {\n         this.bulkRequestHandler.execute(bulkRequest, executionId);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 531,
+      "original_line": 531,
+      "side": "RIGHT",
+      "original_position": 46,
+      "position": 46,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 876407372,
+      "created_at": "2022-05-18T21:44:18Z",
+      "user": "jakelandis",
+      "body": "nit: reverse the order of the conditions (i.e. put `flushSupplier.get() == false` last) to allow the number of actions to short circuit the or. (in most cases `flushSupplier.get() == false` will evaluate to false)",
+      "path": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+      "diff_hunk": "@@ -526,19 +531,20 @@ private void execute(BulkRequest bulkRequest, long executionId) {\n         this.bulkRequestHandler.execute(bulkRequest, executionId);\n     }\n \n-    // needs to be executed under a lock\n-    private void execute() {\n-        if (flushSupplier.get()) {\n-            final BulkRequest bulkRequest = this.bulkRequest;\n-            final long executionId = executionIdGen.incrementAndGet();\n-\n-            this.bulkRequest = bulkRequestSupplier.get();\n-            execute(bulkRequest, executionId);\n+    @Nullable\n+    private Tuple<BulkRequest, Long> maybeGetBulkRequestForFlush() {\n+        assert lock.isHeldByCurrentThread();\n+        if (flushSupplier.get() == false || bulkRequest.numberOfActions() == 0) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 537,
+      "original_line": 537,
+      "side": "RIGHT",
+      "original_position": 60,
+      "position": 60,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 1130660217,
+      "created_at": "2022-05-18T22:44:54Z",
+      "user": "jakelandis",
+      "body": "> Still, I think it would be better not to introduce a new (and hidden) unbounded queue here.\r\n\r\nWhich queue is unbounded here ? It is kinda hard to follow since the scheduler is a `org.elasticsearch.threadpool.Scheduler` and could find any docs that guarantee (for/against) what happens if two schedules overlap. (i.e. flush 1 takes a long time and flush 2 needs to kick off). Is it the scheduler's queue that backs up or does the scheduler allow concurrent schedules meaning that multiple GENERIC threads would be inflight and blocked by the semaphor of BulkRequestHandler ? (Also the GENERIC thread pool is bounded, just a very high bound ... if I am reading correctly)\r\n\r\nIf we were using Java's `ScheduledThreadPoolExecutor#scheduleAtFixedRate` the docs there are explicit state \"If any execution of this task takes longer than its period, then subsequent executions may start late, but will not concurrently execute.\" ...so at worse we would back up the scheduler and have more control over the queue and rejections for this specific flush case. Do we need to use the custom scheduler for thread context stuff for security ? \r\n\r\nAt a higher level...what happens when the writes are very slow the flushes are very frequent and the concurrency of BulkRequestHandler is 1?\r\n"
+    },
+    {
+      "type": "review",
+      "id": 977667893,
+      "created_at": "2022-05-18T22:45:15Z",
+      "user": "jakelandis",
+      "state": "COMMENTED",
+      "body": "changes look good, just a couple nitpics."
+    },
+    {
+      "type": "comment",
+      "id": 1131318350,
+      "created_at": "2022-05-19T07:18:42Z",
+      "user": "DaveCTurner",
+      "body": "> Which queue is unbounded here ? It is kinda hard to follow since the scheduler is a org.elasticsearch.threadpool.Scheduler and could find any docs that guarantee (for/against) what happens if two schedules overlap. (i.e. flush 1 takes a long time and flush 2 needs to kick off). Is it the scheduler's queue that backs up or does the scheduler allow concurrent schedules meaning that multiple GENERIC threads would be inflight and blocked by the semaphor of BulkRequestHandler ?\r\n\r\nOur `Scheduler` is really [a `ScheduledThreadPoolExecutor` with a pool size of 1](https://github.com/elastic/elasticsearch/blob/12ad399c488f0cc60e19b5e1b29c6d569cb4351a/server/src/main/java/org/elasticsearch/threadpool/Scheduler.java#L45-L49); [these docs](https://docs.oracle.com/en/java/javase/18/docs/api/java.base/java/util/concurrent/ScheduledThreadPoolExecutor.html) indicate that this executor does not create extra threads but does have an unbounded queue:\r\n\r\n> While this class inherits from [ThreadPoolExecutor](https://docs.oracle.com/en/java/javase/18/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html), a few of the inherited tuning methods are not useful for it. In particular, because it acts as a fixed-sized pool using `corePoolSize` threads and an unbounded queue, adjustments to `maximumPoolSize` have no useful effect.\r\n\r\nHowever the scheduled flush tasks all immediately fork to the `GENERIC` pool so there can be (boundedly) many of them running at once, and (unboundedly) many of them enqueued.\r\n\r\n> (Also the GENERIC thread pool is bounded, just a very high bound ... if I am reading correctly)\r\n\r\nIt comes from `EsExecutors#newFixed` so the number of threads is bounded but its queue is unbounded.\r\n\r\n> At a higher level...what happens when the writes are very slow the flushes are very frequent and the concurrency of BulkRequestHandler is 1?\r\n\r\nRight, this is exactly the point. Today if writes get too far behind we block the threads calling `add()` which slows down the incoming work. With this change we remove that backpressure mechanism and allow the work to build up in memory without bound."
+    },
+    {
+      "type": "comment",
+      "id": 1131483068,
+      "created_at": "2022-05-19T09:49:19Z",
+      "user": "fcofdez",
+      "body": "> However the scheduled flush tasks all immediately fork to the GENERIC pool so there can be (boundedly) many of them running at once, and (unboundedly) many of them enqueued.\r\n\r\nJust as a note, this depends on how `BulkProcessor` is configured. If the `ThreadPool` is used it dispatches the flush task to the `GENERIC` pool, otherwise the flush task is executed in the scheduler thread that is created for the `BulkProcessor`. "
+    },
+    {
+      "type": "comment",
+      "id": 1131620186,
+      "created_at": "2022-05-19T12:24:11Z",
+      "user": "DaveCTurner",
+      "body": "Oh right I see, it ignores the `executor` parameter in that case. Tricky. Still, it's the same situation just with fewer threads involved right?"
+    }
+  ]
+}

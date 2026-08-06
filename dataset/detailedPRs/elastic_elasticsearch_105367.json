@@ -1,0 +1,174 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 105367,
+  "pr_number": 105367,
+  "title": "Fix geoip index deletion race condition",
+  "user": "joegallo",
+  "created_at": "2024-02-09T20:33:29Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    ">test",
+    "WIP",
+    ":Distributed/Ingest Node",
+    "Team:Data Management (obsolete)",
+    "v8.13.0"
+  ],
+  "base_commit": "21b0caaf13cf1d0dde5a85ef2a44917d3481d539",
+  "merge_commit_sha": "e9c911251af9d446b85dba5e41611ee95542b75b",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "closed"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/105367",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-02-09T20:18:44Z",
+      "sha": "555b0fc45daa4e8a2b51d08ea5c4ee6138da7152",
+      "message": "Re-enable some tests",
+      "author": "Joe Gallo",
+      "author_email": "joegallo@gmail.com",
+      "author_raw_date": "2024-02-09T20:18:44Z",
+      "author_date": "2024-02-09T20:18:44Z",
+      "committer": "Joe Gallo",
+      "committer_email": "joegallo@gmail.com",
+      "raw_date": "2024-02-09T20:18:44Z",
+      "diff_text": "modules/ingest-geoip/src/internalClusterTest/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderIT.java\n@@ -212,7 +212,6 @@ public void testInvalidTimestamp() throws Exception {\n         });\n     }\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/92888\")\n     public void testUpdatedTimestamp() throws Exception {\n         assumeTrue(\"only test with fixture to have stable results\", getEndpoint() != null);\n         testGeoIpDatabasesDownload();\n@@ -224,7 +223,6 @@ public void testUpdatedTimestamp() throws Exception {\n         testGeoIpDatabasesDownload();\n     }\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/92888\")\n     public void testGeoIpDatabasesDownload() throws Exception {\n         putGeoIpPipeline();\n         updateClusterSettings(Settings.builder().put(GeoIpDownloaderTaskExecutor.ENABLED_SETTING.getKey(), true));",
+      "diff": [
+        {
+          "file": "modules/ingest-geoip/src/internalClusterTest/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderIT.java",
+          "patch": "@@ -212,7 +212,6 @@ public void testInvalidTimestamp() throws Exception {\n         });\n     }\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/92888\")\n     public void testUpdatedTimestamp() throws Exception {\n         assumeTrue(\"only test with fixture to have stable results\", getEndpoint() != null);\n         testGeoIpDatabasesDownload();\n@@ -224,7 +223,6 @@ public void testUpdatedTimestamp() throws Exception {\n         testGeoIpDatabasesDownload();\n     }\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/92888\")\n     public void testGeoIpDatabasesDownload() throws Exception {\n         putGeoIpPipeline();\n         updateClusterSettings(Settings.builder().put(GeoIpDownloaderTaskExecutor.ENABLED_SETTING.getKey(), true));"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-02-09T20:21:48Z",
+      "sha": "d686e1db6941785a6b87c3b320d28f3ef424835e",
+      "message": "Extract index deletion into a method",
+      "author": "Joe Gallo",
+      "author_email": "joegallo@gmail.com",
+      "author_raw_date": "2024-02-09T20:21:48Z",
+      "author_date": "2024-02-09T20:21:48Z",
+      "committer": "Joe Gallo",
+      "committer_email": "joegallo@gmail.com",
+      "raw_date": "2024-02-09T20:21:48Z",
+      "diff_text": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloader.java\n@@ -11,19 +11,22 @@\n import org.apache.logging.log4j.LogManager;\n import org.apache.logging.log4j.Logger;\n import org.elasticsearch.ElasticsearchException;\n+import org.elasticsearch.ResourceNotFoundException;\n import org.elasticsearch.action.ActionListener;\n import org.elasticsearch.action.admin.indices.flush.FlushRequest;\n import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;\n import org.elasticsearch.action.index.IndexRequest;\n import org.elasticsearch.action.support.PlainActionFuture;\n import org.elasticsearch.client.internal.Client;\n import org.elasticsearch.cluster.block.ClusterBlockLevel;\n+import org.elasticsearch.cluster.metadata.IndexAbstraction;\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.common.hash.MessageDigests;\n import org.elasticsearch.common.settings.Setting;\n import org.elasticsearch.common.settings.Setting.Property;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.index.Index;\n import org.elasticsearch.index.query.BoolQueryBuilder;\n import org.elasticsearch.index.query.MatchQueryBuilder;\n import org.elasticsearch.index.query.RangeQueryBuilder;\n@@ -36,6 +39,7 @@\n import org.elasticsearch.tasks.TaskId;\n import org.elasticsearch.threadpool.Scheduler;\n import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.RemoteTransportException;\n import org.elasticsearch.xcontent.XContentParser;\n import org.elasticsearch.xcontent.XContentParserConfiguration;\n import org.elasticsearch.xcontent.XContentType;\n@@ -323,6 +327,20 @@ private void cleanDatabases() {\n         stats = stats.expiredDatabases((int) expiredDatabases);\n     }\n \n+    public void deleteIndex() {\n+        IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n+        if (databasesAbstraction != null) {\n+            // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index\n+            Index databasesIndex = databasesAbstraction.getWriteIndex();\n+            client.admin().indices().prepareDelete(databasesIndex.getName()).execute(ActionListener.wrap(rr -> {}, e -> {\n+                Throwable t = e instanceof RemoteTransportException ? e.getCause() : e;\n+                if (t instanceof ResourceNotFoundException == false) {\n+                    logger.warn(\"failed to remove \" + databasesIndex, e);\n+                }\n+            }));\n+        }\n+    }\n+\n     @Override\n     protected void onCancelled() {\n         if (scheduled != null) {\nmodules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderTaskExecutor.java\n@@ -18,14 +18,12 @@\n import org.elasticsearch.cluster.ClusterChangedEvent;\n import org.elasticsearch.cluster.ClusterState;\n import org.elasticsearch.cluster.ClusterStateListener;\n-import org.elasticsearch.cluster.metadata.IndexAbstraction;\n import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.common.settings.Setting;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.gateway.GatewayService;\n-import org.elasticsearch.index.Index;\n import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.ingest.IngestMetadata;\n import org.elasticsearch.ingest.IngestService;\n@@ -48,7 +46,6 @@\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.stream.Collectors;\n \n-import static org.elasticsearch.ingest.geoip.GeoIpDownloader.DATABASES_INDEX;\n import static org.elasticsearch.ingest.geoip.GeoIpDownloader.GEOIP_DOWNLOADER;\n import static org.elasticsearch.ingest.geoip.GeoIpProcessor.Factory.downloadDatabaseOnPipelineCreation;\n \n@@ -366,17 +363,10 @@ private void stopTask(Runnable onFailure) {\n                 }\n             }\n         );\n+        final GeoIpDownloader geoIpDownloader = this.getCurrentTask();\n         persistentTasksService.sendRemoveRequest(GEOIP_DOWNLOADER, ActionListener.runAfter(listener, () -> {\n-            IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n-            if (databasesAbstraction != null) {\n-                // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index\n-                Index databasesIndex = databasesAbstraction.getWriteIndex();\n-                client.admin().indices().prepareDelete(databasesIndex.getName()).execute(ActionListener.wrap(rr -> {}, e -> {\n-                    Throwable t = e instanceof RemoteTransportException ? e.getCause() : e;\n-                    if (t instanceof ResourceNotFoundException == false) {\n-                        logger.warn(\"failed to remove \" + databasesIndex, e);\n-                    }\n-                }));\n+            if (geoIpDownloader != null) {\n+                geoIpDownloader.deleteIndex();\n             }\n         }));\n     }",
+      "diff": [
+        {
+          "file": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloader.java",
+          "patch": "@@ -11,19 +11,22 @@\n import org.apache.logging.log4j.LogManager;\n import org.apache.logging.log4j.Logger;\n import org.elasticsearch.ElasticsearchException;\n+import org.elasticsearch.ResourceNotFoundException;\n import org.elasticsearch.action.ActionListener;\n import org.elasticsearch.action.admin.indices.flush.FlushRequest;\n import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;\n import org.elasticsearch.action.index.IndexRequest;\n import org.elasticsearch.action.support.PlainActionFuture;\n import org.elasticsearch.client.internal.Client;\n import org.elasticsearch.cluster.block.ClusterBlockLevel;\n+import org.elasticsearch.cluster.metadata.IndexAbstraction;\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.common.hash.MessageDigests;\n import org.elasticsearch.common.settings.Setting;\n import org.elasticsearch.common.settings.Setting.Property;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.index.Index;\n import org.elasticsearch.index.query.BoolQueryBuilder;\n import org.elasticsearch.index.query.MatchQueryBuilder;\n import org.elasticsearch.index.query.RangeQueryBuilder;\n@@ -36,6 +39,7 @@\n import org.elasticsearch.tasks.TaskId;\n import org.elasticsearch.threadpool.Scheduler;\n import org.elasticsearch.threadpool.ThreadPool;\n+import org.elasticsearch.transport.RemoteTransportException;\n import org.elasticsearch.xcontent.XContentParser;\n import org.elasticsearch.xcontent.XContentParserConfiguration;\n import org.elasticsearch.xcontent.XContentType;\n@@ -323,6 +327,20 @@ private void cleanDatabases() {\n         stats = stats.expiredDatabases((int) expiredDatabases);\n     }\n \n+    public void deleteIndex() {\n+        IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n+        if (databasesAbstraction != null) {\n+            // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index\n+            Index databasesIndex = databasesAbstraction.getWriteIndex();\n+            client.admin().indices().prepareDelete(databasesIndex.getName()).execute(ActionListener.wrap(rr -> {}, e -> {\n+                Throwable t = e instanceof RemoteTransportException ? e.getCause() : e;\n+                if (t instanceof ResourceNotFoundException == false) {\n+                    logger.warn(\"failed to remove \" + databasesIndex, e);\n+                }\n+            }));\n+        }\n+    }\n+\n     @Override\n     protected void onCancelled() {\n         if (scheduled != null) {"
+        },
+        {
+          "file": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderTaskExecutor.java",
+          "patch": "@@ -18,14 +18,12 @@\n import org.elasticsearch.cluster.ClusterChangedEvent;\n import org.elasticsearch.cluster.ClusterState;\n import org.elasticsearch.cluster.ClusterStateListener;\n-import org.elasticsearch.cluster.metadata.IndexAbstraction;\n import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.common.settings.Setting;\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.gateway.GatewayService;\n-import org.elasticsearch.index.Index;\n import org.elasticsearch.index.IndexSettings;\n import org.elasticsearch.ingest.IngestMetadata;\n import org.elasticsearch.ingest.IngestService;\n@@ -48,7 +46,6 @@\n import java.util.concurrent.atomic.AtomicReference;\n import java.util.stream.Collectors;\n \n-import static org.elasticsearch.ingest.geoip.GeoIpDownloader.DATABASES_INDEX;\n import static org.elasticsearch.ingest.geoip.GeoIpDownloader.GEOIP_DOWNLOADER;\n import static org.elasticsearch.ingest.geoip.GeoIpProcessor.Factory.downloadDatabaseOnPipelineCreation;\n \n@@ -366,17 +363,10 @@ private void stopTask(Runnable onFailure) {\n                 }\n             }\n         );\n+        final GeoIpDownloader geoIpDownloader = this.getCurrentTask();\n         persistentTasksService.sendRemoveRequest(GEOIP_DOWNLOADER, ActionListener.runAfter(listener, () -> {\n-            IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n-            if (databasesAbstraction != null) {\n-                // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index\n-                Index databasesIndex = databasesAbstraction.getWriteIndex();\n-                client.admin().indices().prepareDelete(databasesIndex.getName()).execute(ActionListener.wrap(rr -> {}, e -> {\n-                    Throwable t = e instanceof RemoteTransportException ? e.getCause() : e;\n-                    if (t instanceof ResourceNotFoundException == false) {\n-                        logger.warn(\"failed to remove \" + databasesIndex, e);\n-                    }\n-                }));\n+            if (geoIpDownloader != null) {\n+                geoIpDownloader.deleteIndex();\n             }\n         }));\n     }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-02-09T20:25:12Z",
+      "sha": "8afcae4887c78e5e1e577f36e908a68390506933",
+      "message": "Use a threadpool and (super simple) mutex\n\nWe can probably do better than just 'synchronized' but this is a good\nWIP version for thinking aloud.",
+      "author": "Joe Gallo",
+      "author_email": "joegallo@gmail.com",
+      "author_raw_date": "2024-02-09T20:25:12Z",
+      "author_date": "2024-02-09T20:25:12Z",
+      "committer": "Joe Gallo",
+      "committer_email": "joegallo@gmail.com",
+      "raw_date": "2024-02-09T20:25:12Z",
+      "diff_text": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloader.java\n@@ -126,7 +126,7 @@ public class GeoIpDownloader extends AllocatedPersistentTask {\n     }\n \n     // visible for testing\n-    void updateDatabases() throws IOException {\n+    synchronized void updateDatabases() throws IOException {\n         var clusterState = clusterService.state();\n         var geoipIndex = clusterState.getMetadata().getIndicesLookup().get(GeoIpDownloader.DATABASES_INDEX);\n         if (geoipIndex != null) {\n@@ -327,7 +327,7 @@ private void cleanDatabases() {\n         stats = stats.expiredDatabases((int) expiredDatabases);\n     }\n \n-    public void deleteIndex() {\n+    synchronized void deleteIndex() {\n         IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n         if (databasesAbstraction != null) {\n             // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index\nmodules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderTaskExecutor.java\n@@ -366,7 +366,7 @@ private void stopTask(Runnable onFailure) {\n         final GeoIpDownloader geoIpDownloader = this.getCurrentTask();\n         persistentTasksService.sendRemoveRequest(GEOIP_DOWNLOADER, ActionListener.runAfter(listener, () -> {\n             if (geoIpDownloader != null) {\n-                geoIpDownloader.deleteIndex();\n+                threadPool.generic().execute(geoIpDownloader::deleteIndex);\n             }\n         }));\n     }",
+      "diff": [
+        {
+          "file": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloader.java",
+          "patch": "@@ -126,7 +126,7 @@ public class GeoIpDownloader extends AllocatedPersistentTask {\n     }\n \n     // visible for testing\n-    void updateDatabases() throws IOException {\n+    synchronized void updateDatabases() throws IOException {\n         var clusterState = clusterService.state();\n         var geoipIndex = clusterState.getMetadata().getIndicesLookup().get(GeoIpDownloader.DATABASES_INDEX);\n         if (geoipIndex != null) {\n@@ -327,7 +327,7 @@ private void cleanDatabases() {\n         stats = stats.expiredDatabases((int) expiredDatabases);\n     }\n \n-    public void deleteIndex() {\n+    synchronized void deleteIndex() {\n         IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n         if (databasesAbstraction != null) {\n             // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index"
+        },
+        {
+          "file": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderTaskExecutor.java",
+          "patch": "@@ -366,7 +366,7 @@ private void stopTask(Runnable onFailure) {\n         final GeoIpDownloader geoIpDownloader = this.getCurrentTask();\n         persistentTasksService.sendRemoveRequest(GEOIP_DOWNLOADER, ActionListener.runAfter(listener, () -> {\n             if (geoIpDownloader != null) {\n-                geoIpDownloader.deleteIndex();\n+                threadPool.generic().execute(geoIpDownloader::deleteIndex);\n             }\n         }));\n     }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-02-09T20:33:29Z",
+      "user": "joegallo",
+      "body": "Closes https://github.com/elastic/elasticsearch/issues/75221, https://github.com/elastic/elasticsearch/issues/100361, and https://github.com/elastic/elasticsearch/issues/101418\r\n\r\nJust a draft/WIP PR, thinking about how to prevent the scenario from https://github.com/elastic/elasticsearch/issues/101418#issuecomment-1924657164 from occurring.\r\n\r\nI'm uncertain about the `threadPool` bit, especially, but also the `geoIpDownloader != null` check is interesting (without it we do get test failures, but there was no such requirement before that there'd a current task...)."
+    },
+    {
+      "type": "review",
+      "id": 1873194439,
+      "created_at": "2024-02-09T21:06:23Z",
+      "user": "jbaiera",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1484802047,
+      "created_at": "2024-02-09T21:06:23Z",
+      "user": "jbaiera",
+      "body": "I wonder if this needs to be here because the code is set up to be able to stop the task from any node, but the current task is only set on the node that is running it. Check out the clusterChanged method. We're not ensuring that the stopTask method is only run on the master node like we are in the `setEnabled` method...",
+      "path": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloaderTaskExecutor.java",
+      "diff_hunk": "@@ -366,17 +363,10 @@ private void stopTask(Runnable onFailure) {\n                 }\n             }\n         );\n+        final GeoIpDownloader geoIpDownloader = this.getCurrentTask();\n         persistentTasksService.sendRemoveRequest(GEOIP_DOWNLOADER, ActionListener.runAfter(listener, () -> {\n-            IndexAbstraction databasesAbstraction = clusterService.state().metadata().getIndicesLookup().get(DATABASES_INDEX);\n-            if (databasesAbstraction != null) {\n-                // regardless of whether DATABASES_INDEX is an alias, resolve it to a concrete index\n-                Index databasesIndex = databasesAbstraction.getWriteIndex();\n-                client.admin().indices().prepareDelete(databasesIndex.getName()).execute(ActionListener.wrap(rr -> {}, e -> {\n-                    Throwable t = e instanceof RemoteTransportException ? e.getCause() : e;\n-                    if (t instanceof ResourceNotFoundException == false) {\n-                        logger.warn(\"failed to remove \" + databasesIndex, e);\n-                    }\n-                }));\n+            if (geoIpDownloader != null) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 368,
+      "original_line": 368,
+      "side": "RIGHT",
+      "original_position": 39,
+      "position": 39,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 1936647984,
+      "created_at": "2024-02-09T21:47:07Z",
+      "user": "jbaiera",
+      "body": "To mirror my thoughts from off-page discussions: I think the bones of the change is good, but there is a new issue when going with this approach:\r\n\r\nIn `org.elasticsearch.ingest.geoip.GeoIpDownloaderTaskExecutor#setEnabled` we only start and stop the task on the master node. If we end up stopping the task via the master node, then the currentTask references is likely to always be null, and thus, the delete will not happen.\r\n\r\nI don't know if there is a teardown hook for persistent tasks that we can use instead, or if we should just change it so that every node fires off the stop action like how we do it in `org.elasticsearch.ingest.geoip.GeoIpDownloaderTaskExecutor#clusterChanged` which will ensure the node that is running the task does indeed have a chance to execute the cleanup in a threadsafe way.\r\n\r\nBut then again - if you toggle the enabled switch on and off really fast how bad do things break now?\r\n\r\n"
+    },
+    {
+      "type": "review",
+      "id": 1874273556,
+      "created_at": "2024-02-10T22:55:19Z",
+      "user": "jbaiera",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1485346773,
+      "created_at": "2024-02-10T22:55:19Z",
+      "user": "jbaiera",
+      "body": "Right beneath this method is the `onCancelled()` method, which runs on the node executing the task (on a GENERIC thread, so we should be fine). The task should not be scheduled again until after `markAsCompleted()` is called, so as long as we have a way to avoid running the delete at the same time as the update (synchronized is probably fine?) then the delete will happen always happen on the right node.",
+      "path": "modules/ingest-geoip/src/main/java/org/elasticsearch/ingest/geoip/GeoIpDownloader.java",
+      "diff_hunk": "@@ -323,6 +327,20 @@ private void cleanDatabases() {\n         stats = stats.expiredDatabases((int) expiredDatabases);\n     }\n \n+    synchronized void deleteIndex() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 330,
+      "original_line": 330,
+      "side": "RIGHT",
+      "original_position": 44,
+      "position": 44,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 1938852732,
+      "created_at": "2024-02-12T15:05:56Z",
+      "user": "joegallo",
+      "body": "I'm going to take this one back to the drawing board, the problem here is real, but this solution is mostly barking up the wrong tree. The comments on this PR and elsewhere have been illuminating, though, so I think there's a good chance we can put this issue to bed (edit: albeit by way of a different PR!)."
+    }
+  ]
+}

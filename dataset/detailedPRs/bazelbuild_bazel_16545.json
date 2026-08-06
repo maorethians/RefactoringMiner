@@ -1,0 +1,254 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 16545,
+  "pr_number": 16545,
+  "title": "Make `bazel run` works with minimal mode",
+  "user": "coeuvre",
+  "created_at": "2022-10-25T12:28:43Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "team-Remote-Exec",
+    "awaiting-review"
+  ],
+  "base_commit": "4e66d9340037f0be83d7bc0fdd809a09344ab83f",
+  "merge_commit_sha": "f076c8435ada6490894551b0626750db124349e9",
+  "commits": 4,
+  "issue_events": [
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "labeled",
+    "closed",
+    "mentioned",
+    "subscribed",
+    "labeled",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "unlabeled"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/16545",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-10-25T12:15:06Z",
+      "sha": "8c3d22dbbf2f7c61d701367eafeeae762e00b030",
+      "message": "Make `bazel run` works with minimal mode",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2022-10-25T12:15:06Z",
+      "author_date": "2022-10-25T12:15:06Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2022-10-25T12:15:06Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java\n@@ -524,4 +524,8 @@ public void finalizeAction(Action action, MetadataHandler metadataHandler) {\n       prefetchFiles(outputsToDownload, metadataHandler, Priority.LOW);\n     }\n   }\n+\n+  public void flushOutputTree() throws InterruptedException {\n+    downloadCache.awaitInProgressTasks();\n+  }\n }\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -929,7 +929,14 @@ public void executorInit(CommandEnvironment env, BuildRequest request, ExecutorB\n       remoteOutputService.setActionInputFetcher(actionInputFetcher);\n       actionContextProvider.setActionInputFetcher(actionInputFetcher);\n \n-      if (remoteOutputsMode.downloadToplevelOutputsOnly()) {\n+      boolean useToplevelDownloader = remoteOutputsMode.downloadToplevelOutputsOnly();\n+\n+      // Download toplevel artifacts for `run` command.\n+      if (\"run\".equals(env.getCommandName())) {\n+        useToplevelDownloader = true;\n+      }\n+\n+      if (useToplevelDownloader) {\n         toplevelArtifactsDownloader =\n             new ToplevelArtifactsDownloader(\n                 env.getCommandName(),\nsrc/main/java/com/google/devtools/build/lib/remote/RemoteOutputService.java\n@@ -95,6 +95,13 @@ public ModifiedFileSet startBuild(\n     return ModifiedFileSet.EVERYTHING_MODIFIED;\n   }\n \n+  @Override\n+  public void flushOutputTree() throws InterruptedException {\n+    if (actionInputFetcher != null) {\n+      actionInputFetcher.flushOutputTree();\n+    }\n+  }\n+\n   @Override\n   public void finalizeBuild(boolean buildSuccessful) {\n     // Intentionally left empty.\nsrc/main/java/com/google/devtools/build/lib/remote/util/AsyncTaskCache.java\n@@ -21,11 +21,14 @@\n import io.reactivex.rxjava3.annotations.NonNull;\n import io.reactivex.rxjava3.core.Completable;\n import io.reactivex.rxjava3.core.CompletableEmitter;\n+import io.reactivex.rxjava3.core.Flowable;\n import io.reactivex.rxjava3.core.Single;\n import io.reactivex.rxjava3.core.SingleObserver;\n import io.reactivex.rxjava3.disposables.Disposable;\n import io.reactivex.rxjava3.functions.Action;\n+import io.reactivex.rxjava3.subjects.AsyncSubject;\n import java.util.ArrayList;\n+import java.util.Collection;\n import java.util.HashMap;\n import java.util.List;\n import java.util.Map;\n@@ -131,6 +134,8 @@ class Execution extends Single<ValueT> implements SingleObserver<ValueT> {\n     @GuardedBy(\"lock\")\n     private final List<SingleObserver<? super ValueT>> observers = new ArrayList<>();\n \n+    private final AsyncSubject<ValueT> completion = AsyncSubject.create();\n+\n     Execution(KeyT key, Single<ValueT> upstream) {\n       this.key = key;\n       this.upstream = upstream;\n@@ -182,6 +187,9 @@ public void onSuccess(@NonNull ValueT value) {\n             observer.onSuccess(value);\n           }\n \n+          completion.onNext(value);\n+          completion.onComplete();\n+\n           maybeNotifyTermination();\n         }\n       }\n@@ -198,6 +206,8 @@ public void onError(@NonNull Throwable error) {\n             observer.onError(error);\n           }\n \n+          completion.onError(error);\n+\n           maybeNotifyTermination();\n         }\n       }\n@@ -348,7 +358,42 @@ public void shutdown() {\n     }\n   }\n \n-  /** Waits for the channel to become terminated. */\n+  /**\n+   * Waits for the in-progress tasks to finish. Any tasks that are submitted after the call are not\n+   * waited.\n+   */\n+  public void awaitInProgressTasks() throws InterruptedException {\n+    Completable completable =\n+        Completable.defer(\n+            () -> {\n+              Collection<Execution> executions;\n+              synchronized (lock) {\n+                executions = ImmutableList.copyOf(inProgress.values());\n+              }\n+\n+              if (executions.isEmpty()) {\n+                return Completable.complete();\n+              }\n+\n+              return Completable.fromPublisher(\n+                  Flowable.fromIterable(executions)\n+                      .flatMapSingle(e -> Single.fromObservable(e.completion)));\n+            });\n+\n+    try {\n+      completable.blockingAwait();\n+    } catch (RuntimeException e) {\n+      Throwable cause = e.getCause();\n+      if (cause != null) {\n+        throwIfInstanceOf(cause, InterruptedException.class);\n+      }\n+      throw e;\n+    }\n+  }\n+\n+  /**\n+   * Waits for the channel to become terminated.\n+   */\n   public void awaitTermination() throws InterruptedException {\n     Completable completable =\n         Completable.create(\n@@ -493,7 +538,17 @@ public void shutdown() {\n       cache.shutdown();\n     }\n \n-    /** Waits for the cache to become terminated. */\n+    /**\n+     * Waits for the in-progress tasks to finish. Any tasks that are submitted after the call are\n+     * not waited.\n+     */\n+    public void awaitInProgressTasks() throws InterruptedException {\n+      cache.awaitInProgressTasks();\n+    }\n+\n+    /**\n+     * Waits for the cache to become terminated.\n+     */\n     public void awaitTermination() throws InterruptedException {\n       cache.awaitTermination();\n     }\nsrc/main/java/com/google/devtools/build/lib/runtime/commands/RunCommand.java\n@@ -306,6 +306,14 @@ public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult opti\n       return BlazeCommandResult.detailedExitCode(result.getDetailedExitCode());\n     }\n \n+    if (env.getOutputService() != null) {\n+      try {\n+        env.getOutputService().flushOutputTree();\n+      } catch (InterruptedException ignored) {\n+        Thread.currentThread().interrupt();\n+      }\n+    }\n+\n     // Make sure that we have exactly 1 built target (excluding --run_under),\n     // and that it is executable.\n     // These checks should only fail if keepGoing is true, because we already did\nsrc/main/java/com/google/devtools/build/lib/skyframe/SkyframeActionExecutor.java\n@@ -309,6 +309,10 @@ Path getExecRoot() {\n     return executorEngine.getExecRoot();\n   }\n \n+  ActionInputPrefetcher getActionInputPrefetcher() {\n+    return actionInputPrefetcher;\n+  }\n+\n   ActionContextRegistry getActionContextRegistry() {\n     return executorEngine;\n   }\nsrc/main/java/com/google/devtools/build/lib/skyframe/SkyframeExecutor.java\n@@ -2630,6 +2630,10 @@ public MemoizingEvaluator getEvaluator() {\n     return memoizingEvaluator;\n   }\n \n+  public ActionInputPrefetcher getActionInputPrefetcher() {\n+    return skyframeActionExecutor.getActionInputPrefetcher();\n+  }\n+\n   @VisibleForTesting\n   public ConfiguredRuleClassProvider getRuleClassProviderForTesting() {\n     return ruleClassProvider;\nsrc/main/java/com/google/devtools/build/lib/vfs/OutputService.java\n@@ -117,6 +117,9 @@ public default boolean shouldTrustRemoteArtifacts() {\n   ModifiedFileSet startBuild(EventHandler eventHandler, UUID buildId, boolean finalizeActions)\n       throws BuildFailedException, AbruptExitException, InterruptedException;\n \n+  /** Flush and wait for in-progress downloads. */\n+  void flushOutputTree() throws InterruptedException;\n+\n   /**\n    * Finish the build.\n    *\nsrc/test/shell/bazel/remote/build_without_the_bytes_test.sh\n@@ -1331,4 +1331,26 @@ EOF\n   [[ ! -e \"bazel-bin/a/liblib.jdeps\" ]] || fail \"bazel-bin/a/liblib.jdeps shouldn't exist\"\n }\n \n+function test_bazel_run_with_minimal() {\n+  # Test that `bazel run` works in minimal mode.\n+  mkdir -p a\n+\n+  cat > a/BUILD <<'EOF'\n+genrule(\n+  name = 'bin',\n+  srcs = [],\n+  outs = ['bin.out'],\n+  cmd = \"echo 'echo bin-message' > $@\",\n+  executable = True,\n+)\n+EOF\n+\n+  bazel run \\\n+    --remote_executor=grpc://localhost:${worker_port} \\\n+    --remote_download_minimal \\\n+    //a:bin >& $TEST_log || fail \"Failed to run //a:bin\"\n+\n+  expect_log \"bin-message\"\n+}\n+\n run_suite \"Build without the Bytes tests\"",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java",
+          "patch": "@@ -524,4 +524,8 @@ public void finalizeAction(Action action, MetadataHandler metadataHandler) {\n       prefetchFiles(outputsToDownload, metadataHandler, Priority.LOW);\n     }\n   }\n+\n+  public void flushOutputTree() throws InterruptedException {\n+    downloadCache.awaitInProgressTasks();\n+  }\n }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -929,7 +929,14 @@ public void executorInit(CommandEnvironment env, BuildRequest request, ExecutorB\n       remoteOutputService.setActionInputFetcher(actionInputFetcher);\n       actionContextProvider.setActionInputFetcher(actionInputFetcher);\n \n-      if (remoteOutputsMode.downloadToplevelOutputsOnly()) {\n+      boolean useToplevelDownloader = remoteOutputsMode.downloadToplevelOutputsOnly();\n+\n+      // Download toplevel artifacts for `run` command.\n+      if (\"run\".equals(env.getCommandName())) {\n+        useToplevelDownloader = true;\n+      }\n+\n+      if (useToplevelDownloader) {\n         toplevelArtifactsDownloader =\n             new ToplevelArtifactsDownloader(\n                 env.getCommandName(),"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteOutputService.java",
+          "patch": "@@ -95,6 +95,13 @@ public ModifiedFileSet startBuild(\n     return ModifiedFileSet.EVERYTHING_MODIFIED;\n   }\n \n+  @Override\n+  public void flushOutputTree() throws InterruptedException {\n+    if (actionInputFetcher != null) {\n+      actionInputFetcher.flushOutputTree();\n+    }\n+  }\n+\n   @Override\n   public void finalizeBuild(boolean buildSuccessful) {\n     // Intentionally left empty."
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/util/AsyncTaskCache.java",
+          "patch": "@@ -21,11 +21,14 @@\n import io.reactivex.rxjava3.annotations.NonNull;\n import io.reactivex.rxjava3.core.Completable;\n import io.reactivex.rxjava3.core.CompletableEmitter;\n+import io.reactivex.rxjava3.core.Flowable;\n import io.reactivex.rxjava3.core.Single;\n import io.reactivex.rxjava3.core.SingleObserver;\n import io.reactivex.rxjava3.disposables.Disposable;\n import io.reactivex.rxjava3.functions.Action;\n+import io.reactivex.rxjava3.subjects.AsyncSubject;\n import java.util.ArrayList;\n+import java.util.Collection;\n import java.util.HashMap;\n import java.util.List;\n import java.util.Map;\n@@ -131,6 +134,8 @@ class Execution extends Single<ValueT> implements SingleObserver<ValueT> {\n     @GuardedBy(\"lock\")\n     private final List<SingleObserver<? super ValueT>> observers = new ArrayList<>();\n \n+    private final AsyncSubject<ValueT> completion = AsyncSubject.create();\n+\n     Execution(KeyT key, Single<ValueT> upstream) {\n       this.key = key;\n       this.upstream = upstream;\n@@ -182,6 +187,9 @@ public void onSuccess(@NonNull ValueT value) {\n             observer.onSuccess(value);\n           }\n \n+          completion.onNext(value);\n+          completion.onComplete();\n+\n           maybeNotifyTermination();\n         }\n       }\n@@ -198,6 +206,8 @@ public void onError(@NonNull Throwable error) {\n             observer.onError(error);\n           }\n \n+          completion.onError(error);\n+\n           maybeNotifyTermination();\n         }\n       }\n@@ -348,7 +358,42 @@ public void shutdown() {\n     }\n   }\n \n-  /** Waits for the channel to become terminated. */\n+  /**\n+   * Waits for the in-progress tasks to finish. Any tasks that are submitted after the call are not\n+   * waited.\n+   */\n+  public void awaitInProgressTasks() throws InterruptedException {\n+    Completable completable =\n+        Completable.defer(\n+            () -> {\n+              Collection<Execution> executions;\n+              synchronized (lock) {\n+                executions = ImmutableList.copyOf(inProgress.values());\n+              }\n+\n+              if (executions.isEmpty()) {\n+                return Completable.complete();\n+              }\n+\n+              return Completable.fromPublisher(\n+                  Flowable.fromIterable(executions)\n+                      .flatMapSingle(e -> Single.fromObservable(e.completion)));\n+            });\n+\n+    try {\n+      completable.blockingAwait();\n+    } catch (RuntimeException e) {\n+      Throwable cause = e.getCause();\n+      if (cause != null) {\n+        throwIfInstanceOf(cause, InterruptedException.class);\n+      }\n+      throw e;\n+    }\n+  }\n+\n+  /**\n+   * Waits for the channel to become terminated.\n+   */\n   public void awaitTermination() throws InterruptedException {\n     Completable completable =\n         Completable.create(\n@@ -493,7 +538,17 @@ public void shutdown() {\n       cache.shutdown();\n     }\n \n-    /** Waits for the cache to become terminated. */\n+    /**\n+     * Waits for the in-progress tasks to finish. Any tasks that are submitted after the call are\n+     * not waited.\n+     */\n+    public void awaitInProgressTasks() throws InterruptedException {\n+      cache.awaitInProgressTasks();\n+    }\n+\n+    /**\n+     * Waits for the cache to become terminated.\n+     */\n     public void awaitTermination() throws InterruptedException {\n       cache.awaitTermination();\n     }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/runtime/commands/RunCommand.java",
+          "patch": "@@ -306,6 +306,14 @@ public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult opti\n       return BlazeCommandResult.detailedExitCode(result.getDetailedExitCode());\n     }\n \n+    if (env.getOutputService() != null) {\n+      try {\n+        env.getOutputService().flushOutputTree();\n+      } catch (InterruptedException ignored) {\n+        Thread.currentThread().interrupt();\n+      }\n+    }\n+\n     // Make sure that we have exactly 1 built target (excluding --run_under),\n     // and that it is executable.\n     // These checks should only fail if keepGoing is true, because we already did"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/skyframe/SkyframeActionExecutor.java",
+          "patch": "@@ -309,6 +309,10 @@ Path getExecRoot() {\n     return executorEngine.getExecRoot();\n   }\n \n+  ActionInputPrefetcher getActionInputPrefetcher() {\n+    return actionInputPrefetcher;\n+  }\n+\n   ActionContextRegistry getActionContextRegistry() {\n     return executorEngine;\n   }"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/skyframe/SkyframeExecutor.java",
+          "patch": "@@ -2630,6 +2630,10 @@ public MemoizingEvaluator getEvaluator() {\n     return memoizingEvaluator;\n   }\n \n+  public ActionInputPrefetcher getActionInputPrefetcher() {\n+    return skyframeActionExecutor.getActionInputPrefetcher();\n+  }\n+\n   @VisibleForTesting\n   public ConfiguredRuleClassProvider getRuleClassProviderForTesting() {\n     return ruleClassProvider;"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/vfs/OutputService.java",
+          "patch": "@@ -117,6 +117,9 @@ public default boolean shouldTrustRemoteArtifacts() {\n   ModifiedFileSet startBuild(EventHandler eventHandler, UUID buildId, boolean finalizeActions)\n       throws BuildFailedException, AbruptExitException, InterruptedException;\n \n+  /** Flush and wait for in-progress downloads. */\n+  void flushOutputTree() throws InterruptedException;\n+\n   /**\n    * Finish the build.\n    *"
+        },
+        {
+          "file": "src/test/shell/bazel/remote/build_without_the_bytes_test.sh",
+          "patch": "@@ -1331,4 +1331,26 @@ EOF\n   [[ ! -e \"bazel-bin/a/liblib.jdeps\" ]] || fail \"bazel-bin/a/liblib.jdeps shouldn't exist\"\n }\n \n+function test_bazel_run_with_minimal() {\n+  # Test that `bazel run` works in minimal mode.\n+  mkdir -p a\n+\n+  cat > a/BUILD <<'EOF'\n+genrule(\n+  name = 'bin',\n+  srcs = [],\n+  outs = ['bin.out'],\n+  cmd = \"echo 'echo bin-message' > $@\",\n+  executable = True,\n+)\n+EOF\n+\n+  bazel run \\\n+    --remote_executor=grpc://localhost:${worker_port} \\\n+    --remote_download_minimal \\\n+    //a:bin >& $TEST_log || fail \"Failed to run //a:bin\"\n+\n+  expect_log \"bin-message\"\n+}\n+\n run_suite \"Build without the Bytes tests\""
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-10-25T12:28:43Z",
+      "user": "coeuvre",
+      "body": "Always use `ToplevelArtifactsDownloader` when building without the bytes.\r\n\r\nIt checks the combination of current command (e.g. `build`, `run`, etc.) and download mode (e.g. `toplevel`, `minimal`) to decide whether download outputs for the toplevel targets or not.\r\n\r\nAlso in the `RunCommand`, we wait for the background downloads before checking the local filesystem.\r\n\r\nFixes #11920."
+    },
+    {
+      "type": "review_comment",
+      "id": 1005421876,
+      "created_at": "2022-10-26T09:09:32Z",
+      "user": "coeuvre",
+      "body": "We might need to support other commands (e.g. `coverage`, `mobile-install`, etc.). Do you think whether it is better if we **always** use toplevel downloader but pass in the download mode, let the downloaders decide what to download in both minimal/toplevel mode?",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+      "diff_hunk": "@@ -929,7 +929,14 @@ public void executorInit(CommandEnvironment env, BuildRequest request, ExecutorB\n       remoteOutputService.setActionInputFetcher(actionInputFetcher);\n       actionContextProvider.setActionInputFetcher(actionInputFetcher);\n \n-      if (remoteOutputsMode.downloadToplevelOutputsOnly()) {\n+      boolean useToplevelDownloader = remoteOutputsMode.downloadToplevelOutputsOnly();\n+\n+      // Download toplevel artifacts for `run` command.\n+      if (\"run\".equals(env.getCommandName())) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 935,
+      "side": "RIGHT",
+      "original_position": 8,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1015502033,
+          "user": "tjgq",
+          "body": "Yeah, it does seem better to keep all of that logic in the downloader.",
+          "created_at": "2022-11-07T14:38:37Z"
+        },
+        {
+          "id": 1016571951,
+          "user": "coeuvre",
+          "body": "Done.",
+          "created_at": "2022-11-08T12:31:28Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1156140449,
+      "created_at": "2022-10-26T09:09:33Z",
+      "user": "coeuvre",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1015505602,
+      "created_at": "2022-11-07T14:41:39Z",
+      "user": "tjgq",
+      "body": "Add a comment here explaining why this is necessary (since a casual reader of RunCommand.java might not be familiar with BwoB).",
+      "path": "src/main/java/com/google/devtools/build/lib/runtime/commands/RunCommand.java",
+      "diff_hunk": "@@ -306,6 +306,14 @@ public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult opti\n       return BlazeCommandResult.detailedExitCode(result.getDetailedExitCode());\n     }\n \n+    if (env.getOutputService() != null) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 312,
+      "original_line": 309,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 7,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1016571532,
+          "user": "coeuvre",
+          "body": "Done.",
+          "created_at": "2022-11-08T12:31:10Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1170518270,
+      "created_at": "2022-11-07T15:28:05Z",
+      "user": "tjgq",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2022-11-08T12:25:50Z",
+      "sha": "46f2eebc55f64b8dbe20b068c196ae3cb58b2f53",
+      "message": "Address comments",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2022-11-08T12:25:50Z",
+      "author_date": "2022-11-08T12:25:50Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2022-11-08T12:25:50Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java\n@@ -929,29 +929,21 @@ public void executorInit(CommandEnvironment env, BuildRequest request, ExecutorB\n       remoteOutputService.setActionInputFetcher(actionInputFetcher);\n       actionContextProvider.setActionInputFetcher(actionInputFetcher);\n \n-      boolean useToplevelDownloader = remoteOutputsMode.downloadToplevelOutputsOnly();\n-\n-      // Download toplevel artifacts for `run` command.\n-      if (\"run\".equals(env.getCommandName())) {\n-        useToplevelDownloader = true;\n-      }\n-\n-      if (useToplevelDownloader) {\n-        toplevelArtifactsDownloader =\n-            new ToplevelArtifactsDownloader(\n-                env.getCommandName(),\n-                env.getSkyframeExecutor().getEvaluator(),\n-                actionInputFetcher,\n-                (path) -> {\n-                  FileSystem fileSystem = path.getFileSystem();\n-                  Preconditions.checkState(\n-                      fileSystem instanceof RemoteActionFileSystem,\n-                      \"fileSystem must be an instance of RemoteActionFileSystem\");\n-                  return ((RemoteActionFileSystem) path.getFileSystem())\n-                      .getRemoteMetadata(path.asFragment());\n-                });\n-        env.getEventBus().register(toplevelArtifactsDownloader);\n-      }\n+      toplevelArtifactsDownloader =\n+          new ToplevelArtifactsDownloader(\n+              env.getCommandName(),\n+              remoteOutputsMode.downloadToplevelOutputsOnly(),\n+              env.getSkyframeExecutor().getEvaluator(),\n+              actionInputFetcher,\n+              (path) -> {\n+                FileSystem fileSystem = path.getFileSystem();\n+                Preconditions.checkState(\n+                    fileSystem instanceof RemoteActionFileSystem,\n+                    \"fileSystem must be an instance of RemoteActionFileSystem\");\n+                return ((RemoteActionFileSystem) path.getFileSystem())\n+                    .getRemoteMetadata(path.asFragment());\n+              });\n+      env.getEventBus().register(toplevelArtifactsDownloader);\n     }\n   }\n \nsrc/main/java/com/google/devtools/build/lib/remote/ToplevelArtifactsDownloader.java\n@@ -62,12 +62,14 @@ private enum CommandMode {\n   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();\n \n   private final CommandMode commandMode;\n+  private final boolean downloadToplevel;\n   private final MemoizingEvaluator memoizingEvaluator;\n   private final AbstractActionInputPrefetcher actionInputPrefetcher;\n   private final PathToMetadataConverter pathToMetadataConverter;\n \n   public ToplevelArtifactsDownloader(\n       String commandName,\n+      boolean downloadToplevel,\n       MemoizingEvaluator memoizingEvaluator,\n       AbstractActionInputPrefetcher actionInputPrefetcher,\n       PathToMetadataConverter pathToMetadataConverter) {\n@@ -84,6 +86,7 @@ public ToplevelArtifactsDownloader(\n       default:\n         this.commandMode = CommandMode.UNKNOWN;\n     }\n+    this.downloadToplevel = downloadToplevel;\n     this.memoizingEvaluator = memoizingEvaluator;\n     this.actionInputPrefetcher = actionInputPrefetcher;\n     this.pathToMetadataConverter = pathToMetadataConverter;\n@@ -133,6 +136,10 @@ public void onFailure(Throwable throwable) {\n   @Subscribe\n   @AllowConcurrentEvents\n   public void onAspectComplete(AspectCompleteEvent event) {\n+    if (!shouldDownloadToplevelOutputsForTarget(/* configuredTargetKey= */ null)) {\n+      return;\n+    }\n+\n     if (event.failed()) {\n       return;\n     }\n@@ -156,28 +163,35 @@ public void onTargetComplete(TargetCompleteEvent event) {\n         event.getExecutableTargetData().getRunfiles());\n   }\n \n-  private boolean shouldDownloadToplevelOutputsForTarget(ConfiguredTargetKey configuredTargetKey) {\n-    if (commandMode != CommandMode.TEST) {\n-      return true;\n-    }\n-\n-    // Do not download test binary in test mode.\n-    try {\n-      var configuredTargetValue =\n-          (ConfiguredTargetValue) memoizingEvaluator.getExistingValue(configuredTargetKey);\n-      if (configuredTargetValue == null) {\n-        return false;\n-      }\n-      ConfiguredTarget configuredTarget = configuredTargetValue.getConfiguredTarget();\n-      if (configuredTarget instanceof RuleConfiguredTarget) {\n-        var ruleConfiguredTarget = (RuleConfiguredTarget) configuredTarget;\n-        var isTestRule = isTestRuleName(ruleConfiguredTarget.getRuleClassString());\n-        return !isTestRule;\n-      }\n-      return true;\n-    } catch (InterruptedException ignored) {\n-      Thread.currentThread().interrupt();\n-      return false;\n+  private boolean shouldDownloadToplevelOutputsForTarget(\n+      @Nullable ConfiguredTargetKey configuredTargetKey) {\n+    switch (commandMode) {\n+      case RUN:\n+        return true;\n+      case TEST:\n+        if (configuredTargetKey == null) {\n+          return false;\n+        }\n+        // Do not download test binary in test mode.\n+        try {\n+          var configuredTargetValue =\n+              (ConfiguredTargetValue) memoizingEvaluator.getExistingValue(configuredTargetKey);\n+          if (configuredTargetValue == null) {\n+            return false;\n+          }\n+          ConfiguredTarget configuredTarget = configuredTargetValue.getConfiguredTarget();\n+          if (configuredTarget instanceof RuleConfiguredTarget) {\n+            var ruleConfiguredTarget = (RuleConfiguredTarget) configuredTarget;\n+            var isTestRule = isTestRuleName(ruleConfiguredTarget.getRuleClassString());\n+            return !isTestRule;\n+          }\n+          return true;\n+        } catch (InterruptedException ignored) {\n+          Thread.currentThread().interrupt();\n+          return false;\n+        }\n+      default:\n+        return downloadToplevel;\n     }\n   }\n ",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java",
+          "patch": "@@ -929,29 +929,21 @@ public void executorInit(CommandEnvironment env, BuildRequest request, ExecutorB\n       remoteOutputService.setActionInputFetcher(actionInputFetcher);\n       actionContextProvider.setActionInputFetcher(actionInputFetcher);\n \n-      boolean useToplevelDownloader = remoteOutputsMode.downloadToplevelOutputsOnly();\n-\n-      // Download toplevel artifacts for `run` command.\n-      if (\"run\".equals(env.getCommandName())) {\n-        useToplevelDownloader = true;\n-      }\n-\n-      if (useToplevelDownloader) {\n-        toplevelArtifactsDownloader =\n-            new ToplevelArtifactsDownloader(\n-                env.getCommandName(),\n-                env.getSkyframeExecutor().getEvaluator(),\n-                actionInputFetcher,\n-                (path) -> {\n-                  FileSystem fileSystem = path.getFileSystem();\n-                  Preconditions.checkState(\n-                      fileSystem instanceof RemoteActionFileSystem,\n-                      \"fileSystem must be an instance of RemoteActionFileSystem\");\n-                  return ((RemoteActionFileSystem) path.getFileSystem())\n-                      .getRemoteMetadata(path.asFragment());\n-                });\n-        env.getEventBus().register(toplevelArtifactsDownloader);\n-      }\n+      toplevelArtifactsDownloader =\n+          new ToplevelArtifactsDownloader(\n+              env.getCommandName(),\n+              remoteOutputsMode.downloadToplevelOutputsOnly(),\n+              env.getSkyframeExecutor().getEvaluator(),\n+              actionInputFetcher,\n+              (path) -> {\n+                FileSystem fileSystem = path.getFileSystem();\n+                Preconditions.checkState(\n+                    fileSystem instanceof RemoteActionFileSystem,\n+                    \"fileSystem must be an instance of RemoteActionFileSystem\");\n+                return ((RemoteActionFileSystem) path.getFileSystem())\n+                    .getRemoteMetadata(path.asFragment());\n+              });\n+      env.getEventBus().register(toplevelArtifactsDownloader);\n     }\n   }\n "
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ToplevelArtifactsDownloader.java",
+          "patch": "@@ -62,12 +62,14 @@ private enum CommandMode {\n   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();\n \n   private final CommandMode commandMode;\n+  private final boolean downloadToplevel;\n   private final MemoizingEvaluator memoizingEvaluator;\n   private final AbstractActionInputPrefetcher actionInputPrefetcher;\n   private final PathToMetadataConverter pathToMetadataConverter;\n \n   public ToplevelArtifactsDownloader(\n       String commandName,\n+      boolean downloadToplevel,\n       MemoizingEvaluator memoizingEvaluator,\n       AbstractActionInputPrefetcher actionInputPrefetcher,\n       PathToMetadataConverter pathToMetadataConverter) {\n@@ -84,6 +86,7 @@ public ToplevelArtifactsDownloader(\n       default:\n         this.commandMode = CommandMode.UNKNOWN;\n     }\n+    this.downloadToplevel = downloadToplevel;\n     this.memoizingEvaluator = memoizingEvaluator;\n     this.actionInputPrefetcher = actionInputPrefetcher;\n     this.pathToMetadataConverter = pathToMetadataConverter;\n@@ -133,6 +136,10 @@ public void onFailure(Throwable throwable) {\n   @Subscribe\n   @AllowConcurrentEvents\n   public void onAspectComplete(AspectCompleteEvent event) {\n+    if (!shouldDownloadToplevelOutputsForTarget(/* configuredTargetKey= */ null)) {\n+      return;\n+    }\n+\n     if (event.failed()) {\n       return;\n     }\n@@ -156,28 +163,35 @@ public void onTargetComplete(TargetCompleteEvent event) {\n         event.getExecutableTargetData().getRunfiles());\n   }\n \n-  private boolean shouldDownloadToplevelOutputsForTarget(ConfiguredTargetKey configuredTargetKey) {\n-    if (commandMode != CommandMode.TEST) {\n-      return true;\n-    }\n-\n-    // Do not download test binary in test mode.\n-    try {\n-      var configuredTargetValue =\n-          (ConfiguredTargetValue) memoizingEvaluator.getExistingValue(configuredTargetKey);\n-      if (configuredTargetValue == null) {\n-        return false;\n-      }\n-      ConfiguredTarget configuredTarget = configuredTargetValue.getConfiguredTarget();\n-      if (configuredTarget instanceof RuleConfiguredTarget) {\n-        var ruleConfiguredTarget = (RuleConfiguredTarget) configuredTarget;\n-        var isTestRule = isTestRuleName(ruleConfiguredTarget.getRuleClassString());\n-        return !isTestRule;\n-      }\n-      return true;\n-    } catch (InterruptedException ignored) {\n-      Thread.currentThread().interrupt();\n-      return false;\n+  private boolean shouldDownloadToplevelOutputsForTarget(\n+      @Nullable ConfiguredTargetKey configuredTargetKey) {\n+    switch (commandMode) {\n+      case RUN:\n+        return true;\n+      case TEST:\n+        if (configuredTargetKey == null) {\n+          return false;\n+        }\n+        // Do not download test binary in test mode.\n+        try {\n+          var configuredTargetValue =\n+              (ConfiguredTargetValue) memoizingEvaluator.getExistingValue(configuredTargetKey);\n+          if (configuredTargetValue == null) {\n+            return false;\n+          }\n+          ConfiguredTarget configuredTarget = configuredTargetValue.getConfiguredTarget();\n+          if (configuredTarget instanceof RuleConfiguredTarget) {\n+            var ruleConfiguredTarget = (RuleConfiguredTarget) configuredTarget;\n+            var isTestRule = isTestRuleName(ruleConfiguredTarget.getRuleClassString());\n+            return !isTestRule;\n+          }\n+          return true;\n+        } catch (InterruptedException ignored) {\n+          Thread.currentThread().interrupt();\n+          return false;\n+        }\n+      default:\n+        return downloadToplevel;\n     }\n   }\n "
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-11-08T12:30:54Z",
+      "sha": "0ff6099c675b04d61eebb3e20111d58b9298ca5f",
+      "message": "Address comments",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2022-11-08T12:30:54Z",
+      "author_date": "2022-11-08T12:30:54Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2022-11-08T12:30:54Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/runtime/commands/RunCommand.java\n@@ -306,6 +306,9 @@ public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult opti\n       return BlazeCommandResult.detailedExitCode(result.getDetailedExitCode());\n     }\n \n+    // If Bazel is using an output service (e.g. Build without the Bytes), the toplevel outputs\n+    // might still be downloading in the background. Flush the output tree to wait for all the\n+    // downloads complete.\n     if (env.getOutputService() != null) {\n       try {\n         env.getOutputService().flushOutputTree();",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/runtime/commands/RunCommand.java",
+          "patch": "@@ -306,6 +306,9 @@ public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult opti\n       return BlazeCommandResult.detailedExitCode(result.getDetailedExitCode());\n     }\n \n+    // If Bazel is using an output service (e.g. Build without the Bytes), the toplevel outputs\n+    // might still be downloading in the background. Flush the output tree to wait for all the\n+    // downloads complete.\n     if (env.getOutputService() != null) {\n       try {\n         env.getOutputService().flushOutputTree();"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1172035315,
+      "created_at": "2022-11-08T12:31:10Z",
+      "user": "coeuvre",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1172035775,
+      "created_at": "2022-11-08T12:31:28Z",
+      "user": "coeuvre",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2022-11-08T12:38:54Z",
+      "sha": "98862b10e29b1e859943190df1d4a434028d2b9d",
+      "message": "Address comments",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2022-11-08T12:38:54Z",
+      "author_date": "2022-11-08T12:38:54Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2022-11-08T12:38:54Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/ToplevelArtifactsDownloader.java\n@@ -136,7 +136,7 @@ public void onFailure(Throwable throwable) {\n   @Subscribe\n   @AllowConcurrentEvents\n   public void onAspectComplete(AspectCompleteEvent event) {\n-    if (!shouldDownloadToplevelOutputsForTarget(/* configuredTargetKey= */ null)) {\n+    if (!shouldDownloadToplevelOutputs(event.getAspectKey().getBaseConfiguredTargetKey())) {\n       return;\n     }\n \n@@ -150,7 +150,7 @@ public void onAspectComplete(AspectCompleteEvent event) {\n   @Subscribe\n   @AllowConcurrentEvents\n   public void onTargetComplete(TargetCompleteEvent event) {\n-    if (!shouldDownloadToplevelOutputsForTarget(event.getConfiguredTargetKey())) {\n+    if (!shouldDownloadToplevelOutputs(event.getConfiguredTargetKey())) {\n       return;\n     }\n \n@@ -163,15 +163,12 @@ public void onTargetComplete(TargetCompleteEvent event) {\n         event.getExecutableTargetData().getRunfiles());\n   }\n \n-  private boolean shouldDownloadToplevelOutputsForTarget(\n-      @Nullable ConfiguredTargetKey configuredTargetKey) {\n+  private boolean shouldDownloadToplevelOutputs(ConfiguredTargetKey configuredTargetKey) {\n     switch (commandMode) {\n       case RUN:\n+        // Always download outputs of toplevel targets in RUN mode\n         return true;\n       case TEST:\n-        if (configuredTargetKey == null) {\n-          return false;\n-        }\n         // Do not download test binary in test mode.\n         try {\n           var configuredTargetValue =",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/ToplevelArtifactsDownloader.java",
+          "patch": "@@ -136,7 +136,7 @@ public void onFailure(Throwable throwable) {\n   @Subscribe\n   @AllowConcurrentEvents\n   public void onAspectComplete(AspectCompleteEvent event) {\n-    if (!shouldDownloadToplevelOutputsForTarget(/* configuredTargetKey= */ null)) {\n+    if (!shouldDownloadToplevelOutputs(event.getAspectKey().getBaseConfiguredTargetKey())) {\n       return;\n     }\n \n@@ -150,7 +150,7 @@ public void onAspectComplete(AspectCompleteEvent event) {\n   @Subscribe\n   @AllowConcurrentEvents\n   public void onTargetComplete(TargetCompleteEvent event) {\n-    if (!shouldDownloadToplevelOutputsForTarget(event.getConfiguredTargetKey())) {\n+    if (!shouldDownloadToplevelOutputs(event.getConfiguredTargetKey())) {\n       return;\n     }\n \n@@ -163,15 +163,12 @@ public void onTargetComplete(TargetCompleteEvent event) {\n         event.getExecutableTargetData().getRunfiles());\n   }\n \n-  private boolean shouldDownloadToplevelOutputsForTarget(\n-      @Nullable ConfiguredTargetKey configuredTargetKey) {\n+  private boolean shouldDownloadToplevelOutputs(ConfiguredTargetKey configuredTargetKey) {\n     switch (commandMode) {\n       case RUN:\n+        // Always download outputs of toplevel targets in RUN mode\n         return true;\n       case TEST:\n-        if (configuredTargetKey == null) {\n-          return false;\n-        }\n         // Do not download test binary in test mode.\n         try {\n           var configuredTargetValue ="
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1308552743,
+      "created_at": "2022-11-09T10:39:43Z",
+      "user": "coeuvre",
+      "body": "@bazel-io flag"
+    }
+  ]
+}

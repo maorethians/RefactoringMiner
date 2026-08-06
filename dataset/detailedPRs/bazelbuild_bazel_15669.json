@@ -1,0 +1,159 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 15669,
+  "pr_number": 15669,
+  "title": "Chunker: Always seek on the uncompressed stream.",
+  "user": "benjaminp",
+  "created_at": "2022-06-13T21:11:08Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "team-Remote-Exec"
+  ],
+  "base_commit": "ac61aa4bbac2fc6e380ece362acf349bbc6bad8e",
+  "merge_commit_sha": "badd67eecf4fab87d5d33fe26666063279e68cb0",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "labeled",
+    "labeled",
+    "closed",
+    "head_ref_deleted",
+    "mentioned",
+    "subscribed",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "unlabeled",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "unlabeled"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/15669",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-06-13T20:59:55Z",
+      "sha": "29f822e0d9e544bb5a2f5a0216bd3141b7c1362e",
+      "message": "Chunker: Always seek on the uncompressed stream.\n\nThe `WriteRequest.write_offset` field has bizarre semantics during compressed uploads as documented in the remote API protos: https://github.com/bazelbuild/remote-apis/blob/3b4b6402103539d66fcdd1a4d945f660742665ca/build/bazel/remote/execution/v2/remote_execution.proto#L241-L248 In particular, the write offset of the first `WriteRequest` refers to the offset in the uncompressed source.\n\nThis change ensures we always seek the uncompressed stream to the correct offset when starting an upload call. The old code could fail to resume compressed uploads under some conditions. The `progressiveCompressedUploadShouldWork` test purported to exercise this situation. The test, however, contained the same logic error as the code under test.",
+      "author": "Benjamin Peterson",
+      "author_email": "benjamin@engflow.com",
+      "author_raw_date": "2022-06-13T20:59:53Z",
+      "author_date": "2022-06-13T20:59:53Z",
+      "committer": "Benjamin Peterson",
+      "committer_email": "benjamin@engflow.com",
+      "raw_date": "2022-06-13T20:59:55Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/Chunker.java\n@@ -144,17 +144,17 @@ public void reset() throws IOException {\n   }\n \n   /**\n-   * Seek to an offset, if necessary resetting or initializing\n+   * Seek to an offset in the source stream.\n    *\n-   * <p>May close open resources in order to seek to an earlier offset.\n+   * <p>May close and reopen resources in order to seek to an earlier offset.\n    */\n   public void seek(long toOffset) throws IOException {\n-    if (toOffset < offset) {\n+    if (initialized && toOffset >= offset && !compressed) {\n+      ByteStreams.skipFully(data, toOffset - offset);\n+    } else {\n       reset();\n+      initialize(toOffset);\n     }\n-    maybeInitialize();\n-    ByteStreams.skipFully(data, toOffset - offset);\n-    offset = toOffset;\n     if (data.finished()) {\n       close();\n     }\n@@ -247,18 +247,26 @@ private void maybeInitialize() throws IOException {\n     if (initialized) {\n       return;\n     }\n+    initialize(0);\n+  }\n+\n+  private void initialize(long srcPos) throws IOException {\n+    checkState(!initialized);\n     checkState(data == null);\n     checkState(offset == 0);\n     checkState(chunkCache == null);\n     try {\n+      var src = dataSupplier.get();\n+      ByteStreams.skipFully(src, srcPos);\n       data =\n           compressed\n-              ? new ChunkerInputStream(new ZstdCompressingInputStream(dataSupplier.get()))\n-              : new ChunkerInputStream(dataSupplier.get());\n+              ? new ChunkerInputStream(new ZstdCompressingInputStream(src))\n+              : new ChunkerInputStream(src);\n     } catch (RuntimeException e) {\n       Throwables.propagateIfPossible(e.getCause(), IOException.class);\n       throw e;\n     }\n+    offset = srcPos;\n     initialized = true;\n   }\n \nsrc/test/java/com/google/devtools/build/lib/remote/ByteStreamUploaderTest.java\n@@ -68,6 +68,7 @@\n import java.io.IOException;\n import java.io.InputStream;\n import java.util.ArrayList;\n+import java.util.Arrays;\n import java.util.Collections;\n import java.util.List;\n import java.util.Map;\n@@ -373,23 +374,18 @@ public void progressiveCompressedUploadShouldWork() throws Exception {\n             retrier,\n             /*maximumOpenFiles=*/ -1);\n \n-    byte[] blob = new byte[CHUNK_SIZE * 2 + 1];\n+    int chunkSize = 1024;\n+    int skipSize = chunkSize + 1;\n+    byte[] blob = new byte[chunkSize * 2 + 1];\n     new Random().nextBytes(blob);\n \n     Chunker chunker =\n-        Chunker.builder().setInput(blob).setCompressed(true).setChunkSize(CHUNK_SIZE).build();\n+        Chunker.builder().setInput(blob).setCompressed(true).setChunkSize(chunkSize).build();\n     Digest digest = DIGEST_UTIL.compute(blob);\n \n-    while (chunker.hasNext()) {\n-      chunker.next();\n-    }\n-    long expectedSize = chunker.getOffset();\n-    chunker.reset();\n-\n+    ByteArrayOutputStream output = new ByteArrayOutputStream();\n     serviceRegistry.addService(\n         new ByteStreamImplBase() {\n-\n-          byte[] receivedData = new byte[(int) expectedSize];\n           String receivedResourceName = null;\n           boolean receivedComplete = false;\n           long nextOffset = 0;\n@@ -414,21 +410,21 @@ public void onNext(WriteRequest writeRequest) {\n                   assertThat(resourceName).isEmpty();\n                 }\n \n-                assertThat(writeRequest.getWriteOffset()).isEqualTo(nextOffset);\n-\n-                ByteString data = writeRequest.getData();\n-\n-                System.arraycopy(\n-                    data.toByteArray(), 0, receivedData, (int) nextOffset, data.size());\n-\n-                nextOffset += data.size();\n-                receivedComplete = expectedSize == nextOffset;\n-                assertThat(writeRequest.getFinishWrite()).isEqualTo(receivedComplete);\n-\n                 if (initialOffset == 0) {\n                   streamObserver.onError(Status.DEADLINE_EXCEEDED.asException());\n                   mustQueryWriteStatus = true;\n-                  initialOffset = nextOffset;\n+                  initialOffset = skipSize;\n+                  nextOffset = initialOffset;\n+                } else {\n+                  ByteString data = writeRequest.getData();\n+                  try {\n+                    data.writeTo(output);\n+                  } catch (IOException e) {\n+                    streamObserver.onError(e);\n+                    return;\n+                  }\n+                  nextOffset += data.size();\n+                  receivedComplete = writeRequest.getFinishWrite();\n                 }\n               }\n \n@@ -439,10 +435,6 @@ public void onError(Throwable throwable) {\n \n               @Override\n               public void onCompleted() {\n-                assertThat(nextOffset).isEqualTo(expectedSize);\n-                byte[] decompressed = Zstd.decompress(receivedData, blob.length);\n-                assertThat(decompressed).isEqualTo(blob);\n-\n                 WriteResponse response =\n                     WriteResponse.newBuilder().setCommittedSize(nextOffset).build();\n                 streamObserver.onNext(response);\n@@ -460,7 +452,7 @@ public void queryWriteStatus(\n             if (receivedResourceName != null && receivedResourceName.equals(resourceName)) {\n               assertThat(mustQueryWriteStatus).isTrue();\n               mustQueryWriteStatus = false;\n-              committedSize = nextOffset;\n+              committedSize = receivedComplete ? blob.length : skipSize;\n               complete = receivedComplete;\n             } else {\n               committedSize = 0;\n@@ -476,6 +468,9 @@ public void queryWriteStatus(\n         });\n \n     uploader.uploadBlob(context, digest, chunker);\n+    byte[] decompressed = Zstd.decompress(output.toByteArray(), blob.length - skipSize);\n+    assertThat(Arrays.equals(decompressed, 0, decompressed.length, blob, skipSize, blob.length))\n+        .isTrue();\n \n     // This test triggers one retry.\n     Mockito.verify(mockBackoff, Mockito.times(1)).nextDelayMillis(any(Exception.class));",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/Chunker.java",
+          "patch": "@@ -144,17 +144,17 @@ public void reset() throws IOException {\n   }\n \n   /**\n-   * Seek to an offset, if necessary resetting or initializing\n+   * Seek to an offset in the source stream.\n    *\n-   * <p>May close open resources in order to seek to an earlier offset.\n+   * <p>May close and reopen resources in order to seek to an earlier offset.\n    */\n   public void seek(long toOffset) throws IOException {\n-    if (toOffset < offset) {\n+    if (initialized && toOffset >= offset && !compressed) {\n+      ByteStreams.skipFully(data, toOffset - offset);\n+    } else {\n       reset();\n+      initialize(toOffset);\n     }\n-    maybeInitialize();\n-    ByteStreams.skipFully(data, toOffset - offset);\n-    offset = toOffset;\n     if (data.finished()) {\n       close();\n     }\n@@ -247,18 +247,26 @@ private void maybeInitialize() throws IOException {\n     if (initialized) {\n       return;\n     }\n+    initialize(0);\n+  }\n+\n+  private void initialize(long srcPos) throws IOException {\n+    checkState(!initialized);\n     checkState(data == null);\n     checkState(offset == 0);\n     checkState(chunkCache == null);\n     try {\n+      var src = dataSupplier.get();\n+      ByteStreams.skipFully(src, srcPos);\n       data =\n           compressed\n-              ? new ChunkerInputStream(new ZstdCompressingInputStream(dataSupplier.get()))\n-              : new ChunkerInputStream(dataSupplier.get());\n+              ? new ChunkerInputStream(new ZstdCompressingInputStream(src))\n+              : new ChunkerInputStream(src);\n     } catch (RuntimeException e) {\n       Throwables.propagateIfPossible(e.getCause(), IOException.class);\n       throw e;\n     }\n+    offset = srcPos;\n     initialized = true;\n   }\n "
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/ByteStreamUploaderTest.java",
+          "patch": "@@ -68,6 +68,7 @@\n import java.io.IOException;\n import java.io.InputStream;\n import java.util.ArrayList;\n+import java.util.Arrays;\n import java.util.Collections;\n import java.util.List;\n import java.util.Map;\n@@ -373,23 +374,18 @@ public void progressiveCompressedUploadShouldWork() throws Exception {\n             retrier,\n             /*maximumOpenFiles=*/ -1);\n \n-    byte[] blob = new byte[CHUNK_SIZE * 2 + 1];\n+    int chunkSize = 1024;\n+    int skipSize = chunkSize + 1;\n+    byte[] blob = new byte[chunkSize * 2 + 1];\n     new Random().nextBytes(blob);\n \n     Chunker chunker =\n-        Chunker.builder().setInput(blob).setCompressed(true).setChunkSize(CHUNK_SIZE).build();\n+        Chunker.builder().setInput(blob).setCompressed(true).setChunkSize(chunkSize).build();\n     Digest digest = DIGEST_UTIL.compute(blob);\n \n-    while (chunker.hasNext()) {\n-      chunker.next();\n-    }\n-    long expectedSize = chunker.getOffset();\n-    chunker.reset();\n-\n+    ByteArrayOutputStream output = new ByteArrayOutputStream();\n     serviceRegistry.addService(\n         new ByteStreamImplBase() {\n-\n-          byte[] receivedData = new byte[(int) expectedSize];\n           String receivedResourceName = null;\n           boolean receivedComplete = false;\n           long nextOffset = 0;\n@@ -414,21 +410,21 @@ public void onNext(WriteRequest writeRequest) {\n                   assertThat(resourceName).isEmpty();\n                 }\n \n-                assertThat(writeRequest.getWriteOffset()).isEqualTo(nextOffset);\n-\n-                ByteString data = writeRequest.getData();\n-\n-                System.arraycopy(\n-                    data.toByteArray(), 0, receivedData, (int) nextOffset, data.size());\n-\n-                nextOffset += data.size();\n-                receivedComplete = expectedSize == nextOffset;\n-                assertThat(writeRequest.getFinishWrite()).isEqualTo(receivedComplete);\n-\n                 if (initialOffset == 0) {\n                   streamObserver.onError(Status.DEADLINE_EXCEEDED.asException());\n                   mustQueryWriteStatus = true;\n-                  initialOffset = nextOffset;\n+                  initialOffset = skipSize;\n+                  nextOffset = initialOffset;\n+                } else {\n+                  ByteString data = writeRequest.getData();\n+                  try {\n+                    data.writeTo(output);\n+                  } catch (IOException e) {\n+                    streamObserver.onError(e);\n+                    return;\n+                  }\n+                  nextOffset += data.size();\n+                  receivedComplete = writeRequest.getFinishWrite();\n                 }\n               }\n \n@@ -439,10 +435,6 @@ public void onError(Throwable throwable) {\n \n               @Override\n               public void onCompleted() {\n-                assertThat(nextOffset).isEqualTo(expectedSize);\n-                byte[] decompressed = Zstd.decompress(receivedData, blob.length);\n-                assertThat(decompressed).isEqualTo(blob);\n-\n                 WriteResponse response =\n                     WriteResponse.newBuilder().setCommittedSize(nextOffset).build();\n                 streamObserver.onNext(response);\n@@ -460,7 +452,7 @@ public void queryWriteStatus(\n             if (receivedResourceName != null && receivedResourceName.equals(resourceName)) {\n               assertThat(mustQueryWriteStatus).isTrue();\n               mustQueryWriteStatus = false;\n-              committedSize = nextOffset;\n+              committedSize = receivedComplete ? blob.length : skipSize;\n               complete = receivedComplete;\n             } else {\n               committedSize = 0;\n@@ -476,6 +468,9 @@ public void queryWriteStatus(\n         });\n \n     uploader.uploadBlob(context, digest, chunker);\n+    byte[] decompressed = Zstd.decompress(output.toByteArray(), blob.length - skipSize);\n+    assertThat(Arrays.equals(decompressed, 0, decompressed.length, blob, skipSize, blob.length))\n+        .isTrue();\n \n     // This test triggers one retry.\n     Mockito.verify(mockBackoff, Mockito.times(1)).nextDelayMillis(any(Exception.class));"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-06-13T21:11:08Z",
+      "user": "benjaminp",
+      "body": "The `WriteRequest.write_offset` field has bizarre semantics during compressed uploads as documented in the remote API protos: https://github.com/bazelbuild/remote-apis/blob/3b4b6402103539d66fcdd1a4d945f660742665ca/build/bazel/remote/execution/v2/remote_execution.proto#L241-L248 In particular, the write offset of the first `WriteRequest` refers to the offset in the uncompressed source.\r\n\r\nThis change ensures we always seek the uncompressed stream to the correct offset when starting an upload call. The old code could fail to resume compressed uploads under some conditions. The `progressiveCompressedUploadShouldWork` test purported to exercise this situation. The test, however, contained the same logic error as the code under test."
+    },
+    {
+      "type": "comment",
+      "id": 1154558900,
+      "created_at": "2022-06-13T23:50:57Z",
+      "user": "brentleyjones",
+      "body": "Would this fully fix https://github.com/bazelbuild/bazel/issues/14654 then? Might be worth an inclusion in a 5.3 if one gets made. "
+    },
+    {
+      "type": "review",
+      "id": 1005766256,
+      "created_at": "2022-06-14T12:26:38Z",
+      "user": "coeuvre",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1156793323,
+      "created_at": "2022-06-15T18:26:30Z",
+      "user": "brentleyjones",
+      "body": "@bazel-io flag"
+    },
+    {
+      "type": "comment",
+      "id": 1158975723,
+      "created_at": "2022-06-17T15:18:42Z",
+      "user": "ckolli5",
+      "body": "@bazel-io fork 5.3.0"
+    },
+    {
+      "type": "comment",
+      "id": 1171447459,
+      "created_at": "2022-06-30T16:42:09Z",
+      "user": "ckolli5",
+      "body": "Hello @benjaminp, I am trying to [cherry pick](https://github.com/bazelbuild/bazel/pull/15720) these changes to release-5.3.0 but presubmit checks are failing. Could you please help me in cherry picking these changes with appropriate commits. Thanks!"
+    },
+    {
+      "type": "review",
+      "id": 1085073049,
+      "created_at": "2022-08-25T08:59:54Z",
+      "user": "jgao54",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 954704034,
+      "created_at": "2022-08-25T08:59:54Z",
+      "user": "jgao54",
+      "body": "Was just reviewing the release notes today for bazel 5.3.0 and came across this.\r\n\r\nit looks like with this change, offset no longer updated here when skipFully is called. Just want to sanity check that this is the intentional behavior? (I am not super familiar with bazel internals and how seek is called, but just worried this would result in extra bytes discarded if offset is not updated)",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/Chunker.java",
+      "diff_hunk": "@@ -144,17 +144,17 @@ public void reset() throws IOException {\n   }\n \n   /**\n-   * Seek to an offset, if necessary resetting or initializing\n+   * Seek to an offset in the source stream.\n    *\n-   * <p>May close open resources in order to seek to an earlier offset.\n+   * <p>May close and reopen resources in order to seek to an earlier offset.\n    */\n   public void seek(long toOffset) throws IOException {\n-    if (toOffset < offset) {\n+    if (initialized && toOffset >= offset && !compressed) {\n+      ByteStreams.skipFully(data, toOffset - offset);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 153,
+      "original_line": 153,
+      "side": "RIGHT",
+      "original_position": 13,
+      "position": 13,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 955138905,
+          "user": "benjaminp",
+          "body": "Thanks; this is a bug. It think it's unlikely to be triggered in practice, since seeking an initialized chunker forward is rare.",
+          "created_at": "2022-08-25T15:46:17Z"
+        },
+        {
+          "id": 955535859,
+          "user": "jgao54",
+          "body": "got it, thanks for clarifying!",
+          "created_at": "2022-08-26T00:55:18Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1085696479,
+      "created_at": "2022-08-25T15:46:18Z",
+      "user": "benjaminp",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1086268421,
+      "created_at": "2022-08-26T00:55:19Z",
+      "user": "jgao54",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

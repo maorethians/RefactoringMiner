@@ -1,0 +1,218 @@
+{
+    "pr_body": "Fixes #96768 \r\n\r\nA fix proposal based on the [identified root cause](https://github.com/elastic/elasticsearch/issues/96768#issuecomment-1609907429).\r\n\r\nThe problem in general is that mapping properties parsing is affected by the `subobjects` setting, so if multiple mappings are merged, whenever explicit `subobjects` setting is encountered, formerly parsed mappings become invalid.\r\nWhat I tried in this PR is to determine whether there is an explicit `subobjects` setting within a list of mappings before parsing (and merging) them. This allows for consistent parsing and merging of component templates when processing and validating composable component templates.\r\n\r\nIf this fix proposal is evaluated as a valid path, we still need to add some unit tests, for example:\r\n- [x] different order of components in the `composedOf` list\r\n- [x] contradicting `subobjects` settings\r\n- [x] comparing the new bulk merge to the existing sequential merge\r\n",
+    "original_commit_id": "ebe00a61dc15c30cb29b64ce4dd1309ffc6e5013",
+    "merged": true,
+    "pr_number": 97317,
+    "pr_title": "Fix composable templates with `subobjects: false`",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Hi @eyalkoren, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-search (Team:Search)",
+        "Does this fix the case when we have conflicting `subobjects` directives on a submapper (ie not directly on the root)?\r\n\r\nI worry a bit that this is a special-case fix for one specific type of possible conflict, and that maybe we need to take a step back and see if there is a better way of doing this more generally.  In particular, it might be worth trying to merge the templates as json maps rather than as parsed mappings?  As I understand it, v2 templates are supposed to be parseable so that they can be verified when PUT, but I don't think that necessarily means that we need to merge them together as mappings at index creation time.\r\n\r\nI think it might also be worth getting some input from @elastic/es-data-management given that they own the template code.",
+        "@romseygeek thanks for your input! I agree that there is a bigger issue here, I'll try to define it in more details.\r\n\r\nFirstly, just to clarify, this is not a fix for handling of conflicting directives, it is a fix for failure to merge **_valid_** (non-conflicting) mappings. I only added a validation for conflicting explicit `subobjects` at the root because it's better to fail fast on such case already during parsing, before even trying to merge.\r\n\r\nHaving said that, and maybe that's your point, it doesn't fix failure to merge non-root **_valid_** mappings, such as:\r\n```json\r\n    \"mappings\" : {\r\n      \"properties\" : {\r\n        \"parent\" : {\r\n          \"subobjects\" : false,\r\n          \"type\" : \"object\",\r\n        }\r\n      }\r\n    }\r\n```\r\nand \r\n```json\r\n    \"mappings\" : {\r\n      \"properties\" : {\r\n        \"parent\" : {\r\n          \"properties\" : {\r\n            \"child.grandchild\" : {\r\n              \"type\" : \"keyword\"\r\n            }\r\n          }\r\n        }\r\n      }\r\n    }\r\n```\r\nMerging the two above will also fail. \r\nHowever, when you think of how composable templates are used, I think this is much less likely than failures caused by a merge of mappings with `subobjects: false` at the root level. Normally, a component template makes sense on its own, so it is much more likely that in order to achieve the above mappings, a single mapping would include:\r\n```json\r\n    \"mappings\" : {\r\n      \"properties\" : {\r\n        \"parent\" : {\r\n          \"subobjects\" : false,\r\n          \"type\" : \"object\",\r\n          \"properties\" : {\r\n            \"child.grandchild\" : {\r\n              \"type\" : \"keyword\"\r\n            }\r\n          }\r\n        }\r\n      }\r\n    }\r\n```\r\n\r\nSo, while I agree and even willing to take the challenge to find a wider fix, wouldn't you think it's better to eliminate the higher-impact issue?\r\n\r\n> In particular, it might be worth trying to merge the templates as json maps rather than as parsed mappings?\r\n\r\nI am not sure what this means, let's discuss this. \r\nI think there is a fundamental problem of automatically [parsing dots](https://github.com/elastic/elasticsearch/blob/f554a6ab2df3a005b9143d53aec650c69dd1c6b7/server/src/main/java/org/elasticsearch/index/mapper/ObjectMapper.java#L319-L332) and creating objects based on them. It's like we need to educate Elasticsearch all over that dots are not necessarily indication for field hierarchy, but may serve as yet another valid character in field names.",
+        "Summarizing my offline discussion with @romseygeek: we may be able to generically solve this problem by merging mappings in their raw form first, before parsing them, as in [`XContentHelper#mergeDefaults`](https://github.com/elastic/elasticsearch/blob/84089fe7e490ff80e08ecfbf6815763ffa84fc5b/server/src/main/java/org/elasticsearch/common/xcontent/XContentHelper.java#L414), possibly with slight changes and only for merges during the composition of index templates.\r\nOne possible change we'd need to apply for the current merge for example- we may be OK with simply overriding the value for a field's \"type\" by another type coming from another mapping, but the current expectation is to not allow conflicts of field type with object type.\r\n\r\nAnother alternative is to postpone the object expansion based on `.` in field names to be done as late as possible, after merging is done, at which time we already have the full picture from all mappings. This may be much more complicated to do.\r\n\r\n@dakrone your input on this would be very helpful.",
+        "Update (for my future self mostly): I added a test with the exact example described [above](https://github.com/elastic/elasticsearch/pull/97317#issuecomment-1663592849) that fails as expected. \r\nApplying @romseygeek's proposal of merging the raw (non-parsed JSON `Map<String, Object>` representations) mappings through `XContentHelper#mergeDefaults` fixes the test. I already know it would fail other tests that expect merge exceptions when trying to merge field X with `type: object` with another mapping in which field X is mapped to a non-object type. \r\nSo this approach seems valid so far, but we'd need to implement our own raw merge that is very similar to `mergeDefaults` but contains all special cases for mappings merges for index templates.",
+        "> I already know it would fail other tests that expect merge exceptions when trying to merge field X with type: object with another mapping in which field X is mapped to a non-object type.\r\n\r\nI think it's likely that we'll still get exceptions, it's just that they'll be different exceptions?  For example, overriding an object mapper with a float mapper will then throw an exception at parse time, because float mappers can't have a `properties` subfield.",
+        "> I think it's likely that we'll still get exceptions, it's just that they'll be different exceptions? For example, overriding an object mapper with a float mapper will then throw an exception at parse time, because float mappers can't have a properties subfield.\r\n\r\nIt will then depend in the order of the merge. `XContentHelper#mergeDefaults` simply merges without knowing anything about what it is merging, so it doesn't know that it merges mappings and that the `type` key may require special handling or validations. \r\nWhen I ran `MetadataIndexTemplateServiceTests`, [`testIndexTemplateFailsToOverrideComponentTemplateMappingField()`](https://github.com/elastic/elasticsearch/blob/ac68e54e8e6730cb0e7e323cd30338923d8edd8a/server/src/test/java/org/elasticsearch/cluster/metadata/MetadataIndexTemplateServiceTests.java#L1840-L1843) failed because it expected an exception during validation, which did not occur because the merged raw map contained `type: object`, which is OK with `properties`. On the other hand, [`testUpdateComponentTemplateFailsIfResolvedIndexTemplatesWouldBeInvalid()`](https://github.com/elastic/elasticsearch/blob/ac68e54e8e6730cb0e7e323cd30338923d8edd8a/server/src/test/java/org/elasticsearch/cluster/metadata/MetadataIndexTemplateServiceTests.java#L1965-L1968) failed due to a different exception, where a `text` field is not expected to have `properties` subfield, as you say.\r\n\r\nThe point is that it is not so much about how tests will fail, but that we'll have to reproduce the same behavior in raw mapping merge as we get with parsed mappings merge.",
+        "@romseygeek Please check my recent changes- I tried to find the best combination of code reuse for `XContentHelper#mergeDefaults` as well as safe refactor and zero overhead for existing usages of this legacy functionality. \r\n\r\nFrom all I can tell- it works as expected and solves the issue generically at all levels of the merged documents. Hopefully the full test suite will not uncover issues that I couldn't find manually.\r\n\r\nI don't like the hard-coded distinction between object and non-object fields, but since I need to do that in the raw map form, I couldn't think of a better way. Let me know if you think it needs different handling.",
+        "@romseygeek I just added a [test case](https://github.com/elastic/elasticsearch/pull/97317/commits/0e347b76130dd0d1e11935719c44447e166fdeb4) that failed and emphasized the fact that other sequential merges should be covered as well within this PR. So I applied the new bulk-merge for `MetadataCreateIndexService` as well.\r\n\r\n@piergm originally proposed to do this small refactor in a separate PR, but I now think it better be part of this one. \r\nPlease look in https://github.com/eyalkoren/elasticsearch/pull/1 what I plan to migrate to the new merge API and let me know what you think.",
+        "Piping in here with some background. We originally designed the mappings merging to treat each field as a unit, where the unit would override the entire field definition, rather than merging it like a recursive json map merge. The idea was that by doing this we would avoid a situation where a user configures a field A with option X, Y, and Z and then has a different template with the same field A configured with option M, and N \u2014\u00a0we didn't want to end up with a field A with options X, Y, Z, M, and N, but only the highest precedence \"unit\" configuration for the field.",
+        "@dakrone thanks a lot for explaining the rationale \ud83d\ude4f \r\n\r\nOne way to address the issue you raise is by defining what a _unit_ is and adjust the customized merge accordingly. For example, our customized merge can decide that under a node called `properties`, subtrees are _replaced_ instead of being _merged_. This maintains the exact unit semantics that you describe for fields.\r\n\r\nThe main question I need to be answered now is whether we should proceed with this direction and fix whatever needs fixing within the proposed merge, or should we abandon this path and do something else.\r\nFor example- instead of fixing the merge, we can fix the parsing logic by treating dots as a valid character for field names and stop relying on them to deduce object nesting.\r\n\r\nIf you want me to go down the current path, please provide all such limitations and scenarios and I'll adjust the algorithm accordingly.",
+        "> whether we should proceed with this direction and fix whatever needs fixing within the proposed merge, or should we abandon this path and do something else.\r\n> For example- instead of fixing the merge, we can fix the parsing logic by treating dots as a valid character for field names and stop relying on them to deduce object nesting.\r\n\r\nThe field name parsing code is not an area with which I'm intimately familiar, so I'd defer this decision to @romseygeek and his team. As long as the merging invariant of \"_two separate and valid mappings configurations of the same field name should always merge to a valid mapping configuration for the field_\", then I think either approach is fine.",
+        "@dakrone when adding the [custom merge javadoc](https://github.com/elastic/elasticsearch/pull/97317/files#diff-32c1e36544e0c0ef775f9e26576ef7df0504cc05466e513ba7b143947c234784R408-R432), I realized that we never really went carefully over all mapping parameters to identify which we want to preserve when we merge, like we plan to do with `subobjects`. For example- what about [`dynamic`](https://www.elastic.co/guide/en/elasticsearch/reference/current/dynamic.html) which takes affect on an entire subtree? Are there any other such that affect a field mapping subtree rather than only specific field's mapping? \r\n\r\nAlso - are there other mapping parameters that can be set at the root level (like `subobjects`)? \r\nI know that [`ignore_malformed`](https://www.elastic.co/guide/en/elasticsearch/reference/current/ignore-malformed.html#ignore-malformed-setting) can be set at the root level, but since it is done through the `settings` node, it won't be a problem. Note that any parameter under `_doc` other than `subobjects` will be lost during merge with the proposed algorithm.",
+        "@elasticsearchmachine run elasticsearch-ci/bwc",
+        "Dear all,\r\nafter reading this thread it is not clear to me what to do in order to have my mappings of subobjects merged and not overrid.\r\nIn version 8.9.2 the following component templates were merged correctly. Now from version 8.10 on, the third one overrides the second one even though the subobjects fields are not conflicting. Could you please help me to understand how I can make it work in the new versions? Thanks!\r\n\r\n```\r\nPUT _component_template/bdap_id\r\n{\r\n  \"version\": 1,\r\n  \"template\": {\r\n    \"mappings\": {\r\n      \"dynamic\": false,\r\n      \"_source\": {\r\n        \"enabled\": true\r\n      },\r\n      \"properties\": {\r\n        \"id\": {\r\n          \"type\": \"text\",\r\n          \"fields\": {\r\n            \"keyword\": {\r\n              \"type\": \"keyword\"\r\n            }\r\n          }\r\n        }\r\n      }\r\n    }\r\n  },\r\n  \"_meta\": {\r\n    \"description\": \"Composable template for storing text ids\"\r\n  }\r\n}\r\n```\r\n \r\n```\r\n PUT _component_template/bdap_stac_itemproperties\r\n{\r\n  \"version\": 2,\r\n  \"template\": {\r\n    \"mappings\": {\r\n      \"dynamic\": false,\r\n      \"_source\": {\r\n        \"enabled\": true\r\n      },\r\n      \"properties\": {\r\n        \"properties\": {\r\n          \"properties\": {\r\n            \"title\": {\r\n              \"type\": \"text\",\r\n              \"fields\": {\r\n                \"keyword\": {\r\n                  \"type\": \"keyword\"\r\n                }\r\n              }\r\n            },\r\n            \"description\": {\r\n              \"type\": \"text\"\r\n            }\r\n          }\r\n        }\r\n      }\r\n    }\r\n  },\r\n  \"_meta\": {\r\n    \"description\": \"Composable template for storing STAC item properties\"\r\n  }\r\n}\r\n```\r\n \r\n```\r\nPUT _component_template/bdap_stac_itemproperties_sat\r\n{\r\n  \"version\": 2,\r\n  \"template\": {\r\n    \"mappings\": {\r\n      \"dynamic\": false,\r\n      \"_source\": {\r\n        \"enabled\": true\r\n      },\r\n      \"properties\": {\r\n        \"properties\": {\r\n          \"properties\": {\r\n            \"sat:absolute_orbit\": {\r\n              \"type\": \"integer\"\r\n            },\r\n            \"sat:relative_orbit\": {\r\n              \"type\": \"integer\"\r\n            }\r\n          }\r\n        }\r\n      }\r\n    }\r\n  },\r\n  \"_meta\": {\r\n    \"description\": \"Composable template for storing STAC item properties for sat: extension\"\r\n  }\r\n}\r\n```\r\n \r\nHere the final index_template:\r\n```\r\nPUT _index_template/bdap_template_items_stac\r\n{\r\n  \"version\": 1,\r\n  \"priority\" : 5,\r\n  \"template\": {\r\n    \"settings\": {\r\n      \"index\": {\r\n        \"number_of_shards\": \"1\",\r\n        \"number_of_replicas\": \"1\"\r\n      }\r\n    },\r\n    \"mappings\": {\r\n      \"dynamic\": \"strict\",\r\n      \"_source\": {\r\n        \"enabled\": true,\r\n        \"includes\": [],\r\n        \"excludes\": []\r\n      },\r\n      \"_routing\": {\r\n        \"required\": false\r\n      },\r\n      \"dynamic_templates\": []\r\n    },\r\n    \"aliases\": {\r\n      \"bdap\": {}\r\n    }\r\n  },\r\n  \"index_patterns\": [\r\n    \"bdap-items-stac*\",\r\n    \"bdap-test-items-stac*\",\r\n    \"bdap-dev-items-stac*\"\r\n  ],\r\n  \"composed_of\": [\r\n    \"bdap_id\",\r\n    \"bdap_stac_itemproperties\",\r\n    \"bdap_stac_itemproperties_sat\"\r\n  ],\r\n  \"_meta\": {\r\n    \"description\": \"Composable template for storing STAC items used for PROD, TEST and DEV indexes\"\r\n  }\r\n}\r\n```\r\n \r\nIf I try to do the PUT of 1 first document in version 8.10 I get an error, while in 8.9.2 it created correctly the new index by merging the mappings.\r\n```\r\nPUT bdap-dev-items-stac-001/_doc/1\r\n{\r\n    \"id\": \"Landcover.ESA.WorldCover2020.V1.item.VRT_ESA_WorldCover_10m_2020_v100_InputQuality\",\r\n    \"properties\": {\r\n      \"title\": \"ESA_WorldCover_10m_2020_v100_InputQuality.vrt\",\r\n      \"description\": \"xcgsdfgsdfgsd\",\r\n      \"sat:absolute_orbit\": 45938,\r\n      \"sat:relative_orbit\": 38,\r\n    }\r\n}\r\n```\r\n",
+        "@chiarch84 thanks for reporting!\r\nAt first glance, I think this is related to the specific case of merging mappings of a field named `properties`. I could have sworn I took this option into consideration, but I can't find any evidence for it.\r\nPlease verify that this is indeed the case (for example, try only renaming your `properties` field and see if this resolves the issue) and if so, please open a separate issue with the same description as above and with the error you get.",
+        "I finally got to actually look and there is indeed a [test case](https://github.com/elastic/elasticsearch/blob/bac320829ca1385bcda70f70e5124570b513bf9e/server/src/test/java/org/elasticsearch/index/mapper/MapperServiceTests.java#L1150-L1239) I added for it, but maybe yours is a specific scenario that is not properly covered.\r\nOnce I get to it, I'll test myself, but if you get the chance to verify as I asked, it would be useful."
+    ],
+    "commit_id": "5f11c39dcac885ac62f962881a451d14cafe7468",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 1309,
+            "start_side": null,
+            "start_line": null,
+            "line": 1312,
+            "comment_lines": [
+                "[][1312]"
+            ],
+            "review_comment": [
+                "Note for reviewer: note that I had to use `\"_routing\": {\"required\": false}` explicitly here, instead of relying on the default, because otherwise there is no way to detect contradiction between mapping and settings coming from `ComposableIndexTemplate.DataStreamTemplate`, as they both get translated into a single `RoutingFieldMapper`.\r\nSince this code is executed only if `template.getDataStreamTemplate() != null`, it should be same"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/metadata/MetadataIndexTemplateService.java",
+            "id": 36141,
+            "created_at": "2023-08-07T14:28:06Z",
+            "original_position": 27,
+            "side": "RIGHT",
+            "position": 30,
+            "original_start_line": null
+        },
+        {
+            "original_line": 393,
+            "start_side": null,
+            "start_line": null,
+            "line": 513,
+            "comment_lines": [
+                "[][513]"
+            ],
+            "review_comment": [
+                "**Note for reviewer:** only the `XContentHelper.convertToMap()` operation was extracted from the formerly `synchronized` block. As far as I can see this is a stateless operation, which leaves the former synchronization enforcement the same."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/MapperService.java",
+            "id": 36138,
+            "created_at": "2023-07-03T13:27:05Z",
+            "original_position": 72,
+            "side": "RIGHT",
+            "position": 176,
+            "original_start_line": null
+        },
+        {
+            "original_line": 406,
+            "start_side": null,
+            "start_line": null,
+            "line": 433,
+            "comment_lines": [
+                "[][433]"
+            ],
+            "review_comment": [
+                "Can you add a javadoc for a high-level explanation of how this custom merger behaves? I.e., its special treatment of `subobjects`, etc."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/MapperService.java",
+            "id": 36144,
+            "created_at": "2023-08-24T23:05:06Z",
+            "original_position": 60,
+            "side": "RIGHT",
+            "position": 85,
+            "original_start_line": null
+        },
+        {
+            "original_line": 423,
+            "start_side": null,
+            "start_line": null,
+            "line": 423,
+            "comment_lines": [
+                "[][423]"
+            ],
+            "review_comment": [
+                "Nit: remove this and replace with the `_routing` field requirement",
+                "No, this is still true and it is the actual fix for the originally identified issue- we need to keep `subobjects` when we merge field mappings (e.g. of two `object` field definitions).\r\nThe `_routing` is [something else](https://github.com/elastic/elasticsearch/pull/97317/files#diff-5081302eb39033199deb1977d544d1cd7867212a92b8d77e0aa0ded361272b11R101-R103), I will add another comment into the algorithm implementation in the right place.",
+                "Ah, I was misreading and thinking this was the conflict error part that we removed earlier.  All good then!"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/MapperService.java",
+            "id": 36145,
+            "created_at": "2023-09-05T16:48:56Z",
+            "original_position": 75,
+            "side": "RIGHT",
+            "position": 75,
+            "original_start_line": null
+        },
+        {
+            "original_line": 517,
+            "start_side": null,
+            "start_line": null,
+            "line": 517,
+            "comment_lines": [
+                "[][517]"
+            ],
+            "review_comment": [
+                "Now the merge happens in the raw form of the mappings, which means that the parsing happens on **the superset of all mappings of each field**. So the test would fail a bit earlier than it was failing before, when it sees `type: keyword` and `ignore_malformed` together (`keyword` does not support `ignore_malformed`) for the `@timestamp` field. \r\nChanging the type to `long` restores the former expected failure of using wrong type for `@timestamp`.\r\nConceptually, this doesn't indicate a problem as it can only happen in invalid mappings combinations."
+            ],
+            "path": "modules/data-streams/src/internalClusterTest/java/org/elasticsearch/datastreams/DataStreamIT.java",
+            "id": 36139,
+            "created_at": "2023-08-07T08:30:32Z",
+            "original_position": 5,
+            "side": "RIGHT",
+            "position": 5,
+            "original_start_line": null
+        },
+        {
+            "original_line": 1997,
+            "start_side": "LEFT",
+            "start_line": 1997,
+            "line": 1997,
+            "comment_lines": [
+                "[1997][]",
+                "[1998][]",
+                "[1999][]",
+                "[2000][]",
+                "[2001][]",
+                "[2002][]",
+                "[][1997]"
+            ],
+            "review_comment": [
+                "This tests the mismatch between routing settings and routing enablement through `ComposableIndexTemplate.DataStreamTemplate`. In addition, I had to test conflicting `routing` configurations if such come from the mappings and a contradicting one comes from `ComposableIndexTemplate.DataStreamTemplate` (below)."
+            ],
+            "path": "modules/data-streams/src/internalClusterTest/java/org/elasticsearch/datastreams/DataStreamIT.java",
+            "id": 36140,
+            "created_at": "2023-08-07T14:15:45Z",
+            "original_position": 35,
+            "side": "RIGHT",
+            "position": 35,
+            "original_start_line": 1997
+        },
+        {
+            "original_line": 77,
+            "start_side": null,
+            "start_line": null,
+            "line": 86,
+            "comment_lines": [
+                "[][86]"
+            ],
+            "review_comment": [
+                "Could we also add a test that does the merging for nested maps without a custom merge present? I think that's the only case missing right now?",
+                "I extended `testMergingDefaults()` to include that"
+            ],
+            "path": "server/src/test/java/org/elasticsearch/common/xcontent/support/XContentHelperTests.java",
+            "id": 36146,
+            "created_at": "2023-09-08T20:29:57Z",
+            "original_position": 19,
+            "side": "RIGHT",
+            "position": 28,
+            "original_start_line": null
+        },
+        {
+            "original_line": 427,
+            "start_side": null,
+            "start_line": null,
+            "line": 518,
+            "comment_lines": [
+                "[][518]"
+            ],
+            "review_comment": [
+                "This line doesn't need to be within the synchronized block I think?",
+                "Yeah, it's misleading in this sense \ud83d\ude42 \r\nIt is currently within the synchronized block and [I learned the hard way](https://github.com/elastic/elasticsearch/pull/97199#discussion_r1249541239) that it does need to stay in it."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/index/mapper/MapperService.java",
+            "id": 36142,
+            "created_at": "2023-08-08T08:26:45Z",
+            "original_position": 95,
+            "side": "RIGHT",
+            "position": 181,
+            "original_start_line": null
+        },
+        {
+            "original_line": 103,
+            "start_side": "RIGHT",
+            "start_line": 104,
+            "line": 106,
+            "comment_lines": [
+                "[][104]",
+                "[][105]",
+                "[][106]"
+            ],
+            "review_comment": [
+                "I think this needs a comment as to why this is necessary",
+                "I [commented](https://github.com/elastic/elasticsearch/pull/97317/files#r1285950199) elsewhere about this in the PR. Did you mean that, or adding a comment to the code?",
+                "I meant in the code, so that future code spelunkers know why it's there."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/cluster/metadata/MetadataIndexTemplateService.java",
+            "id": 36143,
+            "created_at": "2023-08-09T21:30:28Z",
+            "original_position": 18,
+            "side": "RIGHT",
+            "position": 21,
+            "original_start_line": 101
+        }
+    ]
+}

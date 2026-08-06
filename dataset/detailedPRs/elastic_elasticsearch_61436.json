@@ -1,0 +1,180 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 61436,
+  "pr_number": 61436,
+  "title": "Copy gradle/system jdk to local dir for packaging tests",
+  "user": "rjernst",
+  "created_at": "2020-08-21T18:14:40Z",
+  "merged_at": "2020-08-21T21:21:45Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">test",
+    ":Delivery/Packaging",
+    "v7.10.0",
+    "v7.9.1",
+    "Team:Delivery (obsolete)",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "164798008c7c115e9e1cc4a7f15ae64905794712",
+  "merge_commit_sha": "8cacaa48c8640f978436a812ac9d1e70a26f4644",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/61436",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-08-21T18:10:28Z",
+      "sha": "5e17b5144526a3dd549e38370d7ce8cd9b5b6c6a",
+      "message": "Copy gradle/system jdk to local dir for packaging tests\n\nThe distro tests rely on two jdks, pulled in by the jdk download plugin.\nThe move the artifact transforms result in the path to the extracted\njdks existing under the gradle cache dir, which is outside the vagrant\nmount of the elasticsearch project. This commit creates a local copy\nwithin the `qa:os` project that the packaging tests use.\n\ncloses #61138",
+      "author": "Ryan Ernst",
+      "author_email": "ryan@iernst.net",
+      "author_raw_date": "2020-08-21T18:10:28Z",
+      "author_date": "2020-08-21T18:10:28Z",
+      "committer": "Ryan Ernst",
+      "committer_email": "ryan@iernst.net",
+      "raw_date": "2020-08-21T18:10:28Z",
+      "diff_text": "buildSrc/src/main/java/org/elasticsearch/gradle/test/DistroTestPlugin.java\n@@ -35,6 +35,7 @@\n import org.elasticsearch.gradle.info.BuildParams;\n import org.elasticsearch.gradle.internal.InternalDistributionDownloadPlugin;\n import org.elasticsearch.gradle.util.GradleUtils;\n+import org.elasticsearch.gradle.util.Util;\n import org.elasticsearch.gradle.vagrant.VagrantBasePlugin;\n import org.elasticsearch.gradle.vagrant.VagrantExtension;\n import org.gradle.api.Action;\n@@ -47,9 +48,11 @@\n import org.gradle.api.plugins.JavaBasePlugin;\n import org.gradle.api.provider.Provider;\n import org.gradle.api.specs.Specs;\n+import org.gradle.api.tasks.Copy;\n import org.gradle.api.tasks.TaskProvider;\n import org.gradle.api.tasks.testing.Test;\n \n+import java.io.File;\n import java.util.ArrayList;\n import java.util.Arrays;\n import java.util.HashMap;\n@@ -79,6 +82,7 @@ public class DistroTestPlugin implements Plugin<Project> {\n     public void apply(Project project) {\n         project.getRootProject().getPluginManager().apply(DockerSupportPlugin.class);\n         project.getPlugins().apply(InternalDistributionDownloadPlugin.class);\n+        project.getPlugins().apply(JdkDownloadPlugin.class);\n         project.getPluginManager().apply(\"elasticsearch.build\");\n \n         Provider<DockerSupportService> dockerSupport = GradleUtils.getBuildService(\n@@ -157,11 +161,22 @@ public void apply(Project project) {\n             }\n         }\n \n+        // setup jdks used by no-jdk tests, and by gradle executing\n+        TaskProvider<Copy> linuxGradleJdk = createJdk(project, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, \"linux\", \"x64\");\n+        TaskProvider<Copy> linuxSystemJdk = createJdk(project, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, \"linux\", \"x64\");\n+        TaskProvider<Copy> windowsGradleJdk = createJdk(project, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, \"windows\", \"x64\");\n+        TaskProvider<Copy> windowsSystemJdk = createJdk(project, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, \"windows\", \"x64\");\n+\n         project.subprojects(vmProject -> {\n             vmProject.getPluginManager().apply(VagrantBasePlugin.class);\n-            vmProject.getPluginManager().apply(JdkDownloadPlugin.class);\n-            List<Object> vmDependencies = new ArrayList<>(configureVM(vmProject));\n-            vmDependencies.add(project.getConfigurations().getByName(\"testRuntimeClasspath\"));\n+            TaskProvider<Copy> gradleJdk = isWindows(vmProject) ? windowsGradleJdk : linuxGradleJdk;\n+            TaskProvider<Copy> systemJdk = isWindows(vmProject) ? windowsSystemJdk : linuxSystemJdk;\n+            configureVM(vmProject, gradleJdk, systemJdk);\n+            List<Object> vmDependencies = Arrays.asList(\n+                gradleJdk,\n+                systemJdk,\n+                project.getConfigurations().getByName(\"testRuntimeClasspath\")\n+            );\n \n             Map<ElasticsearchDistribution.Type, TaskProvider<?>> vmLifecyleTasks = lifecycleTasks(vmProject, \"distroTest\");\n             Map<String, TaskProvider<?>> vmVersionTasks = versionTasks(vmProject, \"distroUpgradeTest\");\n@@ -237,57 +252,56 @@ private static Map<String, TaskProvider<?>> versionTasks(Project project, String\n         return versionTasks;\n     }\n \n-    private static Jdk createJdk(\n-        NamedDomainObjectContainer<Jdk> jdksContainer,\n-        String name,\n+    private static TaskProvider<Copy> createJdk(\n+        Project project,\n+        String purpose,\n         String vendor,\n         String version,\n         String platform,\n         String architecture\n     ) {\n-        Jdk jdk = jdksContainer.create(name);\n+        Jdk jdk = JdkDownloadPlugin.getContainer(project).create(platform + \"-\" + purpose);\n         jdk.setVendor(vendor);\n         jdk.setVersion(version);\n         jdk.setPlatform(platform);\n         jdk.setArchitecture(architecture);\n-        return jdk;\n+\n+        String taskname = \"copy\" + Util.capitalize(platform) + Util.capitalize(purpose) + \"Jdk\";\n+        TaskProvider<Copy> copyTask = project.getTasks().register(taskname, Copy.class);\n+        copyTask.configure(t -> {\n+            t.from(jdk);\n+            t.into(new File(project.getBuildDir(), \"jdks/\" + platform + \"-\" + architecture + \"-\" + vendor + \"-\" + version));\n+        });\n+        return copyTask;\n     }\n \n-    private static List<Object> configureVM(Project project) {\n+    private static void configureVM(Project project, TaskProvider<Copy> gradleJdkProvider, TaskProvider<Copy> systemJdkProvider) {\n         String box = project.getName();\n \n-        // setup jdks used by the distro tests, and by gradle executing\n-\n-        NamedDomainObjectContainer<Jdk> jdksContainer = JdkDownloadPlugin.getContainer(project);\n-        String platform = box.contains(\"windows\") ? \"windows\" : \"linux\";\n-        Jdk systemJdk = createJdk(jdksContainer, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, platform, \"x64\");\n-        Jdk gradleJdk = createJdk(jdksContainer, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, platform, \"x64\");\n-\n         // setup VM used by these tests\n         VagrantExtension vagrant = project.getExtensions().getByType(VagrantExtension.class);\n         vagrant.setBox(box);\n-        vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdk, \"\", \"\"));\n-        vagrant.vmEnv(\"JAVA_HOME\", \"\"); // make sure any default java on the system is ignored\n-        vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdk, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n+\n+        vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdkProvider, \"\", \"\"));\n+        vagrant.vmEnv(\"JAVA_HOME\",\"\"); // make sure any default java on the system is ignored\n+        vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdkProvider, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n         // pass these along to get correct build scans\n         if (System.getenv(\"JENKINS_URL\") != null) {\n             Stream.of(\"JOB_NAME\", \"JENKINS_URL\", \"BUILD_NUMBER\", \"BUILD_URL\").forEach(name -> vagrant.vmEnv(name, System.getenv(name)));\n         }\n         vagrant.setIsWindowsVM(isWindows(project));\n-\n-        return Arrays.asList(systemJdk, gradleJdk);\n     }\n \n-    private static Object convertPath(Project project, VagrantExtension vagrant, Jdk jdk, String additionaLinux, String additionalWindows) {\n-        return new Object() {\n-            @Override\n-            public String toString() {\n-                if (vagrant.isWindowsVM()) {\n-                    return convertWindowsPath(project, jdk.getPath()) + additionalWindows;\n-                }\n-                return convertLinuxPath(project, jdk.getPath()) + additionaLinux;\n+    private static Object convertPath(Project project, VagrantExtension vagrant, TaskProvider<Copy> jdkProvider,\n+                                      String additionaLinux, String additionalWindows) {\n+        return Util.toStringable(() -> {\n+            String hostPath = jdkProvider.get().getDestinationDir().toString();\n+            if (vagrant.isWindowsVM()) {\n+                return convertWindowsPath(project, hostPath) + additionalWindows;\n+            } else {\n+                return convertLinuxPath(project, hostPath) + additionaLinux;\n             }\n-        };\n+        });\n     }\n \n     private static Configuration configureExamplePlugin(Project project) {",
+      "diff": [
+        {
+          "file": "buildSrc/src/main/java/org/elasticsearch/gradle/test/DistroTestPlugin.java",
+          "patch": "@@ -35,6 +35,7 @@\n import org.elasticsearch.gradle.info.BuildParams;\n import org.elasticsearch.gradle.internal.InternalDistributionDownloadPlugin;\n import org.elasticsearch.gradle.util.GradleUtils;\n+import org.elasticsearch.gradle.util.Util;\n import org.elasticsearch.gradle.vagrant.VagrantBasePlugin;\n import org.elasticsearch.gradle.vagrant.VagrantExtension;\n import org.gradle.api.Action;\n@@ -47,9 +48,11 @@\n import org.gradle.api.plugins.JavaBasePlugin;\n import org.gradle.api.provider.Provider;\n import org.gradle.api.specs.Specs;\n+import org.gradle.api.tasks.Copy;\n import org.gradle.api.tasks.TaskProvider;\n import org.gradle.api.tasks.testing.Test;\n \n+import java.io.File;\n import java.util.ArrayList;\n import java.util.Arrays;\n import java.util.HashMap;\n@@ -79,6 +82,7 @@ public class DistroTestPlugin implements Plugin<Project> {\n     public void apply(Project project) {\n         project.getRootProject().getPluginManager().apply(DockerSupportPlugin.class);\n         project.getPlugins().apply(InternalDistributionDownloadPlugin.class);\n+        project.getPlugins().apply(JdkDownloadPlugin.class);\n         project.getPluginManager().apply(\"elasticsearch.build\");\n \n         Provider<DockerSupportService> dockerSupport = GradleUtils.getBuildService(\n@@ -157,11 +161,22 @@ public void apply(Project project) {\n             }\n         }\n \n+        // setup jdks used by no-jdk tests, and by gradle executing\n+        TaskProvider<Copy> linuxGradleJdk = createJdk(project, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, \"linux\", \"x64\");\n+        TaskProvider<Copy> linuxSystemJdk = createJdk(project, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, \"linux\", \"x64\");\n+        TaskProvider<Copy> windowsGradleJdk = createJdk(project, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, \"windows\", \"x64\");\n+        TaskProvider<Copy> windowsSystemJdk = createJdk(project, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, \"windows\", \"x64\");\n+\n         project.subprojects(vmProject -> {\n             vmProject.getPluginManager().apply(VagrantBasePlugin.class);\n-            vmProject.getPluginManager().apply(JdkDownloadPlugin.class);\n-            List<Object> vmDependencies = new ArrayList<>(configureVM(vmProject));\n-            vmDependencies.add(project.getConfigurations().getByName(\"testRuntimeClasspath\"));\n+            TaskProvider<Copy> gradleJdk = isWindows(vmProject) ? windowsGradleJdk : linuxGradleJdk;\n+            TaskProvider<Copy> systemJdk = isWindows(vmProject) ? windowsSystemJdk : linuxSystemJdk;\n+            configureVM(vmProject, gradleJdk, systemJdk);\n+            List<Object> vmDependencies = Arrays.asList(\n+                gradleJdk,\n+                systemJdk,\n+                project.getConfigurations().getByName(\"testRuntimeClasspath\")\n+            );\n \n             Map<ElasticsearchDistribution.Type, TaskProvider<?>> vmLifecyleTasks = lifecycleTasks(vmProject, \"distroTest\");\n             Map<String, TaskProvider<?>> vmVersionTasks = versionTasks(vmProject, \"distroUpgradeTest\");\n@@ -237,57 +252,56 @@ private static Map<String, TaskProvider<?>> versionTasks(Project project, String\n         return versionTasks;\n     }\n \n-    private static Jdk createJdk(\n-        NamedDomainObjectContainer<Jdk> jdksContainer,\n-        String name,\n+    private static TaskProvider<Copy> createJdk(\n+        Project project,\n+        String purpose,\n         String vendor,\n         String version,\n         String platform,\n         String architecture\n     ) {\n-        Jdk jdk = jdksContainer.create(name);\n+        Jdk jdk = JdkDownloadPlugin.getContainer(project).create(platform + \"-\" + purpose);\n         jdk.setVendor(vendor);\n         jdk.setVersion(version);\n         jdk.setPlatform(platform);\n         jdk.setArchitecture(architecture);\n-        return jdk;\n+\n+        String taskname = \"copy\" + Util.capitalize(platform) + Util.capitalize(purpose) + \"Jdk\";\n+        TaskProvider<Copy> copyTask = project.getTasks().register(taskname, Copy.class);\n+        copyTask.configure(t -> {\n+            t.from(jdk);\n+            t.into(new File(project.getBuildDir(), \"jdks/\" + platform + \"-\" + architecture + \"-\" + vendor + \"-\" + version));\n+        });\n+        return copyTask;\n     }\n \n-    private static List<Object> configureVM(Project project) {\n+    private static void configureVM(Project project, TaskProvider<Copy> gradleJdkProvider, TaskProvider<Copy> systemJdkProvider) {\n         String box = project.getName();\n \n-        // setup jdks used by the distro tests, and by gradle executing\n-\n-        NamedDomainObjectContainer<Jdk> jdksContainer = JdkDownloadPlugin.getContainer(project);\n-        String platform = box.contains(\"windows\") ? \"windows\" : \"linux\";\n-        Jdk systemJdk = createJdk(jdksContainer, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, platform, \"x64\");\n-        Jdk gradleJdk = createJdk(jdksContainer, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, platform, \"x64\");\n-\n         // setup VM used by these tests\n         VagrantExtension vagrant = project.getExtensions().getByType(VagrantExtension.class);\n         vagrant.setBox(box);\n-        vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdk, \"\", \"\"));\n-        vagrant.vmEnv(\"JAVA_HOME\", \"\"); // make sure any default java on the system is ignored\n-        vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdk, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n+\n+        vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdkProvider, \"\", \"\"));\n+        vagrant.vmEnv(\"JAVA_HOME\",\"\"); // make sure any default java on the system is ignored\n+        vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdkProvider, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n         // pass these along to get correct build scans\n         if (System.getenv(\"JENKINS_URL\") != null) {\n             Stream.of(\"JOB_NAME\", \"JENKINS_URL\", \"BUILD_NUMBER\", \"BUILD_URL\").forEach(name -> vagrant.vmEnv(name, System.getenv(name)));\n         }\n         vagrant.setIsWindowsVM(isWindows(project));\n-\n-        return Arrays.asList(systemJdk, gradleJdk);\n     }\n \n-    private static Object convertPath(Project project, VagrantExtension vagrant, Jdk jdk, String additionaLinux, String additionalWindows) {\n-        return new Object() {\n-            @Override\n-            public String toString() {\n-                if (vagrant.isWindowsVM()) {\n-                    return convertWindowsPath(project, jdk.getPath()) + additionalWindows;\n-                }\n-                return convertLinuxPath(project, jdk.getPath()) + additionaLinux;\n+    private static Object convertPath(Project project, VagrantExtension vagrant, TaskProvider<Copy> jdkProvider,\n+                                      String additionaLinux, String additionalWindows) {\n+        return Util.toStringable(() -> {\n+            String hostPath = jdkProvider.get().getDestinationDir().toString();\n+            if (vagrant.isWindowsVM()) {\n+                return convertWindowsPath(project, hostPath) + additionalWindows;\n+            } else {\n+                return convertLinuxPath(project, hostPath) + additionaLinux;\n             }\n-        };\n+        });\n     }\n \n     private static Configuration configureExamplePlugin(Project project) {"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-08-21T18:14:40Z",
+      "user": "rjernst",
+      "body": "The distro tests rely on two jdks, pulled in by the jdk download plugin.\r\nThe move to artifact transforms for jdks resulted in the path to the extracted\r\njdks existing under the gradle cache dir, which is outside the vagrant\r\nmount of the elasticsearch project. This commit creates a local copy\r\nwithin the `qa:os` project that the packaging tests use.\r\n\r\ncloses #61138"
+    },
+    {
+      "type": "comment",
+      "id": 678422903,
+      "created_at": "2020-08-21T18:14:42Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-core-infra (:Core/Infra/Packaging)"
+    },
+    {
+      "type": "review_comment",
+      "id": 474855574,
+      "created_at": "2020-08-21T18:19:58Z",
+      "user": "mark-vieira",
+      "body": "Is the only thing we're wanting to defer is the destination dir? If so, can we just compute that ahead of time rather than query it from the task itself?",
+      "path": "buildSrc/src/main/java/org/elasticsearch/gradle/test/DistroTestPlugin.java",
+      "diff_hunk": "@@ -237,57 +252,56 @@ public void apply(Project project) {\n         return versionTasks;\n     }\n \n-    private static Jdk createJdk(\n-        NamedDomainObjectContainer<Jdk> jdksContainer,\n-        String name,\n+    private static TaskProvider<Copy> createJdk(\n+        Project project,\n+        String purpose,\n         String vendor,\n         String version,\n         String platform,\n         String architecture\n     ) {\n-        Jdk jdk = jdksContainer.create(name);\n+        Jdk jdk = JdkDownloadPlugin.getContainer(project).create(platform + \"-\" + purpose);\n         jdk.setVendor(vendor);\n         jdk.setVersion(version);\n         jdk.setPlatform(platform);\n         jdk.setArchitecture(architecture);\n-        return jdk;\n+\n+        String taskname = \"copy\" + Util.capitalize(platform) + Util.capitalize(purpose) + \"Jdk\";\n+        TaskProvider<Copy> copyTask = project.getTasks().register(taskname, Copy.class);\n+        copyTask.configure(t -> {\n+            t.from(jdk);\n+            t.into(new File(project.getBuildDir(), \"jdks/\" + platform + \"-\" + architecture + \"-\" + vendor + \"-\" + version));\n+        });\n+        return copyTask;\n     }\n \n-    private static List<Object> configureVM(Project project) {\n+    private static void configureVM(Project project, TaskProvider<Copy> gradleJdkProvider, TaskProvider<Copy> systemJdkProvider) {\n         String box = project.getName();\n \n-        // setup jdks used by the distro tests, and by gradle executing\n-\n-        NamedDomainObjectContainer<Jdk> jdksContainer = JdkDownloadPlugin.getContainer(project);\n-        String platform = box.contains(\"windows\") ? \"windows\" : \"linux\";\n-        Jdk systemJdk = createJdk(jdksContainer, \"system\", SYSTEM_JDK_VENDOR, SYSTEM_JDK_VERSION, platform, \"x64\");\n-        Jdk gradleJdk = createJdk(jdksContainer, \"gradle\", GRADLE_JDK_VENDOR, GRADLE_JDK_VERSION, platform, \"x64\");\n-\n         // setup VM used by these tests\n         VagrantExtension vagrant = project.getExtensions().getByType(VagrantExtension.class);\n         vagrant.setBox(box);\n-        vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdk, \"\", \"\"));\n-        vagrant.vmEnv(\"JAVA_HOME\", \"\"); // make sure any default java on the system is ignored\n-        vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdk, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n+\n+        vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdkProvider, \"\", \"\"));\n+        vagrant.vmEnv(\"JAVA_HOME\",\"\"); // make sure any default java on the system is ignored\n+        vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdkProvider, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n         // pass these along to get correct build scans\n         if (System.getenv(\"JENKINS_URL\") != null) {\n             Stream.of(\"JOB_NAME\", \"JENKINS_URL\", \"BUILD_NUMBER\", \"BUILD_URL\").forEach(name -> vagrant.vmEnv(name, System.getenv(name)));\n         }\n         vagrant.setIsWindowsVM(isWindows(project));\n-\n-        return Arrays.asList(systemJdk, gradleJdk);\n     }\n \n-    private static Object convertPath(Project project, VagrantExtension vagrant, Jdk jdk, String additionaLinux, String additionalWindows) {\n-        return new Object() {\n-            @Override\n-            public String toString() {\n-                if (vagrant.isWindowsVM()) {\n-                    return convertWindowsPath(project, jdk.getPath()) + additionalWindows;\n-                }\n-                return convertLinuxPath(project, jdk.getPath()) + additionaLinux;\n+    private static Object convertPath(Project project, VagrantExtension vagrant, TaskProvider<Copy> jdkProvider,\n+                                      String additionaLinux, String additionalWindows) {\n+        return Util.toStringable(() -> {\n+            String hostPath = jdkProvider.get().getDestinationDir().toString();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 303,
+      "original_line": 298,
+      "side": "RIGHT",
+      "original_position": 127,
+      "position": 131,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 474856418,
+          "user": "rjernst",
+          "body": "We could, but then I would need to keep track of 4 additional variables, one for the path, and one for the task itself. Is there a downside to using the task?",
+          "created_at": "2020-08-21T18:21:46Z"
+        },
+        {
+          "id": 474856681,
+          "user": "rjernst",
+          "body": "It would also complicate the helper to create each jdk, since it would need to return 2 things, the path and the task.",
+          "created_at": "2020-08-21T18:22:23Z"
+        },
+        {
+          "id": 474859204,
+          "user": "mark-vieira",
+          "body": "Meh, sounds fine to me then 😄 ",
+          "created_at": "2020-08-21T18:28:15Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 472696872,
+      "created_at": "2020-08-21T18:20:13Z",
+      "user": "mark-vieira",
+      "state": "APPROVED",
+      "body": "One comment, otherwise LGTM."
+    },
+    {
+      "type": "review",
+      "id": 472697944,
+      "created_at": "2020-08-21T18:21:46Z",
+      "user": "rjernst",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 472698278,
+      "created_at": "2020-08-21T18:22:24Z",
+      "user": "rjernst",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2020-08-21T18:26:26Z",
+      "sha": "689bf6988dc89614807346e34fd877653cc4af4f",
+      "message": "spotless",
+      "author": "Ryan Ernst",
+      "author_email": "ryan@iernst.net",
+      "author_raw_date": "2020-08-21T18:26:26Z",
+      "author_date": "2020-08-21T18:26:26Z",
+      "committer": "Ryan Ernst",
+      "committer_email": "ryan@iernst.net",
+      "raw_date": "2020-08-21T18:26:26Z",
+      "diff_text": "buildSrc/src/main/java/org/elasticsearch/gradle/test/DistroTestPlugin.java\n@@ -283,7 +283,7 @@ private static void configureVM(Project project, TaskProvider<Copy> gradleJdkPro\n         vagrant.setBox(box);\n \n         vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdkProvider, \"\", \"\"));\n-        vagrant.vmEnv(\"JAVA_HOME\",\"\"); // make sure any default java on the system is ignored\n+        vagrant.vmEnv(\"JAVA_HOME\", \"\"); // make sure any default java on the system is ignored\n         vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdkProvider, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n         // pass these along to get correct build scans\n         if (System.getenv(\"JENKINS_URL\") != null) {\n@@ -292,8 +292,13 @@ private static void configureVM(Project project, TaskProvider<Copy> gradleJdkPro\n         vagrant.setIsWindowsVM(isWindows(project));\n     }\n \n-    private static Object convertPath(Project project, VagrantExtension vagrant, TaskProvider<Copy> jdkProvider,\n-                                      String additionaLinux, String additionalWindows) {\n+    private static Object convertPath(\n+        Project project,\n+        VagrantExtension vagrant,\n+        TaskProvider<Copy> jdkProvider,\n+        String additionaLinux,\n+        String additionalWindows\n+    ) {\n         return Util.toStringable(() -> {\n             String hostPath = jdkProvider.get().getDestinationDir().toString();\n             if (vagrant.isWindowsVM()) {",
+      "diff": [
+        {
+          "file": "buildSrc/src/main/java/org/elasticsearch/gradle/test/DistroTestPlugin.java",
+          "patch": "@@ -283,7 +283,7 @@ private static void configureVM(Project project, TaskProvider<Copy> gradleJdkPro\n         vagrant.setBox(box);\n \n         vagrant.vmEnv(\"SYSTEM_JAVA_HOME\", convertPath(project, vagrant, systemJdkProvider, \"\", \"\"));\n-        vagrant.vmEnv(\"JAVA_HOME\",\"\"); // make sure any default java on the system is ignored\n+        vagrant.vmEnv(\"JAVA_HOME\", \"\"); // make sure any default java on the system is ignored\n         vagrant.vmEnv(\"PATH\", convertPath(project, vagrant, gradleJdkProvider, \"/bin:$PATH\", \"\\\\bin;$Env:PATH\"));\n         // pass these along to get correct build scans\n         if (System.getenv(\"JENKINS_URL\") != null) {\n@@ -292,8 +292,13 @@ private static void configureVM(Project project, TaskProvider<Copy> gradleJdkPro\n         vagrant.setIsWindowsVM(isWindows(project));\n     }\n \n-    private static Object convertPath(Project project, VagrantExtension vagrant, TaskProvider<Copy> jdkProvider,\n-                                      String additionaLinux, String additionalWindows) {\n+    private static Object convertPath(\n+        Project project,\n+        VagrantExtension vagrant,\n+        TaskProvider<Copy> jdkProvider,\n+        String additionaLinux,\n+        String additionalWindows\n+    ) {\n         return Util.toStringable(() -> {\n             String hostPath = jdkProvider.get().getDestinationDir().toString();\n             if (vagrant.isWindowsVM()) {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 472701604,
+      "created_at": "2020-08-21T18:28:16Z",
+      "user": "mark-vieira",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

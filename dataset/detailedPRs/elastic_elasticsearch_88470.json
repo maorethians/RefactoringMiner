@@ -1,0 +1,196 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 88470,
+  "pr_number": 88470,
+  "title": "Fix queued snapshot assignments after partial snapshot fails due to delete",
+  "user": "original-brownbear",
+  "created_at": "2022-07-12T13:02:34Z",
+  "merged_at": "2022-07-27T08:12:14Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v8.4.0"
+  ],
+  "base_commit": "1eb591dc58d3f26bc8b5fa55f9c95ded2d7c2239",
+  "merge_commit_sha": "0e8f5e4d0a243eadc0cbb887b2379120ec5e3037",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "review_requested",
+    "base_ref_changed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/88470",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-07-12T12:58:14Z",
+      "sha": "58bb09c12f1112d18a820fd6b234e47532cb1b5f",
+      "message": "Fix queued snapshot assignments after partial snapshot fails due to delete\n\nWe can't just assume that snapshot after snapshot is assigned right,\nwe must re-compute the right node or whether or not the shard even\nexists still.\n\ncloses #86724",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2022-07-12T12:58:14Z",
+      "author_date": "2022-07-12T12:58:14Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2022-07-12T12:58:14Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java\n@@ -2003,6 +2003,30 @@ public void testSnapshotAndCloneQueuedAfterMissingShard() throws Exception {\n         assertThat(snapshot2.get().getSnapshotInfo().state(), is(SnapshotState.PARTIAL));\n     }\n \n+    public void testQueuedSnapshotAfterPartialWithIndexRecreate() throws Exception {\n+        internalCluster().startNodes(3);\n+        // create an index with a large number of shards so that the nodes will not be able to start all shard snapshots before the index\n+        // is deleted\n+        final Settings highShardCountSettings = indexSettingsNoReplicas(randomIntBetween(12, 24)).build();\n+        final String index1 = \"index-1\";\n+        createIndexWithContent(index1, highShardCountSettings);\n+        final String index2 = \"index-2\";\n+        createIndexWithContent(index2);\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"mock\");\n+        final ActionFuture<CreateSnapshotResponse> partialFuture = startFullSnapshot(repoName, \"partial-snapshot\", true);\n+        blockAllDataNodes(repoName);\n+        waitForBlockOnAnyDataNode(repoName);\n+        // recreate index and start full snapshot to test that shard state updates from the first partial snapshot are correctly are\n+        // correctly applied to the second snapshot that will contain a different index by the same name\n+        assertAcked(client().admin().indices().prepareDelete(index1).get());\n+        createIndexWithContent(index1, highShardCountSettings);\n+        final ActionFuture<CreateSnapshotResponse> nonPartialFuture = startFullSnapshot(repoName, \"full-snapshot\");\n+        unblockAllDataNodes(repoName);\n+        assertSuccessful(nonPartialFuture);\n+        assertSuccessful(partialFuture);\n+    }\n+\n     private static void assertSnapshotStatusCountOnRepo(String otherBlockedRepoName, int count) {\n         final SnapshotsStatusResponse snapshotsStatusResponse = client().admin()\n             .cluster()\nserver/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java\n@@ -3283,12 +3283,7 @@ private void tryStartNextTaskAfterSnapshotUpdated(ShardId shardId, ShardSnapshot\n                                 repoShardId\n                             );\n                         } else {\n-                            startShardOperation(\n-                                shardsBuilder(),\n-                                updatedState.nodeId(),\n-                                updatedState.generation(),\n-                                entry.shardId(repoShardId)\n-                            );\n+                            startShardSnapshot(repoShardId, updatedState.generation());\n                         }\n                     }\n                 }\n@@ -3298,32 +3293,35 @@ private void tryStartSnapshotAfterCloneFinish(RepositoryShardId repoShardId, Sha\n                 assert entry.source() == null;\n                 // current entry is a snapshot operation so we must translate the repository shard id to a routing shard id\n                 if (isQueued(entry.shardsByRepoShardId().get(repoShardId))) {\n-                    final Index index = entry.indexByName(repoShardId.indexName());\n-                    assert index != null\n-                        : \"index [\"\n-                            + repoShardId.index()\n-                            + \"] must exist in snapshot entry [\"\n-                            + entry\n-                            + \"] because it's a normal snapshot but did not\";\n-                    // A clone was updated, so we must use the correct data node id for the reassignment as actual shard snapshot\n-                    final IndexRoutingTable indexRouting = currentState.routingTable().index(index);\n-                    final ShardRouting shardRouting;\n-                    if (indexRouting == null) {\n-                        shardRouting = null;\n-                    } else {\n-                        shardRouting = indexRouting.shard(repoShardId.shardId()).primaryShard();\n-                    }\n-                    final ShardSnapshotStatus shardSnapshotStatus = initShardSnapshotStatus(generation, shardRouting);\n-                    final ShardId routingShardId = shardRouting != null\n-                        ? shardRouting.shardId()\n-                        : new ShardId(index, repoShardId.shardId());\n-                    if (shardSnapshotStatus.isActive()) {\n-                        startShardOperation(shardsBuilder(), routingShardId, shardSnapshotStatus);\n-                    } else {\n-                        // update to queued snapshot did not result in an actual update execution so we just record it but keep applying\n-                        // the update to e.g. fail all snapshots for a given shard if the primary for the shard went away\n-                        shardsBuilder().put(routingShardId, shardSnapshotStatus);\n-                    }\n+                    startShardSnapshot(repoShardId, generation);\n+                }\n+            }\n+\n+            private void startShardSnapshot(RepositoryShardId repoShardId, ShardGeneration generation) {\n+                final Index index = entry.indexByName(repoShardId.indexName());\n+                assert index != null\n+                    : \"index [\"\n+                        + repoShardId.index()\n+                        + \"] must exist in snapshot entry [\"\n+                        + entry\n+                        + \"] because it's a normal snapshot but did not\";\n+                // work out the node to run the snapshot task on as it might have changed from the previous operation if it was a clone\n+                // or there was a primary failover\n+                final IndexRoutingTable indexRouting = currentState.routingTable().index(index);\n+                final ShardRouting shardRouting;\n+                if (indexRouting == null) {\n+                    shardRouting = null;\n+                } else {\n+                    shardRouting = indexRouting.shard(repoShardId.shardId()).primaryShard();\n+                }\n+                final ShardSnapshotStatus shardSnapshotStatus = initShardSnapshotStatus(generation, shardRouting);\n+                final ShardId routingShardId = shardRouting != null ? shardRouting.shardId() : new ShardId(index, repoShardId.shardId());\n+                if (shardSnapshotStatus.isActive()) {\n+                    startShardOperation(shardsBuilder(), routingShardId, shardSnapshotStatus);\n+                } else {\n+                    // update to queued snapshot did not result in an actual update execution so we just record it but keep applying\n+                    // the update to e.g. fail all snapshots for a given shard if the primary for the shard went away\n+                    shardsBuilder().put(routingShardId, shardSnapshotStatus);\n                 }\n             }\n \nserver/src/test/java/org/elasticsearch/snapshots/SnapshotsServiceTests.java\n@@ -352,10 +352,10 @@ public void testCompletedSnapshotStartsNextSnapshot() throws Exception {\n         final SnapshotsInProgress.Entry completedSnapshot = snapshotsInProgress.forRepo(repoName).get(0);\n         assertThat(completedSnapshot.state(), is(SnapshotsInProgress.State.SUCCESS));\n         final SnapshotsInProgress.Entry startedSnapshot = snapshotsInProgress.forRepo(repoName).get(1);\n-        assertThat(startedSnapshot.state(), is(SnapshotsInProgress.State.STARTED));\n+        assertThat(startedSnapshot.state(), is(SnapshotsInProgress.State.SUCCESS));\n         final SnapshotsInProgress.ShardSnapshotStatus shardSnapshotStatus = startedSnapshot.shards().get(routingShardId);\n-        assertThat(shardSnapshotStatus.state(), is(SnapshotsInProgress.ShardState.INIT));\n-        assertThat(shardSnapshotStatus.nodeId(), is(dataNodeId));\n+        assertThat(shardSnapshotStatus.state(), is(SnapshotsInProgress.ShardState.MISSING));\n+        assertNull(shardSnapshotStatus.nodeId());\n         assertIsNoop(updatedClusterState, completeShard);\n     }\n ",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java",
+          "patch": "@@ -2003,6 +2003,30 @@ public void testSnapshotAndCloneQueuedAfterMissingShard() throws Exception {\n         assertThat(snapshot2.get().getSnapshotInfo().state(), is(SnapshotState.PARTIAL));\n     }\n \n+    public void testQueuedSnapshotAfterPartialWithIndexRecreate() throws Exception {\n+        internalCluster().startNodes(3);\n+        // create an index with a large number of shards so that the nodes will not be able to start all shard snapshots before the index\n+        // is deleted\n+        final Settings highShardCountSettings = indexSettingsNoReplicas(randomIntBetween(12, 24)).build();\n+        final String index1 = \"index-1\";\n+        createIndexWithContent(index1, highShardCountSettings);\n+        final String index2 = \"index-2\";\n+        createIndexWithContent(index2);\n+        final String repoName = \"test-repo\";\n+        createRepository(repoName, \"mock\");\n+        final ActionFuture<CreateSnapshotResponse> partialFuture = startFullSnapshot(repoName, \"partial-snapshot\", true);\n+        blockAllDataNodes(repoName);\n+        waitForBlockOnAnyDataNode(repoName);\n+        // recreate index and start full snapshot to test that shard state updates from the first partial snapshot are correctly are\n+        // correctly applied to the second snapshot that will contain a different index by the same name\n+        assertAcked(client().admin().indices().prepareDelete(index1).get());\n+        createIndexWithContent(index1, highShardCountSettings);\n+        final ActionFuture<CreateSnapshotResponse> nonPartialFuture = startFullSnapshot(repoName, \"full-snapshot\");\n+        unblockAllDataNodes(repoName);\n+        assertSuccessful(nonPartialFuture);\n+        assertSuccessful(partialFuture);\n+    }\n+\n     private static void assertSnapshotStatusCountOnRepo(String otherBlockedRepoName, int count) {\n         final SnapshotsStatusResponse snapshotsStatusResponse = client().admin()\n             .cluster()"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java",
+          "patch": "@@ -3283,12 +3283,7 @@ private void tryStartNextTaskAfterSnapshotUpdated(ShardId shardId, ShardSnapshot\n                                 repoShardId\n                             );\n                         } else {\n-                            startShardOperation(\n-                                shardsBuilder(),\n-                                updatedState.nodeId(),\n-                                updatedState.generation(),\n-                                entry.shardId(repoShardId)\n-                            );\n+                            startShardSnapshot(repoShardId, updatedState.generation());\n                         }\n                     }\n                 }\n@@ -3298,32 +3293,35 @@ private void tryStartSnapshotAfterCloneFinish(RepositoryShardId repoShardId, Sha\n                 assert entry.source() == null;\n                 // current entry is a snapshot operation so we must translate the repository shard id to a routing shard id\n                 if (isQueued(entry.shardsByRepoShardId().get(repoShardId))) {\n-                    final Index index = entry.indexByName(repoShardId.indexName());\n-                    assert index != null\n-                        : \"index [\"\n-                            + repoShardId.index()\n-                            + \"] must exist in snapshot entry [\"\n-                            + entry\n-                            + \"] because it's a normal snapshot but did not\";\n-                    // A clone was updated, so we must use the correct data node id for the reassignment as actual shard snapshot\n-                    final IndexRoutingTable indexRouting = currentState.routingTable().index(index);\n-                    final ShardRouting shardRouting;\n-                    if (indexRouting == null) {\n-                        shardRouting = null;\n-                    } else {\n-                        shardRouting = indexRouting.shard(repoShardId.shardId()).primaryShard();\n-                    }\n-                    final ShardSnapshotStatus shardSnapshotStatus = initShardSnapshotStatus(generation, shardRouting);\n-                    final ShardId routingShardId = shardRouting != null\n-                        ? shardRouting.shardId()\n-                        : new ShardId(index, repoShardId.shardId());\n-                    if (shardSnapshotStatus.isActive()) {\n-                        startShardOperation(shardsBuilder(), routingShardId, shardSnapshotStatus);\n-                    } else {\n-                        // update to queued snapshot did not result in an actual update execution so we just record it but keep applying\n-                        // the update to e.g. fail all snapshots for a given shard if the primary for the shard went away\n-                        shardsBuilder().put(routingShardId, shardSnapshotStatus);\n-                    }\n+                    startShardSnapshot(repoShardId, generation);\n+                }\n+            }\n+\n+            private void startShardSnapshot(RepositoryShardId repoShardId, ShardGeneration generation) {\n+                final Index index = entry.indexByName(repoShardId.indexName());\n+                assert index != null\n+                    : \"index [\"\n+                        + repoShardId.index()\n+                        + \"] must exist in snapshot entry [\"\n+                        + entry\n+                        + \"] because it's a normal snapshot but did not\";\n+                // work out the node to run the snapshot task on as it might have changed from the previous operation if it was a clone\n+                // or there was a primary failover\n+                final IndexRoutingTable indexRouting = currentState.routingTable().index(index);\n+                final ShardRouting shardRouting;\n+                if (indexRouting == null) {\n+                    shardRouting = null;\n+                } else {\n+                    shardRouting = indexRouting.shard(repoShardId.shardId()).primaryShard();\n+                }\n+                final ShardSnapshotStatus shardSnapshotStatus = initShardSnapshotStatus(generation, shardRouting);\n+                final ShardId routingShardId = shardRouting != null ? shardRouting.shardId() : new ShardId(index, repoShardId.shardId());\n+                if (shardSnapshotStatus.isActive()) {\n+                    startShardOperation(shardsBuilder(), routingShardId, shardSnapshotStatus);\n+                } else {\n+                    // update to queued snapshot did not result in an actual update execution so we just record it but keep applying\n+                    // the update to e.g. fail all snapshots for a given shard if the primary for the shard went away\n+                    shardsBuilder().put(routingShardId, shardSnapshotStatus);\n                 }\n             }\n "
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/snapshots/SnapshotsServiceTests.java",
+          "patch": "@@ -352,10 +352,10 @@ public void testCompletedSnapshotStartsNextSnapshot() throws Exception {\n         final SnapshotsInProgress.Entry completedSnapshot = snapshotsInProgress.forRepo(repoName).get(0);\n         assertThat(completedSnapshot.state(), is(SnapshotsInProgress.State.SUCCESS));\n         final SnapshotsInProgress.Entry startedSnapshot = snapshotsInProgress.forRepo(repoName).get(1);\n-        assertThat(startedSnapshot.state(), is(SnapshotsInProgress.State.STARTED));\n+        assertThat(startedSnapshot.state(), is(SnapshotsInProgress.State.SUCCESS));\n         final SnapshotsInProgress.ShardSnapshotStatus shardSnapshotStatus = startedSnapshot.shards().get(routingShardId);\n-        assertThat(shardSnapshotStatus.state(), is(SnapshotsInProgress.ShardState.INIT));\n-        assertThat(shardSnapshotStatus.nodeId(), is(dataNodeId));\n+        assertThat(shardSnapshotStatus.state(), is(SnapshotsInProgress.ShardState.MISSING));\n+        assertNull(shardSnapshotStatus.nodeId());\n         assertIsNoop(updatedClusterState, completeShard);\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-07-12T13:02:34Z",
+      "user": "original-brownbear",
+      "body": "We can't just assume that snapshot after snapshot is assigned right,\r\nwe must re-compute the right node or whether or not the shard even\r\nexists still.\r\n\r\ncloses #86724\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 1181734086,
+      "created_at": "2022-07-12T13:02:50Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-07-12T13:03:10Z",
+      "sha": "7df02b3d311e03344c90b913a4d08eba742b01f4",
+      "message": "Update docs/changelog/88470.yaml",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2022-07-12T13:03:10Z",
+      "author_date": "2022-07-12T13:03:10Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2022-07-12T13:03:10Z",
+      "diff_text": "docs/changelog/88470.yaml\n@@ -0,0 +1,6 @@\n+pr: 88470\n+summary: Fix queued snapshot assignments after partial snapshot fails due to delete\n+area: Snapshot/Restore\n+type: bug\n+issues:\n+ - 86724",
+      "diff": [
+        {
+          "file": "docs/changelog/88470.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 88470\n+summary: Fix queued snapshot assignments after partial snapshot fails due to delete\n+area: Snapshot/Restore\n+type: bug\n+issues:\n+ - 86724"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1181734419,
+      "created_at": "2022-07-12T13:03:11Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @original-brownbear, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1181761748,
+      "created_at": "2022-07-12T13:28:42Z",
+      "user": "original-brownbear",
+      "body": "Jenkins run elasticsearch-ci/part-2"
+    },
+    {
+      "type": "review_comment",
+      "id": 919007217,
+      "created_at": "2022-07-12T13:57:54Z",
+      "user": "original-brownbear",
+      "body": "This was broken before, the shard isn't assigned so it must not move to `INIT`\r\n=> since there's no other shards the snapshot must complete right away as well.",
+      "path": "server/src/test/java/org/elasticsearch/snapshots/SnapshotsServiceTests.java",
+      "diff_hunk": "@@ -352,10 +352,10 @@ public void testCompletedSnapshotStartsNextSnapshot() throws Exception {\n         final SnapshotsInProgress.Entry completedSnapshot = snapshotsInProgress.forRepo(repoName).get(0);\n         assertThat(completedSnapshot.state(), is(SnapshotsInProgress.State.SUCCESS));\n         final SnapshotsInProgress.Entry startedSnapshot = snapshotsInProgress.forRepo(repoName).get(1);\n-        assertThat(startedSnapshot.state(), is(SnapshotsInProgress.State.STARTED));\n+        assertThat(startedSnapshot.state(), is(SnapshotsInProgress.State.SUCCESS));\n         final SnapshotsInProgress.ShardSnapshotStatus shardSnapshotStatus = startedSnapshot.shards().get(routingShardId);\n-        assertThat(shardSnapshotStatus.state(), is(SnapshotsInProgress.ShardState.INIT));\n-        assertThat(shardSnapshotStatus.nodeId(), is(dataNodeId));\n+        assertThat(shardSnapshotStatus.state(), is(SnapshotsInProgress.ShardState.MISSING));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 357,
+      "original_line": 357,
+      "side": "RIGHT",
+      "original_position": 9,
+      "position": 9,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1035861876,
+      "created_at": "2022-07-12T13:57:55Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1035863354,
+      "created_at": "2022-07-12T13:58:46Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 919008387,
+      "created_at": "2022-07-12T13:58:46Z",
+      "user": "original-brownbear",
+      "body": "No big change here really, just extracted the code that re-computes where to run the snapshot since we don't need to do the `isQueued` check twice and used it here.\r\n",
+      "path": "server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java",
+      "diff_hunk": "@@ -3283,12 +3283,7 @@ private void tryStartNextTaskAfterSnapshotUpdated(ShardId shardId, ShardSnapshot\n                                 repoShardId\n                             );\n                         } else {\n-                            startShardOperation(\n-                                shardsBuilder(),\n-                                updatedState.nodeId(),\n-                                updatedState.generation(),\n-                                entry.shardId(repoShardId)\n-                            );\n+                            startShardSnapshot(repoShardId, updatedState.generation());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3286,
+      "original_line": 3286,
+      "side": "RIGHT",
+      "original_position": 10,
+      "position": 10,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 1051133266,
+      "created_at": "2022-07-26T14:53:40Z",
+      "user": "tlrx",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 1196402972,
+      "created_at": "2022-07-27T08:12:05Z",
+      "user": "original-brownbear",
+      "body": "Thanks Tanguy!"
+    }
+  ]
+}

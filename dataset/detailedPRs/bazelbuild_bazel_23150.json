@@ -1,0 +1,195 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 23150,
+  "pr_number": 23150,
+  "title": "Do not reuse gRPC connections that fail with native Netty errors",
+  "user": "fmeum",
+  "created_at": "2024-07-30T10:44:16Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "team-Remote-Exec"
+  ],
+  "base_commit": "3a416240888159846f07c6d85b722f414b3b1198",
+  "merge_commit_sha": "78f8010cba1bfe3e93d16da96fd0b61802aba27a",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "unlabeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "closed",
+    "unlabeled",
+    "referenced",
+    "head_ref_deleted",
+    "referenced",
+    "mentioned",
+    "subscribed",
+    "referenced"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/23150",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-07-30T10:42:52Z",
+      "sha": "fcc654c8b707640106a9d164136b27a5974e960e",
+      "message": "Do not reuse gRPC connections that fail with native Netty errors\n\nSuch connections are usually not in a recoverable state and should not be used for retries, which would otherwise likely fail in the same way.",
+      "author": "Fabian Meumertzheim",
+      "author_email": "fabian@meumertzhe.im",
+      "author_raw_date": "2024-07-30T10:42:52Z",
+      "author_date": "2024-07-30T10:42:52Z",
+      "committer": "Fabian Meumertzheim",
+      "committer_email": "fabian@meumertzhe.im",
+      "raw_date": "2024-07-30T10:42:52Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/grpc/BUILD\n@@ -20,5 +20,6 @@ java_library(\n         \"//third_party:jsr305\",\n         \"//third_party:rxjava3\",\n         \"//third_party/grpc-java:grpc-jar\",\n+        \"@maven//:io_netty_netty_transport_native_unix_common\",\n     ],\n )\nsrc/main/java/com/google/devtools/build/lib/remote/grpc/SharedConnectionFactory.java\n@@ -16,7 +16,12 @@\n import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n import io.grpc.CallOptions;\n import io.grpc.ClientCall;\n+import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;\n+import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;\n+import io.grpc.Metadata;\n import io.grpc.MethodDescriptor;\n+import io.grpc.Status;\n+import io.netty.channel.unix.Errors;\n import io.reactivex.rxjava3.core.Single;\n import io.reactivex.rxjava3.disposables.Disposable;\n import io.reactivex.rxjava3.functions.Action;\n@@ -118,7 +123,13 @@ public Single<SharedConnection> create() {\n                     .map(\n                         conn ->\n                             new SharedConnection(\n-                                conn, /* onClose= */ () -> tokenBucket.addToken(token))));\n+                                conn,\n+                                /* onClose= */ () -> tokenBucket.addToken(token),\n+                                /* onFatalError= */ () -> {\n+                                  synchronized (this) {\n+                                    connectionAsyncSubject = null;\n+                                  }\n+                                })));\n   }\n \n   /** Returns current number of available connections. */\n@@ -130,16 +141,33 @@ public int numAvailableConnections() {\n   public static class SharedConnection implements Connection {\n     private final Connection connection;\n     private final Action onClose;\n+    private final Runnable onFatalError;\n \n-    public SharedConnection(Connection connection, Action onClose) {\n+    public SharedConnection(Connection connection, Action onClose, Runnable onFatalError) {\n       this.connection = connection;\n       this.onClose = onClose;\n+      this.onFatalError = onFatalError;\n     }\n \n     @Override\n     public <ReqT, RespT> ClientCall<ReqT, RespT> call(\n         MethodDescriptor<ReqT, RespT> method, CallOptions options) {\n-      return connection.call(method, options);\n+      return new SimpleForwardingClientCall<>(connection.call(method, options)) {\n+        @Override\n+        public void start(Listener<RespT> responseListener, Metadata headers) {\n+          super.start(\n+              new SimpleForwardingClientCallListener<>(responseListener) {\n+                @Override\n+                public void onClose(Status status, Metadata trailers) {\n+                  if (isFatalError(status.getCause())) {\n+                    onFatalError.run();\n+                  }\n+                  super.onClose(status, trailers);\n+                }\n+              },\n+              headers);\n+        }\n+      };\n     }\n \n     @Override\n@@ -155,5 +183,11 @@ public void close() throws IOException {\n     public Connection getUnderlyingConnection() {\n       return connection;\n     }\n+\n+    private static boolean isFatalError(@Nullable Throwable t) {\n+      // A low-level netty error indicates that the connection is fundamentally broken\n+      // and should not be reused for retries.\n+      return t instanceof Errors.NativeIoException;\n+    }\n   }\n }\nsrc/test/java/com/google/devtools/build/lib/remote/grpc/BUILD\n@@ -29,5 +29,7 @@ java_test(\n         \"//third_party:mockito\",\n         \"//third_party:rxjava3\",\n         \"//third_party:truth\",\n+        \"@maven//:io_grpc_grpc_api\",\n+        \"@maven//:io_netty_netty_transport_native_unix_common\",\n     ],\n )\nsrc/test/java/com/google/devtools/build/lib/remote/grpc/SharedConnectionFactoryTest.java\n@@ -14,16 +14,28 @@\n package com.google.devtools.build.lib.remote.grpc;\n \n import static com.google.common.truth.Truth.assertThat;\n+import static org.mockito.ArgumentMatchers.any;\n+import static org.mockito.Mockito.doAnswer;\n import static org.mockito.Mockito.mock;\n import static org.mockito.Mockito.times;\n import static org.mockito.Mockito.verify;\n import static org.mockito.Mockito.when;\n \n import com.google.devtools.build.lib.remote.grpc.SharedConnectionFactory.SharedConnection;\n import com.google.devtools.build.lib.remote.util.RxNoGlobalErrorsRule;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.Metadata;\n+import io.grpc.MethodDescriptor;\n+import io.grpc.Status;\n+import io.netty.channel.unix.Errors;\n import io.reactivex.rxjava3.core.Single;\n import io.reactivex.rxjava3.observers.TestObserver;\n import java.io.IOException;\n+import java.io.InputStream;\n+import java.util.ArrayDeque;\n+import java.util.List;\n+import java.util.Queue;\n import java.util.concurrent.Semaphore;\n import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicInteger;\n@@ -145,6 +157,76 @@ public void create_concurrentCreate_shareConnections() throws InterruptedExcepti\n     verify(connectionFactory, times(1)).create();\n   }\n \n+  @Test\n+  public void create_belowMaxConcurrency_fatalErrorPreventsReuse() throws IOException {\n+    Connection brokenConnection =\n+        new Connection() {\n+          @Override\n+          public <ReqT, RespT> ClientCall<ReqT, RespT> call(\n+              MethodDescriptor<ReqT, RespT> method, CallOptions options) {\n+            var call = mock(ClientCall.class);\n+            doAnswer(\n+                    invocationOnMock -> {\n+                      ((ClientCall.Listener) invocationOnMock.getArgument(0))\n+                          .onClose(\n+                              Status.fromThrowable(mock(Errors.NativeIoException.class)),\n+                              new Metadata());\n+                      return null;\n+                    })\n+                .when(call)\n+                .start(any(), any());\n+            return call;\n+          }\n+\n+          @Override\n+          public void close() {}\n+        };\n+    Connection newConnection = mock(Connection.class);\n+    Queue<Connection> connectionsToCreate =\n+        new ArrayDeque<>(List.of(brokenConnection, newConnection));\n+    when(connectionFactory.create())\n+        .thenAnswer(invocation -> Single.just(connectionsToCreate.remove()));\n+\n+    SharedConnectionFactory factory = new SharedConnectionFactory(connectionFactory, 2);\n+\n+    TestObserver<SharedConnection> observer1 = factory.create().test();\n+    assertThat(factory.numAvailableConnections()).isEqualTo(1);\n+    observer1\n+        .assertValue(conn -> conn.getUnderlyingConnection() == brokenConnection)\n+        .assertComplete();\n+\n+    // Submit a call on the first connection and have it fail.\n+    MethodDescriptor.Marshaller<byte[]> nullMarshaller =\n+        new MethodDescriptor.Marshaller<>() {\n+          @Override\n+          public InputStream stream(byte[] bytes) {\n+            return null;\n+          }\n+\n+          @Override\n+          public byte[] parse(InputStream inputStream) {\n+            return null;\n+          }\n+        };\n+    try (Connection firstConnection = observer1.values().getFirst()) {\n+      var call =\n+          firstConnection.call(\n+              MethodDescriptor.newBuilder(nullMarshaller, nullMarshaller)\n+                  .setType(MethodDescriptor.MethodType.CLIENT_STREAMING)\n+                  .setFullMethodName(\"testMethod\")\n+                  .build(),\n+              CallOptions.DEFAULT);\n+      ClientCall.Listener<byte[]> listener = new ClientCall.Listener<>() {};\n+      call.start(listener, new io.grpc.Metadata());\n+      listener.onClose(Status.fromThrowable(mock(Errors.NativeIoException.class)), new Metadata());\n+    }\n+\n+    // Validate that the connection is not reused.\n+    TestObserver<SharedConnection> observer2 = factory.create().test();\n+    observer2.assertValue(conn -> conn.getUnderlyingConnection() == newConnection).assertComplete();\n+    assertThat(factory.numAvailableConnections()).isEqualTo(1);\n+  }\n+\n   @Test\n   public void create_afterLastFailed_success() {\n     AtomicInteger times = new AtomicInteger(0);",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/grpc/BUILD",
+          "patch": "@@ -20,5 +20,6 @@ java_library(\n         \"//third_party:jsr305\",\n         \"//third_party:rxjava3\",\n         \"//third_party/grpc-java:grpc-jar\",\n+        \"@maven//:io_netty_netty_transport_native_unix_common\",\n     ],\n )"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/grpc/SharedConnectionFactory.java",
+          "patch": "@@ -16,7 +16,12 @@\n import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;\n import io.grpc.CallOptions;\n import io.grpc.ClientCall;\n+import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;\n+import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;\n+import io.grpc.Metadata;\n import io.grpc.MethodDescriptor;\n+import io.grpc.Status;\n+import io.netty.channel.unix.Errors;\n import io.reactivex.rxjava3.core.Single;\n import io.reactivex.rxjava3.disposables.Disposable;\n import io.reactivex.rxjava3.functions.Action;\n@@ -118,7 +123,13 @@ public Single<SharedConnection> create() {\n                     .map(\n                         conn ->\n                             new SharedConnection(\n-                                conn, /* onClose= */ () -> tokenBucket.addToken(token))));\n+                                conn,\n+                                /* onClose= */ () -> tokenBucket.addToken(token),\n+                                /* onFatalError= */ () -> {\n+                                  synchronized (this) {\n+                                    connectionAsyncSubject = null;\n+                                  }\n+                                })));\n   }\n \n   /** Returns current number of available connections. */\n@@ -130,16 +141,33 @@ public int numAvailableConnections() {\n   public static class SharedConnection implements Connection {\n     private final Connection connection;\n     private final Action onClose;\n+    private final Runnable onFatalError;\n \n-    public SharedConnection(Connection connection, Action onClose) {\n+    public SharedConnection(Connection connection, Action onClose, Runnable onFatalError) {\n       this.connection = connection;\n       this.onClose = onClose;\n+      this.onFatalError = onFatalError;\n     }\n \n     @Override\n     public <ReqT, RespT> ClientCall<ReqT, RespT> call(\n         MethodDescriptor<ReqT, RespT> method, CallOptions options) {\n-      return connection.call(method, options);\n+      return new SimpleForwardingClientCall<>(connection.call(method, options)) {\n+        @Override\n+        public void start(Listener<RespT> responseListener, Metadata headers) {\n+          super.start(\n+              new SimpleForwardingClientCallListener<>(responseListener) {\n+                @Override\n+                public void onClose(Status status, Metadata trailers) {\n+                  if (isFatalError(status.getCause())) {\n+                    onFatalError.run();\n+                  }\n+                  super.onClose(status, trailers);\n+                }\n+              },\n+              headers);\n+        }\n+      };\n     }\n \n     @Override\n@@ -155,5 +183,11 @@ public void close() throws IOException {\n     public Connection getUnderlyingConnection() {\n       return connection;\n     }\n+\n+    private static boolean isFatalError(@Nullable Throwable t) {\n+      // A low-level netty error indicates that the connection is fundamentally broken\n+      // and should not be reused for retries.\n+      return t instanceof Errors.NativeIoException;\n+    }\n   }\n }"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/grpc/BUILD",
+          "patch": "@@ -29,5 +29,7 @@ java_test(\n         \"//third_party:mockito\",\n         \"//third_party:rxjava3\",\n         \"//third_party:truth\",\n+        \"@maven//:io_grpc_grpc_api\",\n+        \"@maven//:io_netty_netty_transport_native_unix_common\",\n     ],\n )"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/grpc/SharedConnectionFactoryTest.java",
+          "patch": "@@ -14,16 +14,28 @@\n package com.google.devtools.build.lib.remote.grpc;\n \n import static com.google.common.truth.Truth.assertThat;\n+import static org.mockito.ArgumentMatchers.any;\n+import static org.mockito.Mockito.doAnswer;\n import static org.mockito.Mockito.mock;\n import static org.mockito.Mockito.times;\n import static org.mockito.Mockito.verify;\n import static org.mockito.Mockito.when;\n \n import com.google.devtools.build.lib.remote.grpc.SharedConnectionFactory.SharedConnection;\n import com.google.devtools.build.lib.remote.util.RxNoGlobalErrorsRule;\n+import io.grpc.CallOptions;\n+import io.grpc.ClientCall;\n+import io.grpc.Metadata;\n+import io.grpc.MethodDescriptor;\n+import io.grpc.Status;\n+import io.netty.channel.unix.Errors;\n import io.reactivex.rxjava3.core.Single;\n import io.reactivex.rxjava3.observers.TestObserver;\n import java.io.IOException;\n+import java.io.InputStream;\n+import java.util.ArrayDeque;\n+import java.util.List;\n+import java.util.Queue;\n import java.util.concurrent.Semaphore;\n import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicInteger;\n@@ -145,6 +157,76 @@ public void create_concurrentCreate_shareConnections() throws InterruptedExcepti\n     verify(connectionFactory, times(1)).create();\n   }\n \n+  @Test\n+  public void create_belowMaxConcurrency_fatalErrorPreventsReuse() throws IOException {\n+    Connection brokenConnection =\n+        new Connection() {\n+          @Override\n+          public <ReqT, RespT> ClientCall<ReqT, RespT> call(\n+              MethodDescriptor<ReqT, RespT> method, CallOptions options) {\n+            var call = mock(ClientCall.class);\n+            doAnswer(\n+                    invocationOnMock -> {\n+                      ((ClientCall.Listener) invocationOnMock.getArgument(0))\n+                          .onClose(\n+                              Status.fromThrowable(mock(Errors.NativeIoException.class)),\n+                              new Metadata());\n+                      return null;\n+                    })\n+                .when(call)\n+                .start(any(), any());\n+            return call;\n+          }\n+\n+          @Override\n+          public void close() {}\n+        };\n+    Connection newConnection = mock(Connection.class);\n+    Queue<Connection> connectionsToCreate =\n+        new ArrayDeque<>(List.of(brokenConnection, newConnection));\n+    when(connectionFactory.create())\n+        .thenAnswer(invocation -> Single.just(connectionsToCreate.remove()));\n+\n+    SharedConnectionFactory factory = new SharedConnectionFactory(connectionFactory, 2);\n+\n+    TestObserver<SharedConnection> observer1 = factory.create().test();\n+    assertThat(factory.numAvailableConnections()).isEqualTo(1);\n+    observer1\n+        .assertValue(conn -> conn.getUnderlyingConnection() == brokenConnection)\n+        .assertComplete();\n+\n+    // Submit a call on the first connection and have it fail.\n+    MethodDescriptor.Marshaller<byte[]> nullMarshaller =\n+        new MethodDescriptor.Marshaller<>() {\n+          @Override\n+          public InputStream stream(byte[] bytes) {\n+            return null;\n+          }\n+\n+          @Override\n+          public byte[] parse(InputStream inputStream) {\n+            return null;\n+          }\n+        };\n+    try (Connection firstConnection = observer1.values().getFirst()) {\n+      var call =\n+          firstConnection.call(\n+              MethodDescriptor.newBuilder(nullMarshaller, nullMarshaller)\n+                  .setType(MethodDescriptor.MethodType.CLIENT_STREAMING)\n+                  .setFullMethodName(\"testMethod\")\n+                  .build(),\n+              CallOptions.DEFAULT);\n+      ClientCall.Listener<byte[]> listener = new ClientCall.Listener<>() {};\n+      call.start(listener, new io.grpc.Metadata());\n+      listener.onClose(Status.fromThrowable(mock(Errors.NativeIoException.class)), new Metadata());\n+    }\n+\n+    // Validate that the connection is not reused.\n+    TestObserver<SharedConnection> observer2 = factory.create().test();\n+    observer2.assertValue(conn -> conn.getUnderlyingConnection() == newConnection).assertComplete();\n+    assertThat(factory.numAvailableConnections()).isEqualTo(1);\n+  }\n+\n   @Test\n   public void create_afterLastFailed_success() {\n     AtomicInteger times = new AtomicInteger(0);"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-07-30T10:44:16Z",
+      "user": "fmeum",
+      "body": "Such connections are usually not in a recoverable state and should not be used for retries, which would otherwise likely fail in the same way.\r\n\r\nFixes #20868"
+    },
+    {
+      "type": "review",
+      "id": 2207334478,
+      "created_at": "2024-07-30T10:45:01Z",
+      "user": "fmeum",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1696746934,
+      "created_at": "2024-07-30T10:45:01Z",
+      "user": "fmeum",
+      "body": "This is more of a whitebox test than I would have liked, but I didn't find another way to simulate a connection failure. Open to suggestions here to make this more realistic.",
+      "path": "src/test/java/com/google/devtools/build/lib/remote/grpc/SharedConnectionFactoryTest.java",
+      "diff_hunk": "@@ -145,6 +157,76 @@ public void create_concurrentCreate_shareConnections() throws InterruptedExcepti\n     verify(connectionFactory, times(1)).create();\n   }\n \n+  @Test\n+  public void create_belowMaxConcurrency_fatalErrorPreventsReuse() throws IOException {\n+    Connection brokenConnection =\n+        new Connection() {\n+          @Override\n+          public <ReqT, RespT> ClientCall<ReqT, RespT> call(\n+              MethodDescriptor<ReqT, RespT> method, CallOptions options) {\n+            var call = mock(ClientCall.class);\n+            doAnswer(\n+                    invocationOnMock -> {\n+                      ((ClientCall.Listener) invocationOnMock.getArgument(0))",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 170,
+      "original_line": 170,
+      "side": "RIGHT",
+      "original_position": 43,
+      "position": 43,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2207335569,
+      "created_at": "2024-07-30T10:45:37Z",
+      "user": "fmeum",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1696747670,
+      "created_at": "2024-07-30T10:45:37Z",
+      "user": "fmeum",
+      "body": "We could extend this to cover certain status codes, but I wanted to start with something limited enough to not introduce performance regressions.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/grpc/SharedConnectionFactory.java",
+      "diff_hunk": "@@ -155,5 +183,11 @@ public void close() throws IOException {\n     public Connection getUnderlyingConnection() {\n       return connection;\n     }\n+\n+    private static boolean isFatalError(@Nullable Throwable t) {\n+      // A low-level netty error indicates that the connection is fundamentally broken\n+      // and should not be reused for retries.\n+      return t instanceof Errors.NativeIoException;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 190,
+      "original_line": 190,
+      "side": "RIGHT",
+      "original_position": 72,
+      "position": 72,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 2258248680,
+      "created_at": "2024-07-30T12:37:00Z",
+      "user": "werkt",
+      "body": "This may also fix #10159 and some other related ssl issues."
+    },
+    {
+      "type": "comment",
+      "id": 2258258667,
+      "created_at": "2024-07-30T12:42:18Z",
+      "user": "fmeum",
+      "body": "> This may also fix #10159 and some other related ssl issues.\n\nOnly if we extend the predicate for resetting the connection though. I'm currently only doing that for client-side low-level netty failures. @werkt Do you have other classes of exceptions in mind?"
+    },
+    {
+      "type": "comment",
+      "id": 2258378764,
+      "created_at": "2024-07-30T13:39:33Z",
+      "user": "werkt",
+      "body": "#18764 was another example. You're probably right, the detection here wouldn't see through the UNAVAILABLE to the handshake timeout - what I found was that the SSLException was sticky, and I couldn't manipulate the channel persistence management levels enough to get it reliably fixed or reproducing before I started diagnosing the underlying network issues."
+    },
+    {
+      "type": "review",
+      "id": 2232677094,
+      "created_at": "2024-08-12T11:06:47Z",
+      "user": "coeuvre",
+      "state": "APPROVED",
+      "body": "Thanks for the PR! LGTM."
+    },
+    {
+      "type": "comment",
+      "id": 2283939319,
+      "created_at": "2024-08-12T13:07:43Z",
+      "user": "fmeum",
+      "body": "@bazel-io fork 7.4.0"
+    },
+    {
+      "type": "comment",
+      "id": 2284129280,
+      "created_at": "2024-08-12T14:24:19Z",
+      "user": "coeuvre",
+      "body": "FYI: `Errors.NativeIoException` is final and cannot be mocked. I also cannot instantiate a new `Errors.NativeIoException` because it causes linkage error on windows (and it not worth it to play with the complexity of linkage only for test). So I added a `Predicate` to the factory and let test override it."
+    },
+    {
+      "type": "comment",
+      "id": 2297317904,
+      "created_at": "2024-08-19T19:45:25Z",
+      "user": "keith",
+      "body": "can we cherry pick this into a release that's coming sooner than October? maybe a 7.3.2?"
+    },
+    {
+      "type": "comment",
+      "id": 2297531474,
+      "created_at": "2024-08-19T22:00:01Z",
+      "user": "fmeum",
+      "body": "@Wyverald "
+    },
+    {
+      "type": "comment",
+      "id": 2297566890,
+      "created_at": "2024-08-19T22:18:12Z",
+      "user": "keith",
+      "body": "idk when the 7.4.0 RCs will be, that would be fine with me too, but currently we can't use HEAD commits because of https://github.com/bazelbuild/continuous-integration/issues/1402"
+    }
+  ]
+}

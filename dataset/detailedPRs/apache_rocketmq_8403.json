@@ -1,0 +1,151 @@
+{
+  "repo": "apache/rocketmq",
+  "number": 8403,
+  "pr_number": 8403,
+  "title": "[ISSUE #8405] Add the ability to write ConsumeQueue using fileChannel to prevent JVM crashes in some situations",
+  "user": "RongtongJin",
+  "created_at": "2024-07-19T02:25:47Z",
+  "merged_at": "2024-07-22T09:20:11Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "d9d53d58cf7f32143485f12d4851d5c119d0855a",
+  "merge_commit_sha": "86d59d2485b5fed162db3743e11c0902de3e34ad",
+  "commits": 1,
+  "issue_events": [
+    "renamed",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/apache/rocketmq/pull/8403",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-07-19T02:14:10Z",
+      "sha": "2c790b30f49c87ac31857bda3f661c2a05b50352",
+      "message": "Add the ability to write ConsumeQueue using fileChannel to prevent JVM crashes in some situations",
+      "author": "RongtongJin",
+      "author_email": "jinrongtong16@mails.ucas.ac.cn",
+      "author_raw_date": "2024-07-19T02:14:10Z",
+      "author_date": "2024-07-19T02:14:10Z",
+      "committer": "RongtongJin",
+      "committer_email": "jinrongtong16@mails.ucas.ac.cn",
+      "raw_date": "2024-07-19T02:14:10Z",
+      "diff_text": "store/src/main/java/org/apache/rocketmq/store/ConsumeQueue.java\n@@ -833,7 +833,13 @@ private boolean putMessagePositionInfo(final long offset, final int size, final\n                 }\n             }\n             this.setMaxPhysicOffset(offset + size);\n-            return mappedFile.appendMessage(this.byteBufferIndex.array());\n+            boolean appendResult;\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendResult = mappedFile.appendMessageUsingFileChannel(this.byteBufferIndex.array());\n+            } else {\n+                appendResult = mappedFile.appendMessage(this.byteBufferIndex.array());\n+            }\n+            return appendResult;\n         }\n         return false;\n     }\n@@ -846,7 +852,12 @@ private void fillPreBlank(final MappedFile mappedFile, final long untilWhere) {\n \n         int until = (int) (untilWhere % this.mappedFileQueue.getMappedFileSize());\n         for (int i = 0; i < until; i += CQ_STORE_UNIT_SIZE) {\n-            mappedFile.appendMessage(byteBuffer.array());\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                mappedFile.appendMessageUsingFileChannel(byteBuffer.array());\n+            } else {\n+                mappedFile.appendMessage(byteBuffer.array());\n+            }\n+\n         }\n     }\n \nstore/src/main/java/org/apache/rocketmq/store/config/MessageStoreConfig.java\n@@ -419,6 +419,8 @@ public class MessageStoreConfig {\n      */\n     private boolean readUnCommitted = false;\n \n+    private boolean putConsumeQueueDataByFileChannel = true;\n+\n     public boolean isEnabledAppendPropCRC() {\n         return enabledAppendPropCRC;\n     }\n@@ -1832,4 +1834,12 @@ public boolean isReadUnCommitted() {\n     public void setReadUnCommitted(boolean readUnCommitted) {\n         this.readUnCommitted = readUnCommitted;\n     }\n+\n+    public boolean isPutConsumeQueueDataByFileChannel() {\n+        return putConsumeQueueDataByFileChannel;\n+    }\n+\n+    public void setPutConsumeQueueDataByFileChannel(boolean putConsumeQueueDataByFileChannel) {\n+        this.putConsumeQueueDataByFileChannel = putConsumeQueueDataByFileChannel;\n+    }\n }\nstore/src/main/java/org/apache/rocketmq/store/logfile/DefaultMappedFile.java\n@@ -97,14 +97,14 @@ public class DefaultMappedFile extends AbstractMappedFile {\n     protected long mappedByteBufferAccessCountSinceLastSwap = 0L;\n \n     /**\n-     * If this mapped file belongs to consume queue, this field stores store-timestamp of first message referenced\n-     * by this logical queue.\n+     * If this mapped file belongs to consume queue, this field stores store-timestamp of first message referenced by\n+     * this logical queue.\n      */\n     private long startTimestamp = -1;\n \n     /**\n-     * If this mapped file belongs to consume queue, this field stores store-timestamp of last message referenced\n-     * by this logical queue.\n+     * If this mapped file belongs to consume queue, this field stores store-timestamp of last message referenced by\n+     * this logical queue.\n      */\n     private long stopTimestamp = -1;\n \n@@ -357,6 +357,24 @@ public boolean appendMessage(final byte[] data, final int offset, final int leng\n         return false;\n     }\n \n+    @Override\n+    public boolean appendMessageUsingFileChannel(byte[] data) {\n+        int currentPos = WROTE_POSITION_UPDATER.get(this);\n+\n+        if ((currentPos + data.length) <= this.fileSize) {\n+            try {\n+                this.fileChannel.position(currentPos);\n+                this.fileChannel.write(ByteBuffer.wrap(data, 0, data.length));\n+            } catch (Throwable e) {\n+                log.error(\"Error occurred when append message to mappedFile.\", e);\n+            }\n+            WROTE_POSITION_UPDATER.addAndGet(this, data.length);\n+            return true;\n+        }\n+\n+        return false;\n+    }\n+\n     /**\n      * @return The current flushed position\n      */\n@@ -840,7 +858,6 @@ public void setStopTimestamp(long stopTimestamp) {\n         this.stopTimestamp = stopTimestamp;\n     }\n \n-\n     public Iterator<SelectMappedBufferResult> iterator(int startPos) {\n         return new Itr(startPos);\n     }\nstore/src/main/java/org/apache/rocketmq/store/logfile/MappedFile.java\n@@ -101,12 +101,23 @@ public interface MappedFile {\n \n     /**\n      * Appends a raw message data represents by a byte array to the current {@code MappedFile}.\n+     * Using mappedByteBuffer\n      *\n      * @param data the byte array to append\n      * @return true if success; false otherwise.\n      */\n     boolean appendMessage(byte[] data);\n \n+\n+    /**\n+     * Appends a raw message data represents by a byte array to the current {@code MappedFile}.\n+     * Using fileChannel\n+     *\n+     * @param data the byte array to append\n+     * @return true if success; false otherwise.\n+     */\n+    boolean appendMessageUsingFileChannel(byte[] data);\n+\n     /**\n      * Appends a raw message data represents by a byte array to the current {@code MappedFile}.\n      *\nstore/src/main/java/org/apache/rocketmq/store/queue/BatchConsumeQueue.java\n@@ -587,7 +587,12 @@ public boolean putBatchMessagePositionInfo(final long offset, final int size, fi\n         MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile(this.mappedFileQueue.getMaxOffset());\n         if (mappedFile != null) {\n             boolean isNewFile = isNewFile(mappedFile);\n-            boolean appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+            boolean appendRes;\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendRes = mappedFile.appendMessageUsingFileChannel(this.byteBufferItem.array());\n+            } else {\n+                appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+            }\n             if (appendRes) {\n                 maxMsgPhyOffsetInCommitLog = offset;\n                 maxOffsetInQueue = msgBaseOffset + batchSize;\nstore/src/main/java/org/apache/rocketmq/store/queue/SparseConsumeQueue.java\n@@ -262,7 +262,15 @@ public void putEndPositionInfo(MappedFile mappedFile) {\n             this.byteBufferItem.putShort((short)0);\n             this.byteBufferItem.putInt(INVALID_POS);\n             this.byteBufferItem.putInt(0); // 4 bytes reserved\n-            boolean appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+\n+            boolean appendRes;\n+\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendRes = mappedFile.appendMessageUsingFileChannel(this.byteBufferItem.array());\n+            } else {\n+                appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+            }\n+\n             if (!appendRes) {\n                 log.error(\"append end position info into {} failed\", mappedFile.getFileName());\n             }",
+      "diff": [
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/ConsumeQueue.java",
+          "patch": "@@ -833,7 +833,13 @@ private boolean putMessagePositionInfo(final long offset, final int size, final\n                 }\n             }\n             this.setMaxPhysicOffset(offset + size);\n-            return mappedFile.appendMessage(this.byteBufferIndex.array());\n+            boolean appendResult;\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendResult = mappedFile.appendMessageUsingFileChannel(this.byteBufferIndex.array());\n+            } else {\n+                appendResult = mappedFile.appendMessage(this.byteBufferIndex.array());\n+            }\n+            return appendResult;\n         }\n         return false;\n     }\n@@ -846,7 +852,12 @@ private void fillPreBlank(final MappedFile mappedFile, final long untilWhere) {\n \n         int until = (int) (untilWhere % this.mappedFileQueue.getMappedFileSize());\n         for (int i = 0; i < until; i += CQ_STORE_UNIT_SIZE) {\n-            mappedFile.appendMessage(byteBuffer.array());\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                mappedFile.appendMessageUsingFileChannel(byteBuffer.array());\n+            } else {\n+                mappedFile.appendMessage(byteBuffer.array());\n+            }\n+\n         }\n     }\n "
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/config/MessageStoreConfig.java",
+          "patch": "@@ -419,6 +419,8 @@ public class MessageStoreConfig {\n      */\n     private boolean readUnCommitted = false;\n \n+    private boolean putConsumeQueueDataByFileChannel = true;\n+\n     public boolean isEnabledAppendPropCRC() {\n         return enabledAppendPropCRC;\n     }\n@@ -1832,4 +1834,12 @@ public boolean isReadUnCommitted() {\n     public void setReadUnCommitted(boolean readUnCommitted) {\n         this.readUnCommitted = readUnCommitted;\n     }\n+\n+    public boolean isPutConsumeQueueDataByFileChannel() {\n+        return putConsumeQueueDataByFileChannel;\n+    }\n+\n+    public void setPutConsumeQueueDataByFileChannel(boolean putConsumeQueueDataByFileChannel) {\n+        this.putConsumeQueueDataByFileChannel = putConsumeQueueDataByFileChannel;\n+    }\n }"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/logfile/DefaultMappedFile.java",
+          "patch": "@@ -97,14 +97,14 @@ public class DefaultMappedFile extends AbstractMappedFile {\n     protected long mappedByteBufferAccessCountSinceLastSwap = 0L;\n \n     /**\n-     * If this mapped file belongs to consume queue, this field stores store-timestamp of first message referenced\n-     * by this logical queue.\n+     * If this mapped file belongs to consume queue, this field stores store-timestamp of first message referenced by\n+     * this logical queue.\n      */\n     private long startTimestamp = -1;\n \n     /**\n-     * If this mapped file belongs to consume queue, this field stores store-timestamp of last message referenced\n-     * by this logical queue.\n+     * If this mapped file belongs to consume queue, this field stores store-timestamp of last message referenced by\n+     * this logical queue.\n      */\n     private long stopTimestamp = -1;\n \n@@ -357,6 +357,24 @@ public boolean appendMessage(final byte[] data, final int offset, final int leng\n         return false;\n     }\n \n+    @Override\n+    public boolean appendMessageUsingFileChannel(byte[] data) {\n+        int currentPos = WROTE_POSITION_UPDATER.get(this);\n+\n+        if ((currentPos + data.length) <= this.fileSize) {\n+            try {\n+                this.fileChannel.position(currentPos);\n+                this.fileChannel.write(ByteBuffer.wrap(data, 0, data.length));\n+            } catch (Throwable e) {\n+                log.error(\"Error occurred when append message to mappedFile.\", e);\n+            }\n+            WROTE_POSITION_UPDATER.addAndGet(this, data.length);\n+            return true;\n+        }\n+\n+        return false;\n+    }\n+\n     /**\n      * @return The current flushed position\n      */\n@@ -840,7 +858,6 @@ public void setStopTimestamp(long stopTimestamp) {\n         this.stopTimestamp = stopTimestamp;\n     }\n \n-\n     public Iterator<SelectMappedBufferResult> iterator(int startPos) {\n         return new Itr(startPos);\n     }"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/logfile/MappedFile.java",
+          "patch": "@@ -101,12 +101,23 @@ public interface MappedFile {\n \n     /**\n      * Appends a raw message data represents by a byte array to the current {@code MappedFile}.\n+     * Using mappedByteBuffer\n      *\n      * @param data the byte array to append\n      * @return true if success; false otherwise.\n      */\n     boolean appendMessage(byte[] data);\n \n+\n+    /**\n+     * Appends a raw message data represents by a byte array to the current {@code MappedFile}.\n+     * Using fileChannel\n+     *\n+     * @param data the byte array to append\n+     * @return true if success; false otherwise.\n+     */\n+    boolean appendMessageUsingFileChannel(byte[] data);\n+\n     /**\n      * Appends a raw message data represents by a byte array to the current {@code MappedFile}.\n      *"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/queue/BatchConsumeQueue.java",
+          "patch": "@@ -587,7 +587,12 @@ public boolean putBatchMessagePositionInfo(final long offset, final int size, fi\n         MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile(this.mappedFileQueue.getMaxOffset());\n         if (mappedFile != null) {\n             boolean isNewFile = isNewFile(mappedFile);\n-            boolean appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+            boolean appendRes;\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendRes = mappedFile.appendMessageUsingFileChannel(this.byteBufferItem.array());\n+            } else {\n+                appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+            }\n             if (appendRes) {\n                 maxMsgPhyOffsetInCommitLog = offset;\n                 maxOffsetInQueue = msgBaseOffset + batchSize;"
+        },
+        {
+          "file": "store/src/main/java/org/apache/rocketmq/store/queue/SparseConsumeQueue.java",
+          "patch": "@@ -262,7 +262,15 @@ public void putEndPositionInfo(MappedFile mappedFile) {\n             this.byteBufferItem.putShort((short)0);\n             this.byteBufferItem.putInt(INVALID_POS);\n             this.byteBufferItem.putInt(0); // 4 bytes reserved\n-            boolean appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+\n+            boolean appendRes;\n+\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendRes = mappedFile.appendMessageUsingFileChannel(this.byteBufferItem.array());\n+            } else {\n+                appendRes = mappedFile.appendMessage(this.byteBufferItem.array());\n+            }\n+\n             if (!appendRes) {\n                 log.error(\"append end position info into {} failed\", mappedFile.getFileName());\n             }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-07-19T02:25:47Z",
+      "user": "RongtongJin",
+      "body": "<!-- Please make sure the target branch is right. In most case, the target branch should be `develop`. -->\r\n\r\n### Which Issue(s) This PR Fixes\r\n\r\n<!-- Please ensure that the related issue has already been created, and [link this pull request to that issue using keywords](<https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword>) to ensure automatic closure. -->\r\n\r\nFixes #8405\r\n\r\n### Brief Description\r\n\r\nAdd the ability to write ConsumeQueue using fileChannel to prevent JVM crashes in some situations\r\n\r\n### How Did You Test This Change?\r\n\r\n<!-- In order to ensure the code quality of Apache RocketMQ, we expect every pull request to have undergone thorough testing. -->\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 2237981768,
+      "created_at": "2024-07-19T02:54:46Z",
+      "user": "codecov-commenter",
+      "body": "## [Codecov](https://app.codecov.io/gh/apache/rocketmq/pull/8403?dropdown=coverage&src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) Report\nAttention: Patch coverage is `51.85185%` with `13 lines` in your changes missing coverage. Please review.\n> Project coverage is 45.06%. Comparing base [(`d9d53d5`)](https://app.codecov.io/gh/apache/rocketmq/commit/d9d53d58cf7f32143485f12d4851d5c119d0855a?dropdown=coverage&el=desc&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) to head [(`2c790b3`)](https://app.codecov.io/gh/apache/rocketmq/commit/2c790b30f49c87ac31857bda3f661c2a05b50352?dropdown=coverage&el=desc&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache).\n> Report is 208 commits behind head on develop.\n\n| [Files with missing lines](https://app.codecov.io/gh/apache/rocketmq/pull/8403?dropdown=coverage&src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) | Patch % | Lines |\n|---|---|---|\n| [...n/java/org/apache/rocketmq/store/ConsumeQueue.java](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&filepath=store%2Fsrc%2Fmain%2Fjava%2Forg%2Fapache%2Frocketmq%2Fstore%2FConsumeQueue.java&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache#diff-c3RvcmUvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3N0b3JlL0NvbnN1bWVRdWV1ZS5qYXZh) | 42.85% | [2 Missing and 2 partials :warning: ](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) |\n| [...ache/rocketmq/store/logfile/DefaultMappedFile.java](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&filepath=store%2Fsrc%2Fmain%2Fjava%2Forg%2Fapache%2Frocketmq%2Fstore%2Flogfile%2FDefaultMappedFile.java&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache#diff-c3RvcmUvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3N0b3JlL2xvZ2ZpbGUvRGVmYXVsdE1hcHBlZEZpbGUuamF2YQ==) | 60.00% | [3 Missing and 1 partial :warning: ](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) |\n| [...pache/rocketmq/store/queue/SparseConsumeQueue.java](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&filepath=store%2Fsrc%2Fmain%2Fjava%2Forg%2Fapache%2Frocketmq%2Fstore%2Fqueue%2FSparseConsumeQueue.java&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache#diff-c3RvcmUvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3N0b3JlL3F1ZXVlL1NwYXJzZUNvbnN1bWVRdWV1ZS5qYXZh) | 0.00% | [3 Missing :warning: ](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) |\n| [...ache/rocketmq/store/config/MessageStoreConfig.java](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&filepath=store%2Fsrc%2Fmain%2Fjava%2Forg%2Fapache%2Frocketmq%2Fstore%2Fconfig%2FMessageStoreConfig.java&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache#diff-c3RvcmUvc3JjL21haW4vamF2YS9vcmcvYXBhY2hlL3JvY2tldG1xL3N0b3JlL2NvbmZpZy9NZXNzYWdlU3RvcmVDb25maWcuamF2YQ==) | 50.00% | [2 Missing :warning: ](https://app.codecov.io/gh/apache/rocketmq/pull/8403?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache) |\n\n<details><summary>Additional details and impacted files</summary>\n\n\n```diff\n@@              Coverage Diff              @@\n##             develop    #8403      +/-   ##\n=============================================\n- Coverage      45.12%   45.06%   -0.06%     \n+ Complexity     10931    10923       -8     \n=============================================\n  Files           1274     1274              \n  Lines          88970    88993      +23     \n  Branches       11434    11439       +5     \n=============================================\n- Hits           40144    40106      -38     \n- Misses         43826    43876      +50     \n- Partials        5000     5011      +11     \n```\n\n</details>\n\n[:umbrella: View full report in Codecov by Sentry](https://app.codecov.io/gh/apache/rocketmq/pull/8403?dropdown=coverage&src=pr&el=continue&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache).   \n:loudspeaker: Have feedback on the report? [Share it here](https://about.codecov.io/codecov-pr-comment-feedback/?utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=apache).\n"
+    },
+    {
+      "type": "review",
+      "id": 2187789366,
+      "created_at": "2024-07-19T09:27:50Z",
+      "user": "ltamber",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2187816293,
+      "created_at": "2024-07-19T09:39:10Z",
+      "user": "humkum",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2187820185,
+      "created_at": "2024-07-19T09:41:19Z",
+      "user": "fuyou001",
+      "state": "APPROVED",
+      "body": "LGMT"
+    },
+    {
+      "type": "comment",
+      "id": 2238790231,
+      "created_at": "2024-07-19T09:45:51Z",
+      "user": "humkum",
+      "body": "How can this prevent JVM crashes? Is it because fileChannel uses off-heap memory?"
+    },
+    {
+      "type": "review_comment",
+      "id": 1684220949,
+      "created_at": "2024-07-19T11:11:36Z",
+      "user": "caigy",
+      "body": "`byteBufferIndex`, of which type is `ByteBuffer`, is transformed to `byte[]` and then transformed back into `ByteBuffer` in `DefaultMappedFile.appendMessageUsingFileChannel()`. IMO it's unnecessary.",
+      "path": "store/src/main/java/org/apache/rocketmq/store/ConsumeQueue.java",
+      "diff_hunk": "@@ -833,7 +833,13 @@ private boolean putMessagePositionInfo(final long offset, final int size, final\n                 }\n             }\n             this.setMaxPhysicOffset(offset + size);\n-            return mappedFile.appendMessage(this.byteBufferIndex.array());\n+            boolean appendResult;\n+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {\n+                appendResult = mappedFile.appendMessageUsingFileChannel(this.byteBufferIndex.array());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 838,
+      "original_line": 838,
+      "side": "RIGHT",
+      "original_position": 7,
+      "position": 7,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2187969136,
+      "created_at": "2024-07-19T11:11:43Z",
+      "user": "caigy",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2241907195,
+      "created_at": "2024-07-22T02:03:41Z",
+      "user": "RongtongJin",
+      "body": "> How can this prevent JVM crashes? Is it because fileChannel uses off-heap memory?\r\n\r\nyes"
+    },
+    {
+      "type": "review",
+      "id": 2191069911,
+      "created_at": "2024-07-22T09:19:56Z",
+      "user": "caigy",
+      "state": "APPROVED",
+      "body": ""
+    }
+  ]
+}

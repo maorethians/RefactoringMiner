@@ -1,0 +1,130 @@
+{
+  "repo": "netty/netty",
+  "number": 13580,
+  "pr_number": 13580,
+  "title": "Only create SslClosedException if there are any writes left to fail.",
+  "user": "normanmaurer",
+  "created_at": "2023-08-31T12:54:22Z",
+  "merged_at": "2023-09-01T07:25:00Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "efcd3ce942d6f68510c9e196215d1c9c3c24ff08",
+  "merge_commit_sha": "a6f28f2734b5ab6d302e1b6812b820d7019b9bbe",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "review_requested",
+    "milestoned",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced"
+  ],
+  "url": "https://github.com/netty/netty/pull/13580",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-08-31T12:52:50Z",
+      "sha": "15108a54d7a48e89aa5946beb69a7ed6063d2b88",
+      "message": "Only create SslClosedException if there are any writes left to fail.\n\nMotivation:\n\nThere is no need to create the SslClosedException if there is no write to fail.\n\nModifications:\n\nCheck if there are any pending writes left and only then create the SslClosedException\n\nResult:\n\nFixes https://github.com/netty/netty/issues/13569",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2023-08-31T12:52:50Z",
+      "author_date": "2023-08-31T12:52:50Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2023-08-31T12:52:50Z",
+      "diff_text": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java\n@@ -893,16 +893,21 @@ private void wrap(ChannelHandlerContext ctx, boolean inUnwrap) throws SSLExcepti\n                 // else out is not readable we can re-use it and so save an extra allocation\n \n                 if (result.getStatus() == Status.CLOSED) {\n-                    // Make a best effort to preserve any exception that way previously encountered from the handshake\n-                    // or the transport, else fallback to a general error.\n-                    Throwable exception = handshakePromise.cause();\n-                    if (exception == null) {\n-                        exception = sslClosePromise.cause();\n+                    // First check if there is any write left that needs to be failed, if there is none we don't need\n+                    // to create a new exception or obtain an existing one.\n+                    if (!pendingUnencryptedWrites.isEmpty()) {\n+                        // Make a best effort to preserve any exception that way previously encountered from the\n+                        // handshake or the transport, else fallback to a general error.\n+                        Throwable exception = handshakePromise.cause();\n                         if (exception == null) {\n-                            exception = new SslClosedEngineException(\"SSLEngine closed already\");\n+                            exception = sslClosePromise.cause();\n+                            if (exception == null) {\n+                                exception = new SslClosedEngineException(\"SSLEngine closed already\");\n+                            }\n                         }\n+                        pendingUnencryptedWrites.releaseAndFailAll(ctx, exception);\n                     }\n-                    pendingUnencryptedWrites.releaseAndFailAll(ctx, exception);\n+\n                     return;\n                 } else {\n                     switch (result.getHandshakeStatus()) {\nhandler/src/test/java/io/netty/handler/ssl/SslHandlerTest.java\n@@ -1722,11 +1722,17 @@ private void testHandshakeEvents(SslProvider provider, String protocol) throws E\n \n         EventLoopGroup group = new NioEventLoopGroup();\n \n-        final LinkedBlockingQueue<SslHandshakeCompletionEvent> serverCompletionEvents =\n+        final LinkedBlockingQueue<SslHandshakeCompletionEvent> serverHandshakeCompletionEvents =\n                 new LinkedBlockingQueue<SslHandshakeCompletionEvent>();\n \n-        final LinkedBlockingQueue<SslHandshakeCompletionEvent> clientCompletionEvents =\n+        final LinkedBlockingQueue<SslHandshakeCompletionEvent> clientHandshakeCompletionEvents =\n                 new LinkedBlockingQueue<SslHandshakeCompletionEvent>();\n+\n+        final LinkedBlockingQueue<SslCloseCompletionEvent> serverCloseCompletionEvents =\n+                new LinkedBlockingQueue<SslCloseCompletionEvent>();\n+\n+        final LinkedBlockingQueue<SslCloseCompletionEvent> clientCloseCompletionEvents =\n+                new LinkedBlockingQueue<SslCloseCompletionEvent>();\n         try {\n             Channel sc = new ServerBootstrap()\n                     .group(group)\n@@ -1735,7 +1741,8 @@ private void testHandshakeEvents(SslProvider provider, String protocol) throws E\n                         @Override\n                         protected void initChannel(Channel ch) throws Exception {\n                             ch.pipeline().addLast(sslServerCtx.newHandler(UnpooledByteBufAllocator.DEFAULT));\n-                            ch.pipeline().addLast(new SslHandshakeCompletionEventHandler(serverCompletionEvents));\n+                            ch.pipeline().addLast(new SslCompletionEventHandler(\n+                                    serverHandshakeCompletionEvents, serverCloseCompletionEvents));\n                         }\n                     })\n                     .bind(new InetSocketAddress(0)).syncUninterruptibly().channel();\n@@ -1748,7 +1755,9 @@ protected void initChannel(Channel ch) throws Exception {\n                         protected void initChannel(Channel ch) {\n                             ch.pipeline().addLast(sslClientCtx.newHandler(\n                                     UnpooledByteBufAllocator.DEFAULT, \"netty.io\", 9999));\n-                            ch.pipeline().addLast(new SslHandshakeCompletionEventHandler(clientCompletionEvents));\n+                            ch.pipeline().addLast(\n+                                    new SslCompletionEventHandler(\n+                                            clientHandshakeCompletionEvents, clientCloseCompletionEvents));\n                         }\n                     })\n                     .remoteAddress(sc.localAddress());\n@@ -1759,37 +1768,57 @@ protected void initChannel(Channel ch) {\n             // We expect 4 events as we have 2 connections and for each connection there should be one event\n             // on the server-side and one on the client-side.\n             for (int i = 0; i < 2; i++) {\n-                SslHandshakeCompletionEvent event = clientCompletionEvents.take();\n+                SslHandshakeCompletionEvent event = clientHandshakeCompletionEvents.take();\n                 assertTrue(event.isSuccess());\n             }\n             for (int i = 0; i < 2; i++) {\n-                SslHandshakeCompletionEvent event = serverCompletionEvents.take();\n+                SslHandshakeCompletionEvent event = serverHandshakeCompletionEvents.take();\n                 assertTrue(event.isSuccess());\n             }\n \n+            assertEquals(0, clientCloseCompletionEvents.size());\n+            assertEquals(0, serverCloseCompletionEvents.size());\n+\n             cc1.close().sync();\n             cc2.close().sync();\n+\n+            // We expect 4 events as we have 2 connections and for each connection there should be one event\n+            // on the server-side and one on the client-side.\n+            for (int i = 0; i < 2; i++) {\n+                SslCloseCompletionEvent event = clientCloseCompletionEvents.take();\n+                assertNotNull(event);\n+            }\n+            for (int i = 0; i < 2; i++) {\n+                SslCloseCompletionEvent event = serverCloseCompletionEvents.take();\n+                assertNotNull(event);\n+            }\n+\n             sc.close().sync();\n-            assertEquals(0, clientCompletionEvents.size());\n-            assertEquals(0, serverCompletionEvents.size());\n+            assertEquals(0, clientHandshakeCompletionEvents.size());\n+            assertEquals(0, serverHandshakeCompletionEvents.size());\n         } finally {\n             group.shutdownGracefully();\n             ReferenceCountUtil.release(sslClientCtx);\n             ReferenceCountUtil.release(sslServerCtx);\n         }\n     }\n \n-    private static class SslHandshakeCompletionEventHandler extends ChannelInboundHandlerAdapter {\n-        private final Queue<SslHandshakeCompletionEvent> completionEvents;\n+    private static class SslCompletionEventHandler extends ChannelInboundHandlerAdapter {\n+        private final Queue<SslHandshakeCompletionEvent> handshakeCompletionEvents;\n+        private final Queue<SslCloseCompletionEvent> closeCompletionEvents;\n \n-        SslHandshakeCompletionEventHandler(Queue<SslHandshakeCompletionEvent> completionEvents) {\n-            this.completionEvents = completionEvents;\n+        SslCompletionEventHandler(Queue<SslHandshakeCompletionEvent> handshakeCompletionEvents,\n+                                  Queue<SslCloseCompletionEvent> closeCompletionEvents) {\n+            this.handshakeCompletionEvents = handshakeCompletionEvents;\n+            this.closeCompletionEvents = closeCompletionEvents;\n         }\n \n         @Override\n         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {\n             if (evt instanceof SslHandshakeCompletionEvent) {\n-                completionEvents.add((SslHandshakeCompletionEvent) evt);\n+                handshakeCompletionEvents.add((SslHandshakeCompletionEvent) evt);\n+            } else if (evt instanceof SslCloseCompletionEvent) {\n+                closeCompletionEvents.add((SslCloseCompletionEvent) evt);\n             }\n         }\n ",
+      "diff": [
+        {
+          "file": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "patch": "@@ -893,16 +893,21 @@ private void wrap(ChannelHandlerContext ctx, boolean inUnwrap) throws SSLExcepti\n                 // else out is not readable we can re-use it and so save an extra allocation\n \n                 if (result.getStatus() == Status.CLOSED) {\n-                    // Make a best effort to preserve any exception that way previously encountered from the handshake\n-                    // or the transport, else fallback to a general error.\n-                    Throwable exception = handshakePromise.cause();\n-                    if (exception == null) {\n-                        exception = sslClosePromise.cause();\n+                    // First check if there is any write left that needs to be failed, if there is none we don't need\n+                    // to create a new exception or obtain an existing one.\n+                    if (!pendingUnencryptedWrites.isEmpty()) {\n+                        // Make a best effort to preserve any exception that way previously encountered from the\n+                        // handshake or the transport, else fallback to a general error.\n+                        Throwable exception = handshakePromise.cause();\n                         if (exception == null) {\n-                            exception = new SslClosedEngineException(\"SSLEngine closed already\");\n+                            exception = sslClosePromise.cause();\n+                            if (exception == null) {\n+                                exception = new SslClosedEngineException(\"SSLEngine closed already\");\n+                            }\n                         }\n+                        pendingUnencryptedWrites.releaseAndFailAll(ctx, exception);\n                     }\n-                    pendingUnencryptedWrites.releaseAndFailAll(ctx, exception);\n+\n                     return;\n                 } else {\n                     switch (result.getHandshakeStatus()) {"
+        },
+        {
+          "file": "handler/src/test/java/io/netty/handler/ssl/SslHandlerTest.java",
+          "patch": "@@ -1722,11 +1722,17 @@ private void testHandshakeEvents(SslProvider provider, String protocol) throws E\n \n         EventLoopGroup group = new NioEventLoopGroup();\n \n-        final LinkedBlockingQueue<SslHandshakeCompletionEvent> serverCompletionEvents =\n+        final LinkedBlockingQueue<SslHandshakeCompletionEvent> serverHandshakeCompletionEvents =\n                 new LinkedBlockingQueue<SslHandshakeCompletionEvent>();\n \n-        final LinkedBlockingQueue<SslHandshakeCompletionEvent> clientCompletionEvents =\n+        final LinkedBlockingQueue<SslHandshakeCompletionEvent> clientHandshakeCompletionEvents =\n                 new LinkedBlockingQueue<SslHandshakeCompletionEvent>();\n+\n+        final LinkedBlockingQueue<SslCloseCompletionEvent> serverCloseCompletionEvents =\n+                new LinkedBlockingQueue<SslCloseCompletionEvent>();\n+\n+        final LinkedBlockingQueue<SslCloseCompletionEvent> clientCloseCompletionEvents =\n+                new LinkedBlockingQueue<SslCloseCompletionEvent>();\n         try {\n             Channel sc = new ServerBootstrap()\n                     .group(group)\n@@ -1735,7 +1741,8 @@ private void testHandshakeEvents(SslProvider provider, String protocol) throws E\n                         @Override\n                         protected void initChannel(Channel ch) throws Exception {\n                             ch.pipeline().addLast(sslServerCtx.newHandler(UnpooledByteBufAllocator.DEFAULT));\n-                            ch.pipeline().addLast(new SslHandshakeCompletionEventHandler(serverCompletionEvents));\n+                            ch.pipeline().addLast(new SslCompletionEventHandler(\n+                                    serverHandshakeCompletionEvents, serverCloseCompletionEvents));\n                         }\n                     })\n                     .bind(new InetSocketAddress(0)).syncUninterruptibly().channel();\n@@ -1748,7 +1755,9 @@ protected void initChannel(Channel ch) throws Exception {\n                         protected void initChannel(Channel ch) {\n                             ch.pipeline().addLast(sslClientCtx.newHandler(\n                                     UnpooledByteBufAllocator.DEFAULT, \"netty.io\", 9999));\n-                            ch.pipeline().addLast(new SslHandshakeCompletionEventHandler(clientCompletionEvents));\n+                            ch.pipeline().addLast(\n+                                    new SslCompletionEventHandler(\n+                                            clientHandshakeCompletionEvents, clientCloseCompletionEvents));\n                         }\n                     })\n                     .remoteAddress(sc.localAddress());\n@@ -1759,37 +1768,57 @@ protected void initChannel(Channel ch) {\n             // We expect 4 events as we have 2 connections and for each connection there should be one event\n             // on the server-side and one on the client-side.\n             for (int i = 0; i < 2; i++) {\n-                SslHandshakeCompletionEvent event = clientCompletionEvents.take();\n+                SslHandshakeCompletionEvent event = clientHandshakeCompletionEvents.take();\n                 assertTrue(event.isSuccess());\n             }\n             for (int i = 0; i < 2; i++) {\n-                SslHandshakeCompletionEvent event = serverCompletionEvents.take();\n+                SslHandshakeCompletionEvent event = serverHandshakeCompletionEvents.take();\n                 assertTrue(event.isSuccess());\n             }\n \n+            assertEquals(0, clientCloseCompletionEvents.size());\n+            assertEquals(0, serverCloseCompletionEvents.size());\n+\n             cc1.close().sync();\n             cc2.close().sync();\n+\n+            // We expect 4 events as we have 2 connections and for each connection there should be one event\n+            // on the server-side and one on the client-side.\n+            for (int i = 0; i < 2; i++) {\n+                SslCloseCompletionEvent event = clientCloseCompletionEvents.take();\n+                assertNotNull(event);\n+            }\n+            for (int i = 0; i < 2; i++) {\n+                SslCloseCompletionEvent event = serverCloseCompletionEvents.take();\n+                assertNotNull(event);\n+            }\n+\n             sc.close().sync();\n-            assertEquals(0, clientCompletionEvents.size());\n-            assertEquals(0, serverCompletionEvents.size());\n+            assertEquals(0, clientHandshakeCompletionEvents.size());\n+            assertEquals(0, serverHandshakeCompletionEvents.size());\n         } finally {\n             group.shutdownGracefully();\n             ReferenceCountUtil.release(sslClientCtx);\n             ReferenceCountUtil.release(sslServerCtx);\n         }\n     }\n \n-    private static class SslHandshakeCompletionEventHandler extends ChannelInboundHandlerAdapter {\n-        private final Queue<SslHandshakeCompletionEvent> completionEvents;\n+    private static class SslCompletionEventHandler extends ChannelInboundHandlerAdapter {\n+        private final Queue<SslHandshakeCompletionEvent> handshakeCompletionEvents;\n+        private final Queue<SslCloseCompletionEvent> closeCompletionEvents;\n \n-        SslHandshakeCompletionEventHandler(Queue<SslHandshakeCompletionEvent> completionEvents) {\n-            this.completionEvents = completionEvents;\n+        SslCompletionEventHandler(Queue<SslHandshakeCompletionEvent> handshakeCompletionEvents,\n+                                  Queue<SslCloseCompletionEvent> closeCompletionEvents) {\n+            this.handshakeCompletionEvents = handshakeCompletionEvents;\n+            this.closeCompletionEvents = closeCompletionEvents;\n         }\n \n         @Override\n         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {\n             if (evt instanceof SslHandshakeCompletionEvent) {\n-                completionEvents.add((SslHandshakeCompletionEvent) evt);\n+                handshakeCompletionEvents.add((SslHandshakeCompletionEvent) evt);\n+            } else if (evt instanceof SslCloseCompletionEvent) {\n+                closeCompletionEvents.add((SslCloseCompletionEvent) evt);\n             }\n         }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-08-31T12:54:22Z",
+      "user": "normanmaurer",
+      "body": "Motivation:\r\n\r\nThere is no need to create the SslClosedException if there is no write to fail.\r\n\r\nModifications:\r\n\r\nCheck if there are any pending writes left and only then create the SslClosedException\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/13569\r\n\r\n"
+    },
+    {
+      "type": "review_comment",
+      "id": 1311671394,
+      "created_at": "2023-08-31T13:54:52Z",
+      "user": "slandelle",
+      "body": "Shouldn't this Exception be a constant? This is the only place in Netty's code that's it's thrown.",
+      "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+      "diff_hunk": "@@ -893,16 +893,21 @@ private void wrap(ChannelHandlerContext ctx, boolean inUnwrap) throws SSLExcepti\n                 // else out is not readable we can re-use it and so save an extra allocation\n \n                 if (result.getStatus() == Status.CLOSED) {\n-                    // Make a best effort to preserve any exception that way previously encountered from the handshake\n-                    // or the transport, else fallback to a general error.\n-                    Throwable exception = handshakePromise.cause();\n-                    if (exception == null) {\n-                        exception = sslClosePromise.cause();\n+                    // First check if there is any write left that needs to be failed, if there is none we don't need\n+                    // to create a new exception or obtain an existing one.\n+                    if (!pendingUnencryptedWrites.isEmpty()) {\n+                        // Make a best effort to preserve any exception that way previously encountered from the\n+                        // handshake or the transport, else fallback to a general error.\n+                        Throwable exception = handshakePromise.cause();\n                         if (exception == null) {\n-                            exception = new SslClosedEngineException(\"SSLEngine closed already\");\n+                            exception = sslClosePromise.cause();\n+                            if (exception == null) {\n+                                exception = new SslClosedEngineException(\"SSLEngine closed already\");",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 905,
+      "original_line": 905,
+      "side": "RIGHT",
+      "original_position": 19,
+      "position": 19,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1311727900,
+          "user": "normanmaurer",
+          "body": "nope it shouldn't because people could add stuff to it via `addSuppressed(...)` which would led to a memory leak. ",
+          "created_at": "2023-08-31T14:31:29Z"
+        },
+        {
+          "id": 1311733773,
+          "user": "slandelle",
+          "body": "Oh right.",
+          "created_at": "2023-08-31T14:35:55Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1604822821,
+      "created_at": "2023-08-31T14:28:43Z",
+      "user": "slandelle",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1604905285,
+      "created_at": "2023-08-31T14:31:29Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1604914784,
+      "created_at": "2023-08-31T14:35:55Z",
+      "user": "slandelle",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1604915224,
+      "created_at": "2023-08-31T14:36:07Z",
+      "user": "slandelle",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1605618648,
+      "created_at": "2023-08-31T19:59:37Z",
+      "user": "chrisvest",
+      "state": "APPROVED",
+      "body": ""
+    }
+  ]
+}

@@ -1,0 +1,235 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 76067,
+  "pr_number": 76067,
+  "title": "Noop repository update should skip verification",
+  "user": "henningandersen",
+  "created_at": "2021-08-04T09:09:59Z",
+  "merged_at": "2021-08-04T12:16:41Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v7.14.1",
+    "v7.15.0",
+    "v8.0.0-alpha2"
+  ],
+  "base_commit": "2d7d3bda90d6e833c6595d2673db23845d2eeb69",
+  "merge_commit_sha": "39ee7883e22d9076558873fec8d53e5d256677b4",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "unlabeled",
+    "labeled",
+    "unlabeled",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/76067",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-08-04T09:08:02Z",
+      "sha": "eab0c0967bae9e0466198384426f5b993db38629",
+      "message": "Noop repository update should skip verification\n\nIt is common to do an idempotent PUT of a repo, just to ensure it is\nthere. This commit ensures that if the change is in fact a noop change,\nwe no longer do any repository verification, since a node having trouble\n(for instance running out of heap) could then mean such a no-change\nrepo update failing.\n\nCloses #76012",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2021-08-04T09:08:02Z",
+      "author_date": "2021-08-04T09:08:02Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2021-08-04T09:08:02Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/repositories/RepositoriesServiceIT.java\n@@ -12,6 +12,7 @@\n import org.elasticsearch.client.Client;\n import org.elasticsearch.cluster.metadata.RepositoryMetadata;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.env.Environment;\n import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.repositories.fs.FsRepository;\n import org.elasticsearch.snapshots.mockstore.MockRepository;\n@@ -81,5 +82,11 @@ public void testUpdateRepository() {\n \n         final Repository updatedRepository = repositoriesService.repository(repositoryName);\n         assertThat(updatedRepository, updated ? not(sameInstance(originalRepository)) : sameInstance(originalRepository));\n+\n+        // check that a noop update does not verify.\n+        internalCluster().startDataOnlyNode(Settings.builder().put(Environment.PATH_REPO_SETTING.getKey(), createTempDir()).build());\n+        assertAcked(\n+            client.admin().cluster().preparePutRepository(repositoryName).setType(updatedRepositoryType).setSettings(repoSettings).get()\n+        );\n     }\n }\nserver/src/main/java/org/elasticsearch/cluster/metadata/RepositoryMetadata.java\n@@ -167,6 +167,18 @@ public boolean equalsIgnoreGenerations(RepositoryMetadata other) {\n         return name.equals(other.name) && uuid.equals(other.uuid()) && type.equals(other.type()) && settings.equals(other.settings());\n     }\n \n+    /**\n+     * Checks if this instance contains the same data as the updated instance, ignoring {@link #uuid}, {@link #generation} and\n+     * {@link #pendingGeneration}.\n+     * @param updated the metadata with the updated type and settings.\n+     * @return true if it is a noop update, false if data changed.\n+     */\n+    public boolean isNoopUpdate(RepositoryMetadata updated) {\n+        assert name.equals(updated.name);\n+        //noinspection ConstantConditions\n+        return name.equals(updated.name) && type.equals(updated.type()) && settings.equals(updated.settings());\n+    }\n+\n     @Override\n     public boolean equals(Object o) {\n         if (this == o) return true;\nserver/src/main/java/org/elasticsearch/repositories/RepositoriesService.java\n@@ -147,16 +147,16 @@ public void registerRepository(final PutRepositoryRequest request, final ActionL\n         }\n \n         final StepListener<AcknowledgedResponse> acknowledgementStep = new StepListener<>();\n-        final StepListener<Void> publicationStep = new StepListener<>();\n+        final StepListener<Boolean> publicationStep = new StepListener<>(); // Boolean==changed.\n \n         if (request.verify()) {\n \n             // When publication has completed (and all acks received or timed out) then verify the repository.\n             // (if acks timed out then acknowledgementStep completes before the master processes this cluster state, hence why we have\n             // to wait for the publication to be complete too)\n             final StepListener<List<DiscoveryNode>> verifyStep = new StepListener<>();\n-            publicationStep.whenComplete(ignored -> acknowledgementStep.whenComplete(clusterStateUpdateResponse -> {\n-                if (clusterStateUpdateResponse.isAcknowledged()) {\n+            publicationStep.whenComplete(changed -> acknowledgementStep.whenComplete(clusterStateUpdateResponse -> {\n+                if (clusterStateUpdateResponse.isAcknowledged() && changed) {\n                     // The response was acknowledged - all nodes should know about the new repository, let's verify them\n                     verifyRepository(request.name(), verifyStep);\n                 } else {\n@@ -201,7 +201,7 @@ public ClusterState execute(ClusterState currentState) {\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n-                            if (newRepositoryMetadata.equalsIgnoreGenerations(repositoryMetadata)) {\n+                            if (newRepositoryMetadata.isNoopUpdate(repositoryMetadata)) {\n                                 // Previous version is the same as this one no update is needed.\n                                 return currentState;\n                             }\n@@ -256,7 +256,7 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS\n                             logger.info(\"put repository [{}]\", request.name());\n                         }\n                     }\n-                    publicationStep.onResponse(null);\n+                    publicationStep.onResponse(oldState != newState);\n                 }\n             }\n         );",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/repositories/RepositoriesServiceIT.java",
+          "patch": "@@ -12,6 +12,7 @@\n import org.elasticsearch.client.Client;\n import org.elasticsearch.cluster.metadata.RepositoryMetadata;\n import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.env.Environment;\n import org.elasticsearch.plugins.Plugin;\n import org.elasticsearch.repositories.fs.FsRepository;\n import org.elasticsearch.snapshots.mockstore.MockRepository;\n@@ -81,5 +82,11 @@ public void testUpdateRepository() {\n \n         final Repository updatedRepository = repositoriesService.repository(repositoryName);\n         assertThat(updatedRepository, updated ? not(sameInstance(originalRepository)) : sameInstance(originalRepository));\n+\n+        // check that a noop update does not verify.\n+        internalCluster().startDataOnlyNode(Settings.builder().put(Environment.PATH_REPO_SETTING.getKey(), createTempDir()).build());\n+        assertAcked(\n+            client.admin().cluster().preparePutRepository(repositoryName).setType(updatedRepositoryType).setSettings(repoSettings).get()\n+        );\n     }\n }"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/metadata/RepositoryMetadata.java",
+          "patch": "@@ -167,6 +167,18 @@ public boolean equalsIgnoreGenerations(RepositoryMetadata other) {\n         return name.equals(other.name) && uuid.equals(other.uuid()) && type.equals(other.type()) && settings.equals(other.settings());\n     }\n \n+    /**\n+     * Checks if this instance contains the same data as the updated instance, ignoring {@link #uuid}, {@link #generation} and\n+     * {@link #pendingGeneration}.\n+     * @param updated the metadata with the updated type and settings.\n+     * @return true if it is a noop update, false if data changed.\n+     */\n+    public boolean isNoopUpdate(RepositoryMetadata updated) {\n+        assert name.equals(updated.name);\n+        //noinspection ConstantConditions\n+        return name.equals(updated.name) && type.equals(updated.type()) && settings.equals(updated.settings());\n+    }\n+\n     @Override\n     public boolean equals(Object o) {\n         if (this == o) return true;"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java",
+          "patch": "@@ -147,16 +147,16 @@ public void registerRepository(final PutRepositoryRequest request, final ActionL\n         }\n \n         final StepListener<AcknowledgedResponse> acknowledgementStep = new StepListener<>();\n-        final StepListener<Void> publicationStep = new StepListener<>();\n+        final StepListener<Boolean> publicationStep = new StepListener<>(); // Boolean==changed.\n \n         if (request.verify()) {\n \n             // When publication has completed (and all acks received or timed out) then verify the repository.\n             // (if acks timed out then acknowledgementStep completes before the master processes this cluster state, hence why we have\n             // to wait for the publication to be complete too)\n             final StepListener<List<DiscoveryNode>> verifyStep = new StepListener<>();\n-            publicationStep.whenComplete(ignored -> acknowledgementStep.whenComplete(clusterStateUpdateResponse -> {\n-                if (clusterStateUpdateResponse.isAcknowledged()) {\n+            publicationStep.whenComplete(changed -> acknowledgementStep.whenComplete(clusterStateUpdateResponse -> {\n+                if (clusterStateUpdateResponse.isAcknowledged() && changed) {\n                     // The response was acknowledged - all nodes should know about the new repository, let's verify them\n                     verifyRepository(request.name(), verifyStep);\n                 } else {\n@@ -201,7 +201,7 @@ public ClusterState execute(ClusterState currentState) {\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n-                            if (newRepositoryMetadata.equalsIgnoreGenerations(repositoryMetadata)) {\n+                            if (newRepositoryMetadata.isNoopUpdate(repositoryMetadata)) {\n                                 // Previous version is the same as this one no update is needed.\n                                 return currentState;\n                             }\n@@ -256,7 +256,7 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS\n                             logger.info(\"put repository [{}]\", request.name());\n                         }\n                     }\n-                    publicationStep.onResponse(null);\n+                    publicationStep.onResponse(oldState != newState);\n                 }\n             }\n         );"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-08-04T09:09:59Z",
+      "user": "henningandersen",
+      "body": "It is common to do an idempotent PUT of a repo, just to ensure it is\r\nthere. This commit ensures that if the change is in fact a noop change,\r\nwe no longer do any repository verification, since a node having trouble\r\n(for instance running out of heap) could then mean such a no-change\r\nrepo update failing.\r\n\r\nCloses #76012\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 892496897,
+      "created_at": "2021-08-04T09:10:03Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review_comment",
+      "id": 682479882,
+      "created_at": "2021-08-04T10:12:07Z",
+      "user": "original-brownbear",
+      "body": "How does this verify that no verification takes place?",
+      "path": "server/src/internalClusterTest/java/org/elasticsearch/repositories/RepositoriesServiceIT.java",
+      "diff_hunk": "@@ -81,5 +82,11 @@ public void testUpdateRepository() {\n \n         final Repository updatedRepository = repositoriesService.repository(repositoryName);\n         assertThat(updatedRepository, updated ? not(sameInstance(originalRepository)) : sameInstance(originalRepository));\n+\n+        // check that a noop update does not verify.\n+        internalCluster().startDataOnlyNode(Settings.builder().put(Environment.PATH_REPO_SETTING.getKey(), createTempDir()).build());\n+        assertAcked(",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 89,
+      "original_line": 88,
+      "side": "RIGHT",
+      "original_position": 15,
+      "position": 16,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 682510346,
+          "user": "henningandersen",
+          "body": "The new node does not share the same `path.repo` as the rest of the cluster and therefore fails verification. The PUT would fail if it did any verification, thus checking that the verification does not run.\r\n\r\nI added a bit more to the comment to explain this.",
+          "created_at": "2021-08-04T10:58:13Z"
+        },
+        {
+          "id": 682511285,
+          "user": "original-brownbear",
+          "body": "Ah thanks, sorry for being slow there :) Sweet idea for a test :)",
+          "created_at": "2021-08-04T10:59:53Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 682488070,
+      "created_at": "2021-08-04T10:24:42Z",
+      "user": "original-brownbear",
+      "body": "Somewhat optional but: I wonder, can't we just check equality of settings below in this `if` and break out there to keep it simple? I find it confusing that we would add a third \"equals\" method to `RepositoryMetadata` that only differs through the uuid check from `equalsIgnoreGenerations` and that redundantly checks name and type equality.\r\n```\r\nif (canUpdateInPlace(newRepositoryMetadata, existing)) {\r\n                                // we're updating in place so the updated metadata must point at the same uuid and generations\r\nupdatedMetadata = repositoryMetadata.withSettings(newRepositoryMetadata.settings());\r\n```",
+      "path": "server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java",
+      "diff_hunk": "@@ -201,7 +201,7 @@ public ClusterState execute(ClusterState currentState) {\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n-                            if (newRepositoryMetadata.equalsIgnoreGenerations(repositoryMetadata)) {\n+                            if (newRepositoryMetadata.isNoopUpdate(repositoryMetadata)) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 204,
+      "side": "RIGHT",
+      "original_position": 25,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 682511753,
+          "user": "henningandersen",
+          "body": "Yeah, thanks, that can work out. I did consider it, but were somewhat afraid of one of:\r\n\r\n1. `canUpdateInPlace` sometime in the future allowing `type` update too in certain cases.\r\n2. `canUpdateInPlace` returning false due to a repo-plugin that returns false even if the settings are identical.\r\n\r\nI was probably over-thinking this so went with your suggestion, 1 would need some change in those lines anyway and 2 would be a bug in the repo plugin.",
+          "created_at": "2021-08-04T11:00:36Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 722105442,
+      "created_at": "2021-08-04T10:25:07Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": "Thanks @henningandersen one question and one optional request :) looks just fine otherwise."
+    },
+    {
+      "type": "commit",
+      "date": "2021-08-04T10:49:44Z",
+      "sha": "9cffd3b07206233e609cf50f9bcd3fc7ad8ea4a4",
+      "message": "clarify why test checks skipped verification",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2021-08-04T10:49:44Z",
+      "author_date": "2021-08-04T10:49:44Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2021-08-04T10:49:44Z",
+      "diff_text": "server/src/internalClusterTest/java/org/elasticsearch/repositories/RepositoriesServiceIT.java\n@@ -83,7 +83,8 @@ public void testUpdateRepository() {\n         final Repository updatedRepository = repositoriesService.repository(repositoryName);\n         assertThat(updatedRepository, updated ? not(sameInstance(originalRepository)) : sameInstance(originalRepository));\n \n-        // check that a noop update does not verify.\n+        // check that a noop update does not verify. Since the new data node does not share the same `path.repo`, verification will fail if\n+        // it runs.\n         internalCluster().startDataOnlyNode(Settings.builder().put(Environment.PATH_REPO_SETTING.getKey(), createTempDir()).build());\n         assertAcked(\n             client.admin().cluster().preparePutRepository(repositoryName).setType(updatedRepositoryType).setSettings(repoSettings).get()",
+      "diff": [
+        {
+          "file": "server/src/internalClusterTest/java/org/elasticsearch/repositories/RepositoriesServiceIT.java",
+          "patch": "@@ -83,7 +83,8 @@ public void testUpdateRepository() {\n         final Repository updatedRepository = repositoriesService.repository(repositoryName);\n         assertThat(updatedRepository, updated ? not(sameInstance(originalRepository)) : sameInstance(originalRepository));\n \n-        // check that a noop update does not verify.\n+        // check that a noop update does not verify. Since the new data node does not share the same `path.repo`, verification will fail if\n+        // it runs.\n         internalCluster().startDataOnlyNode(Settings.builder().put(Environment.PATH_REPO_SETTING.getKey(), createTempDir()).build());\n         assertAcked(\n             client.admin().cluster().preparePutRepository(repositoryName).setType(updatedRepositoryType).setSettings(repoSettings).get()"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2021-08-04T10:56:53Z",
+      "sha": "3bc8a97016eb29084b9d6cef6301c580eeb3d8f5",
+      "message": "simplify code a bit.",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2021-08-04T10:56:53Z",
+      "author_date": "2021-08-04T10:56:53Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2021-08-04T10:56:53Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/metadata/RepositoryMetadata.java\n@@ -167,18 +167,6 @@ public boolean equalsIgnoreGenerations(RepositoryMetadata other) {\n         return name.equals(other.name) && uuid.equals(other.uuid()) && type.equals(other.type()) && settings.equals(other.settings());\n     }\n \n-    /**\n-     * Checks if this instance contains the same data as the updated instance, ignoring {@link #uuid}, {@link #generation} and\n-     * {@link #pendingGeneration}.\n-     * @param updated the metadata with the updated type and settings.\n-     * @return true if it is a noop update, false if data changed.\n-     */\n-    public boolean isNoopUpdate(RepositoryMetadata updated) {\n-        assert name.equals(updated.name);\n-        //noinspection ConstantConditions\n-        return name.equals(updated.name) && type.equals(updated.type()) && settings.equals(updated.settings());\n-    }\n-\n     @Override\n     public boolean equals(Object o) {\n         if (this == o) return true;\nserver/src/main/java/org/elasticsearch/repositories/RepositoriesService.java\n@@ -201,10 +201,6 @@ public ClusterState execute(ClusterState currentState) {\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n-                            if (newRepositoryMetadata.isNoopUpdate(repositoryMetadata)) {\n-                                // Previous version is the same as this one no update is needed.\n-                                return currentState;\n-                            }\n                             Repository existing = RepositoriesService.this.repositories.get(request.name());\n                             if (existing == null) {\n                                 existing = RepositoriesService.this.internalRepositories.get(request.name());\n@@ -213,6 +209,10 @@ public ClusterState execute(ClusterState currentState) {\n                             assert existing.getMetadata() == repositoryMetadata;\n                             final RepositoryMetadata updatedMetadata;\n                             if (canUpdateInPlace(newRepositoryMetadata, existing)) {\n+                                if (repositoryMetadata.settings().equals(newRepositoryMetadata.settings())) {\n+                                    // Previous version is the same as this one no update is needed.\n+                                    return currentState;\n+                                }\n                                 // we're updating in place so the updated metadata must point at the same uuid and generations\n                                 updatedMetadata = repositoryMetadata.withSettings(newRepositoryMetadata.settings());\n                             } else {",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/metadata/RepositoryMetadata.java",
+          "patch": "@@ -167,18 +167,6 @@ public boolean equalsIgnoreGenerations(RepositoryMetadata other) {\n         return name.equals(other.name) && uuid.equals(other.uuid()) && type.equals(other.type()) && settings.equals(other.settings());\n     }\n \n-    /**\n-     * Checks if this instance contains the same data as the updated instance, ignoring {@link #uuid}, {@link #generation} and\n-     * {@link #pendingGeneration}.\n-     * @param updated the metadata with the updated type and settings.\n-     * @return true if it is a noop update, false if data changed.\n-     */\n-    public boolean isNoopUpdate(RepositoryMetadata updated) {\n-        assert name.equals(updated.name);\n-        //noinspection ConstantConditions\n-        return name.equals(updated.name) && type.equals(updated.type()) && settings.equals(updated.settings());\n-    }\n-\n     @Override\n     public boolean equals(Object o) {\n         if (this == o) return true;"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java",
+          "patch": "@@ -201,10 +201,6 @@ public ClusterState execute(ClusterState currentState) {\n                     List<RepositoryMetadata> repositoriesMetadata = new ArrayList<>(repositories.repositories().size() + 1);\n                     for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {\n                         if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {\n-                            if (newRepositoryMetadata.isNoopUpdate(repositoryMetadata)) {\n-                                // Previous version is the same as this one no update is needed.\n-                                return currentState;\n-                            }\n                             Repository existing = RepositoriesService.this.repositories.get(request.name());\n                             if (existing == null) {\n                                 existing = RepositoriesService.this.internalRepositories.get(request.name());\n@@ -213,6 +209,10 @@ public ClusterState execute(ClusterState currentState) {\n                             assert existing.getMetadata() == repositoryMetadata;\n                             final RepositoryMetadata updatedMetadata;\n                             if (canUpdateInPlace(newRepositoryMetadata, existing)) {\n+                                if (repositoryMetadata.settings().equals(newRepositoryMetadata.settings())) {\n+                                    // Previous version is the same as this one no update is needed.\n+                                    return currentState;\n+                                }\n                                 // we're updating in place so the updated metadata must point at the same uuid and generations\n                                 updatedMetadata = repositoryMetadata.withSettings(newRepositoryMetadata.settings());\n                             } else {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 722143814,
+      "created_at": "2021-08-04T10:58:14Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 722145138,
+      "created_at": "2021-08-04T10:59:57Z",
+      "user": "original-brownbear",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "review",
+      "id": 722145722,
+      "created_at": "2021-08-04T11:00:36Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 892609213,
+      "created_at": "2021-08-04T12:16:26Z",
+      "user": "henningandersen",
+      "body": "Thanks for reviewing this, Armin."
+    }
+  ]
+}

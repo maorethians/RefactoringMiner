@@ -1,0 +1,141 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 91794,
+  "pr_number": 91794,
+  "title": "Execute async cleanup tasks in CoordinatorTests",
+  "user": "DaveCTurner",
+  "created_at": "2022-11-22T11:32:19Z",
+  "merged_at": "2022-11-22T14:13:47Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">test",
+    ":Distributed/Cluster Coordination",
+    "Team:Distributed",
+    "v8.6.1",
+    "v8.7.0",
+    "v8.5.3"
+  ],
+  "base_commit": "8816fdab59246767a758c70e079819897ed7245f",
+  "merge_commit_sha": "763150001ce43c55d98f345e8104627592fc77ba",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/91794",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-11-22T11:26:57Z",
+      "sha": "39216e7f3281ec728647371c1dabcdfa7015a9fd",
+      "message": "Execute async cleanup tasks in CoordinatorTests\n\nClosing the `JoinValidationService` will enqueue a cache-cleaning task\nwhich must be executed to release any pages held by the cache.\n\nThis commit also introduces a deterministic leak detector to replace the\none based on garbage collection, because in these tests we know exactly\nthe expected lifecycle of all allocated pages.\n\nCloses #91599\nCloses #91379\nCloses #90576",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2022-11-22T11:26:57Z",
+      "author_date": "2022-11-22T11:26:57Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2022-11-22T11:26:57Z",
+      "diff_text": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java\n@@ -53,7 +53,6 @@\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.common.transport.TransportAddress;\n import org.elasticsearch.common.unit.ByteSizeValue;\n-import org.elasticsearch.common.util.MockPageCacheRecycler;\n import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;\n import org.elasticsearch.common.util.concurrent.PrioritizedEsThreadPoolExecutor;\n import org.elasticsearch.common.util.set.Sets;\n@@ -271,6 +270,7 @@ public class Cluster implements Releasable {\n         private final Map<Long, ClusterState> committedStatesByVersion = new HashMap<>();\n         private final LinearizabilityChecker linearizabilityChecker = new LinearizabilityChecker();\n         private final History history = new History();\n+        private final CountingPageCacheRecycler countingPageCacheRecycler;\n         private final Recycler<BytesRef> recycler;\n         private final NodeHealthService nodeHealthService;\n \n@@ -289,9 +289,8 @@ public Cluster(int initialNodeCount, boolean allNodesMasterEligible, Settings no\n \n         Cluster(int initialNodeCount, boolean allNodesMasterEligible, Settings nodeSettings, NodeHealthService nodeHealthService) {\n             this.nodeHealthService = nodeHealthService;\n-            this.recycler = usually()\n-                ? BytesRefRecycler.NON_RECYCLING_INSTANCE\n-                : new BytesRefRecycler(new MockPageCacheRecycler(Settings.EMPTY));\n+            this.countingPageCacheRecycler = new CountingPageCacheRecycler();\n+            this.recycler = new BytesRefRecycler(countingPageCacheRecycler);\n             deterministicTaskQueue.setExecutionDelayVariabilityMillis(DEFAULT_DELAY_VARIABILITY);\n \n             assertThat(initialNodeCount, greaterThan(0));\n@@ -876,6 +875,12 @@ public void close() {\n             }\n \n             clusterNodes.forEach(ClusterNode::close);\n+\n+            // Closing nodes may spawn some other background cleanup tasks that must also be run\n+            runFor(DEFAULT_DELAY_VARIABILITY, \"accumulate close-time tasks\");\n+            deterministicTaskQueue.runAllRunnableTasks();\n+\n+            countingPageCacheRecycler.assertAllPagesReleased();\n         }\n \n         protected List<NamedWriteableRegistry.Entry> extraNamedWriteables() {\ntest/framework/src/main/java/org/elasticsearch/cluster/coordination/CountingPageCacheRecycler.java\n@@ -0,0 +1,61 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.coordination;\n+\n+import org.elasticsearch.common.recycler.Recycler;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.PageCacheRecycler;\n+\n+import static org.junit.Assert.assertEquals;\n+import static org.junit.Assert.assertFalse;\n+\n+public class CountingPageCacheRecycler extends PageCacheRecycler {\n+\n+    private int openPages = 0;\n+\n+    public CountingPageCacheRecycler() {\n+        super(Settings.EMPTY);\n+    }\n+\n+    @Override\n+    public Recycler.V<byte[]> bytePage(boolean clear) {\n+        final var page = super.bytePage(clear);\n+        openPages += 1;\n+        return new Recycler.V<>() {\n+            boolean closed = false;\n+\n+            @Override\n+            public byte[] v() {\n+                return page.v();\n+            }\n+\n+            @Override\n+            public boolean isRecycled() {\n+                return page.isRecycled();\n+            }\n+\n+            @Override\n+            public void close() {\n+                assertFalse(closed);\n+                closed = true;\n+                openPages -= 1;\n+                page.close();\n+            }\n+        };\n+    }\n+\n+    @Override\n+    public Recycler.V<Object[]> objectPage() {\n+        throw new AssertionError(\"unexpected call to objectPage()\");\n+    }\n+\n+    public void assertAllPagesReleased() {\n+        assertEquals(0, openPages);\n+    }\n+}",
+      "diff": [
+        {
+          "file": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java",
+          "patch": "@@ -53,7 +53,6 @@\n import org.elasticsearch.common.settings.Settings;\n import org.elasticsearch.common.transport.TransportAddress;\n import org.elasticsearch.common.unit.ByteSizeValue;\n-import org.elasticsearch.common.util.MockPageCacheRecycler;\n import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;\n import org.elasticsearch.common.util.concurrent.PrioritizedEsThreadPoolExecutor;\n import org.elasticsearch.common.util.set.Sets;\n@@ -271,6 +270,7 @@ public class Cluster implements Releasable {\n         private final Map<Long, ClusterState> committedStatesByVersion = new HashMap<>();\n         private final LinearizabilityChecker linearizabilityChecker = new LinearizabilityChecker();\n         private final History history = new History();\n+        private final CountingPageCacheRecycler countingPageCacheRecycler;\n         private final Recycler<BytesRef> recycler;\n         private final NodeHealthService nodeHealthService;\n \n@@ -289,9 +289,8 @@ public Cluster(int initialNodeCount, boolean allNodesMasterEligible, Settings no\n \n         Cluster(int initialNodeCount, boolean allNodesMasterEligible, Settings nodeSettings, NodeHealthService nodeHealthService) {\n             this.nodeHealthService = nodeHealthService;\n-            this.recycler = usually()\n-                ? BytesRefRecycler.NON_RECYCLING_INSTANCE\n-                : new BytesRefRecycler(new MockPageCacheRecycler(Settings.EMPTY));\n+            this.countingPageCacheRecycler = new CountingPageCacheRecycler();\n+            this.recycler = new BytesRefRecycler(countingPageCacheRecycler);\n             deterministicTaskQueue.setExecutionDelayVariabilityMillis(DEFAULT_DELAY_VARIABILITY);\n \n             assertThat(initialNodeCount, greaterThan(0));\n@@ -876,6 +875,12 @@ public void close() {\n             }\n \n             clusterNodes.forEach(ClusterNode::close);\n+\n+            // Closing nodes may spawn some other background cleanup tasks that must also be run\n+            runFor(DEFAULT_DELAY_VARIABILITY, \"accumulate close-time tasks\");\n+            deterministicTaskQueue.runAllRunnableTasks();\n+\n+            countingPageCacheRecycler.assertAllPagesReleased();\n         }\n \n         protected List<NamedWriteableRegistry.Entry> extraNamedWriteables() {"
+        },
+        {
+          "file": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/CountingPageCacheRecycler.java",
+          "patch": "@@ -0,0 +1,61 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.coordination;\n+\n+import org.elasticsearch.common.recycler.Recycler;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.PageCacheRecycler;\n+\n+import static org.junit.Assert.assertEquals;\n+import static org.junit.Assert.assertFalse;\n+\n+public class CountingPageCacheRecycler extends PageCacheRecycler {\n+\n+    private int openPages = 0;\n+\n+    public CountingPageCacheRecycler() {\n+        super(Settings.EMPTY);\n+    }\n+\n+    @Override\n+    public Recycler.V<byte[]> bytePage(boolean clear) {\n+        final var page = super.bytePage(clear);\n+        openPages += 1;\n+        return new Recycler.V<>() {\n+            boolean closed = false;\n+\n+            @Override\n+            public byte[] v() {\n+                return page.v();\n+            }\n+\n+            @Override\n+            public boolean isRecycled() {\n+                return page.isRecycled();\n+            }\n+\n+            @Override\n+            public void close() {\n+                assertFalse(closed);\n+                closed = true;\n+                openPages -= 1;\n+                page.close();\n+            }\n+        };\n+    }\n+\n+    @Override\n+    public Recycler.V<Object[]> objectPage() {\n+        throw new AssertionError(\"unexpected call to objectPage()\");\n+    }\n+\n+    public void assertAllPagesReleased() {\n+        assertEquals(0, openPages);\n+    }\n+}"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-11-22T11:32:19Z",
+      "user": "DaveCTurner",
+      "body": "Closing the `JoinValidationService` will enqueue a cache-cleaning task which must be executed to release any pages held by the cache.\r\n\r\nThis commit also introduces a deterministic leak detector to replace the one based on garbage collection, because in these tests we know exactly the expected lifecycle of all allocated pages.\r\n\r\nCloses #91599\r\nCloses #91379\r\nCloses #90576"
+    },
+    {
+      "type": "comment",
+      "id": 1323528297,
+      "created_at": "2022-11-22T11:32:43Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1029273225,
+      "created_at": "2022-11-22T12:34:35Z",
+      "user": "kingherc",
+      "body": "It would be nice if log is e.g. TRACE to also capture the thread stack of the pages. That way, if the assertion that there is no page remaining fails, we may be able to inspect which thread stacks created them. I believe this should be cheap for the majority of the tests (since I guess they do not run in TRACE mode) and when a test fails we may easily re-run it with TRACE to figure out leaks.\r\n\r\nThis is optional if you consider this would be beneficial.",
+      "path": "test/framework/src/main/java/org/elasticsearch/cluster/coordination/CountingPageCacheRecycler.java",
+      "diff_hunk": "@@ -0,0 +1,61 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.coordination;\n+\n+import org.elasticsearch.common.recycler.Recycler;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.PageCacheRecycler;\n+\n+import static org.junit.Assert.assertEquals;\n+import static org.junit.Assert.assertFalse;\n+\n+public class CountingPageCacheRecycler extends PageCacheRecycler {\n+\n+    private int openPages = 0;\n+\n+    public CountingPageCacheRecycler() {\n+        super(Settings.EMPTY);\n+    }\n+\n+    @Override\n+    public Recycler.V<byte[]> bytePage(boolean clear) {\n+        final var page = super.bytePage(clear);\n+        openPages += 1;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 29,
+      "original_line": 29,
+      "side": "RIGHT",
+      "original_position": 29,
+      "position": 29,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1029279720,
+          "user": "DaveCTurner",
+          "body": "I think I'd prefer not to do this here, it would mean we can't just use a counter to check for leaks (or we'd have two whole different implementations depending on the log level). I'd rather just add such tracing code as and when it's needed.",
+          "created_at": "2022-11-22T12:41:38Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1189968323,
+      "created_at": "2022-11-22T12:35:51Z",
+      "user": "kingherc",
+      "state": "APPROVED",
+      "body": "LGTM! Just one comment if you think more tracing might help in the future."
+    },
+    {
+      "type": "review",
+      "id": 1189978392,
+      "created_at": "2022-11-22T12:41:39Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1323622262,
+      "created_at": "2022-11-22T12:43:01Z",
+      "user": "DaveCTurner",
+      "body": "I'm running some iterations of the `CoordinatorTests` in the background to see if this causes any problems before merging it."
+    }
+  ]
+}

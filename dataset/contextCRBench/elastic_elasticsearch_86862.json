@@ -1,0 +1,82 @@
+{
+    "pr_body": "This commit releases the BulkProcessor lock after a new bulk request\r\nis created during flush instead of waiting until the request is\r\ndispatched. This prevents a deadlock when the GENERIC thread pool\r\nis saturated with tasks adding new items to the BulkProcessor\r\nwaiting to obtain the lock, this might prevent the original\r\nBulkRequest of making progress in certain scenarios, as some\r\nretry operations might be dispatched in the GENERIC thread pool.\r\n\r\nCloses #68468",
+    "original_commit_id": "1eb591dc58d3f26bc8b5fa55f9c95ded2d7c2239",
+    "merged": false,
+    "pr_number": 86862,
+    "pr_title": "Do not hold the lock during flush in BulkProcessor",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Pinging @elastic/clients-team (Team:Clients)",
+        "Hi @fcofdez, I've created a changelog YAML for you.",
+        "I'm not sure if these are the correct labels, I was reviewing this comment https://github.com/elastic/elasticsearch/pull/85490#discussion_r868421363 and I decided to try to reproduce this issue and fix it. Maybe it makes sense to solve it differently, but I guess that having the test reproducing the issue is still valuable.",
+        "@elasticmachine run elasticsearch-ci/part-2\r\nUnrelated test failure `org.elasticsearch.xpack.ml.integration.TestFeatureLicenseTrackingIT`",
+        "> One effect of the lock here is to apply backpressure on the writing threads if indexing is slow. I think this change removes that backpressure which could lead to building up an unbounded number of pending items.\r\n\r\nI see your point but that backpressure is not guaranteed if the bulk request is flushed after the maximum size / number of docs is reached as the lock is released before sending the request. Additionally, in the ILM history context we're effectively queing an unlimited number of documents since we dispatch the `BulkProcessor#add` to the `GENERIC` thread pool, right? I guess it would make sense to clarify what's the expected behaviour of this class and rewrite it to handle better these scenarios.",
+        "Yes that's right, we are not really respecting backpressure with ILM history entries anyway thanks to the unbounded queue on the `GENERIC` threadpool. It'd be great to make that queue bounded too, but that's a separate (and much bigger) project. Still, I think it would be better not to introduce a new (and hidden) unbounded queue here.",
+        "> Still, I think it would be better not to introduce a new (and hidden) unbounded queue here.\r\n\r\nWhich queue is unbounded here ? It is kinda hard to follow since the scheduler is a `org.elasticsearch.threadpool.Scheduler` and could find any docs that guarantee (for/against) what happens if two schedules overlap. (i.e. flush 1 takes a long time and flush 2 needs to kick off). Is it the scheduler's queue that backs up or does the scheduler allow concurrent schedules meaning that multiple GENERIC threads would be inflight and blocked by the semaphor of BulkRequestHandler ? (Also the GENERIC thread pool is bounded, just a very high bound ... if I am reading correctly)\r\n\r\nIf we were using Java's `ScheduledThreadPoolExecutor#scheduleAtFixedRate` the docs there are explicit state \"If any execution of this task takes longer than its period, then subsequent executions may start late, but will not concurrently execute.\" ...so at worse we would back up the scheduler and have more control over the queue and rejections for this specific flush case. Do we need to use the custom scheduler for thread context stuff for security ? \r\n\r\nAt a higher level...what happens when the writes are very slow the flushes are very frequent and the concurrency of BulkRequestHandler is 1?\r\n",
+        "> Which queue is unbounded here ? It is kinda hard to follow since the scheduler is a org.elasticsearch.threadpool.Scheduler and could find any docs that guarantee (for/against) what happens if two schedules overlap. (i.e. flush 1 takes a long time and flush 2 needs to kick off). Is it the scheduler's queue that backs up or does the scheduler allow concurrent schedules meaning that multiple GENERIC threads would be inflight and blocked by the semaphor of BulkRequestHandler ?\r\n\r\nOur `Scheduler` is really [a `ScheduledThreadPoolExecutor` with a pool size of 1](https://github.com/elastic/elasticsearch/blob/12ad399c488f0cc60e19b5e1b29c6d569cb4351a/server/src/main/java/org/elasticsearch/threadpool/Scheduler.java#L45-L49); [these docs](https://docs.oracle.com/en/java/javase/18/docs/api/java.base/java/util/concurrent/ScheduledThreadPoolExecutor.html) indicate that this executor does not create extra threads but does have an unbounded queue:\r\n\r\n> While this class inherits from [ThreadPoolExecutor](https://docs.oracle.com/en/java/javase/18/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html), a few of the inherited tuning methods are not useful for it. In particular, because it acts as a fixed-sized pool using `corePoolSize` threads and an unbounded queue, adjustments to `maximumPoolSize` have no useful effect.\r\n\r\nHowever the scheduled flush tasks all immediately fork to the `GENERIC` pool so there can be (boundedly) many of them running at once, and (unboundedly) many of them enqueued.\r\n\r\n> (Also the GENERIC thread pool is bounded, just a very high bound ... if I am reading correctly)\r\n\r\nIt comes from `EsExecutors#newFixed` so the number of threads is bounded but its queue is unbounded.\r\n\r\n> At a higher level...what happens when the writes are very slow the flushes are very frequent and the concurrency of BulkRequestHandler is 1?\r\n\r\nRight, this is exactly the point. Today if writes get too far behind we block the threads calling `add()` which slows down the incoming work. With this change we remove that backpressure mechanism and allow the work to build up in memory without bound.",
+        "> However the scheduled flush tasks all immediately fork to the GENERIC pool so there can be (boundedly) many of them running at once, and (unboundedly) many of them enqueued.\r\n\r\nJust as a note, this depends on how `BulkProcessor` is configured. If the `ThreadPool` is used it dispatches the flush task to the `GENERIC` pool, otherwise the flush task is executed in the scheduler thread that is created for the `BulkProcessor`. ",
+        "Oh right I see, it ignores the `executor` parameter in that case. Tricky. Still, it's the same situation just with fewer threads involved right?"
+    ],
+    "commit_id": "8519c42edf435d00c458672aea5dd82394a205f9",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 531,
+            "start_side": null,
+            "start_line": null,
+            "line": 531,
+            "comment_lines": [
+                "[526][531]"
+            ],
+            "review_comment": [
+                "nit: (on the line above) assert lock.isLocked() == false //the bulkRequestHandler handles the concurrency"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+            "id": 35956,
+            "created_at": "2022-05-18T21:25:45Z",
+            "original_position": 46,
+            "side": "RIGHT",
+            "position": 46,
+            "original_start_line": null
+        },
+        {
+            "original_line": 537,
+            "start_side": null,
+            "start_line": null,
+            "line": 537,
+            "comment_lines": [
+                "[][537]"
+            ],
+            "review_comment": [
+                "nit: reverse the order of the conditions (i.e. put `flushSupplier.get() == false` last) to allow the number of actions to short circuit the or. (in most cases `flushSupplier.get() == false` will evaluate to false)"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+            "id": 35957,
+            "created_at": "2022-05-18T21:44:18Z",
+            "original_position": 60,
+            "side": "RIGHT",
+            "position": 60,
+            "original_start_line": null
+        },
+        {
+            "original_line": 517,
+            "start_side": null,
+            "start_line": null,
+            "line": 517,
+            "comment_lines": [
+                "[513][517]"
+            ],
+            "review_comment": [
+                "nit: remove this comment. "
+            ],
+            "path": "server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java",
+            "id": 35955,
+            "created_at": "2022-05-18T21:24:09Z",
+            "original_position": 39,
+            "side": "RIGHT",
+            "position": 39,
+            "original_start_line": null
+        }
+    ]
+}

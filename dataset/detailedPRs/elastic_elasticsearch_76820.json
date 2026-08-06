@@ -1,0 +1,205 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 76820,
+  "pr_number": 76820,
+  "title": "Watcher: Fix index action simulation when indexing several documents",
+  "user": "spinscale",
+  "created_at": "2021-08-23T11:43:02Z",
+  "merged_at": "2021-08-31T07:14:42Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Watcher",
+    "Team:Data Management (obsolete)",
+    "v7.16.0",
+    "v8.0.0-alpha2"
+  ],
+  "base_commit": "8aed99fc0241f164cc6375541dfdc5c0a463f163",
+  "merge_commit_sha": "441d7b51999f12aa064d0cd9e2f8e975074cda6e",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/76820",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-08-23T11:40:08Z",
+      "sha": "19c3811022334d695405065080dac02433ea04c3",
+      "message": "Watcher: Fix index action simulation when indexing several documents\n\nWhen using the index action to index several documents at once,\nsimulation the action ended up in indexed documents because there was\nnot break in case the action should only be simulated.\n\nThis commits adds such an abortion condition together with a proper\nsimulation response.\n\nCloses #74148 #66735",
+      "author": "Alexander Reelsen",
+      "author_email": "alexander@reelsen.net",
+      "author_raw_date": "2021-08-23T11:40:08Z",
+      "author_date": "2021-08-23T11:40:08Z",
+      "committer": "Alexander Reelsen",
+      "committer_email": "alexander@reelsen.net",
+      "raw_date": "2021-08-23T11:40:08Z",
+      "diff_text": "x-pack/plugin/watcher/qa/rest/src/yamlRestTest/resources/rest-api-spec/test/watcher/execute_watch/50_action_mode.yml\n@@ -71,3 +71,37 @@ teardown:\n   - match: { watch_record.result.actions.0.id: \"logging\" }\n   - match: { watch_record.result.actions.0.status: \"simulated\" }\n \n+---\n+\"Test simulate index action\":\n+  - do:\n+      watcher.execute_watch:\n+        body: >\n+          {\n+            \"watch\": {\n+              \"trigger\": {\n+                \"schedule\" : { \"cron\" : \"0 0 0 1 * ? 2099\" }\n+              },\n+              \"input\": {\n+                \"simple\": {\n+                  \"foo\": \"bar\"\n+                }\n+              },\n+              \"actions\": {\n+                \"index_payload\" : {\n+                  \"transform\": { \"script\": \"return ['_doc':[['_id':'the-id','_index':'the-index','a':'b']]]\"},\n+                  \"index\" : {}\n+                }\n+              }\n+            },\n+            \"action_modes\" : {\n+              \"_all\" : \"simulate\"\n+            }\n+          }\n+\n+  - match: { watch_record.trigger_event.type: \"manual\" }\n+  - match: { watch_record.state: \"executed\" }\n+  - match: { watch_record.status.execution_state: \"executed\" }\n+  - match: { watch_record.result.actions.0.id: \"index_payload\" }\n+  - match: { watch_record.result.actions.0.status: \"simulated\" }\n+  - match: { watch_record.result.actions.0.index.request.source.0._id: \"the-id\" }\n+  - match: { watch_record.result.actions.0.index.request.source.0._index: \"the-index\" }\nx-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/actions/index/ExecutableIndexAction.java\n@@ -7,6 +7,7 @@\n package org.elasticsearch.xpack.watcher.actions.index;\n \n import org.apache.logging.log4j.Logger;\n+import org.elasticsearch.action.DocWriteRequest;\n import org.elasticsearch.action.DocWriteResponse;\n import org.elasticsearch.action.bulk.BulkItemResponse;\n import org.elasticsearch.action.bulk.BulkRequest;\n@@ -15,9 +16,9 @@\n import org.elasticsearch.action.index.IndexResponse;\n import org.elasticsearch.client.Client;\n import org.elasticsearch.common.bytes.BytesReference;\n-import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.common.xcontent.XContentBuilder;\n import org.elasticsearch.common.xcontent.XContentType;\n+import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.xpack.core.ClientHelper;\n import org.elasticsearch.xpack.core.watcher.actions.Action;\n import org.elasticsearch.xpack.core.watcher.actions.Action.Result.Status;\n@@ -145,6 +146,22 @@ Action.Result indexBulk(Iterable<?> list, String actionId, WatchExecutionContext\n             }\n             bulkRequest.add(indexRequest);\n         }\n+\n+        if (ctx.simulateAction(actionId)) {\n+            try (XContentBuilder builder = jsonBuilder().startArray()) {\n+                for (DocWriteRequest<?> request : bulkRequest.requests()) {\n+                    builder.startObject();\n+                    builder.field(\"_id\", request.id());\n+                    builder.field(\"_index\", request.index());\n+                    builder.endObject();\n+                }\n+                builder.endArray();\n+\n+                return new IndexAction.Simulated(\"\", \"\",\n+                    action.refreshPolicy, new XContentSource(BytesReference.bytes(builder), XContentType.JSON));\n+            }\n+        }\n+\n         ClientHelper.assertNoAuthorizationHeader(ctx.watch().status().getHeaders());\n         BulkResponse bulkResponse = ClientHelper.executeWithHeaders(ctx.watch().status().getHeaders(), ClientHelper.WATCHER_ORIGIN, client,\n                 () -> client.bulk(bulkRequest).actionGet(bulkDefaultTimeout));\nx-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/actions/index/IndexActionTests.java\n@@ -60,6 +60,7 @@\n import static org.hamcrest.Matchers.is;\n import static org.hamcrest.Matchers.startsWith;\n import static org.mockito.Mockito.mock;\n+import static org.mockito.Mockito.verifyZeroInteractions;\n import static org.mockito.Mockito.when;\n \n public class IndexActionTests extends ESTestCase {\n@@ -383,4 +384,25 @@ public void testFailureResult() throws Exception {\n             assertThat(result.status(), is(Status.FAILURE));\n         }\n     }\n+\n+    public void testIndexSeveralDocumentsIsSimulated() throws Exception {\n+        IndexAction action = new IndexAction(\"test-index\", null, null, \"@timestamp\", null, null, refreshPolicy);\n+        ExecutableIndexAction executable = new ExecutableIndexAction(action, logger, client,\n+            TimeValue.timeValueSeconds(30), TimeValue.timeValueSeconds(30));\n+\n+        String docId = randomAlphaOfLength(5);\n+        final List<Map<String, String>> docs = List.of(Map.of(\"foo\", \"bar\", \"_id\", docId));\n+        Payload payload;\n+        if (randomBoolean()) {\n+            payload = new Payload.Simple(\"_doc\", docs);\n+        } else {\n+            payload = new Payload.Simple(\"_doc\", docs.toArray());\n+        }\n+        WatchExecutionContext ctx = WatcherTestUtils.mockExecutionContext(\"_id\", ZonedDateTime.now(ZoneOffset.UTC), payload);\n+        when(ctx.simulateAction(\"my_id\")).thenReturn(true);\n+\n+        Action.Result result = executable.execute(\"my_id\", ctx, payload);\n+        assertThat(result.status(), is(Status.SIMULATED));\n+        verifyZeroInteractions(client);\n+    }\n }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/watcher/qa/rest/src/yamlRestTest/resources/rest-api-spec/test/watcher/execute_watch/50_action_mode.yml",
+          "patch": "@@ -71,3 +71,37 @@ teardown:\n   - match: { watch_record.result.actions.0.id: \"logging\" }\n   - match: { watch_record.result.actions.0.status: \"simulated\" }\n \n+---\n+\"Test simulate index action\":\n+  - do:\n+      watcher.execute_watch:\n+        body: >\n+          {\n+            \"watch\": {\n+              \"trigger\": {\n+                \"schedule\" : { \"cron\" : \"0 0 0 1 * ? 2099\" }\n+              },\n+              \"input\": {\n+                \"simple\": {\n+                  \"foo\": \"bar\"\n+                }\n+              },\n+              \"actions\": {\n+                \"index_payload\" : {\n+                  \"transform\": { \"script\": \"return ['_doc':[['_id':'the-id','_index':'the-index','a':'b']]]\"},\n+                  \"index\" : {}\n+                }\n+              }\n+            },\n+            \"action_modes\" : {\n+              \"_all\" : \"simulate\"\n+            }\n+          }\n+\n+  - match: { watch_record.trigger_event.type: \"manual\" }\n+  - match: { watch_record.state: \"executed\" }\n+  - match: { watch_record.status.execution_state: \"executed\" }\n+  - match: { watch_record.result.actions.0.id: \"index_payload\" }\n+  - match: { watch_record.result.actions.0.status: \"simulated\" }\n+  - match: { watch_record.result.actions.0.index.request.source.0._id: \"the-id\" }\n+  - match: { watch_record.result.actions.0.index.request.source.0._index: \"the-index\" }"
+        },
+        {
+          "file": "x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/actions/index/ExecutableIndexAction.java",
+          "patch": "@@ -7,6 +7,7 @@\n package org.elasticsearch.xpack.watcher.actions.index;\n \n import org.apache.logging.log4j.Logger;\n+import org.elasticsearch.action.DocWriteRequest;\n import org.elasticsearch.action.DocWriteResponse;\n import org.elasticsearch.action.bulk.BulkItemResponse;\n import org.elasticsearch.action.bulk.BulkRequest;\n@@ -15,9 +16,9 @@\n import org.elasticsearch.action.index.IndexResponse;\n import org.elasticsearch.client.Client;\n import org.elasticsearch.common.bytes.BytesReference;\n-import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.common.xcontent.XContentBuilder;\n import org.elasticsearch.common.xcontent.XContentType;\n+import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.xpack.core.ClientHelper;\n import org.elasticsearch.xpack.core.watcher.actions.Action;\n import org.elasticsearch.xpack.core.watcher.actions.Action.Result.Status;\n@@ -145,6 +146,22 @@ Action.Result indexBulk(Iterable<?> list, String actionId, WatchExecutionContext\n             }\n             bulkRequest.add(indexRequest);\n         }\n+\n+        if (ctx.simulateAction(actionId)) {\n+            try (XContentBuilder builder = jsonBuilder().startArray()) {\n+                for (DocWriteRequest<?> request : bulkRequest.requests()) {\n+                    builder.startObject();\n+                    builder.field(\"_id\", request.id());\n+                    builder.field(\"_index\", request.index());\n+                    builder.endObject();\n+                }\n+                builder.endArray();\n+\n+                return new IndexAction.Simulated(\"\", \"\",\n+                    action.refreshPolicy, new XContentSource(BytesReference.bytes(builder), XContentType.JSON));\n+            }\n+        }\n+\n         ClientHelper.assertNoAuthorizationHeader(ctx.watch().status().getHeaders());\n         BulkResponse bulkResponse = ClientHelper.executeWithHeaders(ctx.watch().status().getHeaders(), ClientHelper.WATCHER_ORIGIN, client,\n                 () -> client.bulk(bulkRequest).actionGet(bulkDefaultTimeout));"
+        },
+        {
+          "file": "x-pack/plugin/watcher/src/test/java/org/elasticsearch/xpack/watcher/actions/index/IndexActionTests.java",
+          "patch": "@@ -60,6 +60,7 @@\n import static org.hamcrest.Matchers.is;\n import static org.hamcrest.Matchers.startsWith;\n import static org.mockito.Mockito.mock;\n+import static org.mockito.Mockito.verifyZeroInteractions;\n import static org.mockito.Mockito.when;\n \n public class IndexActionTests extends ESTestCase {\n@@ -383,4 +384,25 @@ public void testFailureResult() throws Exception {\n             assertThat(result.status(), is(Status.FAILURE));\n         }\n     }\n+\n+    public void testIndexSeveralDocumentsIsSimulated() throws Exception {\n+        IndexAction action = new IndexAction(\"test-index\", null, null, \"@timestamp\", null, null, refreshPolicy);\n+        ExecutableIndexAction executable = new ExecutableIndexAction(action, logger, client,\n+            TimeValue.timeValueSeconds(30), TimeValue.timeValueSeconds(30));\n+\n+        String docId = randomAlphaOfLength(5);\n+        final List<Map<String, String>> docs = List.of(Map.of(\"foo\", \"bar\", \"_id\", docId));\n+        Payload payload;\n+        if (randomBoolean()) {\n+            payload = new Payload.Simple(\"_doc\", docs);\n+        } else {\n+            payload = new Payload.Simple(\"_doc\", docs.toArray());\n+        }\n+        WatchExecutionContext ctx = WatcherTestUtils.mockExecutionContext(\"_id\", ZonedDateTime.now(ZoneOffset.UTC), payload);\n+        when(ctx.simulateAction(\"my_id\")).thenReturn(true);\n+\n+        Action.Result result = executable.execute(\"my_id\", ctx, payload);\n+        assertThat(result.status(), is(Status.SIMULATED));\n+        verifyZeroInteractions(client);\n+    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-08-23T11:43:02Z",
+      "user": "spinscale",
+      "body": "When using the index action to index several documents at once,\r\nsimulation the action ended up in indexed documents because there was\r\nnot break in case the action should only be simulated.\r\n\r\nThis commits adds such an abortion condition together with a proper\r\nsimulation response.\r\n\r\nCloses #74148 #66735\r\n\r\nThe proper fix would probably be to only have a bulk action, but this is a small and readable fix for now."
+    },
+    {
+      "type": "commit",
+      "date": "2021-08-23T11:46:53Z",
+      "sha": "452ef1bb6e636b00acf2410a3506df3ea4679b8a",
+      "message": "Merge branch 'master' into 2108-fix-watcher-index-action-simulation",
+      "author": "Alexander Reelsen",
+      "author_email": "alexander@reelsen.net",
+      "author_raw_date": "2021-08-23T11:46:53Z",
+      "author_date": "2021-08-23T11:46:53Z",
+      "committer": "Alexander Reelsen",
+      "committer_email": "alexander@reelsen.net",
+      "raw_date": "2021-08-23T11:46:53Z",
+      "diff_text": "distribution/docker/src/docker/Dockerfile.cloud-ess\n@@ -2,7 +2,7 @@ FROM ${base_image} AS builder\n \n USER root\n \n-COPY plugins/*.zip /opt/plugins/archive\n+COPY plugins/*.zip /opt/plugins/archive/\n \n RUN chown root.root /opt/plugins/archive/*\n RUN chmod 0444 /opt/plugins/archive/*\ndocs/reference/ml/df-analytics/apis/get-trained-models.asciidoc\n@@ -225,8 +225,7 @@ List of the available hyperparameters optimized during the\n `absolute_importance`::::\n (double)\n A positive number showing how much the parameter influences the variation of the \n-// {ml-docs}/dfa-regression-lossfunction.html[loss function]. \n-loss function. For \n+{ml-docs}/dfa-regression-lossfunction.html[loss function]. For \n hyperparameters with values that are not specified by the user but tuned during \n hyperparameter optimization. \n \ndocs/reference/ml/df-analytics/apis/put-dfanalytics.asciidoc\n@@ -392,9 +392,9 @@ include::{es-repo-dir}/ml/ml-shared.asciidoc[tag=lambda]\n The loss function used during {regression}. Available options are `mse` (mean\n squared error), `msle` (mean squared logarithmic error),  `huber` (Pseudo-Huber\n loss). Defaults to `mse`.\n-// Refer to\n-// {ml-docs}/dfa-regression-lossfunction.html[Loss functions for {regression} analyses]\n-// to learn more.\n+Refer to\n+{ml-docs}/dfa-regression-lossfunction.html[Loss functions for {regression} analyses]\n+to learn more.\n \n `loss_function_parameter`::::\n (Optional, double)\nx-pack/plugin/sql/qa/server/security/src/test/java/org/elasticsearch/xpack/sql/qa/security/CliSecurityIT.java\n@@ -29,23 +29,19 @@ public class CliSecurityIT extends SqlSecurityTestCase {\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testDescribeWorksAsFullAccess() {\n-    }\n+    public void testDescribeWorksAsFullAccess() {}\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testQuerySingleFieldGranted() {\n-    }\n+    public void testQuerySingleFieldGranted() {}\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testScrollWithSingleFieldExcepted() {\n-    }\n+    public void testScrollWithSingleFieldExcepted() {}\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testQueryWorksAsAdmin() {\n-    }\n+    public void testQueryWorksAsAdmin() {}\n \n     static SecurityConfig adminSecurityConfig() {\n         String keystoreLocation;",
+      "diff": [
+        {
+          "file": "distribution/docker/src/docker/Dockerfile.cloud-ess",
+          "patch": "@@ -2,7 +2,7 @@ FROM ${base_image} AS builder\n \n USER root\n \n-COPY plugins/*.zip /opt/plugins/archive\n+COPY plugins/*.zip /opt/plugins/archive/\n \n RUN chown root.root /opt/plugins/archive/*\n RUN chmod 0444 /opt/plugins/archive/*"
+        },
+        {
+          "file": "docs/reference/ml/df-analytics/apis/get-trained-models.asciidoc",
+          "patch": "@@ -225,8 +225,7 @@ List of the available hyperparameters optimized during the\n `absolute_importance`::::\n (double)\n A positive number showing how much the parameter influences the variation of the \n-// {ml-docs}/dfa-regression-lossfunction.html[loss function]. \n-loss function. For \n+{ml-docs}/dfa-regression-lossfunction.html[loss function]. For \n hyperparameters with values that are not specified by the user but tuned during \n hyperparameter optimization. \n "
+        },
+        {
+          "file": "docs/reference/ml/df-analytics/apis/put-dfanalytics.asciidoc",
+          "patch": "@@ -392,9 +392,9 @@ include::{es-repo-dir}/ml/ml-shared.asciidoc[tag=lambda]\n The loss function used during {regression}. Available options are `mse` (mean\n squared error), `msle` (mean squared logarithmic error),  `huber` (Pseudo-Huber\n loss). Defaults to `mse`.\n-// Refer to\n-// {ml-docs}/dfa-regression-lossfunction.html[Loss functions for {regression} analyses]\n-// to learn more.\n+Refer to\n+{ml-docs}/dfa-regression-lossfunction.html[Loss functions for {regression} analyses]\n+to learn more.\n \n `loss_function_parameter`::::\n (Optional, double)"
+        },
+        {
+          "file": "x-pack/plugin/sql/qa/server/security/src/test/java/org/elasticsearch/xpack/sql/qa/security/CliSecurityIT.java",
+          "patch": "@@ -29,23 +29,19 @@ public class CliSecurityIT extends SqlSecurityTestCase {\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testDescribeWorksAsFullAccess() {\n-    }\n+    public void testDescribeWorksAsFullAccess() {}\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testQuerySingleFieldGranted() {\n-    }\n+    public void testQuerySingleFieldGranted() {}\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testScrollWithSingleFieldExcepted() {\n-    }\n+    public void testScrollWithSingleFieldExcepted() {}\n \n     @Override\n     @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/76806\")\n-    public void testQueryWorksAsAdmin() {\n-    }\n+    public void testQueryWorksAsAdmin() {}\n \n     static SecurityConfig adminSecurityConfig() {\n         String keystoreLocation;"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 908350018,
+      "created_at": "2021-08-30T13:36:48Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-data-management (Team:Data Management)"
+    },
+    {
+      "type": "review_comment",
+      "id": 698498220,
+      "created_at": "2021-08-30T13:41:27Z",
+      "user": "martijnvg",
+      "body": "Can `BulkItemResponse` be reused here and then serialise that to json?\r\nThis way if the format ever changes then this code doesn't need to be changed.",
+      "path": "x-pack/plugin/watcher/src/main/java/org/elasticsearch/xpack/watcher/actions/index/ExecutableIndexAction.java",
+      "diff_hunk": "@@ -145,6 +146,22 @@ public ExecutableIndexAction(IndexAction action, Logger logger, Client client,\n             }\n             bulkRequest.add(indexRequest);\n         }\n+\n+        if (ctx.simulateAction(actionId)) {\n+            try (XContentBuilder builder = jsonBuilder().startArray()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 151,
+      "original_line": 151,
+      "side": "RIGHT",
+      "original_position": 25,
+      "position": 25,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 698527998,
+          "user": "spinscale",
+          "body": "there is no bulk item response, because the request is not sent but only simulated",
+          "created_at": "2021-08-30T14:18:01Z"
+        },
+        {
+          "id": 699046619,
+          "user": "martijnvg",
+          "body": "Right, my comment doesn't make much sense. Most of the `BulkItemResponse` instance would have dummy values (except for id and index).",
+          "created_at": "2021-08-31T07:12:19Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 741662236,
+      "created_at": "2021-08-30T13:42:10Z",
+      "user": "martijnvg",
+      "state": "COMMENTED",
+      "body": "Thanks, looks good Alex!\r\nI left one question and I also wonder whether this should be back ported to the 7.x branch?"
+    },
+    {
+      "type": "review",
+      "id": 741702898,
+      "created_at": "2021-08-30T14:18:01Z",
+      "user": "spinscale",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 908383304,
+      "created_at": "2021-08-30T14:18:42Z",
+      "user": "spinscale",
+      "body": "I think it should be ported back, but I'll leave that and merging gladly to you - not really up-to-date with existing tooling :-)"
+    },
+    {
+      "type": "review",
+      "id": 742356991,
+      "created_at": "2021-08-31T07:12:19Z",
+      "user": "martijnvg",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 742357535,
+      "created_at": "2021-08-31T07:12:57Z",
+      "user": "martijnvg",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 908964719,
+      "created_at": "2021-08-31T07:13:25Z",
+      "user": "martijnvg",
+      "body": "> I think it should be ported back, but I'll leave that and merging gladly to you - not really up-to-date with existing tooling :-)\r\n\r\n:) I will merge and backport."
+    },
+    {
+      "type": "comment",
+      "id": 908968922,
+      "created_at": "2021-08-31T07:20:02Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💚 Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [7.x](https://github.com/elastic/elasticsearch/pull/77048)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/77048\">](https://github.com/elastic/elasticsearch/pull/77048) |"
+    }
+  ]
+}

@@ -1,0 +1,131 @@
+{
+    "pr_body": "Fix https://github.com/elastic/elasticsearch/issues/111452\r\n\r\nhttps://github.com/elastic/elasticsearch/pull/107545 postpones some of the validation for fields that occur in multiple indices with different types. Such fields must not be explicitly used in the query.\r\n\r\nThe validation now happens [after the main reference resolution](https://github.com/elastic/elasticsearch/pull/107545/files#diff-2c689d9c0606d310fd36a603064f43cb4b23d356f08983fbdb98c65e76e6919dR1187-R1192). This is problematic for renames in particular. Consider a field `a` that has the same type in all indices:\r\n```\r\nFROM idx | RENAME a AS b\r\n```\r\nis perfectly valid. But after reference resolution, the `RENAME` becomes a `PROJECT` that has to list _all_ fields that it will output. If there is a `field` that is `keyword` in `index1` but `ip` in `index2`, we have the following\r\n```\r\nFROM idx | PROJECT field, a AS b\r\n```\r\nPerforming the validation _now_ gives wrong results, because it sees `field` and flags it as invalid; `field` was not used explicitly, but ended up in the plan due to replacing `RENAME` by a `PROJECT`.\r\n\r\n~~This PR reverts to the original approach: during the initial resolution in `ResolveRefs`, we immediately validate usage of a field attribute referring to a multi-typed field. Usage is considered valid if the attribute is either used inside a conversion function, like `TO_IP`, or if the attribute is being dropped.~~\r\n\r\n**Updated with another approach**: This PR now aligns how we treat multi-typed fields with how we treat unsupported field types. The latter are already being passed through and are even allowed to be mentioned explicitly in `KEEP`, ~~`RENAME`~~ and `DROP`. To achieve this, rather than mapping `FieldAttribute`s containing an `InvalidMappedField` to `UnresolvedAttribute` - which the verifier finds and counts as invalid query - we map such field attributes to `UnsupportedAttribute`, which is what fields with unsupported types are also being mapped to.\r\n\r\nTo avoid weird workarounds when resolving `STATS`, type resolution for convert functions becomes more lenient, so that multi-typed field attributes (`FieldAttribute` containing an `InvalidMappedField`) are considered resolved as long as all of the mapped types are supported by the convert function; e.g. `TO_IP(client_ip)` in case `client_ip` is mapped as both `keyword` and `ip`.",
+    "original_commit_id": "f90dc31c00c40b464f87aecf30e3fda361f4101f",
+    "merged": true,
+    "pr_number": 111475,
+    "pr_title": "ESQL: Fix for overzealous validation in case of invalid mapped fields",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Hi @alex-spies, I've created a changelog YAML for you.",
+        "Pinging @elastic/es-analytical-engine (Team:Analytics)",
+        "Hi @alex-spies, I've updated the changelog YAML for you.",
+        "I took a new approach today; this should be closer to what we already had, because it uses the pass-through mechanism that we have in place for fields with unsupported data types (passed through as `null`s). It also avoids any changes to `Node`.",
+        "One more approach that seems to solve the problems when resolving aggregates:\r\nConsider expressions like `TO_IP(client_ip)` _resolved_ when `client_ip` is a multi-typed field attribute whose types can all be used in `TO_IP`. Considering it unresolved caused issues when trying to resolve `STATS` and `INLINESTATS`, which would've been hacky to work around; considering `TO_IP(client_ip)` resolved is conceptually cleaner, as we _know_ this is valid.",
+        "`FROM sample_data, sample_data_str | rename client_ip as foo` excellent find @astefan (How could I miss that..).\r\n\r\nThe error message that this yields\r\n\r\n```\r\n\"Cannot invoke \\\"org.elasticsearch.xpack.esql.planner.Layout$ChannelAndType.channel()\\\" because the return value of \\\"org.elasticsearch.xpack.esql.planner.Layout.get(org.elasticsearch.xpack.esql.core.expression.NameId)\\\" is null\"\r\n```\r\n\r\nis consistent with what you get when you rename a field of unsupported type; in your example, that'd be\r\n```\r\nfrom test | rename flatx as foo\r\n```\r\n\r\nI'll try to improve that; renaming should be okay for both or have a nice error message for both. I'm leaning towards error message, because otherwise users might wanna do `FROM idx | RENAME multi_typed_field AS foo | EVAL foo = to_ip(foo)`.\r\n\r\nThe argument for allowing multi-typed field in more places, i.e. `KEEP`, is that we should not be _more_ restrictive with multi-typed fields than with fields of unsupported types. Mapping `FieldAttribute`s containing `InvalidMappedField`s (i.e. union type fields) to `UnsupportedAttribute` forces consistency for these two kinds of fields.\r\n\r\nIn particular, `KEEP flatx` is allowed in your example. And allowing this is _important_ because on main, `KEEP *x` _fails_ which is a bad UX imho - I wanna be able to `KEEP` a bunch of fields matching a wildcards; if this accidentally includes a couple multi-typed fields, I as a user won't care so much; but having to explicitly `DROP` them before the `KEEP` is inconvenient, and it's inconsistent because it's not needed for fields of unsupported type, like `flatx`.",
+        "> So far, we said \"this is unsupported, so I want to remove it, drop gives me that\", so what's the argument for keep and especially rename?\r\n\r\nUnsupported fields are allowed to pass through. With keep we allow for the them to be retained, with drop to be discarded and with rename to change their alias. All valid sub-cases of projection.\r\nHowever unsupported fields cannot be manipulated.\r\n\r\n> FROM idx | RENAME multi_typed_field AS foo | EVAL foo = to_ip(foo)\r\n\r\nCan the query be written differently to not throw an error? Is the issue EVAL or RENAME?\r\n",
+        "> with drop to be discarded and with rename to change their alias. All valid sub-cases of projection.\r\nHowever unsupported fields cannot be manipulated.\r\n\r\nThat's all true except for `RENAME`; this currently does not work with unsupported types in main (layout errors). We can fix it or forbid it. In any case, I'd like to do the same for multi-typed fields and fields of unsupported type for consistency.\r\n\r\n> `FROM idx | RENAME multi_typed_field AS foo | EVAL foo = to_ip(foo)`\r\n> Can the query be written differently to not throw an error? Is the issue EVAL or RENAME?\r\n\r\nThis can be simply written as `FROM idx | EVAL foo = to_ip(multi_typed_field)`. As of now, the problem is the layout issue with RENAME used on unsupported attributes; but even if fixed, it'd be a bit of additional work to ensure renaming a multi-typed field _and then_ using a conversion function on it is properly supported - at the very least we'd need to add good tests.",
+        "Found a fix for `RENAME unsupported AS foo` which also fixes `RENAME multi_typed_field AS foo`. It required creating reference attributes from aliases even if the child expression is not fully resolved - which is exactly the case for `UnsupportedAttribute`, which is considered unresolved, but its type is resolved (to `UNSUPPORTED`).\r\n\r\n@costin @astefan let's discuss whether we want to allow `RENAME` for unsupported/multi types before moving on with this fix.\r\n\r\n(Side note: maybe the verification step could be simplified if we didn't consider `UnsupportedAttribute` as unresolvable. I suspect that the mechanism that allows passing through unsupported types could be simpler if we shifted the responsibility to the type resolution step only, i.e. don't fail a query just because we see an `UnsupportedAttribute`, but fail it when this is used in a place that requires something other than the `UNSUPPORTED` data type. It would prevent having to change `Alias.toAttribute` as well.)",
+        "@astefan found another nice edge case:\r\n\r\n```\r\n// client_ip is mapped as ip and keyword\r\nFROM sample_data, sample_data_str | rename client_ip as foo | sort foo\r\n```\r\nIn the current state of the PR, this actually computes *even though it's clearly incorrect*, while\r\n```\r\nFROM sample_data, sample_data_str | sort client_ip\r\n```\r\nCorrectly returns a validation error. The same is true when we replace the `sort` by an `mv_expand`.\r\n\r\nThis indicates that allowing to `RENAME my_unsupported_field AS foo` will require more work because we'll at least have to carefully re-check the validation and add additional tests.",
+        "Discussed this offline with @costin and @astefan : we won't allow `RENAME`s of unsupported/multi-typed fields for now; we can add this later.\r\n\r\nUpdated the PR, invalidated such `RENAME`s and added a verifier test. If CI likes this, I think this should be good to go.",
+        "## \ud83d\udc94 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| \u274c |  8.15  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 111475`",
+        "## \ud83d\udc9a All backports created successfully\n\n| Status | Branch | Result |\n|:------:|:------:|:------|\n|\u2705|8.15|[<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/111735\">](https://github.com/elastic/elasticsearch/pull/111735)|\n\n### Questions ?\nPlease refer to the [Backport tool documentation](https://github.com/sqren/backport)\n\n<!--- Backport version: 9.4.3 -->"
+    ],
+    "commit_id": "35ca062f807f06d50fc61aac63c19337de099607",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 1065,
+            "start_side": "LEFT",
+            "start_line": 1060,
+            "line": 1065,
+            "comment_lines": [
+                "[1065][]"
+            ],
+            "review_comment": [
+                "Unrelated, but maybe it's better not to fake an ES field here, `UnresolvedAttribute` seems to do the trick as well."
+            ],
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/analysis/Analyzer.java",
+            "id": 37256,
+            "created_at": "2024-08-05T14:03:33Z",
+            "original_position": 28,
+            "side": "LEFT",
+            "position": 77,
+            "original_start_line": 1070
+        },
+        {
+            "original_line": 183,
+            "start_side": null,
+            "start_line": null,
+            "line": 193,
+            "comment_lines": [
+                "[][193]"
+            ],
+            "review_comment": [
+                "Because (I _think_) the `allowUnionTypes = true` variant of this method is only used (\ud83e\udd1e ) in `AbstractConvertFunction`, create a variant that uses `true`, give it a union-types specific name and use that in `AbstractConverFunction`."
+            ],
+            "path": "x-pack/plugin/esql-core/src/main/java/org/elasticsearch/xpack/esql/core/expression/TypeResolutions.java",
+            "id": 37260,
+            "created_at": "2024-08-06T13:49:00Z",
+            "original_position": 28,
+            "side": "RIGHT",
+            "position": 38,
+            "original_start_line": null
+        },
+        {
+            "original_line": 1129,
+            "start_side": "LEFT",
+            "start_line": 1113,
+            "line": 1129,
+            "comment_lines": [
+                "[1123][]",
+                "[1124][]",
+                "[1125][]",
+                "[1126][]",
+                "[1127][]",
+                "[1128][]",
+                "[1129][]"
+            ],
+            "review_comment": [
+                "This may have been already obsolete; in any case, there shouldn't be a need to special-case aggs while resolving union types."
+            ],
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/analysis/Analyzer.java",
+            "id": 37257,
+            "created_at": "2024-08-05T14:04:32Z",
+            "original_position": 67,
+            "side": "LEFT",
+            "position": 125,
+            "original_start_line": 1123
+        },
+        {
+            "original_line": 461,
+            "start_side": null,
+            "start_line": null,
+            "line": 461,
+            "comment_lines": [
+                "[461][]"
+            ],
+            "review_comment": [
+                "I think it's important we use something that tracks the order of attributes, because this is used below in `mergeOutputAttributes`. Using the `AttributeMap` could lead to funky errors in case of attribute shadowing in the groupings.",
+                "The role of AttributeMap is to guarantee equality - while it can deal with ordering (it's a linkedmap), it's better to have this recorded elsewhere such as a list.",
+                "Ah, fair point; however, there shouldn't be groupings with same name id but different names, so the `mergeOutputAttributes` below should take care of deduplicating fine.\r\n\r\nI think using the `AttributeMap` here is less obvious (I completely forgot the thing preserves iteration order), esp. since an `AttributeSet` seems to suffice."
+            ],
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/analysis/Analyzer.java",
+            "id": 37259,
+            "created_at": "2024-08-06T12:50:02Z",
+            "original_position": 21,
+            "side": "LEFT",
+            "position": 29,
+            "original_start_line": null
+        },
+        {
+            "original_line": 27,
+            "start_side": null,
+            "start_line": null,
+            "line": 27,
+            "comment_lines": [
+                "[27][]"
+            ],
+            "review_comment": [
+                "This was used only in 1 place and had essentially only 1 implementation; maybe let's remove it, esp. since it coincides with a method of `LogicalPlan`?"
+            ],
+            "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plan/logical/Stats.java",
+            "id": 37258,
+            "created_at": "2024-08-06T12:38:47Z",
+            "original_position": 7,
+            "side": "LEFT",
+            "position": 7,
+            "original_start_line": null
+        }
+    ]
+}

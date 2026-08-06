@@ -1,0 +1,238 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 68542,
+  "pr_number": 68542,
+  "title": "Workaround for JDK bug with total mem on Debian8",
+  "user": "danhermann",
+  "created_at": "2021-02-04T18:28:58Z",
+  "merged_at": "2021-02-08T13:56:10Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Core/Infra/Stats",
+    "Team:Data Management (obsolete)",
+    "v7.12.0",
+    "v7.11.1",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "1b2fad47c4efbf9caa958e8489e275b4a157d52a",
+  "merge_commit_sha": "20960505ed792b7c70e6951a430adff0dfc02c1f",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/68542",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-02-04T18:22:50Z",
+      "sha": "5ca73c686e1c96382209a401209da8aff38d9f98",
+      "message": "workaround for JDK bug with total mem on Debian8",
+      "author": "Dan Hermann",
+      "author_email": "dan.hermann@elastic.co",
+      "author_raw_date": "2021-02-04T18:22:50Z",
+      "author_date": "2021-02-04T18:22:50Z",
+      "committer": "Dan Hermann",
+      "committer_email": "dan.hermann@elastic.co",
+      "raw_date": "2021-02-04T18:22:50Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/monitor/os/OsProbe.java\n@@ -100,11 +100,16 @@ public long getTotalPhysicalMemorySize() {\n             return 0;\n         }\n         try {\n-            final long totalMem = (long) getTotalPhysicalMemorySize.invoke(osMxBean);\n+            long totalMem = (long) getTotalPhysicalMemorySize.invoke(osMxBean);\n             if (totalMem < 0) {\n                 logger.debug(\"OS reported a negative total memory value [{}]\", totalMem);\n                 return 0;\n             }\n+            if (totalMem == 0 && isDebian8()) {\n+                // workaround for JDK bug on debian8: https://github.com/elastic/elasticsearch/issues/67089#issuecomment-756114654\n+                totalMem = getTotalMemFromProcMeminfo();\n+            }\n+\n             return totalMem;\n         } catch (Exception e) {\n             logger.warn(\"exception retrieving total physical memory\", e);\n@@ -641,6 +646,56 @@ List<String> readOsRelease() throws IOException {\n         }\n     }\n \n+    /**\n+     * Returns the lines from /proc/meminfo as a workaround for JDK bugs that prevent retrieval of total system memory\n+     * on some Linux variants such as Debian8.\n+     */\n+    @SuppressForbidden(reason = \"access /proc/meminfo\")\n+    List<String> readProcMeminfo() throws IOException {\n+        final List<String> lines;\n+        if (Files.exists(PathUtils.get(\"/proc/meminfo\"))) {\n+            lines = Files.readAllLines(PathUtils.get(\"/proc/meminfo\"));\n+            assert lines != null && lines.isEmpty() == false;\n+            return lines;\n+        } else {\n+            return Collections.emptyList();\n+        }\n+    }\n+\n+    /**\n+     * Retrieves system total memory in bytes from /proc/meminfo\n+     */\n+    long getTotalMemFromProcMeminfo() throws IOException {\n+        List<String> meminfoLines = readProcMeminfo();\n+        final List<String> memTotalLines = meminfoLines.stream().filter(line -> line.startsWith(\"MemTotal\")).collect(Collectors.toList());\n+        assert memTotalLines.size() <= 1 : memTotalLines;\n+        final Optional<String> maybeMemTotalLine = memTotalLines.size() == 1 ? Optional.of(memTotalLines.get(0)) : Optional.empty();\n+        if (maybeMemTotalLine.isPresent()) {\n+            final String memTotalLine = maybeMemTotalLine.get();\n+            int beginIdx = memTotalLine.indexOf(\"MemTotal:\");\n+            int endIdx = memTotalLine.lastIndexOf(\" kB\");\n+            if (beginIdx + 9 < endIdx) {\n+                final String memTotalString = memTotalLine.substring(beginIdx + 9, endIdx).trim();\n+                try {\n+                    long memTotalInKb = Long.parseLong(memTotalString);\n+                    return memTotalInKb * 1024;\n+                } catch (NumberFormatException e) {\n+                    logger.warn(\"Unable to retrieve total memory from meminfo line [\" + memTotalLine + \"]\");\n+                    return 0;\n+                }\n+            } else {\n+                logger.warn(\"Unable to retrieve total memory from meminfo line [\" + memTotalLine + \"]\");\n+                return 0;\n+            }\n+        } else {\n+            return 0;\n+        }\n+    }\n+\n+    boolean isDebian8() throws IOException {\n+        return Constants.LINUX && getPrettyName().equals(\"Debian GNU/Linux 8 (jessie)\");\n+    }\n+\n     public OsStats osStats() {\n         final OsStats.Cpu cpu = new OsStats.Cpu(getSystemCpuPercent(), getSystemLoadAverage());\n         final OsStats.Mem mem = new OsStats.Mem(getTotalPhysicalMemorySize(), getFreePhysicalMemorySize());\nserver/src/test/java/org/elasticsearch/monitor/os/OsProbeTests.java\n@@ -254,6 +254,50 @@ public void testCgroupProbeWithMissingMemory() {\n         assertNull(cgroup);\n     }\n \n+    public void testGetTotalMemFromProcMeminfo() throws Exception {\n+        // missing MemTotal line\n+        var meminfoLines = Arrays.asList(\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        OsProbe probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n+        // MemTotal line with invalid value\n+        meminfoLines = Arrays.asList(\n+            \"MemTotal:        invalid kB\",\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n+        // MemTotal line with random valid value\n+        long memTotalInKb = randomLongBetween(1, Long.MAX_VALUE / 1024L);\n+        meminfoLines = Arrays.asList(\n+            \"MemTotal:        \" + memTotalInKb + \" kB\",\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(memTotalInKb * 1024L));\n+    }\n+\n     private static List<String> getProcSelfGroupLines(String hierarchy) {\n         return Arrays.asList(\n             \"10:freezer:/\",\n@@ -282,12 +326,14 @@ private static OsProbe buildStubOsProbe(final boolean areCgroupStatsAvailable, f\n      * @param areCgroupStatsAvailable whether or not cgroup data is available. Normally OsProbe establishes this for itself.\n      * @param hierarchy a mock value used to generate a cgroup hierarchy.\n      * @param procSelfCgroupLines the lines that will be used as the content of <code>/proc/self/cgroup</code>\n+     * @param procMeminfoLines lines that will be used as the content of <code>/proc/meminfo</code>\n      * @return a test instance\n      */\n     private static OsProbe buildStubOsProbe(\n         final boolean areCgroupStatsAvailable,\n         final String hierarchy,\n-        List<String> procSelfCgroupLines\n+        List<String> procSelfCgroupLines,\n+        List<String> procMeminfoLines\n     ) {\n         return new OsProbe() {\n             @Override\n@@ -338,6 +384,20 @@ String readSysFsCgroupMemoryUsageInBytes(String controlGroup) {\n             boolean areCgroupStatsAvailable() {\n                 return areCgroupStatsAvailable;\n             }\n+\n+            @Override\n+            List<String> readProcMeminfo() throws IOException {\n+                return procMeminfoLines;\n+            }\n         };\n     }\n+\n+    private static OsProbe buildStubOsProbe(\n+        final boolean areCgroupStatsAvailable,\n+        final String hierarchy,\n+        List<String> procSelfCgroupLines\n+    ) {\n+        return buildStubOsProbe(areCgroupStatsAvailable, hierarchy, procSelfCgroupLines, List.of());\n+    }\n+\n }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/monitor/os/OsProbe.java",
+          "patch": "@@ -100,11 +100,16 @@ public long getTotalPhysicalMemorySize() {\n             return 0;\n         }\n         try {\n-            final long totalMem = (long) getTotalPhysicalMemorySize.invoke(osMxBean);\n+            long totalMem = (long) getTotalPhysicalMemorySize.invoke(osMxBean);\n             if (totalMem < 0) {\n                 logger.debug(\"OS reported a negative total memory value [{}]\", totalMem);\n                 return 0;\n             }\n+            if (totalMem == 0 && isDebian8()) {\n+                // workaround for JDK bug on debian8: https://github.com/elastic/elasticsearch/issues/67089#issuecomment-756114654\n+                totalMem = getTotalMemFromProcMeminfo();\n+            }\n+\n             return totalMem;\n         } catch (Exception e) {\n             logger.warn(\"exception retrieving total physical memory\", e);\n@@ -641,6 +646,56 @@ List<String> readOsRelease() throws IOException {\n         }\n     }\n \n+    /**\n+     * Returns the lines from /proc/meminfo as a workaround for JDK bugs that prevent retrieval of total system memory\n+     * on some Linux variants such as Debian8.\n+     */\n+    @SuppressForbidden(reason = \"access /proc/meminfo\")\n+    List<String> readProcMeminfo() throws IOException {\n+        final List<String> lines;\n+        if (Files.exists(PathUtils.get(\"/proc/meminfo\"))) {\n+            lines = Files.readAllLines(PathUtils.get(\"/proc/meminfo\"));\n+            assert lines != null && lines.isEmpty() == false;\n+            return lines;\n+        } else {\n+            return Collections.emptyList();\n+        }\n+    }\n+\n+    /**\n+     * Retrieves system total memory in bytes from /proc/meminfo\n+     */\n+    long getTotalMemFromProcMeminfo() throws IOException {\n+        List<String> meminfoLines = readProcMeminfo();\n+        final List<String> memTotalLines = meminfoLines.stream().filter(line -> line.startsWith(\"MemTotal\")).collect(Collectors.toList());\n+        assert memTotalLines.size() <= 1 : memTotalLines;\n+        final Optional<String> maybeMemTotalLine = memTotalLines.size() == 1 ? Optional.of(memTotalLines.get(0)) : Optional.empty();\n+        if (maybeMemTotalLine.isPresent()) {\n+            final String memTotalLine = maybeMemTotalLine.get();\n+            int beginIdx = memTotalLine.indexOf(\"MemTotal:\");\n+            int endIdx = memTotalLine.lastIndexOf(\" kB\");\n+            if (beginIdx + 9 < endIdx) {\n+                final String memTotalString = memTotalLine.substring(beginIdx + 9, endIdx).trim();\n+                try {\n+                    long memTotalInKb = Long.parseLong(memTotalString);\n+                    return memTotalInKb * 1024;\n+                } catch (NumberFormatException e) {\n+                    logger.warn(\"Unable to retrieve total memory from meminfo line [\" + memTotalLine + \"]\");\n+                    return 0;\n+                }\n+            } else {\n+                logger.warn(\"Unable to retrieve total memory from meminfo line [\" + memTotalLine + \"]\");\n+                return 0;\n+            }\n+        } else {\n+            return 0;\n+        }\n+    }\n+\n+    boolean isDebian8() throws IOException {\n+        return Constants.LINUX && getPrettyName().equals(\"Debian GNU/Linux 8 (jessie)\");\n+    }\n+\n     public OsStats osStats() {\n         final OsStats.Cpu cpu = new OsStats.Cpu(getSystemCpuPercent(), getSystemLoadAverage());\n         final OsStats.Mem mem = new OsStats.Mem(getTotalPhysicalMemorySize(), getFreePhysicalMemorySize());"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/monitor/os/OsProbeTests.java",
+          "patch": "@@ -254,6 +254,50 @@ public void testCgroupProbeWithMissingMemory() {\n         assertNull(cgroup);\n     }\n \n+    public void testGetTotalMemFromProcMeminfo() throws Exception {\n+        // missing MemTotal line\n+        var meminfoLines = Arrays.asList(\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        OsProbe probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n+        // MemTotal line with invalid value\n+        meminfoLines = Arrays.asList(\n+            \"MemTotal:        invalid kB\",\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n+        // MemTotal line with random valid value\n+        long memTotalInKb = randomLongBetween(1, Long.MAX_VALUE / 1024L);\n+        meminfoLines = Arrays.asList(\n+            \"MemTotal:        \" + memTotalInKb + \" kB\",\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(memTotalInKb * 1024L));\n+    }\n+\n     private static List<String> getProcSelfGroupLines(String hierarchy) {\n         return Arrays.asList(\n             \"10:freezer:/\",\n@@ -282,12 +326,14 @@ private static OsProbe buildStubOsProbe(final boolean areCgroupStatsAvailable, f\n      * @param areCgroupStatsAvailable whether or not cgroup data is available. Normally OsProbe establishes this for itself.\n      * @param hierarchy a mock value used to generate a cgroup hierarchy.\n      * @param procSelfCgroupLines the lines that will be used as the content of <code>/proc/self/cgroup</code>\n+     * @param procMeminfoLines lines that will be used as the content of <code>/proc/meminfo</code>\n      * @return a test instance\n      */\n     private static OsProbe buildStubOsProbe(\n         final boolean areCgroupStatsAvailable,\n         final String hierarchy,\n-        List<String> procSelfCgroupLines\n+        List<String> procSelfCgroupLines,\n+        List<String> procMeminfoLines\n     ) {\n         return new OsProbe() {\n             @Override\n@@ -338,6 +384,20 @@ String readSysFsCgroupMemoryUsageInBytes(String controlGroup) {\n             boolean areCgroupStatsAvailable() {\n                 return areCgroupStatsAvailable;\n             }\n+\n+            @Override\n+            List<String> readProcMeminfo() throws IOException {\n+                return procMeminfoLines;\n+            }\n         };\n     }\n+\n+    private static OsProbe buildStubOsProbe(\n+        final boolean areCgroupStatsAvailable,\n+        final String hierarchy,\n+        List<String> procSelfCgroupLines\n+    ) {\n+        return buildStubOsProbe(areCgroupStatsAvailable, hierarchy, procSelfCgroupLines, List.of());\n+    }\n+\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-02-04T18:28:58Z",
+      "user": "danhermann",
+      "body": "Reads total system memory from `/proc/meminfo` on Debian8 systems if the JDK reports `0` total memory. See https://github.com/elastic/elasticsearch/issues/66885#issuecomment-757888941 for more background.\r\n\r\nFixes #66629.\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 773515615,
+      "created_at": "2021-02-04T18:29:02Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-core-features (Team:Core/Features)"
+    },
+    {
+      "type": "review",
+      "id": 583694427,
+      "created_at": "2021-02-04T18:30:50Z",
+      "user": "danhermann",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 570452216,
+      "created_at": "2021-02-04T18:30:50Z",
+      "user": "danhermann",
+      "body": "I'm not thrilled by everything that happens here, but by default, the value is cached so that this method shouldn't be called more than once per second and probably less frequently on systems with appropriate monitoring intervals.",
+      "path": "server/src/main/java/org/elasticsearch/monitor/os/OsProbe.java",
+      "diff_hunk": "@@ -641,6 +646,56 @@ private String getPrettyName() throws IOException {\n         }\n     }\n \n+    /**\n+     * Returns the lines from /proc/meminfo as a workaround for JDK bugs that prevent retrieval of total system memory\n+     * on some Linux variants such as Debian8.\n+     */\n+    @SuppressForbidden(reason = \"access /proc/meminfo\")\n+    List<String> readProcMeminfo() throws IOException {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 654,
+      "original_line": 654,
+      "side": "RIGHT",
+      "original_position": 27,
+      "position": 27,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 773533549,
+      "created_at": "2021-02-04T18:59:22Z",
+      "user": "danhermann",
+      "body": "@elasticmachine run elasticsearch-ci/1"
+    },
+    {
+      "type": "comment",
+      "id": 773573657,
+      "created_at": "2021-02-04T20:09:29Z",
+      "user": "danhermann",
+      "body": "@elasticmachine run elasticsearch-ci/default-distro"
+    },
+    {
+      "type": "review_comment",
+      "id": 571106085,
+      "created_at": "2021-02-05T16:50:18Z",
+      "user": "henningandersen",
+      "body": "```suggestion\r\n        if (memTotalLines.size() == 1) {\r\n            final String memTotalLine = memTotalLines.get(0);\r\n```",
+      "path": "server/src/main/java/org/elasticsearch/monitor/os/OsProbe.java",
+      "diff_hunk": "@@ -641,6 +646,56 @@ private String getPrettyName() throws IOException {\n         }\n     }\n \n+    /**\n+     * Returns the lines from /proc/meminfo as a workaround for JDK bugs that prevent retrieval of total system memory\n+     * on some Linux variants such as Debian8.\n+     */\n+    @SuppressForbidden(reason = \"access /proc/meminfo\")\n+    List<String> readProcMeminfo() throws IOException {\n+        final List<String> lines;\n+        if (Files.exists(PathUtils.get(\"/proc/meminfo\"))) {\n+            lines = Files.readAllLines(PathUtils.get(\"/proc/meminfo\"));\n+            assert lines != null && lines.isEmpty() == false;\n+            return lines;\n+        } else {\n+            return Collections.emptyList();\n+        }\n+    }\n+\n+    /**\n+     * Retrieves system total memory in bytes from /proc/meminfo\n+     */\n+    long getTotalMemFromProcMeminfo() throws IOException {\n+        List<String> meminfoLines = readProcMeminfo();\n+        final List<String> memTotalLines = meminfoLines.stream().filter(line -> line.startsWith(\"MemTotal\")).collect(Collectors.toList());\n+        assert memTotalLines.size() <= 1 : memTotalLines;\n+        final Optional<String> maybeMemTotalLine = memTotalLines.size() == 1 ? Optional.of(memTotalLines.get(0)) : Optional.empty();\n+        if (maybeMemTotalLine.isPresent()) {\n+            final String memTotalLine = maybeMemTotalLine.get();",
+      "start_line": null,
+      "original_start_line": 672,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 674,
+      "side": "RIGHT",
+      "original_position": 47,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 571112484,
+      "created_at": "2021-02-05T16:59:41Z",
+      "user": "henningandersen",
+      "body": "Let us for completeness also add a case of having wrong unit.",
+      "path": "server/src/test/java/org/elasticsearch/monitor/os/OsProbeTests.java",
+      "diff_hunk": "@@ -254,6 +254,50 @@ public void testCgroupProbeWithMissingMemory() {\n         assertNull(cgroup);\n     }\n \n+    public void testGetTotalMemFromProcMeminfo() throws Exception {\n+        // missing MemTotal line\n+        var meminfoLines = Arrays.asList(\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        OsProbe probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n+        // MemTotal line with invalid value",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 271,
+      "original_line": 271,
+      "side": "RIGHT",
+      "original_position": 18,
+      "position": 18,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 571114228,
+      "created_at": "2021-02-05T17:02:22Z",
+      "user": "henningandersen",
+      "body": "Can we also add a test that does not stub out /proc/meminfo and verify that it gives us something > 0? It should run on debian 8 only.",
+      "path": "server/src/test/java/org/elasticsearch/monitor/os/OsProbeTests.java",
+      "diff_hunk": "@@ -254,6 +254,50 @@ public void testCgroupProbeWithMissingMemory() {\n         assertNull(cgroup);\n     }\n \n+    public void testGetTotalMemFromProcMeminfo() throws Exception {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 257,
+      "original_line": 257,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 4,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 584520378,
+      "created_at": "2021-02-05T17:04:48Z",
+      "user": "henningandersen",
+      "state": "APPROVED",
+      "body": "LGTM, thanks for fixing this @danhermann \r\n\r\nI wonder if we should reenable various tests on debian 8 that were previously disabled due to this, for instance `TransportGetAutoscalingCapacityActionIT` and some of the ML rest tests? Can definitely also be handled in a follow-up."
+    },
+    {
+      "type": "commit",
+      "date": "2021-02-05T20:15:27Z",
+      "sha": "357e7666ec1e65ad5fc50509bcbb6ce04248cbfc",
+      "message": "review comments",
+      "author": "Dan Hermann",
+      "author_email": "dan.hermann@elastic.co",
+      "author_raw_date": "2021-02-05T20:15:27Z",
+      "author_date": "2021-02-05T20:15:27Z",
+      "committer": "Dan Hermann",
+      "committer_email": "dan.hermann@elastic.co",
+      "raw_date": "2021-02-05T20:15:27Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/monitor/os/OsProbe.java\n@@ -669,9 +669,8 @@ long getTotalMemFromProcMeminfo() throws IOException {\n         List<String> meminfoLines = readProcMeminfo();\n         final List<String> memTotalLines = meminfoLines.stream().filter(line -> line.startsWith(\"MemTotal\")).collect(Collectors.toList());\n         assert memTotalLines.size() <= 1 : memTotalLines;\n-        final Optional<String> maybeMemTotalLine = memTotalLines.size() == 1 ? Optional.of(memTotalLines.get(0)) : Optional.empty();\n-        if (maybeMemTotalLine.isPresent()) {\n-            final String memTotalLine = maybeMemTotalLine.get();\n+        if (memTotalLines.size() == 1) {\n+            final String memTotalLine = memTotalLines.get(0);\n             int beginIdx = memTotalLine.indexOf(\"MemTotal:\");\n             int endIdx = memTotalLine.lastIndexOf(\" kB\");\n             if (beginIdx + 9 < endIdx) {\nserver/src/test/java/org/elasticsearch/monitor/os/OsProbeTests.java\n@@ -282,6 +282,20 @@ public void testGetTotalMemFromProcMeminfo() throws Exception {\n         probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n         assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n \n+        // MemTotal line with invalid unit\n+        meminfoLines = Arrays.asList(\n+            \"MemTotal:       39646240 MB\",\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n         // MemTotal line with random valid value\n         long memTotalInKb = randomLongBetween(1, Long.MAX_VALUE / 1024L);\n         meminfoLines = Arrays.asList(\n@@ -298,6 +312,13 @@ public void testGetTotalMemFromProcMeminfo() throws Exception {\n         assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(memTotalInKb * 1024L));\n     }\n \n+    public void testGetTotalMemoryOnDebian8() throws Exception {\n+        // tests the workaround for JDK bug on debian8: https://github.com/elastic/elasticsearch/issues/67089#issuecomment-756114654\n+        final OsProbe osProbe = new OsProbe();\n+        assumeTrue(\"runs only on Debian 8\", osProbe.isDebian8());\n+        assertThat(osProbe.getTotalPhysicalMemorySize(), greaterThan(0L));\n+    }\n+\n     private static List<String> getProcSelfGroupLines(String hierarchy) {\n         return Arrays.asList(\n             \"10:freezer:/\",",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/monitor/os/OsProbe.java",
+          "patch": "@@ -669,9 +669,8 @@ long getTotalMemFromProcMeminfo() throws IOException {\n         List<String> meminfoLines = readProcMeminfo();\n         final List<String> memTotalLines = meminfoLines.stream().filter(line -> line.startsWith(\"MemTotal\")).collect(Collectors.toList());\n         assert memTotalLines.size() <= 1 : memTotalLines;\n-        final Optional<String> maybeMemTotalLine = memTotalLines.size() == 1 ? Optional.of(memTotalLines.get(0)) : Optional.empty();\n-        if (maybeMemTotalLine.isPresent()) {\n-            final String memTotalLine = maybeMemTotalLine.get();\n+        if (memTotalLines.size() == 1) {\n+            final String memTotalLine = memTotalLines.get(0);\n             int beginIdx = memTotalLine.indexOf(\"MemTotal:\");\n             int endIdx = memTotalLine.lastIndexOf(\" kB\");\n             if (beginIdx + 9 < endIdx) {"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/monitor/os/OsProbeTests.java",
+          "patch": "@@ -282,6 +282,20 @@ public void testGetTotalMemFromProcMeminfo() throws Exception {\n         probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n         assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n \n+        // MemTotal line with invalid unit\n+        meminfoLines = Arrays.asList(\n+            \"MemTotal:       39646240 MB\",\n+            \"MemFree:         8467692 kB\",\n+            \"MemAvailable:   39646240 kB\",\n+            \"Buffers:         4699504 kB\",\n+            \"Cached:         23290380 kB\",\n+            \"SwapCached:            0 kB\",\n+            \"Active:         43637908 kB\",\n+            \"Inactive:        8130280 kB\"\n+        );\n+        probe = buildStubOsProbe(true, \"\", List.of(), meminfoLines);\n+        assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(0L));\n+\n         // MemTotal line with random valid value\n         long memTotalInKb = randomLongBetween(1, Long.MAX_VALUE / 1024L);\n         meminfoLines = Arrays.asList(\n@@ -298,6 +312,13 @@ public void testGetTotalMemFromProcMeminfo() throws Exception {\n         assertThat(probe.getTotalMemFromProcMeminfo(), equalTo(memTotalInKb * 1024L));\n     }\n \n+    public void testGetTotalMemoryOnDebian8() throws Exception {\n+        // tests the workaround for JDK bug on debian8: https://github.com/elastic/elasticsearch/issues/67089#issuecomment-756114654\n+        final OsProbe osProbe = new OsProbe();\n+        assumeTrue(\"runs only on Debian 8\", osProbe.isDebian8());\n+        assertThat(osProbe.getTotalPhysicalMemorySize(), greaterThan(0L));\n+    }\n+\n     private static List<String> getProcSelfGroupLines(String hierarchy) {\n         return Arrays.asList(\n             \"10:freezer:/\","
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 774281460,
+      "created_at": "2021-02-05T20:50:30Z",
+      "user": "danhermann",
+      "body": "@elasticmachine run elasticsearch-ci/bwc"
+    },
+    {
+      "type": "comment",
+      "id": 775167454,
+      "created_at": "2021-02-08T13:56:00Z",
+      "user": "danhermann",
+      "body": "Thanks, @henningandersen! I've made the changes you requested and will open another PR to re-enable the tests that were failing due to this issue. Let me know if you see anything else related to this that needs to be addressed.\r\n"
+    }
+  ]
+}

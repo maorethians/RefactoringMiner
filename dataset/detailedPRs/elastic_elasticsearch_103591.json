@@ -1,0 +1,186 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 103591,
+  "pr_number": 103591,
+  "title": "[ML] Wait for the model results on graceful shutdown",
+  "user": "davidkyle",
+  "created_at": "2023-12-19T17:45:05Z",
+  "merged_at": "2023-12-22T17:39:56Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":ml",
+    "Team:ML",
+    "cloud-deploy",
+    "v8.12.0",
+    "v8.13.0"
+  ],
+  "base_commit": "c0b3f494cbf6af7d2fc37278faa1ae9a3c4181ce",
+  "merge_commit_sha": "652ff2620d3e87407bc8f48dff206ccfbd926d0d",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/103591",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-12-19T17:28:07Z",
+      "sha": "1da898f43ffe6e56cc1ccec6d78844a12f523946",
+      "message": "Wait for the results",
+      "author": "David Kyle",
+      "author_email": "david.kyle@elastic.co",
+      "author_raw_date": "2023-12-19T17:28:07Z",
+      "author_date": "2023-12-19T17:28:07Z",
+      "committer": "David Kyle",
+      "committer_email": "david.kyle@elastic.co",
+      "raw_date": "2023-12-19T17:28:07Z",
+      "diff_text": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/MachineLearning.java\n@@ -1051,7 +1051,7 @@ public Collection<?> createComponents(PluginServices services) {\n             normalizerProcessFactory = (jobId, quantilesState, bucketSpan, executorService) -> new MultiplyingNormalizerProcess(1.0);\n             analyticsProcessFactory = (jobId, analyticsProcessConfig, hasState, executorService, onProcessCrash) -> null;\n             memoryEstimationProcessFactory = (jobId, analyticsProcessConfig, hasState, executorService, onProcessCrash) -> null;\n-            pyTorchProcessFactory = (task, executorService, onProcessCrash) -> new BlackHolePyTorchProcess();\n+            pyTorchProcessFactory = (task, executorService, afterInputStreamClose, onProcessCrash) -> new BlackHolePyTorchProcess();\n         }\n         NormalizerFactory normalizerFactory = new NormalizerFactory(\n             normalizerProcessFactory,\nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/deployment/DeploymentManager.java\n@@ -496,7 +496,14 @@ synchronized void startAndLoad(TrainedModelLocation modelLocation, ActionListene\n             }\n \n             logger.debug(\"[{}] start and load\", task.getDeploymentId());\n-            process.set(pyTorchProcessFactory.createProcess(task, executorServiceForProcess, this::onProcessCrash));\n+            process.set(\n+                pyTorchProcessFactory.createProcess(\n+                    task,\n+                    executorServiceForProcess,\n+                    () -> resultProcessor.awaitCompletion(COMPLETION_TIMEOUT.getMinutes(), TimeUnit.MINUTES),\n+                    this::onProcessCrash\n+                )\n+            );\n             startTime = Instant.now();\n             logger.debug(\"[{}] process started\", task.getDeploymentId());\n             try {\nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/pytorch/process/NativePyTorchProcess.java\n@@ -20,23 +20,27 @@\n import java.nio.file.Path;\n import java.util.Iterator;\n import java.util.List;\n+import java.util.concurrent.TimeoutException;\n import java.util.function.Consumer;\n \n public class NativePyTorchProcess extends AbstractNativeProcess implements PyTorchProcess {\n \n     private static final String NAME = \"pytorch_inference\";\n \n     private final ProcessResultsParser<PyTorchResult> resultsParser;\n+    private final PyTorchProcessFactory.TimeoutRunnable afterInStreamClose;\n \n     protected NativePyTorchProcess(\n         String jobId,\n         NativeController nativeController,\n         ProcessPipes processPipes,\n         int numberOfFields,\n         List<Path> filesToDelete,\n+        PyTorchProcessFactory.TimeoutRunnable afterInStreamClose,\n         Consumer<String> onProcessCrash\n     ) {\n         super(jobId, nativeController, processPipes, numberOfFields, filesToDelete, onProcessCrash);\n+        this.afterInStreamClose = afterInStreamClose;\n         this.resultsParser = new ProcessResultsParser<>(PyTorchResult.PARSER, NamedXContentRegistry.EMPTY);\n     }\n \n@@ -71,4 +75,9 @@ public void writeInferenceRequest(BytesReference jsonRequest) throws IOException\n         processInStream().write('\\n');\n         processInStream().flush();\n     }\n+\n+    @Override\n+    protected void afterProcessInStreamClose() throws TimeoutException {\n+        afterInStreamClose.run();\n+    }\n }\nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/pytorch/process/NativePyTorchProcessFactory.java\n@@ -56,6 +56,7 @@ void setProcessConnectTimeout(TimeValue processConnectTimeout) {\n     public NativePyTorchProcess createProcess(\n         TrainedModelDeploymentTask task,\n         ExecutorService executorService,\n+        TimeoutRunnable afterInStreamClose,\n         Consumer<String> onProcessCrash\n     ) {\n         ProcessPipes processPipes = new ProcessPipes(\n@@ -80,6 +81,7 @@ public NativePyTorchProcess createProcess(\n             processPipes,\n             0,\n             Collections.emptyList(),\n+            afterInStreamClose,\n             onProcessCrash\n         );\n \nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/pytorch/process/PyTorchProcessFactory.java\n@@ -10,9 +10,19 @@\n import org.elasticsearch.xpack.ml.inference.deployment.TrainedModelDeploymentTask;\n \n import java.util.concurrent.ExecutorService;\n+import java.util.concurrent.TimeoutException;\n import java.util.function.Consumer;\n \n public interface PyTorchProcessFactory {\n \n-    PyTorchProcess createProcess(TrainedModelDeploymentTask task, ExecutorService executorService, Consumer<String> onProcessCrash);\n+    interface TimeoutRunnable {\n+        void run() throws TimeoutException;\n+    }\n+\n+    PyTorchProcess createProcess(\n+        TrainedModelDeploymentTask task,\n+        ExecutorService executorService,\n+        TimeoutRunnable afterInStreamClose,\n+        Consumer<String> onProcessCrash\n+    );\n }\nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/process/AbstractNativeProcess.java\n@@ -223,7 +223,7 @@ public void close() throws IOException {\n      * Implementations can override this if they need to perform extra processing\n      * immediately after the native process's input stream is closed.\n      */\n-    protected void afterProcessInStreamClose() {\n+    protected void afterProcessInStreamClose() throws TimeoutException {\n         // no-op by default\n     }\n ",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/MachineLearning.java",
+          "patch": "@@ -1051,7 +1051,7 @@ public Collection<?> createComponents(PluginServices services) {\n             normalizerProcessFactory = (jobId, quantilesState, bucketSpan, executorService) -> new MultiplyingNormalizerProcess(1.0);\n             analyticsProcessFactory = (jobId, analyticsProcessConfig, hasState, executorService, onProcessCrash) -> null;\n             memoryEstimationProcessFactory = (jobId, analyticsProcessConfig, hasState, executorService, onProcessCrash) -> null;\n-            pyTorchProcessFactory = (task, executorService, onProcessCrash) -> new BlackHolePyTorchProcess();\n+            pyTorchProcessFactory = (task, executorService, afterInputStreamClose, onProcessCrash) -> new BlackHolePyTorchProcess();\n         }\n         NormalizerFactory normalizerFactory = new NormalizerFactory(\n             normalizerProcessFactory,"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/deployment/DeploymentManager.java",
+          "patch": "@@ -496,7 +496,14 @@ synchronized void startAndLoad(TrainedModelLocation modelLocation, ActionListene\n             }\n \n             logger.debug(\"[{}] start and load\", task.getDeploymentId());\n-            process.set(pyTorchProcessFactory.createProcess(task, executorServiceForProcess, this::onProcessCrash));\n+            process.set(\n+                pyTorchProcessFactory.createProcess(\n+                    task,\n+                    executorServiceForProcess,\n+                    () -> resultProcessor.awaitCompletion(COMPLETION_TIMEOUT.getMinutes(), TimeUnit.MINUTES),\n+                    this::onProcessCrash\n+                )\n+            );\n             startTime = Instant.now();\n             logger.debug(\"[{}] process started\", task.getDeploymentId());\n             try {"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/pytorch/process/NativePyTorchProcess.java",
+          "patch": "@@ -20,23 +20,27 @@\n import java.nio.file.Path;\n import java.util.Iterator;\n import java.util.List;\n+import java.util.concurrent.TimeoutException;\n import java.util.function.Consumer;\n \n public class NativePyTorchProcess extends AbstractNativeProcess implements PyTorchProcess {\n \n     private static final String NAME = \"pytorch_inference\";\n \n     private final ProcessResultsParser<PyTorchResult> resultsParser;\n+    private final PyTorchProcessFactory.TimeoutRunnable afterInStreamClose;\n \n     protected NativePyTorchProcess(\n         String jobId,\n         NativeController nativeController,\n         ProcessPipes processPipes,\n         int numberOfFields,\n         List<Path> filesToDelete,\n+        PyTorchProcessFactory.TimeoutRunnable afterInStreamClose,\n         Consumer<String> onProcessCrash\n     ) {\n         super(jobId, nativeController, processPipes, numberOfFields, filesToDelete, onProcessCrash);\n+        this.afterInStreamClose = afterInStreamClose;\n         this.resultsParser = new ProcessResultsParser<>(PyTorchResult.PARSER, NamedXContentRegistry.EMPTY);\n     }\n \n@@ -71,4 +75,9 @@ public void writeInferenceRequest(BytesReference jsonRequest) throws IOException\n         processInStream().write('\\n');\n         processInStream().flush();\n     }\n+\n+    @Override\n+    protected void afterProcessInStreamClose() throws TimeoutException {\n+        afterInStreamClose.run();\n+    }\n }"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/pytorch/process/NativePyTorchProcessFactory.java",
+          "patch": "@@ -56,6 +56,7 @@ void setProcessConnectTimeout(TimeValue processConnectTimeout) {\n     public NativePyTorchProcess createProcess(\n         TrainedModelDeploymentTask task,\n         ExecutorService executorService,\n+        TimeoutRunnable afterInStreamClose,\n         Consumer<String> onProcessCrash\n     ) {\n         ProcessPipes processPipes = new ProcessPipes(\n@@ -80,6 +81,7 @@ public NativePyTorchProcess createProcess(\n             processPipes,\n             0,\n             Collections.emptyList(),\n+            afterInStreamClose,\n             onProcessCrash\n         );\n "
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/inference/pytorch/process/PyTorchProcessFactory.java",
+          "patch": "@@ -10,9 +10,19 @@\n import org.elasticsearch.xpack.ml.inference.deployment.TrainedModelDeploymentTask;\n \n import java.util.concurrent.ExecutorService;\n+import java.util.concurrent.TimeoutException;\n import java.util.function.Consumer;\n \n public interface PyTorchProcessFactory {\n \n-    PyTorchProcess createProcess(TrainedModelDeploymentTask task, ExecutorService executorService, Consumer<String> onProcessCrash);\n+    interface TimeoutRunnable {\n+        void run() throws TimeoutException;\n+    }\n+\n+    PyTorchProcess createProcess(\n+        TrainedModelDeploymentTask task,\n+        ExecutorService executorService,\n+        TimeoutRunnable afterInStreamClose,\n+        Consumer<String> onProcessCrash\n+    );\n }"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/process/AbstractNativeProcess.java",
+          "patch": "@@ -223,7 +223,7 @@ public void close() throws IOException {\n      * Implementations can override this if they need to perform extra processing\n      * immediately after the native process's input stream is closed.\n      */\n-    protected void afterProcessInStreamClose() {\n+    protected void afterProcessInStreamClose() throws TimeoutException {\n         // no-op by default\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-12-19T17:45:05Z",
+      "user": "davidkyle",
+      "body": "#103414 shows a timeout exception when the pytorch_inference process is gracefully shutdown. The timeout occurs waiting for the log stream to close but that will not happen until the process has finished processing the queued requests. \r\n\r\nThis change waits for that work to complete after closing the input stream but before waiting on the log stream to close.\r\n\r\nThe error in #103414 does not mean that the process has not stopped properly rather it is a short timeout as at that point it was expected that all the work is complete but this was not the case. The process would continue to shutdown properly. \r\n\r\nCloses #103414"
+    },
+    {
+      "type": "commit",
+      "date": "2023-12-19T17:45:29Z",
+      "sha": "da24c6b6fecc5b650ae977409df868a4eae29fe8",
+      "message": "Update docs/changelog/103591.yaml",
+      "author": "David Kyle",
+      "author_email": "david.kyle@elastic.co",
+      "author_raw_date": "2023-12-19T17:45:29Z",
+      "author_date": "2023-12-19T17:45:29Z",
+      "committer": "David Kyle",
+      "committer_email": "david.kyle@elastic.co",
+      "raw_date": "2023-12-19T17:45:29Z",
+      "diff_text": "docs/changelog/103591.yaml\n@@ -0,0 +1,6 @@\n+pr: 103591\n+summary: Wait for the model results on graceful shutdown\n+area: Machine Learning\n+type: bug\n+issues:\n+ - 103414",
+      "diff": [
+        {
+          "file": "docs/changelog/103591.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 103591\n+summary: Wait for the model results on graceful shutdown\n+area: Machine Learning\n+type: bug\n+issues:\n+ - 103414"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1863223543,
+      "created_at": "2023-12-19T17:45:29Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @davidkyle, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1866016150,
+      "created_at": "2023-12-21T10:29:48Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/ml-core (Team:ML)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1434225542,
+      "created_at": "2023-12-21T15:40:56Z",
+      "user": "maxhniebergall",
+      "body": "maybe it would be clearer to say \"closed\" rather than \"close\"?",
+      "path": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/process/AbstractNativeProcess.java",
+      "diff_hunk": "@@ -223,7 +223,7 @@ public void close() throws IOException {\n      * Implementations can override this if they need to perform extra processing\n      * immediately after the native process's input stream is closed.\n      */\n-    protected void afterProcessInStreamClose() {\n+    protected void afterProcessInStreamClose() throws TimeoutException {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 226,
+      "original_line": 226,
+      "side": "RIGHT",
+      "original_position": 5,
+      "position": 5,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1435245796,
+          "user": "droberts195",
+          "body": "Let's leave this minor naming concern for a followup. Dave K is off for the rest of the year and if this change is merged today it will be in time for 8.12.0. I'll merge it now.",
+          "created_at": "2023-12-22T17:39:09Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1793213007,
+      "created_at": "2023-12-21T15:41:08Z",
+      "user": "maxhniebergall",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "review",
+      "id": 1794779672,
+      "created_at": "2023-12-22T17:39:09Z",
+      "user": "droberts195",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1867933109,
+      "created_at": "2023-12-22T17:43:43Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💚 Backport successful\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [8.12](https://github.com/elastic/elasticsearch/pull/103696)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/103696\">](https://github.com/elastic/elasticsearch/pull/103696) |"
+    }
+  ]
+}

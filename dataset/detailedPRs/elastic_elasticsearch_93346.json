@@ -1,0 +1,95 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 93346,
+  "pr_number": 93346,
+  "title": "Check if shard could be allocated before initializing it",
+  "user": "idegtiarenko",
+  "created_at": "2023-01-30T12:54:33Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    ":Distributed/Allocation",
+    "Team:Distributed",
+    "v8.8.0"
+  ],
+  "base_commit": "7b9df003b996428ed86e2518587a44def38702d7",
+  "merge_commit_sha": "19a3d898860550627b42377899065008c9125d16",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "unlabeled",
+    "labeled",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/93346",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-01-30T12:49:31Z",
+      "sha": "d814c5ede7245f389e89da4e914f720efda4f985",
+      "message": "Check if shard could be allocated before initializing it",
+      "author": "ievgen.degtiarenko",
+      "author_email": "ievgen.degtiarenko@elastic.co",
+      "author_raw_date": "2023-01-30T12:49:31Z",
+      "author_date": "2023-01-30T12:49:31Z",
+      "committer": "ievgen.degtiarenko",
+      "committer_email": "ievgen.degtiarenko@elastic.co",
+      "raw_date": "2023-01-30T12:49:31Z",
+      "diff_text": "qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/SnapshotBasedRecoveryIT.java\n@@ -42,7 +42,6 @@\n \n public class SnapshotBasedRecoveryIT extends AbstractRollingTestCase {\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/93271\")\n     public void testSnapshotBasedRecovery() throws Exception {\n         final String indexName = \"snapshot_based_recovery\";\n         final String repositoryName = \"snapshot_based_recovery_repo\";\n@@ -111,33 +110,14 @@ public void testSnapshotBasedRecovery() throws Exception {\n                     indexName,\n                     Settings.builder().put(IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 1)\n                 );\n-                try {\n-                    ensureGreen(indexName);\n-                } catch (AssertionError e) {\n-                    logAllocationExplain();\n-                    throw e;\n-                }\n+                ensureGreen(indexName);\n                 assertMatchAllReturnsAllDocuments(indexName, numDocs);\n                 assertMatchQueryReturnsAllDocuments(indexName, numDocs);\n             }\n             default -> throw new IllegalStateException(\"unknown type \" + CLUSTER_TYPE);\n         }\n     }\n \n-    private void logAllocationExplain() throws Exception {\n-        // Used to debug #91383\n-        var request = new Request(HttpGet.METHOD_NAME, \"_cluster/allocation/explain?include_disk_info=true&include_yes_decisions=true\");\n-        request.setJsonEntity(\"\"\"\n-                    {\n-                      \"index\": \"snapshot_based_recovery\",\n-                      \"shard\": 0,\n-                      \"primary\": false\n-                    }\n-            \"\"\");\n-        var response = client().performRequest(request);\n-        logger.info(\"--> allocation explain {}\", EntityUtils.toString(response.getEntity()));\n-    }\n-\n     private List<String> getUpgradedNodeIds() throws IOException {\n         Request request = new Request(HttpGet.METHOD_NAME, \"_nodes/_all\");\n         Response response = client().performRequest(request);\nserver/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java\n@@ -18,6 +18,7 @@\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;\n import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;\n+import org.elasticsearch.cluster.routing.allocation.decider.Decision;\n import org.elasticsearch.common.metrics.MeanMetric;\n import org.elasticsearch.common.settings.ClusterSettings;\n import org.elasticsearch.common.settings.Setting;\n@@ -190,9 +191,15 @@ public DesiredBalance compute(\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n                     final var nodeId = nodeIds.removeFirst();\n-                    final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }\n@@ -203,10 +210,16 @@ public DesiredBalance compute(\n             if (unassignedPrimaries.contains(shardRouting.shardId()) == false) {\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n-                    final String nodeId = nodeIds.removeFirst();\n-                    ShardRouting shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var nodeId = nodeIds.removeFirst();\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }",
+      "diff": [
+        {
+          "file": "qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/SnapshotBasedRecoveryIT.java",
+          "patch": "@@ -42,7 +42,6 @@\n \n public class SnapshotBasedRecoveryIT extends AbstractRollingTestCase {\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/93271\")\n     public void testSnapshotBasedRecovery() throws Exception {\n         final String indexName = \"snapshot_based_recovery\";\n         final String repositoryName = \"snapshot_based_recovery_repo\";\n@@ -111,33 +110,14 @@ public void testSnapshotBasedRecovery() throws Exception {\n                     indexName,\n                     Settings.builder().put(IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 1)\n                 );\n-                try {\n-                    ensureGreen(indexName);\n-                } catch (AssertionError e) {\n-                    logAllocationExplain();\n-                    throw e;\n-                }\n+                ensureGreen(indexName);\n                 assertMatchAllReturnsAllDocuments(indexName, numDocs);\n                 assertMatchQueryReturnsAllDocuments(indexName, numDocs);\n             }\n             default -> throw new IllegalStateException(\"unknown type \" + CLUSTER_TYPE);\n         }\n     }\n \n-    private void logAllocationExplain() throws Exception {\n-        // Used to debug #91383\n-        var request = new Request(HttpGet.METHOD_NAME, \"_cluster/allocation/explain?include_disk_info=true&include_yes_decisions=true\");\n-        request.setJsonEntity(\"\"\"\n-                    {\n-                      \"index\": \"snapshot_based_recovery\",\n-                      \"shard\": 0,\n-                      \"primary\": false\n-                    }\n-            \"\"\");\n-        var response = client().performRequest(request);\n-        logger.info(\"--> allocation explain {}\", EntityUtils.toString(response.getEntity()));\n-    }\n-\n     private List<String> getUpgradedNodeIds() throws IOException {\n         Request request = new Request(HttpGet.METHOD_NAME, \"_nodes/_all\");\n         Response response = client().performRequest(request);"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java",
+          "patch": "@@ -18,6 +18,7 @@\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;\n import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;\n+import org.elasticsearch.cluster.routing.allocation.decider.Decision;\n import org.elasticsearch.common.metrics.MeanMetric;\n import org.elasticsearch.common.settings.ClusterSettings;\n import org.elasticsearch.common.settings.Setting;\n@@ -190,9 +191,15 @@ public DesiredBalance compute(\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n                     final var nodeId = nodeIds.removeFirst();\n-                    final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }\n@@ -203,10 +210,16 @@ public DesiredBalance compute(\n             if (unassignedPrimaries.contains(shardRouting.shardId()) == false) {\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n-                    final String nodeId = nodeIds.removeFirst();\n-                    ShardRouting shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var nodeId = nodeIds.removeFirst();\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-01-30T12:54:33Z",
+      "user": "idegtiarenko",
+      "body": "DesiredBalanceComputer might blindly start unassigned shard in-place even if it could no longer be allocated on the node.\r\nThe way to reproduce this is described here: https://github.com/elastic/elasticsearch/issues/93271#issuecomment-1406330919\r\n\r\nThis was discovered while trying to fix flaky `SnapshotBasedRecoveryIT#testSnapshotBasedRecovery`.\r\n\r\nClose: #93271 "
+    },
+    {
+      "type": "review",
+      "id": 1275112335,
+      "created_at": "2023-01-30T12:55:16Z",
+      "user": "idegtiarenko",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1090590790,
+      "created_at": "2023-01-30T12:55:16Z",
+      "user": "idegtiarenko",
+      "body": "I am working on unit test to verify this",
+      "path": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java",
+      "diff_hunk": "@@ -190,9 +191,15 @@ public DesiredBalance compute(\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n                     final var nodeId = nodeIds.removeFirst();\n-                    final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 202,
+      "original_line": 202,
+      "side": "RIGHT",
+      "original_position": 23,
+      "position": 23,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "comment",
+      "id": 1425522812,
+      "created_at": "2023-02-10T09:41:54Z",
+      "user": "idegtiarenko",
+      "body": "Merged as part of https://github.com/elastic/elasticsearch/pull/93654"
+    }
+  ]
+}

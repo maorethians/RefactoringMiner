@@ -1,0 +1,173 @@
+{
+  "repo": "netty/netty",
+  "number": 14332,
+  "pr_number": 14332,
+  "title": "AdaptiveByteBufAllocator: Make pooling of AdaptiveByteBuf magazine local",
+  "user": "normanmaurer",
+  "created_at": "2024-09-13T13:02:30Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "5a9b28a4157f79bb69331b0979e73c2eb8b2bb3f",
+  "merge_commit_sha": "6b057403a4f7d0dec2e81813f49553cccd0f8d9d",
+  "commits": 1,
+  "issue_events": [
+    "review_requested",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "milestoned",
+    "demilestoned",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/netty/netty/pull/14332",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-09-13T12:59:20Z",
+      "sha": "abf3989074441f967c6c27288fc183306651e21a",
+      "message": "AdaptiveByteBufAllocator: Make pooling of AdaptiveByteBuf magazine local\n\nMotivation:\n\nTo reduce the usage of FastThreadLocal and make the AdaptiveByteBufAllocator also play nice with virtual threads we should just pool the AdapativeByteBuf instances in the Magazines itself.\n\nModifications:\n\n- Remove usage of Recycler for pooling AdaptiveByteBuf\n- Use a bounded MPSC queue that is stored in the Magazine itself for pooling these instances\n\nResult:\n\nFixes https://github.com/netty/netty/issues/14279",
+      "author": "Norman Maurer",
+      "author_email": "norman_maurer@apple.com",
+      "author_raw_date": "2024-09-13T12:59:20Z",
+      "author_date": "2024-09-13T12:59:20Z",
+      "committer": "Norman Maurer",
+      "committer_email": "norman_maurer@apple.com",
+      "raw_date": "2024-09-13T12:59:20Z",
+      "diff_text": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java\n@@ -15,7 +15,6 @@\n  */\n package io.netty.buffer;\n \n-import io.netty.util.AbstractReferenceCounted;\n import io.netty.util.ByteProcessor;\n import io.netty.util.IllegalReferenceCountException;\n import io.netty.util.NettyRuntime;\n@@ -113,6 +112,14 @@ enum MagazineCaching {\n     private static final int CENTRAL_QUEUE_CAPACITY = SystemPropertyUtil.getInt(\n             \"io.netty.allocator.centralQueueCapacity\", NettyRuntime.availableProcessors());\n \n+    /**\n+     * The capacity if the magazine local buffer queue. This queue just pools the outer ByteBuf instance and not\n+     * the actual memory and so helps to reduce GC pressure.\n+     */\n+    // TODO: Choose a good default.\n+    private static final int MAGAZINE_BUFFER_QUEUE_CAPACITY = SystemPropertyUtil.getInt(\n+            \"io.netty.allocator.magazineBufferQueueCapacity\", 4 * 1024);\n+\n     private static final Object NO_MAGAZINE = Boolean.TRUE;\n \n     private final ChunkAllocator chunkAllocator;\n@@ -196,36 +203,24 @@ private static Queue<Chunk> createSharedChunkQueue() {\n     @Override\n     public ByteBuf allocate(int size, int maxCapacity) {\n         if (size <= MAX_CHUNK_SIZE) {\n-            Thread currentThread = Thread.currentThread();\n-            boolean willCleanupFastThreadLocals = FastThreadLocalThread.willCleanupFastThreadLocals(currentThread);\n-            AdaptiveByteBuf buf = AdaptiveByteBuf.newInstance(willCleanupFastThreadLocals);\n-            try {\n-                if (allocate(size, maxCapacity, currentThread, buf)) {\n-                    // Allocation did work, the ownership will is transferred to the caller.\n-                    AdaptiveByteBuf result = buf;\n-                    buf = null;\n-                    return result;\n-                }\n-            } finally {\n-                if (buf != null) {\n-                    // We didn't handover ownership of the buf, release it now so we don't leak.\n-                    buf.release();\n-                }\n+            AdaptiveByteBuf allocated = allocate(size, maxCapacity, Thread.currentThread());\n+            if (allocated != null) {\n+                return allocated;\n             }\n         }\n         // The magazines failed us, or the buffer is too big to be pooled.\n         return chunkAllocator.allocate(size, maxCapacity);\n     }\n \n-    private boolean allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {\n+    private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread) {\n         int sizeBucket = AllocationStatistics.sizeBucket(size); // Compute outside of Magazine lock for better ILP.\n         FastThreadLocal<Object> threadLocalMagazine = this.threadLocalMagazine;\n         if (threadLocalMagazine != null && currentThread instanceof FastThreadLocalThread) {\n             Object mag = threadLocalMagazine.get();\n             if (mag != NO_MAGAZINE) {\n-                boolean allocated = ((Magazine) mag).tryAllocate(size, sizeBucket, maxCapacity, buf);\n-                assert allocated : \"Allocation of threadLocalMagazine must always succeed\";\n-                return true;\n+                AdaptiveByteBuf allocated = ((Magazine) mag).tryAllocate(size, sizeBucket, maxCapacity);\n+                assert allocated != null : \"Allocation of threadLocalMagazine must always succeed\";\n+                return allocated;\n             }\n         }\n         long threadId = currentThread.getId();\n@@ -237,22 +232,24 @@ private boolean allocate(int size, int maxCapacity, Thread currentThread, Adapti\n             int index = (int) (threadId & mask);\n             for (int i = 0, m = Integer.numberOfTrailingZeros(~mask); i < m; i++) {\n                 Magazine mag = mags[index + i & mask];\n-                if (mag.tryAllocate(size, sizeBucket, maxCapacity, buf)) {\n+                AdaptiveByteBuf allocated = mag.tryAllocate(size, sizeBucket, maxCapacity);\n+                if (allocated != null) {\n                     // Was able to allocate.\n-                    return true;\n+                    return allocated;\n                 }\n             }\n             expansions++;\n         } while (expansions <= EXPANSION_ATTEMPTS && tryExpandMagazines(mags.length));\n-        return false;\n+        return null;\n     }\n \n     /**\n      * Allocate into the given buffer. Used by {@link AdaptiveByteBuf#capacity(int)}.\n      */\n     void allocate(int size, int maxCapacity, AdaptiveByteBuf into) {\n         Magazine magazine = into.chunk.magazine;\n-        if (!allocate(size, maxCapacity, Thread.currentThread(), into)) {\n+        int sizeBucket = AllocationStatistics.sizeBucket(size);\n+        if (!into.chunk.magazine.tryAllocate(size, sizeBucket, maxCapacity, into)) {\n             // Create a one-off chunk for this allocation as the previous allocate call did not work out.\n             AbstractByteBuf innerChunk = chunkAllocator.allocate(size, maxCapacity);\n             Chunk chunk = new Chunk(innerChunk, magazine, false);\n@@ -455,6 +452,15 @@ private static final class Magazine extends AllocationStatistics {\n         private volatile Chunk nextInLine;\n         private final AtomicLong usedMemory;\n         private final StampedLock allocationLock;\n+        private final Queue<AdaptiveByteBuf> bufferQueue =\n+                PlatformDependent.newFixedMpscQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);\n+\n+        private final ObjectPool.Handle<AdaptiveByteBuf> handle = new ObjectPool.Handle<AdaptiveByteBuf>() {\n+            @Override\n+            public void recycle(AdaptiveByteBuf self) {\n+                bufferQueue.offer(self);\n+            }\n+        };\n \n         Magazine(AdaptivePoolingAllocator parent) {\n             this(parent, true);\n@@ -472,6 +478,39 @@ private static final class Magazine extends AllocationStatistics {\n             usedMemory = new AtomicLong();\n         }\n \n+        private AdaptiveByteBuf newBuffer() {\n+            AdaptiveByteBuf buffer = bufferQueue.poll();\n+            if (buffer == null) {\n+                buffer = new AdaptiveByteBuf(handle);\n+            } else {\n+                buffer.resetRefCnt();\n+                buffer.discardMarks();\n+            }\n+            return buffer;\n+        }\n+\n+        public AdaptiveByteBuf tryAllocate(int size, int sizeBucket, int maxCapacity) {\n+            if (allocationLock == null) {\n+                AdaptiveByteBuf buf = newBuffer();\n+                // This magazine is not shared across threads, just allocate directly.\n+                allocate(size, sizeBucket, maxCapacity, buf);\n+                return buf;\n+            }\n+\n+            // Try to retrieve the lock and if successful allocate.\n+            long writeLock = allocationLock.tryWriteLock();\n+            if (writeLock != 0) {\n+                try {\n+                    AdaptiveByteBuf buf = newBuffer();\n+                    allocate(size, sizeBucket, maxCapacity, buf);\n+                    return buf;\n+                } finally {\n+                    allocationLock.unlockWrite(writeLock);\n+                }\n+            }\n+            return null;\n+        }\n+\n         public boolean tryAllocate(int size, int sizeBucket, int maxCapacity, AdaptiveByteBuf buf) {\n             if (allocationLock == null) {\n                 // This magazine is not shared across threads, just allocate directly.\n@@ -725,26 +764,8 @@ public int capacity() {\n     }\n \n     static final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {\n-        static final ObjectPool<AdaptiveByteBuf> RECYCLER = ObjectPool.newPool(\n-                new ObjectPool.ObjectCreator<AdaptiveByteBuf>() {\n-                    @Override\n-                    public AdaptiveByteBuf newObject(ObjectPool.Handle<AdaptiveByteBuf> handle) {\n-                        return new AdaptiveByteBuf(handle);\n-                    }\n-                });\n-\n-        static AdaptiveByteBuf newInstance(boolean useThreadLocal) {\n-            if (useThreadLocal) {\n-                AdaptiveByteBuf buf = RECYCLER.get();\n-                buf.resetRefCnt();\n-                buf.discardMarks();\n-                return buf;\n-            }\n-            return new AdaptiveByteBuf(null);\n-        }\n \n         private final ObjectPool.Handle<AdaptiveByteBuf> handle;\n-\n         private int adjustment;\n         private AbstractByteBuf rootParent;\n         private Chunk chunk;\n@@ -779,36 +800,6 @@ private AbstractByteBuf rootParent() {\n             throw new IllegalReferenceCountException();\n         }\n \n-        @Override\n-        public ByteBuf retainedSlice() {\n-            if (handle == null) {\n-                return super.retainedSlice();\n-            }\n-            // If the handle is not null we can use the Pooled variants that use a Recycler.\n-            ensureAccessible();\n-            return PooledSlicedByteBuf.newInstance(this, this, readerIndex(), readableBytes());\n-        }\n-\n-        @Override\n-        public ByteBuf retainedSlice(int index, int length) {\n-            if (handle == null) {\n-                return super.retainedSlice(index, length);\n-            }\n-            // If the handle is not null we can use the Pooled variants that use a Recycler.\n-            ensureAccessible();\n-            return PooledSlicedByteBuf.newInstance(this, this, index, length);\n-        }\n-\n-        @Override\n-        public ByteBuf retainedDuplicate() {\n-            if (handle == null) {\n-                return super.retainedDuplicate();\n-            }\n-            // If the handle is not null we can use the Pooled variants that use a Recycler.\n-            ensureAccessible();\n-            return PooledDuplicatedByteBuf.newInstance(this, this, readerIndex(), writerIndex());\n-        }\n-\n         @Override\n         public int capacity() {\n             return length;",
+      "diff": [
+        {
+          "file": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java",
+          "patch": "@@ -15,7 +15,6 @@\n  */\n package io.netty.buffer;\n \n-import io.netty.util.AbstractReferenceCounted;\n import io.netty.util.ByteProcessor;\n import io.netty.util.IllegalReferenceCountException;\n import io.netty.util.NettyRuntime;\n@@ -113,6 +112,14 @@ enum MagazineCaching {\n     private static final int CENTRAL_QUEUE_CAPACITY = SystemPropertyUtil.getInt(\n             \"io.netty.allocator.centralQueueCapacity\", NettyRuntime.availableProcessors());\n \n+    /**\n+     * The capacity if the magazine local buffer queue. This queue just pools the outer ByteBuf instance and not\n+     * the actual memory and so helps to reduce GC pressure.\n+     */\n+    // TODO: Choose a good default.\n+    private static final int MAGAZINE_BUFFER_QUEUE_CAPACITY = SystemPropertyUtil.getInt(\n+            \"io.netty.allocator.magazineBufferQueueCapacity\", 4 * 1024);\n+\n     private static final Object NO_MAGAZINE = Boolean.TRUE;\n \n     private final ChunkAllocator chunkAllocator;\n@@ -196,36 +203,24 @@ private static Queue<Chunk> createSharedChunkQueue() {\n     @Override\n     public ByteBuf allocate(int size, int maxCapacity) {\n         if (size <= MAX_CHUNK_SIZE) {\n-            Thread currentThread = Thread.currentThread();\n-            boolean willCleanupFastThreadLocals = FastThreadLocalThread.willCleanupFastThreadLocals(currentThread);\n-            AdaptiveByteBuf buf = AdaptiveByteBuf.newInstance(willCleanupFastThreadLocals);\n-            try {\n-                if (allocate(size, maxCapacity, currentThread, buf)) {\n-                    // Allocation did work, the ownership will is transferred to the caller.\n-                    AdaptiveByteBuf result = buf;\n-                    buf = null;\n-                    return result;\n-                }\n-            } finally {\n-                if (buf != null) {\n-                    // We didn't handover ownership of the buf, release it now so we don't leak.\n-                    buf.release();\n-                }\n+            AdaptiveByteBuf allocated = allocate(size, maxCapacity, Thread.currentThread());\n+            if (allocated != null) {\n+                return allocated;\n             }\n         }\n         // The magazines failed us, or the buffer is too big to be pooled.\n         return chunkAllocator.allocate(size, maxCapacity);\n     }\n \n-    private boolean allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {\n+    private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread) {\n         int sizeBucket = AllocationStatistics.sizeBucket(size); // Compute outside of Magazine lock for better ILP.\n         FastThreadLocal<Object> threadLocalMagazine = this.threadLocalMagazine;\n         if (threadLocalMagazine != null && currentThread instanceof FastThreadLocalThread) {\n             Object mag = threadLocalMagazine.get();\n             if (mag != NO_MAGAZINE) {\n-                boolean allocated = ((Magazine) mag).tryAllocate(size, sizeBucket, maxCapacity, buf);\n-                assert allocated : \"Allocation of threadLocalMagazine must always succeed\";\n-                return true;\n+                AdaptiveByteBuf allocated = ((Magazine) mag).tryAllocate(size, sizeBucket, maxCapacity);\n+                assert allocated != null : \"Allocation of threadLocalMagazine must always succeed\";\n+                return allocated;\n             }\n         }\n         long threadId = currentThread.getId();\n@@ -237,22 +232,24 @@ private boolean allocate(int size, int maxCapacity, Thread currentThread, Adapti\n             int index = (int) (threadId & mask);\n             for (int i = 0, m = Integer.numberOfTrailingZeros(~mask); i < m; i++) {\n                 Magazine mag = mags[index + i & mask];\n-                if (mag.tryAllocate(size, sizeBucket, maxCapacity, buf)) {\n+                AdaptiveByteBuf allocated = mag.tryAllocate(size, sizeBucket, maxCapacity);\n+                if (allocated != null) {\n                     // Was able to allocate.\n-                    return true;\n+                    return allocated;\n                 }\n             }\n             expansions++;\n         } while (expansions <= EXPANSION_ATTEMPTS && tryExpandMagazines(mags.length));\n-        return false;\n+        return null;\n     }\n \n     /**\n      * Allocate into the given buffer. Used by {@link AdaptiveByteBuf#capacity(int)}.\n      */\n     void allocate(int size, int maxCapacity, AdaptiveByteBuf into) {\n         Magazine magazine = into.chunk.magazine;\n-        if (!allocate(size, maxCapacity, Thread.currentThread(), into)) {\n+        int sizeBucket = AllocationStatistics.sizeBucket(size);\n+        if (!into.chunk.magazine.tryAllocate(size, sizeBucket, maxCapacity, into)) {\n             // Create a one-off chunk for this allocation as the previous allocate call did not work out.\n             AbstractByteBuf innerChunk = chunkAllocator.allocate(size, maxCapacity);\n             Chunk chunk = new Chunk(innerChunk, magazine, false);\n@@ -455,6 +452,15 @@ private static final class Magazine extends AllocationStatistics {\n         private volatile Chunk nextInLine;\n         private final AtomicLong usedMemory;\n         private final StampedLock allocationLock;\n+        private final Queue<AdaptiveByteBuf> bufferQueue =\n+                PlatformDependent.newFixedMpscQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);\n+\n+        private final ObjectPool.Handle<AdaptiveByteBuf> handle = new ObjectPool.Handle<AdaptiveByteBuf>() {\n+            @Override\n+            public void recycle(AdaptiveByteBuf self) {\n+                bufferQueue.offer(self);\n+            }\n+        };\n \n         Magazine(AdaptivePoolingAllocator parent) {\n             this(parent, true);\n@@ -472,6 +478,39 @@ private static final class Magazine extends AllocationStatistics {\n             usedMemory = new AtomicLong();\n         }\n \n+        private AdaptiveByteBuf newBuffer() {\n+            AdaptiveByteBuf buffer = bufferQueue.poll();\n+            if (buffer == null) {\n+                buffer = new AdaptiveByteBuf(handle);\n+            } else {\n+                buffer.resetRefCnt();\n+                buffer.discardMarks();\n+            }\n+            return buffer;\n+        }\n+\n+        public AdaptiveByteBuf tryAllocate(int size, int sizeBucket, int maxCapacity) {\n+            if (allocationLock == null) {\n+                AdaptiveByteBuf buf = newBuffer();\n+                // This magazine is not shared across threads, just allocate directly.\n+                allocate(size, sizeBucket, maxCapacity, buf);\n+                return buf;\n+            }\n+\n+            // Try to retrieve the lock and if successful allocate.\n+            long writeLock = allocationLock.tryWriteLock();\n+            if (writeLock != 0) {\n+                try {\n+                    AdaptiveByteBuf buf = newBuffer();\n+                    allocate(size, sizeBucket, maxCapacity, buf);\n+                    return buf;\n+                } finally {\n+                    allocationLock.unlockWrite(writeLock);\n+                }\n+            }\n+            return null;\n+        }\n+\n         public boolean tryAllocate(int size, int sizeBucket, int maxCapacity, AdaptiveByteBuf buf) {\n             if (allocationLock == null) {\n                 // This magazine is not shared across threads, just allocate directly.\n@@ -725,26 +764,8 @@ public int capacity() {\n     }\n \n     static final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {\n-        static final ObjectPool<AdaptiveByteBuf> RECYCLER = ObjectPool.newPool(\n-                new ObjectPool.ObjectCreator<AdaptiveByteBuf>() {\n-                    @Override\n-                    public AdaptiveByteBuf newObject(ObjectPool.Handle<AdaptiveByteBuf> handle) {\n-                        return new AdaptiveByteBuf(handle);\n-                    }\n-                });\n-\n-        static AdaptiveByteBuf newInstance(boolean useThreadLocal) {\n-            if (useThreadLocal) {\n-                AdaptiveByteBuf buf = RECYCLER.get();\n-                buf.resetRefCnt();\n-                buf.discardMarks();\n-                return buf;\n-            }\n-            return new AdaptiveByteBuf(null);\n-        }\n \n         private final ObjectPool.Handle<AdaptiveByteBuf> handle;\n-\n         private int adjustment;\n         private AbstractByteBuf rootParent;\n         private Chunk chunk;\n@@ -779,36 +800,6 @@ private AbstractByteBuf rootParent() {\n             throw new IllegalReferenceCountException();\n         }\n \n-        @Override\n-        public ByteBuf retainedSlice() {\n-            if (handle == null) {\n-                return super.retainedSlice();\n-            }\n-            // If the handle is not null we can use the Pooled variants that use a Recycler.\n-            ensureAccessible();\n-            return PooledSlicedByteBuf.newInstance(this, this, readerIndex(), readableBytes());\n-        }\n-\n-        @Override\n-        public ByteBuf retainedSlice(int index, int length) {\n-            if (handle == null) {\n-                return super.retainedSlice(index, length);\n-            }\n-            // If the handle is not null we can use the Pooled variants that use a Recycler.\n-            ensureAccessible();\n-            return PooledSlicedByteBuf.newInstance(this, this, index, length);\n-        }\n-\n-        @Override\n-        public ByteBuf retainedDuplicate() {\n-            if (handle == null) {\n-                return super.retainedDuplicate();\n-            }\n-            // If the handle is not null we can use the Pooled variants that use a Recycler.\n-            ensureAccessible();\n-            return PooledDuplicatedByteBuf.newInstance(this, this, readerIndex(), writerIndex());\n-        }\n-\n         @Override\n         public int capacity() {\n             return length;"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-09-13T13:02:30Z",
+      "user": "normanmaurer",
+      "body": "Motivation:\r\n\r\nTo reduce the usage of FastThreadLocal and make the AdaptiveByteBufAllocator also play nice with virtual threads we should just pool the AdapativeByteBuf instances in the Magazines itself.\r\n\r\nModifications:\r\n\r\n- Remove usage of Recycler for pooling AdaptiveByteBuf\r\n- Use a bounded MPSC queue that is stored in the Magazine itself for pooling these instances\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/14279\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 2348912567,
+      "created_at": "2024-09-13T13:02:47Z",
+      "user": "normanmaurer",
+      "body": "This implements the idea of @franz1981 "
+    },
+    {
+      "type": "review",
+      "id": 2303076534,
+      "created_at": "2024-09-13T13:03:33Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1758830695,
+      "created_at": "2024-09-13T13:03:33Z",
+      "user": "normanmaurer",
+      "body": "I am open for suggestions :D ",
+      "path": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java",
+      "diff_hunk": "@@ -113,6 +112,14 @@ enum MagazineCaching {\n     private static final int CENTRAL_QUEUE_CAPACITY = SystemPropertyUtil.getInt(\n             \"io.netty.allocator.centralQueueCapacity\", NettyRuntime.availableProcessors());\n \n+    /**\n+     * The capacity if the magazine local buffer queue. This queue just pools the outer ByteBuf instance and not\n+     * the actual memory and so helps to reduce GC pressure.\n+     */\n+    // TODO: Choose a good default.",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 119,
+      "original_line": 119,
+      "side": "RIGHT",
+      "original_position": 16,
+      "position": 16,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2303105990,
+      "created_at": "2024-09-13T13:13:15Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1758847552,
+      "created_at": "2024-09-13T13:13:15Z",
+      "user": "normanmaurer",
+      "body": "Please note that with the current implementation we would always stay in the same chunk when trying to increase the capacity. ",
+      "path": "buffer/src/main/java/io/netty/buffer/AdaptivePoolingAllocator.java",
+      "diff_hunk": "@@ -237,22 +232,24 @@ private boolean allocate(int size, int maxCapacity, Thread currentThread, Adapti\n             int index = (int) (threadId & mask);\n             for (int i = 0, m = Integer.numberOfTrailingZeros(~mask); i < m; i++) {\n                 Magazine mag = mags[index + i & mask];\n-                if (mag.tryAllocate(size, sizeBucket, maxCapacity, buf)) {\n+                AdaptiveByteBuf allocated = mag.tryAllocate(size, sizeBucket, maxCapacity);\n+                if (allocated != null) {\n                     // Was able to allocate.\n-                    return true;\n+                    return allocated;\n                 }\n             }\n             expansions++;\n         } while (expansions <= EXPANSION_ATTEMPTS && tryExpandMagazines(mags.length));\n-        return false;\n+        return null;\n     }\n \n     /**\n      * Allocate into the given buffer. Used by {@link AdaptiveByteBuf#capacity(int)}.\n      */\n     void allocate(int size, int maxCapacity, AdaptiveByteBuf into) {\n         Magazine magazine = into.chunk.magazine;\n-        if (!allocate(size, maxCapacity, Thread.currentThread(), into)) {\n+        int sizeBucket = AllocationStatistics.sizeBucket(size);\n+        if (!into.chunk.magazine.tryAllocate(size, sizeBucket, maxCapacity, into)) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 252,
+      "original_line": 252,
+      "side": "RIGHT",
+      "original_position": 92,
+      "position": 92,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1813450764,
+          "user": "chrisvest",
+          "body": "That's not going to work so well, since we pointer-bump allocate from chunks.",
+          "created_at": "2024-10-23T19:57:42Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2303294168,
+      "created_at": "2024-09-13T14:29:42Z",
+      "user": "franz1981",
+      "state": "APPROVED",
+      "body": "It is what I mean thanks bud ❤️ \n\nMaybe the event loop magazines can just use the existing recycler given that they can benefit of the array deque AND they can guarantee the thread confinement. Furthermore it will make the recycler invitations to be bi-morphic which is still perfectly fine, perf wise, wdyt?"
+    },
+    {
+      "type": "comment",
+      "id": 2349865172,
+      "created_at": "2024-09-13T18:44:12Z",
+      "user": "chrisvest",
+      "body": "How about we hold this until after 4.1.114?"
+    },
+    {
+      "type": "comment",
+      "id": 2349905237,
+      "created_at": "2024-09-13T18:54:24Z",
+      "user": "normanmaurer",
+      "body": "Sure thing... no hurry at all."
+    },
+    {
+      "type": "comment",
+      "id": 2352469095,
+      "created_at": "2024-09-16T09:53:55Z",
+      "user": "normanmaurer",
+      "body": "I cleared the milestone "
+    },
+    {
+      "type": "review",
+      "id": 2390158934,
+      "created_at": "2024-10-23T19:57:43Z",
+      "user": "chrisvest",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2433543862,
+      "created_at": "2024-10-23T22:00:02Z",
+      "user": "chrisvest",
+      "body": "See https://github.com/netty/netty/pull/14414"
+    },
+    {
+      "type": "comment",
+      "id": 2434197529,
+      "created_at": "2024-10-24T03:54:57Z",
+      "user": "normanmaurer",
+      "body": "Let's close this in favor of https://github.com/netty/netty/pull/14414"
+    }
+  ]
+}

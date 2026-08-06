@@ -1,0 +1,806 @@
+{
+  "repo": "oracle/graal",
+  "number": 10135,
+  "pr_number": 10135,
+  "title": "Implement Truffle compiler control based on HotSpot's CompileBroker compilation activity",
+  "user": "simonis",
+  "created_at": "2024-11-21T16:43:58Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "OCA Verified"
+  ],
+  "base_commit": "cb464855ea73fa08e27715e9f32f5f2e87dc41ad",
+  "merge_commit_sha": null,
+  "commits": 5,
+  "issue_events": [
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "closed"
+  ],
+  "url": "https://github.com/oracle/graal/pull/10135",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-11-21T12:51:15Z",
+      "sha": "c55983ced7d01676c68f4a4aaf33e0f9fc4dd23a",
+      "message": "Implement Truffle compiler control based on HotSpot's CompileBroker compilation activity",
+      "author": "Volker Simonis",
+      "author_email": "volker.simonis@gmail.com",
+      "author_raw_date": "2024-11-20T19:26:50Z",
+      "author_date": "2024-11-20T19:26:50Z",
+      "committer": "Volker Simonis",
+      "committer_email": "volker.simonis@gmail.com",
+      "raw_date": "2024-11-21T12:51:15Z",
+      "diff_text": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java\n@@ -359,4 +359,31 @@ default ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String class\n      */\n     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);\n \n+    /**\n+     * Represents HotSpot's compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     */\n+    enum CompilationActivityMode {\n+        STOP_COMPILATION,\n+        RUN_COMPILATION,\n+        SHUTDOWN_COMPILATION;\n+\n+        static public CompilationActivityMode fromInteger(int i) {\n+            return switch (i) {\n+                case 0 -> STOP_COMPILATION;\n+                case 1 -> RUN_COMPILATION;\n+                case 2 -> SHUTDOWN_COMPILATION;\n+                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n+            };\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code STOP_COMPILATION}, {@code RUN_COMPILATION} or {@code SHUTDOWN_COMPILATION}\n+     */\n+     default CompilationActivityMode getCompilationActivityMode() {\n+         return CompilationActivityMode.RUN_COMPILATION;\n+     }\n }\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java\n@@ -158,6 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n+                   \"compilation activity mode in the host VM. If the activity mode is 'STOP_COMPILATION' because \" +\n+                   \"of a full code cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n+                   \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n+                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\",\n+                   usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)\n+    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(1000L);\n+\n     @Option(help = \"Manually set the number of compiler threads. By default, the number of compiler threads is scaled with the number of available cores on the CPU.\", usageSyntax = \"[1, inf)\", category = OptionCategory.EXPERT, //\n                     stability = OptionStability.STABLE, sandbox = SandboxPolicy.UNTRUSTED) //\n     public static final OptionKey<Integer> CompilerThreads = new OptionKey<>(-1);\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java\n@@ -41,6 +41,7 @@\n package com.oracle.truffle.runtime;\n \n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.CompilerIdleDelay;\n+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;\n \n import java.io.CharArrayWriter;\n import java.io.PrintWriter;\n@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n+                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n+            stoppedCompilationTime = 0;\n+            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+            return queue.submitCompilation(priority, optimizedCallTarget);\n+        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n+            if (stoppedCompilationTime == 0) {\n+                stoppedCompilationTime = System.currentTimeMillis();\n+            }\n+            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n+            // eventually, if the hosts code cache can be cleaned up.\n+            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n+                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+            }\n+        } else {\n+            // Compilation was shut down permanently because the hosts code cache ran full and\n+            // the host was configured without support for code cache sweeping.\n+            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n+            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n+            // The logger can be null if the engine is closed.\n+            if (logger != null && logShutdownCompilations) {\n+                logShutdownCompilations = false;\n+                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +\n+                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+            }\n+            try {\n+                queue.shutdownAndAwaitTermination(100 /* milliseconds */);\n+            } catch (RuntimeException re) {\n+                // Best effort, ignore failure\n+            }\n+        }\n+        return null;\n     }\n \n     @SuppressWarnings(\"all\")\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java\n@@ -40,6 +40,9 @@\n  */\n package com.oracle.truffle.runtime.hotspot;\n \n+import java.lang.invoke.MethodHandle;\n+import java.lang.invoke.MethodHandles;\n+import java.lang.invoke.MethodType;\n import java.lang.ref.Reference;\n import java.lang.reflect.Field;\n import java.lang.reflect.InvocationTargetException;\n@@ -692,4 +695,30 @@ public boolean isLibGraalCompilationEnabled() {\n         return compilationSupport instanceof LibGraalTruffleCompilationSupport;\n     }\n \n+    static MethodHandle getCompilationActivityMode;\n+    static {\n+        try {\n+            MethodType mt = MethodType.methodType(int.class);\n+            getCompilationActivityMode = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n+        } catch (NoSuchMethodException | IllegalAccessException e) {\n+            // Older JVMCI runtimes might not support `getCompilationActivityMode()`\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     */\n+    @Override\n+    public CompilationActivityMode getCompilationActivityMode() {\n+        int activityMode = 1; // Default is to run compilations\n+        if (getCompilationActivityMode != null) {\n+            try {\n+                activityMode = (int) getCompilationActivityMode.invokeExact(HotSpotJVMCIRuntime.runtime());\n+            } catch (Throwable t) {\n+                // Ignore and go with the default mode\n+            }\n+        }\n+        return CompilationActivityMode.fromInteger(activityMode);\n+    }\n }",
+      "diff": [
+        {
+          "file": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java",
+          "patch": "@@ -359,4 +359,31 @@ default ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String class\n      */\n     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);\n \n+    /**\n+     * Represents HotSpot's compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     */\n+    enum CompilationActivityMode {\n+        STOP_COMPILATION,\n+        RUN_COMPILATION,\n+        SHUTDOWN_COMPILATION;\n+\n+        static public CompilationActivityMode fromInteger(int i) {\n+            return switch (i) {\n+                case 0 -> STOP_COMPILATION;\n+                case 1 -> RUN_COMPILATION;\n+                case 2 -> SHUTDOWN_COMPILATION;\n+                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n+            };\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code STOP_COMPILATION}, {@code RUN_COMPILATION} or {@code SHUTDOWN_COMPILATION}\n+     */\n+     default CompilationActivityMode getCompilationActivityMode() {\n+         return CompilationActivityMode.RUN_COMPILATION;\n+     }\n }"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java",
+          "patch": "@@ -158,6 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n+                   \"compilation activity mode in the host VM. If the activity mode is 'STOP_COMPILATION' because \" +\n+                   \"of a full code cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n+                   \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n+                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\",\n+                   usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)\n+    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(1000L);\n+\n     @Option(help = \"Manually set the number of compiler threads. By default, the number of compiler threads is scaled with the number of available cores on the CPU.\", usageSyntax = \"[1, inf)\", category = OptionCategory.EXPERT, //\n                     stability = OptionStability.STABLE, sandbox = SandboxPolicy.UNTRUSTED) //\n     public static final OptionKey<Integer> CompilerThreads = new OptionKey<>(-1);"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+          "patch": "@@ -41,6 +41,7 @@\n package com.oracle.truffle.runtime;\n \n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.CompilerIdleDelay;\n+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;\n \n import java.io.CharArrayWriter;\n import java.io.PrintWriter;\n@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n+                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n+            stoppedCompilationTime = 0;\n+            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+            return queue.submitCompilation(priority, optimizedCallTarget);\n+        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n+            if (stoppedCompilationTime == 0) {\n+                stoppedCompilationTime = System.currentTimeMillis();\n+            }\n+            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n+            // eventually, if the hosts code cache can be cleaned up.\n+            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n+                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+            }\n+        } else {\n+            // Compilation was shut down permanently because the hosts code cache ran full and\n+            // the host was configured without support for code cache sweeping.\n+            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n+            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n+            // The logger can be null if the engine is closed.\n+            if (logger != null && logShutdownCompilations) {\n+                logShutdownCompilations = false;\n+                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +\n+                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+            }\n+            try {\n+                queue.shutdownAndAwaitTermination(100 /* milliseconds */);\n+            } catch (RuntimeException re) {\n+                // Best effort, ignore failure\n+            }\n+        }\n+        return null;\n     }\n \n     @SuppressWarnings(\"all\")"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java",
+          "patch": "@@ -40,6 +40,9 @@\n  */\n package com.oracle.truffle.runtime.hotspot;\n \n+import java.lang.invoke.MethodHandle;\n+import java.lang.invoke.MethodHandles;\n+import java.lang.invoke.MethodType;\n import java.lang.ref.Reference;\n import java.lang.reflect.Field;\n import java.lang.reflect.InvocationTargetException;\n@@ -692,4 +695,30 @@ public boolean isLibGraalCompilationEnabled() {\n         return compilationSupport instanceof LibGraalTruffleCompilationSupport;\n     }\n \n+    static MethodHandle getCompilationActivityMode;\n+    static {\n+        try {\n+            MethodType mt = MethodType.methodType(int.class);\n+            getCompilationActivityMode = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n+        } catch (NoSuchMethodException | IllegalAccessException e) {\n+            // Older JVMCI runtimes might not support `getCompilationActivityMode()`\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     */\n+    @Override\n+    public CompilationActivityMode getCompilationActivityMode() {\n+        int activityMode = 1; // Default is to run compilations\n+        if (getCompilationActivityMode != null) {\n+            try {\n+                activityMode = (int) getCompilationActivityMode.invokeExact(HotSpotJVMCIRuntime.runtime());\n+            } catch (Throwable t) {\n+                // Ignore and go with the default mode\n+            }\n+        }\n+        return CompilationActivityMode.fromInteger(activityMode);\n+    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-11-21T16:43:58Z",
+      "user": "simonis",
+      "body": "Truffle compilations run in \"hosted\" mode, i.e. the Truffle runtimes triggers compilations independently of HotSpot's [`CompileBroker`](https://github.com/openjdk/jdk/blob/8f22db23a50fe537d8ef369e92f0d5f9970d98f0/src/hotspot/share/compiler/compileBroker.hpp). But the results of Truffle compilations are still stored as ordinary nmethods in HotSpot's code cache (with the help of the JVMCI method `jdk.vm.ci.hotspot.HotSpotCodeCacheProvider::installCode()`). The regular JIT compilers are controlled by the `CompileBroker` which is aware of the code cache occupancy. If the code cache runs full, the `CompileBroker` temporary pauses any subsequent JIT compilations until the code cache gets swept (if running with `-XX:+UseCodeCacheFlushing -XX:+MethodFlushing` which is the default) or completely shuts down the JIT compilers if running with `-XX:+UseCodeCacheFlushing`.\r\n\r\nTruffle compiled methods can contribute significantly to the overall code cache occupancy and they can trigger JIT compilation stalls if they fill the code cache up. But the Truffle framework itself is neither aware of the current code cache occupancy, nor of the compilation activity of the `CompileBroker`. If Truffle tries to install a compiled method through JVMCI and the code cache is full, it will silently fail. Currently Truffle interprets such failures as transient errors and basically ignores it. Whenever the corresponding method gets hot again (usually immediately at the next invocation), Truffle will recompile it again just to fail again in the nmethod installation step, if the code cache is still full.\r\n\r\nWhen the code cache is tight, this can lead to situations, where Truffle is unnecessarily and repeatedly compiling methods which can't be installed in the code cache but produce a significant CPU load. Instead, Truffle should poll HotSpot's `CompileBroker` compilation activity and paus compilations for the time the `CompileBroker` is pausing JIT compilations (or completely shutdown Truffle compilations if the `CompileBroker` shut down the JIT compilers).\r\n\r\nThe corresponding JVMCI change is tracked under [JDK-8344727: [JVMCI] Export the CompileBroker compilation activity mode for Truffle compiler control](https://bugs.openjdk.org/browse/JDK-8344727).\r\n\r\nThis PR fixes the problem by checking HotSpot's compilation activity mode in `OptimizedTruffleRuntime::submitForCompilation()` before actually submitting a compilation task to a compile queue. If the compilation activity mode is `RUN_COMPILATION` the task is submitted as before without any changes. However, if the compilation activity mode is `STOP_COMPILATION` (i.e. the `CompileBroker` has temporarily stopped JIT compilations, we flush the current compile queue (because compiled methods can not be installed anyway) and return `null`. We also start a timer which can be configured with the new `StoppedCompilationRetryDelay` parameter (defaults to 1000ms). After `StoppedCompilationRetryDelay` we submit a new compilation task, even if the compilation activity mode is not `RUN_COMPILATION`. This can help to trigger a code cache cleanup in situations when there are no JIT compilations, because code cache sweeping is only triggered when new nmethods are installed. Finally, when the compilation activity mode is `SHUTDOWN_COMPILATION`, we simply shutdown the compilation queue and issue a warning to inform users about the code cache shortage.\r\n\r\nI've manually tested the change by running an octane benchmark with a very small code cache. Before the change, we could see the following results:\r\n```\r\nRayTrace: 484\r\n----\r\nScore (version 9): 484\r\n\r\n[engine] Truffle runtime statistics for engine 1\r\n    Compilations                : 2255\r\n      Success                   : 549\r\n      Temporary Bailouts        : 1703\r\n        jdk.vm.ci.code.BailoutException: Code installation failed: code cache is full: 1702\r\n      Permanent Bailouts        : 0\r\n      Failed                    : 0\r\n      Interrupted               : 3\r\n    Invalidated                 : 0\r\n    Queues                      : 2480\r\n    Dequeues                    : 30\r\n        Target inlined into only caller: 30\r\n    Splits                      : 156\r\n    Compilation Accuracy        : 1.000000\r\n    Queue Accuracy              : 0.987903\r\n    Compilation Utilization     : 2.948298\r\n    Remaining Compilation Queue : 195\r\n    Time to queue               : count=2480, sum=187025989722, min=   60029, average= 75413705.53, max=181007679, maxTarget=cross\r\n    Time waiting in queue       : count=2254, sum=1385581671, min=      54, average=   614721.24, max=156182217, maxTarget=Function.prototype.apply <split-322>\r\n\r\n    JVMCI CompileBroker Time:\r\n       Compile:          0,000 s\r\n       Install Code:     0,000 s (installs: 0, CodeBlob total size: 0, CodeBlob code size: 0)\r\n\r\n    JVMCI Hosted Time:\r\n       Install Code:    27,227 s (installs: 565, CodeBlob total size: 5916736, CodeBlob code size: 1713432)\r\n\r\n  nmethod code size         :  6834896 bytes\r\n  nmethod total size        : 14834520 bytes\r\nCodeCache: size=3896Kb used=3458Kb max_used=3586Kb free=437Kb\r\n bounds [0x00007ffff436d000, 0x00007ffff473b000, 0x00007ffff473b000]\r\n total_blobs=1378 nmethods=566 adapters=714\r\n compilation: disabled (not enough contiguous free space left)\r\n              stopped_count=26, restarted_count=25\r\n full_count=3200\r\n\r\nreal\t3m11,398s\r\nuser\t11m19,363s\r\nsys\t0m9,387s\r\n```\r\n\r\nAs you can see, out of 2255 compilations, 1702 have been to no purpose, because they failed in the final installation step because of a full code cache (i.e. `BailoutException: Code installation failed: code cache is full: 1702`). The other interesting observation is that although the benchmark terminated after 3min11s wall clock time, it actually consumed 11m19s cpu time, because the Truffle compiler threads where continuously doing useless work.\r\n\r\nWith my changes applied, the picture looks as follows:\r\n```\r\nRayTrace: 531\r\n----\r\nScore (version 9): 531\r\n\r\n\r\n[engine] Truffle runtime statistics for engine 1\r\n    Compilations                : 128\r\n      Success                   : 111\r\n      Temporary Bailouts        : 17\r\n        jdk.vm.ci.code.BailoutException: Code installation failed: code cache is full: 16\r\n        org.graalvm.compiler.core.common.CancellationBailoutException: Compilation cancelled.: 1\r\n      Permanent Bailouts        : 0\r\n      Failed                    : 0\r\n      Interrupted               : 0\r\n    Invalidated                 : 0\r\n    Queues                      : 410\r\n    Dequeues                    : 283\r\n        Compilation temporary disabled due to full code cache.: 277\r\n        Target inlined into only caller: 6\r\n    Splits                      : 156\r\n    Compilation Accuracy        : 1.000000\r\n    Queue Accuracy              : 0.309756\r\n    Compilation Utilization     : 0.069104\r\n    Remaining Compilation Queue : 0\r\n    Time to queue               : count= 410, sum=24979066360, min=   88714, average= 60924552.10, max=186708180, maxTarget=blend\r\n    Time waiting in queue       : count= 128, sum=  22955820, min=       6, average=   179342.35, max=  724639, maxTarget=:anonymous <split-344>\r\n\r\n    JVMCI CompileBroker Time:\r\n       Compile:          0,000 s\r\n       Install Code:     0,000 s (installs: 0, CodeBlob total size: 0, CodeBlob code size: 0)\r\n\r\n    JVMCI Hosted Time:\r\n       Install Code:     0,637 s (installs: 124, CodeBlob total size: 1156760, CodeBlob code size: 321496)\r\n\r\n  nmethod code size         :  2460456 bytes\r\n  nmethod total size        :  4833272 bytes\r\nCodeCache: size=3896Kb used=3464Kb max_used=3537Kb free=431Kb\r\n bounds [0x00007ffff436d000, 0x00007ffff473b000, 0x00007ffff473b000]\r\n total_blobs=1557 nmethods=745 adapters=714\r\n compilation: disabled (not enough contiguous free space left)\r\n              stopped_count=5, restarted_count=4\r\n full_count=33\r\n\r\nreal\t3m14,756s\r\nuser\t3m22,013s\r\nsys\t0m1,044s\r\n```\r\n\r\nAs you can see, we compile considerably fewer methods and we only have 16 compilation failures due to a full code cache. At the same time we can see that from the 410 methods which have been enqueued for compilation, 277 have been dequeued because of `Compilation temporary disabled due to full code cache`. Again, the wall clock time of the benchmark was 3m14s but this time, the overall cpu time was just slightly higher with 3m22s because we haven't done such a huge amount of unnecessary compilations any more. Also notice how HotSpot's code cache `full_count`, which is incremented every time when a nmethod can't be installed because of a full code cache, dropped from 3200 to 33.\r\n\r\nThese example were run with `-XX:+UseCodeCacheFlushing -XX:+MethodFlushing`. If the JVM is configured with `-XX:-UseCodeCacheFlushing`, the benefits of this change are even higher.\r\n\r\nFixes #10133 "
+    },
+    {
+      "type": "review_comment",
+      "id": 1852556638,
+      "created_at": "2024-11-21T17:16:48Z",
+      "user": "chumer",
+      "body": "submitForCompilation is not thread-safe. We need to handle these fields to be modified from multpile threads. So we would need to synchronize accessing these fields.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 917,
+      "side": "RIGHT",
+      "original_position": 13,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1856456871,
+          "user": "simonis",
+          "body": "In this case synchronization is not really required for correctness (the worst thing that can happen is that we schedule a compilation too much if compilations are stopped or we log more than once if compilation has been shutdown) but I've now changed both fields to `AtomicLong` and `AtomicBoolean` to also make the code formally correct. ",
+          "created_at": "2024-11-25T11:36:52Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1852557877,
+      "created_at": "2024-11-21T17:17:29Z",
+      "user": "chumer",
+      "body": "We do not really call Truffle compilations host compilations, that is typically reserved for compilations of HotSpot directly. Maybe we should just change it to Truffle compilations to avoid confusion.\r\nSidenote: it would not be a problem to show this warning once per engine.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n+                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n+            stoppedCompilationTime = 0;\n+            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+            return queue.submitCompilation(priority, optimizedCallTarget);\n+        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n+            if (stoppedCompilationTime == 0) {\n+                stoppedCompilationTime = System.currentTimeMillis();\n+            }\n+            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n+            // eventually, if the hosts code cache can be cleaned up.\n+            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n+                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+            }\n+        } else {\n+            // Compilation was shut down permanently because the hosts code cache ran full and\n+            // the host was configured without support for code cache sweeping.\n+            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n+            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n+            // The logger can be null if the engine is closed.\n+            if (logger != null && logShutdownCompilations) {\n+                logShutdownCompilations = false;\n+                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 945,
+      "side": "RIGHT",
+      "original_position": 43,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1852579966,
+      "created_at": "2024-11-21T17:32:57Z",
+      "user": "chumer",
+      "body": "Maybe we should move this logic into OptimizedCallTarget#compile instead and have a more efficent check, similar to how we already check for OptimizedCallTarget.compilationTask? Currently we would take a lock for every OptimizedCallTarget.call that triggers a compilation if compilation is paused.\r\n\r\nWe should also use the OptimizedCallTrage.EngineData class to store any state associated with the retry time. I know it most likely will be the same for all engines, but its a principle we work by to avoid that engines can affect each other. So we also avoid sharing locks.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 922,
+      "side": "RIGHT",
+      "original_position": 20,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1856521690,
+          "user": "simonis",
+          "body": "I've moved the compilation activity mode handling to `OptimizedCallTarget::compile()` as suggested.",
+          "created_at": "2024-11-25T12:19:39Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1852581267,
+      "created_at": "2024-11-21T17:33:43Z",
+      "user": "chumer",
+      "body": "This just cancels compilation for one engine only, whereas the JVMCI indication is for all engines. Either we move this code to the engine level or we pass `null` to filter for all engines in the queue.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n+                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n+            stoppedCompilationTime = 0;\n+            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+            return queue.submitCompilation(priority, optimizedCallTarget);\n+        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n+            if (stoppedCompilationTime == 0) {\n+                stoppedCompilationTime = System.currentTimeMillis();\n+            }\n+            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n+            // eventually, if the hosts code cache can be cleaned up.\n+            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 934,
+      "side": "RIGHT",
+      "original_position": 32,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1856513911,
+          "user": "simonis",
+          "body": "Your observation is correct, but I don't understand your comment \"*we pass null to filter for all engines in the queue*\"? From looking at the code of `getQueuedTargets()`, passing a `null` argument for the engine wouldn't return any compilation at all:\r\n```java\r\n        for (CompilationTask.ExecutorServiceWrapper wrapper : array) {\r\n            OptimizedCallTarget target = wrapper.compileTask.targetRef.get();\r\n            if (target != null && target.engine == engine) {\r\n                queuedTargets.add(target);\r\n            }\r\n        }\r\n```\r\nDid I misunderstood you or do you propose that I change `getQueuedTargets()` to treat a `null` engine as a filter for \"all engines\"?",
+          "created_at": "2024-11-25T12:14:10Z"
+        },
+        {
+          "id": 1856520413,
+          "user": "chumer",
+          "body": "> Did I misunderstood you or do you propose that I change getQueuedTargets() to treat a null engine as a filter for \"all engines\"?\r\n\r\nyes that is what I meant. But of course if you have a better idea or want to do this in an extra API that is probably fine too",
+          "created_at": "2024-11-25T12:18:42Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1852584569,
+      "created_at": "2024-11-21T17:36:09Z",
+      "user": "chumer",
+      "body": "Can you describe a bit what you are trying to achieve here? why would it help to block the entire interpreter thread if this happens?",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n+                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n+            stoppedCompilationTime = 0;\n+            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+            return queue.submitCompilation(priority, optimizedCallTarget);\n+        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n+            if (stoppedCompilationTime == 0) {\n+                stoppedCompilationTime = System.currentTimeMillis();\n+            }\n+            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n+            // eventually, if the hosts code cache can be cleaned up.\n+            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n+                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+            }\n+        } else {\n+            // Compilation was shut down permanently because the hosts code cache ran full and\n+            // the host was configured without support for code cache sweeping.\n+            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n+            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n+            // The logger can be null if the engine is closed.\n+            if (logger != null && logShutdownCompilations) {\n+                logShutdownCompilations = false;\n+                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +\n+                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+            }\n+            try {\n+                queue.shutdownAndAwaitTermination(100 /* milliseconds */);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 949,
+      "side": "RIGHT",
+      "original_position": 47,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1859074055,
+          "user": "simonis",
+          "body": "I must confess, that this is something I don't really understand very well. My actual intention is to stop/tear-down the Truffle compiler and all associated compiler threads once compilation has been shut down in HotSpot, but I didn't found a good way to do it.\r\nCould you please advice what would be the best reaction if HotSpot is shutting down compilations because of a full code cache without any hope for recovery? I.e. what can we do to run full speed interpreted without any profiling/compilation overhead from that point on?",
+          "created_at": "2024-11-26T18:46:37Z"
+        },
+        {
+          "id": 1863531451,
+          "user": "chumer",
+          "body": "The fastest way to disable a compilation is using OptimizedCallTarget.compilationFailed.\r\nEvery time we see shutdown with a call target we could disable compilation.\r\nBest idea I have.\r\nI put up an example what i would do in another comment (no idea how to link draft comments here)",
+          "created_at": "2024-11-29T13:31:14Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1852585694,
+      "created_at": "2024-11-21T17:37:09Z",
+      "user": "chumer",
+      "body": "Why would this fail? If you want to catch InterruptedException and ignore that, that would be fine. But I do not like catching wildcard exceptions and ignore them, I would prefer to rethrow.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n+                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n+            stoppedCompilationTime = 0;\n+            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+            return queue.submitCompilation(priority, optimizedCallTarget);\n+        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n+            if (stoppedCompilationTime == 0) {\n+                stoppedCompilationTime = System.currentTimeMillis();\n+            }\n+            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n+            // eventually, if the hosts code cache can be cleaned up.\n+            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n+                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+            }\n+        } else {\n+            // Compilation was shut down permanently because the hosts code cache ran full and\n+            // the host was configured without support for code cache sweeping.\n+            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n+            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n+            // The logger can be null if the engine is closed.\n+            if (logger != null && logShutdownCompilations) {\n+                logShutdownCompilations = false;\n+                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +\n+                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+            }\n+            try {\n+                queue.shutdownAndAwaitTermination(100 /* milliseconds */);\n+            } catch (RuntimeException re) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 950,
+      "side": "RIGHT",
+      "original_position": 48,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1852590452,
+      "created_at": "2024-11-21T17:40:32Z",
+      "user": "chumer",
+      "body": "Minor, but I think we could write this as a switch and easier to read retry handling (probably opinionated):\r\n\r\n```\r\nCompilationActivityMode compilationActivityMode = getCompilationActivityMode();\r\nif (compilationActivityMode != CompilationActivityMode.RUN_COMPILATION) {\r\n   if ((stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay)) {\r\n        compilationActivityMode = CompilationActivityMode.RUN_COMPILATION;\r\n  }\r\n}\r\n\r\nswitch (compilationActivityMode) {\r\n ...\r\n  default : CompilerDirectives.shouldNotReachHere(\"invalid activity mode\")\r\n}\r\n\r\n```\r\n\r\n",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+      "diff_hunk": "@@ -912,10 +913,45 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n+    private long stoppedCompilationTime = 0;\n+    private boolean logShutdownCompilations = true;\n+\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n+        BackgroundCompileQueue queue = getCompileQueue();\n+        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n+        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 923,
+      "side": "RIGHT",
+      "original_position": 21,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1856549507,
+          "user": "simonis",
+          "body": "Done",
+          "created_at": "2024-11-25T12:40:14Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1852593508,
+      "created_at": "2024-11-21T17:42:51Z",
+      "user": "chumer",
+      "body": "The method handle field final can and should be final if you refactor this code.\r\n",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java",
+      "diff_hunk": "@@ -692,4 +695,30 @@ public boolean isLibGraalCompilationEnabled() {\n         return compilationSupport instanceof LibGraalTruffleCompilationSupport;\n     }\n \n+    static MethodHandle getCompilationActivityMode;\n+    static {\n+        try {\n+            MethodType mt = MethodType.methodType(int.class);\n+            getCompilationActivityMode = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n+        } catch (NoSuchMethodException | IllegalAccessException e) {\n+            // Older JVMCI runtimes might not support `getCompilationActivityMode()`",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 705,
+      "original_line": 704,
+      "side": "RIGHT",
+      "original_position": 20,
+      "position": 28,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1852595173,
+      "created_at": "2024-11-21T17:43:50Z",
+      "user": "chumer",
+      "body": "We are not catching errors like this. Please rethrow, we want to see and detect failures like this.\r\nIf this would repeatedly fail it would trigger an error each time which would be just visible in the performance.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java",
+      "diff_hunk": "@@ -692,4 +695,30 @@ public boolean isLibGraalCompilationEnabled() {\n         return compilationSupport instanceof LibGraalTruffleCompilationSupport;\n     }\n \n+    static MethodHandle getCompilationActivityMode;\n+    static {\n+        try {\n+            MethodType mt = MethodType.methodType(int.class);\n+            getCompilationActivityMode = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n+        } catch (NoSuchMethodException | IllegalAccessException e) {\n+            // Older JVMCI runtimes might not support `getCompilationActivityMode()`\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     */\n+    @Override\n+    public CompilationActivityMode getCompilationActivityMode() {\n+        int activityMode = 1; // Default is to run compilations\n+        if (getCompilationActivityMode != null) {\n+            try {\n+                activityMode = (int) getCompilationActivityMode.invokeExact(HotSpotJVMCIRuntime.runtime());\n+            } catch (Throwable t) {\n+                // Ignore and go with the default mode",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 719,
+      "side": "RIGHT",
+      "original_position": 35,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1852606182,
+      "created_at": "2024-11-21T17:51:23Z",
+      "user": "chumer",
+      "body": "There is no need to have the getCompilationActivityMode in this interface. This interface is intended for methods that get called by the Graal compiler. You can move this abstract specification directly into OptimizedTruffleRuntime and implemented more concretely in HotSpotTruffleRutnime.",
+      "path": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java",
+      "diff_hunk": "@@ -359,4 +359,31 @@ default ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String class\n      */\n     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);\n \n+    /**\n+     * Represents HotSpot's compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     */\n+    enum CompilationActivityMode {\n+        STOP_COMPILATION,\n+        RUN_COMPILATION,\n+        SHUTDOWN_COMPILATION;\n+\n+        static public CompilationActivityMode fromInteger(int i) {\n+            return switch (i) {\n+                case 0 -> STOP_COMPILATION;\n+                case 1 -> RUN_COMPILATION;\n+                case 2 -> SHUTDOWN_COMPILATION;\n+                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n+            };\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code STOP_COMPILATION}, {@code RUN_COMPILATION} or {@code SHUTDOWN_COMPILATION}\n+     */\n+     default CompilationActivityMode getCompilationActivityMode() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 386,
+      "side": "RIGHT",
+      "original_position": 28,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1852609119,
+      "created_at": "2024-11-21T17:53:07Z",
+      "user": "chumer",
+      "body": "Well this sounds like it would be supported in all runtimes. But it is not. SVM does not support this yet. So we should mention this only works for HotSpot right now. Note that OptimizedRuntimeOptions are shared across all optimizing runtimes this includes SVM.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java",
+      "diff_hunk": "@@ -158,6 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n+                   \"compilation activity mode in the host VM. If the activity mode is 'STOP_COMPILATION' because \" +\n+                   \"of a full code cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n+                   \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n+                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\",",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 165,
+      "side": "RIGHT",
+      "original_position": 8,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1852611707,
+      "created_at": "2024-11-21T17:54:34Z",
+      "user": "chumer",
+      "body": "Minor: The help text is extensive but seems a bit implementation heavy. I think it is enough for a user of this option to know what happens that is observable to the user. In other words specific enum names like STOP_COMPILATION won't help understanding the semantics of this option.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java",
+      "diff_hunk": "@@ -158,6 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 161,
+      "side": "RIGHT",
+      "original_position": 4,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1852643360,
+          "user": "dougxc",
+          "body": "Also, this option is ignored if not running on HotSpot right? Might be worth pointing that out.",
+          "created_at": "2024-11-21T18:18:03Z"
+        },
+        {
+          "id": 1852645589,
+          "user": "dougxc",
+          "body": "> Also, this option is ignored if not running on HotSpot right? Might be worth pointing that out.\r\n\r\nSorry - just saw now that @chumer already pointed this out.",
+          "created_at": "2024-11-21T18:19:59Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2452158510,
+      "created_at": "2024-11-21T17:54:58Z",
+      "user": "chumer",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1852641743,
+      "created_at": "2024-11-21T18:16:46Z",
+      "user": "dougxc",
+      "body": "I would not list the enum constants in this javadoc - just one more location you need to remember to update if enum constants are added (or deleted/renamed).",
+      "path": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java",
+      "diff_hunk": "@@ -359,4 +359,31 @@ default ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String class\n      */\n     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);\n \n+    /**\n+     * Represents HotSpot's compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     */\n+    enum CompilationActivityMode {\n+        STOP_COMPILATION,\n+        RUN_COMPILATION,\n+        SHUTDOWN_COMPILATION;\n+\n+        static public CompilationActivityMode fromInteger(int i) {\n+            return switch (i) {\n+                case 0 -> STOP_COMPILATION;\n+                case 1 -> RUN_COMPILATION;\n+                case 2 -> SHUTDOWN_COMPILATION;\n+                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n+            };\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode which is one of:\n+     * {@code STOP_COMPILATION}, {@code RUN_COMPILATION} or {@code SHUTDOWN_COMPILATION}",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 384,
+      "side": "RIGHT",
+      "original_position": 26,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2452295309,
+      "created_at": "2024-11-21T18:19:08Z",
+      "user": "dougxc",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2452301276,
+      "created_at": "2024-11-21T18:20:00Z",
+      "user": "dougxc",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2458180753,
+      "created_at": "2024-11-25T11:36:52Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2458270024,
+      "created_at": "2024-11-25T12:14:10Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2458280268,
+      "created_at": "2024-11-25T12:18:42Z",
+      "user": "chumer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2458282184,
+      "created_at": "2024-11-25T12:19:39Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2458327993,
+      "created_at": "2024-11-25T12:40:15Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-11-26T18:36:27Z",
+      "sha": "4208437adee23c3c02ba5d9537b29353aa910103",
+      "message": "Updated according to reviewer's requests",
+      "author": "Volker Simonis",
+      "author_email": "volker.simonis@gmail.com",
+      "author_raw_date": "2024-11-25T14:55:01Z",
+      "author_date": "2024-11-25T14:55:01Z",
+      "committer": "Volker Simonis",
+      "committer_email": "volker.simonis@gmail.com",
+      "raw_date": "2024-11-26T18:36:27Z",
+      "diff_text": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java\n@@ -358,32 +358,4 @@ default ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String class\n      * silent.\n      */\n     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);\n-\n-    /**\n-     * Represents HotSpot's compilation activity mode which is one of:\n-     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n-     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n-     */\n-    enum CompilationActivityMode {\n-        STOP_COMPILATION,\n-        RUN_COMPILATION,\n-        SHUTDOWN_COMPILATION;\n-\n-        static public CompilationActivityMode fromInteger(int i) {\n-            return switch (i) {\n-                case 0 -> STOP_COMPILATION;\n-                case 1 -> RUN_COMPILATION;\n-                case 2 -> SHUTDOWN_COMPILATION;\n-                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n-            };\n-        }\n-    }\n-\n-    /**\n-     * Returns the current host compilation activity mode which is one of:\n-     * {@code STOP_COMPILATION}, {@code RUN_COMPILATION} or {@code SHUTDOWN_COMPILATION}\n-     */\n-     default CompilationActivityMode getCompilationActivityMode() {\n-         return CompilationActivityMode.RUN_COMPILATION;\n-     }\n }\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java\n@@ -218,7 +218,8 @@ public int getQueueSize() {\n \n     /**\n      * Return call targets waiting in queue. This does not include call targets currently being\n-     * compiled.\n+     * compiled. If {@code engine} is {@code null}, the call targets for all engines are returned,\n+     * otherwise only the call targets belonging to {@code engine} will be returned.\n      */\n     public Collection<OptimizedCallTarget> getQueuedTargets(EngineData engine) {\n         BlockingQueue<Runnable> queue = this.compilationQueue;\n@@ -230,7 +231,7 @@ public Collection<OptimizedCallTarget> getQueuedTargets(EngineData engine) {\n         CompilationTask.ExecutorServiceWrapper[] array = queue.toArray(new CompilationTask.ExecutorServiceWrapper[0]);\n         for (CompilationTask.ExecutorServiceWrapper wrapper : array) {\n             OptimizedCallTarget target = wrapper.compileTask.targetRef.get();\n-            if (target != null && target.engine == engine) {\n+            if (target != null && (engine == null || target.engine == engine)) {\n                 queuedTargets.add(target);\n             }\n         }\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/EngineData.java\n@@ -68,6 +68,7 @@\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingMaxCalleeSize;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingMaxPropagationDepth;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingTraceEvents;\n+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceCompilation;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceCompilationDetails;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceDeoptimizeFrame;\n@@ -148,6 +149,7 @@ public final class EngineData {\n     @CompilationFinal public boolean traceDeoptimizeFrame;\n     @CompilationFinal public boolean compileAOTOnCreate;\n     @CompilationFinal public boolean firstTierOnly;\n+    @CompilationFinal public long stoppedCompilationRetryDelay;\n \n     // compilation queue options\n     @CompilationFinal public boolean priorityQueue;\n@@ -305,6 +307,7 @@ private void loadOptions(OptionValues options, SandboxPolicy sandboxPolicy) {\n         this.firstTierOnly = options.get(Mode) == EngineModeEnum.LATENCY;\n         this.propagateCallAndLoopCount = options.get(PropagateLoopCountToLexicalSingleCaller);\n         this.propagateCallAndLoopCountMaxDepth = options.get(PropagateLoopCountToLexicalSingleCallerMaxDepth);\n+        this.stoppedCompilationRetryDelay = options.get(StoppedCompilationRetryDelay);\n \n         // compilation queue options\n         priorityQueue = options.get(PriorityQueue);\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java\n@@ -43,6 +43,7 @@\n import java.lang.ref.Reference;\n import java.lang.ref.WeakReference;\n import java.util.ArrayList;\n+import java.util.Collection;\n import java.util.LinkedHashMap;\n import java.util.List;\n import java.util.Map;\n@@ -51,7 +52,9 @@\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;\n import java.util.function.Supplier;\n+import java.util.logging.Level;\n \n+import com.oracle.truffle.api.TruffleLogger;\n import org.graalvm.options.OptionKey;\n import org.graalvm.options.OptionValues;\n \n@@ -855,6 +858,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n+    final boolean isCompilationStopped() {\n+        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n+        long sct = runtime().stoppedCompilationTime().get();\n+        if (compilationActivityMode == OptimizedTruffleRuntime.CompilationActivityMode.STOP_COMPILATION) {\n+            if (sct != 0 && System.currentTimeMillis() - sct > engine.stoppedCompilationRetryDelay) {\n+                runtime().stoppedCompilationTime().compareAndSet(sct, 0);\n+                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger a code cache sweep.\n+                compilationActivityMode = OptimizedTruffleRuntime.CompilationActivityMode.RUN_COMPILATION;\n+            }\n+        }\n+\n+        switch (compilationActivityMode) {\n+            case RUN_COMPILATION : {\n+                // This is the common case - compilations are not stopped.\n+                return false;\n+            }\n+            case STOP_COMPILATION : {\n+                if (sct == 0) {\n+                    runtime().stoppedCompilationTime().compareAndSet(0, System.currentTimeMillis());\n+                }\n+                // Flush the compilations queue for now. There's still a chance that compilation\n+                // will be re-enabled eventually, if the hosts code cache can be cleaned up.\n+                Collection<OptimizedCallTarget> targets = runtime().getCompileQueue().getQueuedTargets(null);\n+                // If there's just a single compilation target in the queue, the chance is high that it is\n+                // the one we've just added after the StoppedCompilationRetryDelay ran out, so keep it to\n+                // potentially trigger a code cache sweep.\n+                if (targets.size() > 1) {\n+                    for (OptimizedCallTarget target : targets) {\n+                        target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+                    }\n+                }\n+                return true;\n+            }\n+            case SHUTDOWN_COMPILATION : {\n+                // Compilation was shut down permanently because the hosts code cache ran full and\n+                // the host was configured without support for code cache sweeping.\n+                TruffleLogger logger = engine.getLogger(\"engine\");\n+                // The logger can be null if the engine is closed.\n+                if (logger != null && runtime().logShutdownCompilations().compareAndExchange(true, false)) {\n+                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \"  +\n+                            \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+                }\n+                try {\n+                    runtime().getCompileQueue().shutdownAndAwaitTermination(100 /* milliseconds */);\n+                } catch (RuntimeException re) {\n+                    // Best effort, ignore failure\n+                }\n+                return true;\n+            }\n+            default : CompilerDirectives.shouldNotReachHere(\"Invalid compilation activity mode: \" + compilationActivityMode);\n+        }\n+        return false;\n+    }\n+\n     /**\n      * Returns <code>true</code> if the call target was already compiled or was compiled\n      * synchronously. Returns <code>false</code> if compilation was not scheduled or is happening in\n@@ -866,6 +923,7 @@ public final boolean compile(boolean lastTierCompilation) {\n         if (!needsCompile(lastTier)) {\n             return true;\n         }\n+\n         if (!isSubmittedForCompilation()) {\n             if (!acceptForCompilation()) {\n                 // do not try to compile again\n@@ -881,6 +939,10 @@ public final boolean compile(boolean lastTierCompilation) {\n                     return true;\n                 }\n \n+                if (isCompilationStopped()) {\n+                    return false;\n+                }\n+\n                 ensureInitialized();\n                 if (!isSubmittedForCompilation()) {\n                     if (lastTier) {\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java\n@@ -159,10 +159,11 @@ public ExceptionAction apply(String s) {\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n     @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n-                   \"compilation activity mode in the host VM. If the activity mode is 'STOP_COMPILATION' because \" +\n-                   \"of a full code cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n+                   \"compilation activity mode in the host VM. If the activity mode indicates a full code \" +\n+                   \"cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n                    \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n-                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\",\n+                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\" +\n+                   \"The option is only supported on the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 1000\",\n                    usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)\n     public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(1000L);\n \ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java\n@@ -64,6 +64,8 @@\n import java.util.concurrent.ExecutionException;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.TimeoutException;\n+import java.util.concurrent.atomic.AtomicBoolean;\n+import java.util.concurrent.atomic.AtomicLong;\n import java.util.function.Consumer;\n import java.util.function.Supplier;\n import java.util.logging.Level;\n@@ -913,45 +915,23 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n-    private long stoppedCompilationTime = 0;\n-    private boolean logShutdownCompilations = true;\n+\n+    private final AtomicLong stoppedCompilationTime = new AtomicLong(0);\n+\n+    public final AtomicLong stoppedCompilationTime() {\n+        return stoppedCompilationTime;\n+    }\n+\n+    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);\n+\n+    public final AtomicBoolean logShutdownCompilations() {\n+        return logShutdownCompilations;\n+    }\n \n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        BackgroundCompileQueue queue = getCompileQueue();\n-        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n-        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n-                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n-            stoppedCompilationTime = 0;\n-            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-            return queue.submitCompilation(priority, optimizedCallTarget);\n-        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n-            if (stoppedCompilationTime == 0) {\n-                stoppedCompilationTime = System.currentTimeMillis();\n-            }\n-            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n-            // eventually, if the hosts code cache can be cleaned up.\n-            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n-                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n-            }\n-        } else {\n-            // Compilation was shut down permanently because the hosts code cache ran full and\n-            // the host was configured without support for code cache sweeping.\n-            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n-            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n-            // The logger can be null if the engine is closed.\n-            if (logger != null && logShutdownCompilations) {\n-                logShutdownCompilations = false;\n-                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +\n-                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n-            }\n-            try {\n-                queue.shutdownAndAwaitTermination(100 /* milliseconds */);\n-            } catch (RuntimeException re) {\n-                // Best effort, ignore failure\n-            }\n-        }\n-        return null;\n+        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n     }\n \n     @SuppressWarnings(\"all\")\n@@ -1519,4 +1499,30 @@ static OptionCategory matchCategory(TruffleCompilerOptionDescriptor d) {\n         }\n     }\n \n+    /**\n+     * Represents HotSpot's compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     */\n+    public enum CompilationActivityMode {\n+        STOP_COMPILATION,\n+        RUN_COMPILATION,\n+        SHUTDOWN_COMPILATION;\n+\n+        static public CompilationActivityMode fromInteger(int i) {\n+            return switch (i) {\n+                case 0 -> STOP_COMPILATION;\n+                case 1 -> RUN_COMPILATION;\n+                case 2 -> SHUTDOWN_COMPILATION;\n+                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n+            };\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode. The default is to run compilations.\n+     */\n+    public CompilationActivityMode getCompilationActivityMode() {\n+        return CompilationActivityMode.RUN_COMPILATION;\n+    }\n }\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java\n@@ -695,19 +695,20 @@ public boolean isLibGraalCompilationEnabled() {\n         return compilationSupport instanceof LibGraalTruffleCompilationSupport;\n     }\n \n-    static MethodHandle getCompilationActivityMode;\n+    static final MethodHandle getCompilationActivityMode;\n     static {\n+        MethodHandle mHandle = null;\n         try {\n             MethodType mt = MethodType.methodType(int.class);\n-            getCompilationActivityMode = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n+            mHandle = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n         } catch (NoSuchMethodException | IllegalAccessException e) {\n             // Older JVMCI runtimes might not support `getCompilationActivityMode()`\n         }\n+        getCompilationActivityMode = mHandle;\n     }\n \n     /**\n-     * Returns the current host compilation activity mode which is one of:\n-     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Returns the current host compilation activity mode based on HotSpot's code cache state.\n      */\n     @Override\n     public CompilationActivityMode getCompilationActivityMode() {\n@@ -716,7 +717,7 @@ public CompilationActivityMode getCompilationActivityMode() {\n             try {\n                 activityMode = (int) getCompilationActivityMode.invokeExact(HotSpotJVMCIRuntime.runtime());\n             } catch (Throwable t) {\n-                // Ignore and go with the default mode\n+                throw new RuntimeException(\"Can't get HotSpot's compilation activity mode\", t);\n             }\n         }\n         return CompilationActivityMode.fromInteger(activityMode);",
+      "diff": [
+        {
+          "file": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java",
+          "patch": "@@ -358,32 +358,4 @@ default ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String class\n      * silent.\n      */\n     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);\n-\n-    /**\n-     * Represents HotSpot's compilation activity mode which is one of:\n-     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n-     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n-     */\n-    enum CompilationActivityMode {\n-        STOP_COMPILATION,\n-        RUN_COMPILATION,\n-        SHUTDOWN_COMPILATION;\n-\n-        static public CompilationActivityMode fromInteger(int i) {\n-            return switch (i) {\n-                case 0 -> STOP_COMPILATION;\n-                case 1 -> RUN_COMPILATION;\n-                case 2 -> SHUTDOWN_COMPILATION;\n-                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n-            };\n-        }\n-    }\n-\n-    /**\n-     * Returns the current host compilation activity mode which is one of:\n-     * {@code STOP_COMPILATION}, {@code RUN_COMPILATION} or {@code SHUTDOWN_COMPILATION}\n-     */\n-     default CompilationActivityMode getCompilationActivityMode() {\n-         return CompilationActivityMode.RUN_COMPILATION;\n-     }\n }"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java",
+          "patch": "@@ -218,7 +218,8 @@ public int getQueueSize() {\n \n     /**\n      * Return call targets waiting in queue. This does not include call targets currently being\n-     * compiled.\n+     * compiled. If {@code engine} is {@code null}, the call targets for all engines are returned,\n+     * otherwise only the call targets belonging to {@code engine} will be returned.\n      */\n     public Collection<OptimizedCallTarget> getQueuedTargets(EngineData engine) {\n         BlockingQueue<Runnable> queue = this.compilationQueue;\n@@ -230,7 +231,7 @@ public Collection<OptimizedCallTarget> getQueuedTargets(EngineData engine) {\n         CompilationTask.ExecutorServiceWrapper[] array = queue.toArray(new CompilationTask.ExecutorServiceWrapper[0]);\n         for (CompilationTask.ExecutorServiceWrapper wrapper : array) {\n             OptimizedCallTarget target = wrapper.compileTask.targetRef.get();\n-            if (target != null && target.engine == engine) {\n+            if (target != null && (engine == null || target.engine == engine)) {\n                 queuedTargets.add(target);\n             }\n         }"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/EngineData.java",
+          "patch": "@@ -68,6 +68,7 @@\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingMaxCalleeSize;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingMaxPropagationDepth;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingTraceEvents;\n+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceCompilation;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceCompilationDetails;\n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceDeoptimizeFrame;\n@@ -148,6 +149,7 @@ public final class EngineData {\n     @CompilationFinal public boolean traceDeoptimizeFrame;\n     @CompilationFinal public boolean compileAOTOnCreate;\n     @CompilationFinal public boolean firstTierOnly;\n+    @CompilationFinal public long stoppedCompilationRetryDelay;\n \n     // compilation queue options\n     @CompilationFinal public boolean priorityQueue;\n@@ -305,6 +307,7 @@ private void loadOptions(OptionValues options, SandboxPolicy sandboxPolicy) {\n         this.firstTierOnly = options.get(Mode) == EngineModeEnum.LATENCY;\n         this.propagateCallAndLoopCount = options.get(PropagateLoopCountToLexicalSingleCaller);\n         this.propagateCallAndLoopCountMaxDepth = options.get(PropagateLoopCountToLexicalSingleCallerMaxDepth);\n+        this.stoppedCompilationRetryDelay = options.get(StoppedCompilationRetryDelay);\n \n         // compilation queue options\n         priorityQueue = options.get(PriorityQueue);"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java",
+          "patch": "@@ -43,6 +43,7 @@\n import java.lang.ref.Reference;\n import java.lang.ref.WeakReference;\n import java.util.ArrayList;\n+import java.util.Collection;\n import java.util.LinkedHashMap;\n import java.util.List;\n import java.util.Map;\n@@ -51,7 +52,9 @@\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;\n import java.util.function.Supplier;\n+import java.util.logging.Level;\n \n+import com.oracle.truffle.api.TruffleLogger;\n import org.graalvm.options.OptionKey;\n import org.graalvm.options.OptionValues;\n \n@@ -855,6 +858,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n+    final boolean isCompilationStopped() {\n+        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n+        long sct = runtime().stoppedCompilationTime().get();\n+        if (compilationActivityMode == OptimizedTruffleRuntime.CompilationActivityMode.STOP_COMPILATION) {\n+            if (sct != 0 && System.currentTimeMillis() - sct > engine.stoppedCompilationRetryDelay) {\n+                runtime().stoppedCompilationTime().compareAndSet(sct, 0);\n+                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger a code cache sweep.\n+                compilationActivityMode = OptimizedTruffleRuntime.CompilationActivityMode.RUN_COMPILATION;\n+            }\n+        }\n+\n+        switch (compilationActivityMode) {\n+            case RUN_COMPILATION : {\n+                // This is the common case - compilations are not stopped.\n+                return false;\n+            }\n+            case STOP_COMPILATION : {\n+                if (sct == 0) {\n+                    runtime().stoppedCompilationTime().compareAndSet(0, System.currentTimeMillis());\n+                }\n+                // Flush the compilations queue for now. There's still a chance that compilation\n+                // will be re-enabled eventually, if the hosts code cache can be cleaned up.\n+                Collection<OptimizedCallTarget> targets = runtime().getCompileQueue().getQueuedTargets(null);\n+                // If there's just a single compilation target in the queue, the chance is high that it is\n+                // the one we've just added after the StoppedCompilationRetryDelay ran out, so keep it to\n+                // potentially trigger a code cache sweep.\n+                if (targets.size() > 1) {\n+                    for (OptimizedCallTarget target : targets) {\n+                        target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+                    }\n+                }\n+                return true;\n+            }\n+            case SHUTDOWN_COMPILATION : {\n+                // Compilation was shut down permanently because the hosts code cache ran full and\n+                // the host was configured without support for code cache sweeping.\n+                TruffleLogger logger = engine.getLogger(\"engine\");\n+                // The logger can be null if the engine is closed.\n+                if (logger != null && runtime().logShutdownCompilations().compareAndExchange(true, false)) {\n+                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \"  +\n+                            \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+                }\n+                try {\n+                    runtime().getCompileQueue().shutdownAndAwaitTermination(100 /* milliseconds */);\n+                } catch (RuntimeException re) {\n+                    // Best effort, ignore failure\n+                }\n+                return true;\n+            }\n+            default : CompilerDirectives.shouldNotReachHere(\"Invalid compilation activity mode: \" + compilationActivityMode);\n+        }\n+        return false;\n+    }\n+\n     /**\n      * Returns <code>true</code> if the call target was already compiled or was compiled\n      * synchronously. Returns <code>false</code> if compilation was not scheduled or is happening in\n@@ -866,6 +923,7 @@ public final boolean compile(boolean lastTierCompilation) {\n         if (!needsCompile(lastTier)) {\n             return true;\n         }\n+\n         if (!isSubmittedForCompilation()) {\n             if (!acceptForCompilation()) {\n                 // do not try to compile again\n@@ -881,6 +939,10 @@ public final boolean compile(boolean lastTierCompilation) {\n                     return true;\n                 }\n \n+                if (isCompilationStopped()) {\n+                    return false;\n+                }\n+\n                 ensureInitialized();\n                 if (!isSubmittedForCompilation()) {\n                     if (lastTier) {"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java",
+          "patch": "@@ -159,10 +159,11 @@ public ExceptionAction apply(String s) {\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n     @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n-                   \"compilation activity mode in the host VM. If the activity mode is 'STOP_COMPILATION' because \" +\n-                   \"of a full code cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n+                   \"compilation activity mode in the host VM. If the activity mode indicates a full code \" +\n+                   \"cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n                    \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n-                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\",\n+                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\" +\n+                   \"The option is only supported on the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 1000\",\n                    usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)\n     public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(1000L);\n "
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+          "patch": "@@ -64,6 +64,8 @@\n import java.util.concurrent.ExecutionException;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.TimeoutException;\n+import java.util.concurrent.atomic.AtomicBoolean;\n+import java.util.concurrent.atomic.AtomicLong;\n import java.util.function.Consumer;\n import java.util.function.Supplier;\n import java.util.logging.Level;\n@@ -913,45 +915,23 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n-    private long stoppedCompilationTime = 0;\n-    private boolean logShutdownCompilations = true;\n+\n+    private final AtomicLong stoppedCompilationTime = new AtomicLong(0);\n+\n+    public final AtomicLong stoppedCompilationTime() {\n+        return stoppedCompilationTime;\n+    }\n+\n+    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);\n+\n+    public final AtomicBoolean logShutdownCompilations() {\n+        return logShutdownCompilations;\n+    }\n \n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n-        BackgroundCompileQueue queue = getCompileQueue();\n-        CompilationActivityMode compilationActivityMode = getCompilationActivityMode();\n-        if (compilationActivityMode == CompilationActivityMode.RUN_COMPILATION ||\n-                (stoppedCompilationTime != 0 && System.currentTimeMillis() - stoppedCompilationTime > optimizedCallTarget.getOptionValue(StoppedCompilationRetryDelay))) {\n-            stoppedCompilationTime = 0;\n-            Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n-            return queue.submitCompilation(priority, optimizedCallTarget);\n-        } else if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n-            if (stoppedCompilationTime == 0) {\n-                stoppedCompilationTime = System.currentTimeMillis();\n-            }\n-            // Flush the compilations queue. There's still a chance that compilation will be re-enabled\n-            // eventually, if the hosts code cache can be cleaned up.\n-            for (OptimizedCallTarget target : queue.getQueuedTargets(optimizedCallTarget.engine)) {\n-                target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n-            }\n-        } else {\n-            // Compilation was shut down permanently because the hosts code cache ran full and\n-            // the host was configured without support for code cache sweeping.\n-            assert compilationActivityMode == CompilationActivityMode.SHUTDOWN_COMPILATION;\n-            TruffleLogger logger = optimizedCallTarget.engine.getLogger(\"engine\");\n-            // The logger can be null if the engine is closed.\n-            if (logger != null && logShutdownCompilations) {\n-                logShutdownCompilations = false;\n-                logger.log(Level.WARNING, \"Truffle host compilations permanently disabled because of full code cache. \"  +\n-                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n-            }\n-            try {\n-                queue.shutdownAndAwaitTermination(100 /* milliseconds */);\n-            } catch (RuntimeException re) {\n-                // Best effort, ignore failure\n-            }\n-        }\n-        return null;\n+        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n+        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);\n     }\n \n     @SuppressWarnings(\"all\")\n@@ -1519,4 +1499,30 @@ static OptionCategory matchCategory(TruffleCompilerOptionDescriptor d) {\n         }\n     }\n \n+    /**\n+     * Represents HotSpot's compilation activity mode which is one of:\n+     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     */\n+    public enum CompilationActivityMode {\n+        STOP_COMPILATION,\n+        RUN_COMPILATION,\n+        SHUTDOWN_COMPILATION;\n+\n+        static public CompilationActivityMode fromInteger(int i) {\n+            return switch (i) {\n+                case 0 -> STOP_COMPILATION;\n+                case 1 -> RUN_COMPILATION;\n+                case 2 -> SHUTDOWN_COMPILATION;\n+                default -> throw new RuntimeException(\"Invalid CompilationActivityMode \" + i);\n+            };\n+        }\n+    }\n+\n+    /**\n+     * Returns the current host compilation activity mode. The default is to run compilations.\n+     */\n+    public CompilationActivityMode getCompilationActivityMode() {\n+        return CompilationActivityMode.RUN_COMPILATION;\n+    }\n }"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java",
+          "patch": "@@ -695,19 +695,20 @@ public boolean isLibGraalCompilationEnabled() {\n         return compilationSupport instanceof LibGraalTruffleCompilationSupport;\n     }\n \n-    static MethodHandle getCompilationActivityMode;\n+    static final MethodHandle getCompilationActivityMode;\n     static {\n+        MethodHandle mHandle = null;\n         try {\n             MethodType mt = MethodType.methodType(int.class);\n-            getCompilationActivityMode = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n+            mHandle = MethodHandles.lookup().findVirtual(HotSpotJVMCIRuntime.class, \"getCompilationActivityMode\", mt);\n         } catch (NoSuchMethodException | IllegalAccessException e) {\n             // Older JVMCI runtimes might not support `getCompilationActivityMode()`\n         }\n+        getCompilationActivityMode = mHandle;\n     }\n \n     /**\n-     * Returns the current host compilation activity mode which is one of:\n-     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n+     * Returns the current host compilation activity mode based on HotSpot's code cache state.\n      */\n     @Override\n     public CompilationActivityMode getCompilationActivityMode() {\n@@ -716,7 +717,7 @@ public CompilationActivityMode getCompilationActivityMode() {\n             try {\n                 activityMode = (int) getCompilationActivityMode.invokeExact(HotSpotJVMCIRuntime.runtime());\n             } catch (Throwable t) {\n-                // Ignore and go with the default mode\n+                throw new RuntimeException(\"Can't get HotSpot's compilation activity mode\", t);\n             }\n         }\n         return CompilationActivityMode.fromInteger(activityMode);"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2462432360,
+      "created_at": "2024-11-26T18:46:37Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2501695585,
+      "created_at": "2024-11-26T18:52:15Z",
+      "user": "simonis",
+      "body": "Hi @chumer, @dougxc,\r\n\r\nThanks a lot for your quick and very helpful review. I've just pushed a new version of my changes which hopefully addresses your requests (except for the right reaction on compilation shutdowns for which I've asked for additional help).\r\n\r\nI've now moved the compilation mode handling one lever up into `OptimizedCallTarget` as suggseted by @chumer and refactored the code into a new function which makes it a little bit cleaner.\r\n\r\nPlease let me know what you think?\r\n\r\nThank you and best regards,\r\nVolker\r\n "
+    },
+    {
+      "type": "commit",
+      "date": "2024-11-26T19:19:50Z",
+      "sha": "8d1285e2614ff332c5a78187c0eab2d6d15bb6a5",
+      "message": "Remove unused import",
+      "author": "Volker Simonis",
+      "author_email": "volker.simonis@gmail.com",
+      "author_raw_date": "2024-11-26T19:19:50Z",
+      "author_date": "2024-11-26T19:19:50Z",
+      "committer": "Volker Simonis",
+      "committer_email": "volker.simonis@gmail.com",
+      "raw_date": "2024-11-26T19:19:50Z",
+      "diff_text": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java\n@@ -41,7 +41,6 @@\n package com.oracle.truffle.runtime;\n \n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.CompilerIdleDelay;\n-import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;\n \n import java.io.CharArrayWriter;\n import java.io.PrintWriter;",
+      "diff": [
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+          "patch": "@@ -41,7 +41,6 @@\n package com.oracle.truffle.runtime;\n \n import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.CompilerIdleDelay;\n-import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;\n \n import java.io.CharArrayWriter;\n import java.io.PrintWriter;"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2462547962,
+      "created_at": "2024-11-26T19:52:28Z",
+      "user": "dougxc",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1859146208,
+      "created_at": "2024-11-26T19:52:28Z",
+      "user": "dougxc",
+      "body": "I think you should still point out in this help text that this option (currently) only has an effect when running on HotSpot.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java",
+      "diff_hunk": "@@ -158,6 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n+                   \"compilation activity mode in the host VM. If the activity mode is 'STOP_COMPILATION' because \" +\n+                   \"of a full code cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n+                   \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n+                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\",\n+                   usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 166,
+      "side": "RIGHT",
+      "original_position": 9,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1860362584,
+          "user": "simonis",
+          "body": "Hm, not sure if you saw the sentence I've added: \"*The option is only supported on the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect*\".\n\nOr am I missing something?",
+          "created_at": "2024-11-27T10:00:09Z"
+        },
+        {
+          "id": 1860379786,
+          "user": "dougxc",
+          "body": "Sorry, I was confused by the GitHub view which was pinned to a specific commit for some reason.",
+          "created_at": "2024-11-27T10:10:32Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2464543908,
+      "created_at": "2024-11-27T10:00:09Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2464571710,
+      "created_at": "2024-11-27T10:10:32Z",
+      "user": "dougxc",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2507725058,
+      "created_at": "2024-11-29T12:30:29Z",
+      "user": "simonis",
+      "body": "@chumer, could you please have a look at the updated version?\r\n"
+    },
+    {
+      "type": "review_comment",
+      "id": 1863523693,
+      "created_at": "2024-11-29T13:24:53Z",
+      "user": "chumer",
+      "body": "Optional: no need to qualify the class name. It makes enough sense without.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java",
+      "diff_hunk": "@@ -855,6 +858,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n+    final boolean isCompilationStopped() {\n+        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 862,
+      "side": "RIGHT",
+      "original_position": 23,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1863540347,
+      "created_at": "2024-11-29T13:38:52Z",
+      "user": "chumer",
+      "body": "Here is my suggestion:\r\n\r\nNote instead of runtime we use the engine to log to avoid missing warnings. (warnings can be suppressed per engine)\r\n\r\n\r\n```java\r\n      if (engine.logShutdownCompilations().get()) {\r\n                // The logger can be null if the engine is closed.\r\n                if (engine.logShutdownCompilations().compareAndExchange(true, false)) {\r\n                       TruffleLogger logger = engine.getLogger(\"engine\");\r\n                       if (logger != null) {\r\n                          // log for each engine once\r\n                      }\r\n                }\r\n      }\r\n      // do not try to compile this call target again\r\n      callTarget.compilationFailed = true;\r\n      return true;\r\n```",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java",
+      "diff_hunk": "@@ -855,6 +858,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n+    final boolean isCompilationStopped() {\n+        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n+        long sct = runtime().stoppedCompilationTime().get();\n+        if (compilationActivityMode == OptimizedTruffleRuntime.CompilationActivityMode.STOP_COMPILATION) {\n+            if (sct != 0 && System.currentTimeMillis() - sct > engine.stoppedCompilationRetryDelay) {\n+                runtime().stoppedCompilationTime().compareAndSet(sct, 0);\n+                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger a code cache sweep.\n+                compilationActivityMode = OptimizedTruffleRuntime.CompilationActivityMode.RUN_COMPILATION;\n+            }\n+        }\n+\n+        switch (compilationActivityMode) {\n+            case RUN_COMPILATION : {\n+                // This is the common case - compilations are not stopped.\n+                return false;\n+            }\n+            case STOP_COMPILATION : {\n+                if (sct == 0) {\n+                    runtime().stoppedCompilationTime().compareAndSet(0, System.currentTimeMillis());\n+                }\n+                // Flush the compilations queue for now. There's still a chance that compilation\n+                // will be re-enabled eventually, if the hosts code cache can be cleaned up.\n+                Collection<OptimizedCallTarget> targets = runtime().getCompileQueue().getQueuedTargets(null);\n+                // If there's just a single compilation target in the queue, the chance is high that it is\n+                // the one we've just added after the StoppedCompilationRetryDelay ran out, so keep it to\n+                // potentially trigger a code cache sweep.\n+                if (targets.size() > 1) {\n+                    for (OptimizedCallTarget target : targets) {\n+                        target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n+                    }\n+                }\n+                return true;\n+            }\n+            case SHUTDOWN_COMPILATION : {\n+                // Compilation was shut down permanently because the hosts code cache ran full and\n+                // the host was configured without support for code cache sweeping.\n+                TruffleLogger logger = engine.getLogger(\"engine\");\n+                // The logger can be null if the engine is closed.\n+                if (logger != null && runtime().logShutdownCompilations().compareAndExchange(true, false)) {\n+                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \"  +\n+                            \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+                }\n+                try {\n+                    runtime().getCompileQueue().shutdownAndAwaitTermination(100 /* milliseconds */);\n+                } catch (RuntimeException re) {\n+                    // Best effort, ignore failure\n+                }\n+                return true;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 908,
+      "side": "RIGHT",
+      "original_position": 69,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1863554120,
+          "user": "chumer",
+          "body": "On a second thought, it might be a good idea to return the enum here, so the compilationFailed flag can be set in OptimizedCallTarget.compile and not in a method called `isCompilationStopped` which is a bit surprising.",
+          "created_at": "2024-11-29T13:49:54Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1863549539,
+      "created_at": "2024-11-29T13:46:21Z",
+      "user": "chumer",
+      "body": "> the one we've just added \r\n\r\nI assume if this assumption is false, the compilation would fail since it has been stopped, right?\r\nYou basically cancel the compilations to avoid having them all fail?\r\nWhat kind of failure is to be expected if it is stopped? A non permanent bailout? Any other failure could trigger OptimizedCallTarget.compilationFailed to be set to true, which would no longer call this method.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java",
+      "diff_hunk": "@@ -855,6 +858,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n+    final boolean isCompilationStopped() {\n+        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n+        long sct = runtime().stoppedCompilationTime().get();\n+        if (compilationActivityMode == OptimizedTruffleRuntime.CompilationActivityMode.STOP_COMPILATION) {\n+            if (sct != 0 && System.currentTimeMillis() - sct > engine.stoppedCompilationRetryDelay) {\n+                runtime().stoppedCompilationTime().compareAndSet(sct, 0);\n+                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger a code cache sweep.\n+                compilationActivityMode = OptimizedTruffleRuntime.CompilationActivityMode.RUN_COMPILATION;\n+            }\n+        }\n+\n+        switch (compilationActivityMode) {\n+            case RUN_COMPILATION : {\n+                // This is the common case - compilations are not stopped.\n+                return false;\n+            }\n+            case STOP_COMPILATION : {\n+                if (sct == 0) {\n+                    runtime().stoppedCompilationTime().compareAndSet(0, System.currentTimeMillis());\n+                }\n+                // Flush the compilations queue for now. There's still a chance that compilation\n+                // will be re-enabled eventually, if the hosts code cache can be cleaned up.\n+                Collection<OptimizedCallTarget> targets = runtime().getCompileQueue().getQueuedTargets(null);\n+                // If there's just a single compilation target in the queue, the chance is high that it is\n+                // the one we've just added after the StoppedCompilationRetryDelay ran out, so keep it to\n+                // potentially trigger a code cache sweep.\n+                if (targets.size() > 1) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 889,
+      "original_line": 887,
+      "side": "RIGHT",
+      "original_position": 48,
+      "position": 57,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1863552444,
+      "created_at": "2024-11-29T13:48:34Z",
+      "user": "chumer",
+      "body": "I would move this check right before the synchronized block. Doing this in the synchronized block does not give us any advantage as its global anyway, but it is costly as its done on every call target call in the interpreter.",
+      "path": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java",
+      "diff_hunk": "@@ -881,6 +939,10 @@ public final boolean compile(boolean lastTierCompilation) {\n                     return true;\n                 }\n \n+                if (isCompilationStopped()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 942,
+      "side": "RIGHT",
+      "original_position": 91,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2469916480,
+      "created_at": "2024-11-29T13:51:25Z",
+      "user": "chumer",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2507864296,
+      "created_at": "2024-11-29T13:52:39Z",
+      "user": "chumer",
+      "body": "@simonis Thank you for the changes!. did another turn. looks like its going to be the last one 👍 \r\nI know such features are notoriously hard to test. Do you have an idea how we could do at least a smoke test for this?"
+    },
+    {
+      "type": "review",
+      "id": 2470218393,
+      "created_at": "2024-11-29T15:53:33Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2470339741,
+      "created_at": "2024-11-29T17:16:19Z",
+      "user": "simonis",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2508232895,
+      "created_at": "2024-11-29T18:12:31Z",
+      "user": "simonis",
+      "body": "> @simonis Thank you for the changes!. did another turn. looks like its going to be the last one 👍 I know such features are notoriously hard to test. Do you have an idea how we could do at least a smoke test for this?\r\n\r\nI can imagine something like the following:\r\n- start the JVM with a very small code cache\r\n- In a loop\r\n  - trigger the compilation of a Truffle method\r\n  - call `jcmd Compiler.codecache` on the current process\r\n  - from the output, we can determine how many times compilation was dis-/enabled and how many nmethod installations have failed because of a full code cache.\r\n  \r\nIt would be a little tricky to exclude all the JIT compilations and only allow truffle compilations so the results don't get influenced by JIT compilations.\r\n\r\nIs this something acceptable as Truffle test? Do you already have similar tests (i.e. simple tests which repeatedly trigger the compilation of a single method, tests which call external tools and parse their output). I'm just asking because the HotSpot JTreg tests have frameworks and tooling for such kind of tests. I'm not familiar with the Truffle tests and don't want to re-invent the wheel so I'd be happy if you could point me to some tests which I could use a template to start with. "
+    },
+    {
+      "type": "commit",
+      "date": "2024-11-30T00:11:06Z",
+      "sha": "0ae44fe1e628b67e1dfd1dfabaf1da43237f4116",
+      "message": "Updated according to second review round",
+      "author": "Volker Simonis",
+      "author_email": "volker.simonis@gmail.com",
+      "author_raw_date": "2024-11-29T23:54:46Z",
+      "author_date": "2024-11-29T23:54:46Z",
+      "committer": "Volker Simonis",
+      "committer_email": "volker.simonis@gmail.com",
+      "raw_date": "2024-11-30T00:11:06Z",
+      "diff_text": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java\n@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java\n@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/EngineData.java\n@@ -86,6 +86,7 @@\n import java.util.Map;\n import java.util.Objects;\n import java.util.concurrent.ConcurrentHashMap;\n+import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.function.Function;\n import java.util.logging.Level;\n \n@@ -495,6 +496,16 @@ public TruffleLogger getLogger(String loggerId) {\n         return polyglotEngine != null ? loggerFactory.apply(loggerId) : null;\n     }\n \n+    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);\n+\n+    /**\n+     * Only log compilation shutdowns (see {@code OptimizedCallTarget.isCompilationStopped()}) once\n+     * per engine.\n+     */\n+    public final AtomicBoolean logShutdownCompilations() {\n+        return logShutdownCompilations;\n+    }\n+\n     @SuppressWarnings(\"static-method\")\n     public void mergeLoadedSources(Source[] sources) {\n         OptimizedRuntimeAccessor.SOURCE.mergeLoadedSources(sources);\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java\n@@ -84,6 +84,7 @@\n import com.oracle.truffle.api.nodes.RootNode;\n import com.oracle.truffle.compiler.TruffleCompilable;\n import com.oracle.truffle.runtime.OptimizedRuntimeOptions.ExceptionAction;\n+import com.oracle.truffle.runtime.OptimizedTruffleRuntime.CompilationActivityMode;\n \n import jdk.vm.ci.meta.JavaConstant;\n import jdk.vm.ci.meta.SpeculationLog;\n@@ -858,58 +859,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n-    final boolean isCompilationStopped() {\n-        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n+    final CompilationActivityMode getCompilationActivityMode() {\n+        CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n         long sct = runtime().stoppedCompilationTime().get();\n-        if (compilationActivityMode == OptimizedTruffleRuntime.CompilationActivityMode.STOP_COMPILATION) {\n+        if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n             if (sct != 0 && System.currentTimeMillis() - sct > engine.stoppedCompilationRetryDelay) {\n                 runtime().stoppedCompilationTime().compareAndSet(sct, 0);\n-                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger a code cache sweep.\n-                compilationActivityMode = OptimizedTruffleRuntime.CompilationActivityMode.RUN_COMPILATION;\n+                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger\n+                // a code cache sweep.\n+                compilationActivityMode = CompilationActivityMode.RUN_COMPILATION;\n             }\n         }\n \n         switch (compilationActivityMode) {\n-            case RUN_COMPILATION : {\n+            case RUN_COMPILATION: {\n                 // This is the common case - compilations are not stopped.\n-                return false;\n+                return CompilationActivityMode.RUN_COMPILATION;\n             }\n-            case STOP_COMPILATION : {\n+            case STOP_COMPILATION: {\n                 if (sct == 0) {\n                     runtime().stoppedCompilationTime().compareAndSet(0, System.currentTimeMillis());\n                 }\n                 // Flush the compilations queue for now. There's still a chance that compilation\n                 // will be re-enabled eventually, if the hosts code cache can be cleaned up.\n                 Collection<OptimizedCallTarget> targets = runtime().getCompileQueue().getQueuedTargets(null);\n-                // If there's just a single compilation target in the queue, the chance is high that it is\n-                // the one we've just added after the StoppedCompilationRetryDelay ran out, so keep it to\n-                // potentially trigger a code cache sweep.\n+                // If there's just a single compilation target in the queue, the chance is high that\n+                // it is the one we've just added after the StoppedCompilationRetryDelay ran out, so\n+                // keep it to potentially trigger a code cache sweep.\n                 if (targets.size() > 1) {\n                     for (OptimizedCallTarget target : targets) {\n                         target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n                     }\n                 }\n-                return true;\n+                return CompilationActivityMode.STOP_COMPILATION;\n             }\n-            case SHUTDOWN_COMPILATION : {\n+            case SHUTDOWN_COMPILATION: {\n                 // Compilation was shut down permanently because the hosts code cache ran full and\n                 // the host was configured without support for code cache sweeping.\n                 TruffleLogger logger = engine.getLogger(\"engine\");\n                 // The logger can be null if the engine is closed.\n-                if (logger != null && runtime().logShutdownCompilations().compareAndExchange(true, false)) {\n-                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \"  +\n-                            \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+                if (logger != null && engine.logShutdownCompilations().compareAndExchange(true, false)) {\n+                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \" +\n+                                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n                 }\n-                try {\n-                    runtime().getCompileQueue().shutdownAndAwaitTermination(100 /* milliseconds */);\n-                } catch (RuntimeException re) {\n-                    // Best effort, ignore failure\n+                // Flush the compilation queue and mark all methods as not compilable.\n+                for (OptimizedCallTarget target : runtime().getCompileQueue().getQueuedTargets(null)) {\n+                    target.cancelCompilation(\"Compilation permanently disabled due to full code cache.\");\n+                    target.compilationFailed = true;\n                 }\n-                return true;\n+                return CompilationActivityMode.SHUTDOWN_COMPILATION;\n             }\n-            default : CompilerDirectives.shouldNotReachHere(\"Invalid compilation activity mode: \" + compilationActivityMode);\n+            default:\n+                CompilerDirectives.shouldNotReachHere(\"Invalid compilation activity mode: \" + compilationActivityMode);\n         }\n-        return false;\n+        return CompilationActivityMode.RUN_COMPILATION;\n     }\n \n     /**\n@@ -931,6 +934,15 @@ public final boolean compile(boolean lastTierCompilation) {\n                 return false;\n             }\n \n+            CompilationActivityMode cam = getCompilationActivityMode();\n+            if (cam != CompilationActivityMode.RUN_COMPILATION) {\n+                if (cam == CompilationActivityMode.SHUTDOWN_COMPILATION) {\n+                    // Compilation was shut down permanently.\n+                    compilationFailed = true;\n+                }\n+                return false;\n+            }\n+\n             CompilationTask task = null;\n             // Do not try to compile this target concurrently,\n             // but do not block other threads if compilation is not asynchronous.\n@@ -939,10 +951,6 @@ public final boolean compile(boolean lastTierCompilation) {\n                     return true;\n                 }\n \n-                if (isCompilationStopped()) {\n-                    return false;\n-                }\n-\n                 ensureInitialized();\n                 if (!isSubmittedForCompilation()) {\n                     if (lastTier) {\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java\n@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0\n@@ -158,14 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n-    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n-                   \"compilation activity mode in the host VM. If the activity mode indicates a full code \" +\n-                   \"cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n-                   \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n-                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\" +\n-                   \"The option is only supported on the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 1000\",\n-                   usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)\n-    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(1000L);\n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the compilation \" +\n+                    \"activity mode in the host VM. If the activity mode indicates a full code cache, no new compilation \" +\n+                    \"requests are submitted and the compilation queue is flushed. After 'StoppedCompilationRetryDelay' \" +\n+                    \"milliseconds new compilations will be submitted again (which might trigger a sweep of the code \" +\n+                    \"cache and a reset of the compilation activity mode in the host JVM). The option is only supported on \" +\n+                    \"the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 5000\", //\n+                    usageSyntax = \"<ms>\", category = OptionCategory.EXPERT) //\n+    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(5000L);\n \n     @Option(help = \"Manually set the number of compiler threads. By default, the number of compiler threads is scaled with the number of available cores on the CPU.\", usageSyntax = \"[1, inf)\", category = OptionCategory.EXPERT, //\n                     stability = OptionStability.STABLE, sandbox = SandboxPolicy.UNTRUSTED) //\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java\n@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0\n@@ -63,7 +63,6 @@\n import java.util.concurrent.ExecutionException;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.TimeoutException;\n-import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.function.Consumer;\n import java.util.function.Supplier;\n@@ -914,19 +913,12 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n-\n     private final AtomicLong stoppedCompilationTime = new AtomicLong(0);\n \n     public final AtomicLong stoppedCompilationTime() {\n         return stoppedCompilationTime;\n     }\n \n-    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);\n-\n-    public final AtomicBoolean logShutdownCompilations() {\n-        return logShutdownCompilations;\n-    }\n-\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n         Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n@@ -1499,9 +1491,9 @@ static OptionCategory matchCategory(TruffleCompilerOptionDescriptor d) {\n     }\n \n     /**\n-     * Represents HotSpot's compilation activity mode which is one of:\n-     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n-     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     * Represents HotSpot's compilation activity mode which is one of: {@code stop_compilation = 0},\n+     * {@code run_compilation = 1} or {@code shutdown_compilation = 2} Should be in sync with the\n+     * {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n      */\n     public enum CompilationActivityMode {\n         STOP_COMPILATION,\ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java\n@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0",
+      "diff": [
+        {
+          "file": "truffle/src/com.oracle.truffle.compiler/src/com/oracle/truffle/compiler/TruffleCompilerRuntime.java",
+          "patch": "@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java",
+          "patch": "@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/EngineData.java",
+          "patch": "@@ -86,6 +86,7 @@\n import java.util.Map;\n import java.util.Objects;\n import java.util.concurrent.ConcurrentHashMap;\n+import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.function.Function;\n import java.util.logging.Level;\n \n@@ -495,6 +496,16 @@ public TruffleLogger getLogger(String loggerId) {\n         return polyglotEngine != null ? loggerFactory.apply(loggerId) : null;\n     }\n \n+    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);\n+\n+    /**\n+     * Only log compilation shutdowns (see {@code OptimizedCallTarget.isCompilationStopped()}) once\n+     * per engine.\n+     */\n+    public final AtomicBoolean logShutdownCompilations() {\n+        return logShutdownCompilations;\n+    }\n+\n     @SuppressWarnings(\"static-method\")\n     public void mergeLoadedSources(Source[] sources) {\n         OptimizedRuntimeAccessor.SOURCE.mergeLoadedSources(sources);"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedCallTarget.java",
+          "patch": "@@ -84,6 +84,7 @@\n import com.oracle.truffle.api.nodes.RootNode;\n import com.oracle.truffle.compiler.TruffleCompilable;\n import com.oracle.truffle.runtime.OptimizedRuntimeOptions.ExceptionAction;\n+import com.oracle.truffle.runtime.OptimizedTruffleRuntime.CompilationActivityMode;\n \n import jdk.vm.ci.meta.JavaConstant;\n import jdk.vm.ci.meta.SpeculationLog;\n@@ -858,58 +859,60 @@ final boolean isCompilationFailed() {\n         return compilationFailed;\n     }\n \n-    final boolean isCompilationStopped() {\n-        OptimizedTruffleRuntime.CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n+    final CompilationActivityMode getCompilationActivityMode() {\n+        CompilationActivityMode compilationActivityMode = runtime().getCompilationActivityMode();\n         long sct = runtime().stoppedCompilationTime().get();\n-        if (compilationActivityMode == OptimizedTruffleRuntime.CompilationActivityMode.STOP_COMPILATION) {\n+        if (compilationActivityMode == CompilationActivityMode.STOP_COMPILATION) {\n             if (sct != 0 && System.currentTimeMillis() - sct > engine.stoppedCompilationRetryDelay) {\n                 runtime().stoppedCompilationTime().compareAndSet(sct, 0);\n-                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger a code cache sweep.\n-                compilationActivityMode = OptimizedTruffleRuntime.CompilationActivityMode.RUN_COMPILATION;\n+                // Try again every StoppedCompilationRetryDelay milliseconds to potentially trigger\n+                // a code cache sweep.\n+                compilationActivityMode = CompilationActivityMode.RUN_COMPILATION;\n             }\n         }\n \n         switch (compilationActivityMode) {\n-            case RUN_COMPILATION : {\n+            case RUN_COMPILATION: {\n                 // This is the common case - compilations are not stopped.\n-                return false;\n+                return CompilationActivityMode.RUN_COMPILATION;\n             }\n-            case STOP_COMPILATION : {\n+            case STOP_COMPILATION: {\n                 if (sct == 0) {\n                     runtime().stoppedCompilationTime().compareAndSet(0, System.currentTimeMillis());\n                 }\n                 // Flush the compilations queue for now. There's still a chance that compilation\n                 // will be re-enabled eventually, if the hosts code cache can be cleaned up.\n                 Collection<OptimizedCallTarget> targets = runtime().getCompileQueue().getQueuedTargets(null);\n-                // If there's just a single compilation target in the queue, the chance is high that it is\n-                // the one we've just added after the StoppedCompilationRetryDelay ran out, so keep it to\n-                // potentially trigger a code cache sweep.\n+                // If there's just a single compilation target in the queue, the chance is high that\n+                // it is the one we've just added after the StoppedCompilationRetryDelay ran out, so\n+                // keep it to potentially trigger a code cache sweep.\n                 if (targets.size() > 1) {\n                     for (OptimizedCallTarget target : targets) {\n                         target.cancelCompilation(\"Compilation temporary disabled due to full code cache.\");\n                     }\n                 }\n-                return true;\n+                return CompilationActivityMode.STOP_COMPILATION;\n             }\n-            case SHUTDOWN_COMPILATION : {\n+            case SHUTDOWN_COMPILATION: {\n                 // Compilation was shut down permanently because the hosts code cache ran full and\n                 // the host was configured without support for code cache sweeping.\n                 TruffleLogger logger = engine.getLogger(\"engine\");\n                 // The logger can be null if the engine is closed.\n-                if (logger != null && runtime().logShutdownCompilations().compareAndExchange(true, false)) {\n-                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \"  +\n-                            \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n+                if (logger != null && engine.logShutdownCompilations().compareAndExchange(true, false)) {\n+                    logger.log(Level.WARNING, \"Truffle compilations permanently disabled because of full code cache. \" +\n+                                    \"Increase the code cache size using '-XX:ReservedCodeCacheSize=' and/or run with '-XX:+UseCodeCacheFlushing -XX:+MethodFlushing'.\");\n                 }\n-                try {\n-                    runtime().getCompileQueue().shutdownAndAwaitTermination(100 /* milliseconds */);\n-                } catch (RuntimeException re) {\n-                    // Best effort, ignore failure\n+                // Flush the compilation queue and mark all methods as not compilable.\n+                for (OptimizedCallTarget target : runtime().getCompileQueue().getQueuedTargets(null)) {\n+                    target.cancelCompilation(\"Compilation permanently disabled due to full code cache.\");\n+                    target.compilationFailed = true;\n                 }\n-                return true;\n+                return CompilationActivityMode.SHUTDOWN_COMPILATION;\n             }\n-            default : CompilerDirectives.shouldNotReachHere(\"Invalid compilation activity mode: \" + compilationActivityMode);\n+            default:\n+                CompilerDirectives.shouldNotReachHere(\"Invalid compilation activity mode: \" + compilationActivityMode);\n         }\n-        return false;\n+        return CompilationActivityMode.RUN_COMPILATION;\n     }\n \n     /**\n@@ -931,6 +934,15 @@ public final boolean compile(boolean lastTierCompilation) {\n                 return false;\n             }\n \n+            CompilationActivityMode cam = getCompilationActivityMode();\n+            if (cam != CompilationActivityMode.RUN_COMPILATION) {\n+                if (cam == CompilationActivityMode.SHUTDOWN_COMPILATION) {\n+                    // Compilation was shut down permanently.\n+                    compilationFailed = true;\n+                }\n+                return false;\n+            }\n+\n             CompilationTask task = null;\n             // Do not try to compile this target concurrently,\n             // but do not block other threads if compilation is not asynchronous.\n@@ -939,10 +951,6 @@ public final boolean compile(boolean lastTierCompilation) {\n                     return true;\n                 }\n \n-                if (isCompilationStopped()) {\n-                    return false;\n-                }\n-\n                 ensureInitialized();\n                 if (!isSubmittedForCompilation()) {\n                     if (lastTier) {"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedRuntimeOptions.java",
+          "patch": "@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0\n@@ -158,14 +158,14 @@ public ExceptionAction apply(String s) {\n     // TODO: GR-29949\n     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);\n \n-    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the \" +\n-                   \"compilation activity mode in the host VM. If the activity mode indicates a full code \" +\n-                   \"cache, no new compilation requests are submitted and the compilation queue is flushed. \" +\n-                   \"After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again \" +\n-                   \"(which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM).\" +\n-                   \"The option is only supported on the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 1000\",\n-                   usageSyntax = \"<ms>\", category = OptionCategory.EXPERT)\n-    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(1000L);\n+    @Option(help = \"Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the compilation \" +\n+                    \"activity mode in the host VM. If the activity mode indicates a full code cache, no new compilation \" +\n+                    \"requests are submitted and the compilation queue is flushed. After 'StoppedCompilationRetryDelay' \" +\n+                    \"milliseconds new compilations will be submitted again (which might trigger a sweep of the code \" +\n+                    \"cache and a reset of the compilation activity mode in the host JVM). The option is only supported on \" +\n+                    \"the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 5000\", //\n+                    usageSyntax = \"<ms>\", category = OptionCategory.EXPERT) //\n+    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(5000L);\n \n     @Option(help = \"Manually set the number of compiler threads. By default, the number of compiler threads is scaled with the number of available cores on the CPU.\", usageSyntax = \"[1, inf)\", category = OptionCategory.EXPERT, //\n                     stability = OptionStability.STABLE, sandbox = SandboxPolicy.UNTRUSTED) //"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+          "patch": "@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0\n@@ -63,7 +63,6 @@\n import java.util.concurrent.ExecutionException;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.TimeoutException;\n-import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.function.Consumer;\n import java.util.function.Supplier;\n@@ -914,19 +913,12 @@ private void notifyCompilationFailure(OptimizedCallTarget callTarget, Throwable\n     protected void onEngineCreated(EngineData engine) {\n     }\n \n-\n     private final AtomicLong stoppedCompilationTime = new AtomicLong(0);\n \n     public final AtomicLong stoppedCompilationTime() {\n         return stoppedCompilationTime;\n     }\n \n-    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);\n-\n-    public final AtomicBoolean logShutdownCompilations() {\n-        return logShutdownCompilations;\n-    }\n-\n     @SuppressWarnings(\"try\")\n     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {\n         Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);\n@@ -1499,9 +1491,9 @@ static OptionCategory matchCategory(TruffleCompilerOptionDescriptor d) {\n     }\n \n     /**\n-     * Represents HotSpot's compilation activity mode which is one of:\n-     * {@code stop_compilation = 0}, {@code run_compilation = 1} or {@code shutdown_compilation = 2}\n-     * Should be in sync with the {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     * Represents HotSpot's compilation activity mode which is one of: {@code stop_compilation = 0},\n+     * {@code run_compilation = 1} or {@code shutdown_compilation = 2} Should be in sync with the\n+     * {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n      */\n     public enum CompilationActivityMode {\n         STOP_COMPILATION,"
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/hotspot/HotSpotTruffleRuntime.java",
+          "patch": "@@ -1,5 +1,5 @@\n /*\n- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.\n+ * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.\n  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.\n  *\n  * The Universal Permissive License (UPL), Version 1.0"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-11-30T13:11:35Z",
+      "sha": "acdb24aa5fde8b1e431a5ce902ee0e50dd36fe4d",
+      "message": "Fixed checkstyle errors",
+      "author": "Volker Simonis",
+      "author_email": "volker.simonis@gmail.com",
+      "author_raw_date": "2024-11-30T13:11:35Z",
+      "author_date": "2024-11-30T13:11:35Z",
+      "committer": "Volker Simonis",
+      "committer_email": "volker.simonis@gmail.com",
+      "raw_date": "2024-11-30T13:11:35Z",
+      "diff_text": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/EngineData.java\n@@ -502,7 +502,7 @@ public TruffleLogger getLogger(String loggerId) {\n      * Only log compilation shutdowns (see {@code OptimizedCallTarget.isCompilationStopped()}) once\n      * per engine.\n      */\n-    public final AtomicBoolean logShutdownCompilations() {\n+    public AtomicBoolean logShutdownCompilations() {\n         return logShutdownCompilations;\n     }\n \ntruffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java\n@@ -1492,15 +1492,15 @@ static OptionCategory matchCategory(TruffleCompilerOptionDescriptor d) {\n \n     /**\n      * Represents HotSpot's compilation activity mode which is one of: {@code stop_compilation = 0},\n-     * {@code run_compilation = 1} or {@code shutdown_compilation = 2} Should be in sync with the\n-     * {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     * {@code run_compilation = 1} or {@code shutdown_compilation = 2}. Should be in sync with the\n+     * {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}.\n      */\n     public enum CompilationActivityMode {\n         STOP_COMPILATION,\n         RUN_COMPILATION,\n         SHUTDOWN_COMPILATION;\n \n-        static public CompilationActivityMode fromInteger(int i) {\n+        public static CompilationActivityMode fromInteger(int i) {\n             return switch (i) {\n                 case 0 -> STOP_COMPILATION;\n                 case 1 -> RUN_COMPILATION;",
+      "diff": [
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/EngineData.java",
+          "patch": "@@ -502,7 +502,7 @@ public TruffleLogger getLogger(String loggerId) {\n      * Only log compilation shutdowns (see {@code OptimizedCallTarget.isCompilationStopped()}) once\n      * per engine.\n      */\n-    public final AtomicBoolean logShutdownCompilations() {\n+    public AtomicBoolean logShutdownCompilations() {\n         return logShutdownCompilations;\n     }\n "
+        },
+        {
+          "file": "truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/OptimizedTruffleRuntime.java",
+          "patch": "@@ -1492,15 +1492,15 @@ static OptionCategory matchCategory(TruffleCompilerOptionDescriptor d) {\n \n     /**\n      * Represents HotSpot's compilation activity mode which is one of: {@code stop_compilation = 0},\n-     * {@code run_compilation = 1} or {@code shutdown_compilation = 2} Should be in sync with the\n-     * {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}\n+     * {@code run_compilation = 1} or {@code shutdown_compilation = 2}. Should be in sync with the\n+     * {@code CompilerActivity} enum in {@code hotspot/share/compiler/compileBroker.hpp}.\n      */\n     public enum CompilationActivityMode {\n         STOP_COMPILATION,\n         RUN_COMPILATION,\n         SHUTDOWN_COMPILATION;\n \n-        static public CompilationActivityMode fromInteger(int i) {\n+        public static CompilationActivityMode fromInteger(int i) {\n             return switch (i) {\n                 case 0 -> STOP_COMPILATION;\n                 case 1 -> RUN_COMPILATION;"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2527840302,
+      "created_at": "2024-12-09T12:50:00Z",
+      "user": "simonis",
+      "body": "@chumer, could you please have a look at the updated version?"
+    },
+    {
+      "type": "review",
+      "id": 2512178209,
+      "created_at": "2024-12-18T15:32:36Z",
+      "user": "chumer",
+      "state": "APPROVED",
+      "body": "Looks good. Thanks a lot for this contribution @simonis !\r\nI will take it from here to integrate."
+    },
+    {
+      "type": "comment",
+      "id": 2556839194,
+      "created_at": "2024-12-20T11:43:14Z",
+      "user": "chumer",
+      "body": "Integrated: https://github.com/oracle/graal/pull/10358"
+    },
+    {
+      "type": "comment",
+      "id": 2567086352,
+      "created_at": "2025-01-01T17:26:22Z",
+      "user": "simonis",
+      "body": "Fixes #10133\r\n"
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+{
+    "pr_body": "Optimize away a number of refcounting in the inbound pipeline and remove the indirection of collecting pieces of a message into an `ArrayList` before passing them to the aggregator which does its own collecting of these pieces anyway.\r\nThe production impact of this change is expected to be relatively minor, though I think it does save a little indirection and might allow for further optimisations down the line. Also, it makes the code more obviously correct by only incrementing the reference count of buffers that are queued for later use.\r\n\r\nI found this while looking into why #79718 breaks on OSX CI while logging an endless stream of slow transport warnings. Theses are in large part caused by instantiating lots and lots of leak tracking exceptions with stack-traces in tests. This change reduces the number of increments and decrements massively, thus speeding up tests (on all platforms not just OSX for what it's worth).\r\n\r\nRough illustration (no real benchmark, just some profiling from tests but you can see the right hand side of the profile going down even for an expensive transport action like get-snapshots with many pending snapshots). I don't have the charts for other tests with me right now, but the effect is obviously much bigger when dealing with smaller transport messages in tests:\r\n\r\nbefore:\r\n\r\n<img width=\"1310\" alt=\"image\" src=\"https://user-images.githubusercontent.com/6490959/141282098-8c30be08-a63f-48c3-8dc8-bbb9a0382bf8.png\">\r\n\r\nafter:\r\n\r\n<img width=\"1292\" alt=\"image\" src=\"https://user-images.githubusercontent.com/6490959/141281977-02009c0e-5c8b-4d60-b7c9-ae0077e5e164.png\">\r\n\r\ncloses #79718 (I assume this will be enough to stabilize the test now combined with the other fix already applied to the issue)",
+    "original_commit_id": "af6703a51344768ac9681b264ef0adb1ca4878ff",
+    "merged": false,
+    "pr_number": 80656,
+    "pr_title": "Faster Inbound Pipeline",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "@elasticmachine update branch",
+        "> I'd prefer to keep the ref counting more obviously correct \r\n\r\nIMO this is exactly what this PR does. We shouldn't be ref-count incrementing and decrementing left and right when we don't need it. We should increment when we need to hold on to something outside of the current execution stack and only then, anything else just makes the code needlessly hard to follow IMO. To me incrementing a reference always means we fork off or need something later and this wasn't the case here at all.",
+        "I sort of see what you mean but also this change means that refcounting is different depending on whether there are multiple fragments to combine or not. I don't see a way to avoid the extra refcounting in the multi-fragment case, but it isn't as simple as it was and it took some thought.",
+        "I looked at this briefly yesterday. I was also opposed to the change. I don\u2019t think it fixes the underlying issue. If normal ref count incs and decs kill the test framework, I think that is an issue. And removing incs/decs used in production does not seem like a good solution. \r\n\r\nAdditionally this code was structured similar to Netty specifically to separate decoding from aggregation, from handling. I didn\u2019t want the decoder wrapping further pipeline steps. Always attempted to step back to the top (Pipeline) before moving to the next step. I did not want the decoder state to be concerned about what happened further down the pipeline.\r\n\r\nThe Consumer interface was just for testing. If I did it again I would probably pass the list in similar to netty.  \r\n\r\nI also don\u2019t agree on the correctness point. try with resource for each scope and passing a new retain into another scope guarantees an uncaught exception does not lead to a leak. \r\n\r\nI\u2019m not rejecting the PR if anything. You all can find whatever approach you want. Those were just my thoughts looking at it. ",
+        ">  perhaps stop collecting stack traces on the platforms on which it's too slow to cope while we're not chasing any particular leak there\r\n\r\nOne important point I'd make here is that the problem is not necessarily just that we collect stack traces for every message. It's simply how many we have to collect with the redundant ref counting we do. This is the traces we get for a tiny message (so no aggregation or anything in here) once it hits `InboundHandler`, so before we even get around to deserializing in master.\r\n\r\n```\r\n\r\nRecent access records: \r\n#1:\r\n\torg.elasticsearch.core.AbstractRefCounted.incRef(AbstractRefCounted.java:24)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retain(ReleasableBytesReference.java:81)\r\n\torg.elasticsearch.transport.InboundAggregator.aggregate(InboundAggregator.java:80)\r\n\torg.elasticsearch.transport.InboundPipeline.forwardFragments(InboundPipeline.java:153)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:120)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n#2:\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.close(ReleasableBytesReference.java:96)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:113)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n#3:\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.close(ReleasableBytesReference.java:96)\r\n\torg.elasticsearch.transport.InboundPipeline.releasePendingBytes(InboundPipeline.java:188)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:106)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n#4:\r\n\torg.elasticsearch.core.AbstractRefCounted.incRef(AbstractRefCounted.java:24)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retain(ReleasableBytesReference.java:81)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retainedSlice(ReleasableBytesReference.java:87)\r\n\torg.elasticsearch.transport.InboundDecoder.internalDecode(InboundDecoder.java:94)\r\n\torg.elasticsearch.transport.InboundDecoder.decode(InboundDecoder.java:44)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:104)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n#5:\r\n\torg.elasticsearch.core.AbstractRefCounted.incRef(AbstractRefCounted.java:24)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retain(ReleasableBytesReference.java:81)\r\n\torg.elasticsearch.transport.InboundPipeline.getPendingBytes(InboundPipeline.java:164)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:103)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n#6:\r\n\torg.elasticsearch.core.AbstractRefCounted.incRef(AbstractRefCounted.java:24)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retainedSlice(ReleasableBytesReference.java:90)\r\n\torg.elasticsearch.transport.InboundPipeline.releasePendingBytes(InboundPipeline.java:183)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:106)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n#7:\r\n\torg.elasticsearch.core.AbstractRefCounted.incRef(AbstractRefCounted.java:24)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retain(ReleasableBytesReference.java:81)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:95)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:85)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\nCreated at:\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:347)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n: 3 leak records were discarded because they were duplicates\r\n```\r\n\r\nAfter my change it's this:\r\n\r\n```\r\n\r\nRecent access records: \r\n#1:\r\n\torg.elasticsearch.core.AbstractRefCounted.incRef(AbstractRefCounted.java:24)\r\n\torg.elasticsearch.common.bytes.ReleasableBytesReference.retain(ReleasableBytesReference.java:81)\r\n\torg.elasticsearch.transport.InboundAggregator.aggregate(InboundAggregator.java:80)\r\n\torg.elasticsearch.transport.InboundPipeline.forwardFragment(InboundPipeline.java:157)\r\n\torg.elasticsearch.transport.InboundDecoder.internalDecode(InboundDecoder.java:124)\r\n\torg.elasticsearch.transport.InboundDecoder.decode(InboundDecoder.java:48)\r\n\torg.elasticsearch.transport.InboundPipeline.decode(InboundPipeline.java:116)\r\n\torg.elasticsearch.transport.InboundPipeline.doHandleBytes(InboundPipeline.java:102)\r\n\torg.elasticsearch.transport.InboundPipeline.handleBytes(InboundPipeline.java:83)\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:351)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\nCreated at:\r\n\torg.elasticsearch.transport.nio.MockNioTransport$MockTcpReadWriteHandler.consumeReads(MockNioTransport.java:347)\r\n\torg.elasticsearch.nio.SocketChannelContext.handleReadBytes(SocketChannelContext.java:222)\r\n\torg.elasticsearch.nio.BytesChannelContext.read(BytesChannelContext.java:35)\r\n\torg.elasticsearch.nio.EventHandler.handleRead(EventHandler.java:128)\r\n\torg.elasticsearch.transport.nio.TestEventHandler.handleRead(TestEventHandler.java:143)\r\n\torg.elasticsearch.nio.NioSelector.handleRead(NioSelector.java:415)\r\n\torg.elasticsearch.nio.NioSelector.processKey(NioSelector.java:241)\r\n\torg.elasticsearch.nio.NioSelector.singleLoop(NioSelector.java:168)\r\n\torg.elasticsearch.nio.NioSelector.runLoop(NioSelector.java:125)\r\n\tjava.base/java.lang.Thread.run(Thread.java:833)\r\n```\r\n\r\n... IMO this is logically much closer to the reality of what gets retained where and makes it far easier to understand where a leak may be coming from when debugging.\r\n\r\nI agree that many of the redundant ref-count changes we have right now are trivial to reason about because they're all try-with-resources, but they also don't add anything because of their simplicity. They burn cycles now (though not that many in production) and make debugging a leak needlessly hard, because you have to go through all of them and make sure none of the 7 (instead of 2 that are needed) recorded touch points are correct.\r\n\r\nAlso. without this change we are not actually operating the way Netty operates either I'd say because we'd just deserialize messages one by one anyway and then pass them along the pipeline as soon as we had one full message instead of Netty which at least optionally batches things in decoding here and there via the flag `io.netty.handler.codec.ByteToMessageDecoder#singleDecode`? Since we don't have that kind of batching I don't really see the point in pushing stuff up the stack again like that, it just adds complexity for working with the list that is always <=3 in length anyway?",
+        ">  I don't see a way to avoid the extra refcounting in the multi-fragment case, but it isn't as simple as it was and it took some thought.\r\n\r\nTrue, but that simplicity also meant a lot of needless cycles went into wrapping trivial messages multiple times. In a world where we cache 3-element lists thread-local because we think this code is hot enough to justify it, I find this to be an acceptable bit of complexity to add.",
+        "Yeah it's neater for sure, but that's still fundamentally a bug in the test-only leak tracker for which we're proposing a production code change. If we properly paired every acquire with its corresponding release then we could clean up the stack traces for the acquires that weren't released.\r\n\r\nHave we considered not separating the parts of the `InboundPipeline` so much? Acknowledging that Tim says we're following Netty's patterns here, but Netty is super-flexible so it needs these things to be separate whereas we have much simpler needs.",
+        ">  but Netty is super-flexible so it needs these things to be separate whereas we have much simpler needs.\r\n\r\nI'd be all for it. Technically, there is no reason for the code to be spread out like this in our case IMO. Netty allows for things like multiple layers of decoding and aggregating messages where tracking a list makes sense to neatly do stuff like read a chunked HTTP message step by step and whatnot. We don't do anything like that and IMO could just make the code as flat as the ref counting is now, rather than have redundant complicated ref-counting to wrap around all the various steps in the current code.\r\n\r\n> but that's still fundamentally a bug in the test-only leak tracker for which we're proposing a production code change. I\r\n\r\nNot sure I fully agree with this. I'd say yes, I wouldn't have proposed this without the leak-tracker causing us trouble, but I think it's worthwhile in isolation to not have needless wrapping of buffers and ref counting in code this hot. Also, I still don't see how redundant ref count incrementing and releasing without forking adds anything but confusion to this code (the case where we handle aggregate and single buffer message is the only exception to this where it maybe does).",
+        "Build failure is just a Jenkins issue, the build (part-2) went through fine.",
+        "https://github.com/elastic/elasticsearch/pull/81096 makes this PR a clean win in production IMO. Without this change, Netty's default 4 target records on leak tracking will not be enough to record the full history of a leak. With this change, it should be fine in most cases.",
+        "> . But I think it could make sense to collapse InboundDecoder and InboundPipeline as a (separate) experiment to see if this simplifies things\r\n\r\n++ \r\n\r\n> I am also hesitant on this change as is. \r\n\r\nDid my best to respond to inline comments :) But I'm not really sure what I can do here to address general concerns I'm afraid. The remove ref counting didn't actually add anything safety (with the one exception mentioned). Yes it was safe, but it was also redundant and obscured the points where actual transfers of ownership took place?",
+        "1. It seems very plausible that we could introduce some type of chunked content scheme at some point in the future. As we move to a world were compression is enabled by default, it is unfortunate that a message must be compressed in a single go. That is a world were our decoding step might be more complicated and produce multiple things before an entire message is available.\r\n2. I am very opposed to collapsing the decoder into the pipeline. the decoder is separate specifically because unit testing this code is very important.\r\n3. The `incs` and `decs` around `InboundPipeline#getPendingBytes()` and `InboundPipeline#releasePendingBytes` seem fine to remove. Same thing with the retains in `InboundDecoder#internalDecode` before we pass to the decompressor.\r\n4. I continue to opposed calling further steps down the pipeline from inside the `InboundDecoder`.\r\n5. I don't think any of passing bytes back and forth here is a hot enough code path where uncontented volatile read/writes matter. Particularly since all of this code is surrounded by TLS and Compression which is many many many times more expensive.\r\n6. Compression is poll based as the method must return the number of bytes consumed and can produce multiple pages. I think we do not want to interrupt a decompression loop to pass bytes down the pipeline.",
+        "Pinging again on this one. I'm still of the opinion that this is an outright win because of the fact that it fixes leak-tracking to be more useful in the real world (https://github.com/elastic/elasticsearch/pull/80656#issuecomment-979411349). Can we do anything to push this forward or simplify our buffer ref-counting to more closely reflect what gets escaped where? \r\nMy main motivation here at this point is fixing the leak tracking.",
+        "Pinging @elastic/es-distributed-obsolete (Team:Distributed (Obsolete))",
+        "Pinging @elastic/es-distributed-coordination (Team:Distributed Coordination)",
+        "closing in favor of https://github.com/elastic/elasticsearch/pull/123390"
+    ],
+    "commit_id": "69665bc8aa9c55d887c6406792a60da4f95e0bce",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 44,
+            "start_side": null,
+            "start_line": null,
+            "line": 44,
+            "comment_lines": [
+                "[][44]"
+            ],
+            "review_comment": [
+                "Could we not pass the `TcpChannel` around everywhere like this? It's always the same channel isn't it?",
+                "Probably, I bet we can make additional optimizations like that (though I might actually like it better to be less \"functional\" here and just remove the ability to pass a consumer here when we only have one production code user of this method). It's weird to have this kind of generality on the very very hot path (though admittedly it's not showing up in profiling) just for tests?",
+                "Hiding my above comment, I misread the question initially. I added passing around the channel here to avoid instantiating a capturing lambda here where previously we had a non-capturing one."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/transport/InboundDecoder.java",
+            "id": 35089,
+            "created_at": "2021-11-25T13:45:35Z",
+            "original_position": 24,
+            "side": "RIGHT",
+            "position": 24,
+            "original_start_line": null
+        },
+        {
+            "original_line": 30,
+            "start_side": null,
+            "start_line": null,
+            "line": 30,
+            "comment_lines": [
+                "[30][]"
+            ],
+            "review_comment": [
+                ":+1:"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/transport/InboundPipeline.java",
+            "id": 35090,
+            "created_at": "2021-11-25T13:45:57Z",
+            "original_position": 12,
+            "side": "LEFT",
+            "position": 12,
+            "original_start_line": null
+        },
+        {
+            "original_line": 108,
+            "start_side": null,
+            "start_line": null,
+            "line": 108,
+            "comment_lines": [
+                "[104][108]"
+            ],
+            "review_comment": [
+                "I wonder if a push-style interaction out of `decompress` would be easier, since then the ref-counting is mostly not an issue.",
+                "True, I guess that would be another possible simplification and would make decompress work more similarly to how the rest of the pipeline works with this change as well. Not sure we'd want to blow this one up with making that change here also. I'd rather push that down to a follow-up to keep this somewhat tricky change small? :)"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/transport/InboundDecoder.java",
+            "id": 35092,
+            "created_at": "2021-11-29T12:36:46Z",
+            "original_position": 90,
+            "side": "RIGHT",
+            "position": 90,
+            "original_start_line": null
+        },
+        {
+            "original_line": 85,
+            "start_side": null,
+            "start_line": null,
+            "line": 81,
+            "comment_lines": [
+                "[][81]"
+            ],
+            "review_comment": [
+                "This seems to be like a \"transfer\" ownership operation. It seems to me that it is a bit artificial in that it's primary purpose is to avoid an incref/decref solely for the leak tracker.",
+                "I found the whole thing rather artificial before. We would retain the original, then slice and then build a new releasable from the original. This way at least, we're honest about the fact that this is all backed by the same ref-count and all we really did is move the read offset. In the end part of the motivation for this change is that we aren't actually transferring ownership all the time in the two spots that this method is used in."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/common/bytes/ReleasableBytesReference.java",
+            "id": 35091,
+            "created_at": "2021-11-29T12:20:07Z",
+            "original_position": 4,
+            "side": "RIGHT",
+            "position": 4,
+            "original_start_line": null
+        },
+        {
+            "original_line": 123,
+            "start_side": null,
+            "start_line": null,
+            "line": 124,
+            "comment_lines": [
+                "[][124]"
+            ],
+            "review_comment": [
+                "If the channel is closed then the bytes get released mid-decode. Is that a problem? (possibly not, but I'd like to hear the reasoning)",
+                "The channel is closed on the same thread that this runs on, we don't release mid-decode. We release after deserializing and handling what we deserialized in all cases. ",
+                "Yeah I really just meant within the `decode()` method.",
+                "Ah I see. I think there we're good because we don't have any incremental decode on a message. We decode a full message and pass it along to message handling, then return from decode. So closing the channel will always be the last step in `decode` as far as I can see."
+            ],
+            "path": "server/src/main/java/org/elasticsearch/transport/InboundPipeline.java",
+            "id": 35088,
+            "created_at": "2021-11-25T13:32:38Z",
+            "original_position": 97,
+            "side": "RIGHT",
+            "position": 97,
+            "original_start_line": null
+        },
+        {
+            "original_line": 132,
+            "start_side": null,
+            "start_line": null,
+            "line": 134,
+            "comment_lines": [
+                "[][134]"
+            ],
+            "review_comment": [
+                "If `isClosed` can we assert that `pending` is now empty?",
+                "Yea that should be fine, will add"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/transport/InboundPipeline.java",
+            "id": 35087,
+            "created_at": "2021-11-25T13:31:40Z",
+            "original_position": 109,
+            "side": "RIGHT",
+            "position": 110,
+            "original_start_line": null
+        },
+        {
+            "original_line": 109,
+            "start_side": null,
+            "start_line": null,
+            "line": 110,
+            "comment_lines": [
+                "[][110]"
+            ],
+            "review_comment": [
+                "Could we have a test in `InboundPipelineTests` showing that we handle the `isClosed` case correctly here? And elsewhere I guess, but I checked that we never actually exercise the `isClosed == true` branch here.",
+                "Let me try :) Should be doable, these paths are exercised by some internal cluster tests so there should be an obvious way to do it. On it",
+                "Test added, should be good for another round now :)"
+            ],
+            "path": "server/src/main/java/org/elasticsearch/transport/InboundPipeline.java",
+            "id": 35086,
+            "created_at": "2021-11-25T13:25:20Z",
+            "original_position": 67,
+            "side": "RIGHT",
+            "position": 67,
+            "original_start_line": null
+        }
+    ]
+}

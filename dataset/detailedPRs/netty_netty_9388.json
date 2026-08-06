@@ -1,0 +1,313 @@
+{
+  "repo": "netty/netty",
+  "number": 9388,
+  "pr_number": 9388,
+  "title": "Only close eventFD in EpollEventLoop when it cannot be written to.",
+  "user": "carl-mastrangelo",
+  "created_at": "2019-07-17T22:07:47Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [],
+  "base_commit": "dd1785ba66dca72a82ec5e5d2e63498f1f591db0",
+  "merge_commit_sha": "ec7e5ad003dbfed451708e22dde97c53e1c98901",
+  "commits": 3,
+  "issue_events": [
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "referenced",
+    "referenced",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/netty/netty/pull/9388",
+  "timeline": [
+    {
+      "type": "description",
+      "created_at": "2019-07-17T22:07:47Z",
+      "user": "carl-mastrangelo",
+      "body": "Motivation:\r\nWriting to the eventFD is racy with close.   If the event loop is shutdown\r\nand the fd closed, the fd number could be reused.   An in progress call to wakeup()\r\nmay write to the newly allocated fd, causing corruption.\r\n\r\nModification:\r\nMake wakeup() indicate if a write is in progress or has completed.  The normal\r\nloop will clear this indicator.  A shutdown now waits for the pending fd write to\r\nfinish.\r\n\r\nResult:\r\nNo TSAN races reported.\r\n\r\nFixes #9362"
+    },
+    {
+      "type": "comment",
+      "id": 512587199,
+      "created_at": "2019-07-17T22:09:05Z",
+      "user": "netty-bot",
+      "body": "Can one of the admins verify this patch?"
+    },
+    {
+      "type": "commit",
+      "date": "2019-07-18T01:01:28Z",
+      "sha": "2bcb9dbac1f6b1626fb210dbc42c33da8428f6c1",
+      "message": "Only close eventFD in EpollEventLoop when it cannot be written to.\n\nMotivation:\nWriting to the eventFD is racy with close.   If the event loop is shutdown\nand the fd closed, the fd number could be reused.   An in progress call to wakeup()\nmay write to the newly allocated fd, causing corruption.\n\nModification:\nMake wakeup() indicate if a write is in progress or has completed.  The normal\nloop will clear this indicator.  A shutdown now waits for the pending fd write to\nfinish.\n\nResult:\nNo TSAN races reported.",
+      "author": "Carl Mastrangelo",
+      "author_email": "notcarl@google.com",
+      "author_raw_date": "2019-07-17T22:03:53Z",
+      "author_date": "2019-07-17T22:03:53Z",
+      "committer": "Carl Mastrangelo",
+      "committer_email": "notcarl@google.com",
+      "raw_date": "2019-07-18T01:01:28Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java\n@@ -47,6 +47,10 @@ class EpollEventLoop extends SingleThreadEventLoop {\n     private static final AtomicIntegerFieldUpdater<EpollEventLoop> WAKEN_UP_UPDATER =\n             AtomicIntegerFieldUpdater.newUpdater(EpollEventLoop.class, \"wakenUp\");\n \n+    private static final int WAKEUP_ALLOWED = 0;\n+    private static final int WAKEUP_INPROGRESS = 1;\n+    private static final int WAKEUP_NOT_ALLOWED = -1;\n+\n     static {\n         // Ensure JNI is initialized by the time this class is loaded by this time!\n         // We use unix-common methods in this class which are backed by JNI methods.\n@@ -73,7 +77,8 @@ public int get() throws Exception {\n             return epollWaitNow();\n         }\n     };\n-    @SuppressWarnings(\"unused\") // AtomicIntegerFieldUpdater\n+    // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n+    // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.\n     private volatile int wakenUp;\n     private volatile int ioRatio = 50;\n \n@@ -177,9 +182,13 @@ NativeDatagramPacketArray cleanDatagramPacketArray() {\n \n     @Override\n     protected void wakeup(boolean inEventLoop) {\n-        if (!inEventLoop && WAKEN_UP_UPDATER.getAndSet(this, 1) == 0) {\n+        if (!inEventLoop && WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_INPROGRESS)) {\n             // write to the evfd which will then wake-up epoll_wait(...)\n-            Native.eventFdWrite(eventFd.intValue(), 1L);\n+            try {\n+                Native.eventFdWrite(eventFd.intValue(), 1L);\n+            } finally {\n+                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_INPROGRESS, WAKEUP_NOT_ALLOWED);\n+            }\n         }\n     }\n \n@@ -298,8 +307,8 @@ protected void run() {\n                         break;\n \n                     case SelectStrategy.SELECT:\n-                        if (wakenUp == 1) {\n-                            wakenUp = 0;\n+                        if (wakenUp != WAKEUP_ALLOWED) {\n+                            wakenUp = WAKEUP_ALLOWED;\n                         }\n                         if (!hasTasks()) {\n                             strategy = epollWait();\n@@ -454,6 +463,15 @@ protected void cleanup() {\n                 logger.warn(\"Failed to close the epoll fd.\", e);\n             }\n             try {\n+                // There are three possibilities:\n+                // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n+                // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n+                // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n+                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED);\n+\n+                // Busy loop until the last wakeup() is out of the critical section.\n+                while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n+\n                 eventFd.close();\n             } catch (IOException e) {\n                 logger.warn(\"Failed to close the event fd.\", e);",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+          "patch": "@@ -47,6 +47,10 @@ class EpollEventLoop extends SingleThreadEventLoop {\n     private static final AtomicIntegerFieldUpdater<EpollEventLoop> WAKEN_UP_UPDATER =\n             AtomicIntegerFieldUpdater.newUpdater(EpollEventLoop.class, \"wakenUp\");\n \n+    private static final int WAKEUP_ALLOWED = 0;\n+    private static final int WAKEUP_INPROGRESS = 1;\n+    private static final int WAKEUP_NOT_ALLOWED = -1;\n+\n     static {\n         // Ensure JNI is initialized by the time this class is loaded by this time!\n         // We use unix-common methods in this class which are backed by JNI methods.\n@@ -73,7 +77,8 @@ public int get() throws Exception {\n             return epollWaitNow();\n         }\n     };\n-    @SuppressWarnings(\"unused\") // AtomicIntegerFieldUpdater\n+    // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n+    // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.\n     private volatile int wakenUp;\n     private volatile int ioRatio = 50;\n \n@@ -177,9 +182,13 @@ NativeDatagramPacketArray cleanDatagramPacketArray() {\n \n     @Override\n     protected void wakeup(boolean inEventLoop) {\n-        if (!inEventLoop && WAKEN_UP_UPDATER.getAndSet(this, 1) == 0) {\n+        if (!inEventLoop && WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_INPROGRESS)) {\n             // write to the evfd which will then wake-up epoll_wait(...)\n-            Native.eventFdWrite(eventFd.intValue(), 1L);\n+            try {\n+                Native.eventFdWrite(eventFd.intValue(), 1L);\n+            } finally {\n+                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_INPROGRESS, WAKEUP_NOT_ALLOWED);\n+            }\n         }\n     }\n \n@@ -298,8 +307,8 @@ protected void run() {\n                         break;\n \n                     case SelectStrategy.SELECT:\n-                        if (wakenUp == 1) {\n-                            wakenUp = 0;\n+                        if (wakenUp != WAKEUP_ALLOWED) {\n+                            wakenUp = WAKEUP_ALLOWED;\n                         }\n                         if (!hasTasks()) {\n                             strategy = epollWait();\n@@ -454,6 +463,15 @@ protected void cleanup() {\n                 logger.warn(\"Failed to close the epoll fd.\", e);\n             }\n             try {\n+                // There are three possibilities:\n+                // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n+                // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n+                // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n+                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED);\n+\n+                // Busy loop until the last wakeup() is out of the critical section.\n+                while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n+\n                 eventFd.close();\n             } catch (IOException e) {\n                 logger.warn(\"Failed to close the event fd.\", e);"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 304724259,
+      "created_at": "2019-07-18T03:46:04Z",
+      "user": "njhill",
+      "body": "Not sure the bits have any relevance, could be arbitrary unique integers? could as well just be 0, 1, 2?\r\n\r\n",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+      "diff_hunk": "@@ -73,7 +77,8 @@ public int get() throws Exception {\n             return epollWaitNow();\n         }\n     };\n-    @SuppressWarnings(\"unused\") // AtomicIntegerFieldUpdater\n+    // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n+    // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 81,
+      "side": "RIGHT",
+      "original_position": 17,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 305505076,
+          "user": "carl-mastrangelo",
+          "body": "Oops, that should not have survived.  That was from a previous version.",
+          "created_at": "2019-07-19T19:59:05Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 304724300,
+      "created_at": "2019-07-18T03:46:24Z",
+      "user": "njhill",
+      "body": "could put the loop inside if block? i.e.\r\n```java\r\nif (!WAKEN_UP_UPDATER.compareAndSet... ) {\r\n    // Busy loop ...\r\n    while (wakenup != WAKEUP_NOT_ALLOWED) { }\r\n}\r\n```",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+      "diff_hunk": "@@ -454,6 +463,15 @@ protected void cleanup() {\n                 logger.warn(\"Failed to close the epoll fd.\", e);\n             }\n             try {\n+                // There are three possibilities:\n+                // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n+                // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n+                // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n+                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED);\n+\n+                // Busy loop until the last wakeup() is out of the critical section.\n+                while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 473,
+      "side": "RIGHT",
+      "original_position": 59,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 305505482,
+          "user": "carl-mastrangelo",
+          "body": "Done.",
+          "created_at": "2019-07-19T20:00:27Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 263417060,
+      "created_at": "2019-07-18T04:08:11Z",
+      "user": "njhill",
+      "state": "COMMENTED",
+      "body": "@carl-mastrangelo lgtm but I think it would be improved with the following adjustments to where the state transitions happen:\r\n- move the pre-`eventFd.close()` CAS to post-`epollWait()` (outside the `if(!hasTasks())` block), so it's done every time the loop wakes up\r\n- initialize `wakenUp` field to `WAKEUP_NOT_ALLOWED`\r\n- change the `if (wakenUp == WAKEUP_ALLOWED) { ... }` to just set `wakenUp = WAKEUP_ALLOWED` unconditionally since it will now never be false here\r\n\r\nThis is kind of equivalent to what I'm proposing in #9223, so maybe you won't like it :) but I'm still convinced it's good and that it will reduce the chance of redundant eventfd write syscall + wakeup pairs, particularly in the case the loop woke up due to a non-eventfd event.\r\n\r\nAlso similar to what you suggested in that issue, maybe we should rename `wakenUp` to `wakeupState`?"
+    },
+    {
+      "type": "review",
+      "id": 263509086,
+      "created_at": "2019-07-18T08:42:56Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 304801252,
+      "created_at": "2019-07-18T08:42:56Z",
+      "user": "normanmaurer",
+      "body": "its a bit sad that we now need another CAS :/",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+      "diff_hunk": "@@ -177,9 +182,13 @@ NativeDatagramPacketArray cleanDatagramPacketArray() {\n \n     @Override\n     protected void wakeup(boolean inEventLoop) {\n-        if (!inEventLoop && WAKEN_UP_UPDATER.getAndSet(this, 1) == 0) {\n+        if (!inEventLoop && WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_INPROGRESS)) {\n             // write to the evfd which will then wake-up epoll_wait(...)\n-            Native.eventFdWrite(eventFd.intValue(), 1L);\n+            try {\n+                Native.eventFdWrite(eventFd.intValue(), 1L);\n+            } finally {\n+                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_INPROGRESS, WAKEUP_NOT_ALLOWED);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 188,
+      "original_line": 190,
+      "side": "RIGHT",
+      "original_position": 32,
+      "position": 32,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 305505958,
+          "user": "carl-mastrangelo",
+          "body": "The alternative is:  on shutdown, busy-read from the event FD until we *don't* get EAGAIN, which would indicate that the `wakeup()` call is complete.   That avoids the second CAS.  thoughts?",
+          "created_at": "2019-07-19T20:02:01Z"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 512723832,
+      "created_at": "2019-07-18T08:43:19Z",
+      "user": "normanmaurer",
+      "body": "@netty-bot test this please "
+    },
+    {
+      "type": "review",
+      "id": 264405612,
+      "created_at": "2019-07-19T19:59:05Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 264406197,
+      "created_at": "2019-07-19T20:00:27Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 264406834,
+      "created_at": "2019-07-19T20:02:01Z",
+      "user": "carl-mastrangelo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2019-07-19T20:02:53Z",
+      "sha": "66044d9d72531707677da19179baae0f0f134817",
+      "message": "some of the changes",
+      "author": "Carl Mastrangelo",
+      "author_email": "notcarl@google.com",
+      "author_raw_date": "2019-07-19T20:02:53Z",
+      "author_date": "2019-07-19T20:02:53Z",
+      "committer": "Carl Mastrangelo",
+      "committer_email": "notcarl@google.com",
+      "raw_date": "2019-07-19T20:02:53Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java\n@@ -79,7 +79,7 @@ public int get() throws Exception {\n     };\n     // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n     // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.\n-    private volatile int wakenUp;\n+    private volatile int wakenUp = WAKEUP_NOT_ALLOWED;\n     private volatile int ioRatio = 50;\n \n     // See http://man7.org/linux/man-pages/man2/timerfd_create.2.html.\n@@ -307,9 +307,7 @@ protected void run() {\n                         break;\n \n                     case SelectStrategy.SELECT:\n-                        if (wakenUp != WAKEUP_ALLOWED) {\n-                            wakenUp = WAKEUP_ALLOWED;\n-                        }\n+                        wakenUp = WAKEUP_ALLOWED;\n                         if (!hasTasks()) {\n                             strategy = epollWait();\n                         }\n@@ -467,11 +465,11 @@ protected void cleanup() {\n                 // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n                 // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n                 // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n-                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED);\n-\n-                // Busy loop until the last wakeup() is out of the critical section.\n-                while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n-\n+                if (!WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED)) {\n+                    // Busy loop until the last wakeup() is out of the critical section.\n+                    while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n+                }\n+                \n                 eventFd.close();\n             } catch (IOException e) {\n                 logger.warn(\"Failed to close the event fd.\", e);",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+          "patch": "@@ -79,7 +79,7 @@ public int get() throws Exception {\n     };\n     // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n     // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.\n-    private volatile int wakenUp;\n+    private volatile int wakenUp = WAKEUP_NOT_ALLOWED;\n     private volatile int ioRatio = 50;\n \n     // See http://man7.org/linux/man-pages/man2/timerfd_create.2.html.\n@@ -307,9 +307,7 @@ protected void run() {\n                         break;\n \n                     case SelectStrategy.SELECT:\n-                        if (wakenUp != WAKEUP_ALLOWED) {\n-                            wakenUp = WAKEUP_ALLOWED;\n-                        }\n+                        wakenUp = WAKEUP_ALLOWED;\n                         if (!hasTasks()) {\n                             strategy = epollWait();\n                         }\n@@ -467,11 +465,11 @@ protected void cleanup() {\n                 // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n                 // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n                 // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n-                WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED);\n-\n-                // Busy loop until the last wakeup() is out of the critical section.\n-                while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n-\n+                if (!WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED)) {\n+                    // Busy loop until the last wakeup() is out of the critical section.\n+                    while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n+                }\n+                \n                 eventFd.close();\n             } catch (IOException e) {\n                 logger.warn(\"Failed to close the event fd.\", e);"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2019-07-19T20:07:43Z",
+      "sha": "e7c75453156648c5d5835061a5f0a945bfe5b90b",
+      "message": "wake comment",
+      "author": "Carl Mastrangelo",
+      "author_email": "notcarl@google.com",
+      "author_raw_date": "2019-07-19T20:07:43Z",
+      "author_date": "2019-07-19T20:07:43Z",
+      "committer": "Carl Mastrangelo",
+      "committer_email": "notcarl@google.com",
+      "raw_date": "2019-07-19T20:07:43Z",
+      "diff_text": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java\n@@ -77,8 +77,6 @@ public int get() throws Exception {\n             return epollWaitNow();\n         }\n     };\n-    // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n-    // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.\n     private volatile int wakenUp = WAKEUP_NOT_ALLOWED;\n     private volatile int ioRatio = 50;\n \n@@ -469,7 +467,7 @@ protected void cleanup() {\n                     // Busy loop until the last wakeup() is out of the critical section.\n                     while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n                 }\n-                \n+\n                 eventFd.close();\n             } catch (IOException e) {\n                 logger.warn(\"Failed to close the event fd.\", e);",
+      "diff": [
+        {
+          "file": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+          "patch": "@@ -77,8 +77,6 @@ public int get() throws Exception {\n             return epollWaitNow();\n         }\n     };\n-    // wakenUp is a packed field, where the bottom bit indicates if the loop is trying to exit\n-    // The high bits indicate if there are multiple non-loop threads trying to wake up the loop.\n     private volatile int wakenUp = WAKEUP_NOT_ALLOWED;\n     private volatile int ioRatio = 50;\n \n@@ -469,7 +467,7 @@ protected void cleanup() {\n                     // Busy loop until the last wakeup() is out of the critical section.\n                     while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }\n                 }\n-                \n+\n                 eventFd.close();\n             } catch (IOException e) {\n                 logger.warn(\"Failed to close the event fd.\", e);"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 305509841,
+      "created_at": "2019-07-19T20:14:29Z",
+      "user": "johnou",
+      "body": "Thread yield?",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+      "diff_hunk": "@@ -454,6 +459,15 @@ protected void cleanup() {\n                 logger.warn(\"Failed to close the epoll fd.\", e);\n             }\n             try {\n+                // There are three possibilities:\n+                // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n+                // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n+                // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n+                if (!WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED)) {\n+                    // Busy loop until the last wakeup() is out of the critical section.\n+                    while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 468,
+      "original_line": 468,
+      "side": "RIGHT",
+      "original_position": 58,
+      "position": 58,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 264485968,
+      "created_at": "2019-07-20T06:22:42Z",
+      "user": "normanmaurer",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 305569692,
+      "created_at": "2019-07-20T06:22:42Z",
+      "user": "normanmaurer",
+      "body": "Maybe not a big deal but should we add a sleep(50) or so to reduce CPU costs ?",
+      "path": "transport-native-epoll/src/main/java/io/netty/channel/epoll/EpollEventLoop.java",
+      "diff_hunk": "@@ -454,6 +459,15 @@ protected void cleanup() {\n                 logger.warn(\"Failed to close the epoll fd.\", e);\n             }\n             try {\n+                // There are three possibilities:\n+                // a.  wakenUp is WAKEUP_ALLOWED, which means no pending write\n+                // b.  wakenUp is WAKEUP_NOT_ALLOWED, which means no pending writes\n+                // c.  wakenUp is WAKEUP_INPROGRESS, which means will it will eventually reach WAKEUP_NOT_ALLOWED.\n+                if (!WAKEN_UP_UPDATER.compareAndSet(this, WAKEUP_ALLOWED, WAKEUP_NOT_ALLOWED)) {\n+                    // Busy loop until the last wakeup() is out of the critical section.\n+                    while (wakenUp != WAKEUP_NOT_ALLOWED) { /* spin */ }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 468,
+      "original_line": 468,
+      "side": "RIGHT",
+      "original_position": 58,
+      "position": 58,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 264411878,
+      "created_at": "2019-07-20T07:58:56Z",
+      "user": "johnou",
+      "state": "CHANGES_REQUESTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 513935633,
+      "created_at": "2019-07-22T20:10:49Z",
+      "user": "njhill",
+      "body": "@carl-mastrangelo I'm actually not sure this is watertight yet, the below is  maybe unlikely but I think possible... WDYT?\r\n\r\n- EL is awake, `wakenUp == WA`\r\n- T1 submits task and CAS succeeds, now `wakenUp == WIP`, proceeds to call eventfd write\r\n- EL completes task processing, sets `wakenUp = WA` prior to going to sleep\r\n- T2 submits task and CAS succeeds, now `wakenUp == WIP`\r\n- T1 finishes eventfd write, successfully CASes `wakenUp` from `WIP` to `WNA`\r\n- Channel was closed at some point, EL proceeds to close eventfd, not blocked because state is `WNA`\r\n- fd is reassigned, T2 calls eventfd write"
+    },
+    {
+      "type": "comment",
+      "id": 514101914,
+      "created_at": "2019-07-23T08:08:48Z",
+      "user": "njhill",
+      "body": "Here is a possible alternative that avoids the race described above and does not use additional CAS for wakeup: ~b397f45cd4d39ee05e26eeba1d0f411ac015ac77~ 36ff672b808fd5e17fb908fd22a2ce4f9cae97eb\r\n\r\nI don't think it's quite what @ejona86 was suggesting in #9362, but might be similar. And it's not clear to me how polling for EAGAIN or a non-EAGAIN would avoid the race - I don't think either tells you for sure that there is or isn't some outstanding write in progress?\r\n\r\nIt does mean typically reading from the fd during close, but I'm not sure that's a big deal. Closing shouldn't be high frequency or on critical path (unlike wakeup operation for example), and it already involves some syscalls to close all the fds."
+    },
+    {
+      "type": "comment",
+      "id": 522014516,
+      "created_at": "2019-08-16T13:46:48Z",
+      "user": "normanmaurer",
+      "body": "@ejona86 please check https://github.com/netty/netty/commit/36ff672b808fd5e17fb908fd22a2ce4f9cae97eb."
+    },
+    {
+      "type": "comment",
+      "id": 528347483,
+      "created_at": "2019-09-05T12:49:06Z",
+      "user": "normanmaurer",
+      "body": "This was fixed by https://github.com/netty/netty/pull/9535"
+    }
+  ]
+}

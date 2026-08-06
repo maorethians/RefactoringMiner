@@ -1,0 +1,162 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 71330,
+  "pr_number": 71330,
+  "title": "Reduce Memory Use of Parallel Azure Blob Deletes",
+  "user": "original-brownbear",
+  "created_at": "2021-04-06T11:22:10Z",
+  "merged_at": "2021-04-06T12:45:03Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v7.13.0",
+    "v7.12.1",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "18cb909a2db99b74b4ea58bb4d7b710d1165f0bc",
+  "merge_commit_sha": "821383378e66a2257d9a14fb7e2a3dc6c94d365e",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "head_ref_restored"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/71330",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-04-06T11:21:20Z",
+      "sha": "9cb10dd25da98090982f02db966d0abce8978f73",
+      "message": "Reduce Memory Use of Parallel Azure Blob Deletes\n\n1. Limit the number of blob deletes to execute in parallel to `100`.\n2. Use flat listing when deleting a directory to require fewer listings\nin between deletes and keep the code simpler.\n\ncloses #71267",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-04-06T11:19:15Z",
+      "author_date": "2021-04-06T11:19:15Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-04-06T11:21:20Z",
+      "diff_text": "plugins/repository-azure/src/main/java/org/elasticsearch/repositories/azure/AzureBlobStore.java\n@@ -33,6 +33,7 @@\n import org.apache.logging.log4j.Logger;\n import org.apache.logging.log4j.message.ParameterizedMessage;\n import org.elasticsearch.cluster.metadata.RepositoryMetadata;\n+import org.elasticsearch.cluster.routing.allocation.AllocationService;\n import org.elasticsearch.common.Nullable;\n import org.elasticsearch.common.UUIDs;\n import org.elasticsearch.common.blobstore.BlobContainer;\n@@ -58,20 +59,18 @@\n import java.net.URL;\n import java.nio.ByteBuffer;\n import java.nio.file.FileAlreadyExistsException;\n-import java.util.ArrayDeque;\n import java.util.ArrayList;\n import java.util.Base64;\n import java.util.Collections;\n import java.util.HashMap;\n import java.util.List;\n import java.util.Map;\n import java.util.Objects;\n-import java.util.Queue;\n import java.util.concurrent.atomic.AtomicInteger;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.function.BiConsumer;\n import java.util.function.BiPredicate;\n-import java.util.function.Supplier;\n+import java.util.function.Function;\n \n public class AzureBlobStore implements BlobStore {\n     private static final Logger logger = LogManager.getLogger(AzureBlobStore.class);\n@@ -153,8 +152,7 @@ public AzureBlobStore(RepositoryMetadata metadata, AzureStorageService service)\n     private boolean isListRequest(String httpMethod, URL url) {\n         return httpMethod.equals(\"GET\") &&\n             url.getQuery() != null &&\n-            url.getQuery().contains(\"comp=list\") &&\n-            url.getQuery().contains(\"delimiter=\");\n+            url.getQuery().contains(\"comp=list\");\n     }\n \n     // https://docs.microsoft.com/en-us/rest/api/storageservices/put-block\n@@ -216,91 +214,80 @@ public boolean blobExists(String blob) throws IOException {\n         }\n     }\n \n+    // number of concurrent blob delete requests to use while bulk deleting\n+    private static final int CONCURRENT_DELETES = 100;\n+\n     public DeleteResult deleteBlobDirectory(String path) throws IOException {\n         final AtomicInteger blobsDeleted = new AtomicInteger(0);\n         final AtomicLong bytesDeleted = new AtomicLong(0);\n \n-        final BlobServiceClient client = client();\n         SocketAccess.doPrivilegedVoidException(() -> {\n-            final BlobContainerClient blobContainerClient = client.getBlobContainerClient(container);\n             final BlobContainerAsyncClient blobContainerAsyncClient = asyncClient().getBlobContainerAsyncClient(container);\n-            final Queue<String> directories = new ArrayDeque<>();\n-            directories.offer(path);\n-            String directoryName;\n-            List<Mono<Void>> deleteTasks = new ArrayList<>();\n-            while ((directoryName = directories.poll()) != null) {\n-                final BlobListDetails blobListDetails = new BlobListDetails()\n-                    .setRetrieveMetadata(true);\n-\n-                final ListBlobsOptions options = new ListBlobsOptions()\n-                    .setPrefix(directoryName)\n-                    .setDetails(blobListDetails);\n-\n-                for (BlobItem blobItem : blobContainerClient.listBlobsByHierarchy(\"/\", options, null)) {\n+            final ListBlobsOptions options = new ListBlobsOptions()\n+                    .setPrefix(path)\n+                    .setDetails(new BlobListDetails().setRetrieveMetadata(true));\n+            try {\n+                blobContainerAsyncClient.listBlobs(options, null).flatMap(blobItem -> {\n                     if (blobItem.isPrefix() != null && blobItem.isPrefix()) {\n-                        directories.offer(blobItem.getName());\n+                        return Mono.empty();\n                     } else {\n-                        BlobAsyncClient blobAsyncClient = blobContainerAsyncClient.getBlobAsyncClient(blobItem.getName());\n-                        final Mono<Void> deleteTask = blobAsyncClient.delete()\n-                            // Ignore not found blobs, as it's possible that due to network errors a request\n-                            // for an already deleted blob is retried, causing an error.\n-                            .onErrorResume(this::isNotFoundError, throwable -> Mono.empty())\n-                            .onErrorMap(throwable -> new IOException(\"Error deleting blob \" + blobItem.getName(), throwable));\n-                        deleteTasks.add(deleteTask);\n+                        final String blobName = blobItem.getName();\n+                        BlobAsyncClient blobAsyncClient = blobContainerAsyncClient.getBlobAsyncClient(blobName);\n+                        final Mono<Void> deleteTask = getDeleteTask(blobName, blobAsyncClient);\n                         bytesDeleted.addAndGet(blobItem.getProperties().getContentLength());\n                         blobsDeleted.incrementAndGet();\n+                        return deleteTask;\n                     }\n-                }\n+                }, CONCURRENT_DELETES).then().block();\n+            } catch (Exception e) {\n+                filterDeleteExceptionsAndRethrow(e, new IOException(\"Deleting directory [\" + path + \"] failed\"));\n             }\n-\n-            executeDeleteTasks(deleteTasks, () -> \"Deleting directory [\" + path + \"] failed\");\n         });\n \n         return new DeleteResult(blobsDeleted.get(), bytesDeleted.get());\n     }\n \n+    private static void filterDeleteExceptionsAndRethrow(Exception e, IOException exception) throws IOException {\n+        int suppressedCount = 0;\n+        for (Throwable suppressed : e.getSuppressed()) {\n+            // We're only interested about the blob deletion exceptions and not in the reactor internals exceptions\n+            if (suppressed instanceof IOException) {\n+                exception.addSuppressed(suppressed);\n+                suppressedCount++;\n+                if (suppressedCount > 10) {\n+                    break;\n+                }\n+            }\n+        }\n+        throw exception;\n+    }\n+\n     void deleteBlobList(List<String> blobs) throws IOException {\n         if (blobs.isEmpty()) {\n             return;\n         }\n \n         BlobServiceAsyncClient asyncClient = asyncClient();\n         SocketAccess.doPrivilegedVoidException(() -> {\n-            List<Mono<Void>> deleteTasks = new ArrayList<>(blobs.size());\n             final BlobContainerAsyncClient blobContainerClient = asyncClient.getBlobContainerAsyncClient(container);\n-            for (String blob : blobs) {\n-                final Mono<Void> deleteTask = blobContainerClient.getBlobAsyncClient(blob)\n-                    .delete()\n-                    // Ignore not found blobs\n-                    .onErrorResume(this::isNotFoundError, throwable -> Mono.empty())\n-                    .onErrorMap(throwable -> new IOException(\"Error deleting blob \" + blob, throwable));\n-\n-                deleteTasks.add(deleteTask);\n+            try {\n+                Flux.fromIterable(blobs).flatMap(blob ->\n+                        getDeleteTask(blob, blobContainerClient.getBlobAsyncClient(blob)), CONCURRENT_DELETES).then().block();\n+            } catch (Exception e) {\n+                filterDeleteExceptionsAndRethrow(e,\n+                        new IOException(\"Unable to delete blobs \"\n+                                + AllocationService.firstListElementsToCommaDelimitedString(blobs, Function.identity(), false)));\n             }\n-\n-            executeDeleteTasks(deleteTasks, () -> \"Unable to delete blobs \" + blobs);\n         });\n     }\n \n-    private boolean isNotFoundError(Throwable e) {\n-        return e instanceof BlobStorageException && ((BlobStorageException) e).getStatusCode() == 404;\n-    }\n-\n-    private void executeDeleteTasks(List<Mono<Void>> deleteTasks, Supplier<String> errorMessageSupplier) throws IOException {\n-        try {\n-            // zipDelayError executes all tasks in parallel and delays\n-            // error propagation until all tasks have finished.\n-            Mono.zipDelayError(deleteTasks, results -> null).block();\n-        } catch (Exception e) {\n-            final IOException exception = new IOException(errorMessageSupplier.get());\n-            for (Throwable suppressed : e.getSuppressed()) {\n-                // We're only interested about the blob deletion exceptions and not in the reactor internals exceptions\n-                if (suppressed instanceof IOException) {\n-                    exception.addSuppressed(suppressed);\n-                }\n-            }\n-            throw exception;\n-        }\n+    private static Mono<Void> getDeleteTask(String blobName, BlobAsyncClient blobAsyncClient) {\n+        return blobAsyncClient.delete()\n+                // Ignore not found blobs, as it's possible that due to network errors a request\n+                // for an already deleted blob is retried, causing an error.\n+                .onErrorResume(e ->\n+                        e instanceof BlobStorageException && ((BlobStorageException) e).getStatusCode() == 404, throwable -> Mono.empty())\n+                .onErrorMap(throwable -> new IOException(\"Error deleting blob \" + blobName, throwable));\n     }\n \n     public InputStream getInputStream(String blob, long position, final @Nullable Long length) throws IOException {",
+      "diff": [
+        {
+          "file": "plugins/repository-azure/src/main/java/org/elasticsearch/repositories/azure/AzureBlobStore.java",
+          "patch": "@@ -33,6 +33,7 @@\n import org.apache.logging.log4j.Logger;\n import org.apache.logging.log4j.message.ParameterizedMessage;\n import org.elasticsearch.cluster.metadata.RepositoryMetadata;\n+import org.elasticsearch.cluster.routing.allocation.AllocationService;\n import org.elasticsearch.common.Nullable;\n import org.elasticsearch.common.UUIDs;\n import org.elasticsearch.common.blobstore.BlobContainer;\n@@ -58,20 +59,18 @@\n import java.net.URL;\n import java.nio.ByteBuffer;\n import java.nio.file.FileAlreadyExistsException;\n-import java.util.ArrayDeque;\n import java.util.ArrayList;\n import java.util.Base64;\n import java.util.Collections;\n import java.util.HashMap;\n import java.util.List;\n import java.util.Map;\n import java.util.Objects;\n-import java.util.Queue;\n import java.util.concurrent.atomic.AtomicInteger;\n import java.util.concurrent.atomic.AtomicLong;\n import java.util.function.BiConsumer;\n import java.util.function.BiPredicate;\n-import java.util.function.Supplier;\n+import java.util.function.Function;\n \n public class AzureBlobStore implements BlobStore {\n     private static final Logger logger = LogManager.getLogger(AzureBlobStore.class);\n@@ -153,8 +152,7 @@ public AzureBlobStore(RepositoryMetadata metadata, AzureStorageService service)\n     private boolean isListRequest(String httpMethod, URL url) {\n         return httpMethod.equals(\"GET\") &&\n             url.getQuery() != null &&\n-            url.getQuery().contains(\"comp=list\") &&\n-            url.getQuery().contains(\"delimiter=\");\n+            url.getQuery().contains(\"comp=list\");\n     }\n \n     // https://docs.microsoft.com/en-us/rest/api/storageservices/put-block\n@@ -216,91 +214,80 @@ public boolean blobExists(String blob) throws IOException {\n         }\n     }\n \n+    // number of concurrent blob delete requests to use while bulk deleting\n+    private static final int CONCURRENT_DELETES = 100;\n+\n     public DeleteResult deleteBlobDirectory(String path) throws IOException {\n         final AtomicInteger blobsDeleted = new AtomicInteger(0);\n         final AtomicLong bytesDeleted = new AtomicLong(0);\n \n-        final BlobServiceClient client = client();\n         SocketAccess.doPrivilegedVoidException(() -> {\n-            final BlobContainerClient blobContainerClient = client.getBlobContainerClient(container);\n             final BlobContainerAsyncClient blobContainerAsyncClient = asyncClient().getBlobContainerAsyncClient(container);\n-            final Queue<String> directories = new ArrayDeque<>();\n-            directories.offer(path);\n-            String directoryName;\n-            List<Mono<Void>> deleteTasks = new ArrayList<>();\n-            while ((directoryName = directories.poll()) != null) {\n-                final BlobListDetails blobListDetails = new BlobListDetails()\n-                    .setRetrieveMetadata(true);\n-\n-                final ListBlobsOptions options = new ListBlobsOptions()\n-                    .setPrefix(directoryName)\n-                    .setDetails(blobListDetails);\n-\n-                for (BlobItem blobItem : blobContainerClient.listBlobsByHierarchy(\"/\", options, null)) {\n+            final ListBlobsOptions options = new ListBlobsOptions()\n+                    .setPrefix(path)\n+                    .setDetails(new BlobListDetails().setRetrieveMetadata(true));\n+            try {\n+                blobContainerAsyncClient.listBlobs(options, null).flatMap(blobItem -> {\n                     if (blobItem.isPrefix() != null && blobItem.isPrefix()) {\n-                        directories.offer(blobItem.getName());\n+                        return Mono.empty();\n                     } else {\n-                        BlobAsyncClient blobAsyncClient = blobContainerAsyncClient.getBlobAsyncClient(blobItem.getName());\n-                        final Mono<Void> deleteTask = blobAsyncClient.delete()\n-                            // Ignore not found blobs, as it's possible that due to network errors a request\n-                            // for an already deleted blob is retried, causing an error.\n-                            .onErrorResume(this::isNotFoundError, throwable -> Mono.empty())\n-                            .onErrorMap(throwable -> new IOException(\"Error deleting blob \" + blobItem.getName(), throwable));\n-                        deleteTasks.add(deleteTask);\n+                        final String blobName = blobItem.getName();\n+                        BlobAsyncClient blobAsyncClient = blobContainerAsyncClient.getBlobAsyncClient(blobName);\n+                        final Mono<Void> deleteTask = getDeleteTask(blobName, blobAsyncClient);\n                         bytesDeleted.addAndGet(blobItem.getProperties().getContentLength());\n                         blobsDeleted.incrementAndGet();\n+                        return deleteTask;\n                     }\n-                }\n+                }, CONCURRENT_DELETES).then().block();\n+            } catch (Exception e) {\n+                filterDeleteExceptionsAndRethrow(e, new IOException(\"Deleting directory [\" + path + \"] failed\"));\n             }\n-\n-            executeDeleteTasks(deleteTasks, () -> \"Deleting directory [\" + path + \"] failed\");\n         });\n \n         return new DeleteResult(blobsDeleted.get(), bytesDeleted.get());\n     }\n \n+    private static void filterDeleteExceptionsAndRethrow(Exception e, IOException exception) throws IOException {\n+        int suppressedCount = 0;\n+        for (Throwable suppressed : e.getSuppressed()) {\n+            // We're only interested about the blob deletion exceptions and not in the reactor internals exceptions\n+            if (suppressed instanceof IOException) {\n+                exception.addSuppressed(suppressed);\n+                suppressedCount++;\n+                if (suppressedCount > 10) {\n+                    break;\n+                }\n+            }\n+        }\n+        throw exception;\n+    }\n+\n     void deleteBlobList(List<String> blobs) throws IOException {\n         if (blobs.isEmpty()) {\n             return;\n         }\n \n         BlobServiceAsyncClient asyncClient = asyncClient();\n         SocketAccess.doPrivilegedVoidException(() -> {\n-            List<Mono<Void>> deleteTasks = new ArrayList<>(blobs.size());\n             final BlobContainerAsyncClient blobContainerClient = asyncClient.getBlobContainerAsyncClient(container);\n-            for (String blob : blobs) {\n-                final Mono<Void> deleteTask = blobContainerClient.getBlobAsyncClient(blob)\n-                    .delete()\n-                    // Ignore not found blobs\n-                    .onErrorResume(this::isNotFoundError, throwable -> Mono.empty())\n-                    .onErrorMap(throwable -> new IOException(\"Error deleting blob \" + blob, throwable));\n-\n-                deleteTasks.add(deleteTask);\n+            try {\n+                Flux.fromIterable(blobs).flatMap(blob ->\n+                        getDeleteTask(blob, blobContainerClient.getBlobAsyncClient(blob)), CONCURRENT_DELETES).then().block();\n+            } catch (Exception e) {\n+                filterDeleteExceptionsAndRethrow(e,\n+                        new IOException(\"Unable to delete blobs \"\n+                                + AllocationService.firstListElementsToCommaDelimitedString(blobs, Function.identity(), false)));\n             }\n-\n-            executeDeleteTasks(deleteTasks, () -> \"Unable to delete blobs \" + blobs);\n         });\n     }\n \n-    private boolean isNotFoundError(Throwable e) {\n-        return e instanceof BlobStorageException && ((BlobStorageException) e).getStatusCode() == 404;\n-    }\n-\n-    private void executeDeleteTasks(List<Mono<Void>> deleteTasks, Supplier<String> errorMessageSupplier) throws IOException {\n-        try {\n-            // zipDelayError executes all tasks in parallel and delays\n-            // error propagation until all tasks have finished.\n-            Mono.zipDelayError(deleteTasks, results -> null).block();\n-        } catch (Exception e) {\n-            final IOException exception = new IOException(errorMessageSupplier.get());\n-            for (Throwable suppressed : e.getSuppressed()) {\n-                // We're only interested about the blob deletion exceptions and not in the reactor internals exceptions\n-                if (suppressed instanceof IOException) {\n-                    exception.addSuppressed(suppressed);\n-                }\n-            }\n-            throw exception;\n-        }\n+    private static Mono<Void> getDeleteTask(String blobName, BlobAsyncClient blobAsyncClient) {\n+        return blobAsyncClient.delete()\n+                // Ignore not found blobs, as it's possible that due to network errors a request\n+                // for an already deleted blob is retried, causing an error.\n+                .onErrorResume(e ->\n+                        e instanceof BlobStorageException && ((BlobStorageException) e).getStatusCode() == 404, throwable -> Mono.empty())\n+                .onErrorMap(throwable -> new IOException(\"Error deleting blob \" + blobName, throwable));\n     }\n \n     public InputStream getInputStream(String blob, long position, final @Nullable Long length) throws IOException {"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-04-06T11:22:10Z",
+      "user": "original-brownbear",
+      "body": "1. Limit the number of blob deletes to execute in parallel to `100`.\r\n2. Use flat listing when deleting a directory to require fewer listings\r\nin between deletes and keep the code simpler. (and adjust the list request counting to also count flat listings correctly)\r\n\r\ncloses #71267\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 814041667,
+      "created_at": "2021-04-06T11:22:13Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review",
+      "id": 628856655,
+      "created_at": "2021-04-06T11:23:31Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 607763325,
+      "created_at": "2021-04-06T11:23:31Z",
+      "user": "original-brownbear",
+      "body": "Admittedly a totally random choice of parallelism. But I figured we used up to 50 threads in the old SDK, this is certainly cheaper than additional threads -> lets at least double the concurrency. ",
+      "path": "plugins/repository-azure/src/main/java/org/elasticsearch/repositories/azure/AzureBlobStore.java",
+      "diff_hunk": "@@ -216,91 +214,80 @@ public boolean blobExists(String blob) throws IOException {\n         }\n     }\n \n+    // number of concurrent blob delete requests to use while bulk deleting\n+    private static final int CONCURRENT_DELETES = 100;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 218,
+      "original_line": 218,
+      "side": "RIGHT",
+      "original_position": 45,
+      "position": 45,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 607779852,
+          "user": "DaveCTurner",
+          "body": "TBH I was expecting a higher limit :) Do you have a sense of the performance impact here?",
+          "created_at": "2021-04-06T11:51:02Z"
+        },
+        {
+          "id": 607787644,
+          "user": "original-brownbear",
+          "body": ">  Do you have a sense of the performance impact here?\r\n\r\nIt's pretty hard to guess with the buffering overhead from Netty sending out request etc. so I figured I'd stay on the safe side. I think it's a fair guess to assume something like 2k IO buffer overhead per request and then some extra bytes for all the state handling.\r\n\r\n> TBH I was expecting a higher limit :) \r\n\r\nI didn't benchmark it but I wonder how much that will even get us in terms of throughput. This isn't a batch size, this is a concurrent requests limit. So assuming 100ms latency per request this means 1k/s and it's not a global limit so concurrent delete calls would multiply this limit.\r\nWe don't really have any benchmarking here and Azure doesn't give a target request rate for deletes but their target rate for operations on a single blob is 500/s (the rate target for deletes is probably higher than this) but I figured 10x that if we run 5 snapshot threads in parallel across all blobs is a reasonable guess?\r\n",
+          "created_at": "2021-04-06T12:03:54Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 628877946,
+      "created_at": "2021-04-06T11:51:02Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 628888424,
+      "created_at": "2021-04-06T12:03:54Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 628916579,
+      "created_at": "2021-04-06T12:36:21Z",
+      "user": "fcofdez",
+      "state": "APPROVED",
+      "body": "LGTM, thanks for taking care of this 👍 "
+    },
+    {
+      "type": "comment",
+      "id": 814086030,
+      "created_at": "2021-04-06T12:38:12Z",
+      "user": "fcofdez",
+      "body": "I was a bit concerned about using the reactor primitives to limit the concurrency as it seems like in some parts of the SDK the reactive contract is not followed (i.e. for blob downloads even if you request just 1 byte it would bring more data) but for the uses in this PR it seems to work fine 👍."
+    },
+    {
+      "type": "comment",
+      "id": 814090219,
+      "created_at": "2021-04-06T12:44:48Z",
+      "user": "original-brownbear",
+      "body": "Thanks Francisco!\r\n\r\n> but for the uses in this PR it seems to work fine\r\n\r\nYea I remembered that but it seems that the bytes flux path is different for some reason. "
+    }
+  ]
+}

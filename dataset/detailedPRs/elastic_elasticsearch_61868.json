@@ -1,0 +1,169 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 61868,
+  "pr_number": 61868,
+  "title": "[ML] Update reindexing task progress before persisting job progress",
+  "user": "dimitris-athanasiou",
+  "created_at": "2020-09-02T16:17:30Z",
+  "merged_at": "2020-09-02T18:00:53Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">non-issue",
+    ":ml",
+    "v7.10.0",
+    "v7.9.2",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "95fccbebbb3107bf8a3ae919455e0cb33cd7f9b4",
+  "merge_commit_sha": "76fa5000b24948c468d923c612d7a43ed4d57154",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "referenced",
+    "referenced",
+    "unlabeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/61868",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-09-02T16:10:18Z",
+      "sha": "32d3427da7bac5be4915a5b843543ccef565192d",
+      "message": "[ML] Update reindexing task progress before persisting job progress\n\nThis fixes a bug introduced by #61782. In that PR I thought I could\nsimplify the persistence of progress by using the progress straight\nfrom the stats holder in the task instead of calling the get\nstats action. However, I overlooked that it is then possible to\nhave stale progress for the reindexing task as that is only updated\nwhen the get stats API is called.\n\nIn this commit this is fixed by updating reindexing task progress\nbefore persisting the job progress. This seems to be much more\nlightweight than calling the get stats request.\n\nCloses #61852",
+      "author": "Dimitris Athanasiou",
+      "author_email": "dimitris@elastic.co",
+      "author_raw_date": "2020-09-02T15:51:13Z",
+      "author_date": "2020-09-02T15:51:13Z",
+      "committer": "Dimitris Athanasiou",
+      "committer_email": "dimitris@elastic.co",
+      "raw_date": "2020-09-02T16:10:18Z",
+      "diff_text": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/dataframe/DataFrameAnalyticsTask.java\n@@ -290,7 +290,7 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n \n         String progressDocId = StoredProgress.documentId(jobId);\n \n-        // Step 3: Run the runnable provided as the argument\n+        // Step 4: Run the runnable provided as the argument\n         ActionListener<IndexResponse> indexProgressDocListener = ActionListener.wrap(\n             indexResponse -> {\n                 LOGGER.debug(\"[{}] Successfully indexed progress document\", jobId);\n@@ -303,7 +303,7 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n             }\n         );\n \n-        // Step 2: Create or update the progress document:\n+        // Step 3: Create or update the progress document:\n         //   - if the document did not exist, create the new one in the current write index\n         //   - if the document did exist, update it in the index where it resides (not necessarily the current write index)\n         ActionListener<SearchResponse> searchFormerProgressDocListener = ActionListener.wrap(\n@@ -331,14 +331,26 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n             }\n         );\n \n-        // Step 1: Search for existing progress document in .ml-state*\n-        SearchRequest searchRequest =\n-            new SearchRequest(AnomalyDetectorsIndex.jobStateIndexPattern())\n-                .source(\n-                    new SearchSourceBuilder()\n-                        .size(1)\n-                        .query(new IdsQueryBuilder().addIds(progressDocId)));\n-        executeAsyncWithOrigin(client, ML_ORIGIN, SearchAction.INSTANCE, searchRequest, searchFormerProgressDocListener);\n+        // Step 2: Search for existing progress document in .ml-state*\n+        ActionListener<Void> reindexProgressUpdateListener = ActionListener.wrap(\n+            aVoid -> {\n+                SearchRequest searchRequest =\n+                    new SearchRequest(AnomalyDetectorsIndex.jobStateIndexPattern())\n+                        .source(\n+                            new SearchSourceBuilder()\n+                                .size(1)\n+                                .query(new IdsQueryBuilder().addIds(progressDocId)));\n+                executeAsyncWithOrigin(client, ML_ORIGIN, SearchAction.INSTANCE, searchRequest, searchFormerProgressDocListener);\n+            },\n+            e -> {\n+                LOGGER.error(new ParameterizedMessage(\n+                    \"[{}] cannot persist progress as an error occurred while updating reindexing task progress\", taskParams.getId()), e);\n+                runnable.run();\n+            }\n+        );\n+\n+        // Step 1: Update reindexing progress as it could be stale\n+        updateReindexTaskProgress(reindexProgressUpdateListener);\n     }\n \n     /**\nx-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/dataframe/DataFrameAnalyticsTaskTests.java\n@@ -46,6 +46,7 @@\n import java.util.Map;\n \n import static org.hamcrest.Matchers.equalTo;\n+import static org.hamcrest.Matchers.hasSize;\n import static org.mockito.Matchers.any;\n import static org.mockito.Matchers.eq;\n import static org.mockito.Matchers.same;\n@@ -216,8 +217,9 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n         PersistentTasksService persistentTasksService = new PersistentTasksService(clusterService, mock(ThreadPool.class), client);\n         TaskManager taskManager = mock(TaskManager.class);\n \n+        // We leave reindexing progress here to zero in order to check it is updated before it is persisted\n         List<PhaseProgress> progress = List.of(\n-            new PhaseProgress(ProgressTracker.REINDEXING, 100),\n+            new PhaseProgress(ProgressTracker.REINDEXING, 0),\n             new PhaseProgress(ProgressTracker.LOADING_DATA, 100),\n             new PhaseProgress(ProgressTracker.WRITING_RESULTS, 30));\n \n@@ -239,6 +241,7 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n             new DataFrameAnalyticsTask(\n                 123, \"type\", \"action\", null, Map.of(), client, clusterService, analyticsManager, auditor, taskParams);\n         task.init(persistentTasksService, taskManager, \"task-id\", 42);\n+        task.setReindexingFinished();\n         Exception exception = new Exception(\"some exception\");\n \n         task.setFailed(exception);\n@@ -260,7 +263,8 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n             try (XContentParser parser = JsonXContent.jsonXContent.createParser(\n                 NamedXContentRegistry.EMPTY, DeprecationHandler.IGNORE_DEPRECATIONS, indexRequest.source().utf8ToString())) {\n                 StoredProgress parsedProgress = StoredProgress.PARSER.apply(parser, null);\n-                assertThat(parsedProgress.get(), equalTo(progress));\n+                assertThat(parsedProgress.get(), hasSize(3));\n+                assertThat(parsedProgress.get().get(0), equalTo(new PhaseProgress(\"reindexing\", 100)));\n             }\n \n             verify(client).execute(\n@@ -269,7 +273,7 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n                     \"task-id\", 42, new DataFrameAnalyticsTaskState(DataFrameAnalyticsState.FAILED, 42, \"some exception\"))),\n                 any());\n         }\n-        verifyNoMoreInteractions(client, clusterService, analyticsManager, auditor, taskManager);\n+        verifyNoMoreInteractions(client, analyticsManager, auditor, taskManager);\n     }\n \n     @SuppressWarnings(\"unchecked\")",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/dataframe/DataFrameAnalyticsTask.java",
+          "patch": "@@ -290,7 +290,7 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n \n         String progressDocId = StoredProgress.documentId(jobId);\n \n-        // Step 3: Run the runnable provided as the argument\n+        // Step 4: Run the runnable provided as the argument\n         ActionListener<IndexResponse> indexProgressDocListener = ActionListener.wrap(\n             indexResponse -> {\n                 LOGGER.debug(\"[{}] Successfully indexed progress document\", jobId);\n@@ -303,7 +303,7 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n             }\n         );\n \n-        // Step 2: Create or update the progress document:\n+        // Step 3: Create or update the progress document:\n         //   - if the document did not exist, create the new one in the current write index\n         //   - if the document did exist, update it in the index where it resides (not necessarily the current write index)\n         ActionListener<SearchResponse> searchFormerProgressDocListener = ActionListener.wrap(\n@@ -331,14 +331,26 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n             }\n         );\n \n-        // Step 1: Search for existing progress document in .ml-state*\n-        SearchRequest searchRequest =\n-            new SearchRequest(AnomalyDetectorsIndex.jobStateIndexPattern())\n-                .source(\n-                    new SearchSourceBuilder()\n-                        .size(1)\n-                        .query(new IdsQueryBuilder().addIds(progressDocId)));\n-        executeAsyncWithOrigin(client, ML_ORIGIN, SearchAction.INSTANCE, searchRequest, searchFormerProgressDocListener);\n+        // Step 2: Search for existing progress document in .ml-state*\n+        ActionListener<Void> reindexProgressUpdateListener = ActionListener.wrap(\n+            aVoid -> {\n+                SearchRequest searchRequest =\n+                    new SearchRequest(AnomalyDetectorsIndex.jobStateIndexPattern())\n+                        .source(\n+                            new SearchSourceBuilder()\n+                                .size(1)\n+                                .query(new IdsQueryBuilder().addIds(progressDocId)));\n+                executeAsyncWithOrigin(client, ML_ORIGIN, SearchAction.INSTANCE, searchRequest, searchFormerProgressDocListener);\n+            },\n+            e -> {\n+                LOGGER.error(new ParameterizedMessage(\n+                    \"[{}] cannot persist progress as an error occurred while updating reindexing task progress\", taskParams.getId()), e);\n+                runnable.run();\n+            }\n+        );\n+\n+        // Step 1: Update reindexing progress as it could be stale\n+        updateReindexTaskProgress(reindexProgressUpdateListener);\n     }\n \n     /**"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/dataframe/DataFrameAnalyticsTaskTests.java",
+          "patch": "@@ -46,6 +46,7 @@\n import java.util.Map;\n \n import static org.hamcrest.Matchers.equalTo;\n+import static org.hamcrest.Matchers.hasSize;\n import static org.mockito.Matchers.any;\n import static org.mockito.Matchers.eq;\n import static org.mockito.Matchers.same;\n@@ -216,8 +217,9 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n         PersistentTasksService persistentTasksService = new PersistentTasksService(clusterService, mock(ThreadPool.class), client);\n         TaskManager taskManager = mock(TaskManager.class);\n \n+        // We leave reindexing progress here to zero in order to check it is updated before it is persisted\n         List<PhaseProgress> progress = List.of(\n-            new PhaseProgress(ProgressTracker.REINDEXING, 100),\n+            new PhaseProgress(ProgressTracker.REINDEXING, 0),\n             new PhaseProgress(ProgressTracker.LOADING_DATA, 100),\n             new PhaseProgress(ProgressTracker.WRITING_RESULTS, 30));\n \n@@ -239,6 +241,7 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n             new DataFrameAnalyticsTask(\n                 123, \"type\", \"action\", null, Map.of(), client, clusterService, analyticsManager, auditor, taskParams);\n         task.init(persistentTasksService, taskManager, \"task-id\", 42);\n+        task.setReindexingFinished();\n         Exception exception = new Exception(\"some exception\");\n \n         task.setFailed(exception);\n@@ -260,7 +263,8 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n             try (XContentParser parser = JsonXContent.jsonXContent.createParser(\n                 NamedXContentRegistry.EMPTY, DeprecationHandler.IGNORE_DEPRECATIONS, indexRequest.source().utf8ToString())) {\n                 StoredProgress parsedProgress = StoredProgress.PARSER.apply(parser, null);\n-                assertThat(parsedProgress.get(), equalTo(progress));\n+                assertThat(parsedProgress.get(), hasSize(3));\n+                assertThat(parsedProgress.get().get(0), equalTo(new PhaseProgress(\"reindexing\", 100)));\n             }\n \n             verify(client).execute(\n@@ -269,7 +273,7 @@ private void testSetFailed(boolean nodeShuttingDown) throws IOException {\n                     \"task-id\", 42, new DataFrameAnalyticsTaskState(DataFrameAnalyticsState.FAILED, 42, \"some exception\"))),\n                 any());\n         }\n-        verifyNoMoreInteractions(client, clusterService, analyticsManager, auditor, taskManager);\n+        verifyNoMoreInteractions(client, analyticsManager, auditor, taskManager);\n     }\n \n     @SuppressWarnings(\"unchecked\")"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-09-02T16:17:30Z",
+      "user": "dimitris-athanasiou",
+      "body": "This fixes a bug introduced by #61782. In that PR I thought I could\r\nsimplify the persistence of progress by using the progress straight\r\nfrom the stats holder in the task instead of calling the get\r\nstats action. However, I overlooked that it is then possible to\r\nhave stale progress for the reindexing task as that is only updated\r\nwhen the get stats API is called.\r\n\r\nIn this commit this is fixed by updating reindexing task progress\r\nbefore persisting the job progress. This seems to be much more\r\nlightweight than calling the get stats request.\r\n\r\nCloses #61852\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 685843505,
+      "created_at": "2020-09-02T16:17:32Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/ml-core (:ml)"
+    },
+    {
+      "type": "review_comment",
+      "id": 482205978,
+      "created_at": "2020-09-02T16:32:09Z",
+      "user": "benwtrent",
+      "body": "I was going to comment about \"what else could be stale\", but looking at how we handle the `_stats` call, we effectively do this.\r\n\r\nSo, we are just shortcutting the `_stats` call here by slightly \"duplicating\" the code here \r\n\r\nI am referencing:\r\n\r\nhttps://github.com/elastic/elasticsearch/blob/c5cef17bd597eb42164e518c94308b5093025107/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportGetDataFrameAnalyticsStatsAction.java#L122",
+      "path": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/dataframe/DataFrameAnalyticsTask.java",
+      "diff_hunk": "@@ -331,14 +331,26 @@ void persistProgress(Client client, String jobId, Runnable runnable) {\n             }\n         );\n \n-        // Step 1: Search for existing progress document in .ml-state*\n-        SearchRequest searchRequest =\n-            new SearchRequest(AnomalyDetectorsIndex.jobStateIndexPattern())\n-                .source(\n-                    new SearchSourceBuilder()\n-                        .size(1)\n-                        .query(new IdsQueryBuilder().addIds(progressDocId)));\n-        executeAsyncWithOrigin(client, ML_ORIGIN, SearchAction.INSTANCE, searchRequest, searchFormerProgressDocListener);\n+        // Step 2: Search for existing progress document in .ml-state*\n+        ActionListener<Void> reindexProgressUpdateListener = ActionListener.wrap(\n+            aVoid -> {\n+                SearchRequest searchRequest =\n+                    new SearchRequest(AnomalyDetectorsIndex.jobStateIndexPattern())\n+                        .source(\n+                            new SearchSourceBuilder()\n+                                .size(1)\n+                                .query(new IdsQueryBuilder().addIds(progressDocId)));\n+                executeAsyncWithOrigin(client, ML_ORIGIN, SearchAction.INSTANCE, searchRequest, searchFormerProgressDocListener);\n+            },\n+            e -> {\n+                LOGGER.error(new ParameterizedMessage(\n+                    \"[{}] cannot persist progress as an error occurred while updating reindexing task progress\", taskParams.getId()), e);\n+                runnable.run();\n+            }\n+        );\n+\n+        // Step 1: Update reindexing progress as it could be stale\n+        updateReindexTaskProgress(reindexProgressUpdateListener);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 353,
+      "original_line": 353,
+      "side": "RIGHT",
+      "original_position": 49,
+      "position": 49,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 482208739,
+          "user": "dimitris-athanasiou",
+          "body": "Yes indeed. Reindex is the only async task that we need to take care of updating its progress before reporting it. I thought about adding back the call to the get stats API. But it is quite a long way around. What do you think is better?",
+          "created_at": "2020-09-02T16:36:40Z"
+        },
+        {
+          "id": 482209992,
+          "user": "benwtrent",
+          "body": "I think doing this directly is fine.\r\n\r\nWe should definitely comment here AND on the _stats call. That way if ever we introduce another async service that we have to worry about refreshing, we capture it.",
+          "created_at": "2020-09-02T16:38:43Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 480998483,
+      "created_at": "2020-09-02T16:32:50Z",
+      "user": "benwtrent",
+      "state": "APPROVED",
+      "body": "Its a bit weird that reindex is the only thing that could be stale. \r\n\r\nBut I suppose it makes sense as it is the only \"task\" that we kick off where we don't have an internal monitor running."
+    },
+    {
+      "type": "review",
+      "id": 481002103,
+      "created_at": "2020-09-02T16:36:40Z",
+      "user": "dimitris-athanasiou",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 481003685,
+      "created_at": "2020-09-02T16:38:44Z",
+      "user": "benwtrent",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2020-09-02T17:20:23Z",
+      "sha": "d58c9480531b3097ad1ec720f305ddaafab68c70",
+      "message": "Add comment in get stats",
+      "author": "Dimitris Athanasiou",
+      "author_email": "dimitris@elastic.co",
+      "author_raw_date": "2020-09-02T17:20:23Z",
+      "author_date": "2020-09-02T17:20:23Z",
+      "committer": "Dimitris Athanasiou",
+      "committer_email": "dimitris@elastic.co",
+      "raw_date": "2020-09-02T17:20:23Z",
+      "diff_text": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportGetDataFrameAnalyticsStatsAction.java\n@@ -119,6 +119,7 @@ protected void taskOperation(GetDataFrameAnalyticsStatsAction.Request request, D\n             }, listener::onFailure\n         );\n \n+        // We must update the progress of the reindexing task as it might be stale\n         task.updateReindexTaskProgress(reindexingProgressListener);\n     }\n ",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/action/TransportGetDataFrameAnalyticsStatsAction.java",
+          "patch": "@@ -119,6 +119,7 @@ protected void taskOperation(GetDataFrameAnalyticsStatsAction.Request request, D\n             }, listener::onFailure\n         );\n \n+        // We must update the progress of the reindexing task as it might be stale\n         task.updateReindexTaskProgress(reindexingProgressListener);\n     }\n "
+        }
+      ]
+    }
+  ]
+}

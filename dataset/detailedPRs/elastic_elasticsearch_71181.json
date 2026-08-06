@@ -1,0 +1,201 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 71181,
+  "pr_number": 71181,
+  "title": "Optimize BytesReferenceStreamInput Number Reads",
+  "user": "original-brownbear",
+  "created_at": "2021-04-01T13:14:06Z",
+  "merged_at": "2021-04-02T03:47:38Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">non-issue",
+    ":Core/Infra/Core",
+    "Team:Core/Infra",
+    "v7.13.0",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "a59805acbf56fc14dfb32f0f9785d3959441c7ea",
+  "merge_commit_sha": "fabc43704e31355f9d4208332e7f8704d8e7da1a",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/71181",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-04-01T13:08:50Z",
+      "sha": "d834f5a04af88fc2e9a9d52b0667b8b95d8ff96e",
+      "message": "Optimize BytesReferenceStreamInput Number Reads\n\n`readByte` was used for all primitive reads which via the expensive `maybeNextSlice`\nwhich did not inline well caused slowness when reading large aggregate messages.\n\nThis commit makes these reads do bulk operations on the underlying `byte[]` where possible\ninstead. Also, it extracts cold path from `maybeNextSlice` so that we get a fast bounds check\nbranch instead of the loop with a large body for the hot case.\n\ncloses #70800",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-04-01T13:08:50Z",
+      "author_date": "2021-04-01T13:08:50Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-04-01T13:08:50Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/common/Numbers.java\n@@ -24,12 +24,24 @@ public final class Numbers {\n     private Numbers() {\n     }\n \n+    public static short bytesToShort(byte[] bytes, int offset) {\n+        return (short) (((bytes[offset] & 0xFF) << 8) | (bytes[offset + 1] & 0xFF));\n+    }\n+\n+    public static int bytesToInt(byte[] bytes, int offset) {\n+        return ((bytes[offset] & 0xFF) << 24) | ((bytes[offset + 1] & 0xFF) << 16) | ((bytes[offset + 2] & 0xFF) << 8)\n+                | (bytes[offset + 3] & 0xFF);\n+    }\n+\n+    public static long bytesToLong(byte[] bytes, int offset) {\n+        return (((long) (((bytes[offset] & 0xFF) << 24) | ((bytes[offset + 1] & 0xFF) << 16) | ((bytes[offset + 2] & 0xFF) << 8)\n+                | (bytes[offset + 3] & 0xFF))) << 32)\n+                | ((((bytes[offset + 4] & 0xFF) << 24) | ((bytes[offset + 5] & 0xFF) << 16) | ((bytes[offset + 6] & 0xFF) << 8)\n+                | (bytes[offset + 7] & 0xFF)) & 0xFFFFFFFFL);\n+    }\n+\n     public static long bytesToLong(BytesRef bytes) {\n-        int high = (bytes.bytes[bytes.offset + 0] << 24) | ((bytes.bytes[bytes.offset + 1] & 0xff) << 16) |\n-            ((bytes.bytes[bytes.offset + 2] & 0xff) << 8) | (bytes.bytes[bytes.offset + 3] & 0xff);\n-        int low = (bytes.bytes[bytes.offset + 4] << 24) | ((bytes.bytes[bytes.offset + 5] & 0xff) << 16) |\n-            ((bytes.bytes[bytes.offset + 6] & 0xff) << 8) | (bytes.bytes[bytes.offset + 7] & 0xff);\n-        return (((long) high) << 32) | (low & 0x0ffffffffL);\n+        return bytesToLong(bytes.bytes, bytes.offset);\n     }\n \n     public static byte[] intToBytes(int val) {\nserver/src/main/java/org/elasticsearch/common/bytes/BytesReferenceStreamInput.java\n@@ -10,6 +10,7 @@\n \n import org.apache.lucene.util.BytesRef;\n import org.apache.lucene.util.BytesRefIterator;\n+import org.elasticsearch.common.Numbers;\n import org.elasticsearch.common.io.stream.StreamInput;\n \n import java.io.EOFException;\n@@ -40,26 +41,64 @@ class BytesReferenceStreamInput extends StreamInput {\n \n     @Override\n     public byte readByte() throws IOException {\n-        if (offset() >= bytesReference.length()) {\n-            throw new EOFException();\n-        }\n         maybeNextSlice();\n         return slice.bytes[slice.offset + (sliceIndex++)];\n     }\n \n+    @Override\n+    public short readShort() throws IOException {\n+        if (slice.length - sliceIndex >= 2) {\n+            sliceIndex += 2;\n+            return Numbers.bytesToShort(slice.bytes, slice.offset + sliceIndex - 2);\n+        } else {\n+            // slow path\n+            return super.readShort();\n+        }\n+    }\n+\n+    @Override\n+    public int readInt() throws IOException {\n+        if (slice.length - sliceIndex >= 4) {\n+            sliceIndex += 4;\n+            return Numbers.bytesToInt(slice.bytes, slice.offset + sliceIndex - 4);\n+        } else {\n+            // slow path\n+            return super.readInt();\n+        }\n+    }\n+\n+    @Override\n+    public long readLong() throws IOException {\n+        if (slice.length - sliceIndex >= 8) {\n+            sliceIndex += 8;\n+            return Numbers.bytesToLong(slice.bytes, slice.offset + sliceIndex - 8);\n+        } else {\n+            // slow path\n+            return super.readLong();\n+        }\n+    }\n+\n     protected int offset() {\n         return sliceStartOffset + sliceIndex;\n     }\n \n     private void maybeNextSlice() throws IOException {\n-        while (sliceIndex == slice.length) {\n-            sliceStartOffset += sliceIndex;\n+        if (sliceIndex == slice.length) {\n+            moveToNextSlice();\n+        }\n+    }\n+\n+    private void moveToNextSlice() throws IOException {\n+        slice = iterator.next();\n+        while (slice != null && slice.length == 0) {\n+            // rare corner case of a bytes reference that has a 0-length component\n             slice = iterator.next();\n-            sliceIndex = 0;\n-            if (slice == null) {\n-                throw new EOFException();\n-            }\n         }\n+        if (slice == null) {\n+            throw new EOFException();\n+        }\n+        sliceStartOffset += sliceIndex;\n+        sliceIndex = 0;\n     }\n \n     @Override\nserver/src/main/java/org/elasticsearch/index/translog/BufferedChecksumStreamInput.java\n@@ -9,6 +9,7 @@\n package org.elasticsearch.index.translog;\n \n import org.apache.lucene.store.BufferedChecksum;\n+import org.elasticsearch.common.Numbers;\n import org.elasticsearch.common.io.stream.FilterStreamInput;\n import org.elasticsearch.common.io.stream.StreamInput;\n \n@@ -65,22 +66,21 @@ public void readBytes(byte[] b, int offset, int len) throws IOException {\n     public short readShort() throws IOException {\n         final byte[] buf = buffer.get();\n         readBytes(buf, 0, 2);\n-        return (short) (((buf[0] & 0xFF) << 8) | (buf[1] & 0xFF));\n+        return Numbers.bytesToShort(buf, 0);\n     }\n \n     @Override\n     public int readInt() throws IOException {\n         final byte[] buf = buffer.get();\n         readBytes(buf, 0, 4);\n-        return ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) | ((buf[2] & 0xFF) << 8) | (buf[3] & 0xFF);\n+        return Numbers.bytesToInt(buf, 0);\n     }\n \n     @Override\n     public long readLong() throws IOException {\n         final byte[] buf = buffer.get();\n         readBytes(buf, 0, 8);\n-        return (((long) (((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) | ((buf[2] & 0xFF) << 8) | (buf[3] & 0xFF))) << 32)\n-            | ((((buf[4] & 0xFF) << 24) | ((buf[5] & 0xFF) << 16) | ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF)) & 0xFFFFFFFFL);\n+        return Numbers.bytesToLong(buf, 0);\n     }\n \n     @Override",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/common/Numbers.java",
+          "patch": "@@ -24,12 +24,24 @@ public final class Numbers {\n     private Numbers() {\n     }\n \n+    public static short bytesToShort(byte[] bytes, int offset) {\n+        return (short) (((bytes[offset] & 0xFF) << 8) | (bytes[offset + 1] & 0xFF));\n+    }\n+\n+    public static int bytesToInt(byte[] bytes, int offset) {\n+        return ((bytes[offset] & 0xFF) << 24) | ((bytes[offset + 1] & 0xFF) << 16) | ((bytes[offset + 2] & 0xFF) << 8)\n+                | (bytes[offset + 3] & 0xFF);\n+    }\n+\n+    public static long bytesToLong(byte[] bytes, int offset) {\n+        return (((long) (((bytes[offset] & 0xFF) << 24) | ((bytes[offset + 1] & 0xFF) << 16) | ((bytes[offset + 2] & 0xFF) << 8)\n+                | (bytes[offset + 3] & 0xFF))) << 32)\n+                | ((((bytes[offset + 4] & 0xFF) << 24) | ((bytes[offset + 5] & 0xFF) << 16) | ((bytes[offset + 6] & 0xFF) << 8)\n+                | (bytes[offset + 7] & 0xFF)) & 0xFFFFFFFFL);\n+    }\n+\n     public static long bytesToLong(BytesRef bytes) {\n-        int high = (bytes.bytes[bytes.offset + 0] << 24) | ((bytes.bytes[bytes.offset + 1] & 0xff) << 16) |\n-            ((bytes.bytes[bytes.offset + 2] & 0xff) << 8) | (bytes.bytes[bytes.offset + 3] & 0xff);\n-        int low = (bytes.bytes[bytes.offset + 4] << 24) | ((bytes.bytes[bytes.offset + 5] & 0xff) << 16) |\n-            ((bytes.bytes[bytes.offset + 6] & 0xff) << 8) | (bytes.bytes[bytes.offset + 7] & 0xff);\n-        return (((long) high) << 32) | (low & 0x0ffffffffL);\n+        return bytesToLong(bytes.bytes, bytes.offset);\n     }\n \n     public static byte[] intToBytes(int val) {"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/common/bytes/BytesReferenceStreamInput.java",
+          "patch": "@@ -10,6 +10,7 @@\n \n import org.apache.lucene.util.BytesRef;\n import org.apache.lucene.util.BytesRefIterator;\n+import org.elasticsearch.common.Numbers;\n import org.elasticsearch.common.io.stream.StreamInput;\n \n import java.io.EOFException;\n@@ -40,26 +41,64 @@ class BytesReferenceStreamInput extends StreamInput {\n \n     @Override\n     public byte readByte() throws IOException {\n-        if (offset() >= bytesReference.length()) {\n-            throw new EOFException();\n-        }\n         maybeNextSlice();\n         return slice.bytes[slice.offset + (sliceIndex++)];\n     }\n \n+    @Override\n+    public short readShort() throws IOException {\n+        if (slice.length - sliceIndex >= 2) {\n+            sliceIndex += 2;\n+            return Numbers.bytesToShort(slice.bytes, slice.offset + sliceIndex - 2);\n+        } else {\n+            // slow path\n+            return super.readShort();\n+        }\n+    }\n+\n+    @Override\n+    public int readInt() throws IOException {\n+        if (slice.length - sliceIndex >= 4) {\n+            sliceIndex += 4;\n+            return Numbers.bytesToInt(slice.bytes, slice.offset + sliceIndex - 4);\n+        } else {\n+            // slow path\n+            return super.readInt();\n+        }\n+    }\n+\n+    @Override\n+    public long readLong() throws IOException {\n+        if (slice.length - sliceIndex >= 8) {\n+            sliceIndex += 8;\n+            return Numbers.bytesToLong(slice.bytes, slice.offset + sliceIndex - 8);\n+        } else {\n+            // slow path\n+            return super.readLong();\n+        }\n+    }\n+\n     protected int offset() {\n         return sliceStartOffset + sliceIndex;\n     }\n \n     private void maybeNextSlice() throws IOException {\n-        while (sliceIndex == slice.length) {\n-            sliceStartOffset += sliceIndex;\n+        if (sliceIndex == slice.length) {\n+            moveToNextSlice();\n+        }\n+    }\n+\n+    private void moveToNextSlice() throws IOException {\n+        slice = iterator.next();\n+        while (slice != null && slice.length == 0) {\n+            // rare corner case of a bytes reference that has a 0-length component\n             slice = iterator.next();\n-            sliceIndex = 0;\n-            if (slice == null) {\n-                throw new EOFException();\n-            }\n         }\n+        if (slice == null) {\n+            throw new EOFException();\n+        }\n+        sliceStartOffset += sliceIndex;\n+        sliceIndex = 0;\n     }\n \n     @Override"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/index/translog/BufferedChecksumStreamInput.java",
+          "patch": "@@ -9,6 +9,7 @@\n package org.elasticsearch.index.translog;\n \n import org.apache.lucene.store.BufferedChecksum;\n+import org.elasticsearch.common.Numbers;\n import org.elasticsearch.common.io.stream.FilterStreamInput;\n import org.elasticsearch.common.io.stream.StreamInput;\n \n@@ -65,22 +66,21 @@ public void readBytes(byte[] b, int offset, int len) throws IOException {\n     public short readShort() throws IOException {\n         final byte[] buf = buffer.get();\n         readBytes(buf, 0, 2);\n-        return (short) (((buf[0] & 0xFF) << 8) | (buf[1] & 0xFF));\n+        return Numbers.bytesToShort(buf, 0);\n     }\n \n     @Override\n     public int readInt() throws IOException {\n         final byte[] buf = buffer.get();\n         readBytes(buf, 0, 4);\n-        return ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) | ((buf[2] & 0xFF) << 8) | (buf[3] & 0xFF);\n+        return Numbers.bytesToInt(buf, 0);\n     }\n \n     @Override\n     public long readLong() throws IOException {\n         final byte[] buf = buffer.get();\n         readBytes(buf, 0, 8);\n-        return (((long) (((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) | ((buf[2] & 0xFF) << 8) | (buf[3] & 0xFF))) << 32)\n-            | ((((buf[4] & 0xFF) << 24) | ((buf[5] & 0xFF) << 16) | ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF)) & 0xFFFFFFFFL);\n+        return Numbers.bytesToLong(buf, 0);\n     }\n \n     @Override"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-04-01T13:14:06Z",
+      "user": "original-brownbear",
+      "body": "`readByte` was used for all primitive reads which via the expensive `maybeNextSlice`\r\nwhich did not inline well caused slowness when reading large aggregate messages.\r\n\r\nThis commit makes these reads do bulk operations on the underlying `byte[]` where possible\r\ninstead. Also, it extracts cold path from `maybeNextSlice` so that we get a fast bounds check\r\nbranch instead of the loop with a large body for the hot case.\r\n\r\ncloses #70800\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 811899175,
+      "created_at": "2021-04-01T13:14:09Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-core-infra (Team:Core/Infra)"
+    },
+    {
+      "type": "review",
+      "id": 626256607,
+      "created_at": "2021-04-01T13:17:49Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 605650162,
+      "created_at": "2021-04-01T13:17:49Z",
+      "user": "original-brownbear",
+      "body": "no need for double checking here, the slice lengths must be correct (it's an assumption we make in other places so the `maybeNextSlice` is all we need",
+      "path": "server/src/main/java/org/elasticsearch/common/bytes/BytesReferenceStreamInput.java",
+      "diff_hunk": "@@ -40,26 +41,64 @@\n \n     @Override\n     public byte readByte() throws IOException {\n-        if (offset() >= bytesReference.length()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 43,
+      "original_line": 43,
+      "side": "LEFT",
+      "original_position": 12,
+      "position": 12,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 605650373,
+      "created_at": "2021-04-01T13:18:09Z",
+      "user": "nik9000",
+      "body": "Its worth leaving a comment here that we're being super intentional about moving the slow stuff to another method so the `if` statement is inlined.",
+      "path": "server/src/main/java/org/elasticsearch/common/bytes/BytesReferenceStreamInput.java",
+      "diff_hunk": "@@ -40,26 +41,64 @@\n \n     @Override\n     public byte readByte() throws IOException {\n-        if (offset() >= bytesReference.length()) {\n-            throw new EOFException();\n-        }\n         maybeNextSlice();\n         return slice.bytes[slice.offset + (sliceIndex++)];\n     }\n \n+    @Override\n+    public short readShort() throws IOException {\n+        if (slice.length - sliceIndex >= 2) {\n+            sliceIndex += 2;\n+            return Numbers.bytesToShort(slice.bytes, slice.offset + sliceIndex - 2);\n+        } else {\n+            // slow path\n+            return super.readShort();\n+        }\n+    }\n+\n+    @Override\n+    public int readInt() throws IOException {\n+        if (slice.length - sliceIndex >= 4) {\n+            sliceIndex += 4;\n+            return Numbers.bytesToInt(slice.bytes, slice.offset + sliceIndex - 4);\n+        } else {\n+            // slow path\n+            return super.readInt();\n+        }\n+    }\n+\n+    @Override\n+    public long readLong() throws IOException {\n+        if (slice.length - sliceIndex >= 8) {\n+            sliceIndex += 8;\n+            return Numbers.bytesToLong(slice.bytes, slice.offset + sliceIndex - 8);\n+        } else {\n+            // slow path\n+            return super.readLong();\n+        }\n+    }\n+\n     protected int offset() {\n         return sliceStartOffset + sliceIndex;\n     }\n \n     private void maybeNextSlice() throws IOException {\n-        while (sliceIndex == slice.length) {\n-            sliceStartOffset += sliceIndex;\n+        if (sliceIndex == slice.length) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 86,
+      "original_line": 86,
+      "side": "RIGHT",
+      "original_position": 59,
+      "position": 59,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 605701989,
+          "user": "original-brownbear",
+          "body": "++ added one.",
+          "created_at": "2021-04-01T14:27:14Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 626256936,
+      "created_at": "2021-04-01T13:25:59Z",
+      "user": "nik9000",
+      "state": "COMMENTED",
+      "body": "This looks right to me. I think it's worth a jmh benchmark to prove to ourselves that we're really helping.\r\n\r\nIt isn't a \"for now\" thing, but I'd love to be able to assert that the jvm *can* inline methods we think are important to inline. We go to a lot of trouble to juggle things so the JVM can inline them but we don't have any way to test whether or not we've broken them. Some kind of test would be nice. But that ain't a \"for now\" thing."
+    },
+    {
+      "type": "commit",
+      "date": "2021-04-01T14:19:16Z",
+      "sha": "1880bf36df44b98ff759978197b2e38913ab90d4",
+      "message": "comment",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-04-01T14:19:16Z",
+      "author_date": "2021-04-01T14:19:16Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-04-01T14:19:16Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/common/bytes/BytesReferenceStreamInput.java\n@@ -84,6 +84,7 @@ protected int offset() {\n \n     private void maybeNextSlice() throws IOException {\n         if (sliceIndex == slice.length) {\n+            // moveToNextSlice is intentionally extracted to another method since it's the assumed cold-path\n             moveToNextSlice();\n         }\n     }",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/common/bytes/BytesReferenceStreamInput.java",
+          "patch": "@@ -84,6 +84,7 @@ protected int offset() {\n \n     private void maybeNextSlice() throws IOException {\n         if (sliceIndex == slice.length) {\n+            // moveToNextSlice is intentionally extracted to another method since it's the assumed cold-path\n             moveToNextSlice();\n         }\n     }"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 626327693,
+      "created_at": "2021-04-01T14:27:14Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 626616961,
+      "created_at": "2021-04-01T20:18:22Z",
+      "user": "nik9000",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 812301402,
+      "created_at": "2021-04-02T03:47:23Z",
+      "user": "original-brownbear",
+      "body": "Thanks Nik!"
+    }
+  ]
+}

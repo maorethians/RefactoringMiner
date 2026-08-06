@@ -1,0 +1,67 @@
+{
+    "pr_body": "> \"close_notify\" alert is used to indicate orderly closure of one\r\n> direction of the connection.  Upon receiving such an alert, the TLS\r\n> implementation SHOULD indicate end-of-data to the application.\r\n\r\nThis PR addresses issue when HTTP client sends TLS close_notify alert and wait for response from our HTTP server. \r\nBut we dont handle close_notify alerts today, only full connection termination. Some clients might hang for a while until other timeouts fire up.\r\n\r\nIn this change I introduce an event listener for SslCloseCompletionEvent in the Netty4HttpPipeliningHandler, that handles close_notify alerts. When we receive alert we will close connection immediately. It might introduce server response truncation, but we rely on client to send close_notify when no more data is expected from the server.\r\n\r\nAdded warning logging, can be spotted now in unit and integ tests\r\n```\r\n[2024-06-25T21:08:49,310][WARN ][o.e.h.n.Netty4HttpPipeliningHandler] [node_t1] received TLS close_notify, closing connection [id: 0xfb96648b, L:/[0:0:0:0:0:0:0:1]:13484 - R:/[0:0:0:0:0:0:0:1]:63937]\r\n```\r\n\r\nFixes #76642 \r\n",
+    "original_commit_id": "45a517ac177587a36179af1847e3c91cf932f1a1",
+    "merged": true,
+    "pr_number": 109899,
+    "pr_title": "Add TLS close_notify handler to http server",
+    "lang": "java",
+    "full_name": "elastic/elasticsearch",
+    "pr_comment": [
+        "Pinging @elastic/es-distributed (Team:Distributed)",
+        "> Looks pretty good. Just one small comment and a note about a failing test.\r\n\r\nThanks @Tim-Brooks for the feedback! I fixed leaking buffers."
+    ],
+    "commit_id": "75a5fbcfd0e36e8d91e965385caf842377c14953",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 271,
+            "start_side": null,
+            "start_line": null,
+            "line": 273,
+            "comment_lines": [
+                "[][273]"
+            ],
+            "review_comment": [
+                "I have not investigated the test failure much. But I'm pretty sure these are going to need to be released at the end of the test.",
+                "Or else the leak detector will fire."
+            ],
+            "path": "x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/transport/netty4/SecurityNetty4HttpServerTransportCloseNotifyTests.java",
+            "id": 36840,
+            "created_at": "2024-06-27T04:38:40Z",
+            "original_position": 271,
+            "side": "RIGHT",
+            "position": 273,
+            "original_start_line": null
+        },
+        {
+            "original_line": 59,
+            "start_side": null,
+            "start_line": null,
+            "line": 67,
+            "comment_lines": [
+                "[][67]"
+            ],
+            "review_comment": [
+                "Tests make sense, but I think we'll also need some integ tests showing how this interacts with the rest of the system, particularly the task cancellation mechanism (which it doesn't today, but it'll need to).",
+                "I'm still thinking should we cancel or not. If we serve all requests while channel is writable then we dont need additional handling for cancelation. If channel is not writable, client decided not to wait, it will go through exception path, which exists today.",
+                "Although it is certainly possible to keep serving responses as you propose, it's also legitimate to cancel tasks and send the resulting exception responses, or indeed to just tear down the connection without sending any of the remaining responses, so this is more of a design question than a technical absolute.\r\n\r\nI couldn't find any clients which might send a `close_notify` while awaiting responses - AFAICT this only happens on the abort path or when dropping an idle connection from a pool.",
+                "You are right, looking further into HTTP and TLS RFC's closing connection on `close_notify` make sense. Serving all responses and closing connection should be handled with `Connection: close` header in HTTP1. \r\n\r\nIn TLS prior to v1.3 `close_notify` should discard all pending writes and close connection. TLS v1.3 tries to address [truncation attack](https://en.wikipedia.org/wiki/Transport_Layer_Security#:~:text=142%5D%5B143%5D-,Truncation%20attack,-%5Bedit%5D) by letting application layer to figure out how to close connection, we probably want to handle logout requests (oidc, saml) fully without truncation. I think in scope of this PR closing connection should be a good step forward.",
+                "I don't think truncation attacks are a possibility here, we always send either a `Content-length` header or else a properly-terminated chunked-encoded message so clients can tell if a response is incomplete at the HTTP layer. But this isn't the right place to discuss this more deeply - if you think there's a security issue in this area then please [mail security@elastic.co](https://www.elastic.co/community/security) with details.",
+                "Changed code to close connection immediately in all cases. Found that `SslHandler` triggers `userEvent` on `close_notify` `SslCloseCompletionEvent`, so I updated `Netty4HttpPipeliningHandler` to listen this event and close connection.",
+                "Also added integ test - SecurityNetty4TransportCloseNotifyIT. It's pretty similar to unit test, but on internalCluster. Have to use custom http client to send close_notify, I tried to hijack apache's http client sslEngine, but it got pretty messy.\r\n\r\n>  I think we'll also need some integ tests showing how this interacts with the rest of the system, particularly the task cancellation mechanism (which it doesn't today, but it'll need to).\r\n\r\nSince there is no cancellation now, is there something I should do with current tests?\r\n",
+                "> Since there is no cancellation now,\r\n\r\nI think task cancellation should be hooked-up by default with this implementation. Since you close the channel, that will propagate through the listener framework and cancel tasks (I think).\r\n\r\n`Netty4HttpChannel#addCloseListener`. ",
+                "Nice! Is it worth to test cancellation in integ test? If yes, what rest operation would be a good example?",
+                "> Nice! Is it worth to test cancellation in integ test?\r\n\r\nI will take another look at this PR later today. \r\n\r\nBut IMO, if \"HTTP Close triggers Task cancellation\" triggers task cancellation is already tested, then this PR only needs to validate the \"SSL client close_notify\" leads to channel close.\r\n\r\nHowever, I don't know if that test exists. My initial perusal of the code is that we do not have this test at an HTTP level (which we should). I would say this PR should implement it if it is missing.\r\n\r\n",
+                "I would look in `RestActionCancellationIT` and other classes in that qa package (`SearchRestCancellationIT`,  `ClusterHealthRestCancellationIT`, etc).\r\n\r\nIt looks like these are testing task cancellation through the http layer. I would do a bit of investigation and look at how the \"cancellation\" is implemented. I _think_ it might be through closing the http connection. But that appears to be a bit deep in the apache code and we should confirm it.\r\n\r\nIf those tests are sufficient then I think we are covered at the moment.",
+                "I added action cancellation test.\r\n\r\n`RestActionCancellationIT` and `SearchRestCancellationIT` call request.abort() which indeed close connection. \r\nWith help of neat plugin `CancellableActionTestPlugin` I found it's pretty easy to add integ test here for action cancellation - `testSendCloseNotifyCancelAction`"
+            ],
+            "path": "x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/transport/netty4/SecurityNetty4HttpServerTransportCloseNotifyTests.java",
+            "id": 36839,
+            "created_at": "2024-06-19T05:32:16Z",
+            "original_position": 59,
+            "side": "RIGHT",
+            "position": 67,
+            "original_start_line": null
+        }
+    ]
+}

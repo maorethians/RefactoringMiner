@@ -1,0 +1,52 @@
+{
+    "pr_body": "\u2026 to provide an upgradeStreamHandler during client side cleartext upgrade\r\n\r\nMotivation:\r\n\r\nWhen we use Http2MultiplexHandler along with a clear tex upgrade in client side using Http2ClientUpgradeCodec, it throws an exception when a ChannelHandler is not provided for upgradeStreamHandler. This may be to strict as the user user can chose to create the outbound channel using Http2StreamChannelBootstrap later on.\r\n\r\nModifications:\r\n\r\n- Just ensure we use a dummy handler that will release all received frames / events when the user does not supply one\r\n- Adjust unit tests\r\n\r\nResult:\r\n\r\nFixes https://github.com/netty/netty/issues/9508.",
+    "original_commit_id": "7f391426a2179d3c68e3a116567aa9a0aaf0524c",
+    "merged": false,
+    "pr_number": 9533,
+    "pr_title": "Http2MultiplexHandler / Http2MultiplexCodec should not force the user\u2026",
+    "lang": "java",
+    "full_name": "netty/netty",
+    "pr_comment": [
+        "@netty-bot test this please ",
+        "@netty-bot test this please ",
+        "@nizarm can you show us how you would make use of this ?",
+        "> @nizarm can you show us how you would make use of this ?\r\nHey @normanmaurer  - without this fix - here is how I am using this now\r\n\r\n```java\r\nHttp2MultiplexHandler multiplexHandler = new Http2MultiplexHandler(unsupportedHandler, unsupportedHandler);  \r\n\r\nfinal HttpClientCodec sourceCodec = new HttpClientCodec(_maxInitialLineLength, _maxHeaderSize, _maxChunkSize);\r\n\r\n    UnsupportedHandler unsupportedHandler = new UnsupportedHandler();\r\n   // please note that I am passing a second dummy channel handler as it is mandatory now\r\n   // Once the fix is in place - I will not pass the 2nd argument as that is optional with the fix.\r\n    Http2MultiplexHandler multiplexHandler = new Http2MultiplexHandler(unsupportedHandler, unsupportedHandler);\r\n\r\n    Http2ClientUpgradeCodecTemporaryFix upgradeCodec = new Http2ClientUpgradeCodecTemporaryFix(\r\n        (Http2ConnectionHandler) Http2FrameCodecBuilder\r\n        .forClient()\r\n        .initialSettings(createHttp2Settings())\r\n        .build(),\r\n        multiplexHandler\r\n        );\r\n\r\n    final ChannelPromise upgradePromise = channel.newPromise();\r\n    channel.attr(NettyChannelAttributes.INITIALIZATION_FUTURE).set(upgradePromise);\r\n\r\n    channel.pipeline().addLast(sourceCodec);\r\n    channel.pipeline().addLast(new HttpClientUpgradeHandler(sourceCodec, upgradeCodec, _maxContentLength));\r\n\r\nOnce the clear text upgrade workflow is completed ... we bootstrap the client side stram channel using bootstrap as follows\r\n\r\nfinal Http2StreamChannelBootstrap bootstrap =\r\n        new Http2StreamChannelBootstrap(channel).handler(new Http2StreamChannelInitializer(_ssl, _maxContentLength));\r\n\r\nThe Http2StreamChannelInitializer contain all the channel handlers we need for the stream channel.\r\n```\r\n\r\nSo this fix allows us not to forcefully pass an upgradeStreamHandler as shown in the above comment.\r\n\r\nLet me know if you have any questions or concerns on this usage !\r\n\r\n//So after the fix we instantiate the multiplex handler as follows (please note - we are now not\r\n//forced to pass the 2nd argument as it is optional now and we are not really using it)\r\nHttp2MultiplexHandler multiplexHandler = new Http2MultiplexHandler(unsupportedHandler);",
+        "@nizarm, my understanding of your pattern is that after you get the signal to upgrade, you install `MultiplexHandler` and the frame codec and then immediately after use `Http2StreamChannelBootstrap` to actually spin up the child `Channel` as you would any other stream channel. This seems like a reasonable pattern to me, so I guess the open question is what to do for that upgrade stream initializer, eg the current pattern. Presumably we just don't want the `MultiplexHandler` to do anything if you haven't provided it, right? If so, the question then becomes what happens to the messages received the upgrade stream if you don't do bootstrap a new channel or bootstrap it too late (after messages have already started to flow through). Presumably we'd want to reset the stream in either case and log an error, or perhaps be even more aggressive since that situation represents a illegal state?\r\n\r\nThere is also a chance I'm misunderstanding so please feel free to put me back on course. \ud83d\ude04 ",
+        "> @nizarm, my understanding of your pattern is that after you get the signal to upgrade, you install `MultiplexHandler` and the frame codec and then immediately after use `Http2StreamChannelBootstrap` to actually spin up the child `Channel` as you would any other stream channel. This seems like a reasonable pattern to me, so I guess the open question is what to do for that upgrade stream initializer, eg the current pattern. Presumably we just don't want the `MultiplexHandler` to do anything if you haven't provided it, right? If so, the question then becomes what happens to the messages received the upgrade stream if you don't do bootstrap a new channel or bootstrap it too late (after messages have already started to flow through). Presumably we'd want to reset the stream in either case and log an error, or perhaps be even more aggressive since that situation represents a illegal state?\r\n> \r\n> There is also a chance I'm misunderstanding so please feel free to put me back on course.\r\n\r\nYuu got that right @bryce-anderson. Since the signal to upgrade happen only once and for every channel request by the user code we simply create a new streamchannel using the bootstrap shown above.",
+        "@bryce-anderson so I am right in my understanding that in this case we should just reset the upgrade stream directly ?",
+        "Good question. I asked because I don't think we should be adding the `NOOP_UPGRADE_HANDLER` which will silently discard messages. As far as I can tell, we don't want to initialize the stream channel at all since presumably the bootstrap will do that. At that point we'd need to change the `channelRead` methods to make sure we actually have an `.attachment` on the `FrameStream` before proceeding and if not reset and tear down?",
+        "@nizarm one thing that is not clear to me yet is why you can not just use the `upgradeHandler` as it is and want to use the bootstrap. Can you explain why this is ?",
+        "> @nizarm one thing that is not clear to me yet is why you can not just use the `upgradeHandler` as it is and want to use the bootstrap. Can you explain why this is ?\r\n\r\nThe reason is we maintain a channel pool that is responsible for returning Channels to downstream communication. If the connection is Http2 the 'upgradeHandler' based approach is not flexible for our use case - because that happens only once per non stream channel. But our channel pool would like to issue more stream channels on the parent channel using Bootstrap based approach !",
+        "@nizarm hmm... its still not clear to me why this would be a problem tho...\r\n\r\nWhy you can't just do something like this:\r\n\r\n```java\r\nHttp2MultiplexHandler multiplexHandler = new Http2MultiplexHandler(..., new ChannelInboundHandlerAdapter() {\r\n    @Override\r\n    public void channelActive(ChannelHandlerContext ctx) throws Exception {\r\n        // This is called once the upgrade was completed\r\n            \r\n        // Obtain the parent channel which is the real connection and bootstrap more http2 streams.\r\n        Http2StreamChannelBootstrap bootstrap = new Http2StreamChannelBootstrap(ctx.channel().parent());\r\n                \r\n        ...\r\n        bootstrap.open().addListener(new FutureListener<Channel>() {\r\n            @Override\r\n            public void operationComplete(Future<Channel> future) throws Exception {\r\n                // Do something with the new stream\r\n            }\r\n        });\r\n    }\r\n});\r\n```",
+        "> ```java\r\n> bootstrap\r\n> ```\r\n\r\nYes I can do this. But this will force me to have two code paths to create Http2StreamChannels. One during the upgrade time and the other one when every time the user want to write a new outbound message. The upgrade time happens only once during the lifetime of a parent TCP connection right?\r\n",
+        "@nizarm yes... It just feels cleaner this way imho... @bryce-anderson WDYT ?",
+        "@nizarm @bryce-anderson ping ...",
+        "I tend to agree with @normanmaurer. I think it's good to separate the upgrade stream from all other streams since it has some unique properties such as it's outbound data path being HTTP/1.x, etc. I'm not strongly opinionated about that, but it seems like the alternative is to risk some illegal state and guarding against that seems like it will spread the concern to a number of different places which isn't worth it IMO.",
+        "Ok let me close this one then... "
+    ],
+    "commit_id": "631724af7d003351d151899eed38b1de95bd1da1",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 69,
+            "start_side": null,
+            "start_line": null,
+            "line": 69,
+            "comment_lines": [
+                "[][69]"
+            ],
+            "review_comment": [
+                "Why does this ignore/throw away the message, event, and exceptions instead of letting them go to the end of the pipeline?",
+                "because the user has no way to access the Channel and so the pipeline to add handlers by himself / herself ? ",
+                "Isn't that what the BootStrap will be in charge of, setting up the new stream channel?"
+            ],
+            "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/AbstractHttp2StreamChannel.java",
+            "id": 50656,
+            "created_at": "2019-09-03T20:38:38Z",
+            "original_position": 21,
+            "side": "RIGHT",
+            "position": 21,
+            "original_start_line": null
+        }
+    ]
+}

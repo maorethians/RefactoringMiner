@@ -1,0 +1,511 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 86153,
+  "pr_number": 86153,
+  "title": "Delay searchable snapshot allocation during shutdown",
+  "user": "henningandersen",
+  "created_at": "2022-04-25T16:38:43Z",
+  "merged_at": "2022-04-29T11:56:15Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Core/Infra",
+    "Team:Distributed",
+    ":Core/Infra/Node Lifecycle",
+    "auto-backport",
+    "v8.3.0",
+    "v8.2.1",
+    "v7.17.4"
+  ],
+  "base_commit": "a02d4f8237b25345bacf9a6617d341ac4d14a302",
+  "merge_commit_sha": "70d2d6abe572019f20314ce334e7575f9edbd253",
+  "commits": 10,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/86153",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-04-25T16:37:28Z",
+      "sha": "3646ac8028ac74c981d2f5002019bc050ce8b4f8",
+      "message": "Delay searchable snapshot allocation during shutdown\n\nDuring a shutdown, searchable snapshots should not be re-allocated to new nodes,\nsince this leads to data download. Instead, now wait for the shutdown reallocation\ndelay before reallocating shards.\n\nFixes #85052",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-25T16:37:28Z",
+      "author_date": "2022-04-25T16:37:28Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-25T16:37:28Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/gateway/ReplicaShardAllocator.java\n@@ -250,27 +250,36 @@ public AllocateUnassignedDecision makeAllocationDecision(\n             // if we didn't manage to find *any* data (regardless of matching sizes), and the replica is\n             // unassigned due to a node leaving, so we delay allocation of this replica to see if the\n             // node with the shard copy will rejoin so we can re-use the copy it has\n-            logger.debug(\"{}: allocation of [{}] is delayed\", unassignedShard.shardId(), unassignedShard);\n-            long remainingDelayMillis = 0L;\n-            long totalDelayMillis = 0L;\n-            if (explain) {\n-                UnassignedInfo unassignedInfo = unassignedShard.unassignedInfo();\n-                Metadata metadata = allocation.metadata();\n-                IndexMetadata indexMetadata = metadata.index(unassignedShard.index());\n-                totalDelayMillis = INDEX_DELAYED_NODE_LEFT_TIMEOUT_SETTING.get(indexMetadata.getSettings()).getMillis();\n-                long remainingDelayNanos = unassignedInfo.getRemainingDelay(\n-                    System.nanoTime(),\n-                    indexMetadata.getSettings(),\n-                    metadata.nodeShutdowns()\n-                );\n-                remainingDelayMillis = TimeValue.timeValueNanos(remainingDelayNanos).millis();\n-            }\n-            return AllocateUnassignedDecision.delayed(remainingDelayMillis, totalDelayMillis, nodeDecisions);\n+            return delayedDecision(unassignedShard, allocation, logger, nodeDecisions);\n         }\n \n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n+    /**\n+     * Return a delayed decision, filling in the right amount of remaining time if decisions are debugged/explained.\n+     */\n+    public static AllocateUnassignedDecision delayedDecision(ShardRouting unassignedShard, RoutingAllocation allocation, Logger logger,\n+                                                        List<NodeAllocationResult> nodeDecisions) {\n+        boolean explain = allocation.debugDecision();\n+        logger.debug(\"{}: allocation of [{}] is delayed\", unassignedShard.shardId(), unassignedShard);\n+        long remainingDelayMillis = 0L;\n+        long totalDelayMillis = 0L;\n+        if (explain) {\n+            UnassignedInfo unassignedInfo = unassignedShard.unassignedInfo();\n+            Metadata metadata = allocation.metadata();\n+            IndexMetadata indexMetadata = metadata.index(unassignedShard.index());\n+            totalDelayMillis = INDEX_DELAYED_NODE_LEFT_TIMEOUT_SETTING.get(indexMetadata.getSettings()).getMillis();\n+            long remainingDelayNanos = unassignedInfo.getRemainingDelay(\n+                System.nanoTime(),\n+                indexMetadata.getSettings(),\n+                metadata.nodeShutdowns()\n+            );\n+            remainingDelayMillis = TimeValue.timeValueNanos(remainingDelayNanos).millis();\n+        }\n+        return AllocateUnassignedDecision.delayed(remainingDelayMillis, totalDelayMillis, nodeDecisions);\n+    }\n+\n     /**\n      * Determines if the shard can be allocated on at least one node based on the allocation deciders.\n      *\nx-pack/plugin/searchable-snapshots/build.gradle\n@@ -14,6 +14,7 @@ dependencies {\n   compileOnly project(path: xpackModule('core'))\n   implementation project(path: 'preallocate')\n   internalClusterTestImplementation(testArtifact(project(xpackModule('core'))))\n+  internalClusterTestImplementation(project(path: xpackModule('shutdown')))\n   internalClusterTestImplementation(project(path: ':modules:reindex'))\n }\n \nx-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java\n@@ -0,0 +1,116 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n+public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n+    }\n+\n+    public void testAllocationDisabledDuringShutdown() throws Exception {\n+        final String restoredIndexName = setupMountedIndex();\n+        final Set<String> indexNodes = internalCluster().nodesInclude(restoredIndexName);\n+        final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n+        final Map<String, String> nodeNameToId = state.getNodes()\n+            .stream()\n+            .collect(Collectors.toMap(DiscoveryNode::getName, DiscoveryNode::getId));\n+\n+        for (String indexNode : indexNodes) {\n+            final String indexNodeId = nodeNameToId.get(indexNode);\n+            putShutdown(indexNodeId);\n+            final int shards = (int) state.routingTable()\n+                .allShards(restoredIndexName)\n+                .stream()\n+                .filter(s -> indexNodeId.equals(s.currentNodeId()))\n+                .count();\n+            assert shards > 0;\n+\n+            final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n+            cacheService.synchronizeCache();\n+\n+            logger.info(\"--> Restarting [{}/{}]\", indexNodeId, indexNode);\n+            internalCluster().restartNode(indexNode, new InternalTestCluster.RestartCallback() {\n+                @Override\n+                public Settings onNodeStopped(String nodeName) throws Exception {\n+                    assertBusy(() -> {\n+                        ClusterHealthResponse response = client().admin()\n+                            .cluster()\n+                            .health(Requests.clusterHealthRequest(restoredIndexName))\n+                            .actionGet();\n+                        assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n+                    });\n+                    return super.onNodeStopped(nodeName);\n+                }\n+            });\n+            // leave shutdown in place for some nodes to check that shards get assigned anyway.\n+            if (randomBoolean()) {\n+                removeShutdown(indexNodeId);\n+            }\n+        }\n+\n+        ensureGreen(restoredIndexName);\n+    }\n+\n+    private String setupMountedIndex() throws Exception {\n+        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+        createAndPopulateIndex(indexName, Settings.builder());\n+\n+        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+        createRepository(repositoryName, \"mock\");\n+\n+        final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+        assertAcked(client().admin().indices().prepareDelete(indexName));\n+        return mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY);\n+    }\n+\n+    private void putShutdown(String nodeToRestartId) throws InterruptedException, ExecutionException {\n+        PutShutdownNodeAction.Request putShutdownRequest = new PutShutdownNodeAction.Request(\n+            nodeToRestartId,\n+            SingleNodeShutdownMetadata.Type.RESTART,\n+            this.getTestName(),\n+            null,\n+            null\n+        );\n+        assertTrue(client().execute(PutShutdownNodeAction.INSTANCE, putShutdownRequest).get().isAcknowledged());\n+    }\n+\n+    private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n+        assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n+    }\n+}\nx-pack/plugin/searchable-snapshots/src/main/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotAllocator.java\n@@ -17,6 +17,7 @@\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.metadata.RepositoriesMetadata;\n import org.elasticsearch.cluster.metadata.RepositoryMetadata;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.node.DiscoveryNodes;\n import org.elasticsearch.cluster.routing.RecoverySource;\n@@ -341,11 +342,26 @@ private AllocateUnassignedDecision decideAllocation(RoutingAllocation allocation\n                 );\n                 return AllocateUnassignedDecision.yes(nodeWithHighestMatch.node(), null, nodeDecisions, true);\n             }\n+        } else if (isDelayedDueToShutdown(allocation, shardRouting)) {\n+            return ReplicaShardAllocator.delayedDecision(shardRouting, allocation, logger, nodeDecisions);\n         }\n+\n         // TODO: do we need handling of delayed allocation for leaving replicas here?\n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n+    private boolean isDelayedDueToShutdown(RoutingAllocation allocation, ShardRouting shardRouting) {\n+        if (shardRouting.unassignedInfo().isDelayed()) {\n+            String lastAllocatedNodeId = shardRouting.unassignedInfo().getLastAllocatedNodeId();\n+            if (lastAllocatedNodeId != null) {\n+                SingleNodeShutdownMetadata nodeShutdownMetadata = allocation.nodeShutdowns().get(lastAllocatedNodeId);\n+                return nodeShutdownMetadata != null && nodeShutdownMetadata.getType() == SingleNodeShutdownMetadata.Type.RESTART;\n+            }\n+        }\n+\n+        return false;\n+    }\n+\n     @Override\n     public AllocateUnassignedDecision explainUnassignedShardAllocation(ShardRouting shardRouting, RoutingAllocation routingAllocation) {\n         assert shardRouting.unassigned();",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/gateway/ReplicaShardAllocator.java",
+          "patch": "@@ -250,27 +250,36 @@ public AllocateUnassignedDecision makeAllocationDecision(\n             // if we didn't manage to find *any* data (regardless of matching sizes), and the replica is\n             // unassigned due to a node leaving, so we delay allocation of this replica to see if the\n             // node with the shard copy will rejoin so we can re-use the copy it has\n-            logger.debug(\"{}: allocation of [{}] is delayed\", unassignedShard.shardId(), unassignedShard);\n-            long remainingDelayMillis = 0L;\n-            long totalDelayMillis = 0L;\n-            if (explain) {\n-                UnassignedInfo unassignedInfo = unassignedShard.unassignedInfo();\n-                Metadata metadata = allocation.metadata();\n-                IndexMetadata indexMetadata = metadata.index(unassignedShard.index());\n-                totalDelayMillis = INDEX_DELAYED_NODE_LEFT_TIMEOUT_SETTING.get(indexMetadata.getSettings()).getMillis();\n-                long remainingDelayNanos = unassignedInfo.getRemainingDelay(\n-                    System.nanoTime(),\n-                    indexMetadata.getSettings(),\n-                    metadata.nodeShutdowns()\n-                );\n-                remainingDelayMillis = TimeValue.timeValueNanos(remainingDelayNanos).millis();\n-            }\n-            return AllocateUnassignedDecision.delayed(remainingDelayMillis, totalDelayMillis, nodeDecisions);\n+            return delayedDecision(unassignedShard, allocation, logger, nodeDecisions);\n         }\n \n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n+    /**\n+     * Return a delayed decision, filling in the right amount of remaining time if decisions are debugged/explained.\n+     */\n+    public static AllocateUnassignedDecision delayedDecision(ShardRouting unassignedShard, RoutingAllocation allocation, Logger logger,\n+                                                        List<NodeAllocationResult> nodeDecisions) {\n+        boolean explain = allocation.debugDecision();\n+        logger.debug(\"{}: allocation of [{}] is delayed\", unassignedShard.shardId(), unassignedShard);\n+        long remainingDelayMillis = 0L;\n+        long totalDelayMillis = 0L;\n+        if (explain) {\n+            UnassignedInfo unassignedInfo = unassignedShard.unassignedInfo();\n+            Metadata metadata = allocation.metadata();\n+            IndexMetadata indexMetadata = metadata.index(unassignedShard.index());\n+            totalDelayMillis = INDEX_DELAYED_NODE_LEFT_TIMEOUT_SETTING.get(indexMetadata.getSettings()).getMillis();\n+            long remainingDelayNanos = unassignedInfo.getRemainingDelay(\n+                System.nanoTime(),\n+                indexMetadata.getSettings(),\n+                metadata.nodeShutdowns()\n+            );\n+            remainingDelayMillis = TimeValue.timeValueNanos(remainingDelayNanos).millis();\n+        }\n+        return AllocateUnassignedDecision.delayed(remainingDelayMillis, totalDelayMillis, nodeDecisions);\n+    }\n+\n     /**\n      * Determines if the shard can be allocated on at least one node based on the allocation deciders.\n      *"
+        },
+        {
+          "file": "x-pack/plugin/searchable-snapshots/build.gradle",
+          "patch": "@@ -14,6 +14,7 @@ dependencies {\n   compileOnly project(path: xpackModule('core'))\n   implementation project(path: 'preallocate')\n   internalClusterTestImplementation(testArtifact(project(xpackModule('core'))))\n+  internalClusterTestImplementation(project(path: xpackModule('shutdown')))\n   internalClusterTestImplementation(project(path: ':modules:reindex'))\n }\n "
+        },
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+          "patch": "@@ -0,0 +1,116 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n+public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n+    }\n+\n+    public void testAllocationDisabledDuringShutdown() throws Exception {\n+        final String restoredIndexName = setupMountedIndex();\n+        final Set<String> indexNodes = internalCluster().nodesInclude(restoredIndexName);\n+        final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n+        final Map<String, String> nodeNameToId = state.getNodes()\n+            .stream()\n+            .collect(Collectors.toMap(DiscoveryNode::getName, DiscoveryNode::getId));\n+\n+        for (String indexNode : indexNodes) {\n+            final String indexNodeId = nodeNameToId.get(indexNode);\n+            putShutdown(indexNodeId);\n+            final int shards = (int) state.routingTable()\n+                .allShards(restoredIndexName)\n+                .stream()\n+                .filter(s -> indexNodeId.equals(s.currentNodeId()))\n+                .count();\n+            assert shards > 0;\n+\n+            final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n+            cacheService.synchronizeCache();\n+\n+            logger.info(\"--> Restarting [{}/{}]\", indexNodeId, indexNode);\n+            internalCluster().restartNode(indexNode, new InternalTestCluster.RestartCallback() {\n+                @Override\n+                public Settings onNodeStopped(String nodeName) throws Exception {\n+                    assertBusy(() -> {\n+                        ClusterHealthResponse response = client().admin()\n+                            .cluster()\n+                            .health(Requests.clusterHealthRequest(restoredIndexName))\n+                            .actionGet();\n+                        assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n+                    });\n+                    return super.onNodeStopped(nodeName);\n+                }\n+            });\n+            // leave shutdown in place for some nodes to check that shards get assigned anyway.\n+            if (randomBoolean()) {\n+                removeShutdown(indexNodeId);\n+            }\n+        }\n+\n+        ensureGreen(restoredIndexName);\n+    }\n+\n+    private String setupMountedIndex() throws Exception {\n+        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+        createAndPopulateIndex(indexName, Settings.builder());\n+\n+        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+        createRepository(repositoryName, \"mock\");\n+\n+        final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+        assertAcked(client().admin().indices().prepareDelete(indexName));\n+        return mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY);\n+    }\n+\n+    private void putShutdown(String nodeToRestartId) throws InterruptedException, ExecutionException {\n+        PutShutdownNodeAction.Request putShutdownRequest = new PutShutdownNodeAction.Request(\n+            nodeToRestartId,\n+            SingleNodeShutdownMetadata.Type.RESTART,\n+            this.getTestName(),\n+            null,\n+            null\n+        );\n+        assertTrue(client().execute(PutShutdownNodeAction.INSTANCE, putShutdownRequest).get().isAcknowledged());\n+    }\n+\n+    private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n+        assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n+    }\n+}"
+        },
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/main/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotAllocator.java",
+          "patch": "@@ -17,6 +17,7 @@\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.metadata.RepositoriesMetadata;\n import org.elasticsearch.cluster.metadata.RepositoryMetadata;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.node.DiscoveryNodes;\n import org.elasticsearch.cluster.routing.RecoverySource;\n@@ -341,11 +342,26 @@ private AllocateUnassignedDecision decideAllocation(RoutingAllocation allocation\n                 );\n                 return AllocateUnassignedDecision.yes(nodeWithHighestMatch.node(), null, nodeDecisions, true);\n             }\n+        } else if (isDelayedDueToShutdown(allocation, shardRouting)) {\n+            return ReplicaShardAllocator.delayedDecision(shardRouting, allocation, logger, nodeDecisions);\n         }\n+\n         // TODO: do we need handling of delayed allocation for leaving replicas here?\n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n+    private boolean isDelayedDueToShutdown(RoutingAllocation allocation, ShardRouting shardRouting) {\n+        if (shardRouting.unassignedInfo().isDelayed()) {\n+            String lastAllocatedNodeId = shardRouting.unassignedInfo().getLastAllocatedNodeId();\n+            if (lastAllocatedNodeId != null) {\n+                SingleNodeShutdownMetadata nodeShutdownMetadata = allocation.nodeShutdowns().get(lastAllocatedNodeId);\n+                return nodeShutdownMetadata != null && nodeShutdownMetadata.getType() == SingleNodeShutdownMetadata.Type.RESTART;\n+            }\n+        }\n+\n+        return false;\n+    }\n+\n     @Override\n     public AllocateUnassignedDecision explainUnassignedShardAllocation(ShardRouting shardRouting, RoutingAllocation routingAllocation) {\n         assert shardRouting.unassigned();"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-04-25T16:38:43Z",
+      "user": "henningandersen",
+      "body": "During a shutdown, searchable snapshots should not be re-allocated to new nodes,\r\nsince this leads to data download. Instead, now wait for the shutdown reallocation\r\ndelay before reallocating shards.\r\n\r\nFixes #85052\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 1108798268,
+      "created_at": "2022-04-25T16:38:47Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "comment",
+      "id": 1108798269,
+      "created_at": "2022-04-25T16:38:47Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-core-infra (Team:Core/Infra)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-25T16:39:08Z",
+      "sha": "38ac38f8be964ab9e3a9eeae9ca99bed88896f1b",
+      "message": "Update docs/changelog/86153.yaml",
+      "author": "Henning Andersen",
+      "author_email": "33268011+henningandersen@users.noreply.github.com",
+      "author_raw_date": "2022-04-25T16:39:08Z",
+      "author_date": "2022-04-25T16:39:08Z",
+      "committer": "Henning Andersen",
+      "committer_email": "33268011+henningandersen@users.noreply.github.com",
+      "raw_date": "2022-04-25T16:39:08Z",
+      "diff_text": "docs/changelog/86153.yaml\n@@ -0,0 +1,6 @@\n+pr: 86153\n+summary: Delay searchable snapshot allocation during shutdown\n+area: \"Snapshot/Restore, Infra/Node Lifecycle\"\n+type: bug\n+issues:\n+ - 85052",
+      "diff": [
+        {
+          "file": "docs/changelog/86153.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 86153\n+summary: Delay searchable snapshot allocation during shutdown\n+area: \"Snapshot/Restore, Infra/Node Lifecycle\"\n+type: bug\n+issues:\n+ - 85052"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1108798572,
+      "created_at": "2022-04-25T16:39:09Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @henningandersen, I've created a changelog YAML for you."
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-25T17:00:43Z",
+      "sha": "0e310ba834ac57749d783120046b94d6d11eed1b",
+      "message": "Fix changelog yaml",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-25T17:00:06Z",
+      "author_date": "2022-04-25T17:00:06Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-25T17:00:43Z",
+      "diff_text": "docs/changelog/86153.yaml\n@@ -1,6 +1,6 @@\n pr: 86153\n summary: Delay searchable snapshot allocation during shutdown\n-area: \"Snapshot/Restore, Infra/Node Lifecycle\"\n+area: \"Snapshot/Restore\"\n type: bug\n issues:\n  - 85052",
+      "diff": [
+        {
+          "file": "docs/changelog/86153.yaml",
+          "patch": "@@ -1,6 +1,6 @@\n pr: 86153\n summary: Delay searchable snapshot allocation during shutdown\n-area: \"Snapshot/Restore, Infra/Node Lifecycle\"\n+area: \"Snapshot/Restore\"\n type: bug\n issues:\n  - 85052"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-25T17:43:06Z",
+      "sha": "c50e0b9b1f32fb6260fed0c681e71f8180800cac",
+      "message": "spotless",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-25T17:43:06Z",
+      "author_date": "2022-04-25T17:43:06Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-25T17:43:06Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/gateway/ReplicaShardAllocator.java\n@@ -259,8 +259,12 @@ public AllocateUnassignedDecision makeAllocationDecision(\n     /**\n      * Return a delayed decision, filling in the right amount of remaining time if decisions are debugged/explained.\n      */\n-    public static AllocateUnassignedDecision delayedDecision(ShardRouting unassignedShard, RoutingAllocation allocation, Logger logger,\n-                                                        List<NodeAllocationResult> nodeDecisions) {\n+    public static AllocateUnassignedDecision delayedDecision(\n+        ShardRouting unassignedShard,\n+        RoutingAllocation allocation,\n+        Logger logger,\n+        List<NodeAllocationResult> nodeDecisions\n+    ) {\n         boolean explain = allocation.debugDecision();\n         logger.debug(\"{}: allocation of [{}] is delayed\", unassignedShard.shardId(), unassignedShard);\n         long remainingDelayMillis = 0L;",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/gateway/ReplicaShardAllocator.java",
+          "patch": "@@ -259,8 +259,12 @@ public AllocateUnassignedDecision makeAllocationDecision(\n     /**\n      * Return a delayed decision, filling in the right amount of remaining time if decisions are debugged/explained.\n      */\n-    public static AllocateUnassignedDecision delayedDecision(ShardRouting unassignedShard, RoutingAllocation allocation, Logger logger,\n-                                                        List<NodeAllocationResult> nodeDecisions) {\n+    public static AllocateUnassignedDecision delayedDecision(\n+        ShardRouting unassignedShard,\n+        RoutingAllocation allocation,\n+        Logger logger,\n+        List<NodeAllocationResult> nodeDecisions\n+    ) {\n         boolean explain = allocation.debugDecision();\n         logger.debug(\"{}: allocation of [{}] is delayed\", unassignedShard.shardId(), unassignedShard);\n         long remainingDelayMillis = 0L;"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 858387087,
+      "created_at": "2022-04-26T07:44:32Z",
+      "user": "tlrx",
+      "body": "```suggestion\r\n    private boolean isDelayedDueToNodeRestart(RoutingAllocation allocation, ShardRouting shardRouting) {\r\n```",
+      "path": "x-pack/plugin/searchable-snapshots/src/main/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotAllocator.java",
+      "diff_hunk": "@@ -341,11 +342,26 @@ private AllocateUnassignedDecision decideAllocation(RoutingAllocation allocation\n                 );\n                 return AllocateUnassignedDecision.yes(nodeWithHighestMatch.node(), null, nodeDecisions, true);\n             }\n+        } else if (isDelayedDueToShutdown(allocation, shardRouting)) {\n+            return ReplicaShardAllocator.delayedDecision(shardRouting, allocation, logger, nodeDecisions);\n         }\n+\n         // TODO: do we need handling of delayed allocation for leaving replicas here?\n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n+    private boolean isDelayedDueToShutdown(RoutingAllocation allocation, ShardRouting shardRouting) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 353,
+      "side": "RIGHT",
+      "original_position": 20,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 861696266,
+          "user": "henningandersen",
+          "body": "Forgot this in prior round, done now in df9115a0833a8344c9a1c38927b0029b10a2d896",
+          "created_at": "2022-04-29T10:53:06Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 858397057,
+      "created_at": "2022-04-26T07:52:40Z",
+      "user": "tlrx",
+      "body": "I wonder if this can cause some test failures when a low number of data nodes is picked up? I quickly tested with a 10 shards index and 2 data nodes and got a failure after ~5 runs.",
+      "path": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+      "diff_hunk": "@@ -0,0 +1,116 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n+public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n+    }\n+\n+    public void testAllocationDisabledDuringShutdown() throws Exception {\n+        final String restoredIndexName = setupMountedIndex();\n+        final Set<String> indexNodes = internalCluster().nodesInclude(restoredIndexName);\n+        final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n+        final Map<String, String> nodeNameToId = state.getNodes()\n+            .stream()\n+            .collect(Collectors.toMap(DiscoveryNode::getName, DiscoveryNode::getId));\n+\n+        for (String indexNode : indexNodes) {\n+            final String indexNodeId = nodeNameToId.get(indexNode);\n+            putShutdown(indexNodeId);\n+            final int shards = (int) state.routingTable()\n+                .allShards(restoredIndexName)\n+                .stream()\n+                .filter(s -> indexNodeId.equals(s.currentNodeId()))\n+                .count();\n+            assert shards > 0;\n+\n+            final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n+            cacheService.synchronizeCache();\n+\n+            logger.info(\"--> Restarting [{}/{}]\", indexNodeId, indexNode);\n+            internalCluster().restartNode(indexNode, new InternalTestCluster.RestartCallback() {\n+                @Override\n+                public Settings onNodeStopped(String nodeName) throws Exception {\n+                    assertBusy(() -> {\n+                        ClusterHealthResponse response = client().admin()\n+                            .cluster()\n+                            .health(Requests.clusterHealthRequest(restoredIndexName))\n+                            .actionGet();\n+                        assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n+                    });\n+                    return super.onNodeStopped(nodeName);\n+                }\n+            });\n+            // leave shutdown in place for some nodes to check that shards get assigned anyway.\n+            if (randomBoolean()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 95,
+      "original_line": 82,
+      "side": "RIGHT",
+      "original_position": 82,
+      "position": 95,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 952914258,
+      "created_at": "2022-04-26T07:53:11Z",
+      "user": "tlrx",
+      "state": "COMMENTED",
+      "body": "This looks good but I suspect that the test will cause failures on CI"
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-28T11:42:09Z",
+      "sha": "8c350969d5a2c88abda0c87e4b54ef25f2f702c4",
+      "message": "Make test not fail\n\nTest could fail if a shard received no docs, since then the shard has no size in the\nsearchable snapshot cache. Now create multiple indices instead of a single index with\nmultiple shards. Also wait for download activity to cease.",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-28T11:42:09Z",
+      "author_date": "2022-04-28T11:42:09Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-28T11:42:09Z",
+      "diff_text": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java\n@@ -19,23 +19,26 @@\n import org.elasticsearch.test.ESIntegTestCase;\n import org.elasticsearch.test.InternalTestCluster;\n import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots;\n import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n import org.hamcrest.Matchers;\n \n+import java.util.ArrayList;\n import java.util.Collection;\n import java.util.List;\n import java.util.Locale;\n import java.util.Map;\n import java.util.Set;\n import java.util.concurrent.ExecutionException;\n import java.util.stream.Collectors;\n+import java.util.stream.StreamSupport;\n \n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n \n-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n \n     @Override\n@@ -44,8 +47,11 @@ protected Collection<Class<? extends Plugin>> nodePlugins() {\n     }\n \n     public void testAllocationDisabledDuringShutdown() throws Exception {\n-        final String restoredIndexName = setupMountedIndex();\n-        final Set<String> indexNodes = internalCluster().nodesInclude(restoredIndexName);\n+        final List<String> restoredIndexNames = setupMountedIndices();\n+        final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n+        final Set<String> indexNodes = restoredIndexNames.stream()\n+            .flatMap(index -> internalCluster().nodesInclude(index).stream())\n+            .collect(Collectors.toSet());\n         final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n         final Map<String, String> nodeNameToId = state.getNodes()\n             .stream()\n@@ -54,13 +60,14 @@ public void testAllocationDisabledDuringShutdown() throws Exception {\n         for (String indexNode : indexNodes) {\n             final String indexNodeId = nodeNameToId.get(indexNode);\n             putShutdown(indexNodeId);\n-            final int shards = (int) state.routingTable()\n-                .allShards(restoredIndexName)\n-                .stream()\n+            final int shards = (int) StreamSupport.stream(state.routingTable().allShards(restoredIndexNamesArray).spliterator(), false)\n                 .filter(s -> indexNodeId.equals(s.currentNodeId()))\n                 .count();\n             assert shards > 0;\n \n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_FETCH_ASYNC_THREAD_POOL_NAME);\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_PREWARMING_THREAD_POOL_NAME);\n+            waitForBlobCacheFillsToComplete();\n             final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n             cacheService.synchronizeCache();\n \n@@ -71,7 +78,7 @@ public Settings onNodeStopped(String nodeName) throws Exception {\n                     assertBusy(() -> {\n                         ClusterHealthResponse response = client().admin()\n                             .cluster()\n-                            .health(Requests.clusterHealthRequest(restoredIndexName))\n+                            .health(Requests.clusterHealthRequest(restoredIndexNamesArray))\n                             .actionGet();\n                         assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n                     });\n@@ -84,19 +91,24 @@ public Settings onNodeStopped(String nodeName) throws Exception {\n             }\n         }\n \n-        ensureGreen(restoredIndexName);\n+        ensureGreen(restoredIndexNamesArray);\n     }\n \n-    private String setupMountedIndex() throws Exception {\n-        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n-        createAndPopulateIndex(indexName, Settings.builder());\n+    private List<String> setupMountedIndices() throws Exception {\n+        int count = between(1, 10);\n+        List<String> restoredIndices = new ArrayList<>();\n+        for (int i = 0; i < count; ++i) {\n+            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createAndPopulateIndex(indexName, Settings.builder());\n \n-        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n-        createRepository(repositoryName, \"mock\");\n+            final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createRepository(repositoryName, \"mock\");\n \n-        final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n-        assertAcked(client().admin().indices().prepareDelete(indexName));\n-        return mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY);\n+            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+            assertAcked(client().admin().indices().prepareDelete(indexName));\n+            restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));\n+        }\n+        return restoredIndices;\n     }\n \n     private void putShutdown(String nodeToRestartId) throws InterruptedException, ExecutionException {\n@@ -113,4 +125,10 @@ private void putShutdown(String nodeToRestartId) throws InterruptedException, Ex\n     private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n         assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n     }\n+\n+    @Override\n+    protected int numberOfShards() {\n+        // use 1 shard per index and instead use multiple indices to have multiple shards.\n+        return 1;\n+    }\n }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+          "patch": "@@ -19,23 +19,26 @@\n import org.elasticsearch.test.ESIntegTestCase;\n import org.elasticsearch.test.InternalTestCluster;\n import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots;\n import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n import org.hamcrest.Matchers;\n \n+import java.util.ArrayList;\n import java.util.Collection;\n import java.util.List;\n import java.util.Locale;\n import java.util.Map;\n import java.util.Set;\n import java.util.concurrent.ExecutionException;\n import java.util.stream.Collectors;\n+import java.util.stream.StreamSupport;\n \n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n \n-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n \n     @Override\n@@ -44,8 +47,11 @@ protected Collection<Class<? extends Plugin>> nodePlugins() {\n     }\n \n     public void testAllocationDisabledDuringShutdown() throws Exception {\n-        final String restoredIndexName = setupMountedIndex();\n-        final Set<String> indexNodes = internalCluster().nodesInclude(restoredIndexName);\n+        final List<String> restoredIndexNames = setupMountedIndices();\n+        final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n+        final Set<String> indexNodes = restoredIndexNames.stream()\n+            .flatMap(index -> internalCluster().nodesInclude(index).stream())\n+            .collect(Collectors.toSet());\n         final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n         final Map<String, String> nodeNameToId = state.getNodes()\n             .stream()\n@@ -54,13 +60,14 @@ public void testAllocationDisabledDuringShutdown() throws Exception {\n         for (String indexNode : indexNodes) {\n             final String indexNodeId = nodeNameToId.get(indexNode);\n             putShutdown(indexNodeId);\n-            final int shards = (int) state.routingTable()\n-                .allShards(restoredIndexName)\n-                .stream()\n+            final int shards = (int) StreamSupport.stream(state.routingTable().allShards(restoredIndexNamesArray).spliterator(), false)\n                 .filter(s -> indexNodeId.equals(s.currentNodeId()))\n                 .count();\n             assert shards > 0;\n \n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_FETCH_ASYNC_THREAD_POOL_NAME);\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_PREWARMING_THREAD_POOL_NAME);\n+            waitForBlobCacheFillsToComplete();\n             final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n             cacheService.synchronizeCache();\n \n@@ -71,7 +78,7 @@ public Settings onNodeStopped(String nodeName) throws Exception {\n                     assertBusy(() -> {\n                         ClusterHealthResponse response = client().admin()\n                             .cluster()\n-                            .health(Requests.clusterHealthRequest(restoredIndexName))\n+                            .health(Requests.clusterHealthRequest(restoredIndexNamesArray))\n                             .actionGet();\n                         assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n                     });\n@@ -84,19 +91,24 @@ public Settings onNodeStopped(String nodeName) throws Exception {\n             }\n         }\n \n-        ensureGreen(restoredIndexName);\n+        ensureGreen(restoredIndexNamesArray);\n     }\n \n-    private String setupMountedIndex() throws Exception {\n-        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n-        createAndPopulateIndex(indexName, Settings.builder());\n+    private List<String> setupMountedIndices() throws Exception {\n+        int count = between(1, 10);\n+        List<String> restoredIndices = new ArrayList<>();\n+        for (int i = 0; i < count; ++i) {\n+            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createAndPopulateIndex(indexName, Settings.builder());\n \n-        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n-        createRepository(repositoryName, \"mock\");\n+            final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createRepository(repositoryName, \"mock\");\n \n-        final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n-        assertAcked(client().admin().indices().prepareDelete(indexName));\n-        return mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY);\n+            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+            assertAcked(client().admin().indices().prepareDelete(indexName));\n+            restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));\n+        }\n+        return restoredIndices;\n     }\n \n     private void putShutdown(String nodeToRestartId) throws InterruptedException, ExecutionException {\n@@ -113,4 +125,10 @@ private void putShutdown(String nodeToRestartId) throws InterruptedException, Ex\n     private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n         assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n     }\n+\n+    @Override\n+    protected int numberOfShards() {\n+        // use 1 shard per index and instead use multiple indices to have multiple shards.\n+        return 1;\n+    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1112243952,
+      "created_at": "2022-04-28T14:01:41Z",
+      "user": "henningandersen",
+      "body": "> This looks good but I suspect that the test will cause failures on CI\r\n\r\nThanks for capturing this and also for figuring out that this happens when a shard receives no data. I amended the test to create multiple indices with one shard, seemed like the easiest route to guarantee docs in every shard. Ready or another look."
+    },
+    {
+      "type": "review_comment",
+      "id": 861028032,
+      "created_at": "2022-04-28T15:26:53Z",
+      "user": "tlrx",
+      "body": "```suggestion\r\n@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\r\n```",
+      "path": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+      "diff_hunk": "@@ -0,0 +1,134 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.ArrayList;\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+import java.util.stream.StreamSupport;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 41,
+      "side": "RIGHT",
+      "original_position": 41,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 861696465,
+          "user": "henningandersen",
+          "body": ":+1:, leftover from some testing, done in 263b644ec66c3e1fff7031bf255e3c3904c51d52",
+          "created_at": "2022-04-29T10:53:26Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 861029784,
+      "created_at": "2022-04-28T15:28:23Z",
+      "user": "tlrx",
+      "body": "```suggestion\r\n            final String indexName = \"index_\" + i;\r\n```",
+      "path": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+      "diff_hunk": "@@ -0,0 +1,134 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.ArrayList;\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+import java.util.stream.StreamSupport;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n+public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n+    }\n+\n+    public void testAllocationDisabledDuringShutdown() throws Exception {\n+        final List<String> restoredIndexNames = setupMountedIndices();\n+        final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n+        final Set<String> indexNodes = restoredIndexNames.stream()\n+            .flatMap(index -> internalCluster().nodesInclude(index).stream())\n+            .collect(Collectors.toSet());\n+        final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n+        final Map<String, String> nodeNameToId = state.getNodes()\n+            .stream()\n+            .collect(Collectors.toMap(DiscoveryNode::getName, DiscoveryNode::getId));\n+\n+        for (String indexNode : indexNodes) {\n+            final String indexNodeId = nodeNameToId.get(indexNode);\n+            putShutdown(indexNodeId);\n+            final int shards = (int) StreamSupport.stream(state.routingTable().allShards(restoredIndexNamesArray).spliterator(), false)\n+                .filter(s -> indexNodeId.equals(s.currentNodeId()))\n+                .count();\n+            assert shards > 0;\n+\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_FETCH_ASYNC_THREAD_POOL_NAME);\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_PREWARMING_THREAD_POOL_NAME);\n+            waitForBlobCacheFillsToComplete();\n+            final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n+            cacheService.synchronizeCache();\n+\n+            logger.info(\"--> Restarting [{}/{}]\", indexNodeId, indexNode);\n+            internalCluster().restartNode(indexNode, new InternalTestCluster.RestartCallback() {\n+                @Override\n+                public Settings onNodeStopped(String nodeName) throws Exception {\n+                    assertBusy(() -> {\n+                        ClusterHealthResponse response = client().admin()\n+                            .cluster()\n+                            .health(Requests.clusterHealthRequest(restoredIndexNamesArray))\n+                            .actionGet();\n+                        assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n+                    });\n+                    return super.onNodeStopped(nodeName);\n+                }\n+            });\n+            // leave shutdown in place for some nodes to check that shards get assigned anyway.\n+            if (randomBoolean()) {\n+                removeShutdown(indexNodeId);\n+            }\n+        }\n+\n+        ensureGreen(restoredIndexNamesArray);\n+    }\n+\n+    private List<String> setupMountedIndices() throws Exception {\n+        int count = between(1, 10);\n+        List<String> restoredIndices = new ArrayList<>();\n+        for (int i = 0; i < count; ++i) {\n+            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 101,
+      "side": "RIGHT",
+      "original_position": 101,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 861696895,
+          "user": "henningandersen",
+          "body": ":+1: , see 9db957e6cc136ebef03d4c5920723ae158bf2851, also now just does one repo.",
+          "created_at": "2022-04-29T10:54:13Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 861030250,
+      "created_at": "2022-04-28T15:28:50Z",
+      "user": "tlrx",
+      "body": "```suggestion\r\n            final String repositoryName = \"repository_\" + i;\r\n```",
+      "path": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+      "diff_hunk": "@@ -0,0 +1,134 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.ArrayList;\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+import java.util.stream.StreamSupport;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n+public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n+    }\n+\n+    public void testAllocationDisabledDuringShutdown() throws Exception {\n+        final List<String> restoredIndexNames = setupMountedIndices();\n+        final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n+        final Set<String> indexNodes = restoredIndexNames.stream()\n+            .flatMap(index -> internalCluster().nodesInclude(index).stream())\n+            .collect(Collectors.toSet());\n+        final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n+        final Map<String, String> nodeNameToId = state.getNodes()\n+            .stream()\n+            .collect(Collectors.toMap(DiscoveryNode::getName, DiscoveryNode::getId));\n+\n+        for (String indexNode : indexNodes) {\n+            final String indexNodeId = nodeNameToId.get(indexNode);\n+            putShutdown(indexNodeId);\n+            final int shards = (int) StreamSupport.stream(state.routingTable().allShards(restoredIndexNamesArray).spliterator(), false)\n+                .filter(s -> indexNodeId.equals(s.currentNodeId()))\n+                .count();\n+            assert shards > 0;\n+\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_FETCH_ASYNC_THREAD_POOL_NAME);\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_PREWARMING_THREAD_POOL_NAME);\n+            waitForBlobCacheFillsToComplete();\n+            final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n+            cacheService.synchronizeCache();\n+\n+            logger.info(\"--> Restarting [{}/{}]\", indexNodeId, indexNode);\n+            internalCluster().restartNode(indexNode, new InternalTestCluster.RestartCallback() {\n+                @Override\n+                public Settings onNodeStopped(String nodeName) throws Exception {\n+                    assertBusy(() -> {\n+                        ClusterHealthResponse response = client().admin()\n+                            .cluster()\n+                            .health(Requests.clusterHealthRequest(restoredIndexNamesArray))\n+                            .actionGet();\n+                        assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n+                    });\n+                    return super.onNodeStopped(nodeName);\n+                }\n+            });\n+            // leave shutdown in place for some nodes to check that shards get assigned anyway.\n+            if (randomBoolean()) {\n+                removeShutdown(indexNodeId);\n+            }\n+        }\n+\n+        ensureGreen(restoredIndexNamesArray);\n+    }\n+\n+    private List<String> setupMountedIndices() throws Exception {\n+        int count = between(1, 10);\n+        List<String> restoredIndices = new ArrayList<>();\n+        for (int i = 0; i < count; ++i) {\n+            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createAndPopulateIndex(indexName, Settings.builder());\n+\n+            final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 104,
+      "side": "RIGHT",
+      "original_position": 104,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 861697071,
+          "user": "henningandersen",
+          "body": "Changed to one repo in 9db957e6cc136ebef03d4c5920723ae158bf2851",
+          "created_at": "2022-04-29T10:54:27Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 861035213,
+      "created_at": "2022-04-28T15:33:37Z",
+      "user": "tlrx",
+      "body": "Can we move up this method, after the `nodePlugins()` method?",
+      "path": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+      "diff_hunk": "@@ -0,0 +1,134 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.searchablesnapshots.allocation;\n+\n+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;\n+import org.elasticsearch.client.internal.Requests;\n+import org.elasticsearch.cluster.ClusterState;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.common.util.CollectionUtils;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.snapshots.SnapshotId;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+import org.elasticsearch.xpack.searchablesnapshots.BaseSearchableSnapshotsIntegTestCase;\n+import org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService;\n+import org.elasticsearch.xpack.shutdown.DeleteShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.PutShutdownNodeAction;\n+import org.elasticsearch.xpack.shutdown.ShutdownPlugin;\n+import org.hamcrest.Matchers;\n+\n+import java.util.ArrayList;\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.Locale;\n+import java.util.Map;\n+import java.util.Set;\n+import java.util.concurrent.ExecutionException;\n+import java.util.stream.Collectors;\n+import java.util.stream.StreamSupport;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n+public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n+    }\n+\n+    public void testAllocationDisabledDuringShutdown() throws Exception {\n+        final List<String> restoredIndexNames = setupMountedIndices();\n+        final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n+        final Set<String> indexNodes = restoredIndexNames.stream()\n+            .flatMap(index -> internalCluster().nodesInclude(index).stream())\n+            .collect(Collectors.toSet());\n+        final ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setNodes(true).get().getState();\n+        final Map<String, String> nodeNameToId = state.getNodes()\n+            .stream()\n+            .collect(Collectors.toMap(DiscoveryNode::getName, DiscoveryNode::getId));\n+\n+        for (String indexNode : indexNodes) {\n+            final String indexNodeId = nodeNameToId.get(indexNode);\n+            putShutdown(indexNodeId);\n+            final int shards = (int) StreamSupport.stream(state.routingTable().allShards(restoredIndexNamesArray).spliterator(), false)\n+                .filter(s -> indexNodeId.equals(s.currentNodeId()))\n+                .count();\n+            assert shards > 0;\n+\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_FETCH_ASYNC_THREAD_POOL_NAME);\n+            assertExecutorIsIdle(SearchableSnapshots.CACHE_PREWARMING_THREAD_POOL_NAME);\n+            waitForBlobCacheFillsToComplete();\n+            final CacheService cacheService = internalCluster().getInstance(CacheService.class, indexNode);\n+            cacheService.synchronizeCache();\n+\n+            logger.info(\"--> Restarting [{}/{}]\", indexNodeId, indexNode);\n+            internalCluster().restartNode(indexNode, new InternalTestCluster.RestartCallback() {\n+                @Override\n+                public Settings onNodeStopped(String nodeName) throws Exception {\n+                    assertBusy(() -> {\n+                        ClusterHealthResponse response = client().admin()\n+                            .cluster()\n+                            .health(Requests.clusterHealthRequest(restoredIndexNamesArray))\n+                            .actionGet();\n+                        assertThat(response.getUnassignedShards(), Matchers.equalTo(shards));\n+                    });\n+                    return super.onNodeStopped(nodeName);\n+                }\n+            });\n+            // leave shutdown in place for some nodes to check that shards get assigned anyway.\n+            if (randomBoolean()) {\n+                removeShutdown(indexNodeId);\n+            }\n+        }\n+\n+        ensureGreen(restoredIndexNamesArray);\n+    }\n+\n+    private List<String> setupMountedIndices() throws Exception {\n+        int count = between(1, 10);\n+        List<String> restoredIndices = new ArrayList<>();\n+        for (int i = 0; i < count; ++i) {\n+            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createAndPopulateIndex(indexName, Settings.builder());\n+\n+            final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            createRepository(repositoryName, \"mock\");\n+\n+            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+            assertAcked(client().admin().indices().prepareDelete(indexName));\n+            restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));\n+        }\n+        return restoredIndices;\n+    }\n+\n+    private void putShutdown(String nodeToRestartId) throws InterruptedException, ExecutionException {\n+        PutShutdownNodeAction.Request putShutdownRequest = new PutShutdownNodeAction.Request(\n+            nodeToRestartId,\n+            SingleNodeShutdownMetadata.Type.RESTART,\n+            this.getTestName(),\n+            null,\n+            null\n+        );\n+        assertTrue(client().execute(PutShutdownNodeAction.INSTANCE, putShutdownRequest).get().isAcknowledged());\n+    }\n+\n+    private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n+        assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n+    }\n+\n+    @Override\n+    protected int numberOfShards() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 130,
+      "side": "RIGHT",
+      "original_position": 130,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 861697248,
+          "user": "henningandersen",
+          "body": ":+1: , see 9db957e6cc136ebef03d4c5920723ae158bf2851",
+          "created_at": "2022-04-29T10:54:42Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 956637497,
+      "created_at": "2022-04-28T15:34:29Z",
+      "user": "tlrx",
+      "state": "APPROVED",
+      "body": "LGTM - I left some minor comments."
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-29T10:46:11Z",
+      "sha": "df9115a0833a8344c9a1c38927b0029b10a2d896",
+      "message": "Rename is delayed method.",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-29T10:46:11Z",
+      "author_date": "2022-04-29T10:46:11Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-29T10:46:11Z",
+      "diff_text": "x-pack/plugin/searchable-snapshots/src/main/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotAllocator.java\n@@ -342,15 +342,15 @@ private AllocateUnassignedDecision decideAllocation(RoutingAllocation allocation\n                 );\n                 return AllocateUnassignedDecision.yes(nodeWithHighestMatch.node(), null, nodeDecisions, true);\n             }\n-        } else if (isDelayedDueToShutdown(allocation, shardRouting)) {\n+        } else if (isDelayedDueToNodeRestart(allocation, shardRouting)) {\n             return ReplicaShardAllocator.delayedDecision(shardRouting, allocation, logger, nodeDecisions);\n         }\n \n         // TODO: do we need handling of delayed allocation for leaving replicas here?\n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n-    private boolean isDelayedDueToShutdown(RoutingAllocation allocation, ShardRouting shardRouting) {\n+    private boolean isDelayedDueToNodeRestart(RoutingAllocation allocation, ShardRouting shardRouting) {\n         if (shardRouting.unassignedInfo().isDelayed()) {\n             String lastAllocatedNodeId = shardRouting.unassignedInfo().getLastAllocatedNodeId();\n             if (lastAllocatedNodeId != null) {",
+      "diff": [
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/main/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotAllocator.java",
+          "patch": "@@ -342,15 +342,15 @@ private AllocateUnassignedDecision decideAllocation(RoutingAllocation allocation\n                 );\n                 return AllocateUnassignedDecision.yes(nodeWithHighestMatch.node(), null, nodeDecisions, true);\n             }\n-        } else if (isDelayedDueToShutdown(allocation, shardRouting)) {\n+        } else if (isDelayedDueToNodeRestart(allocation, shardRouting)) {\n             return ReplicaShardAllocator.delayedDecision(shardRouting, allocation, logger, nodeDecisions);\n         }\n \n         // TODO: do we need handling of delayed allocation for leaving replicas here?\n         return AllocateUnassignedDecision.NOT_TAKEN;\n     }\n \n-    private boolean isDelayedDueToShutdown(RoutingAllocation allocation, ShardRouting shardRouting) {\n+    private boolean isDelayedDueToNodeRestart(RoutingAllocation allocation, ShardRouting shardRouting) {\n         if (shardRouting.unassignedInfo().isDelayed()) {\n             String lastAllocatedNodeId = shardRouting.unassignedInfo().getLastAllocatedNodeId();\n             if (lastAllocatedNodeId != null) {"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-29T10:47:31Z",
+      "sha": "263b644ec66c3e1fff7031bf255e3c3904c51d52",
+      "message": "Allow more data nodes",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-29T10:47:31Z",
+      "author_date": "2022-04-29T10:47:31Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-29T10:47:31Z",
+      "diff_text": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java\n@@ -38,7 +38,7 @@\n \n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n \n-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n \n     @Override",
+      "diff": [
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+          "patch": "@@ -38,7 +38,7 @@\n \n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n \n-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2, numDataNodes = 2)\n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, minNumDataNodes = 2)\n public class SearchableSnapshotShutdownIntegTests extends BaseSearchableSnapshotsIntegTestCase {\n \n     @Override"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-29T10:49:13Z",
+      "sha": "9db957e6cc136ebef03d4c5920723ae158bf2851",
+      "message": "Only one repo and better index name",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-29T10:48:59Z",
+      "author_date": "2022-04-29T10:48:59Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-29T10:49:13Z",
+      "diff_text": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java\n@@ -97,13 +97,13 @@ public Settings onNodeStopped(String nodeName) throws Exception {\n     private List<String> setupMountedIndices() throws Exception {\n         int count = between(1, 10);\n         List<String> restoredIndices = new ArrayList<>();\n+        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+        createRepository(repositoryName, \"mock\");\n+\n         for (int i = 0; i < count; ++i) {\n-            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            final String indexName = \"index_\" + i;\n             createAndPopulateIndex(indexName, Settings.builder());\n \n-            final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n-            createRepository(repositoryName, \"mock\");\n-\n             final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n             assertAcked(client().admin().indices().prepareDelete(indexName));\n             restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));",
+      "diff": [
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+          "patch": "@@ -97,13 +97,13 @@ public Settings onNodeStopped(String nodeName) throws Exception {\n     private List<String> setupMountedIndices() throws Exception {\n         int count = between(1, 10);\n         List<String> restoredIndices = new ArrayList<>();\n+        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+        createRepository(repositoryName, \"mock\");\n+\n         for (int i = 0; i < count; ++i) {\n-            final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n+            final String indexName = \"index_\" + i;\n             createAndPopulateIndex(indexName, Settings.builder());\n \n-            final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);\n-            createRepository(repositoryName, \"mock\");\n-\n             final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n             assertAcked(client().admin().indices().prepareDelete(indexName));\n             restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-29T10:49:50Z",
+      "sha": "675ac084930a770ae0375b50601378c010bb8baf",
+      "message": "Move number of shards method",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-29T10:49:50Z",
+      "author_date": "2022-04-29T10:49:50Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-29T10:49:50Z",
+      "diff_text": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java\n@@ -46,6 +46,12 @@ protected Collection<Class<? extends Plugin>> nodePlugins() {\n         return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n     }\n \n+    @Override\n+    protected int numberOfShards() {\n+        // use 1 shard per index and instead use multiple indices to have multiple shards.\n+        return 1;\n+    }\n+\n     public void testAllocationDisabledDuringShutdown() throws Exception {\n         final List<String> restoredIndexNames = setupMountedIndices();\n         final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n@@ -125,10 +131,4 @@ private void putShutdown(String nodeToRestartId) throws InterruptedException, Ex\n     private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n         assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n     }\n-\n-    @Override\n-    protected int numberOfShards() {\n-        // use 1 shard per index and instead use multiple indices to have multiple shards.\n-        return 1;\n-    }\n }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+          "patch": "@@ -46,6 +46,12 @@ protected Collection<Class<? extends Plugin>> nodePlugins() {\n         return CollectionUtils.appendToCopy(super.nodePlugins(), ShutdownPlugin.class);\n     }\n \n+    @Override\n+    protected int numberOfShards() {\n+        // use 1 shard per index and instead use multiple indices to have multiple shards.\n+        return 1;\n+    }\n+\n     public void testAllocationDisabledDuringShutdown() throws Exception {\n         final List<String> restoredIndexNames = setupMountedIndices();\n         final String[] restoredIndexNamesArray = restoredIndexNames.toArray(String[]::new);\n@@ -125,10 +131,4 @@ private void putShutdown(String nodeToRestartId) throws InterruptedException, Ex\n     private void removeShutdown(String node) throws ExecutionException, InterruptedException {\n         assertTrue(client().execute(DeleteShutdownNodeAction.INSTANCE, new DeleteShutdownNodeAction.Request(node)).get().isAcknowledged());\n     }\n-\n-    @Override\n-    protected int numberOfShards() {\n-        // use 1 shard per index and instead use multiple indices to have multiple shards.\n-        return 1;\n-    }\n }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-04-29T10:50:56Z",
+      "sha": "c929ac888ba14b839282d57a7255064731030040",
+      "message": "Different snapshot names",
+      "author": "Henning Andersen",
+      "author_email": "henning.andersen@elastic.co",
+      "author_raw_date": "2022-04-29T10:50:56Z",
+      "author_date": "2022-04-29T10:50:56Z",
+      "committer": "Henning Andersen",
+      "committer_email": "henning.andersen@elastic.co",
+      "raw_date": "2022-04-29T10:50:56Z",
+      "diff_text": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java\n@@ -110,7 +110,7 @@ private List<String> setupMountedIndices() throws Exception {\n             final String indexName = \"index_\" + i;\n             createAndPopulateIndex(indexName, Settings.builder());\n \n-            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-\" + i, List.of(indexName)).snapshotId();\n             assertAcked(client().admin().indices().prepareDelete(indexName));\n             restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));\n         }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/allocation/SearchableSnapshotShutdownIntegTests.java",
+          "patch": "@@ -110,7 +110,7 @@ private List<String> setupMountedIndices() throws Exception {\n             final String indexName = \"index_\" + i;\n             createAndPopulateIndex(indexName, Settings.builder());\n \n-            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-1\", List.of(indexName)).snapshotId();\n+            final SnapshotId snapshotId = createSnapshot(repositoryName, \"snapshot-\" + i, List.of(indexName)).snapshotId();\n             assertAcked(client().admin().indices().prepareDelete(indexName));\n             restoredIndices.add(mountSnapshot(repositoryName, snapshotId.getName(), indexName, Settings.EMPTY));\n         }"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 957569985,
+      "created_at": "2022-04-29T10:53:07Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 957570273,
+      "created_at": "2022-04-29T10:53:26Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 957571010,
+      "created_at": "2022-04-29T10:54:13Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 957571239,
+      "created_at": "2022-04-29T10:54:27Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 957571579,
+      "created_at": "2022-04-29T10:54:42Z",
+      "user": "henningandersen",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}

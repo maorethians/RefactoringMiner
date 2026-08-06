@@ -1,0 +1,289 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 10970,
+  "pr_number": 10970,
+  "title": "Native patch: handling file permission properly",
+  "user": "meteorcloudy",
+  "created_at": "2020-03-16T16:49:46Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "cla: yes"
+  ],
+  "base_commit": "3d2d8b627500307f7317ad9c7b0eecdf20b81674",
+  "merge_commit_sha": "088a910d5c843a72736bfad2336a5a1ea577e583",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "review_request_removed",
+    "assigned",
+    "closed"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/10970",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2020-03-16T16:49:04Z",
+      "sha": "812e6e716b47c00e41778064ed2510d1d59db9b6",
+      "message": "Native patch: handling file permission properly\n\n1. If no file permission is specified in the patch file, preserve the\noriginal file permission.\n\n2. If file permission is specified, then set it as it is.\n\nFixes https://github.com/bazelbuild/bazel/issues/10913\n\nRELNOTES: Native patch can handle file permission properly",
+      "author": "Yun Peng",
+      "author_email": "pcloudy@google.com",
+      "author_raw_date": "2020-03-16T16:45:31Z",
+      "author_date": "2020-03-16T16:45:31Z",
+      "committer": "Yun Peng",
+      "committer_email": "pcloudy@google.com",
+      "raw_date": "2020-03-16T16:49:04Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java\n@@ -156,7 +156,9 @@ private enum LineType {\n     GIT_HEADER,\n     RENAME_FROM,\n     RENAME_TO,\n-    GIT_LINE,\n+    NEW_MODE,\n+    NEW_FILE_MODE,\n+    OTHER_GIT_LINE,\n     UNKNOWN\n   }\n \n@@ -203,9 +205,15 @@ private static LineType getLineType(String line, boolean isReadingChunk, boolean\n         if (line.startsWith(\"rename to \")) {\n           return LineType.RENAME_TO;\n         }\n+        if (line.startsWith(\"new mode \")) {\n+          return LineType.NEW_MODE;\n+        }\n+        if (line.startsWith(\"new file mode \")) {\n+          return LineType.NEW_FILE_MODE;\n+        }\n         for (String prefix : GIT_LINE_PREFIXES) {\n           if (line.startsWith(prefix)) {\n-            return LineType.GIT_LINE;\n+            return LineType.OTHER_GIT_LINE;\n           }\n         }\n       }\n@@ -229,8 +237,35 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n     FileSystemUtils.writeLinesAs(file, StandardCharsets.UTF_8, content);\n   }\n \n+  private static boolean getReadPermission(int permission) {\n+    // Parse read permission from posix file permission notation\n+    return permission / 4 % 2 == 1;\n+  }\n+\n+  private static boolean getWritePermission(int permission) {\n+    // Parse write permission from posix file permission notation\n+    return permission / 2 % 2 == 1;\n+  }\n+\n+  private static boolean getExecutablePermission(int permission) {\n+    // Parse executable permission from posix file permission notation\n+    return permission % 2 == 1;\n+  }\n+\n+  private static int getFilePermissionValue(Path file) throws IOException {\n+    return (file.isReadable() ? 4 : 0) +\n+        (file.isWritable() ? 2 : 0) +\n+        (file.isExecutable() ? 1 : 0);\n+  }\n+\n+  private static void setFilePermission(Path file, int permission) throws IOException {\n+      file.setReadable(getReadPermission(permission));\n+      file.setWritable(getWritePermission(permission));\n+      file.setExecutable((getExecutablePermission(permission)));\n+  }\n+\n   private static void applyPatchToFile(\n-      Patch<String> patch, Path oldFile, Path newFile, boolean isRenaming)\n+      Patch<String> patch, Path oldFile, Path newFile, boolean isRenaming, int filePermission)\n       throws IOException, PatchFailedException {\n     // The file we should read oldContent from.\n     Path inputFile = null;\n@@ -245,6 +280,10 @@ private static void applyPatchToFile(\n       oldContent = new ArrayList<>();\n     } else {\n       oldContent = readFile(inputFile);\n+      // Preserve old file permission if no explicit permission is set.\n+      if (filePermission == -1) {\n+        filePermission = getFilePermissionValue(inputFile);\n+      }\n     }\n \n     List<String> newContent = OffsetPatch.applyTo(patch, oldContent);\n@@ -268,6 +307,9 @@ private static void applyPatchToFile(\n \n     if (outputFile != null && !isDeleteFile) {\n       writeFile(outputFile, newContent);\n+      if (filePermission != -1) {\n+        setFilePermission(outputFile, filePermission);\n+      }\n     }\n   }\n \n@@ -448,6 +490,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n     Path newFile = null;\n     int oldLineCount = 0;\n     int newLineCount = 0;\n+    int filePermission = -1;\n     Result result;\n \n     for (int i = 0; i < patchFileLines.size(); i++) {\n@@ -464,6 +507,18 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n           newFileStr = extractPath(line, strip, i + 1);\n           newFile = getFilePath(newFileStr, outputDirectory, i + 1);\n           break;\n+        case NEW_MODE:\n+        case NEW_FILE_MODE:\n+          // The line should look like: \"new mode 100755\" or \"new file mode 100755\"\n+          // 7 is the file permission for owner, which is at index 12 or 17\n+          int index = type == LineType.NEW_MODE ? 12 : 17;\n+          char c = line.charAt(index);\n+          if (c < '0' || c > '7') {\n+            throw new PatchFailedException(\n+                \"Wrong file mode format at line \"+ (i + 1) + \": \" + line);\n+          }\n+          filePermission = Character.getNumericValue(c);\n+          break;\n         case CHUNK_HEAD:\n           int pos = line.indexOf(\"@@\", 2);\n           String headerStr = line.substring(0, pos + 2);\n@@ -543,7 +598,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n             newFile = getFilePath(newFileStr, outputDirectory, i + 1);\n           }\n           break;\n-        case GIT_LINE:\n+        case OTHER_GIT_LINE:\n           break;\n         case GIT_HEADER:\n         case UNKNOWN:\n@@ -553,7 +608,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n           // Renaming is a git only format\n           boolean isRenaming = isGitDiff && hasRenameFrom && hasRenameTo;\n \n-          if (!patchContent.isEmpty() || isRenaming) {\n+          if (!patchContent.isEmpty() || isRenaming || filePermission != -1) {\n             // We collected something useful, let's do some sanity checks before applying the patch.\n             int patchStartLocation = i + 1 - patchContent.size();\n \n@@ -569,7 +624,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n             checkFilesStatusForPatching(\n                 patch, oldFile, newFile, oldFileStr, newFileStr, patchStartLocation);\n \n-            applyPatchToFile(patch, oldFile, newFile, isRenaming);\n+            applyPatchToFile(patch, oldFile, newFile, isRenaming, filePermission);\n           }\n \n           patchContent.clear();\n@@ -578,11 +633,27 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n           newFileStr = null;\n           oldFile = null;\n           newFile = null;\n+          filePermission = -1;\n           oldLineCount = 0;\n           newLineCount = 0;\n           isReadingChunk = false;\n           // If the new patch starts with \"diff --git \" then it's a git diff.\n           isGitDiff = type == LineType.GIT_HEADER;\n+          if (isGitDiff) {\n+            // In case there is no line starting with +++ and --- (file permission change),\n+            // try to parse the file names from the line starting with \"diff --git\"\n+            String[] args = line.split(\" \");\n+            if (args.length >= 4) {\n+              oldFileStr = stripPath(args[2], strip);\n+              if (!oldFileStr.isEmpty()) {\n+                oldFile = getFilePath(oldFileStr, outputDirectory, i + 1);\n+              }\n+              newFileStr = stripPath(args[3], strip);\n+              if (!newFileStr.isEmpty()) {\n+                newFile = getFilePath(newFileStr, outputDirectory, i + 1);\n+              }\n+            }\n+          }\n           hasRenameFrom = false;\n           hasRenameTo = false;\n           break;\nsrc/test/java/com/google/devtools/build/lib/bazel/repository/PatchUtilTest.java\n@@ -50,7 +50,7 @@ public void testAddFile() throws IOException, PatchFailedException {\n         scratch.file(\n             \"/root/patchfile\",\n             \"diff --git a/newfile b/newfile\",\n-            \"new file mode 100644\",\n+            \"new file mode 100544\",\n             \"index 0000000..f742c88\",\n             \"--- /dev/null\",\n             \"+++ b/newfile\",\n@@ -63,6 +63,10 @@ public void testAddFile() throws IOException, PatchFailedException {\n     Path newFile = root.getRelative(\"newfile\");\n     ImmutableList<String> newFileContent = ImmutableList.of(\"I'm a new file\", \"hello, world\");\n     assertThat(PatchUtil.readFile(newFile)).containsExactlyElementsIn(newFileContent);\n+    // Make sure file permission is set as specified.\n+    assertThat(newFile.isReadable()).isTrue();\n+    assertThat(newFile.isWritable()).isFalse();\n+    assertThat(newFile.isExecutable()).isTrue();\n   }\n \n   @Test\n@@ -154,6 +158,9 @@ public void testApplyToOldFile() throws IOException, PatchFailedException {\n   public void testApplyToNewFile() throws IOException, PatchFailedException {\n     // If only newfile exists, we should patch the new file.\n     Path newFile = scratch.file(\"/root/newfile\", \"line one\");\n+    newFile.setReadable(true);\n+    newFile.setWritable(true);\n+    newFile.setExecutable(true);\n     Path patchFile =\n         scratch.file(\n             \"/root/patchfile\",\n@@ -165,6 +172,29 @@ public void testApplyToNewFile() throws IOException, PatchFailedException {\n     PatchUtil.apply(patchFile, 0, root);\n     ImmutableList<String> newContent = ImmutableList.of(\"line one\", \"line two\");\n     assertThat(PatchUtil.readFile(newFile)).containsExactlyElementsIn(newContent);\n+    // Make sure file permission is preserved.\n+    assertThat(newFile.isReadable()).isTrue();\n+    assertThat(newFile.isWritable()).isTrue();\n+    assertThat(newFile.isExecutable()).isTrue();\n+  }\n+\n+  @Test\n+  public void testChangeFilePermission() throws IOException, PatchFailedException {\n+    Path myFile = scratch.file(\"/root/test.sh\", \"line one\");\n+    myFile.setReadable(true);\n+    myFile.setWritable(true);\n+    myFile.setExecutable(false);\n+    Path patchFile =\n+        scratch.file(\n+            \"/root/patchfile\",\n+            \"diff --git a/test.sh b/test.sh\",\n+            \"old mode 100644\",\n+            \"new mode 100755\");\n+    PatchUtil.apply(patchFile, 1, root);\n+    assertThat(PatchUtil.readFile(myFile)).containsExactlyElementsIn(ImmutableList.of(\"line one\"));\n+    assertThat(myFile.isReadable()).isTrue();\n+    assertThat(myFile.isWritable()).isTrue();\n+    assertThat(myFile.isExecutable()).isTrue();\n   }\n \n   @Test\n@@ -378,7 +408,7 @@ public void testMissingBothOldAndNewFile() throws IOException {\n     Path patchFile =\n         scratch.file(\n             \"/root/patchfile\",\n-            \"diff --git a/foo.cc b/foo.cc\",\n+            \"diff --git a/ b/\",\n             \"index f3008f9..ec4aaa0 100644\",\n             \"@@ -2,4 +2,5 @@\",\n             \" \",",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java",
+          "patch": "@@ -156,7 +156,9 @@ private enum LineType {\n     GIT_HEADER,\n     RENAME_FROM,\n     RENAME_TO,\n-    GIT_LINE,\n+    NEW_MODE,\n+    NEW_FILE_MODE,\n+    OTHER_GIT_LINE,\n     UNKNOWN\n   }\n \n@@ -203,9 +205,15 @@ private static LineType getLineType(String line, boolean isReadingChunk, boolean\n         if (line.startsWith(\"rename to \")) {\n           return LineType.RENAME_TO;\n         }\n+        if (line.startsWith(\"new mode \")) {\n+          return LineType.NEW_MODE;\n+        }\n+        if (line.startsWith(\"new file mode \")) {\n+          return LineType.NEW_FILE_MODE;\n+        }\n         for (String prefix : GIT_LINE_PREFIXES) {\n           if (line.startsWith(prefix)) {\n-            return LineType.GIT_LINE;\n+            return LineType.OTHER_GIT_LINE;\n           }\n         }\n       }\n@@ -229,8 +237,35 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n     FileSystemUtils.writeLinesAs(file, StandardCharsets.UTF_8, content);\n   }\n \n+  private static boolean getReadPermission(int permission) {\n+    // Parse read permission from posix file permission notation\n+    return permission / 4 % 2 == 1;\n+  }\n+\n+  private static boolean getWritePermission(int permission) {\n+    // Parse write permission from posix file permission notation\n+    return permission / 2 % 2 == 1;\n+  }\n+\n+  private static boolean getExecutablePermission(int permission) {\n+    // Parse executable permission from posix file permission notation\n+    return permission % 2 == 1;\n+  }\n+\n+  private static int getFilePermissionValue(Path file) throws IOException {\n+    return (file.isReadable() ? 4 : 0) +\n+        (file.isWritable() ? 2 : 0) +\n+        (file.isExecutable() ? 1 : 0);\n+  }\n+\n+  private static void setFilePermission(Path file, int permission) throws IOException {\n+      file.setReadable(getReadPermission(permission));\n+      file.setWritable(getWritePermission(permission));\n+      file.setExecutable((getExecutablePermission(permission)));\n+  }\n+\n   private static void applyPatchToFile(\n-      Patch<String> patch, Path oldFile, Path newFile, boolean isRenaming)\n+      Patch<String> patch, Path oldFile, Path newFile, boolean isRenaming, int filePermission)\n       throws IOException, PatchFailedException {\n     // The file we should read oldContent from.\n     Path inputFile = null;\n@@ -245,6 +280,10 @@ private static void applyPatchToFile(\n       oldContent = new ArrayList<>();\n     } else {\n       oldContent = readFile(inputFile);\n+      // Preserve old file permission if no explicit permission is set.\n+      if (filePermission == -1) {\n+        filePermission = getFilePermissionValue(inputFile);\n+      }\n     }\n \n     List<String> newContent = OffsetPatch.applyTo(patch, oldContent);\n@@ -268,6 +307,9 @@ private static void applyPatchToFile(\n \n     if (outputFile != null && !isDeleteFile) {\n       writeFile(outputFile, newContent);\n+      if (filePermission != -1) {\n+        setFilePermission(outputFile, filePermission);\n+      }\n     }\n   }\n \n@@ -448,6 +490,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n     Path newFile = null;\n     int oldLineCount = 0;\n     int newLineCount = 0;\n+    int filePermission = -1;\n     Result result;\n \n     for (int i = 0; i < patchFileLines.size(); i++) {\n@@ -464,6 +507,18 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n           newFileStr = extractPath(line, strip, i + 1);\n           newFile = getFilePath(newFileStr, outputDirectory, i + 1);\n           break;\n+        case NEW_MODE:\n+        case NEW_FILE_MODE:\n+          // The line should look like: \"new mode 100755\" or \"new file mode 100755\"\n+          // 7 is the file permission for owner, which is at index 12 or 17\n+          int index = type == LineType.NEW_MODE ? 12 : 17;\n+          char c = line.charAt(index);\n+          if (c < '0' || c > '7') {\n+            throw new PatchFailedException(\n+                \"Wrong file mode format at line \"+ (i + 1) + \": \" + line);\n+          }\n+          filePermission = Character.getNumericValue(c);\n+          break;\n         case CHUNK_HEAD:\n           int pos = line.indexOf(\"@@\", 2);\n           String headerStr = line.substring(0, pos + 2);\n@@ -543,7 +598,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n             newFile = getFilePath(newFileStr, outputDirectory, i + 1);\n           }\n           break;\n-        case GIT_LINE:\n+        case OTHER_GIT_LINE:\n           break;\n         case GIT_HEADER:\n         case UNKNOWN:\n@@ -553,7 +608,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n           // Renaming is a git only format\n           boolean isRenaming = isGitDiff && hasRenameFrom && hasRenameTo;\n \n-          if (!patchContent.isEmpty() || isRenaming) {\n+          if (!patchContent.isEmpty() || isRenaming || filePermission != -1) {\n             // We collected something useful, let's do some sanity checks before applying the patch.\n             int patchStartLocation = i + 1 - patchContent.size();\n \n@@ -569,7 +624,7 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n             checkFilesStatusForPatching(\n                 patch, oldFile, newFile, oldFileStr, newFileStr, patchStartLocation);\n \n-            applyPatchToFile(patch, oldFile, newFile, isRenaming);\n+            applyPatchToFile(patch, oldFile, newFile, isRenaming, filePermission);\n           }\n \n           patchContent.clear();\n@@ -578,11 +633,27 @@ public static void apply(Path patchFile, int strip, Path outputDirectory)\n           newFileStr = null;\n           oldFile = null;\n           newFile = null;\n+          filePermission = -1;\n           oldLineCount = 0;\n           newLineCount = 0;\n           isReadingChunk = false;\n           // If the new patch starts with \"diff --git \" then it's a git diff.\n           isGitDiff = type == LineType.GIT_HEADER;\n+          if (isGitDiff) {\n+            // In case there is no line starting with +++ and --- (file permission change),\n+            // try to parse the file names from the line starting with \"diff --git\"\n+            String[] args = line.split(\" \");\n+            if (args.length >= 4) {\n+              oldFileStr = stripPath(args[2], strip);\n+              if (!oldFileStr.isEmpty()) {\n+                oldFile = getFilePath(oldFileStr, outputDirectory, i + 1);\n+              }\n+              newFileStr = stripPath(args[3], strip);\n+              if (!newFileStr.isEmpty()) {\n+                newFile = getFilePath(newFileStr, outputDirectory, i + 1);\n+              }\n+            }\n+          }\n           hasRenameFrom = false;\n           hasRenameTo = false;\n           break;"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/bazel/repository/PatchUtilTest.java",
+          "patch": "@@ -50,7 +50,7 @@ public void testAddFile() throws IOException, PatchFailedException {\n         scratch.file(\n             \"/root/patchfile\",\n             \"diff --git a/newfile b/newfile\",\n-            \"new file mode 100644\",\n+            \"new file mode 100544\",\n             \"index 0000000..f742c88\",\n             \"--- /dev/null\",\n             \"+++ b/newfile\",\n@@ -63,6 +63,10 @@ public void testAddFile() throws IOException, PatchFailedException {\n     Path newFile = root.getRelative(\"newfile\");\n     ImmutableList<String> newFileContent = ImmutableList.of(\"I'm a new file\", \"hello, world\");\n     assertThat(PatchUtil.readFile(newFile)).containsExactlyElementsIn(newFileContent);\n+    // Make sure file permission is set as specified.\n+    assertThat(newFile.isReadable()).isTrue();\n+    assertThat(newFile.isWritable()).isFalse();\n+    assertThat(newFile.isExecutable()).isTrue();\n   }\n \n   @Test\n@@ -154,6 +158,9 @@ public void testApplyToOldFile() throws IOException, PatchFailedException {\n   public void testApplyToNewFile() throws IOException, PatchFailedException {\n     // If only newfile exists, we should patch the new file.\n     Path newFile = scratch.file(\"/root/newfile\", \"line one\");\n+    newFile.setReadable(true);\n+    newFile.setWritable(true);\n+    newFile.setExecutable(true);\n     Path patchFile =\n         scratch.file(\n             \"/root/patchfile\",\n@@ -165,6 +172,29 @@ public void testApplyToNewFile() throws IOException, PatchFailedException {\n     PatchUtil.apply(patchFile, 0, root);\n     ImmutableList<String> newContent = ImmutableList.of(\"line one\", \"line two\");\n     assertThat(PatchUtil.readFile(newFile)).containsExactlyElementsIn(newContent);\n+    // Make sure file permission is preserved.\n+    assertThat(newFile.isReadable()).isTrue();\n+    assertThat(newFile.isWritable()).isTrue();\n+    assertThat(newFile.isExecutable()).isTrue();\n+  }\n+\n+  @Test\n+  public void testChangeFilePermission() throws IOException, PatchFailedException {\n+    Path myFile = scratch.file(\"/root/test.sh\", \"line one\");\n+    myFile.setReadable(true);\n+    myFile.setWritable(true);\n+    myFile.setExecutable(false);\n+    Path patchFile =\n+        scratch.file(\n+            \"/root/patchfile\",\n+            \"diff --git a/test.sh b/test.sh\",\n+            \"old mode 100644\",\n+            \"new mode 100755\");\n+    PatchUtil.apply(patchFile, 1, root);\n+    assertThat(PatchUtil.readFile(myFile)).containsExactlyElementsIn(ImmutableList.of(\"line one\"));\n+    assertThat(myFile.isReadable()).isTrue();\n+    assertThat(myFile.isWritable()).isTrue();\n+    assertThat(myFile.isExecutable()).isTrue();\n   }\n \n   @Test\n@@ -378,7 +408,7 @@ public void testMissingBothOldAndNewFile() throws IOException {\n     Path patchFile =\n         scratch.file(\n             \"/root/patchfile\",\n-            \"diff --git a/foo.cc b/foo.cc\",\n+            \"diff --git a/ b/\",\n             \"index f3008f9..ec4aaa0 100644\",\n             \"@@ -2,4 +2,5 @@\",\n             \" \","
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2020-03-16T16:49:46Z",
+      "user": "meteorcloudy",
+      "body": "1. If no file permission is specified in the patch file, preserve the\r\noriginal file permission.\r\n\r\n2. If file permission is specified, then set it as it is.\r\n\r\nFixes https://github.com/bazelbuild/bazel/issues/10913\r\n\r\nRELNOTES: Native patch can handle file permission properly"
+    },
+    {
+      "type": "comment",
+      "id": 599643427,
+      "created_at": "2020-03-16T16:50:09Z",
+      "user": "meteorcloudy",
+      "body": "/cc @irengrig Can you help review this change?"
+    },
+    {
+      "type": "comment",
+      "id": 600526592,
+      "created_at": "2020-03-18T09:55:14Z",
+      "user": "meteorcloudy",
+      "body": "/cc @philwo Can you help review this change?"
+    },
+    {
+      "type": "review_comment",
+      "id": 394492405,
+      "created_at": "2020-03-18T16:47:07Z",
+      "user": "philwo",
+      "body": "We can use bit-operators here to test for the bits in the permission bitmask :)\r\n\r\nExecutable is `0b001 = 1`\r\nWritable is `0b010 = 2`\r\nReadable is `0b100 = 4`\r\n\r\nSo we can replace this with:\r\n\r\n```java\r\nreturn permission & 4;\r\n```",
+      "path": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java",
+      "diff_hunk": "@@ -229,8 +237,35 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n     FileSystemUtils.writeLinesAs(file, StandardCharsets.UTF_8, content);\n   }\n \n+  private static boolean getReadPermission(int permission) {\n+    // Parse read permission from posix file permission notation\n+    return permission / 4 % 2 == 1;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 242,
+      "side": "RIGHT",
+      "original_position": 34,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 394922270,
+          "user": "meteorcloudy",
+          "body": "Thanks, I'll use \r\n```java \r\nreturn (permission & 4) == 4\r\n```",
+          "created_at": "2020-03-19T10:20:20Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 394492820,
+      "created_at": "2020-03-18T16:47:45Z",
+      "user": "philwo",
+      "body": "Similarly:\r\n```java\r\nreturn permission & 2;\r\n```",
+      "path": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java",
+      "diff_hunk": "@@ -229,8 +237,35 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n     FileSystemUtils.writeLinesAs(file, StandardCharsets.UTF_8, content);\n   }\n \n+  private static boolean getReadPermission(int permission) {\n+    // Parse read permission from posix file permission notation\n+    return permission / 4 % 2 == 1;\n+  }\n+\n+  private static boolean getWritePermission(int permission) {\n+    // Parse write permission from posix file permission notation\n+    return permission / 2 % 2 == 1;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 247,
+      "side": "RIGHT",
+      "original_position": 39,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 394922609,
+          "user": "meteorcloudy",
+          "body": "Done.",
+          "created_at": "2020-03-19T10:20:56Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 394492894,
+      "created_at": "2020-03-18T16:47:49Z",
+      "user": "philwo",
+      "body": "Similarly:\r\n```java\r\nreturn permission & 1;\r\n```",
+      "path": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java",
+      "diff_hunk": "@@ -229,8 +237,35 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n     FileSystemUtils.writeLinesAs(file, StandardCharsets.UTF_8, content);\n   }\n \n+  private static boolean getReadPermission(int permission) {\n+    // Parse read permission from posix file permission notation\n+    return permission / 4 % 2 == 1;\n+  }\n+\n+  private static boolean getWritePermission(int permission) {\n+    // Parse write permission from posix file permission notation\n+    return permission / 2 % 2 == 1;\n+  }\n+\n+  private static boolean getExecutablePermission(int permission) {\n+    // Parse executable permission from posix file permission notation\n+    return permission % 2 == 1;",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 252,
+      "side": "RIGHT",
+      "original_position": 44,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 394922662,
+          "user": "meteorcloudy",
+          "body": "Done",
+          "created_at": "2020-03-19T10:21:03Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 394496297,
+      "created_at": "2020-03-18T16:52:40Z",
+      "user": "philwo",
+      "body": "How is this change related?",
+      "path": "src/test/java/com/google/devtools/build/lib/bazel/repository/PatchUtilTest.java",
+      "diff_hunk": "@@ -378,7 +408,7 @@ public void testMissingBothOldAndNewFile() throws IOException {\n     Path patchFile =\n         scratch.file(\n             \"/root/patchfile\",\n-            \"diff --git a/foo.cc b/foo.cc\",\n+            \"diff --git a/ b/\",",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 411,
+      "original_line": 411,
+      "side": "RIGHT",
+      "original_position": 65,
+      "position": 65,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 394924043,
+          "user": "meteorcloudy",
+          "body": "So this test case is for testing an error message is thrown when no input and output file name is specified. Before, we only parse file names from `---` and `+++` lines. But now we also parses file names from `diff --git` line, therefore we should also remove them here to keep the test passing.",
+          "created_at": "2020-03-19T10:23:28Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 394498342,
+      "created_at": "2020-03-18T16:55:34Z",
+      "user": "philwo",
+      "body": "If you want to use some more exotic Java data types, you could use `Optional<BitSet>` for the filePermission type (and `BitSet` in general, rather than an `int`, to store the permissions). Then you could use an `enum` as the keys for the `BitSet` (e.g. `EXECUTABLE = 0, WRITABLE = 1, READABLE = 2`).\r\n\r\nBut using `-1` as the indicator for \"no explicit permissions\" is also fine, if you prefer it. ;)",
+      "path": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java",
+      "diff_hunk": "@@ -245,6 +280,10 @@ private static void applyPatchToFile(\n       oldContent = new ArrayList<>();\n     } else {\n       oldContent = readFile(inputFile);\n+      // Preserve old file permission if no explicit permission is set.\n+      if (filePermission == -1) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 284,
+      "original_line": 284,
+      "side": "RIGHT",
+      "original_position": 70,
+      "position": 70,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 394925258,
+          "user": "meteorcloudy",
+          "body": "I tried to use BitSet, but found converting a character (eg. `7`) to a BitSet also requires some steps. The code overall didn't look much cleaner, so I'll keep using `-1` and bit operations ;)",
+          "created_at": "2020-03-19T10:25:39Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 377049995,
+      "created_at": "2020-03-18T16:55:37Z",
+      "user": "philwo",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 377587276,
+      "created_at": "2020-03-19T10:20:20Z",
+      "user": "meteorcloudy",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2020-03-19T10:20:36Z",
+      "sha": "831719baa6574be7354586d236b5747804796389",
+      "message": "Use bit operation",
+      "author": "Yun Peng",
+      "author_email": "pcloudy@google.com",
+      "author_raw_date": "2020-03-19T10:20:36Z",
+      "author_date": "2020-03-19T10:20:36Z",
+      "committer": "Yun Peng",
+      "committer_email": "pcloudy@google.com",
+      "raw_date": "2020-03-19T10:20:36Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java\n@@ -239,17 +239,17 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n \n   private static boolean getReadPermission(int permission) {\n     // Parse read permission from posix file permission notation\n-    return permission / 4 % 2 == 1;\n+    return (permission & 4) == 4;\n   }\n \n   private static boolean getWritePermission(int permission) {\n     // Parse write permission from posix file permission notation\n-    return permission / 2 % 2 == 1;\n+    return (permission & 2) == 2;\n   }\n \n   private static boolean getExecutablePermission(int permission) {\n     // Parse executable permission from posix file permission notation\n-    return permission % 2 == 1;\n+    return (permission & 1) == 1;\n   }\n \n   private static int getFilePermissionValue(Path file) throws IOException {",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/bazel/repository/PatchUtil.java",
+          "patch": "@@ -239,17 +239,17 @@ private static void writeFile(Path file, List<String> content) throws IOExceptio\n \n   private static boolean getReadPermission(int permission) {\n     // Parse read permission from posix file permission notation\n-    return permission / 4 % 2 == 1;\n+    return (permission & 4) == 4;\n   }\n \n   private static boolean getWritePermission(int permission) {\n     // Parse write permission from posix file permission notation\n-    return permission / 2 % 2 == 1;\n+    return (permission & 2) == 2;\n   }\n \n   private static boolean getExecutablePermission(int permission) {\n     // Parse executable permission from posix file permission notation\n-    return permission % 2 == 1;\n+    return (permission & 1) == 1;\n   }\n \n   private static int getFilePermissionValue(Path file) throws IOException {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 377587707,
+      "created_at": "2020-03-19T10:20:56Z",
+      "user": "meteorcloudy",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 377587785,
+      "created_at": "2020-03-19T10:21:03Z",
+      "user": "meteorcloudy",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 377589500,
+      "created_at": "2020-03-19T10:23:28Z",
+      "user": "meteorcloudy",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 377590770,
+      "created_at": "2020-03-19T10:25:15Z",
+      "user": "philwo",
+      "state": "APPROVED",
+      "body": "Thanks!"
+    },
+    {
+      "type": "review",
+      "id": 377591045,
+      "created_at": "2020-03-19T10:25:40Z",
+      "user": "meteorcloudy",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 601102956,
+      "created_at": "2020-03-19T10:25:53Z",
+      "user": "meteorcloudy",
+      "body": "Thanks for the review!!"
+    }
+  ]
+}

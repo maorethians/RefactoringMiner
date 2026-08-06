@@ -1,0 +1,179 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 87163,
+  "pr_number": 87163,
+  "title": "Clean up DeflateCompressor after exception",
+  "user": "DaveCTurner",
+  "created_at": "2022-05-26T13:34:46Z",
+  "merged_at": "2022-05-30T16:34:04Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Core/Infra/Core",
+    "Team:Core/Infra",
+    "v7.17.5",
+    "v8.4.0",
+    "v8.2.3",
+    "v8.3.1"
+  ],
+  "base_commit": "806288b96d4fa8727cbe1ace137c2d7634e3a330",
+  "merge_commit_sha": "66e3e8d12393ee817ac69f70a8cad59902c1621d",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/87163",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-05-26T13:32:28Z",
+      "sha": "1bfc2729c8589c81098031f24bdd7d7cd8a4ffad",
+      "message": "Clean up DeflateCompressor after exception\n\nWe must reset the thread-local buffer in `DeflateCompressor` whether the\ncompression succeeds or fails.\n\nCloses #87160",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2022-05-26T13:32:26Z",
+      "author_date": "2022-05-26T13:32:26Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2022-05-26T13:32:28Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/common/compress/DeflateCompressor.java\n@@ -207,15 +207,17 @@ public void close() throws IOException {\n     @Override\n     public BytesReference uncompress(BytesReference bytesReference) throws IOException {\n         final BytesStreamOutput buffer = baos.get();\n-        final Inflater inflater = inflaterRef.get();\n-        try (InflaterOutputStream ios = new InflaterOutputStream(buffer, inflater)) {\n-            bytesReference.slice(HEADER.length, bytesReference.length() - HEADER.length).writeTo(ios);\n+        try {\n+            final Inflater inflater = inflaterRef.get();\n+            try (InflaterOutputStream ios = new InflaterOutputStream(buffer, inflater)) {\n+                bytesReference.slice(HEADER.length, bytesReference.length() - HEADER.length).writeTo(ios);\n+            } finally {\n+                inflater.reset();\n+            }\n+            return buffer.copyBytes();\n         } finally {\n-            inflater.reset();\n+            buffer.reset();\n         }\n-        final BytesReference res = buffer.copyBytes();\n-        buffer.reset();\n-        return res;\n     }\n \n     // Reusable Deflater reference. Note: This is a separate instance from the one used for the compressing stream wrapper because we\n@@ -225,15 +227,17 @@ public BytesReference uncompress(BytesReference bytesReference) throws IOExcepti\n     @Override\n     public BytesReference compress(BytesReference bytesReference) throws IOException {\n         final BytesStreamOutput buffer = baos.get();\n-        buffer.write(HEADER);\n-        final Deflater deflater = deflaterRef.get();\n-        try (DeflaterOutputStream dos = new DeflaterOutputStream(buffer, deflater, true)) {\n-            bytesReference.writeTo(dos);\n+        try {\n+            buffer.write(HEADER);\n+            final Deflater deflater = deflaterRef.get();\n+            try (DeflaterOutputStream dos = new DeflaterOutputStream(buffer, deflater, true)) {\n+                bytesReference.writeTo(dos);\n+            } finally {\n+                deflater.reset();\n+            }\n+            return buffer.copyBytes();\n         } finally {\n-            deflater.reset();\n+            buffer.reset();\n         }\n-        final BytesReference res = buffer.copyBytes();\n-        buffer.reset();\n-        return res;\n     }\n }\nserver/src/test/java/org/elasticsearch/common/compress/DeflateCompressTests.java\n@@ -10,6 +10,8 @@\n \n import org.apache.lucene.tests.util.LineFileDocs;\n import org.apache.lucene.tests.util.TestUtil;\n+import org.apache.lucene.util.BytesRef;\n+import org.elasticsearch.common.bytes.BytesArray;\n import org.elasticsearch.test.ESTestCase;\n \n import java.io.ByteArrayInputStream;\n@@ -20,6 +22,7 @@\n import java.nio.charset.StandardCharsets;\n import java.util.Random;\n import java.util.concurrent.CountDownLatch;\n+import java.util.zip.ZipException;\n \n /**\n  * Test streaming compression (e.g. used for recovery)\n@@ -361,6 +364,43 @@ public void run() {\n         }\n     }\n \n+    public void testCompressUncompressWithCorruptions() throws Exception {\n+        final Random r = random();\n+        for (int i = 0; i < 10; i++) {\n+            byte[] bytes = new byte[TestUtil.nextInt(r, 1, 100000)];\n+            r.nextBytes(bytes);\n+            final var offset = between(0, bytes.length - 1);\n+            final var length = between(0, bytes.length - offset);\n+            final var original = new BytesArray(bytes, offset, length);\n+            final var compressed = compressor.compress(original);\n+\n+            if (randomBoolean()) {\n+                var corruptIndex = between(0, compressed.length() - 1);\n+                BytesRef bytesRef;\n+                final var iterator = compressed.iterator();\n+                while ((bytesRef = iterator.next()) != null) {\n+                    if (corruptIndex < bytesRef.length) {\n+                        bytesRef.bytes[bytesRef.offset + corruptIndex] = randomValueOtherThan(\n+                            bytesRef.bytes[bytesRef.offset + corruptIndex],\n+                            () -> (byte) (r.nextInt() & 0xff)\n+                        );\n+                        break;\n+                    } else {\n+                        corruptIndex -= bytesRef.length;\n+                    }\n+                }\n+                try {\n+                    compressor.uncompress(compressed);\n+                } catch (ZipException e) {\n+                    // ok\n+                }\n+            } else {\n+                var uncompressed = compressor.uncompress(compressed);\n+                assertEquals(original, uncompressed);\n+            }\n+        }\n+    }\n+\n     private void doTest(byte bytes[]) throws IOException {\n         InputStream rawIn = new ByteArrayInputStream(bytes);\n         Compressor c = compressor;",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/common/compress/DeflateCompressor.java",
+          "patch": "@@ -207,15 +207,17 @@ public void close() throws IOException {\n     @Override\n     public BytesReference uncompress(BytesReference bytesReference) throws IOException {\n         final BytesStreamOutput buffer = baos.get();\n-        final Inflater inflater = inflaterRef.get();\n-        try (InflaterOutputStream ios = new InflaterOutputStream(buffer, inflater)) {\n-            bytesReference.slice(HEADER.length, bytesReference.length() - HEADER.length).writeTo(ios);\n+        try {\n+            final Inflater inflater = inflaterRef.get();\n+            try (InflaterOutputStream ios = new InflaterOutputStream(buffer, inflater)) {\n+                bytesReference.slice(HEADER.length, bytesReference.length() - HEADER.length).writeTo(ios);\n+            } finally {\n+                inflater.reset();\n+            }\n+            return buffer.copyBytes();\n         } finally {\n-            inflater.reset();\n+            buffer.reset();\n         }\n-        final BytesReference res = buffer.copyBytes();\n-        buffer.reset();\n-        return res;\n     }\n \n     // Reusable Deflater reference. Note: This is a separate instance from the one used for the compressing stream wrapper because we\n@@ -225,15 +227,17 @@ public BytesReference uncompress(BytesReference bytesReference) throws IOExcepti\n     @Override\n     public BytesReference compress(BytesReference bytesReference) throws IOException {\n         final BytesStreamOutput buffer = baos.get();\n-        buffer.write(HEADER);\n-        final Deflater deflater = deflaterRef.get();\n-        try (DeflaterOutputStream dos = new DeflaterOutputStream(buffer, deflater, true)) {\n-            bytesReference.writeTo(dos);\n+        try {\n+            buffer.write(HEADER);\n+            final Deflater deflater = deflaterRef.get();\n+            try (DeflaterOutputStream dos = new DeflaterOutputStream(buffer, deflater, true)) {\n+                bytesReference.writeTo(dos);\n+            } finally {\n+                deflater.reset();\n+            }\n+            return buffer.copyBytes();\n         } finally {\n-            deflater.reset();\n+            buffer.reset();\n         }\n-        final BytesReference res = buffer.copyBytes();\n-        buffer.reset();\n-        return res;\n     }\n }"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/common/compress/DeflateCompressTests.java",
+          "patch": "@@ -10,6 +10,8 @@\n \n import org.apache.lucene.tests.util.LineFileDocs;\n import org.apache.lucene.tests.util.TestUtil;\n+import org.apache.lucene.util.BytesRef;\n+import org.elasticsearch.common.bytes.BytesArray;\n import org.elasticsearch.test.ESTestCase;\n \n import java.io.ByteArrayInputStream;\n@@ -20,6 +22,7 @@\n import java.nio.charset.StandardCharsets;\n import java.util.Random;\n import java.util.concurrent.CountDownLatch;\n+import java.util.zip.ZipException;\n \n /**\n  * Test streaming compression (e.g. used for recovery)\n@@ -361,6 +364,43 @@ public void run() {\n         }\n     }\n \n+    public void testCompressUncompressWithCorruptions() throws Exception {\n+        final Random r = random();\n+        for (int i = 0; i < 10; i++) {\n+            byte[] bytes = new byte[TestUtil.nextInt(r, 1, 100000)];\n+            r.nextBytes(bytes);\n+            final var offset = between(0, bytes.length - 1);\n+            final var length = between(0, bytes.length - offset);\n+            final var original = new BytesArray(bytes, offset, length);\n+            final var compressed = compressor.compress(original);\n+\n+            if (randomBoolean()) {\n+                var corruptIndex = between(0, compressed.length() - 1);\n+                BytesRef bytesRef;\n+                final var iterator = compressed.iterator();\n+                while ((bytesRef = iterator.next()) != null) {\n+                    if (corruptIndex < bytesRef.length) {\n+                        bytesRef.bytes[bytesRef.offset + corruptIndex] = randomValueOtherThan(\n+                            bytesRef.bytes[bytesRef.offset + corruptIndex],\n+                            () -> (byte) (r.nextInt() & 0xff)\n+                        );\n+                        break;\n+                    } else {\n+                        corruptIndex -= bytesRef.length;\n+                    }\n+                }\n+                try {\n+                    compressor.uncompress(compressed);\n+                } catch (ZipException e) {\n+                    // ok\n+                }\n+            } else {\n+                var uncompressed = compressor.uncompress(compressed);\n+                assertEquals(original, uncompressed);\n+            }\n+        }\n+    }\n+\n     private void doTest(byte bytes[]) throws IOException {\n         InputStream rawIn = new ByteArrayInputStream(bytes);\n         Compressor c = compressor;"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-05-26T13:34:46Z",
+      "user": "DaveCTurner",
+      "body": "We must reset the thread-local buffer in `DeflateCompressor` whether the\r\ncompression succeeds or fails.\r\n\r\nCloses #87160"
+    },
+    {
+      "type": "comment",
+      "id": 1138586562,
+      "created_at": "2022-05-26T13:34:54Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-core-infra (Team:Core/Infra)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-05-26T13:35:16Z",
+      "sha": "82837bdc5c75786d66bf2b2380fb003760996811",
+      "message": "Update docs/changelog/87163.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2022-05-26T13:35:16Z",
+      "author_date": "2022-05-26T13:35:16Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2022-05-26T13:35:16Z",
+      "diff_text": "docs/changelog/87163.yaml\n@@ -0,0 +1,6 @@\n+pr: 87163\n+summary: Clean up `DeflateCompressor` after exception\n+area: Infra/Core\n+type: bug\n+issues:\n+ - 87160",
+      "diff": [
+        {
+          "file": "docs/changelog/87163.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 87163\n+summary: Clean up `DeflateCompressor` after exception\n+area: Infra/Core\n+type: bug\n+issues:\n+ - 87160"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1138586971,
+      "created_at": "2022-05-26T13:35:16Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review",
+      "id": 989535970,
+      "created_at": "2022-05-30T16:08:46Z",
+      "user": "idegtiarenko",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 884964886,
+      "created_at": "2022-05-30T16:08:46Z",
+      "user": "idegtiarenko",
+      "body": "Should this fail if exception was not thrown?",
+      "path": "server/src/test/java/org/elasticsearch/common/compress/DeflateCompressTests.java",
+      "diff_hunk": "@@ -361,6 +364,43 @@ public void run() {\n         }\n     }\n \n+    public void testCompressUncompressWithCorruptions() throws Exception {\n+        final Random r = random();\n+        for (int i = 0; i < 10; i++) {\n+            byte[] bytes = new byte[TestUtil.nextInt(r, 1, 100000)];\n+            r.nextBytes(bytes);\n+            final var offset = between(0, bytes.length - 1);\n+            final var length = between(0, bytes.length - offset);\n+            final var original = new BytesArray(bytes, offset, length);\n+            final var compressed = compressor.compress(original);\n+\n+            if (randomBoolean()) {\n+                var corruptIndex = between(0, compressed.length() - 1);\n+                BytesRef bytesRef;\n+                final var iterator = compressed.iterator();\n+                while ((bytesRef = iterator.next()) != null) {\n+                    if (corruptIndex < bytesRef.length) {\n+                        bytesRef.bytes[bytesRef.offset + corruptIndex] = randomValueOtherThan(\n+                            bytesRef.bytes[bytesRef.offset + corruptIndex],\n+                            () -> (byte) (r.nextInt() & 0xff)\n+                        );\n+                        break;\n+                    } else {\n+                        corruptIndex -= bytesRef.length;\n+                    }\n+                }\n+                try {\n+                    compressor.uncompress(compressed);\n+                } catch (ZipException e) {\n+                    // ok\n+                }",
+      "start_line": 392,
+      "original_start_line": 392,
+      "start_side": "RIGHT",
+      "line": 396,
+      "original_line": 396,
+      "side": "RIGHT",
+      "original_position": 50,
+      "position": 50,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 884975616,
+          "user": "DaveCTurner",
+          "body": "No, there's no checksum or anything so modifying a byte will sometimes yield a valid (but different) output.",
+          "created_at": "2022-05-30T16:27:59Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 989550004,
+      "created_at": "2022-05-30T16:27:59Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 989551062,
+      "created_at": "2022-05-30T16:29:29Z",
+      "user": "idegtiarenko",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1141335271,
+      "created_at": "2022-05-30T16:35:24Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💔 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ❌ |  7.17  | Commit could not be cherrypicked due to conflicts |\n| ✅ |  [8.2](https://github.com/elastic/elasticsearch/pull/87222)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/87222\">](https://github.com/elastic/elasticsearch/pull/87222) |\n| ✅ |  [8.3](https://github.com/elastic/elasticsearch/pull/87223)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/87223\">](https://github.com/elastic/elasticsearch/pull/87223) |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 87163`"
+    }
+  ]
+}

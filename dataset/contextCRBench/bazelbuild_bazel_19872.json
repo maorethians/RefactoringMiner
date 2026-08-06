@@ -1,0 +1,81 @@
+{
+    "pr_body": "`JavaHeaderCompileAction` can apply an optimization where it compiles the source files only against direct dependencies, making use of the fact that Turbine includes sufficient information about transitive dependencies into the direct header jars in a special directory.\r\n\r\nIn order to ensure that downstream consumers of header compilation action can use its `.jdeps` file regardless of which of these actions actually uses path mapping, all such paths to transitive jars have to be unmapped.\r\n\r\nWith this commit, actions can declare additional artifacts whose paths they want to apply path mapping to. By always passing all transitive jars into the path mapper, even when only the direct jars are inputs to the action, the transitive header jar paths can be unmapped and stripped path collisions between them correctly result in a noop `PathMapper` being used for the current action.\r\n\r\nFixes https://github.com/bazelbuild/bazel/issues/21091",
+    "original_commit_id": "ca84e545b513043204c09bca66a9ffcbc922e2c7",
+    "merged": false,
+    "pr_number": 19872,
+    "pr_title": "Also path map transitive header jar paths with direct classpath optimization",
+    "lang": "java",
+    "full_name": "bazelbuild/bazel",
+    "pr_comment": [
+        "Note that there is still one problematic case that this PR isn't meant to address: Since we do not unmap the paths embedded in the `META-INF/TRANSITIVE` directories in header jars, if a header compile action without path mapping depends on a header jar produced by one with path mapping, it will emit a mapped path into its `.jdeps` file, which can then result in some compile action falling back to full classpath mode unnecessarily. \r\n\r\nTo fix that problem, we really need to use a mapping scheme that can't produce collisions, e.g. sorting collidings paths by their hashes and then adding a disambiguating count.",
+        "Thanks for tackling this! Overall this seems like an encouraging approach to me.\r\n\r\n> cushon was also concerned about a path-mapped reference being stored in the hjar output. It's stored in a repackaged transitive class which includes a [TurbineTransitiveJar](https://github.com/google/turbine/blob/61bd7210563ab31c3666de56d6974c75388be2a2/java/com/google/turbine/bytecode/Attribute.java#L415) class attribute to its original .jar path. ... I think that's the source for the jdeps content?\r\n\r\n(+1, the implementation comment here mentions https://github.com/google/turbine/commit/f9f2decee04a3c651671f7488a7c9d7952df88c8, which is what I was talking about. I think we're on the same page about the turbine behaviour.)\r\n\r\n> I'm curious how this compares to @aranguyen 's idea to make `getReduced ClassPath` more resilient. And my idea on not disabling path mapping when the same input appears multiple times. And your related idea of not disabling path mapping by remapping away collisions.\r\n\r\nIf I'm following I think either of the 'not disabling path mapping' options are complementary with this PR, and they would help with the \"problematic case that this PR isn't meant to address\" in https://github.com/bazelbuild/bazel/pull/19872#issuecomment-1768645163.\r\n\r\n> cushon had an interesting idea that if we make `getReducedClassPath` more resilient, maybe we don't even need `createFullOutputDeps`. But I think that assumes we can make `getReducedClassPath` sufficiently resilient. And it assumes we don't have other consumers of jdeps (which I'm not sure is true).\r\n\r\nThat's a good point: there are other consumers of jdeps, so I think we would want `createFullOutputDeps` even if `getReducedClassPath` was more resilient.",
+        "I can add a test for the situation in which this change is relevant after the merge of the general test setup in https://github.com/bazelbuild/bazel/pull/18155.",
+        "@aranguyen did you say that this PR doesn't address the failure you found in Google?",
+        "> @aranguyen did you say that this PR doesn't address the failure you found in Google?\r\n\r\nIt's this commit that I tested https://github.com/bazelbuild/bazel/commit/a4e1d7bdcdbaec35ed4c6593ce0b50ae06056fe8#diff-738efdd95b5eedf99d16e391201cb00e284b0ccf3542506f6c88cb01ffb96830 and saw mixed paths still. I think it's different from this one.\r\n\r\n@fmeum any idea why the presubmits are failing. I'll work on testing this one soon",
+        "> @fmeum any idea why the presubmits are failing. I'll work on testing this one soon\r\n\r\nNot yet, I will look into it.",
+        "@aranguyen @gregestren I fixed the failure by resolving the to-do about duplicate inputs.",
+        "@bazel-io flag",
+        "(for 7.1.0)",
+        "Could also go into 7.0.0.",
+        "@bazel-io fork 7.0.0",
+        "Actually, 7.1.0 may be better since this hasn't been reviewed yet, @fmeum. ",
+        "This was rolled back due to a significant memory regression (https://github.com/bazelbuild/bazel/commit/f5d76b1777ce861a7e551342fe25363517d53ff5).",
+        "Is there any additional information in the internal version of the rollback commit? It looks like it has some redacted information.\n\nI will try to reproduce this on Bazel itself.",
+        "Not much. It's a 0.6% memory regression on a large Java project, which crosses some performance check threshold (I can't remember the threshold). It also found a 3.2% reduction in system time and 60% reduction in `oldGenGarbage` (don't know what that means). I'm not sure if they're noise but the benchmark at b/324218949#comment3 (internal) notes them as \"significant\".\r\n\r\n@oquenchil might be able to offer more benchmark insight.\r\n\r\nI'm about to go OOO for a week, but @aranguyen is aware. Conceptually, were we expecting this to have any resource impact if path mapping isn't enabled? The affected build isn't using path mapping at all.",
+        "Thanks for the additional input. \n\nJust so that I understand it correctly: The change increased memory by 0.6% while reducing system time by 3.2%? That would certainly be interesting (and unexpected).",
+        "I don't think the benchmark is always reliable, even with \"significant\" findings. It's a basic story of you have to repeat a huge amount of times to get consistently reliable results.\r\n\r\nBut @oquenchil did repeat the memory profiling a few times, so I believe that result is valid.",
+        "Just from reading the code:\r\n\r\n* The extra field in `JavaHeaderCompileAction` adds 8 bytes per instance.\r\n* The `classpathEntries` `NestedSet` is newly retained.\r\n* The above two show up during analysis, but the majority of the regression only shows up when running a full build. There's some extra unconditional `NestedSet` flattening happening with your change. That might be the culprit (via instantiating the `memo`). Regardless, that should be defered to only happen if path mapping is active.",
+        "Thanks for taking a look!\r\n\r\n> The extra field in `JavaHeaderCompileAction` adds 8 bytes per instance.\r\n\r\nWhen I finalized this PR, the instance size was 72 bytes with 4 bytes padding, so this change wouldn't have affected the size. However, in the meantime the `runfilesSupplier` field has been removed from `SpawnAction`, which brought down the instance size to 64 and thus made this PR a regression.\r\n\r\nI submitted a separate PR (https://github.com/bazelbuild/bazel/pull/21290) that removes the `boolean` field and thus frees up the 4 bytes needed for the new field.\r\n\r\n> The `classpathEntries` `NestedSet` is newly retained.\r\n\r\nIf I traced the flow of this nested set correctly, while it's newly retained *by this action*, it should already be retained by the sibling `JavaCompileAction` (see https://github.com/bazelbuild/bazel/pull/19872#discussion_r1367720207).\r\n\r\n> Regardless, that should be defered to only happen if path mapping is active.\r\n\r\nThis looks easy to achieve and I will implement it when submitting the rollforward.",
+        "I confirmed that storing the `classpathEntries` results in 125k additional `NestedSet` instances retained on the benchmark build. Note that there's a `return` after constructing the `JavaHeaderCompileAction`, so the `JavaCompileAction` construction below is not invoked on the same call.",
+        "> I confirmed that storing the classpathEntries results in 125k additional NestedSet instances retained on the benchmark build. Note that there's a return after constructing the JavaHeaderCompileAction, so the JavaCompileAction construction below is not invoked on the same call.\n\nThanks for the additional information! \n\nDoes the benchmark build involve \"full\" (non-header) Java compilation actions? If it's mostly just header compilation actions and that's actually a common use case, then I don't see a way to make the approach in this PR work at all.\n\nMy assumption so far has been that in \"real-world builds\" there would always be a sibling non-header compilation action that retains this nested set (which ultimately comes from https://cs.opensource.google/bazel/bazel/+/af28cae84e93b5d706c9cd374d1b8e324a3e8ca0:src/main/java/com/google/devtools/build/lib/rules/java/JavaTargetAttributes.java;l=42;bpv=1;bpt=1) in https://cs.opensource.google/bazel/bazel/+/af28cae84e93b5d706c9cd374d1b8e324a3e8ca0:src/main/java/com/google/devtools/build/lib/rules/java/JavaCompilationHelper.java;l=328-343. If the benchmark analyzes the non-header compilation actions and still ends up with additional nested sets, then I'm missing something crucial here. I will benchmark this locally to get a better understanding of what's retained where.",
+        "The benchmark build has 194,776 `JavaCompileAction` instances and 127,013 `JavaHeaderCompileAction` instances. We use `--experimental_java_classpath=bazel`, which might be relevant.",
+        "@fmeum I was also able to confirm the regression myself. Since you mentioned the possibility of this approach not working as the regression is definitely a blocker, WDYT about making `getReducedClassPath` agnostic to pathMapping logic? It would look something like this. This is actually one of the older fix I had (see https://github.com/bazelbuild/bazel/pull/19872#pullrequestreview-1686321018 where Greg mentioned it). I was able to get the failing targets to pass with this fix and I'll run bench marking tonight. I will update tomorrow morning.\r\n\r\n```\r\n  @VisibleForTesting\r\n  ReducedClasspath getReducedClasspath(\r\n      ActionExecutionContext actionExecutionContext, JavaCompileActionContext context)\r\n      throws IOException {\r\n    HashSet<String> direct = new HashSet<>();\r\n    for (Artifact directJar : directJars.toList()) {\r\n      direct.add(directJar.getExecPathString());\r\n    }\r\n    for (Artifact depArtifact : dependencyArtifacts.toList()) {\r\n      for (Deps.Dependency dep :\r\n          context.getDependencies(depArtifact, actionExecutionContext).getDependencyList()) {\r\n        direct.add(dep.getPath());\r\n      }\r\n    }\r\n    ImmutableList<Artifact> transitiveCollection = transitiveInputs.toList();\r\n    List<Artifact> reducedJarsList = new ArrayList<>();\r\n    StringStripper stringStripper = new StringStripper(configuration.getBinDir().getExecPath().subFragment(0,1).getPathString());\r\n    for (Artifact input : transitiveCollection) {\r\n      if (direct.contains(input.getExecPathString())) {\r\n        reducedJarsList.add(input);\r\n      } else if (direct.contains(stringStripper.strip(input.getExecPathString()))) {\r\n        reducedJarsList.add(input);\r\n      }\r\n    }\r\n\r\n    ImmutableList<Artifact> reducedJars = ImmutableList.copyOf(reducedJarsList);\r\n    return new ReducedClasspath(ImmutableList.copyOf(reducedJars), transitiveCollection.size());\r\n  }\r\n```\r\n\r\n",
+        "@aranguyen Yes, that's a great alternative. I would say go ahead with it!\n\nI will spend more time understanding why this regression exists in the first place (I can reproduce it locally on Bazel). Worst case I'll learn something, best case we can switch to this approach later.",
+        "@fmeum benchmark came back with no memory regression with the approach i mentioned but there's a bit of a cost in wall time. I'll try and sort that out. Please do let me know how your investigation goes as well.",
+        "I now understand why the actions weren't sharing the `NestedSet` as I expected. I submitted a separate PR (https://github.com/bazelbuild/bazel/pull/21343) to change that. It looks like it would save one `NestedSet` instance per action, so ideally this would even have a net positive effect on memory usage.",
+        "Submitted a rollforward change: https://github.com/bazelbuild/bazel/pull/21401"
+    ],
+    "commit_id": "0c97e298603f51f02affc6fe0e5931c9fef5fab3",
+    "subject_type": "line",
+    "reviews": [
+        {
+            "original_line": 526,
+            "start_side": null,
+            "start_line": null,
+            "line": 526,
+            "comment_lines": [
+                "[][526]"
+            ],
+            "review_comment": [
+                "As I understand, this adds a new reference to the transitive class path to `JavaheaderCompileAction`. Does that have any memory consequences in that the reference could live longer? I realize there's already a reference passed to `JavaCompileAction` (not sure it's the same reference, since `JavaHeaderCompileActionBuilder` only constructs a `JavaCompileAction` under certain circumstances). Maybe that reference eliminates this concern?\r\n\r\n",
+                "I verified with JOL that the instance size of `JavaHeaderCompileAction` is still 72 after this change (it had 7 bytes of padding previously), so the field itself shouldn't result in higher memory usage. @justinhorvitz Is \"HotSpot >= 15, 64-bit, COOPS, CCPS\" the correct JOL setting to analyze retained size for Bazel?\r\n\r\nThe nested set it creates an additional reference to is either empty or comes from `JavaTargetAttributes#getCompileTimeClassPath()`, which I think is always retained by the corresponding full compilation action here: https://github.com/bazelbuild/bazel/blob/379ee5fd888c8f3a83ed3751bee700287fa5d7de/src/main/java/com/google/devtools/build/lib/rules/java/JavaCompilationHelper.java#L331-L346."
+            ],
+            "path": "src/main/java/com/google/devtools/build/lib/rules/java/JavaHeaderCompileAction.java",
+            "id": 20186,
+            "created_at": "2023-10-18T22:37:55Z",
+            "original_position": 72,
+            "side": "RIGHT",
+            "position": 72,
+            "original_start_line": null
+        },
+        {
+            "original_line": 784,
+            "start_side": null,
+            "start_line": null,
+            "line": 784,
+            "comment_lines": [
+                "[][784]"
+            ],
+            "review_comment": [
+                "typo nit: built?"
+            ],
+            "path": "src/main/java/com/google/devtools/build/lib/rules/java/JavaCompileAction.java",
+            "id": 20187,
+            "created_at": "2023-10-18T22:53:36Z",
+            "original_position": 93,
+            "side": "RIGHT",
+            "position": 93,
+            "original_start_line": null
+        }
+    ]
+}

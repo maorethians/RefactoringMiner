@@ -1,0 +1,291 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 83693,
+  "pr_number": 83693,
+  "title": "Avoid eagerly loading StoredFieldsReader in fetch phase",
+  "user": "jtibshirani",
+  "created_at": "2022-02-08T22:24:17Z",
+  "merged_at": "2022-02-09T19:20:14Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Search/Search DO NOT USE",
+    "Team:Search",
+    "v8.1.0",
+    "v7.17.1",
+    "v8.0.1",
+    "v8.2.0"
+  ],
+  "base_commit": "428f3af8651543473ae342d5c026313827ceb10c",
+  "merge_commit_sha": "4e28da43b9c26a1dfea5ddc28294b0ed69728dbf",
+  "commits": 5,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "ready_for_review",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "labeled",
+    "referenced",
+    "unlabeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/83693",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-02-08T22:14:20Z",
+      "sha": "45b555078e1dd0bf6132a52ac9257442f06ae083",
+      "message": "Avoid eagerly loading StoredFieldsReader in fetch phase\n\nEvery time we create a hit document, we create a new SourceLookup and call\nsetSegmentAndDocument. This in turn creates a new StoredFieldsReader, which is\npretty expensive. In scenarios where you are retrieving a lot of hits, this can\nadd significant overhead. Prior to version 7.11, we did not create a new\nSourceLookup per hit, so this is a performance regression.\n\nThis PR updates setSegmentAndDocument to avoid eagerly creating a\nnew StoredFieldsReader (through StoredFieldsReader#getMergeInstance).",
+      "author": "Julie Tibshirani",
+      "author_email": "julietibs@apache.org",
+      "author_raw_date": "2022-02-08T04:12:25Z",
+      "author_date": "2022-02-08T04:12:25Z",
+      "committer": "Julie Tibshirani",
+      "committer_email": "julietibs@apache.org",
+      "raw_date": "2022-02-08T22:14:20Z",
+      "diff_text": "libs/core/src/main/java/org/elasticsearch/core/MemoizedSupplier.java\n@@ -0,0 +1,29 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.core;\n+\n+import java.util.function.Supplier;\n+\n+public class MemoizedSupplier<T> implements Supplier<T> {\n+    private Supplier<T> supplier;\n+    private T value;\n+\n+    public MemoizedSupplier(Supplier<T> supplier) {\n+        this.supplier = supplier;\n+    }\n+\n+    @Override\n+    public T get() {\n+        if (supplier != null) {\n+            value = supplier.get();\n+            supplier = null;\n+        }\n+        return value;\n+    }\n+}\nserver/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java\n@@ -7,6 +7,7 @@\n  */\n package org.elasticsearch.search.lookup;\n \n+import org.apache.lucene.codecs.StoredFieldsReader;\n import org.apache.lucene.index.LeafReader;\n import org.apache.lucene.index.LeafReaderContext;\n import org.elasticsearch.ElasticsearchParseException;\n@@ -15,6 +16,7 @@\n import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;\n import org.elasticsearch.common.xcontent.XContentHelper;\n import org.elasticsearch.common.xcontent.support.XContentMapValues;\n+import org.elasticsearch.core.MemoizedSupplier;\n import org.elasticsearch.core.Nullable;\n import org.elasticsearch.core.Tuple;\n import org.elasticsearch.index.fieldvisitor.FieldsVisitor;\n@@ -26,13 +28,14 @@\n import java.util.List;\n import java.util.Map;\n import java.util.Set;\n+import java.util.function.Supplier;\n \n import static java.util.Collections.emptyMap;\n \n public class SourceLookup implements Map<String, Object> {\n \n     private LeafReader reader;\n-    CheckedBiConsumer<Integer, FieldsVisitor, IOException> fieldReader;\n+    private CheckedBiConsumer<Integer, FieldsVisitor, IOException> fieldReader;\n \n     private int docId = -1;\n \n@@ -104,19 +107,23 @@ public static Map<String, Object> sourceAsMap(BytesReference source) throws Elas\n     }\n \n     public void setSegmentAndDocument(LeafReaderContext context, int docId) {\n+        // if we are called with the same document, don't invalidate source\n         if (this.reader == context.reader() && this.docId == docId) {\n-            // if we are called with the same document, don't invalidate source\n             return;\n         }\n+\n+        // only reset reader and fieldReader when reader changes\n         if (this.reader != context.reader()) {\n             this.reader = context.reader();\n-            // only reset reader and fieldReader when reader changes\n-            if (context.reader()instanceof SequentialStoredFieldsLeafReader lf) {\n-                // All the docs to fetch are adjacent but Lucene stored fields are optimized\n-                // for random access and don't optimize for sequential access - except for merging.\n-                // So we do a little hack here and pretend we're going to do merges in order to\n-                // get better sequential access.\n-                fieldReader = lf.getSequentialStoredFieldsReader()::visitDocument;\n+\n+            // All the docs to fetch are adjacent but Lucene stored fields are optimized\n+            // for random access and don't optimize for sequential access - except for merging.\n+            // So we do a little hack here and pretend we're going to do merges in order to\n+            // get better sequential access.\n+            if (context.reader() instanceof SequentialStoredFieldsLeafReader lf) {\n+                // Avoid eagerly loading the stored fields reader, since this can be expensive\n+                Supplier<StoredFieldsReader> supplier = new MemoizedSupplier<>(lf::getSequentialStoredFieldsReader);\n+                fieldReader = (d, v) -> supplier.get().visitDocument(d, v);\n             } else {\n                 fieldReader = context.reader()::document;\n             }\nserver/src/test/java/org/elasticsearch/search/lookup/SourceLookupTests.java\n@@ -0,0 +1,73 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.search.lookup;\n+\n+import org.apache.lucene.codecs.StoredFieldsReader;\n+import org.apache.lucene.document.Document;\n+import org.apache.lucene.document.Field;\n+import org.apache.lucene.document.StringField;\n+import org.apache.lucene.index.IndexReader;\n+import org.apache.lucene.index.LeafReader;\n+import org.apache.lucene.index.LeafReaderContext;\n+import org.apache.lucene.index.RandomIndexWriter;\n+import org.apache.lucene.store.Directory;\n+import org.elasticsearch.ElasticsearchParseException;\n+import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;\n+import org.elasticsearch.test.ESTestCase;\n+\n+import java.io.IOException;\n+import java.util.Map;\n+\n+import static org.hamcrest.Matchers.instanceOf;\n+\n+public class SourceLookupTests extends ESTestCase {\n+\n+    public void testSetSegmentAndDocument() throws IOException {\n+        try (Directory dir = newDirectory(); RandomIndexWriter iw = new RandomIndexWriter(random(), dir)) {\n+            Document doc = new Document();\n+            doc.add(new StringField(\"field\", \"value\", Field.Store.YES));\n+            iw.addDocument(doc);\n+\n+            try (IndexReader reader = iw.getReader()) {\n+                LeafReaderContext readerContext = reader.leaves().get(0);\n+\n+                SourceLookup sourceLookup = new SourceLookup();\n+                sourceLookup.setSegmentAndDocument(readerContext, 42);\n+                sourceLookup.setSource(Map.of(\"field\", \"value\"));\n+                assertNotNull(sourceLookup.source());\n+\n+                // Source should be preserved if we pass in the same reader and document\n+                sourceLookup.setSegmentAndDocument(readerContext, 42);\n+                assertNotNull(sourceLookup.source());\n+\n+                // The stored fields reader should not be loaded eagerly\n+                LeafReader throwingReader = new SequentialStoredFieldsLeafReader(readerContext.reader()) {\n+                    @Override\n+                    protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {\n+                        throw new UnsupportedOperationException(\"attempted to load stored fields reader\");\n+                    }\n+\n+                    @Override\n+                    public CacheHelper getReaderCacheHelper() {\n+                        return in.getReaderCacheHelper();\n+                    }\n+\n+                    @Override\n+                    public CacheHelper getCoreCacheHelper() {\n+                        return in.getCoreCacheHelper();\n+                    }\n+                };\n+\n+                sourceLookup.setSegmentAndDocument(throwingReader.getContext(), 0);\n+                ElasticsearchParseException e = expectThrows(ElasticsearchParseException.class, sourceLookup::source);\n+                assertThat(e.getCause(), instanceOf(UnsupportedOperationException.class));\n+            }\n+        }\n+    }\n+}",
+      "diff": [
+        {
+          "file": "libs/core/src/main/java/org/elasticsearch/core/MemoizedSupplier.java",
+          "patch": "@@ -0,0 +1,29 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.core;\n+\n+import java.util.function.Supplier;\n+\n+public class MemoizedSupplier<T> implements Supplier<T> {\n+    private Supplier<T> supplier;\n+    private T value;\n+\n+    public MemoizedSupplier(Supplier<T> supplier) {\n+        this.supplier = supplier;\n+    }\n+\n+    @Override\n+    public T get() {\n+        if (supplier != null) {\n+            value = supplier.get();\n+            supplier = null;\n+        }\n+        return value;\n+    }\n+}"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java",
+          "patch": "@@ -7,6 +7,7 @@\n  */\n package org.elasticsearch.search.lookup;\n \n+import org.apache.lucene.codecs.StoredFieldsReader;\n import org.apache.lucene.index.LeafReader;\n import org.apache.lucene.index.LeafReaderContext;\n import org.elasticsearch.ElasticsearchParseException;\n@@ -15,6 +16,7 @@\n import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;\n import org.elasticsearch.common.xcontent.XContentHelper;\n import org.elasticsearch.common.xcontent.support.XContentMapValues;\n+import org.elasticsearch.core.MemoizedSupplier;\n import org.elasticsearch.core.Nullable;\n import org.elasticsearch.core.Tuple;\n import org.elasticsearch.index.fieldvisitor.FieldsVisitor;\n@@ -26,13 +28,14 @@\n import java.util.List;\n import java.util.Map;\n import java.util.Set;\n+import java.util.function.Supplier;\n \n import static java.util.Collections.emptyMap;\n \n public class SourceLookup implements Map<String, Object> {\n \n     private LeafReader reader;\n-    CheckedBiConsumer<Integer, FieldsVisitor, IOException> fieldReader;\n+    private CheckedBiConsumer<Integer, FieldsVisitor, IOException> fieldReader;\n \n     private int docId = -1;\n \n@@ -104,19 +107,23 @@ public static Map<String, Object> sourceAsMap(BytesReference source) throws Elas\n     }\n \n     public void setSegmentAndDocument(LeafReaderContext context, int docId) {\n+        // if we are called with the same document, don't invalidate source\n         if (this.reader == context.reader() && this.docId == docId) {\n-            // if we are called with the same document, don't invalidate source\n             return;\n         }\n+\n+        // only reset reader and fieldReader when reader changes\n         if (this.reader != context.reader()) {\n             this.reader = context.reader();\n-            // only reset reader and fieldReader when reader changes\n-            if (context.reader()instanceof SequentialStoredFieldsLeafReader lf) {\n-                // All the docs to fetch are adjacent but Lucene stored fields are optimized\n-                // for random access and don't optimize for sequential access - except for merging.\n-                // So we do a little hack here and pretend we're going to do merges in order to\n-                // get better sequential access.\n-                fieldReader = lf.getSequentialStoredFieldsReader()::visitDocument;\n+\n+            // All the docs to fetch are adjacent but Lucene stored fields are optimized\n+            // for random access and don't optimize for sequential access - except for merging.\n+            // So we do a little hack here and pretend we're going to do merges in order to\n+            // get better sequential access.\n+            if (context.reader() instanceof SequentialStoredFieldsLeafReader lf) {\n+                // Avoid eagerly loading the stored fields reader, since this can be expensive\n+                Supplier<StoredFieldsReader> supplier = new MemoizedSupplier<>(lf::getSequentialStoredFieldsReader);\n+                fieldReader = (d, v) -> supplier.get().visitDocument(d, v);\n             } else {\n                 fieldReader = context.reader()::document;\n             }"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/search/lookup/SourceLookupTests.java",
+          "patch": "@@ -0,0 +1,73 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.search.lookup;\n+\n+import org.apache.lucene.codecs.StoredFieldsReader;\n+import org.apache.lucene.document.Document;\n+import org.apache.lucene.document.Field;\n+import org.apache.lucene.document.StringField;\n+import org.apache.lucene.index.IndexReader;\n+import org.apache.lucene.index.LeafReader;\n+import org.apache.lucene.index.LeafReaderContext;\n+import org.apache.lucene.index.RandomIndexWriter;\n+import org.apache.lucene.store.Directory;\n+import org.elasticsearch.ElasticsearchParseException;\n+import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;\n+import org.elasticsearch.test.ESTestCase;\n+\n+import java.io.IOException;\n+import java.util.Map;\n+\n+import static org.hamcrest.Matchers.instanceOf;\n+\n+public class SourceLookupTests extends ESTestCase {\n+\n+    public void testSetSegmentAndDocument() throws IOException {\n+        try (Directory dir = newDirectory(); RandomIndexWriter iw = new RandomIndexWriter(random(), dir)) {\n+            Document doc = new Document();\n+            doc.add(new StringField(\"field\", \"value\", Field.Store.YES));\n+            iw.addDocument(doc);\n+\n+            try (IndexReader reader = iw.getReader()) {\n+                LeafReaderContext readerContext = reader.leaves().get(0);\n+\n+                SourceLookup sourceLookup = new SourceLookup();\n+                sourceLookup.setSegmentAndDocument(readerContext, 42);\n+                sourceLookup.setSource(Map.of(\"field\", \"value\"));\n+                assertNotNull(sourceLookup.source());\n+\n+                // Source should be preserved if we pass in the same reader and document\n+                sourceLookup.setSegmentAndDocument(readerContext, 42);\n+                assertNotNull(sourceLookup.source());\n+\n+                // The stored fields reader should not be loaded eagerly\n+                LeafReader throwingReader = new SequentialStoredFieldsLeafReader(readerContext.reader()) {\n+                    @Override\n+                    protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {\n+                        throw new UnsupportedOperationException(\"attempted to load stored fields reader\");\n+                    }\n+\n+                    @Override\n+                    public CacheHelper getReaderCacheHelper() {\n+                        return in.getReaderCacheHelper();\n+                    }\n+\n+                    @Override\n+                    public CacheHelper getCoreCacheHelper() {\n+                        return in.getCoreCacheHelper();\n+                    }\n+                };\n+\n+                sourceLookup.setSegmentAndDocument(throwingReader.getContext(), 0);\n+                ElasticsearchParseException e = expectThrows(ElasticsearchParseException.class, sourceLookup::source);\n+                assertThat(e.getCause(), instanceOf(UnsupportedOperationException.class));\n+            }\n+        }\n+    }\n+}"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-02-08T22:24:17Z",
+      "user": "jtibshirani",
+      "body": "Every time we create a hit document, we create a new SourceLookup and call\r\nsetSegmentAndDocument. This in turn creates a new StoredFieldsReader, which is\r\npretty expensive. In scenarios where you are retrieving a lot of hits, this can\r\nadd significant overhead. Prior to version 7.11, we did not create a new\r\nSourceLookup per hit, so this is a performance regression.\r\n\r\nThis PR updates setSegmentAndDocument to avoid eagerly creating a\r\nnew StoredFieldsReader (through StoredFieldsReader#getMergeInstance).\r\n\r\nCloses #82777."
+    },
+    {
+      "type": "commit",
+      "date": "2022-02-08T22:24:40Z",
+      "sha": "51d18b0b249343adcaef9b5497f1d0402e8f8d36",
+      "message": "Update docs/changelog/83693.yaml",
+      "author": "Julie Tibshirani",
+      "author_email": "julie.tibshirani@elastic.co",
+      "author_raw_date": "2022-02-08T22:24:40Z",
+      "author_date": "2022-02-08T22:24:40Z",
+      "committer": "Julie Tibshirani",
+      "committer_email": "julie.tibshirani@elastic.co",
+      "raw_date": "2022-02-08T22:24:40Z",
+      "diff_text": "docs/changelog/83693.yaml\n@@ -0,0 +1,5 @@\n+pr: 83693\n+summary: Avoid eagerly loading `StoredFieldsReader` in fetch phase\n+area: Search\n+type: bug\n+issues: []",
+      "diff": [
+        {
+          "file": "docs/changelog/83693.yaml",
+          "patch": "@@ -0,0 +1,5 @@\n+pr: 83693\n+summary: Avoid eagerly loading `StoredFieldsReader` in fetch phase\n+area: Search\n+type: bug\n+issues: []"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1033124138,
+      "created_at": "2022-02-08T22:24:41Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @jtibshirani, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1033128253,
+      "created_at": "2022-02-08T22:30:19Z",
+      "user": "jtibshirani",
+      "body": "Some notes:\r\n* An alternative would be to introduce `SourceLookup#setDoc`, which sets the document without the leaf reader context. This felt less solid, and I wanted to avoid touching the `HitContext` -- source handling in the fetch phase is very complex and doesn't have strong test coverage!\r\n* This gives more motivation for adding fetch benchmarks ([rally-tracks#199](https://github.com/elastic/rally-tracks/issues/199)). I'm also guessing that EQL tests might have caught it, which didn't exist back in 7.11."
+    },
+    {
+      "type": "review",
+      "id": 876725520,
+      "created_at": "2022-02-08T22:31:19Z",
+      "user": "jtibshirani",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 802114322,
+      "created_at": "2022-02-08T22:31:19Z",
+      "user": "jtibshirani",
+      "body": "I restored this class, which was only very recently deleted because it was unused.",
+      "path": "libs/core/src/main/java/org/elasticsearch/core/MemoizedSupplier.java",
+      "diff_hunk": "@@ -0,0 +1,29 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.core;\n+\n+import java.util.function.Supplier;\n+\n+public class MemoizedSupplier<T> implements Supplier<T> {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 13,
+      "original_line": 13,
+      "side": "RIGHT",
+      "original_position": 13,
+      "position": 13,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 876727862,
+      "created_at": "2022-02-08T22:34:12Z",
+      "user": "jtibshirani",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 802116100,
+      "created_at": "2022-02-08T22:34:12Z",
+      "user": "jtibshirani",
+      "body": "The main issue is that `getSequentialStoredFieldsReader` calls `StoredFieldsReader#getMergeInstance`, which creates a new stored fields reader. I wonder if this could be optimized in Lucene to avoid recreating it every time 🤔 ",
+      "path": "server/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java",
+      "diff_hunk": "@@ -104,19 +107,23 @@ public int docId() {\n     }\n \n     public void setSegmentAndDocument(LeafReaderContext context, int docId) {\n+        // if we are called with the same document, don't invalidate source\n         if (this.reader == context.reader() && this.docId == docId) {\n-            // if we are called with the same document, don't invalidate source\n             return;\n         }\n+\n+        // only reset reader and fieldReader when reader changes\n         if (this.reader != context.reader()) {\n             this.reader = context.reader();\n-            // only reset reader and fieldReader when reader changes\n-            if (context.reader()instanceof SequentialStoredFieldsLeafReader lf) {\n-                // All the docs to fetch are adjacent but Lucene stored fields are optimized\n-                // for random access and don't optimize for sequential access - except for merging.\n-                // So we do a little hack here and pretend we're going to do merges in order to\n-                // get better sequential access.\n-                fieldReader = lf.getSequentialStoredFieldsReader()::visitDocument;\n+\n+            // All the docs to fetch are adjacent but Lucene stored fields are optimized\n+            // for random access and don't optimize for sequential access - except for merging.\n+            // So we do a little hack here and pretend we're going to do merges in order to\n+            // get better sequential access.\n+            if (context.reader() instanceof SequentialStoredFieldsLeafReader lf) {\n+                // Avoid eagerly loading the stored fields reader, since this can be expensive\n+                Supplier<StoredFieldsReader> supplier = new MemoizedSupplier<>(lf::getSequentialStoredFieldsReader);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 125,
+      "original_line": 125,
+      "side": "RIGHT",
+      "original_position": 59,
+      "position": 58,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 802567365,
+          "user": "romseygeek",
+          "body": "I think ideally we'd like to push as much of this up into Lucene as possible, as it is all hacks at the moment and if anything changes in how stored fields are merged then we are in trouble.",
+          "created_at": "2022-02-09T11:35:02Z"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-02-08T23:22:22Z",
+      "sha": "6619a44879437f669c264041a49443e64b6e0533",
+      "message": "Fix spotless",
+      "author": "Julie Tibshirani",
+      "author_email": "julietibs@apache.org",
+      "author_raw_date": "2022-02-08T23:21:27Z",
+      "author_date": "2022-02-08T23:21:27Z",
+      "committer": "Julie Tibshirani",
+      "committer_email": "julietibs@apache.org",
+      "raw_date": "2022-02-08T23:22:22Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java\n@@ -120,7 +120,7 @@ public void setSegmentAndDocument(LeafReaderContext context, int docId) {\n             // for random access and don't optimize for sequential access - except for merging.\n             // So we do a little hack here and pretend we're going to do merges in order to\n             // get better sequential access.\n-            if (context.reader() instanceof SequentialStoredFieldsLeafReader lf) {\n+            if (context.reader()instanceof SequentialStoredFieldsLeafReader lf) {\n                 // Avoid eagerly loading the stored fields reader, since this can be expensive\n                 Supplier<StoredFieldsReader> supplier = new MemoizedSupplier<>(lf::getSequentialStoredFieldsReader);\n                 fieldReader = (d, v) -> supplier.get().visitDocument(d, v);",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/search/lookup/SourceLookup.java",
+          "patch": "@@ -120,7 +120,7 @@ public void setSegmentAndDocument(LeafReaderContext context, int docId) {\n             // for random access and don't optimize for sequential access - except for merging.\n             // So we do a little hack here and pretend we're going to do merges in order to\n             // get better sequential access.\n-            if (context.reader() instanceof SequentialStoredFieldsLeafReader lf) {\n+            if (context.reader()instanceof SequentialStoredFieldsLeafReader lf) {\n                 // Avoid eagerly loading the stored fields reader, since this can be expensive\n                 Supplier<StoredFieldsReader> supplier = new MemoizedSupplier<>(lf::getSequentialStoredFieldsReader);\n                 fieldReader = (d, v) -> supplier.get().visitDocument(d, v);"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-02-09T05:37:56Z",
+      "sha": "0e036172605fdfdb371668bf58d5011f2745ddd8",
+      "message": "Improve test",
+      "author": "Julie Tibshirani",
+      "author_email": "julietibs@apache.org",
+      "author_raw_date": "2022-02-09T05:15:13Z",
+      "author_date": "2022-02-09T05:15:13Z",
+      "committer": "Julie Tibshirani",
+      "committer_email": "julietibs@apache.org",
+      "raw_date": "2022-02-09T05:37:56Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/search/lookup/SourceLookupTests.java\n@@ -18,12 +18,14 @@\n import org.apache.lucene.index.RandomIndexWriter;\n import org.apache.lucene.store.Directory;\n import org.elasticsearch.ElasticsearchParseException;\n+import org.elasticsearch.common.bytes.BytesReference;\n import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;\n import org.elasticsearch.test.ESTestCase;\n+import org.elasticsearch.xcontent.XContentFactory;\n \n import java.io.IOException;\n-import java.util.Map;\n \n+import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.instanceOf;\n \n public class SourceLookupTests extends ESTestCase {\n@@ -39,14 +41,16 @@ public void testSetSegmentAndDocument() throws IOException {\n \n                 SourceLookup sourceLookup = new SourceLookup();\n                 sourceLookup.setSegmentAndDocument(readerContext, 42);\n-                sourceLookup.setSource(Map.of(\"field\", \"value\"));\n-                assertNotNull(sourceLookup.source());\n+                sourceLookup.setSource(\n+                    BytesReference.bytes(XContentFactory.jsonBuilder().startObject().field(\"field\", \"value\").endObject())\n+                );\n+                assertNotNull(sourceLookup.internalSourceRef());\n \n                 // Source should be preserved if we pass in the same reader and document\n                 sourceLookup.setSegmentAndDocument(readerContext, 42);\n-                assertNotNull(sourceLookup.source());\n+                assertNotNull(sourceLookup.internalSourceRef());\n \n-                // The stored fields reader should not be loaded eagerly\n+                // Check that the stored fields reader is not loaded eagerly\n                 LeafReader throwingReader = new SequentialStoredFieldsLeafReader(readerContext.reader()) {\n                     @Override\n                     protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {\n@@ -67,6 +71,7 @@ public CacheHelper getCoreCacheHelper() {\n                 sourceLookup.setSegmentAndDocument(throwingReader.getContext(), 0);\n                 ElasticsearchParseException e = expectThrows(ElasticsearchParseException.class, sourceLookup::source);\n                 assertThat(e.getCause(), instanceOf(UnsupportedOperationException.class));\n+                assertThat(e.getCause().getMessage(), containsString(\"attempted to load stored fields reader\"));\n             }\n         }\n     }",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/search/lookup/SourceLookupTests.java",
+          "patch": "@@ -18,12 +18,14 @@\n import org.apache.lucene.index.RandomIndexWriter;\n import org.apache.lucene.store.Directory;\n import org.elasticsearch.ElasticsearchParseException;\n+import org.elasticsearch.common.bytes.BytesReference;\n import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;\n import org.elasticsearch.test.ESTestCase;\n+import org.elasticsearch.xcontent.XContentFactory;\n \n import java.io.IOException;\n-import java.util.Map;\n \n+import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.instanceOf;\n \n public class SourceLookupTests extends ESTestCase {\n@@ -39,14 +41,16 @@ public void testSetSegmentAndDocument() throws IOException {\n \n                 SourceLookup sourceLookup = new SourceLookup();\n                 sourceLookup.setSegmentAndDocument(readerContext, 42);\n-                sourceLookup.setSource(Map.of(\"field\", \"value\"));\n-                assertNotNull(sourceLookup.source());\n+                sourceLookup.setSource(\n+                    BytesReference.bytes(XContentFactory.jsonBuilder().startObject().field(\"field\", \"value\").endObject())\n+                );\n+                assertNotNull(sourceLookup.internalSourceRef());\n \n                 // Source should be preserved if we pass in the same reader and document\n                 sourceLookup.setSegmentAndDocument(readerContext, 42);\n-                assertNotNull(sourceLookup.source());\n+                assertNotNull(sourceLookup.internalSourceRef());\n \n-                // The stored fields reader should not be loaded eagerly\n+                // Check that the stored fields reader is not loaded eagerly\n                 LeafReader throwingReader = new SequentialStoredFieldsLeafReader(readerContext.reader()) {\n                     @Override\n                     protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {\n@@ -67,6 +71,7 @@ public CacheHelper getCoreCacheHelper() {\n                 sourceLookup.setSegmentAndDocument(throwingReader.getContext(), 0);\n                 ElasticsearchParseException e = expectThrows(ElasticsearchParseException.class, sourceLookup::source);\n                 assertThat(e.getCause(), instanceOf(UnsupportedOperationException.class));\n+                assertThat(e.getCause().getMessage(), containsString(\"attempted to load stored fields reader\"));\n             }\n         }\n     }"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1033371655,
+      "created_at": "2022-02-09T05:39:48Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-search (Team:Search)"
+    },
+    {
+      "type": "review",
+      "id": 877325498,
+      "created_at": "2022-02-09T11:35:40Z",
+      "user": "romseygeek",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "review",
+      "id": 877370770,
+      "created_at": "2022-02-09T12:14:40Z",
+      "user": "ywelsch",
+      "state": "APPROVED",
+      "body": "LGTM. Thanks @jtibshirani."
+    },
+    {
+      "type": "commit",
+      "date": "2022-02-09T17:27:55Z",
+      "sha": "9394682f54501f0f88c835f90ec7c67be80634b0",
+      "message": "Update docs/changelog/83693.yaml",
+      "author": "Julie Tibshirani",
+      "author_email": "julie.tibshirani@elastic.co",
+      "author_raw_date": "2022-02-09T17:27:55Z",
+      "author_date": "2022-02-09T17:27:55Z",
+      "committer": "Julie Tibshirani",
+      "committer_email": "julie.tibshirani@elastic.co",
+      "raw_date": "2022-02-09T17:27:55Z",
+      "diff_text": "docs/changelog/83693.yaml\n@@ -2,4 +2,5 @@ pr: 83693\n summary: Avoid eagerly loading `StoredFieldsReader` in fetch phase\n area: Search\n type: bug\n-issues: []\n+issues:\n+ - 82777",
+      "diff": [
+        {
+          "file": "docs/changelog/83693.yaml",
+          "patch": "@@ -2,4 +2,5 @@ pr: 83693\n summary: Avoid eagerly loading `StoredFieldsReader` in fetch phase\n area: Search\n type: bug\n-issues: []\n+issues:\n+ - 82777"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1034013837,
+      "created_at": "2022-02-09T17:27:55Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @jtibshirani, I've updated the changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1034014525,
+      "created_at": "2022-02-09T17:28:39Z",
+      "user": "jtibshirani",
+      "body": "Thanks for the reviews! I forgot to link the original issue: #82777."
+    },
+    {
+      "type": "comment",
+      "id": 1034039425,
+      "created_at": "2022-02-09T17:56:27Z",
+      "user": "jtibshirani",
+      "body": "@elasticmachine ok to test"
+    }
+  ]
+}

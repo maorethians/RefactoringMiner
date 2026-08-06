@@ -1,0 +1,360 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 101184,
+  "pr_number": 101184,
+  "title": "More robust timeout for repo analysis",
+  "user": "DaveCTurner",
+  "created_at": "2023-10-21T05:35:57Z",
+  "merged_at": "2023-10-23T07:17:40Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "auto-merge-without-approval",
+    "v8.11.1",
+    "v8.12.0"
+  ],
+  "base_commit": "6b8790571a3cb1e8bf4162197f7e83f5dd282dc4",
+  "merge_commit_sha": "cfb0780b7a4cb819dd25ca57291058f571ebcae8",
+  "commits": 6,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/101184",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-10-21T05:33:08Z",
+      "sha": "c600d7aaffdc89e1f265c6f5f270053b7db58c77",
+      "message": "More robust timeout for repo analysis\n\nReplaces the transport-level timeout with an overall timeout on the\nwhole repository analysis task to ensure that all child tasks terminate\npromptly.\n\nRelates #66992\nCloses #101182",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-10-21T05:29:57Z",
+      "author_date": "2023-10-21T05:29:57Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-10-21T05:33:08Z",
+      "diff_text": "x-pack/plugin/snapshot-repo-test-kit/src/internalClusterTest/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalysisFailureIT.java\n@@ -27,6 +27,7 @@\n import org.elasticsearch.common.util.concurrent.CountDown;\n import org.elasticsearch.core.CheckedConsumer;\n import org.elasticsearch.core.Nullable;\n+import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.env.Environment;\n import org.elasticsearch.indices.recovery.RecoverySettings;\n import org.elasticsearch.plugins.Plugin;\n@@ -61,6 +62,7 @@\n import java.util.stream.Collectors;\n \n import static org.hamcrest.Matchers.anEmptyMap;\n+import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.nullValue;\n \n@@ -347,8 +349,26 @@ public BytesReference onCompareAndExchange(BytesRegister register, BytesReferenc\n         }\n     }\n \n-    private RepositoryAnalyzeAction.Response analyseRepository(RepositoryAnalyzeAction.Request request) {\n-        return client().execute(RepositoryAnalyzeAction.INSTANCE, request).actionGet(30L, TimeUnit.SECONDS);\n+    public void testTimesOutSpinningRegisterAnalysis() {\n+        final RepositoryAnalyzeAction.Request request = new RepositoryAnalyzeAction.Request(\"test-repo\");\n+        request.timeout(TimeValue.timeValueMillis(between(1, 1000)));\n+\n+        blobStore.setDisruption(new Disruption() {\n+            @Override\n+            public boolean compareAndExchangeFails() {\n+                return true;\n+            }\n+        });\n+        final var exception = expectThrows(RepositoryVerificationException.class, () -> analyseRepository(request));\n+        assertThat(exception.getMessage(), containsString(\"analysis failed\"));\n+        assertThat(\n+            asInstanceOf(RepositoryVerificationException.class, exception.getCause()).getMessage(),\n+            containsString(\"analysis timed out\")\n+        );\n+    }\n+\n+    private void analyseRepository(RepositoryAnalyzeAction.Request request) {\n+        client().execute(RepositoryAnalyzeAction.INSTANCE, request).actionGet(30L, TimeUnit.SECONDS);\n     }\n \n     private static void assertPurpose(OperationPurpose purpose) {\n@@ -464,6 +484,10 @@ default boolean createBlobOnAbort() {\n             return false;\n         }\n \n+        default boolean compareAndExchangeFails() {\n+            return false;\n+        }\n+\n         default BytesReference onCompareAndExchange(BytesRegister register, BytesReference expected, BytesReference updated) {\n             return register.compareAndExchange(expected, updated);\n         }\n@@ -637,8 +661,12 @@ public void compareAndExchangeRegister(\n             ActionListener<OptionalBytesReference> listener\n         ) {\n             assertPurpose(purpose);\n-            final var register = registers.computeIfAbsent(key, ignored -> new BytesRegister());\n-            listener.onResponse(OptionalBytesReference.of(disruption.onCompareAndExchange(register, expected, updated)));\n+            if (disruption.compareAndExchangeFails()) {\n+                listener.onResponse(OptionalBytesReference.MISSING);\n+            } else {\n+                final var register = registers.computeIfAbsent(key, ignored -> new BytesRegister());\n+                listener.onResponse(OptionalBytesReference.of(disruption.onCompareAndExchange(register, expected, updated)));\n+            }\n         }\n     }\n \nx-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java\n@@ -22,6 +22,7 @@\n import org.elasticsearch.action.support.ActionFilters;\n import org.elasticsearch.action.support.HandledTransportAction;\n import org.elasticsearch.action.support.RefCountingRunnable;\n+import org.elasticsearch.action.support.SubscribableListener;\n import org.elasticsearch.cluster.ClusterState;\n import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.node.DiscoveryNodes;\n@@ -364,6 +365,7 @@ public static class AsyncAction {\n         private final DiscoveryNodes discoveryNodes;\n         private final LongSupplier currentTimeMillisSupplier;\n         private final ActionListener<Response> listener;\n+        private final SubscribableListener<Void> cancellationListener;\n         private final long timeoutTimeMillis;\n \n         // choose the blob path nondeterministically to avoid clashes, assuming that the actual path doesn't matter for reproduction\n@@ -394,7 +396,9 @@ public AsyncAction(\n             this.discoveryNodes = discoveryNodes;\n             this.currentTimeMillisSupplier = currentTimeMillisSupplier;\n             this.timeoutTimeMillis = currentTimeMillisSupplier.getAsLong() + request.getTimeout().millis();\n-            this.listener = listener;\n+\n+            this.cancellationListener = new SubscribableListener<>();\n+            this.listener = ActionListener.runBefore(listener, () -> cancellationListener.onResponse(null));\n \n             responses = new ArrayList<>(request.blobCount);\n         }\n@@ -430,7 +434,7 @@ private boolean isRunning() {\n                 return false;\n             }\n \n-            if (timeoutTimeMillis < currentTimeMillisSupplier.getAsLong()) {\n+            if (cancellationListener.isDone()) {\n                 if (failure.compareAndSet(\n                     null,\n                     new RepositoryVerificationException(request.repositoryName, \"analysis timed out after [\" + request.getTimeout() + \"]\")\n@@ -444,12 +448,29 @@ private boolean isRunning() {\n             return true;\n         }\n \n+        private class CheckForCancelListener implements ActionListener<Void> {\n+            @Override\n+            public void onResponse(Void unused) {\n+                // task complete, nothing to do\n+            }\n+\n+            @Override\n+            public void onFailure(Exception e) {\n+                // trigger another isRunning check which will cancel the task if not already failed or cancelled\n+                var isNowRunning = isRunning();\n+                assert isNowRunning == false;\n+            }\n+        }\n+\n         public void run() {\n             assert queue.isEmpty() : \"must only run action once\";\n             assert failure.get() == null : \"must only run action once\";\n \n             logger.info(\"running analysis of repository [{}] using path [{}]\", request.getRepositoryName(), blobPath);\n \n+            cancellationListener.addTimeout(request.getTimeout(), repository.threadPool(), EsExecutors.DIRECT_EXECUTOR_SERVICE);\n+            cancellationListener.addListener(new CheckForCancelListener());\n+\n             final Random random = new Random(request.getSeed());\n             final List<DiscoveryNode> nodes = getSnapshotNodes(discoveryNodes);\n \n@@ -536,7 +557,7 @@ private void runBlobAnalysis(Releasable ref, final BlobAnalyzeAction.Request req\n                     BlobAnalyzeAction.NAME,\n                     request,\n                     task,\n-                    TransportRequestOptions.timeout(TimeValue.timeValueMillis(timeoutTimeMillis - currentTimeMillisSupplier.getAsLong())),\n+                    TransportRequestOptions.EMPTY,\n                     new ActionListenerResponseHandler<>(ActionListener.releaseAfter(new ActionListener<>() {\n                         @Override\n                         public void onResponse(BlobAnalyzeAction.Response response) {",
+      "diff": [
+        {
+          "file": "x-pack/plugin/snapshot-repo-test-kit/src/internalClusterTest/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalysisFailureIT.java",
+          "patch": "@@ -27,6 +27,7 @@\n import org.elasticsearch.common.util.concurrent.CountDown;\n import org.elasticsearch.core.CheckedConsumer;\n import org.elasticsearch.core.Nullable;\n+import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.env.Environment;\n import org.elasticsearch.indices.recovery.RecoverySettings;\n import org.elasticsearch.plugins.Plugin;\n@@ -61,6 +62,7 @@\n import java.util.stream.Collectors;\n \n import static org.hamcrest.Matchers.anEmptyMap;\n+import static org.hamcrest.Matchers.containsString;\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.nullValue;\n \n@@ -347,8 +349,26 @@ public BytesReference onCompareAndExchange(BytesRegister register, BytesReferenc\n         }\n     }\n \n-    private RepositoryAnalyzeAction.Response analyseRepository(RepositoryAnalyzeAction.Request request) {\n-        return client().execute(RepositoryAnalyzeAction.INSTANCE, request).actionGet(30L, TimeUnit.SECONDS);\n+    public void testTimesOutSpinningRegisterAnalysis() {\n+        final RepositoryAnalyzeAction.Request request = new RepositoryAnalyzeAction.Request(\"test-repo\");\n+        request.timeout(TimeValue.timeValueMillis(between(1, 1000)));\n+\n+        blobStore.setDisruption(new Disruption() {\n+            @Override\n+            public boolean compareAndExchangeFails() {\n+                return true;\n+            }\n+        });\n+        final var exception = expectThrows(RepositoryVerificationException.class, () -> analyseRepository(request));\n+        assertThat(exception.getMessage(), containsString(\"analysis failed\"));\n+        assertThat(\n+            asInstanceOf(RepositoryVerificationException.class, exception.getCause()).getMessage(),\n+            containsString(\"analysis timed out\")\n+        );\n+    }\n+\n+    private void analyseRepository(RepositoryAnalyzeAction.Request request) {\n+        client().execute(RepositoryAnalyzeAction.INSTANCE, request).actionGet(30L, TimeUnit.SECONDS);\n     }\n \n     private static void assertPurpose(OperationPurpose purpose) {\n@@ -464,6 +484,10 @@ default boolean createBlobOnAbort() {\n             return false;\n         }\n \n+        default boolean compareAndExchangeFails() {\n+            return false;\n+        }\n+\n         default BytesReference onCompareAndExchange(BytesRegister register, BytesReference expected, BytesReference updated) {\n             return register.compareAndExchange(expected, updated);\n         }\n@@ -637,8 +661,12 @@ public void compareAndExchangeRegister(\n             ActionListener<OptionalBytesReference> listener\n         ) {\n             assertPurpose(purpose);\n-            final var register = registers.computeIfAbsent(key, ignored -> new BytesRegister());\n-            listener.onResponse(OptionalBytesReference.of(disruption.onCompareAndExchange(register, expected, updated)));\n+            if (disruption.compareAndExchangeFails()) {\n+                listener.onResponse(OptionalBytesReference.MISSING);\n+            } else {\n+                final var register = registers.computeIfAbsent(key, ignored -> new BytesRegister());\n+                listener.onResponse(OptionalBytesReference.of(disruption.onCompareAndExchange(register, expected, updated)));\n+            }\n         }\n     }\n "
+        },
+        {
+          "file": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java",
+          "patch": "@@ -22,6 +22,7 @@\n import org.elasticsearch.action.support.ActionFilters;\n import org.elasticsearch.action.support.HandledTransportAction;\n import org.elasticsearch.action.support.RefCountingRunnable;\n+import org.elasticsearch.action.support.SubscribableListener;\n import org.elasticsearch.cluster.ClusterState;\n import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.node.DiscoveryNodes;\n@@ -364,6 +365,7 @@ public static class AsyncAction {\n         private final DiscoveryNodes discoveryNodes;\n         private final LongSupplier currentTimeMillisSupplier;\n         private final ActionListener<Response> listener;\n+        private final SubscribableListener<Void> cancellationListener;\n         private final long timeoutTimeMillis;\n \n         // choose the blob path nondeterministically to avoid clashes, assuming that the actual path doesn't matter for reproduction\n@@ -394,7 +396,9 @@ public AsyncAction(\n             this.discoveryNodes = discoveryNodes;\n             this.currentTimeMillisSupplier = currentTimeMillisSupplier;\n             this.timeoutTimeMillis = currentTimeMillisSupplier.getAsLong() + request.getTimeout().millis();\n-            this.listener = listener;\n+\n+            this.cancellationListener = new SubscribableListener<>();\n+            this.listener = ActionListener.runBefore(listener, () -> cancellationListener.onResponse(null));\n \n             responses = new ArrayList<>(request.blobCount);\n         }\n@@ -430,7 +434,7 @@ private boolean isRunning() {\n                 return false;\n             }\n \n-            if (timeoutTimeMillis < currentTimeMillisSupplier.getAsLong()) {\n+            if (cancellationListener.isDone()) {\n                 if (failure.compareAndSet(\n                     null,\n                     new RepositoryVerificationException(request.repositoryName, \"analysis timed out after [\" + request.getTimeout() + \"]\")\n@@ -444,12 +448,29 @@ private boolean isRunning() {\n             return true;\n         }\n \n+        private class CheckForCancelListener implements ActionListener<Void> {\n+            @Override\n+            public void onResponse(Void unused) {\n+                // task complete, nothing to do\n+            }\n+\n+            @Override\n+            public void onFailure(Exception e) {\n+                // trigger another isRunning check which will cancel the task if not already failed or cancelled\n+                var isNowRunning = isRunning();\n+                assert isNowRunning == false;\n+            }\n+        }\n+\n         public void run() {\n             assert queue.isEmpty() : \"must only run action once\";\n             assert failure.get() == null : \"must only run action once\";\n \n             logger.info(\"running analysis of repository [{}] using path [{}]\", request.getRepositoryName(), blobPath);\n \n+            cancellationListener.addTimeout(request.getTimeout(), repository.threadPool(), EsExecutors.DIRECT_EXECUTOR_SERVICE);\n+            cancellationListener.addListener(new CheckForCancelListener());\n+\n             final Random random = new Random(request.getSeed());\n             final List<DiscoveryNode> nodes = getSnapshotNodes(discoveryNodes);\n \n@@ -536,7 +557,7 @@ private void runBlobAnalysis(Releasable ref, final BlobAnalyzeAction.Request req\n                     BlobAnalyzeAction.NAME,\n                     request,\n                     task,\n-                    TransportRequestOptions.timeout(TimeValue.timeValueMillis(timeoutTimeMillis - currentTimeMillisSupplier.getAsLong())),\n+                    TransportRequestOptions.EMPTY,\n                     new ActionListenerResponseHandler<>(ActionListener.releaseAfter(new ActionListener<>() {\n                         @Override\n                         public void onResponse(BlobAnalyzeAction.Response response) {"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-10-21T05:35:57Z",
+      "user": "DaveCTurner",
+      "body": "Replaces the transport-level timeout with an overall timeout on the\r\nwhole repository analysis task to ensure that all child tasks terminate\r\npromptly.\r\n\r\nRelates #66992\r\nCloses #101182"
+    },
+    {
+      "type": "commit",
+      "date": "2023-10-21T05:36:20Z",
+      "sha": "177ee4177c9e905367d8c8c399789580d246ee66",
+      "message": "Update docs/changelog/101184.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-10-21T05:36:20Z",
+      "author_date": "2023-10-21T05:36:20Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-10-21T05:36:20Z",
+      "diff_text": "docs/changelog/101184.yaml\n@@ -0,0 +1,6 @@\n+pr: 101184\n+summary: More robust timeout for repo analysis\n+area: Snapshot/Restore\n+type: bug\n+issues:\n+ - 101182",
+      "diff": [
+        {
+          "file": "docs/changelog/101184.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 101184\n+summary: More robust timeout for repo analysis\n+area: Snapshot/Restore\n+type: bug\n+issues:\n+ - 101182"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1773678443,
+      "created_at": "2023-10-21T05:36:21Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1773678444,
+      "created_at": "2023-10-21T05:36:21Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "commit",
+      "date": "2023-10-21T06:52:23Z",
+      "sha": "19a62e8797bc40b17b078475e81abef29be72071",
+      "message": "Fix YAML test",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-10-21T06:52:23Z",
+      "author_date": "2023-10-21T06:52:23Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-10-21T06:52:23Z",
+      "diff_text": "x-pack/plugin/snapshot-repo-test-kit/qa/rest/src/yamlRestTest/resources/rest-api-spec/test/10_analyze.yml\n@@ -176,4 +176,5 @@ setup:\n   - match: { status: 500 }\n   - match: { error.type: repository_verification_exception }\n   - match: { error.reason: \"/.*test_repo_slow..analysis.failed.*/\" }\n-  - match: { error.root_cause.0.type: receive_timeout_transport_exception }\n+  - match: { error.root_cause.0.type: repository_verification_exception }\n+  - match: { error.root_cause.0.reason: \"/.*test_repo_slow..analysis.timed.out.after..1s.*/\" }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/snapshot-repo-test-kit/qa/rest/src/yamlRestTest/resources/rest-api-spec/test/10_analyze.yml",
+          "patch": "@@ -176,4 +176,5 @@ setup:\n   - match: { status: 500 }\n   - match: { error.type: repository_verification_exception }\n   - match: { error.reason: \"/.*test_repo_slow..analysis.failed.*/\" }\n-  - match: { error.root_cause.0.type: receive_timeout_transport_exception }\n+  - match: { error.root_cause.0.type: repository_verification_exception }\n+  - match: { error.root_cause.0.reason: \"/.*test_repo_slow..analysis.timed.out.after..1s.*/\" }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-10-21T15:55:38Z",
+      "sha": "d8e0d0229e61694e0ac81e6c385f65cd18dae8b2",
+      "message": "disruption.compareAndExchangeReturnsWitness",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-10-21T15:55:38Z",
+      "author_date": "2023-10-21T15:55:38Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-10-21T15:55:38Z",
+      "diff_text": "x-pack/plugin/snapshot-repo-test-kit/src/internalClusterTest/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalysisFailureIT.java\n@@ -355,8 +355,8 @@ public void testTimesOutSpinningRegisterAnalysis() {\n \n         blobStore.setDisruption(new Disruption() {\n             @Override\n-            public boolean compareAndExchangeFails() {\n-                return true;\n+            public boolean compareAndExchangeReturnsWitness() {\n+                return false;\n             }\n         });\n         final var exception = expectThrows(RepositoryVerificationException.class, () -> analyseRepository(request));\n@@ -484,8 +484,8 @@ default boolean createBlobOnAbort() {\n             return false;\n         }\n \n-        default boolean compareAndExchangeFails() {\n-            return false;\n+        default boolean compareAndExchangeReturnsWitness() {\n+            return true;\n         }\n \n         default BytesReference onCompareAndExchange(BytesRegister register, BytesReference expected, BytesReference updated) {\n@@ -661,11 +661,11 @@ public void compareAndExchangeRegister(\n             ActionListener<OptionalBytesReference> listener\n         ) {\n             assertPurpose(purpose);\n-            if (disruption.compareAndExchangeFails()) {\n-                listener.onResponse(OptionalBytesReference.MISSING);\n-            } else {\n+            if (disruption.compareAndExchangeReturnsWitness()) {\n                 final var register = registers.computeIfAbsent(key, ignored -> new BytesRegister());\n                 listener.onResponse(OptionalBytesReference.of(disruption.onCompareAndExchange(register, expected, updated)));\n+            } else {\n+                listener.onResponse(OptionalBytesReference.MISSING);\n             }\n         }\n     }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/snapshot-repo-test-kit/src/internalClusterTest/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalysisFailureIT.java",
+          "patch": "@@ -355,8 +355,8 @@ public void testTimesOutSpinningRegisterAnalysis() {\n \n         blobStore.setDisruption(new Disruption() {\n             @Override\n-            public boolean compareAndExchangeFails() {\n-                return true;\n+            public boolean compareAndExchangeReturnsWitness() {\n+                return false;\n             }\n         });\n         final var exception = expectThrows(RepositoryVerificationException.class, () -> analyseRepository(request));\n@@ -484,8 +484,8 @@ default boolean createBlobOnAbort() {\n             return false;\n         }\n \n-        default boolean compareAndExchangeFails() {\n-            return false;\n+        default boolean compareAndExchangeReturnsWitness() {\n+            return true;\n         }\n \n         default BytesReference onCompareAndExchange(BytesRegister register, BytesReference expected, BytesReference updated) {\n@@ -661,11 +661,11 @@ public void compareAndExchangeRegister(\n             ActionListener<OptionalBytesReference> listener\n         ) {\n             assertPurpose(purpose);\n-            if (disruption.compareAndExchangeFails()) {\n-                listener.onResponse(OptionalBytesReference.MISSING);\n-            } else {\n+            if (disruption.compareAndExchangeReturnsWitness()) {\n                 final var register = registers.computeIfAbsent(key, ignored -> new BytesRegister());\n                 listener.onResponse(OptionalBytesReference.of(disruption.onCompareAndExchange(register, expected, updated)));\n+            } else {\n+                listener.onResponse(OptionalBytesReference.MISSING);\n             }\n         }\n     }"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1368020446,
+      "created_at": "2023-10-23T00:31:03Z",
+      "user": "ywangd",
+      "body": "Not for this PR, but a more specific `SubscribableListener#isTimeout` method could help make the logic here more explicit.",
+      "path": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java",
+      "diff_hunk": "@@ -430,7 +434,7 @@ private boolean isRunning() {\n                 return false;\n             }\n \n-            if (timeoutTimeMillis < currentTimeMillisSupplier.getAsLong()) {\n+            if (cancellationListener.isDone()) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 437,
+      "side": "RIGHT",
+      "original_position": 32,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1368183862,
+          "user": "DaveCTurner",
+          "body": "A fair point, we can just fail the task on a timeout and make this all a bunch clearer. See 504ebb19808b909ee04186174504bc54eff90999.",
+          "created_at": "2023-10-23T06:32:41Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1368031426,
+      "created_at": "2023-10-23T01:09:17Z",
+      "user": "ywangd",
+      "body": "I am trying to think through the difference scenarios how `cancellationListener` can already be completed before we invoke `onResponse(null)` here. I think they are all OK. I am writing it down to be explicit and maybe you can double check it as well.\r\n1. The request fails due to timeout, i.e. `cancellationListener` is already timed out and this runs right before we are going to call `listener.onFailure`. This is fine because `SubscribableListener` accepts only the first completion and silently ignores all future results.\r\n2. We are about to call `listener.onResponse` for success while `cancellationListener` times out concurrently. The timeout will set the failure and try to cancel the tasks. This is fine because we don't check the failure object anymore and cancelling completed or non-existing tasks seem to be a noop.\r\n3. Timeout can be called even after the `listener` is completed. This is fine since the timeout will be after `cancellationListener.onResponse(null)` and completing a `SubscribableListener` more than once is ignored.",
+      "path": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java",
+      "diff_hunk": "@@ -394,7 +396,9 @@ public AsyncAction(\n             this.discoveryNodes = discoveryNodes;\n             this.currentTimeMillisSupplier = currentTimeMillisSupplier;\n             this.timeoutTimeMillis = currentTimeMillisSupplier.getAsLong() + request.getTimeout().millis();\n-            this.listener = listener;\n+\n+            this.cancellationListener = new SubscribableListener<>();\n+            this.listener = ActionListener.runBefore(listener, () -> cancellationListener.onResponse(null));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 402,
+      "original_line": 401,
+      "side": "RIGHT",
+      "original_position": 23,
+      "position": 31,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1368195088,
+          "user": "DaveCTurner",
+          "body": ":+1: sounds about right, yes.",
+          "created_at": "2023-10-23T06:47:25Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1368031883,
+      "created_at": "2023-10-23T01:10:45Z",
+      "user": "ywangd",
+      "body": "If the cluster has many nodes and the repo analysis is configured to have high concurrency, would it be expensive to cancel the tasks on the scheduler thread? ",
+      "path": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java",
+      "diff_hunk": "@@ -444,12 +448,29 @@ private boolean isRunning() {\n             return true;\n         }\n \n+        private class CheckForCancelListener implements ActionListener<Void> {\n+            @Override\n+            public void onResponse(Void unused) {\n+                // task complete, nothing to do\n+            }\n+\n+            @Override\n+            public void onFailure(Exception e) {\n+                // trigger another isRunning check which will cancel the task if not already failed or cancelled\n+                var isNowRunning = isRunning();\n+                assert isNowRunning == false;\n+            }\n+        }\n+\n         public void run() {\n             assert queue.isEmpty() : \"must only run action once\";\n             assert failure.get() == null : \"must only run action once\";\n \n             logger.info(\"running analysis of repository [{}] using path [{}]\", request.getRepositoryName(), blobPath);\n \n+            cancellationListener.addTimeout(request.getTimeout(), repository.threadPool(), EsExecutors.DIRECT_EXECUTOR_SERVICE);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 475,
+      "original_line": 471,
+      "side": "RIGHT",
+      "original_position": 60,
+      "position": 101,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1368193660,
+          "user": "DaveCTurner",
+          "body": "Eh perhaps, but I wouldn't expect it to be a problem because (a) I don't see folks changing the concurrency very much and (b) even at 1000 nodes I don't think it'd be a huge deal, the cancel messages are tiny. We cancel things for other reasons on low-latency threads, e.g. `RestCancellableNodeClient`.",
+          "created_at": "2023-10-23T06:45:46Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1368032783,
+      "created_at": "2023-10-23T01:14:27Z",
+      "user": "ywangd",
+      "body": "Nit: I find it a bit surprising that `isRunning` does a bit more than an usualy `isXxx` boolean method. Not suggesting any change for this PR though since it is existing code and the name is not related to what we are trying to fix here.",
+      "path": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java",
+      "diff_hunk": "@@ -444,12 +448,29 @@ private boolean isRunning() {\n             return true;\n         }\n \n+        private class CheckForCancelListener implements ActionListener<Void> {\n+            @Override\n+            public void onResponse(Void unused) {\n+                // task complete, nothing to do\n+            }\n+\n+            @Override\n+            public void onFailure(Exception e) {\n+                // trigger another isRunning check which will cancel the task if not already failed or cancelled\n+                var isNowRunning = isRunning();",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 460,
+      "side": "RIGHT",
+      "original_position": 49,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1368199293,
+          "user": "DaveCTurner",
+          "body": "That's fair too. This was done before #82685 introduced `org.elasticsearch.tasks.CancellableTask#addListener`, but if we migrated to that we could drop the `task.isCancelled()` check here. I opened https://github.com/elastic/elasticsearch/issues/101197.",
+          "created_at": "2023-10-23T06:52:24Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1691545878,
+      "created_at": "2023-10-23T01:25:31Z",
+      "user": "ywangd",
+      "state": "APPROVED",
+      "body": "LGTM\r\n\r\nA few non-blocking comments mostly for explaining my thoughts when reading the code."
+    },
+    {
+      "type": "commit",
+      "date": "2023-10-23T06:21:06Z",
+      "sha": "407c28305c30ee241659ae05d70abeb4def1e370",
+      "message": "Merge branch 'main' into 2023/10/21/repo-analysis-timeout",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-10-23T06:21:06Z",
+      "author_date": "2023-10-23T06:21:06Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-10-23T06:21:06Z",
+      "diff_text": "x-pack/plugin/spatial/src/main/java/org/elasticsearch/xpack/spatial/search/aggregations/bucket/geogrid/GeoHexGridTiler.java\n@@ -240,7 +240,7 @@ static class BoundedGeoHexGridTiler extends GeoHexGridTiler {\n         private final GeoBoundingBox bbox;\n         private final GeoHexVisitor visitor;\n         private final int resolution;\n-        private static final double FACTOR = 0.36;\n+        private static final double FACTOR = 0.37;\n \n         BoundedGeoHexGridTiler(int resolution, GeoBoundingBox bbox) {\n             super(resolution);",
+      "diff": [
+        {
+          "file": "x-pack/plugin/spatial/src/main/java/org/elasticsearch/xpack/spatial/search/aggregations/bucket/geogrid/GeoHexGridTiler.java",
+          "patch": "@@ -240,7 +240,7 @@ static class BoundedGeoHexGridTiler extends GeoHexGridTiler {\n         private final GeoBoundingBox bbox;\n         private final GeoHexVisitor visitor;\n         private final int resolution;\n-        private static final double FACTOR = 0.36;\n+        private static final double FACTOR = 0.37;\n \n         BoundedGeoHexGridTiler(int resolution, GeoBoundingBox bbox) {\n             super(resolution);"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2023-10-23T06:28:51Z",
+      "sha": "504ebb19808b909ee04186174504bc54eff90999",
+      "message": "Fail on timeout directly, no need to check isDone",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-10-23T06:28:51Z",
+      "author_date": "2023-10-23T06:28:51Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-10-23T06:28:51Z",
+      "diff_text": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java\n@@ -9,6 +9,7 @@\n \n import org.apache.logging.log4j.LogManager;\n import org.apache.logging.log4j.Logger;\n+import org.elasticsearch.ElasticsearchTimeoutException;\n import org.elasticsearch.ExceptionsHelper;\n import org.elasticsearch.TransportVersions;\n import org.elasticsearch.Version;\n@@ -403,10 +404,17 @@ public AsyncAction(\n             responses = new ArrayList<>(request.blobCount);\n         }\n \n-        private void fail(Exception e) {\n+        private boolean setFirstFailure(Exception e) {\n             if (failure.compareAndSet(null, e)) {\n                 transportService.getTaskManager().cancelTaskAndDescendants(task, \"task failed\", false, ActionListener.noop());\n+                return true;\n             } else {\n+                return false;\n+            }\n+        }\n+\n+        private void fail(Exception e) {\n+            if (setFirstFailure(e) == false) {\n                 if (innerFailures.tryAcquire()) {\n                     final Throwable cause = ExceptionsHelper.unwrapCause(e);\n                     if (cause instanceof TaskCancelledException || cause instanceof ReceiveTimeoutTransportException) {\n@@ -428,23 +436,12 @@ private boolean isRunning() {\n             }\n \n             if (task.isCancelled()) {\n-                failure.compareAndSet(null, new RepositoryVerificationException(request.repositoryName, \"verification cancelled\"));\n+                setFirstFailure(new RepositoryVerificationException(request.repositoryName, \"verification cancelled\"));\n                 // if this CAS failed then we're failing for some other reason, nbd; also if the task is cancelled then its descendants are\n                 // also cancelled, so no further action is needed either way.\n                 return false;\n             }\n \n-            if (cancellationListener.isDone()) {\n-                if (failure.compareAndSet(\n-                    null,\n-                    new RepositoryVerificationException(request.repositoryName, \"analysis timed out after [\" + request.getTimeout() + \"]\")\n-                )) {\n-                    transportService.getTaskManager().cancelTaskAndDescendants(task, \"timed out\", false, ActionListener.noop());\n-                }\n-                // if this CAS failed then we're already failing for some other reason, nbd\n-                return false;\n-            }\n-\n             return true;\n         }\n \n@@ -456,9 +453,16 @@ public void onResponse(Void unused) {\n \n             @Override\n             public void onFailure(Exception e) {\n-                // trigger another isRunning check which will cancel the task if not already failed or cancelled\n-                var isNowRunning = isRunning();\n-                assert isNowRunning == false;\n+                assert e instanceof ElasticsearchTimeoutException : e;\n+                if (isRunning()) {\n+                    // if this CAS fails then we're already failing for some other reason, nbd\n+                    setFirstFailure(\n+                        new RepositoryVerificationException(\n+                            request.repositoryName,\n+                            \"analysis timed out after [\" + request.getTimeout() + \"]\"\n+                        )\n+                    );\n+                }\n             }\n         }\n ",
+      "diff": [
+        {
+          "file": "x-pack/plugin/snapshot-repo-test-kit/src/main/java/org/elasticsearch/repositories/blobstore/testkit/RepositoryAnalyzeAction.java",
+          "patch": "@@ -9,6 +9,7 @@\n \n import org.apache.logging.log4j.LogManager;\n import org.apache.logging.log4j.Logger;\n+import org.elasticsearch.ElasticsearchTimeoutException;\n import org.elasticsearch.ExceptionsHelper;\n import org.elasticsearch.TransportVersions;\n import org.elasticsearch.Version;\n@@ -403,10 +404,17 @@ public AsyncAction(\n             responses = new ArrayList<>(request.blobCount);\n         }\n \n-        private void fail(Exception e) {\n+        private boolean setFirstFailure(Exception e) {\n             if (failure.compareAndSet(null, e)) {\n                 transportService.getTaskManager().cancelTaskAndDescendants(task, \"task failed\", false, ActionListener.noop());\n+                return true;\n             } else {\n+                return false;\n+            }\n+        }\n+\n+        private void fail(Exception e) {\n+            if (setFirstFailure(e) == false) {\n                 if (innerFailures.tryAcquire()) {\n                     final Throwable cause = ExceptionsHelper.unwrapCause(e);\n                     if (cause instanceof TaskCancelledException || cause instanceof ReceiveTimeoutTransportException) {\n@@ -428,23 +436,12 @@ private boolean isRunning() {\n             }\n \n             if (task.isCancelled()) {\n-                failure.compareAndSet(null, new RepositoryVerificationException(request.repositoryName, \"verification cancelled\"));\n+                setFirstFailure(new RepositoryVerificationException(request.repositoryName, \"verification cancelled\"));\n                 // if this CAS failed then we're failing for some other reason, nbd; also if the task is cancelled then its descendants are\n                 // also cancelled, so no further action is needed either way.\n                 return false;\n             }\n \n-            if (cancellationListener.isDone()) {\n-                if (failure.compareAndSet(\n-                    null,\n-                    new RepositoryVerificationException(request.repositoryName, \"analysis timed out after [\" + request.getTimeout() + \"]\")\n-                )) {\n-                    transportService.getTaskManager().cancelTaskAndDescendants(task, \"timed out\", false, ActionListener.noop());\n-                }\n-                // if this CAS failed then we're already failing for some other reason, nbd\n-                return false;\n-            }\n-\n             return true;\n         }\n \n@@ -456,9 +453,16 @@ public void onResponse(Void unused) {\n \n             @Override\n             public void onFailure(Exception e) {\n-                // trigger another isRunning check which will cancel the task if not already failed or cancelled\n-                var isNowRunning = isRunning();\n-                assert isNowRunning == false;\n+                assert e instanceof ElasticsearchTimeoutException : e;\n+                if (isRunning()) {\n+                    // if this CAS fails then we're already failing for some other reason, nbd\n+                    setFirstFailure(\n+                        new RepositoryVerificationException(\n+                            request.repositoryName,\n+                            \"analysis timed out after [\" + request.getTimeout() + \"]\"\n+                        )\n+                    );\n+                }\n             }\n         }\n "
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1691793325,
+      "created_at": "2023-10-23T06:32:41Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1691808831,
+      "created_at": "2023-10-23T06:45:46Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1691810830,
+      "created_at": "2023-10-23T06:47:25Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1691817073,
+      "created_at": "2023-10-23T06:52:24Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1774572647,
+      "created_at": "2023-10-23T07:19:01Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💔 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ❌ |  8.11  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 101184`"
+    },
+    {
+      "type": "review",
+      "id": 1691870644,
+      "created_at": "2023-10-23T07:29:11Z",
+      "user": "fcofdez",
+      "state": "COMMENTED",
+      "body": "LGTM 👍 "
+    }
+  ]
+}

@@ -1,0 +1,199 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 80347,
+  "pr_number": 80347,
+  "title": "[ML] fix bug in model snapshot upgrader where task never exits",
+  "user": "benwtrent",
+  "created_at": "2021-11-04T14:46:31Z",
+  "merged_at": "2021-11-04T16:17:54Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":ml",
+    "Team:ML",
+    "v7.16.0",
+    "v8.1.0",
+    "v7.15.3",
+    "v8.0.0-rc1"
+  ],
+  "base_commit": "265b3d959c87665f4be62c53968856ffed881bd3",
+  "merge_commit_sha": "4c6ab08a223e851c920222fc9578692fd32d7702",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "renamed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/80347",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-11-04T14:42:48Z",
+      "sha": "ab72d7d321ae073a33e78ae88c41d53e814360a5",
+      "message": "[ML] fix bug in model snapshot upgrader",
+      "author": "Benjamin Trent",
+      "author_email": "4357155+benwtrent@users.noreply.github.com",
+      "author_raw_date": "2021-11-04T14:38:54Z",
+      "author_date": "2021-11-04T14:38:54Z",
+      "committer": "Benjamin Trent",
+      "committer_email": "4357155+benwtrent@users.noreply.github.com",
+      "raw_date": "2021-11-04T14:42:48Z",
+      "diff_text": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/JobModelSnapshotUpgrader.java\n@@ -17,6 +17,7 @@\n import org.elasticsearch.common.CheckedSupplier;\n import org.elasticsearch.common.util.concurrent.AbstractRunnable;\n import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;\n+import org.elasticsearch.common.util.concurrent.FutureUtils;\n import org.elasticsearch.common.util.concurrent.ThreadContext;\n import org.elasticsearch.core.internal.io.IOUtils;\n import org.elasticsearch.persistent.PersistentTasksCustomMetadata.PersistentTask;\n@@ -44,7 +45,9 @@\n import java.util.HashMap;\n import java.util.Map;\n import java.util.Objects;\n+import java.util.concurrent.ExecutionException;\n import java.util.concurrent.ExecutorService;\n+import java.util.concurrent.Future;\n import java.util.concurrent.TimeoutException;\n import java.util.function.BiConsumer;\n import java.util.function.Consumer;\n@@ -105,7 +108,7 @@ void start() {\n             params,\n             autodetectExecutorService,\n             (reason) -> {\n-                setTaskToFailed(reason, ActionListener.wrap(t -> {}, f -> {}));\n+                setTaskToFailed(reason, ActionListener.wrap(t -> {}, task::markAsFailed));\n                 try {\n                     nativeStorageProvider.cleanupLocalTmpStorage(task.getDescription());\n                 } catch (IOException e) {\n@@ -281,14 +284,15 @@ private void requestStateWrite() {\n                             params.modelSnapshot().getSnapshotId(),\n                             params.modelSnapshot().getDescription()\n                         );\n-                        return null;\n+                        logger.debug(\"[{}] [{}] state persist call made\", jobId, snapshotId);\n+                        return Void.TYPE;\n                     },\n                         // Execute callback in the UTILITY thread pool, as the current thread in the callback will be one in the\n                         // autodetectWorkerExecutor. Trying to run the callback in that executor will cause a dead lock as that\n                         // executor has a single processing queue.\n                         (aVoid, e) -> threadPool.executor(UTILITY_THREAD_POOL_NAME).execute(() -> shutdown(e))\n                     );\n-                    logger.info(\"asked for state to be persisted\");\n+                    logger.debug(\"[{}] [{}] asked for state to be persisted\", jobId, snapshotId);\n                 }, f -> {\n                     logger.error(\n                         () -> new ParameterizedMessage(\"[{}] [{}] failed to update snapshot upgrader task to started\", jobId, snapshotId),\n@@ -358,30 +362,46 @@ private void checkResultsProcessorIsAlive() {\n         }\n \n         void shutdown(Exception e) {\n+            logger.debug(\"[{}] [{}] shutdown initiated\", jobId, snapshotId);\n             // No point in sending an action to the executor if the process has died\n             if (process.isProcessAlive() == false) {\n+                logger.debug(\"[{}] [{}] process is dead, no need to shutdown\", jobId, snapshotId);\n                 onFinish.accept(e);\n                 autodetectWorkerExecutor.shutdown();\n                 stateStreamer.cancel();\n                 return;\n             }\n-            autodetectWorkerExecutor.execute(() -> {\n+            Future<?> future = autodetectWorkerExecutor.submit(() -> {\n                 try {\n+                    logger.debug(\"[{}] [{}] shutdown is now occurring\", jobId, snapshotId);\n                     if (process.isReady()) {\n                         process.close();\n                     } else {\n                         processor.setProcessKilled();\n                         process.kill(true);\n-                        processor.awaitCompletion();\n+                        stateStreamer.cancel();\n                     }\n+                    processor.awaitCompletion();\n                 } catch (IOException | TimeoutException exc) {\n                     logger.warn(() -> new ParameterizedMessage(\"[{}] [{}] failed to shutdown process\", jobId, snapshotId), exc);\n                 } finally {\n                     onFinish.accept(e);\n                 }\n+                logger.debug(\"[{}] [{}] connection for upgrade has been closed, process is shutdown\", jobId, snapshotId);\n             });\n-            autodetectWorkerExecutor.shutdown();\n-            stateStreamer.cancel();\n+            try {\n+                future.get();\n+                autodetectWorkerExecutor.shutdown();\n+            } catch (InterruptedException interrupt) {\n+                Thread.currentThread().interrupt();\n+            } catch (ExecutionException executionException) {\n+                if (processor.isProcessKilled()) {\n+                    // In this case the original exception is spurious and highly misleading\n+                    throw ExceptionsHelper.conflictStatusException(\"close snapshot upgrade interrupted by kill request\");\n+                } else {\n+                    throw FutureUtils.rethrowExecutionException(executionException);\n+                }\n+            }\n         }\n     }\n }\nx-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/output/JobSnapshotUpgraderResultProcessor.java\n@@ -139,6 +139,10 @@ public void setProcessKilled() {\n         processKilled = true;\n     }\n \n+    public boolean isProcessKilled() {\n+        return processKilled;\n+    }\n+\n     private void logUnexpectedResult(String resultType) {\n         String msg = \"[\" + jobId + \"] [\" + snapshotId + \"] unexpected result read [\" + resultType + \"]\";\n         // This should never happen, but we definitely want to fail if -ea is provided (e.g. during tests)",
+      "diff": [
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/JobModelSnapshotUpgrader.java",
+          "patch": "@@ -17,6 +17,7 @@\n import org.elasticsearch.common.CheckedSupplier;\n import org.elasticsearch.common.util.concurrent.AbstractRunnable;\n import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;\n+import org.elasticsearch.common.util.concurrent.FutureUtils;\n import org.elasticsearch.common.util.concurrent.ThreadContext;\n import org.elasticsearch.core.internal.io.IOUtils;\n import org.elasticsearch.persistent.PersistentTasksCustomMetadata.PersistentTask;\n@@ -44,7 +45,9 @@\n import java.util.HashMap;\n import java.util.Map;\n import java.util.Objects;\n+import java.util.concurrent.ExecutionException;\n import java.util.concurrent.ExecutorService;\n+import java.util.concurrent.Future;\n import java.util.concurrent.TimeoutException;\n import java.util.function.BiConsumer;\n import java.util.function.Consumer;\n@@ -105,7 +108,7 @@ void start() {\n             params,\n             autodetectExecutorService,\n             (reason) -> {\n-                setTaskToFailed(reason, ActionListener.wrap(t -> {}, f -> {}));\n+                setTaskToFailed(reason, ActionListener.wrap(t -> {}, task::markAsFailed));\n                 try {\n                     nativeStorageProvider.cleanupLocalTmpStorage(task.getDescription());\n                 } catch (IOException e) {\n@@ -281,14 +284,15 @@ private void requestStateWrite() {\n                             params.modelSnapshot().getSnapshotId(),\n                             params.modelSnapshot().getDescription()\n                         );\n-                        return null;\n+                        logger.debug(\"[{}] [{}] state persist call made\", jobId, snapshotId);\n+                        return Void.TYPE;\n                     },\n                         // Execute callback in the UTILITY thread pool, as the current thread in the callback will be one in the\n                         // autodetectWorkerExecutor. Trying to run the callback in that executor will cause a dead lock as that\n                         // executor has a single processing queue.\n                         (aVoid, e) -> threadPool.executor(UTILITY_THREAD_POOL_NAME).execute(() -> shutdown(e))\n                     );\n-                    logger.info(\"asked for state to be persisted\");\n+                    logger.debug(\"[{}] [{}] asked for state to be persisted\", jobId, snapshotId);\n                 }, f -> {\n                     logger.error(\n                         () -> new ParameterizedMessage(\"[{}] [{}] failed to update snapshot upgrader task to started\", jobId, snapshotId),\n@@ -358,30 +362,46 @@ private void checkResultsProcessorIsAlive() {\n         }\n \n         void shutdown(Exception e) {\n+            logger.debug(\"[{}] [{}] shutdown initiated\", jobId, snapshotId);\n             // No point in sending an action to the executor if the process has died\n             if (process.isProcessAlive() == false) {\n+                logger.debug(\"[{}] [{}] process is dead, no need to shutdown\", jobId, snapshotId);\n                 onFinish.accept(e);\n                 autodetectWorkerExecutor.shutdown();\n                 stateStreamer.cancel();\n                 return;\n             }\n-            autodetectWorkerExecutor.execute(() -> {\n+            Future<?> future = autodetectWorkerExecutor.submit(() -> {\n                 try {\n+                    logger.debug(\"[{}] [{}] shutdown is now occurring\", jobId, snapshotId);\n                     if (process.isReady()) {\n                         process.close();\n                     } else {\n                         processor.setProcessKilled();\n                         process.kill(true);\n-                        processor.awaitCompletion();\n+                        stateStreamer.cancel();\n                     }\n+                    processor.awaitCompletion();\n                 } catch (IOException | TimeoutException exc) {\n                     logger.warn(() -> new ParameterizedMessage(\"[{}] [{}] failed to shutdown process\", jobId, snapshotId), exc);\n                 } finally {\n                     onFinish.accept(e);\n                 }\n+                logger.debug(\"[{}] [{}] connection for upgrade has been closed, process is shutdown\", jobId, snapshotId);\n             });\n-            autodetectWorkerExecutor.shutdown();\n-            stateStreamer.cancel();\n+            try {\n+                future.get();\n+                autodetectWorkerExecutor.shutdown();\n+            } catch (InterruptedException interrupt) {\n+                Thread.currentThread().interrupt();\n+            } catch (ExecutionException executionException) {\n+                if (processor.isProcessKilled()) {\n+                    // In this case the original exception is spurious and highly misleading\n+                    throw ExceptionsHelper.conflictStatusException(\"close snapshot upgrade interrupted by kill request\");\n+                } else {\n+                    throw FutureUtils.rethrowExecutionException(executionException);\n+                }\n+            }\n         }\n     }\n }"
+        },
+        {
+          "file": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/output/JobSnapshotUpgraderResultProcessor.java",
+          "patch": "@@ -139,6 +139,10 @@ public void setProcessKilled() {\n         processKilled = true;\n     }\n \n+    public boolean isProcessKilled() {\n+        return processKilled;\n+    }\n+\n     private void logUnexpectedResult(String resultType) {\n         String msg = \"[\" + jobId + \"] [\" + snapshotId + \"] unexpected result read [\" + resultType + \"]\";\n         // This should never happen, but we definitely want to fail if -ea is provided (e.g. during tests)"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-11-04T14:46:31Z",
+      "user": "benwtrent",
+      "body": "It is possible that the model snapshot upgrader task is never fully shutdown.\r\n\r\nThis could occur in the following two scenarios:\r\n\r\n - The task state is failed being set to failed (we should kill the task in that situation)\r\n - The executor doesn't fire in time to initiate the shutdown before we shutdown the executor. This is caused by a race condition between scheduling the shutdown and closing the executor.\r\n\r\nTo the user, the failure looks like the REST request NEVER returning. In tests, it looks like:\r\n\r\n```\r\n13:10:20     ElasticsearchStatusException[Elasticsearch exception [type=status_exception, reason=Cannot upgrade job [ml-snapshots-upgrade-job] snapshot [1613739961] as there is currently a snapshot for this job being upgraded]]\r\n```\r\nAs the request is spuriously retried and thus fails as the previous task never shutdown.\r\n\r\ncloses https://github.com/elastic/elasticsearch/issues/69276"
+    },
+    {
+      "type": "comment",
+      "id": 961090463,
+      "created_at": "2021-11-04T14:46:35Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/ml-core (Team:ML)"
+    },
+    {
+      "type": "review",
+      "id": 797843228,
+      "created_at": "2021-11-04T14:47:46Z",
+      "user": "benwtrent",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 742909674,
+      "created_at": "2021-11-04T14:47:46Z",
+      "user": "benwtrent",
+      "body": "This is the key here. Previously, it COULD be that `shutdown` is processed in the window between looking for something in the queue and checking if its closed.\r\n\r\nThis ensures that the `shutdown` request task is handled before closing the executor",
+      "path": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/JobModelSnapshotUpgrader.java",
+      "diff_hunk": "@@ -358,30 +362,46 @@ private void checkResultsProcessorIsAlive() {\n         }\n \n         void shutdown(Exception e) {\n+            logger.debug(\"[{}] [{}] shutdown initiated\", jobId, snapshotId);\n             // No point in sending an action to the executor if the process has died\n             if (process.isProcessAlive() == false) {\n+                logger.debug(\"[{}] [{}] process is dead, no need to shutdown\", jobId, snapshotId);\n                 onFinish.accept(e);\n                 autodetectWorkerExecutor.shutdown();\n                 stateStreamer.cancel();\n                 return;\n             }\n-            autodetectWorkerExecutor.execute(() -> {\n+            Future<?> future = autodetectWorkerExecutor.submit(() -> {\n                 try {\n+                    logger.debug(\"[{}] [{}] shutdown is now occurring\", jobId, snapshotId);\n                     if (process.isReady()) {\n                         process.close();\n                     } else {\n                         processor.setProcessKilled();\n                         process.kill(true);\n-                        processor.awaitCompletion();\n+                        stateStreamer.cancel();\n                     }\n+                    processor.awaitCompletion();\n                 } catch (IOException | TimeoutException exc) {\n                     logger.warn(() -> new ParameterizedMessage(\"[{}] [{}] failed to shutdown process\", jobId, snapshotId), exc);\n                 } finally {\n                     onFinish.accept(e);\n                 }\n+                logger.debug(\"[{}] [{}] connection for upgrade has been closed, process is shutdown\", jobId, snapshotId);\n             });\n-            autodetectWorkerExecutor.shutdown();\n-            stateStreamer.cancel();\n+            try {\n+                future.get();\n+                autodetectWorkerExecutor.shutdown();",
+      "start_line": 383,
+      "original_start_line": 383,
+      "start_side": "LEFT",
+      "line": 394,
+      "original_line": 394,
+      "side": "RIGHT",
+      "original_position": 82,
+      "position": 82,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 797844498,
+      "created_at": "2021-11-04T14:48:42Z",
+      "user": "benwtrent",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 742910569,
+      "created_at": "2021-11-04T14:48:42Z",
+      "user": "benwtrent",
+      "body": "This is not the source of the bug shown by the test results, but it is definitely one that could occur in a strange scenario. Its best to kill the task all together if setting it to failed failed.",
+      "path": "x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/JobModelSnapshotUpgrader.java",
+      "diff_hunk": "@@ -105,7 +108,7 @@ void start() {\n             params,\n             autodetectExecutorService,\n             (reason) -> {\n-                setTaskToFailed(reason, ActionListener.wrap(t -> {}, f -> {}));\n+                setTaskToFailed(reason, ActionListener.wrap(t -> {}, task::markAsFailed));",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 111,
+      "original_line": 111,
+      "side": "RIGHT",
+      "original_position": 23,
+      "position": 23,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 742952942,
+          "user": "droberts195",
+          "body": "`failed` is a state that exists on the persistent task entry in the persistent tasks metadata.  If the whole task is set to failed then that whole entry in the persistent tasks metadata is removed.  So there's no point updating it to have a status of `failed`, then removing it altogether.  We should do one or the other.\r\n\r\nFor datafeeds there is no `failed` state - if they fail their persistent tasks metadata entry is removed which implies a `stopped` state.\r\n\r\nFor anomaly detection jobs the idea behind the `failed` state was that it was a way to keep the persistent tasks metadata entry while recording the failure.  This was done because then the `reason` in the persistent tasks metadata entry can record more information about _why_ the task failed and which node it failed on.  This is really useful stuff to know when the likely cause of failure is something that went wrong with a native process.  Not so useful if everything's in Java land (which is the datafeed case).\r\n\r\nIn the equivalent place for anomaly detection jobs we set the persistent task state to `failed` but keep the persistent task: https://github.com/elastic/elasticsearch/blob/12ad399c488f0cc60e19b5e1b29c6d569cb4351a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/job/process/autodetect/AutodetectProcessManager.java#L685",
+          "created_at": "2021-11-04T15:31:10Z"
+        },
+        {
+          "id": 742972150,
+          "user": "benwtrent",
+          "body": "> So there's no point updating it to have a status of failed, then removing it altogether. We should do one or the other.\r\n\r\nThis particular case is when we failed to set the persistent task state to failed. Consequently, it would still indicate its running even though it isn't. That is why I closed it (removing from cluster state) when it failed to set failed.\r\n\r\nI can look into refactoring setting to failed vs. not existing at all, but I am not sure we want to do that along with this particular bug fix.",
+          "created_at": "2021-11-04T15:51:05Z"
+        },
+        {
+          "id": 742994687,
+          "user": "droberts195",
+          "body": "Sorry, I misread the line.  Yes, what you have is fine, and `markAsFailed` will log the exception that meant we couldn't set the task state to failed.",
+          "created_at": "2021-11-04T16:14:36Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 797904166,
+      "created_at": "2021-11-04T15:31:10Z",
+      "user": "droberts195",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 797930951,
+      "created_at": "2021-11-04T15:51:05Z",
+      "user": "benwtrent",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 797961929,
+      "created_at": "2021-11-04T16:14:54Z",
+      "user": "droberts195",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 961200876,
+      "created_at": "2021-11-04T16:19:05Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💔 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ✅ |  [8.0](https://github.com/elastic/elasticsearch/pull/80359)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/80359\">](https://github.com/elastic/elasticsearch/pull/80359) |\n| ✅ |  [7.16](https://github.com/elastic/elasticsearch/pull/80360)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/80360\">](https://github.com/elastic/elasticsearch/pull/80360) |\n| ❌ |  7.15  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 80347`"
+    }
+  ]
+}

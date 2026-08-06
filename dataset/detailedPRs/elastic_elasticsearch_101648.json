@@ -1,0 +1,264 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 101648,
+  "pr_number": 101648,
+  "title": "ESQL: Fix unreleased block in topn",
+  "user": "nik9000",
+  "created_at": "2023-10-31T19:53:53Z",
+  "merged_at": "2023-11-01T17:26:42Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    "Team:QL (Deprecated)",
+    ":Analytics/ES|QL",
+    "v8.11.1",
+    "v8.12.0"
+  ],
+  "base_commit": "f428aa2f4cc6b285f91af66d73fc1a79bf47464d",
+  "merge_commit_sha": "382f338d75be1988187fdf0a593af46218573f68",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "unlabeled",
+    "labeled",
+    "referenced",
+    "merged",
+    "closed",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/101648",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-10-31T19:51:08Z",
+      "sha": "6e52f189776e5b15b5a832444e70ba4c6af265ca",
+      "message": "ESQL: Fix unreleased block in topn\n\nThis fixes a bug in the topn operator where it'll fail to de-track\nblocks if there's a failure while building the results from topn.\n\nCloses #101588",
+      "author": "Nik Everett",
+      "author_email": "nik9000@gmail.com",
+      "author_raw_date": "2023-10-31T19:51:08Z",
+      "author_date": "2023-10-31T19:51:08Z",
+      "committer": "Nik Everett",
+      "committer_email": "nik9000@gmail.com",
+      "raw_date": "2023-10-31T19:51:08Z",
+      "diff_text": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/data/Block.java\n@@ -12,6 +12,7 @@\n import org.elasticsearch.common.io.stream.NamedWriteableRegistry;\n import org.elasticsearch.core.Nullable;\n import org.elasticsearch.core.Releasable;\n+import org.elasticsearch.core.Releasables;\n import org.elasticsearch.index.mapper.BlockLoader;\n \n import java.util.List;\n@@ -208,6 +209,24 @@ interface Builder extends BlockLoader.Builder, Releasable {\n          * Builds the block. This method can be called multiple times.\n          */\n         Block build();\n+\n+        /**\n+         * Build many {@link Block}s at once, releasing any partially built blocks\n+         * if any fail.\n+         */\n+        static Block[] buildAll(Block.Builder... builders) {\n+            Block[] blocks = new Block[builders.length];\n+            try {\n+                for (int b = 0; b < blocks.length; b++) {\n+                    blocks[b] = builders[b].build();\n+                }\n+            } finally {\n+                if (blocks[blocks.length - 1] == null) {\n+                    Releasables.closeExpectNoException(blocks);\n+                }\n+            }\n+            return blocks;\n+        }\n     }\n \n     /**\nx-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/topn/TopNOperator.java\n@@ -91,12 +91,6 @@ public long ramBytesUsed() {\n             return SHALLOW_SIZE + keys.ramBytesUsed() + orderByCompositeKeyAscending.size() / Byte.SIZE + values.ramBytesUsed();\n         }\n \n-        private void clear() {\n-            keys.clear();\n-            orderByCompositeKeyAscending.clear();\n-            values.clear();\n-        }\n-\n         @Override\n         public void close() {\n             Releasables.closeExpectNoException(keys, values);\n@@ -405,7 +399,17 @@ private Iterator<Page> toPages() {\n \n                 p++;\n                 if (p == size) {\n-                    result.add(new Page(Arrays.stream(builders).map(ResultBuilder::build).toArray(Block[]::new)));\n+                    Block[] blocks = new Block[builders.length];\n+                    try {\n+                        for (int b = 0; b < blocks.length; b++) {\n+                            blocks[b] = builders[b].build();\n+                        }\n+                    } finally {\n+                        if (blocks[blocks.length - 1] == null) {\n+                            Releasables.closeExpectNoException(blocks);\n+                        }\n+                    }\n+                    result.add(new Page(blocks));\n                     Releasables.closeExpectNoException(builders);\n                     builders = null;\n                 }\nx-pack/plugin/esql/compute/src/test/java/org/elasticsearch/compute/operator/TupleBlockSourceOperator.java\n@@ -7,6 +7,7 @@\n \n package org.elasticsearch.compute.operator;\n \n+import org.elasticsearch.compute.data.Block;\n import org.elasticsearch.compute.data.BlockFactory;\n import org.elasticsearch.compute.data.Page;\n import org.elasticsearch.core.Tuple;\n@@ -44,23 +45,23 @@ public TupleBlockSourceOperator(BlockFactory blockFactory, List<Tuple<Long, Long\n \n     @Override\n     protected Page createPage(int positionOffset, int length) {\n-        var blockBuilder1 = blockFactory.newLongBlockBuilder(length);\n-        var blockBuilder2 = blockFactory.newLongBlockBuilder(length);\n-        for (int i = 0; i < length; i++) {\n-            Tuple<Long, Long> item = values.get(positionOffset + i);\n-            if (item.v1() == null) {\n-                blockBuilder1.appendNull();\n-            } else {\n-                blockBuilder1.appendLong(item.v1());\n-            }\n-            if (item.v2() == null) {\n-                blockBuilder2.appendNull();\n-            } else {\n-                blockBuilder2.appendLong(item.v2());\n+        try (var blockBuilder1 = blockFactory.newLongBlockBuilder(length); var blockBuilder2 = blockFactory.newLongBlockBuilder(length)) {\n+            for (int i = 0; i < length; i++) {\n+                Tuple<Long, Long> item = values.get(positionOffset + i);\n+                if (item.v1() == null) {\n+                    blockBuilder1.appendNull();\n+                } else {\n+                    blockBuilder1.appendLong(item.v1());\n+                }\n+                if (item.v2() == null) {\n+                    blockBuilder2.appendNull();\n+                } else {\n+                    blockBuilder2.appendLong(item.v2());\n+                }\n             }\n+            currentPosition += length;\n+            return new Page(Block.Builder.buildAll(blockBuilder1, blockBuilder2));\n         }\n-        currentPosition += length;\n-        return new Page(blockBuilder1.build(), blockBuilder2.build());\n     }\n \n     @Override\nx-pack/plugin/esql/compute/src/test/java/org/elasticsearch/compute/operator/topn/TopNOperatorTests.java\n@@ -11,6 +11,7 @@\n import org.apache.lucene.tests.util.RamUsageTester;\n import org.apache.lucene.util.BytesRef;\n import org.elasticsearch.common.breaker.CircuitBreaker;\n+import org.elasticsearch.common.breaker.CircuitBreakingException;\n import org.elasticsearch.common.network.NetworkAddress;\n import org.elasticsearch.common.unit.ByteSizeValue;\n import org.elasticsearch.common.util.BigArrays;\n@@ -36,6 +37,7 @@\n import org.elasticsearch.compute.operator.SourceOperator;\n import org.elasticsearch.compute.operator.TupleBlockSourceOperator;\n import org.elasticsearch.core.Tuple;\n+import org.elasticsearch.indices.CrankyCircuitBreakerService;\n import org.elasticsearch.test.ESTestCase;\n import org.elasticsearch.test.ListMatcher;\n import org.elasticsearch.xpack.versionfield.Version;\n@@ -234,15 +236,29 @@ public long accumulateObject(Object o, long shallowSize, Map<Field, Object> fiel\n \n     public void testRandomTopN() {\n         for (boolean asc : List.of(true, false)) {\n-            int limit = randomIntBetween(1, 20);\n-            List<Long> inputValues = randomList(0, 5000, ESTestCase::randomLong);\n-            Comparator<Long> comparator = asc ? naturalOrder() : reverseOrder();\n-            List<Long> expectedValues = inputValues.stream().sorted(comparator).limit(limit).toList();\n-            List<Long> outputValues = topNLong(inputValues, limit, asc, false);\n-            assertThat(outputValues, equalTo(expectedValues));\n+            testRandomTopN(asc, driverContext());\n         }\n     }\n \n+    public void testRandomTopNCranky() {\n+        try {\n+            testRandomTopN(randomBoolean(), crankyDriverContext());\n+            logger.info(\"cranky didn't break us\");\n+        } catch (CircuitBreakingException e) {\n+            logger.info(\"broken\", e);\n+            assertThat(e.getMessage(), equalTo(CrankyCircuitBreakerService.ERROR_MESSAGE));\n+        }\n+    }\n+\n+    private void testRandomTopN(boolean asc, DriverContext context) {\n+        int limit = randomIntBetween(1, 20);\n+        List<Long> inputValues = randomList(0, 5000, ESTestCase::randomLong);\n+        Comparator<Long> comparator = asc ? naturalOrder() : reverseOrder();\n+        List<Long> expectedValues = inputValues.stream().sorted(comparator).limit(limit).toList();\n+        List<Long> outputValues = topNLong(context, inputValues, limit, asc, false);\n+        assertThat(outputValues, equalTo(expectedValues));\n+    }\n+\n     public void testBasicTopN() {\n         List<Long> values = Arrays.asList(2L, 1L, 4L, null, 5L, 10L, null, 20L, 4L, 100L);\n         assertThat(topNLong(values, 1, true, false), equalTo(Arrays.asList(1L)));\n@@ -267,8 +283,15 @@ public void testBasicTopN() {\n         assertThat(topNLong(values, 100, false, true), equalTo(Arrays.asList(null, null, 100L, 20L, 10L, 5L, 4L, 4L, 2L, 1L)));\n     }\n \n-    private List<Long> topNLong(List<Long> inputValues, int limit, boolean ascendingOrder, boolean nullsFirst) {\n+    private List<Long> topNLong(\n+        DriverContext driverContext,\n+        List<Long> inputValues,\n+        int limit,\n+        boolean ascendingOrder,\n+        boolean nullsFirst\n+    ) {\n         return topNTwoColumns(\n+            driverContext,\n             inputValues.stream().map(v -> tuple(v, 0L)).toList(),\n             limit,\n             List.of(LONG, LONG),\n@@ -277,6 +300,10 @@ private List<Long> topNLong(List<Long> inputValues, int limit, boolean ascending\n         ).stream().map(Tuple::v1).toList();\n     }\n \n+    private List<Long> topNLong(List<Long> inputValues, int limit, boolean ascendingOrder, boolean nullsFirst) {\n+        return topNLong(driverContext(), inputValues, limit, ascendingOrder, nullsFirst);\n+    }\n+\n     public void testCompareInts() {\n         testCompare(\n             new Page(\n@@ -422,6 +449,7 @@ public void testTopNTwoColumns() {\n         List<Tuple<Long, Long>> values = Arrays.asList(tuple(1L, 1L), tuple(1L, 2L), tuple(null, null), tuple(null, 1L), tuple(1L, null));\n         assertThat(\n             topNTwoColumns(\n+                driverContext(),\n                 values,\n                 5,\n                 List.of(LONG, LONG),\n@@ -432,6 +460,7 @@ public void testTopNTwoColumns() {\n         );\n         assertThat(\n             topNTwoColumns(\n+                driverContext(),\n                 values,\n                 5,\n                 List.of(LONG, LONG),\n@@ -442,6 +471,7 @@ public void testTopNTwoColumns() {\n         );\n         assertThat(\n             topNTwoColumns(\n+                driverContext(),\n                 values,\n                 5,\n                 List.of(LONG, LONG),\n@@ -613,13 +643,13 @@ public void testCollectAllValues_RandomMultiValues() {\n     }\n \n     private List<Tuple<Long, Long>> topNTwoColumns(\n+        DriverContext driverContext,\n         List<Tuple<Long, Long>> inputValues,\n         int limit,\n         List<ElementType> elementTypes,\n         List<TopNEncoder> encoder,\n         List<TopNOperator.SortOrder> sortOrders\n     ) {\n-        DriverContext driverContext = driverContext();\n         List<Tuple<Long, Long>> outputValues = new ArrayList<>();\n         try (\n             Driver driver = new Driver(\nx-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/AbstractEsqlIntegTestCase.java\n@@ -48,7 +48,10 @@ public void ensureBlocksReleased() {\n             CircuitBreakerService breakerService = internalCluster().getInstance(CircuitBreakerService.class, node);\n             CircuitBreaker reqBreaker = breakerService.getBreaker(CircuitBreaker.REQUEST);\n             try {\n-                assertBusy(() -> assertThat(\"Request breaker not reset to 0 on node: \" + node, reqBreaker.getUsed(), equalTo(0L)));\n+                assertBusy(() -> {\n+                    logger.info(\"running tasks: {}\", client().admin().cluster().prepareListTasks().get());\n+                    assertThat(\"Request breaker not reset to 0 on node: \" + node, reqBreaker.getUsed(), equalTo(0L));\n+                });\n             } catch (Exception e) {\n                 assertThat(\"Request breaker not reset to 0 on node: \" + node, reqBreaker.getUsed(), equalTo(0L));\n             }\nx-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/EsqlActionBreakerIT.java\n@@ -7,7 +7,6 @@\n \n package org.elasticsearch.xpack.esql.action;\n \n-import org.apache.lucene.tests.util.LuceneTestCase;\n import org.elasticsearch.ElasticsearchException;\n import org.elasticsearch.action.DocWriteResponse;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n@@ -20,6 +19,7 @@\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.indices.breaker.HierarchyCircuitBreakerService;\n import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.test.junit.annotations.TestLogging;\n \n import java.util.ArrayList;\n import java.util.Collection;\n@@ -32,7 +32,7 @@\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.instanceOf;\n \n-@LuceneTestCase.AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/101588\")\n+@TestLogging(value = \"org.elasticsearch.xpack.esql:TRACE\", reason = \"debug\")\n public class EsqlActionBreakerIT extends EsqlActionIT {\n \n     public static class InternalTransportSettingPlugin extends Plugin {\nx-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/planner/LocalExecutionPlanner.java\n@@ -46,6 +46,8 @@\n import org.elasticsearch.compute.operator.topn.TopNOperator.TopNOperatorFactory;\n import org.elasticsearch.core.Releasables;\n import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.logging.LogManager;\n+import org.elasticsearch.logging.Logger;\n import org.elasticsearch.search.internal.SearchContext;\n import org.elasticsearch.tasks.CancellableTask;\n import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;\n@@ -111,6 +113,7 @@\n  * drivers that are used to execute the given plan.\n  */\n public class LocalExecutionPlanner {\n+    private static final Logger logger = LogManager.getLogger(LocalExecutionPlanner.class);\n \n     private final String sessionId;\n     private final CancellableTask parentTask;\n@@ -813,14 +816,15 @@ public List<Driver> createDrivers(String sessionId) {\n             try {\n                 for (DriverFactory df : driverFactories) {\n                     for (int i = 0; i < df.driverParallelism.instanceCount; i++) {\n+                        logger.trace(\"building {} {}\", i, df);\n                         drivers.add(df.driverSupplier.apply(sessionId));\n                     }\n                 }\n                 success = true;\n                 return drivers;\n             } finally {\n                 if (success == false) {\n-                    Releasables.close(() -> Releasables.close(drivers));\n+                    Releasables.close(Releasables.wrap(drivers));\n                 }\n             }\n         }",
+      "diff": [
+        {
+          "file": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/data/Block.java",
+          "patch": "@@ -12,6 +12,7 @@\n import org.elasticsearch.common.io.stream.NamedWriteableRegistry;\n import org.elasticsearch.core.Nullable;\n import org.elasticsearch.core.Releasable;\n+import org.elasticsearch.core.Releasables;\n import org.elasticsearch.index.mapper.BlockLoader;\n \n import java.util.List;\n@@ -208,6 +209,24 @@ interface Builder extends BlockLoader.Builder, Releasable {\n          * Builds the block. This method can be called multiple times.\n          */\n         Block build();\n+\n+        /**\n+         * Build many {@link Block}s at once, releasing any partially built blocks\n+         * if any fail.\n+         */\n+        static Block[] buildAll(Block.Builder... builders) {\n+            Block[] blocks = new Block[builders.length];\n+            try {\n+                for (int b = 0; b < blocks.length; b++) {\n+                    blocks[b] = builders[b].build();\n+                }\n+            } finally {\n+                if (blocks[blocks.length - 1] == null) {\n+                    Releasables.closeExpectNoException(blocks);\n+                }\n+            }\n+            return blocks;\n+        }\n     }\n \n     /**"
+        },
+        {
+          "file": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/topn/TopNOperator.java",
+          "patch": "@@ -91,12 +91,6 @@ public long ramBytesUsed() {\n             return SHALLOW_SIZE + keys.ramBytesUsed() + orderByCompositeKeyAscending.size() / Byte.SIZE + values.ramBytesUsed();\n         }\n \n-        private void clear() {\n-            keys.clear();\n-            orderByCompositeKeyAscending.clear();\n-            values.clear();\n-        }\n-\n         @Override\n         public void close() {\n             Releasables.closeExpectNoException(keys, values);\n@@ -405,7 +399,17 @@ private Iterator<Page> toPages() {\n \n                 p++;\n                 if (p == size) {\n-                    result.add(new Page(Arrays.stream(builders).map(ResultBuilder::build).toArray(Block[]::new)));\n+                    Block[] blocks = new Block[builders.length];\n+                    try {\n+                        for (int b = 0; b < blocks.length; b++) {\n+                            blocks[b] = builders[b].build();\n+                        }\n+                    } finally {\n+                        if (blocks[blocks.length - 1] == null) {\n+                            Releasables.closeExpectNoException(blocks);\n+                        }\n+                    }\n+                    result.add(new Page(blocks));\n                     Releasables.closeExpectNoException(builders);\n                     builders = null;\n                 }"
+        },
+        {
+          "file": "x-pack/plugin/esql/compute/src/test/java/org/elasticsearch/compute/operator/TupleBlockSourceOperator.java",
+          "patch": "@@ -7,6 +7,7 @@\n \n package org.elasticsearch.compute.operator;\n \n+import org.elasticsearch.compute.data.Block;\n import org.elasticsearch.compute.data.BlockFactory;\n import org.elasticsearch.compute.data.Page;\n import org.elasticsearch.core.Tuple;\n@@ -44,23 +45,23 @@ public TupleBlockSourceOperator(BlockFactory blockFactory, List<Tuple<Long, Long\n \n     @Override\n     protected Page createPage(int positionOffset, int length) {\n-        var blockBuilder1 = blockFactory.newLongBlockBuilder(length);\n-        var blockBuilder2 = blockFactory.newLongBlockBuilder(length);\n-        for (int i = 0; i < length; i++) {\n-            Tuple<Long, Long> item = values.get(positionOffset + i);\n-            if (item.v1() == null) {\n-                blockBuilder1.appendNull();\n-            } else {\n-                blockBuilder1.appendLong(item.v1());\n-            }\n-            if (item.v2() == null) {\n-                blockBuilder2.appendNull();\n-            } else {\n-                blockBuilder2.appendLong(item.v2());\n+        try (var blockBuilder1 = blockFactory.newLongBlockBuilder(length); var blockBuilder2 = blockFactory.newLongBlockBuilder(length)) {\n+            for (int i = 0; i < length; i++) {\n+                Tuple<Long, Long> item = values.get(positionOffset + i);\n+                if (item.v1() == null) {\n+                    blockBuilder1.appendNull();\n+                } else {\n+                    blockBuilder1.appendLong(item.v1());\n+                }\n+                if (item.v2() == null) {\n+                    blockBuilder2.appendNull();\n+                } else {\n+                    blockBuilder2.appendLong(item.v2());\n+                }\n             }\n+            currentPosition += length;\n+            return new Page(Block.Builder.buildAll(blockBuilder1, blockBuilder2));\n         }\n-        currentPosition += length;\n-        return new Page(blockBuilder1.build(), blockBuilder2.build());\n     }\n \n     @Override"
+        },
+        {
+          "file": "x-pack/plugin/esql/compute/src/test/java/org/elasticsearch/compute/operator/topn/TopNOperatorTests.java",
+          "patch": "@@ -11,6 +11,7 @@\n import org.apache.lucene.tests.util.RamUsageTester;\n import org.apache.lucene.util.BytesRef;\n import org.elasticsearch.common.breaker.CircuitBreaker;\n+import org.elasticsearch.common.breaker.CircuitBreakingException;\n import org.elasticsearch.common.network.NetworkAddress;\n import org.elasticsearch.common.unit.ByteSizeValue;\n import org.elasticsearch.common.util.BigArrays;\n@@ -36,6 +37,7 @@\n import org.elasticsearch.compute.operator.SourceOperator;\n import org.elasticsearch.compute.operator.TupleBlockSourceOperator;\n import org.elasticsearch.core.Tuple;\n+import org.elasticsearch.indices.CrankyCircuitBreakerService;\n import org.elasticsearch.test.ESTestCase;\n import org.elasticsearch.test.ListMatcher;\n import org.elasticsearch.xpack.versionfield.Version;\n@@ -234,15 +236,29 @@ public long accumulateObject(Object o, long shallowSize, Map<Field, Object> fiel\n \n     public void testRandomTopN() {\n         for (boolean asc : List.of(true, false)) {\n-            int limit = randomIntBetween(1, 20);\n-            List<Long> inputValues = randomList(0, 5000, ESTestCase::randomLong);\n-            Comparator<Long> comparator = asc ? naturalOrder() : reverseOrder();\n-            List<Long> expectedValues = inputValues.stream().sorted(comparator).limit(limit).toList();\n-            List<Long> outputValues = topNLong(inputValues, limit, asc, false);\n-            assertThat(outputValues, equalTo(expectedValues));\n+            testRandomTopN(asc, driverContext());\n         }\n     }\n \n+    public void testRandomTopNCranky() {\n+        try {\n+            testRandomTopN(randomBoolean(), crankyDriverContext());\n+            logger.info(\"cranky didn't break us\");\n+        } catch (CircuitBreakingException e) {\n+            logger.info(\"broken\", e);\n+            assertThat(e.getMessage(), equalTo(CrankyCircuitBreakerService.ERROR_MESSAGE));\n+        }\n+    }\n+\n+    private void testRandomTopN(boolean asc, DriverContext context) {\n+        int limit = randomIntBetween(1, 20);\n+        List<Long> inputValues = randomList(0, 5000, ESTestCase::randomLong);\n+        Comparator<Long> comparator = asc ? naturalOrder() : reverseOrder();\n+        List<Long> expectedValues = inputValues.stream().sorted(comparator).limit(limit).toList();\n+        List<Long> outputValues = topNLong(context, inputValues, limit, asc, false);\n+        assertThat(outputValues, equalTo(expectedValues));\n+    }\n+\n     public void testBasicTopN() {\n         List<Long> values = Arrays.asList(2L, 1L, 4L, null, 5L, 10L, null, 20L, 4L, 100L);\n         assertThat(topNLong(values, 1, true, false), equalTo(Arrays.asList(1L)));\n@@ -267,8 +283,15 @@ public void testBasicTopN() {\n         assertThat(topNLong(values, 100, false, true), equalTo(Arrays.asList(null, null, 100L, 20L, 10L, 5L, 4L, 4L, 2L, 1L)));\n     }\n \n-    private List<Long> topNLong(List<Long> inputValues, int limit, boolean ascendingOrder, boolean nullsFirst) {\n+    private List<Long> topNLong(\n+        DriverContext driverContext,\n+        List<Long> inputValues,\n+        int limit,\n+        boolean ascendingOrder,\n+        boolean nullsFirst\n+    ) {\n         return topNTwoColumns(\n+            driverContext,\n             inputValues.stream().map(v -> tuple(v, 0L)).toList(),\n             limit,\n             List.of(LONG, LONG),\n@@ -277,6 +300,10 @@ private List<Long> topNLong(List<Long> inputValues, int limit, boolean ascending\n         ).stream().map(Tuple::v1).toList();\n     }\n \n+    private List<Long> topNLong(List<Long> inputValues, int limit, boolean ascendingOrder, boolean nullsFirst) {\n+        return topNLong(driverContext(), inputValues, limit, ascendingOrder, nullsFirst);\n+    }\n+\n     public void testCompareInts() {\n         testCompare(\n             new Page(\n@@ -422,6 +449,7 @@ public void testTopNTwoColumns() {\n         List<Tuple<Long, Long>> values = Arrays.asList(tuple(1L, 1L), tuple(1L, 2L), tuple(null, null), tuple(null, 1L), tuple(1L, null));\n         assertThat(\n             topNTwoColumns(\n+                driverContext(),\n                 values,\n                 5,\n                 List.of(LONG, LONG),\n@@ -432,6 +460,7 @@ public void testTopNTwoColumns() {\n         );\n         assertThat(\n             topNTwoColumns(\n+                driverContext(),\n                 values,\n                 5,\n                 List.of(LONG, LONG),\n@@ -442,6 +471,7 @@ public void testTopNTwoColumns() {\n         );\n         assertThat(\n             topNTwoColumns(\n+                driverContext(),\n                 values,\n                 5,\n                 List.of(LONG, LONG),\n@@ -613,13 +643,13 @@ public void testCollectAllValues_RandomMultiValues() {\n     }\n \n     private List<Tuple<Long, Long>> topNTwoColumns(\n+        DriverContext driverContext,\n         List<Tuple<Long, Long>> inputValues,\n         int limit,\n         List<ElementType> elementTypes,\n         List<TopNEncoder> encoder,\n         List<TopNOperator.SortOrder> sortOrders\n     ) {\n-        DriverContext driverContext = driverContext();\n         List<Tuple<Long, Long>> outputValues = new ArrayList<>();\n         try (\n             Driver driver = new Driver("
+        },
+        {
+          "file": "x-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/AbstractEsqlIntegTestCase.java",
+          "patch": "@@ -48,7 +48,10 @@ public void ensureBlocksReleased() {\n             CircuitBreakerService breakerService = internalCluster().getInstance(CircuitBreakerService.class, node);\n             CircuitBreaker reqBreaker = breakerService.getBreaker(CircuitBreaker.REQUEST);\n             try {\n-                assertBusy(() -> assertThat(\"Request breaker not reset to 0 on node: \" + node, reqBreaker.getUsed(), equalTo(0L)));\n+                assertBusy(() -> {\n+                    logger.info(\"running tasks: {}\", client().admin().cluster().prepareListTasks().get());\n+                    assertThat(\"Request breaker not reset to 0 on node: \" + node, reqBreaker.getUsed(), equalTo(0L));\n+                });\n             } catch (Exception e) {\n                 assertThat(\"Request breaker not reset to 0 on node: \" + node, reqBreaker.getUsed(), equalTo(0L));\n             }"
+        },
+        {
+          "file": "x-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/EsqlActionBreakerIT.java",
+          "patch": "@@ -7,7 +7,6 @@\n \n package org.elasticsearch.xpack.esql.action;\n \n-import org.apache.lucene.tests.util.LuceneTestCase;\n import org.elasticsearch.ElasticsearchException;\n import org.elasticsearch.action.DocWriteResponse;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n@@ -20,6 +19,7 @@\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.indices.breaker.HierarchyCircuitBreakerService;\n import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.test.junit.annotations.TestLogging;\n \n import java.util.ArrayList;\n import java.util.Collection;\n@@ -32,7 +32,7 @@\n import static org.hamcrest.Matchers.equalTo;\n import static org.hamcrest.Matchers.instanceOf;\n \n-@LuceneTestCase.AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/101588\")\n+@TestLogging(value = \"org.elasticsearch.xpack.esql:TRACE\", reason = \"debug\")\n public class EsqlActionBreakerIT extends EsqlActionIT {\n \n     public static class InternalTransportSettingPlugin extends Plugin {"
+        },
+        {
+          "file": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/planner/LocalExecutionPlanner.java",
+          "patch": "@@ -46,6 +46,8 @@\n import org.elasticsearch.compute.operator.topn.TopNOperator.TopNOperatorFactory;\n import org.elasticsearch.core.Releasables;\n import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.logging.LogManager;\n+import org.elasticsearch.logging.Logger;\n import org.elasticsearch.search.internal.SearchContext;\n import org.elasticsearch.tasks.CancellableTask;\n import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;\n@@ -111,6 +113,7 @@\n  * drivers that are used to execute the given plan.\n  */\n public class LocalExecutionPlanner {\n+    private static final Logger logger = LogManager.getLogger(LocalExecutionPlanner.class);\n \n     private final String sessionId;\n     private final CancellableTask parentTask;\n@@ -813,14 +816,15 @@ public List<Driver> createDrivers(String sessionId) {\n             try {\n                 for (DriverFactory df : driverFactories) {\n                     for (int i = 0; i < df.driverParallelism.instanceCount; i++) {\n+                        logger.trace(\"building {} {}\", i, df);\n                         drivers.add(df.driverSupplier.apply(sessionId));\n                     }\n                 }\n                 success = true;\n                 return drivers;\n             } finally {\n                 if (success == false) {\n-                    Releasables.close(() -> Releasables.close(drivers));\n+                    Releasables.close(Releasables.wrap(drivers));\n                 }\n             }\n         }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-10-31T19:53:53Z",
+      "user": "nik9000",
+      "body": "This fixes a bug in the topn operator where it'll fail to de-track blocks if there's a failure while building the results from topn.\r\n\r\nCloses #101588\r\n"
+    },
+    {
+      "type": "commit",
+      "date": "2023-10-31T19:54:17Z",
+      "sha": "83ee9b92c75279bf94cc72db9e1f5be8f10cdc31",
+      "message": "Update docs/changelog/101648.yaml",
+      "author": "Nik Everett",
+      "author_email": "nik9000@gmail.com",
+      "author_raw_date": "2023-10-31T19:54:17Z",
+      "author_date": "2023-10-31T19:54:17Z",
+      "committer": "Nik Everett",
+      "committer_email": "nik9000@gmail.com",
+      "raw_date": "2023-10-31T19:54:17Z",
+      "diff_text": "docs/changelog/101648.yaml\n@@ -0,0 +1,6 @@\n+pr: 101648\n+summary: \"ESQL: Fix unreleased block in topn\"\n+area: ES|QL\n+type: bug\n+issues:\n+ - 101588",
+      "diff": [
+        {
+          "file": "docs/changelog/101648.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 101648\n+summary: \"ESQL: Fix unreleased block in topn\"\n+area: ES|QL\n+type: bug\n+issues:\n+ - 101588"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1787941813,
+      "created_at": "2023-10-31T19:54:17Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-ql (Team:QL)"
+    },
+    {
+      "type": "comment",
+      "id": 1787941826,
+      "created_at": "2023-10-31T19:54:17Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @nik9000, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1787941828,
+      "created_at": "2023-10-31T19:54:17Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/elasticsearch-esql (:Query Languages/ES|QL)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1378225256,
+      "created_at": "2023-10-31T22:35:53Z",
+      "user": "dnhatn",
+      "body": "Nice!",
+      "path": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/data/Block.java",
+      "diff_hunk": "@@ -208,6 +209,24 @@ interface Builder extends BlockLoader.Builder, Releasable {\n          * Builds the block. This method can be called multiple times.\n          */\n         Block build();\n+\n+        /**\n+         * Build many {@link Block}s at once, releasing any partially built blocks\n+         * if any fail.\n+         */\n+        static Block[] buildAll(Block.Builder... builders) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 217,
+      "original_line": 217,
+      "side": "RIGHT",
+      "original_position": 17,
+      "position": 17,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1378556836,
+          "user": "ChrisHegarty",
+          "body": "++ this will be incredibly useful, and avoid future bugs!",
+          "created_at": "2023-11-01T09:14:57Z"
+        },
+        {
+          "id": 1378560264,
+          "user": "ChrisHegarty",
+          "body": "Should we close the builders too, on failure?",
+          "created_at": "2023-11-01T09:18:23Z"
+        },
+        {
+          "id": 1378827946,
+          "user": "nik9000",
+          "body": "I was hoping we can expect the builders to be in `try` blocks.",
+          "created_at": "2023-11-01T13:49:33Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1378225695,
+      "created_at": "2023-10-31T22:36:44Z",
+      "user": "dnhatn",
+      "body": "I thought we should use `Block.Builder.buildAll`, but these builders are ResultBuilder.",
+      "path": "x-pack/plugin/esql/compute/src/main/java/org/elasticsearch/compute/operator/topn/TopNOperator.java",
+      "diff_hunk": "@@ -405,7 +399,17 @@ private Iterator<Page> toPages() {\n \n                 p++;\n                 if (p == size) {\n-                    result.add(new Page(Arrays.stream(builders).map(ResultBuilder::build).toArray(Block[]::new)));\n+                    Block[] blocks = new Block[builders.length];",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 402,
+      "original_line": 402,
+      "side": "RIGHT",
+      "original_position": 18,
+      "position": 18,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1378828273,
+          "user": "nik9000",
+          "body": "Yeah! But those aren't actually builders..... ",
+          "created_at": "2023-11-01T13:49:49Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1707329967,
+      "created_at": "2023-10-31T22:39:03Z",
+      "user": "dnhatn",
+      "state": "APPROVED",
+      "body": "LGTM. Thanks, Nik!"
+    },
+    {
+      "type": "review",
+      "id": 1707831631,
+      "created_at": "2023-11-01T09:20:03Z",
+      "user": "ChrisHegarty",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1708264648,
+      "created_at": "2023-11-01T13:49:33Z",
+      "user": "nik9000",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1708265191,
+      "created_at": "2023-11-01T13:49:50Z",
+      "user": "nik9000",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1789092873,
+      "created_at": "2023-11-01T14:49:53Z",
+      "user": "nik9000",
+      "body": "run elasticsearch-ci/part-1"
+    },
+    {
+      "type": "comment",
+      "id": 1789362029,
+      "created_at": "2023-11-01T17:27:49Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💔 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ❌ |  8.11  | Commit could not be cherrypicked due to conflicts |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 101648`"
+    },
+    {
+      "type": "comment",
+      "id": 1789617271,
+      "created_at": "2023-11-01T20:19:12Z",
+      "user": "nik9000",
+      "body": "Manually backported with #101694"
+    }
+  ]
+}

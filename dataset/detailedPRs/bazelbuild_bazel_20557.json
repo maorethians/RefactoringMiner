@@ -1,0 +1,255 @@
+{
+  "repo": "bazelbuild/bazel",
+  "number": 20557,
+  "pr_number": 20557,
+  "title": "Optimize prefetchInputs.",
+  "user": "coeuvre",
+  "created_at": "2023-12-15T08:06:36Z",
+  "merged_at": null,
+  "merged": false,
+  "state": "closed",
+  "labels": [
+    "team-Remote-Exec"
+  ],
+  "base_commit": "4f0c7df2d13e2b7738723e296e16e899b152a7e9",
+  "merge_commit_sha": "4a932ae88ff9cbbbbec754c44a14cb159a9241a2",
+  "commits": 3,
+  "issue_events": [
+    "review_requested",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "mentioned",
+    "subscribed",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "unlabeled",
+    "mentioned",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "unlabeled",
+    "labeled",
+    "closed",
+    "unlabeled",
+    "referenced",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/bazelbuild/bazel/pull/20557",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-12-15T08:00:35Z",
+      "sha": "2bb70fd225f7934f37ba61619bd2178db5d7509c",
+      "message": "Optimize prefetchInputs.\n\nUse a pre-allocated array to hold the intermediate transfers to avoid\nallocations. Replace some of RxJava code with Futures to avoid RxJava\noverheads.\n\nThis improves the perfromance of prefetchInputs on a large set of\ninputs from ~400ms to ~16ms.\n\nFixes #20555.",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2023-12-15T08:00:35Z",
+      "author_date": "2023-12-15T08:00:35Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2023-12-15T08:00:35Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java\n@@ -16,17 +16,20 @@\n import static com.google.common.base.Preconditions.checkArgument;\n import static com.google.common.base.Preconditions.checkNotNull;\n import static com.google.common.base.Preconditions.checkState;\n+import static com.google.common.util.concurrent.Futures.immediateFailedFuture;\n+import static com.google.common.util.concurrent.Futures.immediateVoidFuture;\n import static com.google.common.util.concurrent.MoreExecutors.directExecutor;\n import static com.google.devtools.build.lib.remote.util.RxFutures.toCompletable;\n import static com.google.devtools.build.lib.remote.util.RxFutures.toListenableFuture;\n-import static com.google.devtools.build.lib.remote.util.RxUtils.mergeBulkTransfer;\n import static com.google.devtools.build.lib.remote.util.Utils.getFromFuture;\n+import static com.google.devtools.build.lib.remote.util.Utils.mergeBulkTransfer;\n \n import com.google.auto.value.AutoValue;\n import com.google.common.annotations.VisibleForTesting;\n import com.google.common.collect.ImmutableSet;\n import com.google.common.collect.Sets;\n import com.google.common.flogger.GoogleLogger;\n+import com.google.common.util.concurrent.Futures;\n import com.google.common.util.concurrent.ListenableFuture;\n import com.google.devtools.build.lib.actions.Action;\n import com.google.devtools.build.lib.actions.ActionExecutionMetadata;\n@@ -53,7 +56,6 @@\n import com.google.devtools.build.lib.vfs.Path;\n import com.google.devtools.build.lib.vfs.PathFragment;\n import io.reactivex.rxjava3.core.Completable;\n-import io.reactivex.rxjava3.core.Flowable;\n import io.reactivex.rxjava3.core.Single;\n import java.io.IOException;\n import java.util.ArrayList;\n@@ -291,30 +293,38 @@ public ListenableFuture<Void> prefetchFiles(\n     // it must still synchronize on the output permissions having been set.\n     Set<Path> dirsWithOutputPermissions = Sets.newConcurrentHashSet();\n \n-    Completable prefetch =\n-        mergeBulkTransfer(\n-                Flowable.fromIterable(files)\n-                    .flatMapSingle(\n-                        input ->\n-                            prefetchFile(\n-                                action,\n-                                dirsWithOutputPermissions,\n-                                metadataSupplier,\n-                                input,\n-                                priority)))\n-            .doOnComplete(\n-                // Set output permissions on tree artifact subdirectories, matching the behavior of\n-                // SkyframeActionExecutor#checkOutputs for artifacts produced by local actions.\n-                () -> {\n-                  for (Path dir : dirsWithOutputPermissions) {\n-                    directoryTracker.setOutputPermissions(dir);\n-                  }\n-                });\n-\n-    return toListenableFuture(prefetch);\n+    List<ListenableFuture<Void>> transfers = new ArrayList<>(files.size());\n+    try (var s = Profiler.instance().profile(\"compose prefetches\")) {\n+      for (var file : files) {\n+        var result =\n+            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority);\n+        transfers.add(result);\n+      }\n+    }\n+\n+    ListenableFuture<Void> mergedTransfer;\n+    try (var s = Profiler.instance().profile(\"mergeBulkTransfer\")) {\n+      mergedTransfer = mergeBulkTransfer(transfers);\n+    }\n+\n+    return Futures.transformAsync(\n+        mergedTransfer,\n+        unused -> {\n+          try {\n+            // Set output permissions on tree artifact subdirectories, matching the behavior of\n+            // SkyframeActionExecutor#checkOutputs for artifacts produced by local actions.\n+            for (Path dir : dirsWithOutputPermissions) {\n+              directoryTracker.setOutputPermissions(dir);\n+            }\n+          } catch (IOException e) {\n+            return immediateFailedFuture(e);\n+          }\n+          return immediateVoidFuture();\n+        },\n+        directExecutor());\n   }\n \n-  private Single<TransferResult> prefetchFile(\n+  private ListenableFuture<Void> prefetchFile(\n       ActionExecutionMetadata action,\n       Set<Path> dirsWithOutputPermissions,\n       MetadataSupplier metadataSupplier,\n@@ -323,14 +333,14 @@ private Single<TransferResult> prefetchFile(\n     try {\n       if (input instanceof VirtualActionInput) {\n         prefetchVirtualActionInput((VirtualActionInput) input);\n-        return Single.just(TransferResult.ok());\n+        return immediateVoidFuture();\n       }\n \n       PathFragment execPath = input.getExecPath();\n \n       FileArtifactValue metadata = metadataSupplier.getMetadata(input);\n       if (metadata == null || !canDownloadFile(execRoot.getRelative(execPath), metadata)) {\n-        return Single.just(TransferResult.ok());\n+        return immediateVoidFuture();\n       }\n \n       @Nullable Symlink symlink = maybeGetSymlink(action, input, metadata, metadataSupplier);\n@@ -357,11 +367,9 @@ private Single<TransferResult> prefetchFile(\n         result = result.andThen(plantSymlink(symlink));\n       }\n \n-      return RxUtils.toTransferResult(result);\n-    } catch (IOException e) {\n-      return Single.just(TransferResult.error(e));\n-    } catch (InterruptedException e) {\n-      return Single.just(TransferResult.interrupted());\n+      return toListenableFuture(result);\n+    } catch (IOException | InterruptedException e) {\n+      return immediateFailedFuture(e);\n     }\n   }\n \nsrc/main/java/com/google/devtools/build/lib/remote/util/Utils.java\n@@ -13,8 +13,12 @@\n // limitations under the License.\n package com.google.devtools.build.lib.remote.util;\n \n+import static com.google.common.base.Preconditions.checkNotNull;\n import static com.google.common.base.Strings.isNullOrEmpty;\n import static com.google.common.base.Throwables.getStackTraceAsString;\n+import static com.google.common.util.concurrent.Futures.immediateFailedFuture;\n+import static com.google.common.util.concurrent.Futures.immediateVoidFuture;\n+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;\n import static java.util.stream.Collectors.joining;\n \n import build.bazel.remote.execution.v2.Action;\n@@ -44,6 +48,7 @@\n import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;\n import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;\n import com.google.devtools.build.lib.remote.options.RemoteOptions;\n+import com.google.devtools.build.lib.remote.util.RxUtils.TransferResult;\n import com.google.devtools.build.lib.server.FailureDetails;\n import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;\n import com.google.devtools.build.lib.vfs.PathFragment;\n@@ -417,11 +422,11 @@ public static ListenableFuture<ActionResult> downloadAsActionResult(\n               try {\n                 return Futures.immediateFuture(ActionResult.parseFrom(data.toByteArray()));\n               } catch (InvalidProtocolBufferException e) {\n-                return Futures.immediateFailedFuture(e);\n+                return immediateFailedFuture(e);\n               }\n             },\n-            MoreExecutors.directExecutor())\n-        .catching(CacheNotFoundException.class, (e) -> null, MoreExecutors.directExecutor());\n+            directExecutor())\n+        .catching(CacheNotFoundException.class, (e) -> null, directExecutor());\n   }\n \n   public static void verifyBlobContents(Digest expected, Digest actual) throws IOException {\n@@ -483,15 +488,15 @@ public ByteString getContents() {\n    */\n   public static <V> ListenableFuture<V> refreshIfUnauthenticatedAsync(\n       AsyncCallable<V> call, CallCredentialsProvider callCredentialsProvider) {\n-    Preconditions.checkNotNull(call);\n-    Preconditions.checkNotNull(callCredentialsProvider);\n+    checkNotNull(call);\n+    checkNotNull(callCredentialsProvider);\n \n     try {\n       return Futures.catchingAsync(\n           call.call(),\n           Throwable.class,\n           (e) -> refreshIfUnauthenticatedAsyncOnException(e, call, callCredentialsProvider),\n-          MoreExecutors.directExecutor());\n+          directExecutor());\n     } catch (Throwable t) {\n       return refreshIfUnauthenticatedAsyncOnException(t, call, callCredentialsProvider);\n     }\n@@ -511,15 +516,15 @@ private static <V> ListenableFuture<V> refreshIfUnauthenticatedAsyncOnException(\n       }\n     }\n \n-    return Futures.immediateFailedFuture(t);\n+    return immediateFailedFuture(t);\n   }\n \n   /** Same as {@link #refreshIfUnauthenticatedAsync} but calling a synchronous code block. */\n   public static <V> V refreshIfUnauthenticated(\n       Callable<V> call, CallCredentialsProvider callCredentialsProvider)\n       throws IOException, InterruptedException {\n-    Preconditions.checkNotNull(call);\n-    Preconditions.checkNotNull(callCredentialsProvider);\n+    checkNotNull(call);\n+    checkNotNull(callCredentialsProvider);\n \n     try {\n       return call.call();\n@@ -618,4 +623,49 @@ public static void waitForBulkTransfer(\n       throw bulkTransferException;\n     }\n   }\n+\n+  public static ListenableFuture<Void> mergeBulkTransfer(\n+      Iterable<ListenableFuture<Void>> transfers) {\n+    return Futures.whenAllComplete(transfers)\n+        .callAsync(\n+            () -> {\n+              BulkTransferException bulkTransferException = null;\n+\n+              for (var transfer : transfers) {\n+                IOException error = null;\n+                try {\n+                  transfer.get();\n+                } catch (CancellationException e) {\n+                  return immediateFailedFuture(new InterruptedException());\n+                } catch (InterruptedException e) {\n+                  return immediateFailedFuture(e);\n+                } catch (ExecutionException e) {\n+                  var cause = e.getCause();\n+                  if (cause instanceof InterruptedException) {\n+                    return immediateFailedFuture(cause);\n+                  } else if (cause instanceof IOException) {\n+                    error = (IOException) cause;\n+                  } else {\n+                    error = new IOException(cause);\n+                  }\n+                }\n+\n+                if (error == null) {\n+                  continue;\n+                }\n+\n+                if (bulkTransferException == null) {\n+                  bulkTransferException = new BulkTransferException();\n+                }\n+                bulkTransferException.add(error);\n+              }\n+\n+              if (bulkTransferException != null) {\n+                return immediateFailedFuture(bulkTransferException);\n+              }\n+\n+              return immediateVoidFuture();\n+            },\n+            directExecutor());\n+  }\n }",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java",
+          "patch": "@@ -16,17 +16,20 @@\n import static com.google.common.base.Preconditions.checkArgument;\n import static com.google.common.base.Preconditions.checkNotNull;\n import static com.google.common.base.Preconditions.checkState;\n+import static com.google.common.util.concurrent.Futures.immediateFailedFuture;\n+import static com.google.common.util.concurrent.Futures.immediateVoidFuture;\n import static com.google.common.util.concurrent.MoreExecutors.directExecutor;\n import static com.google.devtools.build.lib.remote.util.RxFutures.toCompletable;\n import static com.google.devtools.build.lib.remote.util.RxFutures.toListenableFuture;\n-import static com.google.devtools.build.lib.remote.util.RxUtils.mergeBulkTransfer;\n import static com.google.devtools.build.lib.remote.util.Utils.getFromFuture;\n+import static com.google.devtools.build.lib.remote.util.Utils.mergeBulkTransfer;\n \n import com.google.auto.value.AutoValue;\n import com.google.common.annotations.VisibleForTesting;\n import com.google.common.collect.ImmutableSet;\n import com.google.common.collect.Sets;\n import com.google.common.flogger.GoogleLogger;\n+import com.google.common.util.concurrent.Futures;\n import com.google.common.util.concurrent.ListenableFuture;\n import com.google.devtools.build.lib.actions.Action;\n import com.google.devtools.build.lib.actions.ActionExecutionMetadata;\n@@ -53,7 +56,6 @@\n import com.google.devtools.build.lib.vfs.Path;\n import com.google.devtools.build.lib.vfs.PathFragment;\n import io.reactivex.rxjava3.core.Completable;\n-import io.reactivex.rxjava3.core.Flowable;\n import io.reactivex.rxjava3.core.Single;\n import java.io.IOException;\n import java.util.ArrayList;\n@@ -291,30 +293,38 @@ public ListenableFuture<Void> prefetchFiles(\n     // it must still synchronize on the output permissions having been set.\n     Set<Path> dirsWithOutputPermissions = Sets.newConcurrentHashSet();\n \n-    Completable prefetch =\n-        mergeBulkTransfer(\n-                Flowable.fromIterable(files)\n-                    .flatMapSingle(\n-                        input ->\n-                            prefetchFile(\n-                                action,\n-                                dirsWithOutputPermissions,\n-                                metadataSupplier,\n-                                input,\n-                                priority)))\n-            .doOnComplete(\n-                // Set output permissions on tree artifact subdirectories, matching the behavior of\n-                // SkyframeActionExecutor#checkOutputs for artifacts produced by local actions.\n-                () -> {\n-                  for (Path dir : dirsWithOutputPermissions) {\n-                    directoryTracker.setOutputPermissions(dir);\n-                  }\n-                });\n-\n-    return toListenableFuture(prefetch);\n+    List<ListenableFuture<Void>> transfers = new ArrayList<>(files.size());\n+    try (var s = Profiler.instance().profile(\"compose prefetches\")) {\n+      for (var file : files) {\n+        var result =\n+            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority);\n+        transfers.add(result);\n+      }\n+    }\n+\n+    ListenableFuture<Void> mergedTransfer;\n+    try (var s = Profiler.instance().profile(\"mergeBulkTransfer\")) {\n+      mergedTransfer = mergeBulkTransfer(transfers);\n+    }\n+\n+    return Futures.transformAsync(\n+        mergedTransfer,\n+        unused -> {\n+          try {\n+            // Set output permissions on tree artifact subdirectories, matching the behavior of\n+            // SkyframeActionExecutor#checkOutputs for artifacts produced by local actions.\n+            for (Path dir : dirsWithOutputPermissions) {\n+              directoryTracker.setOutputPermissions(dir);\n+            }\n+          } catch (IOException e) {\n+            return immediateFailedFuture(e);\n+          }\n+          return immediateVoidFuture();\n+        },\n+        directExecutor());\n   }\n \n-  private Single<TransferResult> prefetchFile(\n+  private ListenableFuture<Void> prefetchFile(\n       ActionExecutionMetadata action,\n       Set<Path> dirsWithOutputPermissions,\n       MetadataSupplier metadataSupplier,\n@@ -323,14 +333,14 @@ private Single<TransferResult> prefetchFile(\n     try {\n       if (input instanceof VirtualActionInput) {\n         prefetchVirtualActionInput((VirtualActionInput) input);\n-        return Single.just(TransferResult.ok());\n+        return immediateVoidFuture();\n       }\n \n       PathFragment execPath = input.getExecPath();\n \n       FileArtifactValue metadata = metadataSupplier.getMetadata(input);\n       if (metadata == null || !canDownloadFile(execRoot.getRelative(execPath), metadata)) {\n-        return Single.just(TransferResult.ok());\n+        return immediateVoidFuture();\n       }\n \n       @Nullable Symlink symlink = maybeGetSymlink(action, input, metadata, metadataSupplier);\n@@ -357,11 +367,9 @@ private Single<TransferResult> prefetchFile(\n         result = result.andThen(plantSymlink(symlink));\n       }\n \n-      return RxUtils.toTransferResult(result);\n-    } catch (IOException e) {\n-      return Single.just(TransferResult.error(e));\n-    } catch (InterruptedException e) {\n-      return Single.just(TransferResult.interrupted());\n+      return toListenableFuture(result);\n+    } catch (IOException | InterruptedException e) {\n+      return immediateFailedFuture(e);\n     }\n   }\n "
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/util/Utils.java",
+          "patch": "@@ -13,8 +13,12 @@\n // limitations under the License.\n package com.google.devtools.build.lib.remote.util;\n \n+import static com.google.common.base.Preconditions.checkNotNull;\n import static com.google.common.base.Strings.isNullOrEmpty;\n import static com.google.common.base.Throwables.getStackTraceAsString;\n+import static com.google.common.util.concurrent.Futures.immediateFailedFuture;\n+import static com.google.common.util.concurrent.Futures.immediateVoidFuture;\n+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;\n import static java.util.stream.Collectors.joining;\n \n import build.bazel.remote.execution.v2.Action;\n@@ -44,6 +48,7 @@\n import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;\n import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;\n import com.google.devtools.build.lib.remote.options.RemoteOptions;\n+import com.google.devtools.build.lib.remote.util.RxUtils.TransferResult;\n import com.google.devtools.build.lib.server.FailureDetails;\n import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;\n import com.google.devtools.build.lib.vfs.PathFragment;\n@@ -417,11 +422,11 @@ public static ListenableFuture<ActionResult> downloadAsActionResult(\n               try {\n                 return Futures.immediateFuture(ActionResult.parseFrom(data.toByteArray()));\n               } catch (InvalidProtocolBufferException e) {\n-                return Futures.immediateFailedFuture(e);\n+                return immediateFailedFuture(e);\n               }\n             },\n-            MoreExecutors.directExecutor())\n-        .catching(CacheNotFoundException.class, (e) -> null, MoreExecutors.directExecutor());\n+            directExecutor())\n+        .catching(CacheNotFoundException.class, (e) -> null, directExecutor());\n   }\n \n   public static void verifyBlobContents(Digest expected, Digest actual) throws IOException {\n@@ -483,15 +488,15 @@ public ByteString getContents() {\n    */\n   public static <V> ListenableFuture<V> refreshIfUnauthenticatedAsync(\n       AsyncCallable<V> call, CallCredentialsProvider callCredentialsProvider) {\n-    Preconditions.checkNotNull(call);\n-    Preconditions.checkNotNull(callCredentialsProvider);\n+    checkNotNull(call);\n+    checkNotNull(callCredentialsProvider);\n \n     try {\n       return Futures.catchingAsync(\n           call.call(),\n           Throwable.class,\n           (e) -> refreshIfUnauthenticatedAsyncOnException(e, call, callCredentialsProvider),\n-          MoreExecutors.directExecutor());\n+          directExecutor());\n     } catch (Throwable t) {\n       return refreshIfUnauthenticatedAsyncOnException(t, call, callCredentialsProvider);\n     }\n@@ -511,15 +516,15 @@ private static <V> ListenableFuture<V> refreshIfUnauthenticatedAsyncOnException(\n       }\n     }\n \n-    return Futures.immediateFailedFuture(t);\n+    return immediateFailedFuture(t);\n   }\n \n   /** Same as {@link #refreshIfUnauthenticatedAsync} but calling a synchronous code block. */\n   public static <V> V refreshIfUnauthenticated(\n       Callable<V> call, CallCredentialsProvider callCredentialsProvider)\n       throws IOException, InterruptedException {\n-    Preconditions.checkNotNull(call);\n-    Preconditions.checkNotNull(callCredentialsProvider);\n+    checkNotNull(call);\n+    checkNotNull(callCredentialsProvider);\n \n     try {\n       return call.call();\n@@ -618,4 +623,49 @@ public static void waitForBulkTransfer(\n       throw bulkTransferException;\n     }\n   }\n+\n+  public static ListenableFuture<Void> mergeBulkTransfer(\n+      Iterable<ListenableFuture<Void>> transfers) {\n+    return Futures.whenAllComplete(transfers)\n+        .callAsync(\n+            () -> {\n+              BulkTransferException bulkTransferException = null;\n+\n+              for (var transfer : transfers) {\n+                IOException error = null;\n+                try {\n+                  transfer.get();\n+                } catch (CancellationException e) {\n+                  return immediateFailedFuture(new InterruptedException());\n+                } catch (InterruptedException e) {\n+                  return immediateFailedFuture(e);\n+                } catch (ExecutionException e) {\n+                  var cause = e.getCause();\n+                  if (cause instanceof InterruptedException) {\n+                    return immediateFailedFuture(cause);\n+                  } else if (cause instanceof IOException) {\n+                    error = (IOException) cause;\n+                  } else {\n+                    error = new IOException(cause);\n+                  }\n+                }\n+\n+                if (error == null) {\n+                  continue;\n+                }\n+\n+                if (bulkTransferException == null) {\n+                  bulkTransferException = new BulkTransferException();\n+                }\n+                bulkTransferException.add(error);\n+              }\n+\n+              if (bulkTransferException != null) {\n+                return immediateFailedFuture(bulkTransferException);\n+              }\n+\n+              return immediateVoidFuture();\n+            },\n+            directExecutor());\n+  }\n }"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-12-15T08:06:36Z",
+      "user": "coeuvre",
+      "body": "Use a pre-allocated array to hold the intermediate transfers to avoid allocations. Replace some of RxJava code with Futures to avoid RxJava overheads.\r\n\r\nThis improves the perfromance of prefetchInputs on a large set of inputs from ~400ms to ~16ms.\r\n\r\nFixes #20555."
+    },
+    {
+      "type": "commit",
+      "date": "2023-12-15T11:24:42Z",
+      "sha": "4f28357d76c1574469e71786f3ea221ac9daad02",
+      "message": "Fix test",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2023-12-15T11:24:42Z",
+      "author_date": "2023-12-15T11:24:42Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2023-12-15T11:24:42Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java\n@@ -285,6 +285,10 @@ public ListenableFuture<Void> prefetchFiles(\n       files.add(input);\n     }\n \n+    if (files.isEmpty()) {\n+      return immediateVoidFuture();\n+    }\n+\n     // Collect the set of directories whose output permissions must be set at the end of this call.\n     // This responsibility cannot lie with the downloading of an individual file, because multiple\n     // files may be concurrently downloaded into the same directory within a single call to\nsrc/main/java/com/google/devtools/build/lib/remote/util/Utils.java\n@@ -33,7 +33,6 @@\n import com.google.common.util.concurrent.FluentFuture;\n import com.google.common.util.concurrent.Futures;\n import com.google.common.util.concurrent.ListenableFuture;\n-import com.google.common.util.concurrent.MoreExecutors;\n import com.google.devtools.build.lib.actions.ActionInput;\n import com.google.devtools.build.lib.actions.ExecutionRequirements;\n import com.google.devtools.build.lib.actions.Spawn;\n@@ -48,7 +47,6 @@\n import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;\n import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;\n import com.google.devtools.build.lib.remote.options.RemoteOptions;\n-import com.google.devtools.build.lib.remote.util.RxUtils.TransferResult;\n import com.google.devtools.build.lib.server.FailureDetails;\n import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;\n import com.google.devtools.build.lib.vfs.PathFragment;\nsrc/test/java/com/google/devtools/build/lib/remote/ActionInputPrefetcherTestBase.java\n@@ -760,7 +760,7 @@ public void prefetchFile_interruptingMetadataSupplier_interruptsDownload() throw\n         prefetcher.prefetchFiles(\n             action, ImmutableList.of(a1), interruptedMetadataSupplier, Priority.MEDIUM);\n \n-    assertThrows(CancellationException.class, future::get);\n+    assertThrows(InterruptedException.class, () -> getFromFuture(future));\n   }\n \n   @Test",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java",
+          "patch": "@@ -285,6 +285,10 @@ public ListenableFuture<Void> prefetchFiles(\n       files.add(input);\n     }\n \n+    if (files.isEmpty()) {\n+      return immediateVoidFuture();\n+    }\n+\n     // Collect the set of directories whose output permissions must be set at the end of this call.\n     // This responsibility cannot lie with the downloading of an individual file, because multiple\n     // files may be concurrently downloaded into the same directory within a single call to"
+        },
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/util/Utils.java",
+          "patch": "@@ -33,7 +33,6 @@\n import com.google.common.util.concurrent.FluentFuture;\n import com.google.common.util.concurrent.Futures;\n import com.google.common.util.concurrent.ListenableFuture;\n-import com.google.common.util.concurrent.MoreExecutors;\n import com.google.devtools.build.lib.actions.ActionInput;\n import com.google.devtools.build.lib.actions.ExecutionRequirements;\n import com.google.devtools.build.lib.actions.Spawn;\n@@ -48,7 +47,6 @@\n import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;\n import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;\n import com.google.devtools.build.lib.remote.options.RemoteOptions;\n-import com.google.devtools.build.lib.remote.util.RxUtils.TransferResult;\n import com.google.devtools.build.lib.server.FailureDetails;\n import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;\n import com.google.devtools.build.lib.vfs.PathFragment;"
+        },
+        {
+          "file": "src/test/java/com/google/devtools/build/lib/remote/ActionInputPrefetcherTestBase.java",
+          "patch": "@@ -760,7 +760,7 @@ public void prefetchFile_interruptingMetadataSupplier_interruptsDownload() throw\n         prefetcher.prefetchFiles(\n             action, ImmutableList.of(a1), interruptedMetadataSupplier, Priority.MEDIUM);\n \n-    assertThrows(CancellationException.class, future::get);\n+    assertThrows(InterruptedException.class, () -> getFromFuture(future));\n   }\n \n   @Test"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1857878437,
+      "created_at": "2023-12-15T13:25:00Z",
+      "user": "brentleyjones",
+      "body": "@bazel-io flag"
+    },
+    {
+      "type": "comment",
+      "id": 1857879109,
+      "created_at": "2023-12-15T13:25:30Z",
+      "user": "brentleyjones",
+      "body": "@coeuvre How easy would this be to cherry-pick onto 6.5.0 as well as 7.1.0?"
+    },
+    {
+      "type": "review_comment",
+      "id": 1428180032,
+      "created_at": "2023-12-15T16:31:28Z",
+      "user": "tjgq",
+      "body": "Why not just `transfers.add(prefetchFile(...))`?",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java",
+      "diff_hunk": "@@ -291,30 +297,38 @@ public ListenableFuture<Void> prefetchFiles(\n     // it must still synchronize on the output permissions having been set.\n     Set<Path> dirsWithOutputPermissions = Sets.newConcurrentHashSet();\n \n-    Completable prefetch =\n-        mergeBulkTransfer(\n-                Flowable.fromIterable(files)\n-                    .flatMapSingle(\n-                        input ->\n-                            prefetchFile(\n-                                action,\n-                                dirsWithOutputPermissions,\n-                                metadataSupplier,\n-                                input,\n-                                priority)))\n-            .doOnComplete(\n-                // Set output permissions on tree artifact subdirectories, matching the behavior of\n-                // SkyframeActionExecutor#checkOutputs for artifacts produced by local actions.\n-                () -> {\n-                  for (Path dir : dirsWithOutputPermissions) {\n-                    directoryTracker.setOutputPermissions(dir);\n-                  }\n-                });\n-\n-    return toListenableFuture(prefetch);\n+    List<ListenableFuture<Void>> transfers = new ArrayList<>(files.size());\n+    try (var s = Profiler.instance().profile(\"compose prefetches\")) {\n+      for (var file : files) {\n+        var result =\n+            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority);\n+        transfers.add(result);",
+      "start_line": null,
+      "original_start_line": 303,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 305,
+      "side": "RIGHT",
+      "original_position": 71,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1431086430,
+          "user": "coeuvre",
+          "body": "Done.",
+          "created_at": "2023-12-19T08:41:40Z"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1858237747,
+      "created_at": "2023-12-15T17:32:25Z",
+      "user": "iancha1992",
+      "body": "@bazel-io fork 6.5.0"
+    },
+    {
+      "type": "comment",
+      "id": 1858237828,
+      "created_at": "2023-12-15T17:32:30Z",
+      "user": "iancha1992",
+      "body": "@bazel-io fork 7.1.0"
+    },
+    {
+      "type": "comment",
+      "id": 1859814735,
+      "created_at": "2023-12-18T08:43:15Z",
+      "user": "coeuvre",
+      "body": "> @coeuvre How easy would this be to cherry-pick onto 6.5.0 as well as 7.1.0?\r\n\r\n Should be straightforward for both branches."
+    },
+    {
+      "type": "review_comment",
+      "id": 1429850689,
+      "created_at": "2023-12-18T10:07:38Z",
+      "user": "tjgq",
+      "body": "Add a note here explaining why we're using plain futures instead of RxJava.",
+      "path": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java",
+      "diff_hunk": "@@ -291,30 +297,38 @@ public ListenableFuture<Void> prefetchFiles(\n     // it must still synchronize on the output permissions having been set.\n     Set<Path> dirsWithOutputPermissions = Sets.newConcurrentHashSet();\n \n-    Completable prefetch =\n-        mergeBulkTransfer(\n-                Flowable.fromIterable(files)\n-                    .flatMapSingle(\n-                        input ->\n-                            prefetchFile(\n-                                action,\n-                                dirsWithOutputPermissions,\n-                                metadataSupplier,\n-                                input,\n-                                priority)))\n-            .doOnComplete(\n-                // Set output permissions on tree artifact subdirectories, matching the behavior of\n-                // SkyframeActionExecutor#checkOutputs for artifacts produced by local actions.\n-                () -> {\n-                  for (Path dir : dirsWithOutputPermissions) {\n-                    directoryTracker.setOutputPermissions(dir);\n-                  }\n-                });\n-\n-    return toListenableFuture(prefetch);\n+    List<ListenableFuture<Void>> transfers = new ArrayList<>(files.size());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 301,
+      "original_line": 300,
+      "side": "RIGHT",
+      "original_position": 66,
+      "position": 67,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1431086520,
+          "user": "coeuvre",
+          "body": "Done.",
+          "created_at": "2023-12-19T08:41:45Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1784490345,
+      "created_at": "2023-12-18T10:13:39Z",
+      "user": "tjgq",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1861308585,
+      "created_at": "2023-12-18T18:43:36Z",
+      "user": "iancha1992",
+      "body": "@tjgq is this ready for merge to master?\r\n\r\ncc: @bazelbuild/triage "
+    },
+    {
+      "type": "commit",
+      "date": "2023-12-19T08:41:31Z",
+      "sha": "a29bcb3d00d8061f327bb3afb3116d5a017e8113",
+      "message": "Address comments",
+      "author": "Chi Wang",
+      "author_email": "chiwang@google.com",
+      "author_raw_date": "2023-12-19T08:41:31Z",
+      "author_date": "2023-12-19T08:41:31Z",
+      "committer": "Chi Wang",
+      "committer_email": "chiwang@google.com",
+      "raw_date": "2023-12-19T08:41:31Z",
+      "diff_text": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java\n@@ -297,12 +297,12 @@ public ListenableFuture<Void> prefetchFiles(\n     // it must still synchronize on the output permissions having been set.\n     Set<Path> dirsWithOutputPermissions = Sets.newConcurrentHashSet();\n \n+    // Using plain futures to avoid RxJava overheads.\n     List<ListenableFuture<Void>> transfers = new ArrayList<>(files.size());\n     try (var s = Profiler.instance().profile(\"compose prefetches\")) {\n       for (var file : files) {\n-        var result =\n-            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority);\n-        transfers.add(result);\n+        transfers.add(\n+            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority));\n       }\n     }\n ",
+      "diff": [
+        {
+          "file": "src/main/java/com/google/devtools/build/lib/remote/AbstractActionInputPrefetcher.java",
+          "patch": "@@ -297,12 +297,12 @@ public ListenableFuture<Void> prefetchFiles(\n     // it must still synchronize on the output permissions having been set.\n     Set<Path> dirsWithOutputPermissions = Sets.newConcurrentHashSet();\n \n+    // Using plain futures to avoid RxJava overheads.\n     List<ListenableFuture<Void>> transfers = new ArrayList<>(files.size());\n     try (var s = Profiler.instance().profile(\"compose prefetches\")) {\n       for (var file : files) {\n-        var result =\n-            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority);\n-        transfers.add(result);\n+        transfers.add(\n+            prefetchFile(action, dirsWithOutputPermissions, metadataSupplier, file, priority));\n       }\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1788366770,
+      "created_at": "2023-12-19T08:41:40Z",
+      "user": "coeuvre",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1788366932,
+      "created_at": "2023-12-19T08:41:45Z",
+      "user": "coeuvre",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1862341322,
+      "created_at": "2023-12-19T08:42:02Z",
+      "user": "coeuvre",
+      "body": "@iancha1992 I addressed the comments. Should be ready to merge."
+    }
+  ]
+}

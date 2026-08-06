@@ -1,0 +1,198 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 107967,
+  "pr_number": 107967,
+  "title": "Sort time series indices by time range in GetDataStreams API",
+  "user": "lkts",
+  "created_at": "2024-04-26T18:51:37Z",
+  "merged_at": "2024-04-30T15:30:13Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":StorageEngine/TSDB",
+    "Team:StorageEngine",
+    "v8.15.0"
+  ],
+  "base_commit": "ca513b17527adb7e9f1a97872e1ab12474cca391",
+  "merge_commit_sha": "d85fa15b02f99554fc7713ce7eb434faca21818e",
+  "commits": 4,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "review_requested",
+    "unlabeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "mentioned",
+    "subscribed",
+    "merged",
+    "closed",
+    "referenced",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/107967",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-04-26T18:48:26Z",
+      "sha": "4ace01596ea0e0227958b22fd2ff26b3d83972b1",
+      "message": "Sort time series indices by time range in GetDataStreams API",
+      "author": "Oleksandr Kolomiiets",
+      "author_email": "oleksandr.kolomiiets@elastic.co",
+      "author_raw_date": "2024-04-26T18:42:44Z",
+      "author_date": "2024-04-26T18:42:44Z",
+      "committer": "Oleksandr Kolomiiets",
+      "committer_email": "oleksandr.kolomiiets@elastic.co",
+      "raw_date": "2024-04-26T18:48:26Z",
+      "diff_text": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java\n@@ -151,46 +151,64 @@ static GetDataStreamAction.Response innerOperation(\n \n             GetDataStreamAction.Response.TimeSeries timeSeries = null;\n             if (dataStream.getIndexMode() == IndexMode.TIME_SERIES) {\n-                List<Tuple<Instant, Instant>> ranges = new ArrayList<>();\n-                Tuple<Instant, Instant> current = null;\n-                String previousIndexName = null;\n-                for (Index index : dataStream.getIndices()) {\n-                    IndexMetadata indexMetadata = metadata.index(index);\n-                    if (indexMetadata.getIndexMode() != IndexMode.TIME_SERIES) {\n-                        continue;\n+                record IndexInfo(String name, Instant timeSeriesStart, Instant timeSeriesEnd) implements Comparable<IndexInfo> {\n+                    @Override\n+                    public int compareTo(IndexInfo o) {\n+                        return Comparator\n+                            .comparing(IndexInfo::timeSeriesStart)\n+                            .thenComparing(IndexInfo::timeSeriesEnd)\n+                            .compare(this, o);\n                     }\n-                    Instant start = indexMetadata.getTimeSeriesStart();\n-                    Instant end = indexMetadata.getTimeSeriesEnd();\n-                    if (current == null) {\n-                        current = new Tuple<>(start, end);\n-                    } else if (current.v2().compareTo(start) == 0) {\n-                        current = new Tuple<>(current.v1(), end);\n-                    } else if (current.v2().compareTo(start) < 0) {\n-                        ranges.add(current);\n-                        current = new Tuple<>(start, end);\n+                }\n+\n+                List<Tuple<Instant, Instant>> mergedRanges = new ArrayList<>();\n+                Tuple<Instant, Instant> currentMergedRange = null;\n+                IndexInfo previous = null;\n+\n+                // We need indices to be sorted by time series range\n+                // to produce temporal ranges.\n+                // But it is not enforced in API, so we explicitly sort here.\n+                var sortedRanges = dataStream.getIndices().stream()\n+                    .map(metadata::index)\n+                    .filter(m -> m.getIndexMode() == IndexMode.TIME_SERIES)\n+                    .map(m -> new IndexInfo(m.getIndex().getName(), m.getTimeSeriesStart(), m.getTimeSeriesEnd()))\n+                    .sorted()\n+                    .toList();\n+\n+                for (var info : sortedRanges) {\n+                    Instant start = info.timeSeriesStart();\n+                    Instant end = info.timeSeriesEnd();\n+\n+                    if (currentMergedRange == null) {\n+                        currentMergedRange = new Tuple<>(start, end);\n+                    } else if (currentMergedRange.v2().compareTo(start) == 0) {\n+                        currentMergedRange = new Tuple<>(currentMergedRange.v1(), end);\n+                    } else if (currentMergedRange.v2().compareTo(start) < 0) {\n+                        mergedRanges.add(currentMergedRange);\n+                        currentMergedRange = new Tuple<>(start, end);\n                     } else {\n                         String message = \"previous backing index [\"\n-                            + previousIndexName\n+                            + previous.name()\n                             + \"] range [\"\n-                            + current.v1()\n+                            + previous.timeSeriesStart()\n                             + \"/\"\n-                            + current.v2()\n+                            + previous.timeSeriesEnd()\n                             + \"] range is colliding with current backing [\"\n-                            + index.getName()\n+                            + info.name()\n                             + \"] index range [\"\n                             + start\n                             + \"/\"\n                             + end\n                             + \"]\";\n-                        assert current.v2().compareTo(start) < 0 : message;\n+                        assert currentMergedRange.v2().compareTo(start) < 0 : message;\n                         LOGGER.warn(message);\n                     }\n-                    previousIndexName = index.getName();\n+                    previous = info;\n                 }\n-                if (current != null) {\n-                    ranges.add(current);\n+                if (currentMergedRange != null) {\n+                    mergedRanges.add(currentMergedRange);\n                 }\n-                timeSeries = new GetDataStreamAction.Response.TimeSeries(ranges);\n+                timeSeries = new GetDataStreamAction.Response.TimeSeries(mergedRanges);\n             }\n \n             dataStreamInfos.add(\nmodules/data-streams/src/test/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportActionTests.java\n@@ -209,6 +209,49 @@ public void testGetTimeSeriesDataStream() {\n         );\n     }\n \n+    public void testGetTimeSeriesDataStreamWithOutOfOrderIndices() {\n+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);\n+        String dataStream = \"ds-1\";\n+        Instant sixHoursAgo = now.minus(6, ChronoUnit.HOURS);\n+        Instant fourHoursAgo = now.minus(4, ChronoUnit.HOURS);\n+        Instant twoHoursAgo = now.minus(2, ChronoUnit.HOURS);\n+        Instant twoHoursAhead = now.plus(2, ChronoUnit.HOURS);\n+\n+        ClusterState state;\n+        {\n+            var mBuilder = new Metadata.Builder();\n+            DataStreamTestHelper.getClusterStateWithDataStream(\n+                mBuilder,\n+                dataStream,\n+                List.of(\n+                    new Tuple<>(fourHoursAgo, twoHoursAgo),\n+                    new Tuple<>(sixHoursAgo, fourHoursAgo),\n+                    new Tuple<>(twoHoursAgo, twoHoursAhead)\n+                )\n+            );\n+            state = ClusterState.builder(new ClusterName(\"_name\")).metadata(mBuilder).build();\n+        }\n+\n+        var req = new GetDataStreamAction.Request(new String[] {});\n+        var response = GetDataStreamsTransportAction.innerOperation(\n+            state,\n+            req,\n+            resolver,\n+            systemIndices,\n+            ClusterSettings.createBuiltInClusterSettings(),\n+            dataStreamGlobalRetentionResolver\n+        );\n+        assertThat(\n+            response.getDataStreams(),\n+            contains(\n+                allOf(\n+                    transformedMatch(d -> d.getDataStream().getName(), equalTo(dataStream)),\n+                    transformedMatch(d -> d.getTimeSeries().temporalRanges(), contains(new Tuple<>(sixHoursAgo, twoHoursAhead)))\n+                )\n+            )\n+        );\n+    }\n+\n     public void testGetTimeSeriesMixedDataStream() {\n         Instant instant = Instant.parse(\"2023-06-06T14:00:00.000Z\").truncatedTo(ChronoUnit.SECONDS);\n         String dataStream1 = \"ds-1\";",
+      "diff": [
+        {
+          "file": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java",
+          "patch": "@@ -151,46 +151,64 @@ static GetDataStreamAction.Response innerOperation(\n \n             GetDataStreamAction.Response.TimeSeries timeSeries = null;\n             if (dataStream.getIndexMode() == IndexMode.TIME_SERIES) {\n-                List<Tuple<Instant, Instant>> ranges = new ArrayList<>();\n-                Tuple<Instant, Instant> current = null;\n-                String previousIndexName = null;\n-                for (Index index : dataStream.getIndices()) {\n-                    IndexMetadata indexMetadata = metadata.index(index);\n-                    if (indexMetadata.getIndexMode() != IndexMode.TIME_SERIES) {\n-                        continue;\n+                record IndexInfo(String name, Instant timeSeriesStart, Instant timeSeriesEnd) implements Comparable<IndexInfo> {\n+                    @Override\n+                    public int compareTo(IndexInfo o) {\n+                        return Comparator\n+                            .comparing(IndexInfo::timeSeriesStart)\n+                            .thenComparing(IndexInfo::timeSeriesEnd)\n+                            .compare(this, o);\n                     }\n-                    Instant start = indexMetadata.getTimeSeriesStart();\n-                    Instant end = indexMetadata.getTimeSeriesEnd();\n-                    if (current == null) {\n-                        current = new Tuple<>(start, end);\n-                    } else if (current.v2().compareTo(start) == 0) {\n-                        current = new Tuple<>(current.v1(), end);\n-                    } else if (current.v2().compareTo(start) < 0) {\n-                        ranges.add(current);\n-                        current = new Tuple<>(start, end);\n+                }\n+\n+                List<Tuple<Instant, Instant>> mergedRanges = new ArrayList<>();\n+                Tuple<Instant, Instant> currentMergedRange = null;\n+                IndexInfo previous = null;\n+\n+                // We need indices to be sorted by time series range\n+                // to produce temporal ranges.\n+                // But it is not enforced in API, so we explicitly sort here.\n+                var sortedRanges = dataStream.getIndices().stream()\n+                    .map(metadata::index)\n+                    .filter(m -> m.getIndexMode() == IndexMode.TIME_SERIES)\n+                    .map(m -> new IndexInfo(m.getIndex().getName(), m.getTimeSeriesStart(), m.getTimeSeriesEnd()))\n+                    .sorted()\n+                    .toList();\n+\n+                for (var info : sortedRanges) {\n+                    Instant start = info.timeSeriesStart();\n+                    Instant end = info.timeSeriesEnd();\n+\n+                    if (currentMergedRange == null) {\n+                        currentMergedRange = new Tuple<>(start, end);\n+                    } else if (currentMergedRange.v2().compareTo(start) == 0) {\n+                        currentMergedRange = new Tuple<>(currentMergedRange.v1(), end);\n+                    } else if (currentMergedRange.v2().compareTo(start) < 0) {\n+                        mergedRanges.add(currentMergedRange);\n+                        currentMergedRange = new Tuple<>(start, end);\n                     } else {\n                         String message = \"previous backing index [\"\n-                            + previousIndexName\n+                            + previous.name()\n                             + \"] range [\"\n-                            + current.v1()\n+                            + previous.timeSeriesStart()\n                             + \"/\"\n-                            + current.v2()\n+                            + previous.timeSeriesEnd()\n                             + \"] range is colliding with current backing [\"\n-                            + index.getName()\n+                            + info.name()\n                             + \"] index range [\"\n                             + start\n                             + \"/\"\n                             + end\n                             + \"]\";\n-                        assert current.v2().compareTo(start) < 0 : message;\n+                        assert currentMergedRange.v2().compareTo(start) < 0 : message;\n                         LOGGER.warn(message);\n                     }\n-                    previousIndexName = index.getName();\n+                    previous = info;\n                 }\n-                if (current != null) {\n-                    ranges.add(current);\n+                if (currentMergedRange != null) {\n+                    mergedRanges.add(currentMergedRange);\n                 }\n-                timeSeries = new GetDataStreamAction.Response.TimeSeries(ranges);\n+                timeSeries = new GetDataStreamAction.Response.TimeSeries(mergedRanges);\n             }\n \n             dataStreamInfos.add("
+        },
+        {
+          "file": "modules/data-streams/src/test/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportActionTests.java",
+          "patch": "@@ -209,6 +209,49 @@ public void testGetTimeSeriesDataStream() {\n         );\n     }\n \n+    public void testGetTimeSeriesDataStreamWithOutOfOrderIndices() {\n+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);\n+        String dataStream = \"ds-1\";\n+        Instant sixHoursAgo = now.minus(6, ChronoUnit.HOURS);\n+        Instant fourHoursAgo = now.minus(4, ChronoUnit.HOURS);\n+        Instant twoHoursAgo = now.minus(2, ChronoUnit.HOURS);\n+        Instant twoHoursAhead = now.plus(2, ChronoUnit.HOURS);\n+\n+        ClusterState state;\n+        {\n+            var mBuilder = new Metadata.Builder();\n+            DataStreamTestHelper.getClusterStateWithDataStream(\n+                mBuilder,\n+                dataStream,\n+                List.of(\n+                    new Tuple<>(fourHoursAgo, twoHoursAgo),\n+                    new Tuple<>(sixHoursAgo, fourHoursAgo),\n+                    new Tuple<>(twoHoursAgo, twoHoursAhead)\n+                )\n+            );\n+            state = ClusterState.builder(new ClusterName(\"_name\")).metadata(mBuilder).build();\n+        }\n+\n+        var req = new GetDataStreamAction.Request(new String[] {});\n+        var response = GetDataStreamsTransportAction.innerOperation(\n+            state,\n+            req,\n+            resolver,\n+            systemIndices,\n+            ClusterSettings.createBuiltInClusterSettings(),\n+            dataStreamGlobalRetentionResolver\n+        );\n+        assertThat(\n+            response.getDataStreams(),\n+            contains(\n+                allOf(\n+                    transformedMatch(d -> d.getDataStream().getName(), equalTo(dataStream)),\n+                    transformedMatch(d -> d.getTimeSeries().temporalRanges(), contains(new Tuple<>(sixHoursAgo, twoHoursAhead)))\n+                )\n+            )\n+        );\n+    }\n+\n     public void testGetTimeSeriesMixedDataStream() {\n         Instant instant = Instant.parse(\"2023-06-06T14:00:00.000Z\").truncatedTo(ChronoUnit.SECONDS);\n         String dataStream1 = \"ds-1\";"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-04-26T18:51:37Z",
+      "user": "lkts",
+      "body": "Previously this logic assumed that time series indices are sorted by their time series range. This is problematic because data stream APIs don't actually enforce this invariant. As seen in below issues it is possible to add an index to data stream that will break the sort order either manually or via DSL.\r\n\r\nThis PR simply sorts indices in needed order before working with them. It seems appropriate given that this API is not performance sensitive.\r\n\r\nCloses #102088, #106890."
+    },
+    {
+      "type": "comment",
+      "id": 2079956178,
+      "created_at": "2024-04-26T18:52:51Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-storage-engine (Team:StorageEngine)"
+    },
+    {
+      "type": "commit",
+      "date": "2024-04-26T18:53:13Z",
+      "sha": "2991ac702646ddbf2f90a3144d808beae0add0c2",
+      "message": "Update docs/changelog/107967.yaml",
+      "author": "Oleksandr Kolomiiets",
+      "author_email": "olkolomiiets@gmail.com",
+      "author_raw_date": "2024-04-26T18:53:13Z",
+      "author_date": "2024-04-26T18:53:13Z",
+      "committer": "Oleksandr Kolomiiets",
+      "committer_email": "olkolomiiets@gmail.com",
+      "raw_date": "2024-04-26T18:53:13Z",
+      "diff_text": "docs/changelog/107967.yaml\n@@ -0,0 +1,6 @@\n+pr: 107967\n+summary: Sort time series indices by time range in `GetDataStreams` API\n+area: TSDB\n+type: bug\n+issues:\n+ - 102088",
+      "diff": [
+        {
+          "file": "docs/changelog/107967.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 107967\n+summary: Sort time series indices by time range in `GetDataStreams` API\n+area: TSDB\n+type: bug\n+issues:\n+ - 102088"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2079956589,
+      "created_at": "2024-04-26T18:53:14Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @lkts, I've created a changelog YAML for you."
+    },
+    {
+      "type": "commit",
+      "date": "2024-04-26T19:12:11Z",
+      "sha": "44800b37a310acb989cad017cbf4076a6c8915ea",
+      "message": "Style",
+      "author": "Oleksandr Kolomiiets",
+      "author_email": "oleksandr.kolomiiets@elastic.co",
+      "author_raw_date": "2024-04-26T19:11:50Z",
+      "author_date": "2024-04-26T19:11:50Z",
+      "committer": "Oleksandr Kolomiiets",
+      "committer_email": "oleksandr.kolomiiets@elastic.co",
+      "raw_date": "2024-04-26T19:12:11Z",
+      "diff_text": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java\n@@ -154,10 +154,7 @@ static GetDataStreamAction.Response innerOperation(\n                 record IndexInfo(String name, Instant timeSeriesStart, Instant timeSeriesEnd) implements Comparable<IndexInfo> {\n                     @Override\n                     public int compareTo(IndexInfo o) {\n-                        return Comparator\n-                            .comparing(IndexInfo::timeSeriesStart)\n-                            .thenComparing(IndexInfo::timeSeriesEnd)\n-                            .compare(this, o);\n+                        return Comparator.comparing(IndexInfo::timeSeriesStart).thenComparing(IndexInfo::timeSeriesEnd).compare(this, o);\n                     }\n                 }\n \n@@ -168,7 +165,8 @@ public int compareTo(IndexInfo o) {\n                 // We need indices to be sorted by time series range\n                 // to produce temporal ranges.\n                 // But it is not enforced in API, so we explicitly sort here.\n-                var sortedRanges = dataStream.getIndices().stream()\n+                var sortedRanges = dataStream.getIndices()\n+                    .stream()\n                     .map(metadata::index)\n                     .filter(m -> m.getIndexMode() == IndexMode.TIME_SERIES)\n                     .map(m -> new IndexInfo(m.getIndex().getName(), m.getTimeSeriesStart(), m.getTimeSeriesEnd()))",
+      "diff": [
+        {
+          "file": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java",
+          "patch": "@@ -154,10 +154,7 @@ static GetDataStreamAction.Response innerOperation(\n                 record IndexInfo(String name, Instant timeSeriesStart, Instant timeSeriesEnd) implements Comparable<IndexInfo> {\n                     @Override\n                     public int compareTo(IndexInfo o) {\n-                        return Comparator\n-                            .comparing(IndexInfo::timeSeriesStart)\n-                            .thenComparing(IndexInfo::timeSeriesEnd)\n-                            .compare(this, o);\n+                        return Comparator.comparing(IndexInfo::timeSeriesStart).thenComparing(IndexInfo::timeSeriesEnd).compare(this, o);\n                     }\n                 }\n \n@@ -168,7 +165,8 @@ public int compareTo(IndexInfo o) {\n                 // We need indices to be sorted by time series range\n                 // to produce temporal ranges.\n                 // But it is not enforced in API, so we explicitly sort here.\n-                var sortedRanges = dataStream.getIndices().stream()\n+                var sortedRanges = dataStream.getIndices()\n+                    .stream()\n                     .map(metadata::index)\n                     .filter(m -> m.getIndexMode() == IndexMode.TIME_SERIES)\n                     .map(m -> new IndexInfo(m.getIndex().getName(), m.getTimeSeriesStart(), m.getTimeSeriesEnd()))"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1582986522,
+      "created_at": "2024-04-29T12:09:01Z",
+      "user": "martijnvg",
+      "body": "With the indices getting sorted, I think don't we will ever log this warning? Maybe we should remove it and replace this with an `assert`?",
+      "path": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java",
+      "diff_hunk": "@@ -151,46 +151,62 @@ static GetDataStreamAction.Response innerOperation(\n \n             GetDataStreamAction.Response.TimeSeries timeSeries = null;\n             if (dataStream.getIndexMode() == IndexMode.TIME_SERIES) {\n-                List<Tuple<Instant, Instant>> ranges = new ArrayList<>();\n-                Tuple<Instant, Instant> current = null;\n-                String previousIndexName = null;\n-                for (Index index : dataStream.getIndices()) {\n-                    IndexMetadata indexMetadata = metadata.index(index);\n-                    if (indexMetadata.getIndexMode() != IndexMode.TIME_SERIES) {\n-                        continue;\n+                record IndexInfo(String name, Instant timeSeriesStart, Instant timeSeriesEnd) implements Comparable<IndexInfo> {\n+                    @Override\n+                    public int compareTo(IndexInfo o) {\n+                        return Comparator.comparing(IndexInfo::timeSeriesStart).thenComparing(IndexInfo::timeSeriesEnd).compare(this, o);\n                     }\n-                    Instant start = indexMetadata.getTimeSeriesStart();\n-                    Instant end = indexMetadata.getTimeSeriesEnd();\n-                    if (current == null) {\n-                        current = new Tuple<>(start, end);\n-                    } else if (current.v2().compareTo(start) == 0) {\n-                        current = new Tuple<>(current.v1(), end);\n-                    } else if (current.v2().compareTo(start) < 0) {\n-                        ranges.add(current);\n-                        current = new Tuple<>(start, end);\n+                }\n+\n+                List<Tuple<Instant, Instant>> mergedRanges = new ArrayList<>();\n+                Tuple<Instant, Instant> currentMergedRange = null;\n+                IndexInfo previous = null;\n+\n+                // We need indices to be sorted by time series range\n+                // to produce temporal ranges.\n+                // But it is not enforced in API, so we explicitly sort here.\n+                var sortedRanges = dataStream.getIndices()\n+                    .stream()\n+                    .map(metadata::index)\n+                    .filter(m -> m.getIndexMode() == IndexMode.TIME_SERIES)\n+                    .map(m -> new IndexInfo(m.getIndex().getName(), m.getTimeSeriesStart(), m.getTimeSeriesEnd()))\n+                    .sorted()\n+                    .toList();\n+\n+                for (var info : sortedRanges) {\n+                    Instant start = info.timeSeriesStart();\n+                    Instant end = info.timeSeriesEnd();\n+\n+                    if (currentMergedRange == null) {\n+                        currentMergedRange = new Tuple<>(start, end);\n+                    } else if (currentMergedRange.v2().compareTo(start) == 0) {\n+                        currentMergedRange = new Tuple<>(currentMergedRange.v1(), end);\n+                    } else if (currentMergedRange.v2().compareTo(start) < 0) {\n+                        mergedRanges.add(currentMergedRange);\n+                        currentMergedRange = new Tuple<>(start, end);\n                     } else {\n                         String message = \"previous backing index [\"",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 188,
+      "original_line": 188,
+      "side": "RIGHT",
+      "original_position": 54,
+      "position": 54,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1583271267,
+          "user": "lkts",
+          "body": "Yes, this is a \"should never happen\" thing.",
+          "created_at": "2024-04-29T15:22:14Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2028332721,
+      "created_at": "2024-04-29T12:09:30Z",
+      "user": "martijnvg",
+      "state": "COMMENTED",
+      "body": "Looks good! I left one question."
+    },
+    {
+      "type": "commit",
+      "date": "2024-04-29T15:21:39Z",
+      "sha": "d2f4f7b2e6a28e3af59e3f22a6aebf6ee2fbd2d1",
+      "message": "Remove log line",
+      "author": "Oleksandr Kolomiiets",
+      "author_email": "oleksandr.kolomiiets@elastic.co",
+      "author_raw_date": "2024-04-29T15:21:39Z",
+      "author_date": "2024-04-29T15:21:39Z",
+      "committer": "Oleksandr Kolomiiets",
+      "committer_email": "oleksandr.kolomiiets@elastic.co",
+      "raw_date": "2024-04-29T15:21:39Z",
+      "diff_text": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java\n@@ -199,7 +199,6 @@ public int compareTo(IndexInfo o) {\n                             + end\n                             + \"]\";\n                         assert currentMergedRange.v2().compareTo(start) < 0 : message;\n-                        LOGGER.warn(message);\n                     }\n                     previous = info;\n                 }",
+      "diff": [
+        {
+          "file": "modules/data-streams/src/main/java/org/elasticsearch/datastreams/action/GetDataStreamsTransportAction.java",
+          "patch": "@@ -199,7 +199,6 @@ public int compareTo(IndexInfo o) {\n                             + end\n                             + \"]\";\n                         assert currentMergedRange.v2().compareTo(start) < 0 : message;\n-                        LOGGER.warn(message);\n                     }\n                     previous = info;\n                 }"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2028824128,
+      "created_at": "2024-04-29T15:22:14Z",
+      "user": "lkts",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2030405373,
+      "created_at": "2024-04-30T07:18:04Z",
+      "user": "martijnvg",
+      "state": "APPROVED",
+      "body": "lgtm"
+    }
+  ]
+}

@@ -1,0 +1,214 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 93635,
+  "pr_number": 93635,
+  "title": "Only simulate legal desired moves",
+  "user": "DaveCTurner",
+  "created_at": "2023-02-09T10:36:41Z",
+  "merged_at": "2023-02-09T13:44:31Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Allocation",
+    "Team:Distributed",
+    "auto-merge-without-approval",
+    "v8.6.2",
+    "v8.7.1",
+    "v8.8.0"
+  ],
+  "base_commit": "b29399e2daa56afc926d610f8e0e59274a5ed952",
+  "merge_commit_sha": "f068cfda1859b323b7b347a98cf41ae7eec2f420",
+  "commits": 3,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "labeled"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/93635",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-02-09T10:35:41Z",
+      "sha": "bb2361f95974689f63a53204871d7245bd800deb",
+      "message": "Only simulate legal desired moves\n\nToday when setting up for the desired balance computation we move all\nshards to their desired locations without checking any allocation rules.\nHowever, certain allocation rules (e.g. those related to node versions\nand shutdowns) may prevent these movements in reality, resulting in a\nshard which cannot move to its desired location but which may not remain\non its current node either.\n\nThis commit adds some checks to verify that these preliminary moves are\nstill legal when setting up the computation.\n\nCloses #93271",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-02-09T10:07:30Z",
+      "author_date": "2023-02-09T10:07:30Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-02-09T10:35:41Z",
+      "diff_text": "qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/SnapshotBasedRecoveryIT.java\n@@ -42,7 +42,6 @@\n \n public class SnapshotBasedRecoveryIT extends AbstractRollingTestCase {\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/93271\")\n     public void testSnapshotBasedRecovery() throws Exception {\n         final String indexName = \"snapshot_based_recovery\";\n         final String repositoryName = \"snapshot_based_recovery_repo\";\nserver/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java\n@@ -18,6 +18,7 @@\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;\n import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;\n+import org.elasticsearch.cluster.routing.allocation.decider.Decision;\n import org.elasticsearch.common.metrics.MeanMetric;\n import org.elasticsearch.common.settings.ClusterSettings;\n import org.elasticsearch.common.settings.Setting;\n@@ -161,14 +162,21 @@ public DesiredBalance compute(\n             // Here existing shards are moved to desired locations before initializing unassigned shards because we prefer not to leave\n             // immovable shards allocated to undesirable locations (e.g. a node that is shutting down or an allocation filter which was\n             // only recently applied). In contrast, reconciliation prefers to initialize the unassigned shards first.\n-            for (final var shardRouting : shardsToRelocate.values()) {\n+            relocateToDesiredLocation: for (final var shardRouting : shardsToRelocate.values()) {\n                 assert shardRouting.started();\n-                if (targetNodesIterator.hasNext()) {\n-                    ShardRouting shardToRelocate = routingNodes.relocateShard(shardRouting, targetNodesIterator.next(), 0L, changes).v2();\n-                    clusterInfoSimulator.simulateShardStarted(shardToRelocate);\n-                    routingNodes.startShard(logger, shardToRelocate, changes, 0L);\n-                } else {\n-                    break;\n+\n+                while (targetNodesIterator.hasNext()) {\n+                    final var targetNodeId = targetNodesIterator.next();\n+                    final var targetNode = routingNodes.node(targetNodeId);\n+                    if (targetNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, targetNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToRelocate = routingNodes.relocateShard(shardRouting, targetNodeId, 0L, changes).v2();\n+                        clusterInfoSimulator.simulateShardStarted(shardToRelocate);\n+                        routingNodes.startShard(logger, shardToRelocate, changes, 0L);\n+                        continue relocateToDesiredLocation;\n+                    }\n                 }\n             }\n \n@@ -190,9 +198,15 @@ public DesiredBalance compute(\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n                     final var nodeId = nodeIds.removeFirst();\n-                    final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }\n@@ -203,10 +217,16 @@ public DesiredBalance compute(\n             if (unassignedPrimaries.contains(shardRouting.shardId()) == false) {\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n-                    final String nodeId = nodeIds.removeFirst();\n-                    ShardRouting shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var nodeId = nodeIds.removeFirst();\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }\nserver/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java\n@@ -331,13 +331,13 @@ private static String diff(DesiredBalance old, DesiredBalance updated) {\n             var oldAssignment = old.getAssignment(shardId);\n             var updatedAssignment = updated.getAssignment(shardId);\n             if (Objects.equals(oldAssignment, updatedAssignment) == false) {\n-                builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" --> \").append(updatedAssignment);\n+                builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" -> \").append(updatedAssignment);\n             }\n         }\n         for (ShardId shardId : diff) {\n             var oldAssignment = old.getAssignment(shardId);\n             var updatedAssignment = updated.getAssignment(shardId);\n-            builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" --> \").append(updatedAssignment);\n+            builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" -> \").append(updatedAssignment);\n         }\n         return builder.append(newLine).toString();\n     }\nx-pack/plugin/shutdown/src/internalClusterTest/java/org/elasticsearch/xpack/shutdown/DesiredBalanceShutdownIT.java\n@@ -0,0 +1,95 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.shutdown;\n+\n+import org.elasticsearch.action.support.PlainActionFuture;\n+import org.elasticsearch.action.support.master.AcknowledgedResponse;\n+import org.elasticsearch.cluster.metadata.IndexMetadata;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.service.ClusterService;\n+import org.elasticsearch.common.Strings;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.concurrent.TimeUnit;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+public class DesiredBalanceShutdownIT extends ESIntegTestCase {\n+\n+    private static final String INDEX = \"test-index\";\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return List.of(ShutdownPlugin.class);\n+    }\n+\n+    public void testDesiredBalanceWithShutdown() throws Exception {\n+\n+        final var oldNodeName = internalCluster().startNode();\n+        final var oldNodeId = internalCluster().getInstance(ClusterService.class, oldNodeName).localNode().getId();\n+\n+        createIndex(\n+            INDEX,\n+            Settings.builder()\n+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)\n+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)\n+                .put(IndexMetadata.INDEX_ROUTING_REQUIRE_GROUP_PREFIX + \"._name\", oldNodeName)\n+                .build()\n+        );\n+        ensureGreen(INDEX);\n+\n+        internalCluster().restartNode(internalCluster().startNode(), new InternalTestCluster.RestartCallback() {\n+            @Override\n+            public Settings onNodeStopped(String newNodeName) {\n+\n+                logger.info(\"--> excluding index from [{}] and concurrently starting replacement with [{}]\", oldNodeName, newNodeName);\n+\n+                final PlainActionFuture<AcknowledgedResponse> excludeFuture = new PlainActionFuture<>();\n+                client().admin()\n+                    .indices()\n+                    .prepareUpdateSettings(INDEX)\n+                    .setSettings(\n+                        Settings.builder()\n+                            .put(IndexMetadata.INDEX_ROUTING_EXCLUDE_GROUP_PREFIX + \"._name\", oldNodeName)\n+                            .putNull(IndexMetadata.INDEX_ROUTING_REQUIRE_GROUP_PREFIX + \"._name\")\n+                    )\n+                    .execute(excludeFuture);\n+\n+                assertAcked(\n+                    client().execute(\n+                        PutShutdownNodeAction.INSTANCE,\n+                        new PutShutdownNodeAction.Request(oldNodeId, SingleNodeShutdownMetadata.Type.REPLACE, \"test\", null, newNodeName)\n+                    ).actionGet(10, TimeUnit.SECONDS)\n+                );\n+\n+                excludeFuture.actionGet(10, TimeUnit.SECONDS);\n+\n+                return Settings.EMPTY;\n+            }\n+        });\n+\n+        logger.info(\"--> waiting for replacement to complete\");\n+\n+        assertBusy(() -> {\n+            final var getShutdownResponse = client().execute(GetShutdownStatusAction.INSTANCE, new GetShutdownStatusAction.Request())\n+                .actionGet(10, TimeUnit.SECONDS);\n+            assertTrue(\n+                Strings.toString(getShutdownResponse, true, true),\n+                getShutdownResponse.getShutdownStatuses()\n+                    .stream()\n+                    .allMatch(s -> s.overallStatus() == SingleNodeShutdownMetadata.Status.COMPLETE)\n+            );\n+        });\n+    }\n+\n+}",
+      "diff": [
+        {
+          "file": "qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/SnapshotBasedRecoveryIT.java",
+          "patch": "@@ -42,7 +42,6 @@\n \n public class SnapshotBasedRecoveryIT extends AbstractRollingTestCase {\n \n-    @AwaitsFix(bugUrl = \"https://github.com/elastic/elasticsearch/issues/93271\")\n     public void testSnapshotBasedRecovery() throws Exception {\n         final String indexName = \"snapshot_based_recovery\";\n         final String repositoryName = \"snapshot_based_recovery_repo\";"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java",
+          "patch": "@@ -18,6 +18,7 @@\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;\n import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;\n+import org.elasticsearch.cluster.routing.allocation.decider.Decision;\n import org.elasticsearch.common.metrics.MeanMetric;\n import org.elasticsearch.common.settings.ClusterSettings;\n import org.elasticsearch.common.settings.Setting;\n@@ -161,14 +162,21 @@ public DesiredBalance compute(\n             // Here existing shards are moved to desired locations before initializing unassigned shards because we prefer not to leave\n             // immovable shards allocated to undesirable locations (e.g. a node that is shutting down or an allocation filter which was\n             // only recently applied). In contrast, reconciliation prefers to initialize the unassigned shards first.\n-            for (final var shardRouting : shardsToRelocate.values()) {\n+            relocateToDesiredLocation: for (final var shardRouting : shardsToRelocate.values()) {\n                 assert shardRouting.started();\n-                if (targetNodesIterator.hasNext()) {\n-                    ShardRouting shardToRelocate = routingNodes.relocateShard(shardRouting, targetNodesIterator.next(), 0L, changes).v2();\n-                    clusterInfoSimulator.simulateShardStarted(shardToRelocate);\n-                    routingNodes.startShard(logger, shardToRelocate, changes, 0L);\n-                } else {\n-                    break;\n+\n+                while (targetNodesIterator.hasNext()) {\n+                    final var targetNodeId = targetNodesIterator.next();\n+                    final var targetNode = routingNodes.node(targetNodeId);\n+                    if (targetNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, targetNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToRelocate = routingNodes.relocateShard(shardRouting, targetNodeId, 0L, changes).v2();\n+                        clusterInfoSimulator.simulateShardStarted(shardToRelocate);\n+                        routingNodes.startShard(logger, shardToRelocate, changes, 0L);\n+                        continue relocateToDesiredLocation;\n+                    }\n                 }\n             }\n \n@@ -190,9 +198,15 @@ public DesiredBalance compute(\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n                     final var nodeId = nodeIds.removeFirst();\n-                    final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }\n@@ -203,10 +217,16 @@ public DesiredBalance compute(\n             if (unassignedPrimaries.contains(shardRouting.shardId()) == false) {\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n-                    final String nodeId = nodeIds.removeFirst();\n-                    ShardRouting shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var nodeId = nodeIds.removeFirst();\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {\n+                        final var shardToInitialize = unassignedReplicaIterator.initialize(nodeId, null, 0L, changes);\n+                        clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n+                        routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    }\n                 }\n             }\n         }"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java",
+          "patch": "@@ -331,13 +331,13 @@ private static String diff(DesiredBalance old, DesiredBalance updated) {\n             var oldAssignment = old.getAssignment(shardId);\n             var updatedAssignment = updated.getAssignment(shardId);\n             if (Objects.equals(oldAssignment, updatedAssignment) == false) {\n-                builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" --> \").append(updatedAssignment);\n+                builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" -> \").append(updatedAssignment);\n             }\n         }\n         for (ShardId shardId : diff) {\n             var oldAssignment = old.getAssignment(shardId);\n             var updatedAssignment = updated.getAssignment(shardId);\n-            builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" --> \").append(updatedAssignment);\n+            builder.append(newLine).append(shardId).append(\": \").append(oldAssignment).append(\" -> \").append(updatedAssignment);\n         }\n         return builder.append(newLine).toString();\n     }"
+        },
+        {
+          "file": "x-pack/plugin/shutdown/src/internalClusterTest/java/org/elasticsearch/xpack/shutdown/DesiredBalanceShutdownIT.java",
+          "patch": "@@ -0,0 +1,95 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.shutdown;\n+\n+import org.elasticsearch.action.support.PlainActionFuture;\n+import org.elasticsearch.action.support.master.AcknowledgedResponse;\n+import org.elasticsearch.cluster.metadata.IndexMetadata;\n+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;\n+import org.elasticsearch.cluster.service.ClusterService;\n+import org.elasticsearch.common.Strings;\n+import org.elasticsearch.common.settings.Settings;\n+import org.elasticsearch.plugins.Plugin;\n+import org.elasticsearch.test.ESIntegTestCase;\n+import org.elasticsearch.test.InternalTestCluster;\n+\n+import java.util.Collection;\n+import java.util.List;\n+import java.util.concurrent.TimeUnit;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+\n+public class DesiredBalanceShutdownIT extends ESIntegTestCase {\n+\n+    private static final String INDEX = \"test-index\";\n+\n+    @Override\n+    protected Collection<Class<? extends Plugin>> nodePlugins() {\n+        return List.of(ShutdownPlugin.class);\n+    }\n+\n+    public void testDesiredBalanceWithShutdown() throws Exception {\n+\n+        final var oldNodeName = internalCluster().startNode();\n+        final var oldNodeId = internalCluster().getInstance(ClusterService.class, oldNodeName).localNode().getId();\n+\n+        createIndex(\n+            INDEX,\n+            Settings.builder()\n+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)\n+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)\n+                .put(IndexMetadata.INDEX_ROUTING_REQUIRE_GROUP_PREFIX + \"._name\", oldNodeName)\n+                .build()\n+        );\n+        ensureGreen(INDEX);\n+\n+        internalCluster().restartNode(internalCluster().startNode(), new InternalTestCluster.RestartCallback() {\n+            @Override\n+            public Settings onNodeStopped(String newNodeName) {\n+\n+                logger.info(\"--> excluding index from [{}] and concurrently starting replacement with [{}]\", oldNodeName, newNodeName);\n+\n+                final PlainActionFuture<AcknowledgedResponse> excludeFuture = new PlainActionFuture<>();\n+                client().admin()\n+                    .indices()\n+                    .prepareUpdateSettings(INDEX)\n+                    .setSettings(\n+                        Settings.builder()\n+                            .put(IndexMetadata.INDEX_ROUTING_EXCLUDE_GROUP_PREFIX + \"._name\", oldNodeName)\n+                            .putNull(IndexMetadata.INDEX_ROUTING_REQUIRE_GROUP_PREFIX + \"._name\")\n+                    )\n+                    .execute(excludeFuture);\n+\n+                assertAcked(\n+                    client().execute(\n+                        PutShutdownNodeAction.INSTANCE,\n+                        new PutShutdownNodeAction.Request(oldNodeId, SingleNodeShutdownMetadata.Type.REPLACE, \"test\", null, newNodeName)\n+                    ).actionGet(10, TimeUnit.SECONDS)\n+                );\n+\n+                excludeFuture.actionGet(10, TimeUnit.SECONDS);\n+\n+                return Settings.EMPTY;\n+            }\n+        });\n+\n+        logger.info(\"--> waiting for replacement to complete\");\n+\n+        assertBusy(() -> {\n+            final var getShutdownResponse = client().execute(GetShutdownStatusAction.INSTANCE, new GetShutdownStatusAction.Request())\n+                .actionGet(10, TimeUnit.SECONDS);\n+            assertTrue(\n+                Strings.toString(getShutdownResponse, true, true),\n+                getShutdownResponse.getShutdownStatuses()\n+                    .stream()\n+                    .allMatch(s -> s.overallStatus() == SingleNodeShutdownMetadata.Status.COMPLETE)\n+            );\n+        });\n+    }\n+\n+}"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-02-09T10:36:41Z",
+      "user": "DaveCTurner",
+      "body": "Today when setting up for the desired balance computation we move all shards to their desired locations without checking any allocation rules. However, certain allocation rules (e.g. those related to node versions and shutdowns) may prevent these movements in reality, resulting in a shard which cannot move to its desired location but which may not remain on its current node either.\r\n\r\nThis commit adds some checks to verify that these preliminary moves are still legal when setting up the computation.\r\n\r\nCloses #93271"
+    },
+    {
+      "type": "commit",
+      "date": "2023-02-09T10:37:06Z",
+      "sha": "658c82301db0c16974f8f19d48b048c15940e540",
+      "message": "Update docs/changelog/93635.yaml",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-02-09T10:37:06Z",
+      "author_date": "2023-02-09T10:37:06Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-02-09T10:37:06Z",
+      "diff_text": "docs/changelog/93635.yaml\n@@ -0,0 +1,6 @@\n+pr: 93635\n+summary: Only simulate legal desired moves\n+area: Allocation\n+type: bug\n+issues:\n+ - 93271",
+      "diff": [
+        {
+          "file": "docs/changelog/93635.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 93635\n+summary: Only simulate legal desired moves\n+area: Allocation\n+type: bug\n+issues:\n+ - 93271"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1423971389,
+      "created_at": "2023-02-09T10:37:07Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @DaveCTurner, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1423971390,
+      "created_at": "2023-02-09T10:37:07Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1101281472,
+      "created_at": "2023-02-09T10:49:42Z",
+      "user": "idegtiarenko",
+      "body": "Was this necessary or included just in case?",
+      "path": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java",
+      "diff_hunk": "@@ -190,9 +198,15 @@ public DesiredBalance compute(\n                 final var nodeIds = unassignedShardsToInitialize.get(shardRouting);\n                 if (nodeIds != null && nodeIds.isEmpty() == false) {\n                     final var nodeId = nodeIds.removeFirst();\n-                    final var shardToInitialize = unassignedPrimaryIterator.initialize(nodeId, null, 0L, changes);\n-                    clusterInfoSimulator.simulateShardStarted(shardToInitialize);\n-                    routingNodes.startShard(logger, shardToInitialize, changes, 0L);\n+                    final var routingNode = routingNodes.node(nodeId);\n+                    if (routingNode != null\n+                        && routingAllocation.deciders()\n+                            .canAllocate(shardRouting, routingNode, routingAllocation)\n+                            .type() != Decision.Type.NO) {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 205,
+      "original_line": 205,
+      "side": "RIGHT",
+      "original_position": 48,
+      "position": 48,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1101285485,
+          "user": "DaveCTurner",
+          "body": "this is from your PR which fixes `testSnapshotBasedRecovery`",
+          "created_at": "2023-02-09T10:53:36Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1290867262,
+      "created_at": "2023-02-09T10:49:43Z",
+      "user": "idegtiarenko",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1290871742,
+      "created_at": "2023-02-09T10:52:33Z",
+      "user": "idegtiarenko",
+      "state": "APPROVED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1290873325,
+      "created_at": "2023-02-09T10:53:37Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2023-02-09T12:00:01Z",
+      "sha": "31a66aeae0b8711744106366412507a0c530d32b",
+      "message": "Fix up AwarenessAllocationTests",
+      "author": "David Turner",
+      "author_email": "david.turner@elastic.co",
+      "author_raw_date": "2023-02-09T11:59:25Z",
+      "author_date": "2023-02-09T11:59:25Z",
+      "committer": "David Turner",
+      "committer_email": "david.turner@elastic.co",
+      "raw_date": "2023-02-09T12:00:01Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/AwarenessAllocationTests.java\n@@ -18,6 +18,7 @@\n import org.elasticsearch.cluster.TestShardRoutingRoleStrategies;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.metadata.Metadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.node.DiscoveryNodes;\n import org.elasticsearch.cluster.routing.RoutingNode;\n import org.elasticsearch.cluster.routing.RoutingTable;\n@@ -36,6 +37,7 @@\n import java.util.HashMap;\n import java.util.Map;\n import java.util.function.UnaryOperator;\n+import java.util.stream.Collectors;\n \n import static java.util.Collections.emptyMap;\n import static java.util.Collections.singletonList;\n@@ -950,8 +952,10 @@ public void testUnassignedShardsWithUnbalancedZones() {\n         assertThat(shardsWithState(clusterState.getRoutingNodes(), UNASSIGNED).size(), equalTo(1)); // Unassigned shard is expected.\n \n         AllocationCommands commands = new AllocationCommands();\n+        final var unusedNodes = clusterState.nodes().stream().map(DiscoveryNode::getId).collect(Collectors.toSet());\n         // Cancel all initializing shards\n         for (ShardRouting routing : clusterState.routingTable().allShards()) {\n+            unusedNodes.remove(routing.currentNodeId());\n             if (routing.initializing()) {\n                 commands.add(new CancelAllocationCommand(routing.shardId().getIndexName(), routing.id(), routing.currentNodeId(), false));\n             }\n@@ -960,8 +964,10 @@ public void testUnassignedShardsWithUnbalancedZones() {\n         for (ShardRouting routing : clusterState.routingTable().allShards()) {\n             if (routing.primary()) {\n                 var currentNodeId = routing.currentNodeId();\n-                var otherNodeId = randomValueOtherThan(currentNodeId, clusterState.nodes().getNodes().keySet().iterator()::next);\n+                unusedNodes.remove(currentNodeId);\n+                var otherNodeId = randomFrom(unusedNodes);\n                 commands.add(new MoveAllocationCommand(\"test\", 0, currentNodeId, otherNodeId));\n+                break;\n             }\n         }\n ",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/AwarenessAllocationTests.java",
+          "patch": "@@ -18,6 +18,7 @@\n import org.elasticsearch.cluster.TestShardRoutingRoleStrategies;\n import org.elasticsearch.cluster.metadata.IndexMetadata;\n import org.elasticsearch.cluster.metadata.Metadata;\n+import org.elasticsearch.cluster.node.DiscoveryNode;\n import org.elasticsearch.cluster.node.DiscoveryNodes;\n import org.elasticsearch.cluster.routing.RoutingNode;\n import org.elasticsearch.cluster.routing.RoutingTable;\n@@ -36,6 +37,7 @@\n import java.util.HashMap;\n import java.util.Map;\n import java.util.function.UnaryOperator;\n+import java.util.stream.Collectors;\n \n import static java.util.Collections.emptyMap;\n import static java.util.Collections.singletonList;\n@@ -950,8 +952,10 @@ public void testUnassignedShardsWithUnbalancedZones() {\n         assertThat(shardsWithState(clusterState.getRoutingNodes(), UNASSIGNED).size(), equalTo(1)); // Unassigned shard is expected.\n \n         AllocationCommands commands = new AllocationCommands();\n+        final var unusedNodes = clusterState.nodes().stream().map(DiscoveryNode::getId).collect(Collectors.toSet());\n         // Cancel all initializing shards\n         for (ShardRouting routing : clusterState.routingTable().allShards()) {\n+            unusedNodes.remove(routing.currentNodeId());\n             if (routing.initializing()) {\n                 commands.add(new CancelAllocationCommand(routing.shardId().getIndexName(), routing.id(), routing.currentNodeId(), false));\n             }\n@@ -960,8 +964,10 @@ public void testUnassignedShardsWithUnbalancedZones() {\n         for (ShardRouting routing : clusterState.routingTable().allShards()) {\n             if (routing.primary()) {\n                 var currentNodeId = routing.currentNodeId();\n-                var otherNodeId = randomValueOtherThan(currentNodeId, clusterState.nodes().getNodes().keySet().iterator()::next);\n+                unusedNodes.remove(currentNodeId);\n+                var otherNodeId = randomFrom(unusedNodes);\n                 commands.add(new MoveAllocationCommand(\"test\", 0, currentNodeId, otherNodeId));\n+                break;\n             }\n         }\n "
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1424167407,
+      "created_at": "2023-02-09T13:08:02Z",
+      "user": "DaveCTurner",
+      "body": "@elasticmachine please run elasticsearch-ci/part-1"
+    },
+    {
+      "type": "comment",
+      "id": 1424214255,
+      "created_at": "2023-02-09T13:45:35Z",
+      "user": "elasticsearchmachine",
+      "body": "## 💔 Backport failed\n| Status | Branch | Result |\n|:------:|:------:|:------:|\n| ❌ |  8.6  | Commit could not be cherrypicked due to conflicts |\n| ✅ |  [8.7](https://github.com/elastic/elasticsearch/pull/93650)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/93650\">](https://github.com/elastic/elasticsearch/pull/93650) |\n\nYou can use [sqren/backport](https://github.com/sqren/backport) to manually backport by running `backport --upstream elastic/elasticsearch --pr 93635`"
+    }
+  ]
+}

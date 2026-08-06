@@ -1,0 +1,839 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 110361,
+  "pr_number": 110361,
+  "title": "Don't detect PlainActionFuture deadlock on concurrent complete",
+  "user": "nicktindall",
+  "created_at": "2024-07-02T05:21:30Z",
+  "merged_at": "2024-07-03T09:15:47Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    ":Distributed/Distributed",
+    "Team:Distributed",
+    "v8.15.0"
+  ],
+  "base_commit": "80109eb2be91af390ba863d60a05aa98457576a7",
+  "merge_commit_sha": "fcaef5915e654b6f7780baac261676833d9c1442",
+  "commits": 11,
+  "issue_events": [
+    "review_requested",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "labeled",
+    "labeled",
+    "labeled",
+    "unlabeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "unlabeled",
+    "unlabeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/110361",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2024-07-02T05:20:02Z",
+      "sha": "fe192b8cda0681e637d574e948b295ce77f4b52f",
+      "message": "Don't detect PlainActionFuture deadlock on concurrent complete\n\nCloses #110360",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-02T05:13:45Z",
+      "author_date": "2024-07-02T05:13:45Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-02T05:20:02Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/action/support/PlainActionFuture.java\n@@ -379,7 +379,11 @@ private boolean complete(@Nullable V v, @Nullable Exception e, int finalState) {\n             } else if (getState() == COMPLETING) {\n                 // If some other thread is currently completing the future, block until\n                 // they are done so we can guarantee completion.\n-                acquireShared(-1);\n+                // Don't use acquire here, to prevent false-positive deadlock detection\n+                // when multiple threads from the same pool are completing the future\n+                while (isDone() == false) {\n+                    Thread.onSpinWait();\n+                }\n             }\n             return doCompletion;\n         }\nserver/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -14,13 +14,21 @@\n import org.elasticsearch.core.Assertions;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.test.ESTestCase;\n+import org.elasticsearch.threadpool.TestThreadPool;\n import org.elasticsearch.transport.RemoteTransportException;\n \n+import java.util.ArrayList;\n+import java.util.List;\n import java.util.concurrent.CancellationException;\n+import java.util.concurrent.CompletionService;\n+import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n+import java.util.concurrent.ExecutorCompletionService;\n+import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n+import java.util.concurrent.atomic.AtomicReference;\n \n public class PlainActionFutureTests extends ESTestCase {\n \n@@ -142,6 +150,66 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+            final int threads = 4;\n+            final AtomicBoolean running = new AtomicBoolean(true);\n+            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n+            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());\n+            final List<Future<?>> futures = new ArrayList<>();\n+            for (int i = 0; i < threads; i++) {\n+                futures.add(cs.submit(new FutureCompleter(i, startBarrier, futureReference, running), null));\n+            }\n+            startBarrier.countDown();\n+            safeAwait(startBarrier);\n+            cs.poll(500, TimeUnit.MILLISECONDS);\n+            running.set(false);\n+            futures.forEach(ESTestCase::safeGet);\n+        }\n+    }\n+\n+    private static class FutureCompleter implements Runnable {\n+        private final int number;\n+        private final AtomicReference<PlainActionFuture<?>> future;\n+        private final AtomicBoolean running;\n+        private final CountDownLatch startBarrier;\n+        private volatile boolean failed = false;\n+\n+        private FutureCompleter(\n+            int number,\n+            CountDownLatch startBarrier,\n+            AtomicReference<PlainActionFuture<?>> future,\n+            AtomicBoolean running\n+        ) {\n+            this.number = number;\n+            this.future = future;\n+            this.running = running;\n+            this.startBarrier = startBarrier;\n+        }\n+\n+        @Override\n+        public void run() {\n+            try {\n+                startBarrier.countDown();\n+                safeAwait(startBarrier);\n+                while (running.get()) {\n+                    if (number == 0) {\n+                        future.set(new PlainActionFuture<>());\n+                    }\n+                    future.get().onResponse(null);\n+                }\n+            } finally {\n+                if (running.get()) {\n+                    // We failed\n+                    failed = true;\n+                }\n+                running.set(false);\n+            }\n+        }\n+    }\n+\n     private static void assertCancellation(ThrowingRunnable runnable) {\n         final var cancellationException = expectThrows(CancellationException.class, runnable);\n         assertEquals(\"Task was cancelled.\", cancellationException.getMessage());",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/action/support/PlainActionFuture.java",
+          "patch": "@@ -379,7 +379,11 @@ private boolean complete(@Nullable V v, @Nullable Exception e, int finalState) {\n             } else if (getState() == COMPLETING) {\n                 // If some other thread is currently completing the future, block until\n                 // they are done so we can guarantee completion.\n-                acquireShared(-1);\n+                // Don't use acquire here, to prevent false-positive deadlock detection\n+                // when multiple threads from the same pool are completing the future\n+                while (isDone() == false) {\n+                    Thread.onSpinWait();\n+                }\n             }\n             return doCompletion;\n         }"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -14,13 +14,21 @@\n import org.elasticsearch.core.Assertions;\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.test.ESTestCase;\n+import org.elasticsearch.threadpool.TestThreadPool;\n import org.elasticsearch.transport.RemoteTransportException;\n \n+import java.util.ArrayList;\n+import java.util.List;\n import java.util.concurrent.CancellationException;\n+import java.util.concurrent.CompletionService;\n+import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n+import java.util.concurrent.ExecutorCompletionService;\n+import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n+import java.util.concurrent.atomic.AtomicReference;\n \n public class PlainActionFutureTests extends ESTestCase {\n \n@@ -142,6 +150,66 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+            final int threads = 4;\n+            final AtomicBoolean running = new AtomicBoolean(true);\n+            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n+            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());\n+            final List<Future<?>> futures = new ArrayList<>();\n+            for (int i = 0; i < threads; i++) {\n+                futures.add(cs.submit(new FutureCompleter(i, startBarrier, futureReference, running), null));\n+            }\n+            startBarrier.countDown();\n+            safeAwait(startBarrier);\n+            cs.poll(500, TimeUnit.MILLISECONDS);\n+            running.set(false);\n+            futures.forEach(ESTestCase::safeGet);\n+        }\n+    }\n+\n+    private static class FutureCompleter implements Runnable {\n+        private final int number;\n+        private final AtomicReference<PlainActionFuture<?>> future;\n+        private final AtomicBoolean running;\n+        private final CountDownLatch startBarrier;\n+        private volatile boolean failed = false;\n+\n+        private FutureCompleter(\n+            int number,\n+            CountDownLatch startBarrier,\n+            AtomicReference<PlainActionFuture<?>> future,\n+            AtomicBoolean running\n+        ) {\n+            this.number = number;\n+            this.future = future;\n+            this.running = running;\n+            this.startBarrier = startBarrier;\n+        }\n+\n+        @Override\n+        public void run() {\n+            try {\n+                startBarrier.countDown();\n+                safeAwait(startBarrier);\n+                while (running.get()) {\n+                    if (number == 0) {\n+                        future.set(new PlainActionFuture<>());\n+                    }\n+                    future.get().onResponse(null);\n+                }\n+            } finally {\n+                if (running.get()) {\n+                    // We failed\n+                    failed = true;\n+                }\n+                running.set(false);\n+            }\n+        }\n+    }\n+\n     private static void assertCancellation(ThrowingRunnable runnable) {\n         final var cancellationException = expectThrows(CancellationException.class, runnable);\n         assertEquals(\"Task was cancelled.\", cancellationException.getMessage());"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2024-07-02T05:21:30Z",
+      "user": "nicktindall",
+      "body": "Closes #110360\r\nCloses #110181 \r\n\r\nI don't love the test for this, but it does reproduce the issue reliably. Any suggestions for making it less verbose are appreciated.\r\n"
+    },
+    {
+      "type": "review_comment",
+      "id": 1661852804,
+      "created_at": "2024-07-02T05:26:34Z",
+      "user": "nicktindall",
+      "body": "I imagine we stay in this state extremely briefly (and rarely) as we're just waiting on two assignments and the release, perhaps busy wait is OK here?",
+      "path": "server/src/main/java/org/elasticsearch/action/support/PlainActionFuture.java",
+      "diff_hunk": "@@ -379,7 +379,11 @@ private boolean complete(@Nullable V v, @Nullable Exception e, int finalState) {\n             } else if (getState() == COMPLETING) {\n                 // If some other thread is currently completing the future, block until\n                 // they are done so we can guarantee completion.\n-                acquireShared(-1);\n+                // Don't use acquire here, to prevent false-positive deadlock detection\n+                // when multiple threads from the same pool are completing the future\n+                while (isDone() == false) {\n+                    Thread.onSpinWait();\n+                }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 386,
+      "original_line": 386,
+      "side": "RIGHT",
+      "original_position": 9,
+      "position": 9,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1661871125,
+          "user": "nicktindall",
+          "body": "We could also use some other synchronisation mechanism here to wait/notify (that didn't add the waiter to the waiters for the `Sync`), but that might be overkill?",
+          "created_at": "2024-07-02T05:52:06Z"
+        },
+        {
+          "id": 1661882520,
+          "user": "DaveCTurner",
+          "body": "Seems ok to me; possibly this is even more efficient, not that efficiency particularly matters in these cases.",
+          "created_at": "2024-07-02T06:05:54Z"
+        },
+        {
+          "id": 1661930652,
+          "user": "ywangd",
+          "body": "Seems fine to me as well. I think `acquire` internally also does busy waiting.",
+          "created_at": "2024-07-02T06:51:11Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2152723211,
+      "created_at": "2024-07-02T05:26:35Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2152726782,
+      "created_at": "2024-07-02T05:29:35Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1661854949,
+      "created_at": "2024-07-02T05:29:35Z",
+      "user": "nicktindall",
+      "body": "The issue only manifests in the moment the `PlainActionFuture` is first resolved, this test reproduces fairly quickly when we do the above. I wish we didn't have to create objects in a tight loop.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +150,66 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+            final int threads = 4;\n+            final AtomicBoolean running = new AtomicBoolean(true);\n+            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n+            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());\n+            final List<Future<?>> futures = new ArrayList<>();\n+            for (int i = 0; i < threads; i++) {\n+                futures.add(cs.submit(new FutureCompleter(i, startBarrier, futureReference, running), null));\n+            }\n+            startBarrier.countDown();\n+            safeAwait(startBarrier);\n+            cs.poll(500, TimeUnit.MILLISECONDS);\n+            running.set(false);\n+            futures.forEach(ESTestCase::safeGet);\n+        }\n+    }\n+\n+    private static class FutureCompleter implements Runnable {\n+        private final int number;\n+        private final AtomicReference<PlainActionFuture<?>> future;\n+        private final AtomicBoolean running;\n+        private final CountDownLatch startBarrier;\n+        private volatile boolean failed = false;\n+\n+        private FutureCompleter(\n+            int number,\n+            CountDownLatch startBarrier,\n+            AtomicReference<PlainActionFuture<?>> future,\n+            AtomicBoolean running\n+        ) {\n+            this.number = number;\n+            this.future = future;\n+            this.running = running;\n+            this.startBarrier = startBarrier;\n+        }\n+\n+        @Override\n+        public void run() {\n+            try {\n+                startBarrier.countDown();\n+                safeAwait(startBarrier);\n+                while (running.get()) {\n+                    if (number == 0) {\n+                        future.set(new PlainActionFuture<>());\n+                    }\n+                    future.get().onResponse(null);\n+                }",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 202,
+      "side": "RIGHT",
+      "original_position": 75,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-02T05:32:58Z",
+      "sha": "d4e62446357d516244ae0507e7610c87089c132f",
+      "message": "Tidy up",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-02T05:31:17Z",
+      "author_date": "2024-07-02T05:31:17Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-02T05:32:58Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -164,7 +164,7 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws Interrup\n             }\n             startBarrier.countDown();\n             safeAwait(startBarrier);\n-            cs.poll(500, TimeUnit.MILLISECONDS);\n+            cs.poll(250, TimeUnit.MILLISECONDS);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }\n@@ -175,7 +175,6 @@ private static class FutureCompleter implements Runnable {\n         private final AtomicReference<PlainActionFuture<?>> future;\n         private final AtomicBoolean running;\n         private final CountDownLatch startBarrier;\n-        private volatile boolean failed = false;\n \n         private FutureCompleter(\n             int number,\n@@ -201,10 +200,7 @@ public void run() {\n                     future.get().onResponse(null);\n                 }\n             } finally {\n-                if (running.get()) {\n-                    // We failed\n-                    failed = true;\n-                }\n+                // In the event we failed, stop all the other FutureCompleter instances\n                 running.set(false);\n             }\n         }",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -164,7 +164,7 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws Interrup\n             }\n             startBarrier.countDown();\n             safeAwait(startBarrier);\n-            cs.poll(500, TimeUnit.MILLISECONDS);\n+            cs.poll(250, TimeUnit.MILLISECONDS);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }\n@@ -175,7 +175,6 @@ private static class FutureCompleter implements Runnable {\n         private final AtomicReference<PlainActionFuture<?>> future;\n         private final AtomicBoolean running;\n         private final CountDownLatch startBarrier;\n-        private volatile boolean failed = false;\n \n         private FutureCompleter(\n             int number,\n@@ -201,10 +200,7 @@ public void run() {\n                     future.get().onResponse(null);\n                 }\n             } finally {\n-                if (running.get()) {\n-                    // We failed\n-                    failed = true;\n-                }\n+                // In the event we failed, stop all the other FutureCompleter instances\n                 running.set(false);\n             }\n         }"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1661860876,
+      "created_at": "2024-07-02T05:38:14Z",
+      "user": "nicktindall",
+      "body": "This test will unfortunately run the full 250ms in the happy case, on my desktop it seemed to fail around the 80ms mark fairly consistently before the fix.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +150,62 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+            final int threads = 4;\n+            final AtomicBoolean running = new AtomicBoolean(true);\n+            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n+            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());\n+            final List<Future<?>> futures = new ArrayList<>();\n+            for (int i = 0; i < threads; i++) {\n+                futures.add(cs.submit(new FutureCompleter(i, startBarrier, futureReference, running), null));\n+            }\n+            startBarrier.countDown();\n+            safeAwait(startBarrier);\n+            cs.poll(250, TimeUnit.MILLISECONDS);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 167,
+      "side": "RIGHT",
+      "original_position": 40,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1661883333,
+          "user": "DaveCTurner",
+          "body": "I'd rather a test which fails _sometimes_ but always runs quickly, because we run this so often in CI that it'll catch the bug pretty soon anyway.",
+          "created_at": "2024-07-02T06:06:40Z"
+        },
+        {
+          "id": 1661889731,
+          "user": "nicktindall",
+          "body": "Cool, I reduced to 20ms which is still surprisingly reliable.",
+          "created_at": "2024-07-02T06:13:19Z"
+        },
+        {
+          "id": 1661971482,
+          "user": "DaveCTurner",
+          "body": "I'm wondering why we need such a complicated test to reproduce this. Something like this seems to work too:\r\n\r\n```diff\r\ndiff --git a/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java b/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\r\nindex 2ca914eb23c..68c706c7f3c 100644\r\n--- a/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\r\n+++ b/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\r\n@@ -14,6 +14,8 @@ import org.elasticsearch.common.util.concurrent.UncategorizedExecutionException;\r\n import org.elasticsearch.core.Assertions;\r\n import org.elasticsearch.core.TimeValue;\r\n import org.elasticsearch.test.ESTestCase;\r\n+import org.elasticsearch.threadpool.TestThreadPool;\r\n+import org.elasticsearch.threadpool.ThreadPool;\r\n import org.elasticsearch.transport.RemoteTransportException;\r\n\r\n import java.util.concurrent.CancellationException;\r\n@@ -180,4 +182,19 @@ public class PlainActionFutureTests extends ESTestCase {\r\n             }\r\n         };\r\n     }\r\n+\r\n+    public void testConcurrentCompletion() {\r\n+        try (var threadPool = new TestThreadPool(getTestName())) {\r\n+            final var future = new PlainActionFuture<>();\r\n+            final var threadCount = threadPool.info(ThreadPool.Names.GENERIC).getMax();\r\n+            final var barrier = new CyclicBarrier(threadCount);\r\n+            for (int taskIndex = 0; taskIndex < threadCount; taskIndex++) {\r\n+                threadPool.generic().execute(() -> {\r\n+                    safeAwait(barrier);\r\n+                    future.onResponse(null);\r\n+                });\r\n+            }\r\n+            assertNull(safeGet(future));\r\n+        }\r\n+    }\r\n }\r\n```",
+          "created_at": "2024-07-02T07:21:25Z"
+        },
+        {
+          "id": 1662022460,
+          "user": "DaveCTurner",
+          "body": "slightly nicer:\r\n\r\n```diff\r\ndiff --git a/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java b/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\r\nindex 2ca914eb23c..4893dfc91e8 100644\r\n--- a/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\r\n+++ b/server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\r\n@@ -9,11 +9,14 @@\r\n package org.elasticsearch.action.support;\r\n\r\n import org.elasticsearch.ElasticsearchException;\r\n+import org.elasticsearch.action.ActionRunnable;\r\n import org.elasticsearch.common.util.concurrent.FutureUtils;\r\n import org.elasticsearch.common.util.concurrent.UncategorizedExecutionException;\r\n import org.elasticsearch.core.Assertions;\r\n import org.elasticsearch.core.TimeValue;\r\n import org.elasticsearch.test.ESTestCase;\r\n+import org.elasticsearch.threadpool.TestThreadPool;\r\n+import org.elasticsearch.threadpool.ThreadPool;\r\n import org.elasticsearch.transport.RemoteTransportException;\r\n\r\n import java.util.concurrent.CancellationException;\r\n@@ -180,4 +183,18 @@ public class PlainActionFutureTests extends ESTestCase {\r\n             }\r\n         };\r\n     }\r\n+\r\n+    public void testConcurrentCompletion() {\r\n+        try (var threadPool = new TestThreadPool(getTestName())) {\r\n+            final var future = new PlainActionFuture<>();\r\n+            final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\r\n+            final var threadCount = threadPool.info(executorName).getMax();\r\n+            final var executor = threadPool.executor(executorName);\r\n+            final var barrier = new CyclicBarrier(threadCount);\r\n+            for (int i = 0; i < threadCount; i++) {\r\n+                executor.execute(ActionRunnable.run(future, () -> safeAwait(barrier)));\r\n+            }\r\n+            assertNull(safeGet(future));\r\n+        }\r\n+    }\r\n }\r\n```",
+          "created_at": "2024-07-02T07:56:40Z"
+        },
+        {
+          "id": 1662041622,
+          "user": "nicktindall",
+          "body": "That doesn't seem to trigger it on my machine (It's been running for >5000 times without a failure so far). I will try and inline the logic so we don't need the inner class. I'm sure it can be made simpler.\r\n\r\n",
+          "created_at": "2024-07-02T08:06:20Z"
+        },
+        {
+          "id": 1662215051,
+          "user": "DaveCTurner",
+          "body": "Weird, it fails pretty reliably for me. Although 5k iterations isn't very many.",
+          "created_at": "2024-07-02T09:45:07Z"
+        },
+        {
+          "id": 1662217240,
+          "user": "DaveCTurner",
+          "body": "Try running with `-Dtests.iters=1000 -Dtests.failfast=true`, no need to wait for seconds+ for Gradle to start up on each iteration.",
+          "created_at": "2024-07-02T09:46:39Z"
+        },
+        {
+          "id": 1663393598,
+          "user": "nicktindall",
+          "body": "I'm not sure what the difference is, but I can't get it to fail. This M3 MacBook seems to eat race conditions for breakfast (I also had trouble reproducing [this one](https://github.com/elastic/elasticsearch/issues/109866)).\r\n\r\nI ran for 800,000 iterations which took ~48 minutes and produced zero failures, where the latest iteration of my longer test fails almost immediately. While I accept that CI Is probably going to yield these failures more reliably, I think it's probably best if we have a test that reproduces on typical dev hardware.\r\n\r\nSome theories on why the longer test is more reliable\r\n- it produces ~20 `PlainActionFuture`s, so there's 20x the opportunity for it to occur (it can only occur once per future)\r\n- the threads hitting `onResponse` are hot, possibly running JIT-ed code, as opposed to just woken up from a wait. Perhaps this increases the likelihood of the critical piece of concurrency.",
+          "created_at": "2024-07-03T02:24:39Z"
+        },
+        {
+          "id": 1663484167,
+          "user": "DaveCTurner",
+          "body": "> I think it's probably best if we have a test that reproduces on typical dev hardware.\r\n\r\nHmm I think this is the wrong way round - if \"typical dev hardware\" isn't able to reproduce genuine race conditions that happen in CI/production then I don't think we should work around that by making one specific test more complex. I'd recommend using a GCP machine for long-running repro attempts rather than your laptop since it'll be closer to real production infra.",
+          "created_at": "2024-07-03T04:57:13Z"
+        },
+        {
+          "id": 1663516197,
+          "user": "nicktindall",
+          "body": "I think my version of the test is about as slender as it can be now (thanks for the feedback), but I'm OK with replacing it with the much shorter test if you'd prefer.\r\nI'm satisfied that the issue was there and that the change fixes it, and it sounds like that test will fail in CI if we regress, so I'm happy to go with consensus on the cost/benefit of the additional complexity.",
+          "created_at": "2024-07-03T05:35:04Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2152735768,
+      "created_at": "2024-07-02T05:38:15Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2152752323,
+      "created_at": "2024-07-02T05:52:06Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 2201998774,
+      "created_at": "2024-07-02T05:56:15Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-delivery (Team:Delivery)"
+    },
+    {
+      "type": "comment",
+      "id": 2202001981,
+      "created_at": "2024-07-02T05:59:09Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-02T05:59:10Z",
+      "sha": "4b51721b9724edbd1194bfa2db7cefd757d28714",
+      "message": "Update docs/changelog/110361.yaml",
+      "author": "Nick Tindall",
+      "author_email": "pva10x@gmail.com",
+      "author_raw_date": "2024-07-02T05:59:10Z",
+      "author_date": "2024-07-02T05:59:10Z",
+      "committer": "Nick Tindall",
+      "committer_email": "pva10x@gmail.com",
+      "raw_date": "2024-07-02T05:59:10Z",
+      "diff_text": "docs/changelog/110361.yaml\n@@ -0,0 +1,7 @@\n+pr: 110361\n+summary: Don't detect `PlainActionFuture` deadlock on concurrent complete\n+area: Distributed\n+type: bug\n+issues:\n+ - 110181\n+ - 110360",
+      "diff": [
+        {
+          "file": "docs/changelog/110361.yaml",
+          "patch": "@@ -0,0 +1,7 @@\n+pr: 110361\n+summary: Don't detect `PlainActionFuture` deadlock on concurrent complete\n+area: Distributed\n+type: bug\n+issues:\n+ - 110181\n+ - 110360"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 2202002043,
+      "created_at": "2024-07-02T05:59:11Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @nicktindall, I've created a changelog YAML for you."
+    },
+    {
+      "type": "review",
+      "id": 2152769830,
+      "created_at": "2024-07-02T06:07:29Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-02T06:12:39Z",
+      "sha": "0f0d57ea50095718c9680b0ef3b1ca3cfa148bb6",
+      "message": "Reduce timeout",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-02T06:12:24Z",
+      "author_date": "2024-07-02T06:12:24Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-02T06:12:39Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -164,7 +164,7 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws Interrup\n             }\n             startBarrier.countDown();\n             safeAwait(startBarrier);\n-            cs.poll(250, TimeUnit.MILLISECONDS);\n+            cs.poll(20, TimeUnit.MILLISECONDS);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -164,7 +164,7 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws Interrup\n             }\n             startBarrier.countDown();\n             safeAwait(startBarrier);\n-            cs.poll(250, TimeUnit.MILLISECONDS);\n+            cs.poll(20, TimeUnit.MILLISECONDS);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2152781930,
+      "created_at": "2024-07-02T06:13:19Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1661924951,
+      "created_at": "2024-07-02T06:45:53Z",
+      "user": "ywangd",
+      "body": "Nit: can we use full names, e.g. `completionService` instead of `cs`. I find it help readability. Same for `threadPool` instead of `tp`.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +150,62 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+            final int threads = 4;\n+            final AtomicBoolean running = new AtomicBoolean(true);\n+            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n+            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 160,
+      "side": "RIGHT",
+      "original_position": 33,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1661943556,
+      "created_at": "2024-07-02T07:02:30Z",
+      "user": "ywangd",
+      "body": "Nit: can we call this `startLatch` instead of `startBarrier`. The name got me for a bit.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +150,62 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+            final int threads = 4;\n+            final AtomicBoolean running = new AtomicBoolean(true);\n+            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 159,
+      "side": "RIGHT",
+      "original_position": 32,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2152837917,
+      "created_at": "2024-07-02T07:07:58Z",
+      "user": "ywangd",
+      "state": "APPROVED",
+      "body": "LGTM\r\n\r\nNice catch! TIL!"
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-02T07:14:37Z",
+      "sha": "f6ef0b5a23e4627fbac2da794e426e2bed327637",
+      "message": "Improve variable names",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-02T07:14:37Z",
+      "author_date": "2024-07-02T07:14:37Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-02T07:14:37Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -152,19 +152,19 @@ public void testCancelException() {\n \n     public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n-        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n             final int threads = 4;\n             final AtomicBoolean running = new AtomicBoolean(true);\n-            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n-            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());\n+            final CountDownLatch startLatch = new CountDownLatch(threads + 1);\n+            final CompletionService<?> completionService = new ExecutorCompletionService<>(threadPool.generic());\n             final List<Future<?>> futures = new ArrayList<>();\n             for (int i = 0; i < threads; i++) {\n-                futures.add(cs.submit(new FutureCompleter(i, startBarrier, futureReference, running), null));\n+                futures.add(completionService.submit(new FutureCompleter(i, startLatch, futureReference, running), null));\n             }\n-            startBarrier.countDown();\n-            safeAwait(startBarrier);\n-            cs.poll(20, TimeUnit.MILLISECONDS);\n+            startLatch.countDown();\n+            safeAwait(startLatch);\n+            completionService.poll(20, TimeUnit.MILLISECONDS);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -152,19 +152,19 @@ public void testCancelException() {\n \n     public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n-        try (TestThreadPool tp = new TestThreadPool(getTestName())) {\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n             final int threads = 4;\n             final AtomicBoolean running = new AtomicBoolean(true);\n-            final CountDownLatch startBarrier = new CountDownLatch(threads + 1);\n-            final CompletionService<?> cs = new ExecutorCompletionService<>(tp.generic());\n+            final CountDownLatch startLatch = new CountDownLatch(threads + 1);\n+            final CompletionService<?> completionService = new ExecutorCompletionService<>(threadPool.generic());\n             final List<Future<?>> futures = new ArrayList<>();\n             for (int i = 0; i < threads; i++) {\n-                futures.add(cs.submit(new FutureCompleter(i, startBarrier, futureReference, running), null));\n+                futures.add(completionService.submit(new FutureCompleter(i, startLatch, futureReference, running), null));\n             }\n-            startBarrier.countDown();\n-            safeAwait(startBarrier);\n-            cs.poll(20, TimeUnit.MILLISECONDS);\n+            startLatch.countDown();\n+            safeAwait(startLatch);\n+            completionService.poll(20, TimeUnit.MILLISECONDS);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-02T07:18:01Z",
+      "sha": "6f82c8af8db12286a61a365203cf4feb2342e5b4",
+      "message": "More naming",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-02T07:18:01Z",
+      "author_date": "2024-07-02T07:18:01Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-02T07:18:01Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -150,7 +150,7 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n-    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() throws InterruptedException {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -150,7 +150,7 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n-    public void testAssertCompleteAllowedAllowsConcurrentCompletes() throws InterruptedException {\n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() throws InterruptedException {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2152915042,
+      "created_at": "2024-07-02T07:21:25Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2152915593,
+      "created_at": "2024-07-02T07:21:40Z",
+      "user": "DaveCTurner",
+      "state": "CHANGES_REQUESTED",
+      "body": "I think we should try and simplify the test"
+    },
+    {
+      "type": "review",
+      "id": 2152996244,
+      "created_at": "2024-07-02T07:56:40Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2153026464,
+      "created_at": "2024-07-02T08:06:20Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-02T08:27:30Z",
+      "sha": "9ac71cde54874e94dce01215aafd04634e50f7cd",
+      "message": "Attempt at simplifying test",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-02T08:27:30Z",
+      "author_date": "2024-07-02T08:27:30Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-02T08:27:30Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -15,16 +15,16 @@\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.test.ESTestCase;\n import org.elasticsearch.threadpool.TestThreadPool;\n+import org.elasticsearch.threadpool.ThreadPool;\n import org.elasticsearch.transport.RemoteTransportException;\n \n import java.util.ArrayList;\n import java.util.List;\n import java.util.concurrent.CancellationException;\n-import java.util.concurrent.CompletionService;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n-import java.util.concurrent.ExecutorCompletionService;\n+import java.util.concurrent.ExecutorService;\n import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n@@ -150,62 +150,40 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n-    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() throws InterruptedException {\n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n-            final int threads = 4;\n+            final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+            final var threadCount = threadPool.info(executorName).getMax();\n             final AtomicBoolean running = new AtomicBoolean(true);\n-            final CountDownLatch startLatch = new CountDownLatch(threads + 1);\n-            final CompletionService<?> completionService = new ExecutorCompletionService<>(threadPool.generic());\n+            final CountDownLatch startLatch = new CountDownLatch(threadCount + 1);\n             final List<Future<?>> futures = new ArrayList<>();\n-            for (int i = 0; i < threads; i++) {\n-                futures.add(completionService.submit(new FutureCompleter(i, startLatch, futureReference, running), null));\n+            final ExecutorService executor = threadPool.executor(executorName);\n+            for (int i = 1; i < threadCount; i++) {\n+                futures.add(executor.submit(() -> {\n+                    startLatch.countDown();\n+                    safeAwait(startLatch);\n+                    while (running.get()) {\n+                        futureReference.get().onResponse(null);\n+                    }\n+                }, null));\n             }\n+            executor.submit(() -> {\n+                startLatch.countDown();\n+                safeAwait(startLatch);\n+                while (running.get()) {\n+                    futureReference.set(new PlainActionFuture<>());\n+                }\n+            }, null);\n             startLatch.countDown();\n             safeAwait(startLatch);\n-            completionService.poll(20, TimeUnit.MILLISECONDS);\n+            safeSleep(20);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }\n     }\n \n-    private static class FutureCompleter implements Runnable {\n-        private final int number;\n-        private final AtomicReference<PlainActionFuture<?>> future;\n-        private final AtomicBoolean running;\n-        private final CountDownLatch startBarrier;\n-\n-        private FutureCompleter(\n-            int number,\n-            CountDownLatch startBarrier,\n-            AtomicReference<PlainActionFuture<?>> future,\n-            AtomicBoolean running\n-        ) {\n-            this.number = number;\n-            this.future = future;\n-            this.running = running;\n-            this.startBarrier = startBarrier;\n-        }\n-\n-        @Override\n-        public void run() {\n-            try {\n-                startBarrier.countDown();\n-                safeAwait(startBarrier);\n-                while (running.get()) {\n-                    if (number == 0) {\n-                        future.set(new PlainActionFuture<>());\n-                    }\n-                    future.get().onResponse(null);\n-                }\n-            } finally {\n-                // In the event we failed, stop all the other FutureCompleter instances\n-                running.set(false);\n-            }\n-        }\n-    }\n-\n     private static void assertCancellation(ThrowingRunnable runnable) {\n         final var cancellationException = expectThrows(CancellationException.class, runnable);\n         assertEquals(\"Task was cancelled.\", cancellationException.getMessage());",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -15,16 +15,16 @@\n import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.test.ESTestCase;\n import org.elasticsearch.threadpool.TestThreadPool;\n+import org.elasticsearch.threadpool.ThreadPool;\n import org.elasticsearch.transport.RemoteTransportException;\n \n import java.util.ArrayList;\n import java.util.List;\n import java.util.concurrent.CancellationException;\n-import java.util.concurrent.CompletionService;\n import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n-import java.util.concurrent.ExecutorCompletionService;\n+import java.util.concurrent.ExecutorService;\n import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n@@ -150,62 +150,40 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n-    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() throws InterruptedException {\n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n-            final int threads = 4;\n+            final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+            final var threadCount = threadPool.info(executorName).getMax();\n             final AtomicBoolean running = new AtomicBoolean(true);\n-            final CountDownLatch startLatch = new CountDownLatch(threads + 1);\n-            final CompletionService<?> completionService = new ExecutorCompletionService<>(threadPool.generic());\n+            final CountDownLatch startLatch = new CountDownLatch(threadCount + 1);\n             final List<Future<?>> futures = new ArrayList<>();\n-            for (int i = 0; i < threads; i++) {\n-                futures.add(completionService.submit(new FutureCompleter(i, startLatch, futureReference, running), null));\n+            final ExecutorService executor = threadPool.executor(executorName);\n+            for (int i = 1; i < threadCount; i++) {\n+                futures.add(executor.submit(() -> {\n+                    startLatch.countDown();\n+                    safeAwait(startLatch);\n+                    while (running.get()) {\n+                        futureReference.get().onResponse(null);\n+                    }\n+                }, null));\n             }\n+            executor.submit(() -> {\n+                startLatch.countDown();\n+                safeAwait(startLatch);\n+                while (running.get()) {\n+                    futureReference.set(new PlainActionFuture<>());\n+                }\n+            }, null);\n             startLatch.countDown();\n             safeAwait(startLatch);\n-            completionService.poll(20, TimeUnit.MILLISECONDS);\n+            safeSleep(20);\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }\n     }\n \n-    private static class FutureCompleter implements Runnable {\n-        private final int number;\n-        private final AtomicReference<PlainActionFuture<?>> future;\n-        private final AtomicBoolean running;\n-        private final CountDownLatch startBarrier;\n-\n-        private FutureCompleter(\n-            int number,\n-            CountDownLatch startBarrier,\n-            AtomicReference<PlainActionFuture<?>> future,\n-            AtomicBoolean running\n-        ) {\n-            this.number = number;\n-            this.future = future;\n-            this.running = running;\n-            this.startBarrier = startBarrier;\n-        }\n-\n-        @Override\n-        public void run() {\n-            try {\n-                startBarrier.countDown();\n-                safeAwait(startBarrier);\n-                while (running.get()) {\n-                    if (number == 0) {\n-                        future.set(new PlainActionFuture<>());\n-                    }\n-                    future.get().onResponse(null);\n-                }\n-            } finally {\n-                // In the event we failed, stop all the other FutureCompleter instances\n-                running.set(false);\n-            }\n-        }\n-    }\n-\n     private static void assertCancellation(ThrowingRunnable runnable) {\n         final var cancellationException = expectThrows(CancellationException.class, runnable);\n         assertEquals(\"Task was cancelled.\", cancellationException.getMessage());"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2153304518,
+      "created_at": "2024-07-02T09:45:08Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2153308064,
+      "created_at": "2024-07-02T09:46:39Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-03T01:06:16Z",
+      "sha": "2138cee5c5dc25a3c579dad09befafb4f17b4bb8",
+      "message": "Further attempt at simplifying test",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-03T01:06:16Z",
+      "author_date": "2024-07-03T01:06:16Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-03T01:06:16Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -19,12 +19,9 @@\n import org.elasticsearch.transport.RemoteTransportException;\n \n import java.util.ArrayList;\n-import java.util.List;\n import java.util.concurrent.CancellationException;\n-import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n-import java.util.concurrent.ExecutorService;\n import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n@@ -152,33 +149,30 @@ public void testCancelException() {\n \n     public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        final var futures = new ArrayList<Future<?>>();\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n-            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n-            final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n-            final var threadCount = threadPool.info(executorName).getMax();\n-            final AtomicBoolean running = new AtomicBoolean(true);\n-            final CountDownLatch startLatch = new CountDownLatch(threadCount + 1);\n-            final List<Future<?>> futures = new ArrayList<>();\n-            final ExecutorService executor = threadPool.executor(executorName);\n-            for (int i = 1; i < threadCount; i++) {\n-                futures.add(executor.submit(() -> {\n-                    startLatch.countDown();\n-                    safeAwait(startLatch);\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the future\n+            for (int i = 0; i < threadCount; i++) {\n+                futures.add(threadPool.executor(executorName).submit(() -> {\n+                    safeAwait(startBarrier);\n                     while (running.get()) {\n                         futureReference.get().onResponse(null);\n                     }\n                 }, null));\n             }\n-            executor.submit(() -> {\n-                startLatch.countDown();\n-                safeAwait(startLatch);\n-                while (running.get()) {\n-                    futureReference.set(new PlainActionFuture<>());\n-                }\n-            }, null);\n-            startLatch.countDown();\n-            safeAwait(startLatch);\n-            safeSleep(20);\n+            // continually create new futures to complete\n+            safeAwait(startBarrier);\n+            long endTime = System.currentTimeMillis() + 20;\n+            while (System.currentTimeMillis() < endTime) {\n+                futureReference.set(new PlainActionFuture<>());\n+                safeSleep(1);\n+            }\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -19,12 +19,9 @@\n import org.elasticsearch.transport.RemoteTransportException;\n \n import java.util.ArrayList;\n-import java.util.List;\n import java.util.concurrent.CancellationException;\n-import java.util.concurrent.CountDownLatch;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n-import java.util.concurrent.ExecutorService;\n import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n@@ -152,33 +149,30 @@ public void testCancelException() {\n \n     public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        final var futures = new ArrayList<Future<?>>();\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n-            final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n-            final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n-            final var threadCount = threadPool.info(executorName).getMax();\n-            final AtomicBoolean running = new AtomicBoolean(true);\n-            final CountDownLatch startLatch = new CountDownLatch(threadCount + 1);\n-            final List<Future<?>> futures = new ArrayList<>();\n-            final ExecutorService executor = threadPool.executor(executorName);\n-            for (int i = 1; i < threadCount; i++) {\n-                futures.add(executor.submit(() -> {\n-                    startLatch.countDown();\n-                    safeAwait(startLatch);\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the future\n+            for (int i = 0; i < threadCount; i++) {\n+                futures.add(threadPool.executor(executorName).submit(() -> {\n+                    safeAwait(startBarrier);\n                     while (running.get()) {\n                         futureReference.get().onResponse(null);\n                     }\n                 }, null));\n             }\n-            executor.submit(() -> {\n-                startLatch.countDown();\n-                safeAwait(startLatch);\n-                while (running.get()) {\n-                    futureReference.set(new PlainActionFuture<>());\n-                }\n-            }, null);\n-            startLatch.countDown();\n-            safeAwait(startLatch);\n-            safeSleep(20);\n+            // continually create new futures to complete\n+            safeAwait(startBarrier);\n+            long endTime = System.currentTimeMillis() + 20;\n+            while (System.currentTimeMillis() < endTime) {\n+                futureReference.set(new PlainActionFuture<>());\n+                safeSleep(1);\n+            }\n             running.set(false);\n             futures.forEach(ESTestCase::safeGet);\n         }"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2155212510,
+      "created_at": "2024-07-03T02:24:40Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1663483783,
+      "created_at": "2024-07-03T04:56:51Z",
+      "user": "DaveCTurner",
+      "body": "No real need to wait on these futures, uncaught exceptions will fail the test anyway and shutting down the threadpool will `join()` all the threads.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +147,37 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        final var futures = new ArrayList<Future<?>>();\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the future\n+            for (int i = 0; i < threadCount; i++) {\n+                futures.add(threadPool.executor(executorName).submit(() -> {\n+                    safeAwait(startBarrier);\n+                    while (running.get()) {\n+                        futureReference.get().onResponse(null);\n+                    }\n+                }, null));\n+            }\n+            // continually create new futures to complete\n+            safeAwait(startBarrier);\n+            long endTime = System.currentTimeMillis() + 20;\n+            while (System.currentTimeMillis() < endTime) {\n+                futureReference.set(new PlainActionFuture<>());\n+                safeSleep(1);\n+            }\n+            running.set(false);\n+            futures.forEach(ESTestCase::safeGet);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 177,
+      "side": "RIGHT",
+      "original_position": 50,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 2155457369,
+      "created_at": "2024-07-03T04:57:13Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1663484792,
+      "created_at": "2024-07-03T04:57:52Z",
+      "user": "DaveCTurner",
+      "body": "Maybe just loop 20 times rather than hammering on `System.currentTimeMillis()`?",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +147,37 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        final var futures = new ArrayList<Future<?>>();\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the future\n+            for (int i = 0; i < threadCount; i++) {\n+                futures.add(threadPool.executor(executorName).submit(() -> {\n+                    safeAwait(startBarrier);\n+                    while (running.get()) {\n+                        futureReference.get().onResponse(null);\n+                    }\n+                }, null));\n+            }\n+            // continually create new futures to complete\n+            safeAwait(startBarrier);\n+            long endTime = System.currentTimeMillis() + 20;\n+            while (System.currentTimeMillis() < endTime) {",
+      "start_line": null,
+      "original_start_line": 171,
+      "start_side": "RIGHT",
+      "line": null,
+      "original_line": 172,
+      "side": "RIGHT",
+      "original_position": 45,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1663485942,
+      "created_at": "2024-07-03T04:59:00Z",
+      "user": "DaveCTurner",
+      "body": "Why not use all the threads available? More than 4 normally, but even if the pool is smaller than 4 sometimes it's still a valid test.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +147,37 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        final var futures = new ArrayList<Future<?>>();\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 159,
+      "side": "RIGHT",
+      "original_position": 32,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1663497157,
+          "user": "nicktindall",
+          "body": "It blows the test time out to 300ms+ on my machine because of the additional synchronisation. 4 threads takes < 100ms but still reliably reproduces the issue.",
+          "created_at": "2024-07-03T05:10:20Z"
+        },
+        {
+          "id": 1663604050,
+          "user": "DaveCTurner",
+          "body": "Ok let's use `Math.min(threadPool.info(executorName).getMax(), 4)` rather than failing the test if the threadpool is smaller than 4, and add a comment about why.",
+          "created_at": "2024-07-03T06:47:53Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2155458341,
+      "created_at": "2024-07-03T05:00:18Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2155469342,
+      "created_at": "2024-07-03T05:10:20Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-03T05:14:36Z",
+      "sha": "88fd0bcc1b34ee24721e1f9f73bce37e1ac5165a",
+      "message": "Further simplification",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-03T05:14:36Z",
+      "author_date": "2024-07-03T05:14:36Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-03T05:14:36Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -18,11 +18,9 @@\n import org.elasticsearch.threadpool.ThreadPool;\n import org.elasticsearch.transport.RemoteTransportException;\n \n-import java.util.ArrayList;\n import java.util.concurrent.CancellationException;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n-import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicReference;\n@@ -154,27 +152,24 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         final var threadCount = 4;\n         final var running = new AtomicBoolean(true);\n         final var startBarrier = new CyclicBarrier(threadCount + 1);\n-        final var futures = new ArrayList<Future<?>>();\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n-            // N threads competing to complete the future\n+            // N threads competing to complete the futures\n             for (int i = 0; i < threadCount; i++) {\n-                futures.add(threadPool.executor(executorName).submit(() -> {\n+                threadPool.executor(executorName).submit(() -> {\n                     safeAwait(startBarrier);\n                     while (running.get()) {\n                         futureReference.get().onResponse(null);\n                     }\n-                }, null));\n+                }, null);\n             }\n-            // continually create new futures to complete\n+            // create new futures to complete\n             safeAwait(startBarrier);\n-            long endTime = System.currentTimeMillis() + 20;\n-            while (System.currentTimeMillis() < endTime) {\n+            for (int i = 0; i < 20; i++) {\n                 futureReference.set(new PlainActionFuture<>());\n                 safeSleep(1);\n             }\n             running.set(false);\n-            futures.forEach(ESTestCase::safeGet);\n         }\n     }\n ",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -18,11 +18,9 @@\n import org.elasticsearch.threadpool.ThreadPool;\n import org.elasticsearch.transport.RemoteTransportException;\n \n-import java.util.ArrayList;\n import java.util.concurrent.CancellationException;\n import java.util.concurrent.CyclicBarrier;\n import java.util.concurrent.ExecutionException;\n-import java.util.concurrent.Future;\n import java.util.concurrent.TimeUnit;\n import java.util.concurrent.atomic.AtomicBoolean;\n import java.util.concurrent.atomic.AtomicReference;\n@@ -154,27 +152,24 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         final var threadCount = 4;\n         final var running = new AtomicBoolean(true);\n         final var startBarrier = new CyclicBarrier(threadCount + 1);\n-        final var futures = new ArrayList<Future<?>>();\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n             assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n-            // N threads competing to complete the future\n+            // N threads competing to complete the futures\n             for (int i = 0; i < threadCount; i++) {\n-                futures.add(threadPool.executor(executorName).submit(() -> {\n+                threadPool.executor(executorName).submit(() -> {\n                     safeAwait(startBarrier);\n                     while (running.get()) {\n                         futureReference.get().onResponse(null);\n                     }\n-                }, null));\n+                }, null);\n             }\n-            // continually create new futures to complete\n+            // create new futures to complete\n             safeAwait(startBarrier);\n-            long endTime = System.currentTimeMillis() + 20;\n-            while (System.currentTimeMillis() < endTime) {\n+            for (int i = 0; i < 20; i++) {\n                 futureReference.set(new PlainActionFuture<>());\n                 safeSleep(1);\n             }\n             running.set(false);\n-            futures.forEach(ESTestCase::safeGet);\n         }\n     }\n "
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2155493203,
+      "created_at": "2024-07-03T05:35:04Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review_comment",
+      "id": 1663606128,
+      "created_at": "2024-07-03T06:49:22Z",
+      "user": "DaveCTurner",
+      "body": "We can just use `execute()` now that we don't care about the result - no need to wrap the task in a `RunnableFuture`.",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +145,34 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the futures\n+            for (int i = 0; i < threadCount; i++) {\n+                threadPool.executor(executorName).submit(() -> {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 159,
+      "side": "RIGHT",
+      "original_position": 32,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1663607536,
+      "created_at": "2024-07-03T06:50:17Z",
+      "user": "DaveCTurner",
+      "body": "Would it help to wait on the future to be completed too?",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +145,34 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the futures\n+            for (int i = 0; i < threadCount; i++) {\n+                threadPool.executor(executorName).submit(() -> {\n+                    safeAwait(startBarrier);\n+                    while (running.get()) {\n+                        futureReference.get().onResponse(null);\n+                    }\n+                }, null);\n+            }\n+            // create new futures to complete\n+            safeAwait(startBarrier);\n+            for (int i = 0; i < 20; i++) {\n+                futureReference.set(new PlainActionFuture<>());",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 174,
+      "original_line": 169,
+      "side": "RIGHT",
+      "original_position": 42,
+      "position": 47,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1663706811,
+          "user": "nicktindall",
+          "body": "I actually don't think so, I tried replacing the sleep with a wait and that made the test unreliable. I measured, and on my machine each thread completed that loop about 800,000 times in the ~20ms so I feel waiting on the future (in addition to the sleep) is at best redundant and at worst interfering with the behaviour under test.",
+          "created_at": "2024-07-03T07:52:08Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 1663608892,
+      "created_at": "2024-07-03T06:51:16Z",
+      "user": "DaveCTurner",
+      "body": "Could you expand this comment to describe why we're creating multiple futures, recording the investigations you've done in this area?",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +145,34 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n+        final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n+        final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n+        final var threadCount = 4;\n+        final var running = new AtomicBoolean(true);\n+        final var startBarrier = new CyclicBarrier(threadCount + 1);\n+        try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n+            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // N threads competing to complete the futures\n+            for (int i = 0; i < threadCount; i++) {\n+                threadPool.executor(executorName).submit(() -> {\n+                    safeAwait(startBarrier);\n+                    while (running.get()) {\n+                        futureReference.get().onResponse(null);\n+                    }\n+                }, null);\n+            }\n+            // create new futures to complete",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 166,
+      "side": "RIGHT",
+      "original_position": 39,
+      "position": 1,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review_comment",
+      "id": 1663609454,
+      "created_at": "2024-07-03T06:51:39Z",
+      "user": "DaveCTurner",
+      "body": "Is this assumption necessary any more?",
+      "path": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+      "diff_hunk": "@@ -142,6 +145,34 @@ public void testCancelException() {\n         assertPropagatesInterrupt(() -> future.actionGet(10, TimeUnit.SECONDS));\n     }\n \n+    public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n+        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 149,
+      "side": "RIGHT",
+      "original_position": 22,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1663695649,
+          "user": "nicktindall",
+          "body": "Yes, because\r\n```java\r\n    @Override\r\n    public void onFailure(Exception e) {\r\n        assert assertCompleteAllowed();  // <----- only tested when assertions enabled\r\n        ...\r\n```",
+          "created_at": "2024-07-03T07:45:27Z"
+        },
+        {
+          "id": 1663720050,
+          "user": "DaveCTurner",
+          "body": "Sure, but the test is still valid either way AFAICT. I mean most tests make stronger checks if assertions are enabled, but that doesn't mean we should suppress them all like this.",
+          "created_at": "2024-07-03T07:59:50Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2155594930,
+      "created_at": "2024-07-03T06:52:55Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": "Ok I think the test is simple enough now for my tastes, although IMO it deserves a few more comments explaining why it's not any simpler."
+    },
+    {
+      "type": "review",
+      "id": 2155706417,
+      "created_at": "2024-07-03T07:45:27Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2155720410,
+      "created_at": "2024-07-03T07:52:08Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2155736844,
+      "created_at": "2024-07-03T07:59:50Z",
+      "user": "DaveCTurner",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-03T08:01:28Z",
+      "sha": "39d7b80649d174a79fc04aa0057102606debaf34",
+      "message": "Add explanation and tidy",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-03T08:00:31Z",
+      "author_date": "2024-07-03T08:00:31Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-03T08:01:28Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -149,21 +149,27 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n         final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n-        final var threadCount = 4;\n         final var running = new AtomicBoolean(true);\n-        final var startBarrier = new CyclicBarrier(threadCount + 1);\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n-            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // We only need 4 threads to reproduce this issue reliably, using more threads\n+            // just increases the run time due to the additional synchronisation\n+            final var threadCount = Math.min(threadPool.info(executorName).getMax(), 4);\n+            final var startBarrier = new CyclicBarrier(threadCount + 1);\n             // N threads competing to complete the futures\n             for (int i = 0; i < threadCount; i++) {\n-                threadPool.executor(executorName).submit(() -> {\n+                threadPool.executor(executorName).execute(() -> {\n                     safeAwait(startBarrier);\n                     while (running.get()) {\n                         futureReference.get().onResponse(null);\n                     }\n-                }, null);\n+                });\n             }\n-            // create new futures to complete\n+            // The race can only occur once per completion, so we provide\n+            // a stream of new futures to the competing threads to\n+            // maximise the probability it occurs. Providing them\n+            // with new futures while they spin proved to be much\n+            // more reliable at reproducing the issue than releasing\n+            // them all from a barrier to complete a single future.\n             safeAwait(startBarrier);\n             for (int i = 0; i < 20; i++) {\n                 futureReference.set(new PlainActionFuture<>());",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -149,21 +149,27 @@ public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n         assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n         final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n-        final var threadCount = 4;\n         final var running = new AtomicBoolean(true);\n-        final var startBarrier = new CyclicBarrier(threadCount + 1);\n         try (TestThreadPool threadPool = new TestThreadPool(getTestName())) {\n-            assert threadPool.info(executorName).getMax() >= threadCount : \"Not enough threads in pool\";\n+            // We only need 4 threads to reproduce this issue reliably, using more threads\n+            // just increases the run time due to the additional synchronisation\n+            final var threadCount = Math.min(threadPool.info(executorName).getMax(), 4);\n+            final var startBarrier = new CyclicBarrier(threadCount + 1);\n             // N threads competing to complete the futures\n             for (int i = 0; i < threadCount; i++) {\n-                threadPool.executor(executorName).submit(() -> {\n+                threadPool.executor(executorName).execute(() -> {\n                     safeAwait(startBarrier);\n                     while (running.get()) {\n                         futureReference.get().onResponse(null);\n                     }\n-                }, null);\n+                });\n             }\n-            // create new futures to complete\n+            // The race can only occur once per completion, so we provide\n+            // a stream of new futures to the competing threads to\n+            // maximise the probability it occurs. Providing them\n+            // with new futures while they spin proved to be much\n+            // more reliable at reproducing the issue than releasing\n+            // them all from a barrier to complete a single future.\n             safeAwait(startBarrier);\n             for (int i = 0; i < 20; i++) {\n                 futureReference.set(new PlainActionFuture<>());"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2024-07-03T08:05:57Z",
+      "sha": "ef706da1140677faa714b1a1a3cbabb3f16bdd88",
+      "message": "Remove assumption",
+      "author": "Nick Tindall",
+      "author_email": "nick.tindall@elastic.co",
+      "author_raw_date": "2024-07-03T08:05:57Z",
+      "author_date": "2024-07-03T08:05:57Z",
+      "committer": "Nick Tindall",
+      "committer_email": "nick.tindall@elastic.co",
+      "raw_date": "2024-07-03T08:05:57Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java\n@@ -146,7 +146,6 @@ public void testCancelException() {\n     }\n \n     public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n-        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n         final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n         final var running = new AtomicBoolean(true);",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/action/support/PlainActionFutureTests.java",
+          "patch": "@@ -146,7 +146,6 @@ public void testCancelException() {\n     }\n \n     public void testAssertCompleteAllowedAllowsConcurrentCompletesFromSamePool() {\n-        assumeTrue(\"Assertions need to be enabled for assertCompleteAllowed to be invoked\", Assertions.ENABLED);\n         final AtomicReference<PlainActionFuture<?>> futureReference = new AtomicReference<>(new PlainActionFuture<>());\n         final var executorName = randomFrom(ThreadPool.Names.GENERIC, ThreadPool.Names.MANAGEMENT);\n         final var running = new AtomicBoolean(true);"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 2155755903,
+      "created_at": "2024-07-03T08:08:31Z",
+      "user": "nicktindall",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 2155840285,
+      "created_at": "2024-07-03T08:44:16Z",
+      "user": "DaveCTurner",
+      "state": "APPROVED",
+      "body": "LGTM thanks for the extra iterations Nick"
+    }
+  ]
+}

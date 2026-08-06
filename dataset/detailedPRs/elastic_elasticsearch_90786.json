@@ -1,0 +1,299 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 90786,
+  "pr_number": 90786,
+  "title": "Record basic stats in DesiredBalanceShardsAllocator",
+  "user": "idegtiarenko",
+  "created_at": "2022-10-11T07:33:11Z",
+  "merged_at": "2022-10-17T07:58:14Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">enhancement",
+    ":Distributed/Allocation",
+    "Team:Distributed"
+  ],
+  "base_commit": "2f88c0d9701f44ad40373a8140563c217c5bc161",
+  "merge_commit_sha": "f752de9b300a6824a9123a3ac241c05d54bdd1aa",
+  "commits": 5,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "review_requested",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/90786",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2022-10-11T07:31:44Z",
+      "sha": "f9ef0553d155aeec4ce0fb67453a766c97bb710b",
+      "message": "Record basic stats in DesiredBalanceShardsAllocator",
+      "author": "ievgen.degtiarenko",
+      "author_email": "ievgen.degtiarenko@elastic.co",
+      "author_raw_date": "2022-10-11T07:31:44Z",
+      "author_date": "2022-10-11T07:31:44Z",
+      "committer": "ievgen.degtiarenko",
+      "committer_email": "ievgen.degtiarenko@elastic.co",
+      "raw_date": "2022-10-11T07:31:44Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java\n@@ -27,6 +27,7 @@\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.cluster.service.MasterService;\n import org.elasticsearch.common.Priority;\n+import org.elasticsearch.common.metrics.CounterMetric;\n import org.elasticsearch.common.util.set.Sets;\n import org.elasticsearch.index.shard.ShardId;\n import org.elasticsearch.threadpool.ThreadPool;\n@@ -51,6 +52,7 @@ public class DesiredBalanceShardsAllocator implements ShardsAllocator {\n     private static final Logger logger = LogManager.getLogger(DesiredBalanceShardsAllocator.class);\n \n     private final ShardsAllocator delegateAllocator;\n+    private final ThreadPool threadPool;\n     private final ClusterService clusterService;\n     private final DesiredBalanceReconcilerAction reconciler;\n     private final DesiredBalanceComputer desiredBalanceComputer;\n@@ -62,6 +64,13 @@ public class DesiredBalanceShardsAllocator implements ShardsAllocator {\n     private final NodeAllocationOrdering allocationOrdering = new NodeAllocationOrdering();\n     private volatile DesiredBalance currentDesiredBalance = DesiredBalance.INITIAL;\n \n+    // stats\n+    protected final CounterMetric computationsSubmitted = new CounterMetric();\n+    protected final CounterMetric computationsExecuted = new CounterMetric();\n+    protected final CounterMetric computationsConverged = new CounterMetric();\n+    protected final CounterMetric cumulativeComputationTime = new CounterMetric();\n+    protected final CounterMetric cumulativeReconciliationTime = new CounterMetric();\n+\n     @FunctionalInterface\n     public interface DesiredBalanceReconcilerAction {\n         ClusterState apply(ClusterState clusterState, Consumer<RoutingAllocation> routingAllocationAction);\n@@ -84,6 +93,7 @@ public DesiredBalanceShardsAllocator(\n         DesiredBalanceReconcilerAction reconciler\n     ) {\n         this.delegateAllocator = delegateAllocator;\n+        this.threadPool = threadPool;\n         this.clusterService = clusterService;\n         this.reconciler = reconciler;\n         this.desiredBalanceComputer = desiredBalanceComputer;\n@@ -95,11 +105,21 @@ protected void processInput(DesiredBalanceInput desiredBalanceInput) {\n                 long index = desiredBalanceInput.index();\n                 logger.debug(\"Starting desired balance computation for [{}]\", index);\n \n-                setCurrentDesiredBalance(\n-                    desiredBalanceComputer.compute(currentDesiredBalance, desiredBalanceInput, pendingDesiredBalanceMoves, this::isFresh)\n+                recordTime(\n+                    cumulativeComputationTime,\n+                    () -> setCurrentDesiredBalance(\n+                        desiredBalanceComputer.compute(\n+                            currentDesiredBalance,\n+                            desiredBalanceInput,\n+                            pendingDesiredBalanceMoves,\n+                            this::isFresh\n+                        )\n+                    )\n                 );\n+                computationsExecuted.inc();\n                 if (isFresh(desiredBalanceInput)) {\n                     logger.debug(\"Desired balance computation for [{}] is completed, scheduling reconciliation\", index);\n+                    computationsConverged.inc();\n                     submitReconcileTask(currentDesiredBalance);\n                 } else {\n                     logger.debug(\"Desired balance computation for [{}] is discarded as newer one is submitted\", index);\n@@ -131,6 +151,8 @@ public void allocate(RoutingAllocation allocation, ActionListener<Void> listener\n         // TODO add system context assertion\n         // TODO must also capture any shards that the existing-shards allocators have allocated this pass, not just the ignored ones\n \n+        computationsSubmitted.inc();\n+\n         var index = indexGenerator.incrementAndGet();\n         logger.debug(\"Executing allocate for [{}]\", index);\n         queue.add(index, listener);\n@@ -190,7 +212,23 @@ protected void reconcile(DesiredBalance desiredBalance, RoutingAllocation alloca\n             logger.debug(\"Reconciling desired balance for [{}]\", desiredBalance.lastConvergedIndex());\n         }\n         allocationOrdering.retainNodes(getNodeIds(allocation.routingNodes()));\n-        new DesiredBalanceReconciler(desiredBalance, allocation, allocationOrdering).run();\n+        recordTime(cumulativeReconciliationTime, new DesiredBalanceReconciler(desiredBalance, allocation, allocationOrdering)::run);\n+    }\n+\n+    public DesiredBalance getDesiredBalance() {\n+        return currentDesiredBalance;\n+    }\n+\n+    public DesiredBalanceStats getStats() {\n+        return new DesiredBalanceStats(\n+            currentDesiredBalance.lastConvergedIndex(),\n+            desiredBalanceComputation.isActive(),\n+            computationsSubmitted.count(),\n+            computationsExecuted.count(),\n+            computationsConverged.count(),\n+            cumulativeComputationTime.count(),\n+            cumulativeReconciliationTime.count()\n+        );\n     }\n \n     private void onNoLongerMaster() {\n@@ -256,6 +294,16 @@ private void discardSupersededTasks(\n         }\n     }\n \n+    private void recordTime(CounterMetric metric, Runnable action) {\n+        final long started = threadPool.relativeTimeInMillis();\n+        try {\n+            action.run();\n+        } finally {\n+            final long finished = threadPool.relativeTimeInMillis();\n+            metric.inc(finished - started);\n+        }\n+    }\n+\n     private static String diff(DesiredBalance old, DesiredBalance updated) {\n         var intersection = Sets.intersection(old.assignments().keySet(), updated.assignments().keySet());\n         var diff = Sets.difference(Sets.union(old.assignments().keySet(), updated.assignments().keySet()), intersection);\nserver/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java\n@@ -0,0 +1,52 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.routing.allocation.allocator;\n+\n+import org.elasticsearch.common.io.stream.StreamInput;\n+import org.elasticsearch.common.io.stream.StreamOutput;\n+import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.xcontent.ToXContentFragment;\n+import org.elasticsearch.xcontent.XContentBuilder;\n+\n+import java.io.IOException;\n+\n+public record DesiredBalanceStats(\n+    long lastConvergedIndex,\n+    boolean computationActive,\n+    long computationSubmitted,\n+    long computationExecuted,\n+    long computationConverged,\n+    long cumulativeComputationTime,\n+    long cumulativeReconciliationTime\n+) implements Writeable, ToXContentFragment {\n+\n+    public static DesiredBalanceStats readFrom(StreamInput in) throws IOException {\n+        // TODO\n+        return null;\n+    }\n+\n+    @Override\n+    public void writeTo(StreamOutput out) throws IOException {\n+        // TODO\n+    }\n+\n+    @Override\n+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {\n+\n+        builder.field(\"computation.active\", computationActive);\n+        builder.field(\"computation.submitted\", computationSubmitted);\n+        builder.field(\"computation.executed\", computationExecuted);\n+        builder.field(\"computation.converged\", computationConverged);\n+        builder.field(\"computation.converged.index\", lastConvergedIndex);\n+        builder.humanReadableField(\"computation.time_in_millis\", \"computation.time\", cumulativeComputationTime);\n+        builder.humanReadableField(\"reconciliation.time_in_millis\", \"reconciliation.time\", cumulativeReconciliationTime);\n+\n+        return builder;\n+    }\n+}",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java",
+          "patch": "@@ -27,6 +27,7 @@\n import org.elasticsearch.cluster.service.ClusterService;\n import org.elasticsearch.cluster.service.MasterService;\n import org.elasticsearch.common.Priority;\n+import org.elasticsearch.common.metrics.CounterMetric;\n import org.elasticsearch.common.util.set.Sets;\n import org.elasticsearch.index.shard.ShardId;\n import org.elasticsearch.threadpool.ThreadPool;\n@@ -51,6 +52,7 @@ public class DesiredBalanceShardsAllocator implements ShardsAllocator {\n     private static final Logger logger = LogManager.getLogger(DesiredBalanceShardsAllocator.class);\n \n     private final ShardsAllocator delegateAllocator;\n+    private final ThreadPool threadPool;\n     private final ClusterService clusterService;\n     private final DesiredBalanceReconcilerAction reconciler;\n     private final DesiredBalanceComputer desiredBalanceComputer;\n@@ -62,6 +64,13 @@ public class DesiredBalanceShardsAllocator implements ShardsAllocator {\n     private final NodeAllocationOrdering allocationOrdering = new NodeAllocationOrdering();\n     private volatile DesiredBalance currentDesiredBalance = DesiredBalance.INITIAL;\n \n+    // stats\n+    protected final CounterMetric computationsSubmitted = new CounterMetric();\n+    protected final CounterMetric computationsExecuted = new CounterMetric();\n+    protected final CounterMetric computationsConverged = new CounterMetric();\n+    protected final CounterMetric cumulativeComputationTime = new CounterMetric();\n+    protected final CounterMetric cumulativeReconciliationTime = new CounterMetric();\n+\n     @FunctionalInterface\n     public interface DesiredBalanceReconcilerAction {\n         ClusterState apply(ClusterState clusterState, Consumer<RoutingAllocation> routingAllocationAction);\n@@ -84,6 +93,7 @@ public DesiredBalanceShardsAllocator(\n         DesiredBalanceReconcilerAction reconciler\n     ) {\n         this.delegateAllocator = delegateAllocator;\n+        this.threadPool = threadPool;\n         this.clusterService = clusterService;\n         this.reconciler = reconciler;\n         this.desiredBalanceComputer = desiredBalanceComputer;\n@@ -95,11 +105,21 @@ protected void processInput(DesiredBalanceInput desiredBalanceInput) {\n                 long index = desiredBalanceInput.index();\n                 logger.debug(\"Starting desired balance computation for [{}]\", index);\n \n-                setCurrentDesiredBalance(\n-                    desiredBalanceComputer.compute(currentDesiredBalance, desiredBalanceInput, pendingDesiredBalanceMoves, this::isFresh)\n+                recordTime(\n+                    cumulativeComputationTime,\n+                    () -> setCurrentDesiredBalance(\n+                        desiredBalanceComputer.compute(\n+                            currentDesiredBalance,\n+                            desiredBalanceInput,\n+                            pendingDesiredBalanceMoves,\n+                            this::isFresh\n+                        )\n+                    )\n                 );\n+                computationsExecuted.inc();\n                 if (isFresh(desiredBalanceInput)) {\n                     logger.debug(\"Desired balance computation for [{}] is completed, scheduling reconciliation\", index);\n+                    computationsConverged.inc();\n                     submitReconcileTask(currentDesiredBalance);\n                 } else {\n                     logger.debug(\"Desired balance computation for [{}] is discarded as newer one is submitted\", index);\n@@ -131,6 +151,8 @@ public void allocate(RoutingAllocation allocation, ActionListener<Void> listener\n         // TODO add system context assertion\n         // TODO must also capture any shards that the existing-shards allocators have allocated this pass, not just the ignored ones\n \n+        computationsSubmitted.inc();\n+\n         var index = indexGenerator.incrementAndGet();\n         logger.debug(\"Executing allocate for [{}]\", index);\n         queue.add(index, listener);\n@@ -190,7 +212,23 @@ protected void reconcile(DesiredBalance desiredBalance, RoutingAllocation alloca\n             logger.debug(\"Reconciling desired balance for [{}]\", desiredBalance.lastConvergedIndex());\n         }\n         allocationOrdering.retainNodes(getNodeIds(allocation.routingNodes()));\n-        new DesiredBalanceReconciler(desiredBalance, allocation, allocationOrdering).run();\n+        recordTime(cumulativeReconciliationTime, new DesiredBalanceReconciler(desiredBalance, allocation, allocationOrdering)::run);\n+    }\n+\n+    public DesiredBalance getDesiredBalance() {\n+        return currentDesiredBalance;\n+    }\n+\n+    public DesiredBalanceStats getStats() {\n+        return new DesiredBalanceStats(\n+            currentDesiredBalance.lastConvergedIndex(),\n+            desiredBalanceComputation.isActive(),\n+            computationsSubmitted.count(),\n+            computationsExecuted.count(),\n+            computationsConverged.count(),\n+            cumulativeComputationTime.count(),\n+            cumulativeReconciliationTime.count()\n+        );\n     }\n \n     private void onNoLongerMaster() {\n@@ -256,6 +294,16 @@ private void discardSupersededTasks(\n         }\n     }\n \n+    private void recordTime(CounterMetric metric, Runnable action) {\n+        final long started = threadPool.relativeTimeInMillis();\n+        try {\n+            action.run();\n+        } finally {\n+            final long finished = threadPool.relativeTimeInMillis();\n+            metric.inc(finished - started);\n+        }\n+    }\n+\n     private static String diff(DesiredBalance old, DesiredBalance updated) {\n         var intersection = Sets.intersection(old.assignments().keySet(), updated.assignments().keySet());\n         var diff = Sets.difference(Sets.union(old.assignments().keySet(), updated.assignments().keySet()), intersection);"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java",
+          "patch": "@@ -0,0 +1,52 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.routing.allocation.allocator;\n+\n+import org.elasticsearch.common.io.stream.StreamInput;\n+import org.elasticsearch.common.io.stream.StreamOutput;\n+import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.xcontent.ToXContentFragment;\n+import org.elasticsearch.xcontent.XContentBuilder;\n+\n+import java.io.IOException;\n+\n+public record DesiredBalanceStats(\n+    long lastConvergedIndex,\n+    boolean computationActive,\n+    long computationSubmitted,\n+    long computationExecuted,\n+    long computationConverged,\n+    long cumulativeComputationTime,\n+    long cumulativeReconciliationTime\n+) implements Writeable, ToXContentFragment {\n+\n+    public static DesiredBalanceStats readFrom(StreamInput in) throws IOException {\n+        // TODO\n+        return null;\n+    }\n+\n+    @Override\n+    public void writeTo(StreamOutput out) throws IOException {\n+        // TODO\n+    }\n+\n+    @Override\n+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {\n+\n+        builder.field(\"computation.active\", computationActive);\n+        builder.field(\"computation.submitted\", computationSubmitted);\n+        builder.field(\"computation.executed\", computationExecuted);\n+        builder.field(\"computation.converged\", computationConverged);\n+        builder.field(\"computation.converged.index\", lastConvergedIndex);\n+        builder.humanReadableField(\"computation.time_in_millis\", \"computation.time\", cumulativeComputationTime);\n+        builder.humanReadableField(\"reconciliation.time_in_millis\", \"reconciliation.time\", cumulativeReconciliationTime);\n+\n+        return builder;\n+    }\n+}"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2022-10-11T07:33:11Z",
+      "user": "idegtiarenko",
+      "body": "Closes: #90582"
+    },
+    {
+      "type": "comment",
+      "id": 1274220439,
+      "created_at": "2022-10-11T07:33:33Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "commit",
+      "date": "2022-10-12T13:18:58Z",
+      "sha": "4667f7c3be5959d656122604ac20cbeecacd16f7",
+      "message": "add iterations metric",
+      "author": "ievgen.degtiarenko",
+      "author_email": "ievgen.degtiarenko@elastic.co",
+      "author_raw_date": "2022-10-12T13:18:58Z",
+      "author_date": "2022-10-12T13:18:58Z",
+      "committer": "ievgen.degtiarenko",
+      "committer_email": "ievgen.degtiarenko@elastic.co",
+      "raw_date": "2022-10-12T13:18:58Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java\n@@ -16,6 +16,7 @@\n import org.elasticsearch.cluster.routing.ShardRouting;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;\n+import org.elasticsearch.common.metrics.MeanMetric;\n import org.elasticsearch.index.shard.ShardId;\n \n import java.util.ArrayList;\n@@ -41,6 +42,8 @@ public class DesiredBalanceComputer {\n \n     private final ShardsAllocator delegateAllocator;\n \n+    protected final MeanMetric iterations = new MeanMetric();\n+\n     public DesiredBalanceComputer(ShardsAllocator delegateAllocator) {\n         this.delegateAllocator = delegateAllocator;\n     }\n@@ -201,8 +204,9 @@ public DesiredBalance compute(\n             }\n         }\n \n+        int i = 0;\n         boolean hasChanges = false;\n-        for (int i = 0; true; i++) {\n+        while (true) {\n             if (hasChanges) {\n                 // Not the first iteration, so every remaining unassigned shard has been ignored, perhaps due to throttling. We must bring\n                 // them all back out of the ignored list to give the allocator another go...\n@@ -252,7 +256,9 @@ public DesiredBalance compute(\n                 // TODO this warning should be time based, iteration count should be proportional to the number of shards\n                 logger.debug(\"Desired balance computation is still not converged after {} iterations\", i);\n             }\n+            i++;\n         }\n+        iterations.inc(i);\n \n         final var assignments = new HashMap<ShardId, ShardAssignment>();\n         for (var shardAndAssignments : routingNodes.getAssignedShards().entrySet()) {\nserver/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java\n@@ -226,6 +226,7 @@ public DesiredBalanceStats getStats() {\n             computationsSubmitted.count(),\n             computationsExecuted.count(),\n             computationsConverged.count(),\n+            desiredBalanceComputer.iterations.sum(),\n             cumulativeComputationTime.count(),\n             cumulativeReconciliationTime.count()\n         );\nserver/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java\n@@ -22,18 +22,34 @@ public record DesiredBalanceStats(\n     long computationSubmitted,\n     long computationExecuted,\n     long computationConverged,\n+    long computationIterations,\n     long cumulativeComputationTime,\n     long cumulativeReconciliationTime\n ) implements Writeable, ToXContentFragment {\n \n     public static DesiredBalanceStats readFrom(StreamInput in) throws IOException {\n-        // TODO\n-        return null;\n+        return new DesiredBalanceStats(\n+            in.readVLong(),\n+            in.readBoolean(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong()\n+        );\n     }\n \n     @Override\n     public void writeTo(StreamOutput out) throws IOException {\n-        // TODO\n+        out.writeVLong(lastConvergedIndex);\n+        out.writeBoolean(computationActive);\n+        out.writeVLong(computationSubmitted);\n+        out.writeVLong(computationExecuted);\n+        out.writeVLong(computationConverged);\n+        out.writeVLong(computationIterations);\n+        out.writeVLong(cumulativeComputationTime);\n+        out.writeVLong(cumulativeReconciliationTime);\n     }\n \n     @Override\n@@ -43,6 +59,7 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws\n         builder.field(\"computation.submitted\", computationSubmitted);\n         builder.field(\"computation.executed\", computationExecuted);\n         builder.field(\"computation.converged\", computationConverged);\n+        builder.field(\"computation.iterations\", computationIterations);\n         builder.field(\"computation.converged.index\", lastConvergedIndex);\n         builder.humanReadableField(\"computation.time_in_millis\", \"computation.time\", cumulativeComputationTime);\n         builder.humanReadableField(\"reconciliation.time_in_millis\", \"reconciliation.time\", cumulativeReconciliationTime);",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceComputer.java",
+          "patch": "@@ -16,6 +16,7 @@\n import org.elasticsearch.cluster.routing.ShardRouting;\n import org.elasticsearch.cluster.routing.UnassignedInfo;\n import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;\n+import org.elasticsearch.common.metrics.MeanMetric;\n import org.elasticsearch.index.shard.ShardId;\n \n import java.util.ArrayList;\n@@ -41,6 +42,8 @@ public class DesiredBalanceComputer {\n \n     private final ShardsAllocator delegateAllocator;\n \n+    protected final MeanMetric iterations = new MeanMetric();\n+\n     public DesiredBalanceComputer(ShardsAllocator delegateAllocator) {\n         this.delegateAllocator = delegateAllocator;\n     }\n@@ -201,8 +204,9 @@ public DesiredBalance compute(\n             }\n         }\n \n+        int i = 0;\n         boolean hasChanges = false;\n-        for (int i = 0; true; i++) {\n+        while (true) {\n             if (hasChanges) {\n                 // Not the first iteration, so every remaining unassigned shard has been ignored, perhaps due to throttling. We must bring\n                 // them all back out of the ignored list to give the allocator another go...\n@@ -252,7 +256,9 @@ public DesiredBalance compute(\n                 // TODO this warning should be time based, iteration count should be proportional to the number of shards\n                 logger.debug(\"Desired balance computation is still not converged after {} iterations\", i);\n             }\n+            i++;\n         }\n+        iterations.inc(i);\n \n         final var assignments = new HashMap<ShardId, ShardAssignment>();\n         for (var shardAndAssignments : routingNodes.getAssignedShards().entrySet()) {"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java",
+          "patch": "@@ -226,6 +226,7 @@ public DesiredBalanceStats getStats() {\n             computationsSubmitted.count(),\n             computationsExecuted.count(),\n             computationsConverged.count(),\n+            desiredBalanceComputer.iterations.sum(),\n             cumulativeComputationTime.count(),\n             cumulativeReconciliationTime.count()\n         );"
+        },
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java",
+          "patch": "@@ -22,18 +22,34 @@ public record DesiredBalanceStats(\n     long computationSubmitted,\n     long computationExecuted,\n     long computationConverged,\n+    long computationIterations,\n     long cumulativeComputationTime,\n     long cumulativeReconciliationTime\n ) implements Writeable, ToXContentFragment {\n \n     public static DesiredBalanceStats readFrom(StreamInput in) throws IOException {\n-        // TODO\n-        return null;\n+        return new DesiredBalanceStats(\n+            in.readVLong(),\n+            in.readBoolean(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong()\n+        );\n     }\n \n     @Override\n     public void writeTo(StreamOutput out) throws IOException {\n-        // TODO\n+        out.writeVLong(lastConvergedIndex);\n+        out.writeBoolean(computationActive);\n+        out.writeVLong(computationSubmitted);\n+        out.writeVLong(computationExecuted);\n+        out.writeVLong(computationConverged);\n+        out.writeVLong(computationIterations);\n+        out.writeVLong(cumulativeComputationTime);\n+        out.writeVLong(cumulativeReconciliationTime);\n     }\n \n     @Override\n@@ -43,6 +59,7 @@ public XContentBuilder toXContent(XContentBuilder builder, Params params) throws\n         builder.field(\"computation.submitted\", computationSubmitted);\n         builder.field(\"computation.executed\", computationExecuted);\n         builder.field(\"computation.converged\", computationConverged);\n+        builder.field(\"computation.iterations\", computationIterations);\n         builder.field(\"computation.converged.index\", lastConvergedIndex);\n         builder.humanReadableField(\"computation.time_in_millis\", \"computation.time\", cumulativeComputationTime);\n         builder.humanReadableField(\"reconciliation.time_in_millis\", \"reconciliation.time\", cumulativeReconciliationTime);"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 994303169,
+      "created_at": "2022-10-13T08:09:18Z",
+      "user": "arteam",
+      "body": "`getDesiredBalance` doesn't seem to used everywhere. Is it intentional to expose it?",
+      "path": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceShardsAllocator.java",
+      "diff_hunk": "@@ -190,7 +212,24 @@ protected void reconcile(DesiredBalance desiredBalance, RoutingAllocation alloca\n             logger.debug(\"Reconciling desired balance for [{}]\", desiredBalance.lastConvergedIndex());\n         }\n         allocationOrdering.retainNodes(getNodeIds(allocation.routingNodes()));\n-        new DesiredBalanceReconciler(desiredBalance, allocation, allocationOrdering).run();\n+        recordTime(cumulativeReconciliationTime, new DesiredBalanceReconciler(desiredBalance, allocation, allocationOrdering)::run);\n+    }\n+\n+    public DesiredBalance getDesiredBalance() {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 218,
+      "original_line": 218,
+      "side": "RIGHT",
+      "original_position": 79,
+      "position": 79,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 994349198,
+          "user": "idegtiarenko",
+          "body": "It is not used yet. It is exposed so that it could be used by the API",
+          "created_at": "2022-10-13T08:49:42Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 994306589,
+      "created_at": "2022-10-13T08:12:23Z",
+      "user": "arteam",
+      "body": "Is `computation` suppose to be a JSON object with `active`, `submitted`, `executed` fields under it or we intend to expose flat fields `computation.active` like `computation.submitted`?",
+      "path": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java",
+      "diff_hunk": "@@ -0,0 +1,69 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.routing.allocation.allocator;\n+\n+import org.elasticsearch.common.io.stream.StreamInput;\n+import org.elasticsearch.common.io.stream.StreamOutput;\n+import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.xcontent.ToXContentFragment;\n+import org.elasticsearch.xcontent.XContentBuilder;\n+\n+import java.io.IOException;\n+\n+public record DesiredBalanceStats(\n+    long lastConvergedIndex,\n+    boolean computationActive,\n+    long computationSubmitted,\n+    long computationExecuted,\n+    long computationConverged,\n+    long computationIterations,\n+    long cumulativeComputationTime,\n+    long cumulativeReconciliationTime\n+) implements Writeable, ToXContentFragment {\n+\n+    public static DesiredBalanceStats readFrom(StreamInput in) throws IOException {\n+        return new DesiredBalanceStats(\n+            in.readVLong(),\n+            in.readBoolean(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong()\n+        );\n+    }\n+\n+    @Override\n+    public void writeTo(StreamOutput out) throws IOException {\n+        out.writeVLong(lastConvergedIndex);\n+        out.writeBoolean(computationActive);\n+        out.writeVLong(computationSubmitted);\n+        out.writeVLong(computationExecuted);\n+        out.writeVLong(computationConverged);\n+        out.writeVLong(computationIterations);\n+        out.writeVLong(cumulativeComputationTime);\n+        out.writeVLong(cumulativeReconciliationTime);\n+    }\n+\n+    @Override\n+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {\n+\n+        builder.field(\"computation.active\", computationActive);",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 58,
+      "side": "RIGHT",
+      "original_position": 58,
+      "position": 1,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 994358414,
+          "user": "idegtiarenko",
+          "body": "Yeah, probably using `.` is not a good idea. I checked other stats and it looks they are mostly flat and use `_`. I will update",
+          "created_at": "2022-10-13T08:57:39Z"
+        }
+      ]
+    },
+    {
+      "type": "review_comment",
+      "id": 994310681,
+      "created_at": "2022-10-13T08:15:32Z",
+      "user": "arteam",
+      "body": "It would be nice to tets the JSON output and and the serialization via `AbstractXContentTestCase` and `AbstractWireSerializingTestCase`",
+      "path": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java",
+      "diff_hunk": "@@ -0,0 +1,69 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.routing.allocation.allocator;\n+\n+import org.elasticsearch.common.io.stream.StreamInput;\n+import org.elasticsearch.common.io.stream.StreamOutput;\n+import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.xcontent.ToXContentFragment;\n+import org.elasticsearch.xcontent.XContentBuilder;\n+\n+import java.io.IOException;\n+\n+public record DesiredBalanceStats(\n+    long lastConvergedIndex,\n+    boolean computationActive,\n+    long computationSubmitted,\n+    long computationExecuted,\n+    long computationConverged,\n+    long computationIterations,\n+    long cumulativeComputationTime,\n+    long cumulativeReconciliationTime\n+) implements Writeable, ToXContentFragment {\n+\n+    public static DesiredBalanceStats readFrom(StreamInput in) throws IOException {\n+        return new DesiredBalanceStats(\n+            in.readVLong(),\n+            in.readBoolean(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong(),\n+            in.readVLong()\n+        );\n+    }\n+\n+    @Override\n+    public void writeTo(StreamOutput out) throws IOException {\n+        out.writeVLong(lastConvergedIndex);\n+        out.writeBoolean(computationActive);\n+        out.writeVLong(computationSubmitted);\n+        out.writeVLong(computationExecuted);\n+        out.writeVLong(computationConverged);\n+        out.writeVLong(computationIterations);\n+        out.writeVLong(cumulativeComputationTime);\n+        out.writeVLong(cumulativeReconciliationTime);\n+    }\n+\n+    @Override\n+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 57,
+      "original_line": 56,
+      "side": "RIGHT",
+      "original_position": 56,
+      "position": 57,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 994375871,
+          "user": "idegtiarenko",
+          "body": "It looks like `AbstractXContentSerializingTestCase` could combine checks in above two, however I believe `DesiredBalanceStats` does not need to be parsed from JSON. I would fallback to a simpler `AbstractWireSerializingTestCase`",
+          "created_at": "2022-10-13T09:13:28Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1140280482,
+      "created_at": "2022-10-13T08:15:45Z",
+      "user": "arteam",
+      "state": "COMMENTED",
+      "body": "Looks good, I've left a few comments"
+    },
+    {
+      "type": "review",
+      "id": 1140347792,
+      "created_at": "2022-10-13T08:49:42Z",
+      "user": "idegtiarenko",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1140361660,
+      "created_at": "2022-10-13T08:57:39Z",
+      "user": "idegtiarenko",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 1140387418,
+      "created_at": "2022-10-13T09:13:28Z",
+      "user": "idegtiarenko",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "commit",
+      "date": "2022-10-13T09:30:19Z",
+      "sha": "f1395f39c1d15bf61149e85526b47e2eeb0a543c",
+      "message": "add test",
+      "author": "ievgen.degtiarenko",
+      "author_email": "ievgen.degtiarenko@elastic.co",
+      "author_raw_date": "2022-10-13T09:30:19Z",
+      "author_date": "2022-10-13T09:30:19Z",
+      "committer": "ievgen.degtiarenko",
+      "committer_email": "ievgen.degtiarenko@elastic.co",
+      "raw_date": "2022-10-13T09:30:19Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java\n@@ -11,6 +11,7 @@\n import org.elasticsearch.common.io.stream.StreamInput;\n import org.elasticsearch.common.io.stream.StreamOutput;\n import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.xcontent.ToXContentFragment;\n import org.elasticsearch.xcontent.XContentBuilder;\n \n@@ -55,14 +56,14 @@ public void writeTo(StreamOutput out) throws IOException {\n     @Override\n     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {\n \n-        builder.field(\"computation.active\", computationActive);\n-        builder.field(\"computation.submitted\", computationSubmitted);\n-        builder.field(\"computation.executed\", computationExecuted);\n-        builder.field(\"computation.converged\", computationConverged);\n-        builder.field(\"computation.iterations\", computationIterations);\n-        builder.field(\"computation.converged.index\", lastConvergedIndex);\n-        builder.humanReadableField(\"computation.time_in_millis\", \"computation.time\", cumulativeComputationTime);\n-        builder.humanReadableField(\"reconciliation.time_in_millis\", \"reconciliation.time\", cumulativeReconciliationTime);\n+        builder.field(\"computation_active\", computationActive);\n+        builder.field(\"computation_submitted\", computationSubmitted);\n+        builder.field(\"computation_executed\", computationExecuted);\n+        builder.field(\"computation_converged\", computationConverged);\n+        builder.field(\"computation_iterations\", computationIterations);\n+        builder.field(\"computation_converged_index\", lastConvergedIndex);\n+        builder.humanReadableField(\"computation_time_in_millis\", \"computation_time\", new TimeValue(cumulativeComputationTime));\n+        builder.humanReadableField(\"reconciliation_time_in_millis\", \"reconciliation_time\", new TimeValue(cumulativeReconciliationTime));\n \n         return builder;\n     }\nserver/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStatsTest.java\n@@ -0,0 +1,74 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.routing.allocation.allocator;\n+\n+import org.elasticsearch.common.Strings;\n+import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.test.AbstractWireSerializingTestCase;\n+\n+import java.io.IOException;\n+\n+import static org.hamcrest.Matchers.equalTo;\n+\n+public class DesiredBalanceStatsTest extends AbstractWireSerializingTestCase<DesiredBalanceStats> {\n+\n+    @Override\n+    protected Writeable.Reader<DesiredBalanceStats> instanceReader() {\n+        return DesiredBalanceStats::readFrom;\n+    }\n+\n+    @Override\n+    protected DesiredBalanceStats createTestInstance() {\n+        return new DesiredBalanceStats(\n+            randomNonNegativeLong(),\n+            randomBoolean(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong()\n+        );\n+    }\n+\n+    @Override\n+    protected DesiredBalanceStats mutateInstance(DesiredBalanceStats instance) throws IOException {\n+        return createTestInstance();\n+    }\n+\n+    public void testToXContent() {\n+        var instance = createTestInstance();\n+        assertThat(\n+            Strings.toString(instance, true, false),\n+            equalTo(\n+                String.format(\n+                    \"\"\"\n+                        {\n+                          \"computation_active\" : %b,\n+                          \"computation_submitted\" : %d,\n+                          \"computation_executed\" : %d,\n+                          \"computation_converged\" : %d,\n+                          \"computation_iterations\" : %d,\n+                          \"computation_converged_index\" : %d,\n+                          \"computation_time_in_millis\" : %d,\n+                          \"reconciliation_time_in_millis\" : %d\n+                        }\"\"\",\n+                    instance.computationActive(),\n+                    instance.computationSubmitted(),\n+                    instance.computationExecuted(),\n+                    instance.computationConverged(),\n+                    instance.computationIterations(),\n+                    instance.lastConvergedIndex(),\n+                    instance.cumulativeComputationTime(),\n+                    instance.cumulativeReconciliationTime()\n+                )\n+            )\n+        );\n+    }\n+}",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStats.java",
+          "patch": "@@ -11,6 +11,7 @@\n import org.elasticsearch.common.io.stream.StreamInput;\n import org.elasticsearch.common.io.stream.StreamOutput;\n import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.core.TimeValue;\n import org.elasticsearch.xcontent.ToXContentFragment;\n import org.elasticsearch.xcontent.XContentBuilder;\n \n@@ -55,14 +56,14 @@ public void writeTo(StreamOutput out) throws IOException {\n     @Override\n     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {\n \n-        builder.field(\"computation.active\", computationActive);\n-        builder.field(\"computation.submitted\", computationSubmitted);\n-        builder.field(\"computation.executed\", computationExecuted);\n-        builder.field(\"computation.converged\", computationConverged);\n-        builder.field(\"computation.iterations\", computationIterations);\n-        builder.field(\"computation.converged.index\", lastConvergedIndex);\n-        builder.humanReadableField(\"computation.time_in_millis\", \"computation.time\", cumulativeComputationTime);\n-        builder.humanReadableField(\"reconciliation.time_in_millis\", \"reconciliation.time\", cumulativeReconciliationTime);\n+        builder.field(\"computation_active\", computationActive);\n+        builder.field(\"computation_submitted\", computationSubmitted);\n+        builder.field(\"computation_executed\", computationExecuted);\n+        builder.field(\"computation_converged\", computationConverged);\n+        builder.field(\"computation_iterations\", computationIterations);\n+        builder.field(\"computation_converged_index\", lastConvergedIndex);\n+        builder.humanReadableField(\"computation_time_in_millis\", \"computation_time\", new TimeValue(cumulativeComputationTime));\n+        builder.humanReadableField(\"reconciliation_time_in_millis\", \"reconciliation_time\", new TimeValue(cumulativeReconciliationTime));\n \n         return builder;\n     }"
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStatsTest.java",
+          "patch": "@@ -0,0 +1,74 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0 and the Server Side Public License, v 1; you may not use this file except\n+ * in compliance with, at your election, the Elastic License 2.0 or the Server\n+ * Side Public License, v 1.\n+ */\n+\n+package org.elasticsearch.cluster.routing.allocation.allocator;\n+\n+import org.elasticsearch.common.Strings;\n+import org.elasticsearch.common.io.stream.Writeable;\n+import org.elasticsearch.test.AbstractWireSerializingTestCase;\n+\n+import java.io.IOException;\n+\n+import static org.hamcrest.Matchers.equalTo;\n+\n+public class DesiredBalanceStatsTest extends AbstractWireSerializingTestCase<DesiredBalanceStats> {\n+\n+    @Override\n+    protected Writeable.Reader<DesiredBalanceStats> instanceReader() {\n+        return DesiredBalanceStats::readFrom;\n+    }\n+\n+    @Override\n+    protected DesiredBalanceStats createTestInstance() {\n+        return new DesiredBalanceStats(\n+            randomNonNegativeLong(),\n+            randomBoolean(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong(),\n+            randomNonNegativeLong()\n+        );\n+    }\n+\n+    @Override\n+    protected DesiredBalanceStats mutateInstance(DesiredBalanceStats instance) throws IOException {\n+        return createTestInstance();\n+    }\n+\n+    public void testToXContent() {\n+        var instance = createTestInstance();\n+        assertThat(\n+            Strings.toString(instance, true, false),\n+            equalTo(\n+                String.format(\n+                    \"\"\"\n+                        {\n+                          \"computation_active\" : %b,\n+                          \"computation_submitted\" : %d,\n+                          \"computation_executed\" : %d,\n+                          \"computation_converged\" : %d,\n+                          \"computation_iterations\" : %d,\n+                          \"computation_converged_index\" : %d,\n+                          \"computation_time_in_millis\" : %d,\n+                          \"reconciliation_time_in_millis\" : %d\n+                        }\"\"\",\n+                    instance.computationActive(),\n+                    instance.computationSubmitted(),\n+                    instance.computationExecuted(),\n+                    instance.computationConverged(),\n+                    instance.computationIterations(),\n+                    instance.lastConvergedIndex(),\n+                    instance.cumulativeComputationTime(),\n+                    instance.cumulativeReconciliationTime()\n+                )\n+            )\n+        );\n+    }\n+}"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-10-13T09:46:17Z",
+      "sha": "276e9f21e9a3a359d8612a434d3a438165807489",
+      "message": "locale",
+      "author": "ievgen.degtiarenko",
+      "author_email": "ievgen.degtiarenko@elastic.co",
+      "author_raw_date": "2022-10-13T09:46:17Z",
+      "author_date": "2022-10-13T09:46:17Z",
+      "committer": "ievgen.degtiarenko",
+      "committer_email": "ievgen.degtiarenko@elastic.co",
+      "raw_date": "2022-10-13T09:46:17Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStatsTest.java\n@@ -13,6 +13,7 @@\n import org.elasticsearch.test.AbstractWireSerializingTestCase;\n \n import java.io.IOException;\n+import java.util.Locale;\n \n import static org.hamcrest.Matchers.equalTo;\n \n@@ -48,6 +49,7 @@ public void testToXContent() {\n             Strings.toString(instance, true, false),\n             equalTo(\n                 String.format(\n+                    Locale.ROOT,\n                     \"\"\"\n                         {\n                           \"computation_active\" : %b,",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStatsTest.java",
+          "patch": "@@ -13,6 +13,7 @@\n import org.elasticsearch.test.AbstractWireSerializingTestCase;\n \n import java.io.IOException;\n+import java.util.Locale;\n \n import static org.hamcrest.Matchers.equalTo;\n \n@@ -48,6 +49,7 @@ public void testToXContent() {\n             Strings.toString(instance, true, false),\n             equalTo(\n                 String.format(\n+                    Locale.ROOT,\n                     \"\"\"\n                         {\n                           \"computation_active\" : %b,"
+        }
+      ]
+    },
+    {
+      "type": "commit",
+      "date": "2022-10-13T10:51:25Z",
+      "sha": "b113969ad2b6773319280cf3185bd5ab69c028ce",
+      "message": "rename test",
+      "author": "ievgen.degtiarenko",
+      "author_email": "ievgen.degtiarenko@elastic.co",
+      "author_raw_date": "2022-10-13T10:51:25Z",
+      "author_date": "2022-10-13T10:51:25Z",
+      "committer": "ievgen.degtiarenko",
+      "committer_email": "ievgen.degtiarenko@elastic.co",
+      "raw_date": "2022-10-13T10:51:25Z",
+      "diff_text": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStatsTests.java\n@@ -17,7 +17,7 @@\n \n import static org.hamcrest.Matchers.equalTo;\n \n-public class DesiredBalanceStatsTest extends AbstractWireSerializingTestCase<DesiredBalanceStats> {\n+public class DesiredBalanceStatsTests extends AbstractWireSerializingTestCase<DesiredBalanceStats> {\n \n     @Override\n     protected Writeable.Reader<DesiredBalanceStats> instanceReader() {",
+      "diff": [
+        {
+          "file": "server/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceStatsTests.java",
+          "patch": "@@ -17,7 +17,7 @@\n \n import static org.hamcrest.Matchers.equalTo;\n \n-public class DesiredBalanceStatsTest extends AbstractWireSerializingTestCase<DesiredBalanceStats> {\n+public class DesiredBalanceStatsTests extends AbstractWireSerializingTestCase<DesiredBalanceStats> {\n \n     @Override\n     protected Writeable.Reader<DesiredBalanceStats> instanceReader() {"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1143660419,
+      "created_at": "2022-10-17T07:55:21Z",
+      "user": "arteam",
+      "state": "APPROVED",
+      "body": "LGTM! Thanks Ievgen!"
+    },
+    {
+      "type": "comment",
+      "id": 1302332518,
+      "created_at": "2022-11-03T16:02:58Z",
+      "user": "DaveCTurner",
+      "body": "Late to the party due to vacation, but LGTM2 👍 "
+    }
+  ]
+}

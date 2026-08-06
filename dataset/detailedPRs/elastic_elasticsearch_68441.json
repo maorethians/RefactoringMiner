@@ -1,0 +1,133 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 68441,
+  "pr_number": 68441,
+  "title": "Fix BlobStoreRepositoryTest Leaking a RepoData Write Operation",
+  "user": "original-brownbear",
+  "created_at": "2021-02-03T12:39:10Z",
+  "merged_at": "2021-02-03T14:05:47Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">test",
+    ":Distributed/Snapshot/Restore",
+    "Team:Distributed",
+    "v7.12.0",
+    "v7.11.1",
+    "v8.0.0-alpha1"
+  ],
+  "base_commit": "78dc03cbab36374c5d14e35227d37e06f579cad7",
+  "merge_commit_sha": "86005dedafe2216782d5ee52f22e9c687e5b8f38",
+  "commits": 1,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "review_requested",
+    "review_requested",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted",
+    "referenced",
+    "referenced",
+    "referenced",
+    "unlabeled",
+    "labeled",
+    "head_ref_restored"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/68441",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2021-02-03T12:35:26Z",
+      "sha": "1143f954b241afa43ae21eea99d14e149230ef88",
+      "message": "Fix BlobStoreRepositoryTest Leaking a RepoData Write Operation\n\nWe were leaking a repo data write operation here by never waiting on the future.\nSince we normally don't invoke `writeIndexGen` manually there are no safety measures\naround removing the repository from the cluster state and adding it back with a different\npath concurrently, leading to a collision between repo generation CS updates since all tests\nuse the same repository name.\nFix the missing write and added some trace logging that was very helpful in tracking this down.\n\nCloses #68437",
+      "author": "Armin Braun",
+      "author_email": "me@obrown.io",
+      "author_raw_date": "2021-02-03T12:35:26Z",
+      "author_date": "2021-02-03T12:35:26Z",
+      "committer": "Armin Braun",
+      "committer_email": "me@obrown.io",
+      "raw_date": "2021-02-03T12:35:26Z",
+      "diff_text": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java\n@@ -1414,7 +1414,7 @@ private void initializeRepoGenerationTracking(ActionListener<RepositoryData> lis\n                 };\n                 threadPool.generic().execute(() -> doGetRepositoryData(\n                         ActionListener.wrap(repoData -> clusterService.submitStateUpdateTask(\n-                                \"set safe repository generation [\" + metadata.name() + \"][\" + repoData + \"]\",\n+                                \"set initial safe repository generation [\" + metadata.name() + \"][\" + repoData.getGenId() + \"]\",\n                                 new ClusterStateUpdateTask() {\n                                     @Override\n                                     public ClusterState execute(ClusterState currentState) {\n@@ -1441,6 +1441,8 @@ public void onFailure(String source, Exception e) {\n \n                                     @Override\n                                     public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                                        logger.trace(\"[{}] initialized repository generation in cluster state to [{}]\",\n+                                                metadata.name(), repoData.getGenId());\n                                         // Resolve listeners on generic pool since some callbacks for repository data do additional IO\n                                         threadPool.generic().execute(() -> {\n                                             final ActionListener<RepositoryData> existingListener;\n@@ -1449,6 +1451,8 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS\n                                                 repoDataInitialized = null;\n                                             }\n                                             existingListener.onResponse(repoData);\n+                                            logger.trace(\"[{}] called listeners after initializing repository to generation [{}]\"\n+                                                    , metadata.name(), repoData.getGenId());\n                                         });\n                                     }\n                                 }), onFailure)));\n@@ -1719,6 +1723,7 @@ public boolean isReadOnly() {\n      */\n     protected void writeIndexGen(RepositoryData repositoryData, long expectedGen, Version version,\n                                  Function<ClusterState, ClusterState> stateFilter, ActionListener<RepositoryData> listener) {\n+        logger.trace(\"[{}] writing repository data on top of expected generation [{}]\", metadata.name(), expectedGen);\n         assert isReadOnly() == false; // can not write to a read only repository\n         final long currentGen = repositoryData.getGenId();\n         if (currentGen != expectedGen) {\n@@ -1776,6 +1781,7 @@ public void onFailure(String source, Exception e) {\n \n                 @Override\n                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    logger.trace(\"[{}] successfully set pending repository generation to [{}]\", metadata.name(), newGen);\n                     setPendingStep.onResponse(newGen);\n                 }\n             });\n@@ -1872,6 +1878,7 @@ public void onFailure(String source, Exception e) {\n \n                     @Override\n                     public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                        logger.trace(\"[{}] successfully set safe repository generation to [{}]\", metadata.name(), newGen);\n                         cacheRepositoryData(repoDataToCache, newGen);\n                         threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(ActionRunnable.supply(listener, () -> {\n                             // Delete all now outdated index files up to 1000 blobs back from the new generation.\nserver/src/test/java/org/elasticsearch/repositories/blobstore/BlobStoreRepositoryTests.java\n@@ -183,14 +183,13 @@ public void testIndexGenerationalFiles() throws Exception {\n         assertThat(repository.readSnapshotIndexLatestBlob(), equalTo(expectedGeneration + 2L));\n     }\n \n-    public void testRepositoryDataConcurrentModificationNotAllowed() {\n+    public void testRepositoryDataConcurrentModificationNotAllowed() throws Exception {\n         final BlobStoreRepository repository = setupRepo();\n \n         // write to index generational file\n         RepositoryData repositoryData = generateRandomRepoData();\n         final long startingGeneration = repositoryData.getGenId();\n-        final PlainActionFuture<RepositoryData> future = PlainActionFuture.newFuture();\n-        repository.writeIndexGen(repositoryData, startingGeneration, Version.CURRENT, Function.identity(), future);\n+        writeIndexGen(repository, repositoryData, startingGeneration);\n \n         // write repo data again to index generational file, errors because we already wrote to the\n         // N+1 generation from which this repository data instance was created",
+      "diff": [
+        {
+          "file": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java",
+          "patch": "@@ -1414,7 +1414,7 @@ private void initializeRepoGenerationTracking(ActionListener<RepositoryData> lis\n                 };\n                 threadPool.generic().execute(() -> doGetRepositoryData(\n                         ActionListener.wrap(repoData -> clusterService.submitStateUpdateTask(\n-                                \"set safe repository generation [\" + metadata.name() + \"][\" + repoData + \"]\",\n+                                \"set initial safe repository generation [\" + metadata.name() + \"][\" + repoData.getGenId() + \"]\",\n                                 new ClusterStateUpdateTask() {\n                                     @Override\n                                     public ClusterState execute(ClusterState currentState) {\n@@ -1441,6 +1441,8 @@ public void onFailure(String source, Exception e) {\n \n                                     @Override\n                                     public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                                        logger.trace(\"[{}] initialized repository generation in cluster state to [{}]\",\n+                                                metadata.name(), repoData.getGenId());\n                                         // Resolve listeners on generic pool since some callbacks for repository data do additional IO\n                                         threadPool.generic().execute(() -> {\n                                             final ActionListener<RepositoryData> existingListener;\n@@ -1449,6 +1451,8 @@ public void clusterStateProcessed(String source, ClusterState oldState, ClusterS\n                                                 repoDataInitialized = null;\n                                             }\n                                             existingListener.onResponse(repoData);\n+                                            logger.trace(\"[{}] called listeners after initializing repository to generation [{}]\"\n+                                                    , metadata.name(), repoData.getGenId());\n                                         });\n                                     }\n                                 }), onFailure)));\n@@ -1719,6 +1723,7 @@ public boolean isReadOnly() {\n      */\n     protected void writeIndexGen(RepositoryData repositoryData, long expectedGen, Version version,\n                                  Function<ClusterState, ClusterState> stateFilter, ActionListener<RepositoryData> listener) {\n+        logger.trace(\"[{}] writing repository data on top of expected generation [{}]\", metadata.name(), expectedGen);\n         assert isReadOnly() == false; // can not write to a read only repository\n         final long currentGen = repositoryData.getGenId();\n         if (currentGen != expectedGen) {\n@@ -1776,6 +1781,7 @@ public void onFailure(String source, Exception e) {\n \n                 @Override\n                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                    logger.trace(\"[{}] successfully set pending repository generation to [{}]\", metadata.name(), newGen);\n                     setPendingStep.onResponse(newGen);\n                 }\n             });\n@@ -1872,6 +1878,7 @@ public void onFailure(String source, Exception e) {\n \n                     @Override\n                     public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {\n+                        logger.trace(\"[{}] successfully set safe repository generation to [{}]\", metadata.name(), newGen);\n                         cacheRepositoryData(repoDataToCache, newGen);\n                         threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(ActionRunnable.supply(listener, () -> {\n                             // Delete all now outdated index files up to 1000 blobs back from the new generation."
+        },
+        {
+          "file": "server/src/test/java/org/elasticsearch/repositories/blobstore/BlobStoreRepositoryTests.java",
+          "patch": "@@ -183,14 +183,13 @@ public void testIndexGenerationalFiles() throws Exception {\n         assertThat(repository.readSnapshotIndexLatestBlob(), equalTo(expectedGeneration + 2L));\n     }\n \n-    public void testRepositoryDataConcurrentModificationNotAllowed() {\n+    public void testRepositoryDataConcurrentModificationNotAllowed() throws Exception {\n         final BlobStoreRepository repository = setupRepo();\n \n         // write to index generational file\n         RepositoryData repositoryData = generateRandomRepoData();\n         final long startingGeneration = repositoryData.getGenId();\n-        final PlainActionFuture<RepositoryData> future = PlainActionFuture.newFuture();\n-        repository.writeIndexGen(repositoryData, startingGeneration, Version.CURRENT, Function.identity(), future);\n+        writeIndexGen(repository, repositoryData, startingGeneration);\n \n         // write repo data again to index generational file, errors because we already wrote to the\n         // N+1 generation from which this repository data instance was created"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2021-02-03T12:39:10Z",
+      "user": "original-brownbear",
+      "body": "We were leaking a repo data write operation here by never waiting on the future.\r\nSince we normally don't invoke `writeIndexGen` manually there are no safety measures\r\naround removing the repository from the cluster state and adding it back with a different\r\npath concurrently, leading to a collision between repo generation CS updates since all tests\r\nuse the same repository name.\r\nFix the missing write and added some trace logging that was very helpful in tracking this down.\r\n\r\nCloses #68437\r\n"
+    },
+    {
+      "type": "comment",
+      "id": 772477871,
+      "created_at": "2021-02-03T12:39:13Z",
+      "user": "elasticmachine",
+      "body": "Pinging @elastic/es-distributed (Team:Distributed)"
+    },
+    {
+      "type": "review_comment",
+      "id": 569381141,
+      "created_at": "2021-02-03T12:40:06Z",
+      "user": "original-brownbear",
+      "body": "`repoData` has no `toString`, all we care about in the name here is the generation anyway. ",
+      "path": "server/src/main/java/org/elasticsearch/repositories/blobstore/BlobStoreRepository.java",
+      "diff_hunk": "@@ -1414,7 +1414,7 @@ private void initializeRepoGenerationTracking(ActionListener<RepositoryData> lis\n                 };\n                 threadPool.generic().execute(() -> doGetRepositoryData(\n                         ActionListener.wrap(repoData -> clusterService.submitStateUpdateTask(\n-                                \"set safe repository generation [\" + metadata.name() + \"][\" + repoData + \"]\",\n+                                \"set initial safe repository generation [\" + metadata.name() + \"][\" + repoData.getGenId() + \"]\",",
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1417,
+      "original_line": 1417,
+      "side": "RIGHT",
+      "original_position": 5,
+      "position": 5,
+      "subject_type": "line",
+      "reply": []
+    },
+    {
+      "type": "review",
+      "id": 582319491,
+      "created_at": "2021-02-03T12:40:07Z",
+      "user": "original-brownbear",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "review",
+      "id": 582382097,
+      "created_at": "2021-02-03T13:51:32Z",
+      "user": "DaveCTurner",
+      "state": "APPROVED",
+      "body": "LGTM"
+    },
+    {
+      "type": "comment",
+      "id": 772535339,
+      "created_at": "2021-02-03T14:05:50Z",
+      "user": "original-brownbear",
+      "body": "Thanks David!"
+    }
+  ]
+}

@@ -1,0 +1,202 @@
+{
+  "repo": "elastic/elasticsearch",
+  "number": 103474,
+  "pr_number": 103474,
+  "title": "Fix now in millis for ESQL search contexts",
+  "user": "dnhatn",
+  "created_at": "2023-12-14T18:39:56Z",
+  "merged_at": "2023-12-14T21:25:35Z",
+  "merged": true,
+  "state": "closed",
+  "labels": [
+    ">bug",
+    "Team:QL (Deprecated)",
+    ":Analytics/ES|QL",
+    "v8.12.1",
+    "v8.13.0",
+    "v8.11.4"
+  ],
+  "base_commit": "08201860757acc8ddc21652e4120a4d16ffce1a1",
+  "merge_commit_sha": "90ae2151fde4f2db3a89e98a6685e8238d46b7ce",
+  "commits": 2,
+  "issue_events": [
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "labeled",
+    "review_requested",
+    "review_requested",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "subscribed",
+    "labeled",
+    "mentioned",
+    "subscribed",
+    "referenced",
+    "merged",
+    "closed",
+    "head_ref_deleted"
+  ],
+  "url": "https://github.com/elastic/elasticsearch/pull/103474",
+  "timeline": [
+    {
+      "type": "commit",
+      "date": "2023-12-14T18:34:12Z",
+      "sha": "a1079543423af837369e519bd5208a18fe65cd78",
+      "message": "Fix nowInMillis for ESQL search contexts",
+      "author": "Nhat Nguyen",
+      "author_email": "nhat.nguyen@elastic.co",
+      "author_raw_date": "2023-12-14T18:34:12Z",
+      "author_date": "2023-12-14T18:34:12Z",
+      "committer": "Nhat Nguyen",
+      "committer_email": "nhat.nguyen@elastic.co",
+      "raw_date": "2023-12-14T18:34:12Z",
+      "diff_text": "x-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/TimeBasedIndicesIT.java\n@@ -0,0 +1,58 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.esql.action;\n+\n+import org.elasticsearch.action.bulk.BulkRequestBuilder;\n+import org.elasticsearch.action.index.IndexRequest;\n+import org.elasticsearch.action.support.WriteRequest;\n+import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.index.query.RangeQueryBuilder;\n+\n+import java.util.List;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+import static org.elasticsearch.xpack.esql.EsqlTestUtils.getValuesList;\n+import static org.hamcrest.Matchers.hasSize;\n+\n+public class TimeBasedIndicesIT extends AbstractEsqlIntegTestCase {\n+\n+    public void testFilter() {\n+        long epoch = System.currentTimeMillis();\n+        assertAcked(client().admin().indices().prepareCreate(\"test\").setMapping(\"@timestamp\", \"type=date\", \"value\", \"type=long\"));\n+        BulkRequestBuilder bulk = client().prepareBulk(\"test\").setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);\n+        int oldDocs = between(10, 100);\n+        for (int i = 0; i < oldDocs; i++) {\n+            long timestamp = epoch - TimeValue.timeValueHours(between(1, 2)).millis();\n+            bulk.add(new IndexRequest().source(\"@timestamp\", timestamp, \"value\", -i));\n+        }\n+        int newDocs = between(10, 100);\n+        for (int i = 0; i < newDocs; i++) {\n+            long timestamp = epoch + TimeValue.timeValueHours(between(1, 2)).millis();\n+            bulk.add(new IndexRequest().source(\"@timestamp\", timestamp, \"value\", i));\n+        }\n+        bulk.get();\n+        {\n+            EsqlQueryRequest request = new EsqlQueryRequest();\n+            request.query(\"FROM test | limit 1000\");\n+            request.filter(new RangeQueryBuilder(\"@timestamp\").from(epoch - TimeValue.timeValueHours(3).millis()).to(\"now\"));\n+            try (var resp = run(request)) {\n+                List<List<Object>> values = getValuesList(resp);\n+                assertThat(values, hasSize(oldDocs));\n+            }\n+        }\n+        {\n+            EsqlQueryRequest request = new EsqlQueryRequest();\n+            request.query(\"FROM test | limit 1000\");\n+            request.filter(new RangeQueryBuilder(\"@timestamp\").from(\"now\").to(epoch + TimeValue.timeValueHours(3).millis()));\n+            try (var resp = run(request)) {\n+                List<List<Object>> values = getValuesList(resp);\n+                assertThat(values, hasSize(newDocs));\n+            }\n+        }\n+    }\n+}\nx-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plugin/ComputeService.java\n@@ -328,6 +328,7 @@ void runCompute(CancellableTask task, ComputeContext context, PhysicalPlan plan,\n \n     private void acquireSearchContexts(\n         List<ShardId> shardIds,\n+        EsqlConfiguration configuration,\n         Map<Index, AliasFilter> aliasFilters,\n         ActionListener<List<SearchContext>> listener\n     ) {\n@@ -351,11 +352,12 @@ private void acquireSearchContexts(\n                             try {\n                                 for (IndexShard shard : targetShards) {\n                                     var aliasFilter = aliasFilters.getOrDefault(shard.shardId().getIndex(), AliasFilter.EMPTY);\n-                                    ShardSearchRequest shardSearchLocalRequest = new ShardSearchRequest(shard.shardId(), 0, aliasFilter);\n-                                    SearchContext context = searchService.createSearchContext(\n-                                        shardSearchLocalRequest,\n-                                        SearchService.NO_TIMEOUT\n+                                    var shardRequest = new ShardSearchRequest(\n+                                        shard.shardId(),\n+                                        configuration.absoluteStartedTimeInMillis(),\n+                                        aliasFilter\n                                     );\n+                                    SearchContext context = searchService.createSearchContext(shardRequest, SearchService.NO_TIMEOUT);\n                                     searchContexts.add(context);\n                                 }\n                                 for (SearchContext searchContext : searchContexts) {\n@@ -501,8 +503,9 @@ public void messageReceived(DataNodeRequest request, TransportChannel channel, T\n             final var exchangeSink = exchangeService.getSinkHandler(sessionId);\n             parentTask.addListener(() -> exchangeService.finishSinkHandler(sessionId, new TaskCancelledException(\"task cancelled\")));\n             final ActionListener<DataNodeResponse> listener = new OwningChannelActionListener<>(channel);\n-            acquireSearchContexts(request.shardIds(), request.aliasFilters(), ActionListener.wrap(searchContexts -> {\n-                var computeContext = new ComputeContext(sessionId, searchContexts, request.configuration(), null, exchangeSink);\n+            final EsqlConfiguration configuration = request.configuration();\n+            acquireSearchContexts(request.shardIds(), configuration, request.aliasFilters(), ActionListener.wrap(searchContexts -> {\n+                var computeContext = new ComputeContext(sessionId, searchContexts, configuration, null, exchangeSink);\n                 runCompute(parentTask, computeContext, request.plan(), ActionListener.wrap(driverProfiles -> {\n                     // don't return until all pages are fetched\n                     exchangeSink.addCompletionListener(\nx-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/session/EsqlConfiguration.java\n@@ -112,6 +112,15 @@ public String query() {\n         return query;\n     }\n \n+    /**\n+     * Returns the current time in milliseconds from the time epoch for the execution of this request.\n+     * It ensures consistency by using the same value on all nodes involved in the search request.\n+     * Note: Currently, it returns {@link System#currentTimeMillis()}, but this value will be serialized between nodes.\n+     */\n+    public long absoluteStartedTimeInMillis() {\n+        return System.currentTimeMillis();\n+    }\n+\n     /**\n      * Enable profiling, sacrificing performance to return information about\n      * what operations are taking the most time.",
+      "diff": [
+        {
+          "file": "x-pack/plugin/esql/src/internalClusterTest/java/org/elasticsearch/xpack/esql/action/TimeBasedIndicesIT.java",
+          "patch": "@@ -0,0 +1,58 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.xpack.esql.action;\n+\n+import org.elasticsearch.action.bulk.BulkRequestBuilder;\n+import org.elasticsearch.action.index.IndexRequest;\n+import org.elasticsearch.action.support.WriteRequest;\n+import org.elasticsearch.core.TimeValue;\n+import org.elasticsearch.index.query.RangeQueryBuilder;\n+\n+import java.util.List;\n+\n+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n+import static org.elasticsearch.xpack.esql.EsqlTestUtils.getValuesList;\n+import static org.hamcrest.Matchers.hasSize;\n+\n+public class TimeBasedIndicesIT extends AbstractEsqlIntegTestCase {\n+\n+    public void testFilter() {\n+        long epoch = System.currentTimeMillis();\n+        assertAcked(client().admin().indices().prepareCreate(\"test\").setMapping(\"@timestamp\", \"type=date\", \"value\", \"type=long\"));\n+        BulkRequestBuilder bulk = client().prepareBulk(\"test\").setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);\n+        int oldDocs = between(10, 100);\n+        for (int i = 0; i < oldDocs; i++) {\n+            long timestamp = epoch - TimeValue.timeValueHours(between(1, 2)).millis();\n+            bulk.add(new IndexRequest().source(\"@timestamp\", timestamp, \"value\", -i));\n+        }\n+        int newDocs = between(10, 100);\n+        for (int i = 0; i < newDocs; i++) {\n+            long timestamp = epoch + TimeValue.timeValueHours(between(1, 2)).millis();\n+            bulk.add(new IndexRequest().source(\"@timestamp\", timestamp, \"value\", i));\n+        }\n+        bulk.get();\n+        {\n+            EsqlQueryRequest request = new EsqlQueryRequest();\n+            request.query(\"FROM test | limit 1000\");\n+            request.filter(new RangeQueryBuilder(\"@timestamp\").from(epoch - TimeValue.timeValueHours(3).millis()).to(\"now\"));\n+            try (var resp = run(request)) {\n+                List<List<Object>> values = getValuesList(resp);\n+                assertThat(values, hasSize(oldDocs));\n+            }\n+        }\n+        {\n+            EsqlQueryRequest request = new EsqlQueryRequest();\n+            request.query(\"FROM test | limit 1000\");\n+            request.filter(new RangeQueryBuilder(\"@timestamp\").from(\"now\").to(epoch + TimeValue.timeValueHours(3).millis()));\n+            try (var resp = run(request)) {\n+                List<List<Object>> values = getValuesList(resp);\n+                assertThat(values, hasSize(newDocs));\n+            }\n+        }\n+    }\n+}"
+        },
+        {
+          "file": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/plugin/ComputeService.java",
+          "patch": "@@ -328,6 +328,7 @@ void runCompute(CancellableTask task, ComputeContext context, PhysicalPlan plan,\n \n     private void acquireSearchContexts(\n         List<ShardId> shardIds,\n+        EsqlConfiguration configuration,\n         Map<Index, AliasFilter> aliasFilters,\n         ActionListener<List<SearchContext>> listener\n     ) {\n@@ -351,11 +352,12 @@ private void acquireSearchContexts(\n                             try {\n                                 for (IndexShard shard : targetShards) {\n                                     var aliasFilter = aliasFilters.getOrDefault(shard.shardId().getIndex(), AliasFilter.EMPTY);\n-                                    ShardSearchRequest shardSearchLocalRequest = new ShardSearchRequest(shard.shardId(), 0, aliasFilter);\n-                                    SearchContext context = searchService.createSearchContext(\n-                                        shardSearchLocalRequest,\n-                                        SearchService.NO_TIMEOUT\n+                                    var shardRequest = new ShardSearchRequest(\n+                                        shard.shardId(),\n+                                        configuration.absoluteStartedTimeInMillis(),\n+                                        aliasFilter\n                                     );\n+                                    SearchContext context = searchService.createSearchContext(shardRequest, SearchService.NO_TIMEOUT);\n                                     searchContexts.add(context);\n                                 }\n                                 for (SearchContext searchContext : searchContexts) {\n@@ -501,8 +503,9 @@ public void messageReceived(DataNodeRequest request, TransportChannel channel, T\n             final var exchangeSink = exchangeService.getSinkHandler(sessionId);\n             parentTask.addListener(() -> exchangeService.finishSinkHandler(sessionId, new TaskCancelledException(\"task cancelled\")));\n             final ActionListener<DataNodeResponse> listener = new OwningChannelActionListener<>(channel);\n-            acquireSearchContexts(request.shardIds(), request.aliasFilters(), ActionListener.wrap(searchContexts -> {\n-                var computeContext = new ComputeContext(sessionId, searchContexts, request.configuration(), null, exchangeSink);\n+            final EsqlConfiguration configuration = request.configuration();\n+            acquireSearchContexts(request.shardIds(), configuration, request.aliasFilters(), ActionListener.wrap(searchContexts -> {\n+                var computeContext = new ComputeContext(sessionId, searchContexts, configuration, null, exchangeSink);\n                 runCompute(parentTask, computeContext, request.plan(), ActionListener.wrap(driverProfiles -> {\n                     // don't return until all pages are fetched\n                     exchangeSink.addCompletionListener("
+        },
+        {
+          "file": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/session/EsqlConfiguration.java",
+          "patch": "@@ -112,6 +112,15 @@ public String query() {\n         return query;\n     }\n \n+    /**\n+     * Returns the current time in milliseconds from the time epoch for the execution of this request.\n+     * It ensures consistency by using the same value on all nodes involved in the search request.\n+     * Note: Currently, it returns {@link System#currentTimeMillis()}, but this value will be serialized between nodes.\n+     */\n+    public long absoluteStartedTimeInMillis() {\n+        return System.currentTimeMillis();\n+    }\n+\n     /**\n      * Enable profiling, sacrificing performance to return information about\n      * what operations are taking the most time."
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "created_at": "2023-12-14T18:39:56Z",
+      "user": "dnhatn",
+      "body": "Currently, ESQL search contexts do not have the correct actual 'now' in milliseconds. Ideally, we should use a consistent 'now' in millis for all nodes participating in the execution of a search request. I will follow up with a PR to deserialize that value between nodes for version 8.13 and later.\r\n\r\nCloses #103455"
+    },
+    {
+      "type": "commit",
+      "date": "2023-12-14T18:40:21Z",
+      "sha": "d5d1121d07bbf85be248d8e0bf05d8678108160e",
+      "message": "Update docs/changelog/103474.yaml",
+      "author": "Nhat Nguyen",
+      "author_email": "nhat.nguyen@elastic.co",
+      "author_raw_date": "2023-12-14T18:40:21Z",
+      "author_date": "2023-12-14T18:40:21Z",
+      "committer": "Nhat Nguyen",
+      "committer_email": "nhat.nguyen@elastic.co",
+      "raw_date": "2023-12-14T18:40:21Z",
+      "diff_text": "docs/changelog/103474.yaml\n@@ -0,0 +1,6 @@\n+pr: 103474\n+summary: Fix now in millis for ESQL search contexts\n+area: ES|QL\n+type: bug\n+issues:\n+ - 103455",
+      "diff": [
+        {
+          "file": "docs/changelog/103474.yaml",
+          "patch": "@@ -0,0 +1,6 @@\n+pr: 103474\n+summary: Fix now in millis for ESQL search contexts\n+area: ES|QL\n+type: bug\n+issues:\n+ - 103455"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "id": 1856391309,
+      "created_at": "2023-12-14T18:40:21Z",
+      "user": "elasticsearchmachine",
+      "body": "Hi @dnhatn, I've created a changelog YAML for you."
+    },
+    {
+      "type": "comment",
+      "id": 1856391313,
+      "created_at": "2023-12-14T18:40:21Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/es-ql (Team:QL)"
+    },
+    {
+      "type": "comment",
+      "id": 1856391325,
+      "created_at": "2023-12-14T18:40:22Z",
+      "user": "elasticsearchmachine",
+      "body": "Pinging @elastic/elasticsearch-esql (:Query Languages/ES|QL)"
+    },
+    {
+      "type": "review_comment",
+      "id": 1427142330,
+      "created_at": "2023-12-14T18:52:54Z",
+      "user": "bpintea",
+      "body": "Can we not use the inherited `now()` instead?",
+      "path": "x-pack/plugin/esql/src/main/java/org/elasticsearch/xpack/esql/session/EsqlConfiguration.java",
+      "diff_hunk": "@@ -112,6 +112,15 @@ public String query() {\n         return query;\n     }\n \n+    /**\n+     * Returns the current time in milliseconds from the time epoch for the execution of this request.\n+     * It ensures consistency by using the same value on all nodes involved in the search request.\n+     * Note: Currently, it returns {@link System#currentTimeMillis()}, but this value will be serialized between nodes.\n+     */\n+    public long absoluteStartedTimeInMillis() {\n+        return System.currentTimeMillis();\n+    }",
+      "start_line": 120,
+      "original_start_line": 120,
+      "start_side": "RIGHT",
+      "line": 122,
+      "original_line": 122,
+      "side": "RIGHT",
+      "original_position": 11,
+      "position": 11,
+      "subject_type": "line",
+      "reply": [
+        {
+          "id": 1427163261,
+          "user": "dnhatn",
+          "body": "It seems that `now` will be adjusted with the timezone?",
+          "created_at": "2023-12-14T19:13:21Z"
+        },
+        {
+          "id": 1429924876,
+          "user": "bpintea",
+          "body": "It is, but I guess we could (have) convert(ed) that to `Z`? We'd get the serialisation \"for free\". If feels a bit odd to have two time methods on `EsqlConfiguration.java`, but I guess this works for now (so to \"say\") too :)",
+          "created_at": "2023-12-18T10:56:42Z"
+        }
+      ]
+    },
+    {
+      "type": "review",
+      "id": 1782503021,
+      "created_at": "2023-12-14T18:53:09Z",
+      "user": "bpintea",
+      "state": "APPROVED",
+      "body": "Left one comment, it otherwise LGTM."
+    },
+    {
+      "type": "review",
+      "id": 1782536810,
+      "created_at": "2023-12-14T19:13:21Z",
+      "user": "dnhatn",
+      "state": "COMMENTED",
+      "body": ""
+    },
+    {
+      "type": "comment",
+      "id": 1856638531,
+      "created_at": "2023-12-14T21:25:07Z",
+      "user": "dnhatn",
+      "body": "Thanks @bpintea."
+    },
+    {
+      "type": "comment",
+      "id": 1856643293,
+      "created_at": "2023-12-14T21:26:50Z",
+      "user": "elasticsearchmachine",
+      "body": "\r\n| Status | Branch | Result |\r\n|:------:|:------:|:------:|\r\n| ✅ |  [8.12](https://github.com/elastic/elasticsearch/pull/103480)  | [<img src=\"https://img.shields.io/github/pulls/detail/state/elastic/elasticsearch/103480\">](https://github.com/elastic/elasticsearch/pull/103480) |\r\n| ✅ |  8.11  | #103766 |"
+    },
+    {
+      "type": "review",
+      "id": 1786556742,
+      "created_at": "2023-12-18T10:56:42Z",
+      "user": "bpintea",
+      "state": "COMMENTED",
+      "body": ""
+    }
+  ]
+}
