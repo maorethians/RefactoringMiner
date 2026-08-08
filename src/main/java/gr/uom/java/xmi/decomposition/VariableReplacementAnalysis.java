@@ -445,6 +445,14 @@ public class VariableReplacementAnalysis {
 					if(!removedVariablesToBeRemoved.contains(removedVariable)) {
 						for(VariableDeclaration addedVariable : addedVariables) {
 							if(!addedVariablesToBeRemoved.contains(addedVariable)) {
+								if(removedVariable.isParameter() != addedVariable.isParameter()) {
+									if(addedVariable.isParameter() && operation1.getParameterNameList().contains(addedVariable.getVariableName())) {
+										continue;
+									}
+									if(removedVariable.isParameter() && operation2.getParameterNameList().contains(removedVariable.getVariableName())) {
+										continue;
+									}
+								}
 								Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 								if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
 									removedVariablesToBeRemoved.add(removedVariable);
@@ -462,6 +470,14 @@ public class VariableReplacementAnalysis {
 					if(!addedVariablesToBeRemoved.contains(addedVariable)) {
 						for(VariableDeclaration removedVariable : removedVariables) {
 							if(!removedVariablesToBeRemoved.contains(removedVariable)) {
+								if(removedVariable.isParameter() != addedVariable.isParameter()) {
+									if(addedVariable.isParameter() && operation1.getParameterNameList().contains(addedVariable.getVariableName())) {
+										continue;
+									}
+									if(removedVariable.isParameter() && operation2.getParameterNameList().contains(removedVariable.getVariableName())) {
+										continue;
+									}
+								}
 								Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 								if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
 									removedVariablesToBeRemoved.add(removedVariable);
@@ -480,6 +496,14 @@ public class VariableReplacementAnalysis {
 				if(!removedVariablesToBeRemoved.contains(removedVariable) && removedVariable.isParameter()) {
 					for(VariableDeclaration addedVariable : addedVariables) {
 						if(!addedVariablesToBeRemoved.contains(addedVariable) && !removedVariablesToBeRemoved.contains(removedVariable) && (addedVariable.isParameter() || (operation1.getParameterDeclarationList().contains(removedVariable) && !operation1.getParameterTypeList().equals(operation2.getParameterTypeList())))) {
+							if(removedVariable.isParameter() != addedVariable.isParameter()) {
+								if(addedVariable.isParameter() && operation1.getParameterNameList().contains(addedVariable.getVariableName())) {
+									continue;
+								}
+								if(removedVariable.isParameter() && operation2.getParameterNameList().contains(removedVariable.getVariableName())) {
+									continue;
+								}
+							}
 							Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
 								removedVariablesToBeRemoved.add(removedVariable);
@@ -497,6 +521,14 @@ public class VariableReplacementAnalysis {
 				if(!addedVariablesToBeRemoved.contains(addedVariable) && addedVariable.isParameter()) {
 					for(VariableDeclaration removedVariable : removedVariables) {
 						if(!addedVariablesToBeRemoved.contains(addedVariable) && !removedVariablesToBeRemoved.contains(removedVariable) && (removedVariable.isParameter() || (operation2.getParameterDeclarationList().contains(addedVariable) && !operation1.getParameterTypeList().equals(operation2.getParameterTypeList())))) {
+							if(removedVariable.isParameter() != addedVariable.isParameter()) {
+								if(addedVariable.isParameter() && operation1.getParameterNameList().contains(addedVariable.getVariableName())) {
+									continue;
+								}
+								if(removedVariable.isParameter() && operation2.getParameterNameList().contains(removedVariable.getVariableName())) {
+									continue;
+								}
+							}
 							Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
 								removedVariablesToBeRemoved.add(removedVariable);
@@ -514,6 +546,14 @@ public class VariableReplacementAnalysis {
 				if(!addedVariablesToBeRemoved.contains(addedVariable) && addedVariable.isParameter()) {
 					for(VariableDeclaration removedVariable : removedVariables) {
 						if(!removedVariablesToBeRemoved.contains(removedVariable) && !addedVariablesToBeRemoved.contains(addedVariable) && removedVariable.isParameter()) {
+							if(removedVariable.isParameter() != addedVariable.isParameter()) {
+								if(addedVariable.isParameter() && operation1.getParameterNameList().contains(addedVariable.getVariableName())) {
+									continue;
+								}
+								if(removedVariable.isParameter() && operation2.getParameterNameList().contains(removedVariable.getVariableName())) {
+									continue;
+								}
+							}
 							Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
 								removedVariablesToBeRemoved.add(removedVariable);
@@ -805,8 +845,44 @@ public class VariableReplacementAnalysis {
 		}
 		Set<AbstractCodeFragment> statementsInScope1 = removedVariable.getStatementsInScopeUsingVariable();
 		Set<AbstractCodeFragment> statementsInScope2 = addedVariable.getStatementsInScopeUsingVariable();
+		if(operation1 instanceof UMLOperation op1 && operation2 instanceof UMLOperation op2 &&
+				op1.getNestedOperations().size() > 0 && op2.getNestedOperations().size() > 0) {
+			for(UMLOperation nestedOp1 : op1.getNestedOperations()) {
+				for(UMLOperation nestedOp2 : op2.getNestedOperations()) {
+					if(nestedOp1.getBody() != null && nestedOp2.getBody() != null && nestedOp1.equalSignature(nestedOp2)) {
+						List<AbstractStatement> allStatements1 = nestedOp1.getBody().getCompositeStatement().getAllStatements();
+						List<AbstractStatement> allStatements2 = nestedOp2.getBody().getCompositeStatement().getAllStatements();
+						boolean match1 = false;
+						for(AbstractCodeFragment fragment1 : statementsInScope1) {
+							if(allStatements1.contains(fragment1)) {
+								match1 = true;
+								break;
+							}
+						}
+						boolean match2 = false;
+						for(AbstractCodeFragment fragment2 : statementsInScope2) {
+							if(allStatements2.contains(fragment2)) {
+								match2 = true;
+								break;
+							}
+						}
+						if(match1 && match2) {
+							return true;
+						}
+					}
+				}
+			}
+		}
 		for(AbstractCodeMapping mapping : mappings) {
 			if(statementsInScope1.contains(mapping.getFragment1()) && statementsInScope2.contains(mapping.getFragment2())) {
+				if(removedVariable.isParameter() != addedVariable.isParameter()) {
+					if(addedVariable.isParameter() && operation1.getParameterNameList().contains(addedVariable.getVariableName())) {
+						continue;
+					}
+					if(removedVariable.isParameter() && operation2.getParameterNameList().contains(removedVariable.getVariableName())) {
+						continue;
+					}
+				}
 				return true;
 			}
 			if(statementsInScope1.contains(mapping.getFragment1())) {

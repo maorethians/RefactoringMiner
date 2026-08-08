@@ -3195,7 +3195,7 @@ public abstract class UMLAbstractClassDiff {
 								}
 								if(commonTokensInName == null) {
 									commonTokensInName = commonTokens;
-									if(Arrays.equals(tokens1, tokens2)) {
+									if(Arrays.equals(tokens1, tokens2) || Arrays.equals(commonTokens.toArray(), tokens2)) {
 										commonTokenCheck = true;
 									}
 								}
@@ -3268,7 +3268,7 @@ public abstract class UMLAbstractClassDiff {
 								if(mappings == maxMappings && replacements == minReplacements) {
 									filteredMapperSet2.add(mapper);
 								}
-								else if(mappings < maxMappings && replacements >= minReplacements && mapper.getOperation1().getName().contains(mapper.getOperation2().getName())) {
+								else if(mappings <= maxMappings && replacements >= minReplacements && mapper.getOperation1().getName().contains(mapper.getOperation2().getName())) {
 									filteredMapperSet2.add(mapper);
 								}
 								else if(mappings == maxMappings && replacements <= 2*minReplacements && mapper.getOperation1().commonNameTokensExceptForOne(mapper.getOperation2())) {
@@ -3285,8 +3285,11 @@ public abstract class UMLAbstractClassDiff {
 								removedOperations.remove(removedOperation);
 								//check for JUnit migration from @Parameterized.Parameters to @ParameterizedTest
 								mapDataProviderValues(refactoring, addedOperation, removedOperations);
+								if(mapperSet.size() == 1 || (firstMapperWithIdenticalMethodName && filteredMapperSet2.size() == 1)) {
+									this.addOperationBodyMapper(mapper);
+								}
 							}
-							if(overallMaxMatchingTestParameters > -1) {
+							if(overallMaxMatchingTestParameters > -1 || mapperSet.size() == 1 || (firstMapperWithIdenticalMethodName && filteredMapperSet2.size() == 1)) {
 								addedOperationIterator.remove();
 							}
 						}
@@ -3453,12 +3456,19 @@ public abstract class UMLAbstractClassDiff {
 		List<List<LeafExpression>> junit4Rows = null;
 		OperationBody body = junit4DataProvider.getBody();
 		if(body != null) {
+			List<ObjectCreation> arrayCreations = new ArrayList<ObjectCreation>();
 			for(AbstractCall creation : body.getAllCreations()) {
 				if(creation instanceof ObjectCreation && ((ObjectCreation)creation).isArray()) {
+					arrayCreations.add((ObjectCreation)creation);
+				}
+			}
+			for(ObjectCreation creation : arrayCreations) {
+				boolean nestedInAnotherArrayCreation = arrayCreations.stream().anyMatch(other -> other != creation && other.getLocationInfo().subsumes(creation.getLocationInfo()));
+				if(!nestedInAnotherArrayCreation) {
 					if(junit4Rows == null) {
 						junit4Rows = new ArrayList<List<LeafExpression>>();
 					}
-					junit4Rows.addAll(((ObjectCreation)creation).getArrayInitializerRows());
+					junit4Rows.addAll(creation.getArrayInitializerRows());
 				}
 			}
 		}

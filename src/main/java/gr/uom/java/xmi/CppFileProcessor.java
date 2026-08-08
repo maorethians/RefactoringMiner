@@ -48,6 +48,7 @@ import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTCatchHandler;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTCompositeTypeSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTCompositeTypeSpecifier.ICPPASTBaseSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTConstructorChainInitializer;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTDeclarator;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTElaboratedTypeSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTEnumerationSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionDeclarator;
@@ -539,9 +540,19 @@ public class CppFileProcessor {
 			// class CWLSurfaceResource;
 			//friend class F;
 			IASTName name = elaboratedTypeSpecifier.getName();
+			String fullName = name.toString();
 			LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, elaboratedTypeSpecifier, CodeElementType.FORWARD_DECLARATION, fileContent);
 			String[] tokens = elaboratedTypeSpecifier.toString().split("\s");
-			UMLForwardDeclaration decl = new UMLForwardDeclaration(locationInfo, tokens.length > 1 ? tokens[0] : "", name.toString(), elaboratedTypeSpecifier.isFriend());
+			if(simpleDeclaration.getDeclarators().length > 0 && simpleDeclaration.getDeclarators()[0] instanceof IASTFunctionDeclarator functionDeclarator) {
+				fullName = fullName + "." + functionDeclarator.getName().toString();
+			}
+			else if(simpleDeclaration.getDeclarators().length > 0 && simpleDeclaration.getDeclarators()[0] instanceof ICPPASTDeclarator declarator && declarator.getName() != null && !declarator.getName().toString().isBlank()) {
+				fullName = fullName + "." + declarator.getName().toString();
+			}
+			String type = tokens.length > 1 ? tokens[0] : "";
+			if(tokens[0].equals("const"))
+				type = type + " " + tokens[1];
+			UMLForwardDeclaration decl = new UMLForwardDeclaration(locationInfo, type, fullName, elaboratedTypeSpecifier.isFriend());
 			if(parentContainer instanceof UMLClass)
 				((UMLClass)parentContainer).addForwardDeclaration(decl);
 		}
