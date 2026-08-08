@@ -62,7 +62,7 @@ public class NarrativeHtmlGenerator {
     }
 
     public void generateGrainLevelPage(GrainLevel level, int expandedChapterIndex) throws IOException {
-        List<String> chapters = narrator.getFlatChapters(level);
+        List<Narrator.ChapterUnit> chapters = narrator.getFlatChapters(level);
         StringBuilder html = new StringBuilder();
         html.append(getHtmlHeader(level + " Overview"));
         html.append("<div class='max-w-4xl mx-auto px-4 py-12'>");
@@ -74,7 +74,7 @@ public class NarrativeHtmlGenerator {
 
         html.append("<div class='space-y-6'>");
         for (int i = 0; i < chapters.size(); i++) {
-            String content = chapters.get(i);
+            String content = chapters.get(i).getContent();
 
             String openAttr = (i == expandedChapterIndex) ? " open" : "";
             html.append("<details").append(openAttr).append(" class='group bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all duration-200'>");

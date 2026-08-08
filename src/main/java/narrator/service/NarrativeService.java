@@ -11,7 +11,6 @@ import org.refactoringminer.astDiff.graph.cluster.traverse.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -40,7 +39,7 @@ public class NarrativeService {
         cacheManager.putHtmlGenerator(url, generator);
     }
 
-    public List<String> getFlatChapters(String url, GrainLevel level) throws Exception {
+    public List<Narrator.ChapterUnit> getFlatChapters(String url, GrainLevel level) throws Exception {
         TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
         if (root == null) {
             throw new IllegalStateException("No narrative initialized for this URL: " + url);
@@ -112,13 +111,13 @@ public class NarrativeService {
         }
     }
 
-    private List<String> getRawDiffChunks(String url, Narrator narrator) throws Exception {
-        List<String> cached = cacheManager.getRawDiffChunks(url);
+    private List<Narrator.ChapterUnit> getRawDiffChunks(String url, Narrator narrator) throws Exception {
+        List<Narrator.ChapterUnit> cached = cacheManager.getRawDiffChunks(url);
         if (cached != null) {
             return cached;
         }
 
-        List<String> fileChapters = narrator.getFlatChapters(GrainLevel.FILE);
+        List<Narrator.ChapterUnit> fileChapters = narrator.getFlatChapters(GrainLevel.FILE);
         int numChunks = fileChapters.size();
         if (numChunks == 0) {
             return Collections.emptyList();
@@ -159,8 +158,14 @@ public class NarrativeService {
             chunks.add(chunkBuilder.toString());
         }
 
-        cacheManager.putRawDiffChunks(url, chunks);
-        return chunks;
+        List<Narrator.ChapterUnit> units = chunks.stream().map(chunk -> {
+            Narrator.ChapterUnit chu = new Narrator.ChapterUnit();
+            chu.append(chunk);
+            return chu;
+        }).toList();
+
+        cacheManager.putRawDiffChunks(url, units);
+        return units;
     }
 
     private String getHierarchyCacheKey(String url) {

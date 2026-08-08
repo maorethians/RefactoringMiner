@@ -7,6 +7,7 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 
 public class LangChainClient {
     private final ChatLanguageModel model;
@@ -48,16 +49,16 @@ public class LangChainClient {
         return model.generate(prompt);
     }
 
-    public String processChapter(String task, String currentUnderstanding, String chapterContent) {
+    public String processChapter(String task, String chapterContent, Set<String> understanding) {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("Task:\n%s\n\n", task));
         sb.append(String.format("Current chapter:\n%s\n\n", chapterContent));
 
-        if (currentUnderstanding == null || currentUnderstanding.isBlank()) {
+        if (understanding.isEmpty()) {
             sb.append("Please analyze and understand the current chapter.\n");
             sb.append("Then, perform the task on the current chapter in the context of your understanding about it.\n");
         } else {
-            sb.append(String.format("Understanding of the previous chapters:\n%s\n\n", currentUnderstanding));
+            sb.append(String.format("Understanding of the previous chapters:\n%s\n\n", String.join("\n\n", understanding)));
             sb.append("Please analyze and understand the current chapter in the context of the understanding of previous chapters.\n");
             sb.append("Then, perform the task on the current chapter in the context of your understanding about it and the understanding of the previous chapters.\n");
         }
@@ -69,12 +70,12 @@ public class LangChainClient {
         return generate(sb.toString());
     }
 
-    public String compileResults(String task, List<ChapterResult> results) {
+    public String compileResults(String task, List<String> results) {
         StringBuilder sb = new StringBuilder();
         sb.append("Task:\n").append(task).append("\n\n");
         sb.append("Below are the intermediate results for each chapter of the narrative:\n\n");
-        for (ChapterResult res : results) {
-            sb.append(String.format("Chapter %d:\n%s\n\n", res.getChapterIndex() + 1, res.getIntermediateResult()));
+        for (String res : results) {
+            sb.append(res);
         }
         sb.append("\n\nPlease compile these intermediate results into a final comprehensive response to the task.");
         return generate(sb.toString());

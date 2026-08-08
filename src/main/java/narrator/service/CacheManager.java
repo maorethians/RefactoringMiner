@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.List;
 import narrator.mcp.html.NarrativeHtmlGenerator;
 import org.refactoringminer.astDiff.graph.cluster.Cluster;
+import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 import org.refactoringminer.astDiff.graph.cluster.traverse.TraversalPattern;
 
 public class CacheManager {
@@ -12,7 +13,7 @@ public class CacheManager {
     private final Map<String, TraversalPattern> hierarchyCache = new ConcurrentHashMap<>();
 
     private final Map<String, NarrativeHtmlGenerator> htmlGeneratorsCache = new ConcurrentHashMap<>();
-    private final Map<String, List<String>> rawDiffsCache = new ConcurrentHashMap<>();
+    private final Map<String, List<Narrator.ChapterUnit>> rawDiffsCache = new ConcurrentHashMap<>();
 
     public List<Cluster> getClusters(String url) {
         return clustersCache.get(url);
@@ -41,12 +42,12 @@ public class CacheManager {
         htmlGeneratorsCache.put(url, generator);
     }
 
-    public List<String> getRawDiffChunks(String url) {
+    public List<Narrator.ChapterUnit> getRawDiffChunks(String url) {
         return rawDiffsCache.get(url);
     }
 
-    public void putRawDiffChunks(String url, List<String> chunks) {
-        rawDiffsCache.put(url, chunks);
+    public void putRawDiffChunks(String url, List<Narrator.ChapterUnit> units) {
+        rawDiffsCache.put(url, units);
     }
 
     public void clear() {

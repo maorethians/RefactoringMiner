@@ -2,9 +2,10 @@ package narrator.langchain;
 
 import narrator.service.NarrativeService;
 import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
+import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 public class NarrativeProcessor {
     private final NarrativeService narrativeService;
@@ -22,33 +23,27 @@ public class NarrativeProcessor {
 
         // 1. Initialize and get chapters
         narrativeService.initializeNarrative(url);
-        List<String> chapters = narrativeService.getFlatChapters(url, level);
+        List<Narrator.ChapterUnit> chapters = narrativeService.getFlatChapters(url, level);
 
-        NarrativeState state = NarrativeState.empty();
-        List<ChapterResult> results = new ArrayList<>();
+        NarrativeState state = new NarrativeState();
 
         // 2. Iterative processing
         for (int i = 0; i < chapters.size(); i++) {
-            String content = chapters.get(i);
             System.out.println(i + 1 + "/" + chapters.size());
 
-            String response = langchainClient.processChapter(task, state.getUnderstanding(), content);
+            Narrator.ChapterUnit chapter = chapters.get(i);
+            String content = chapter.getContent();
+            Set<String> understanding = state.getUnderstanding(chapter);
+            String response = langchainClient.processChapter(task, content, understanding);
 
-            // Parse the response
             ParsedResponse parsed = parseResponse(response);
 
-            if (!"No updated understanding provided.".equals(parsed.understanding)) {
-                String chapterUnderstanding = "Chapter " + (i + 1) + ": " + parsed.understanding;
-                String updatedUnderstanding = state.getUnderstanding() == null
-                        ? chapterUnderstanding
-                        : state.getUnderstanding() + "\n\n" + chapterUnderstanding;
-                state = new NarrativeState(updatedUnderstanding);
-            }
-            results.add(new ChapterResult(i, content, parsed.result));
+            state.setUnderstanding(chapter, parsed.understanding);
+            state.setResult(chapter, parsed.result);
         }
 
         // 3. Final compilation
-        String finalResult = langchainClient.compileResults(task, results);
+        String finalResult = langchainClient.compileResults(task, state.getResults());
         return new NarrativeResponse(finalResult);
     }
 

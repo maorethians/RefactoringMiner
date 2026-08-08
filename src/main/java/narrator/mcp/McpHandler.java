@@ -193,13 +193,14 @@ public class McpHandler {
             summary.append("-------------------------------------------------------------------------------------------------\n");
 
             for (GrainLevel level : GrainLevel.values()) {
-                List<String> flatChapters = narrativeService.getFlatChapters(url, level);
+                List<Narrator.ChapterUnit> flatChapters = narrativeService.getFlatChapters(url, level);
                 int count = flatChapters.size();
 
                 double totalLines = 0;
                 double maxLines = 0;
 
-                for (String content : flatChapters) {
+                for (Narrator.ChapterUnit chapter : flatChapters) {
+                    String content = chapter.getContent();
                     int lines = content.split("\n").length;
                     totalLines += lines;
                     if (lines > maxLines) maxLines = lines;
@@ -238,7 +239,7 @@ public class McpHandler {
             throw new IllegalArgumentException("Invalid grainLevel: " + grainLevelStr + ". Valid values are: " + java.util.Arrays.toString(GrainLevel.values()));
         }
 
-        List<String> flatChapters = narrativeService.getFlatChapters(url, level);
+        List<Narrator.ChapterUnit> flatChapters = narrativeService.getFlatChapters(url, level);
 
         // For the MCP server, we need to maintain progress.
         // Since NarrativeService doesn't track state per-session,
@@ -254,7 +255,8 @@ public class McpHandler {
             return "[End of Narrative] All chapters for grain level " + level + " have been read.";
         }
 
-        String content = flatChapters.get(startProgress);
+        Narrator.ChapterUnit chapter = flatChapters.get(startProgress);
+        String content = chapter.getContent();
         String header = String.format("[Chapter %d of %d]\n", startProgress + 1, flatChapters.size());
         narrator.incrementProgress(level);
 
@@ -278,7 +280,7 @@ public class McpHandler {
             throw new IllegalArgumentException("Invalid grainLevel: " + grainLevelStr + ". Valid values are: " + java.util.Arrays.toString(GrainLevel.values()));
         }
 
-        List<String> flatChapters = narrativeService.getFlatChapters(url, level);
+        List<Narrator.ChapterUnit> flatChapters = narrativeService.getFlatChapters(url, level);
 
         TraversalPattern root = narrativeService.getCacheManager().getHierarchy("hierarchy:" + url);
         if (root == null) {
@@ -291,7 +293,8 @@ public class McpHandler {
             return "[End of Narrative] All chapters for grain level " + level + " have been read.";
         }
 
-        String content = flatChapters.get(progress);
+        Narrator.ChapterUnit chapter = flatChapters.get(progress);
+        String content = chapter.getContent();
         String header = String.format("[Chapter %d of %d]\n", progress + 1, flatChapters.size());
         narrator.incrementProgress(level);
 
