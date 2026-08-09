@@ -6,6 +6,8 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import com.github.gumtreediff.utils.Pair;
 import org.jgrapht.Graph;
 import org.refactoringminer.astDiff.graph.Edge;
 import org.refactoringminer.astDiff.graph.HunkNetwork;
@@ -35,8 +37,9 @@ public class Driver {
     }
 
     public static Graph<Node, Edge> getCommitRangeGraph(String url) throws Exception {
-        URLHelper.CommitRange range = URLHelper.getCommitRange(url);
-        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommitRange(range.repo, range.startCommit, range.endCommit);
+        String repo = URLHelper.getRepo(url);
+        Pair<String, String> range = URLHelper.getCommitRange(url);
+        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommitRange(repo, range.first, range.second);
 
         return getGraph(projectASTDiff);
     }
