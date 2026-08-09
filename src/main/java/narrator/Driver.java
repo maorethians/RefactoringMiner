@@ -34,9 +34,9 @@ public class Driver {
         return getGraph(projectASTDiff);
     }
 
-    public static Graph<Node, Edge> getCommitRangeGraph(String repo, String startCommit, String endCommit) throws Exception {
-        String clone = "https://github.com/" + repo + ".git";
-        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommitRange(clone, startCommit, endCommit);
+    public static Graph<Node, Edge> getCommitRangeGraph(String url) throws Exception {
+        URLHelper.CommitRange range = URLHelper.getCommitRange(url);
+        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommitRange(range.repo, range.startCommit, range.endCommit);
 
         return getGraph(projectASTDiff);
     }

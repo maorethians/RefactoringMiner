@@ -9,11 +9,10 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
-import java.util.stream.Collectors;
 
 public class ContextCRBenchRunner {
 
-    private static final String DATASET_PATH = "dataset/ContextCRBench/java";
+    private static final String DATASET_PATH = "dataset/contextCRBench";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
 
@@ -36,36 +35,51 @@ public class ContextCRBenchRunner {
             for (File file : files) {
                 String fileName = file.getName();
                 String id = fileName.substring(0, fileName.lastIndexOf('.'));
-                System.out.println("Processing " + id + "...");
 
                 try {
                     String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
                     JsonObject json = JsonParser.parseString(content).getAsJsonObject();
-                    String repo = json.get("repo").getAsString();
-                    int prNumber = json.get("pr_number").getAsInt();
-                    String url = "https://github.com/" + repo + "/pull/" + prNumber;
 
-                    long start = System.currentTimeMillis();
-                    String output = NarrativeRunner.run(url);
-                    long end = System.currentTimeMillis();
-                    long timing = end - start;
+                    // Group review comments by submitted_on_commit
+                    Map<String, List<JsonObject>> commitGroups = new HashMap<>();
+                    if (json.has("reviews")) {
+                        json.getAsJsonArray("reviews").forEach(element -> {
+                            JsonObject review = element.getAsJsonObject();
+                            if (review.has("submitted_on_commit")) {
+                                String sha = review.get("submitted_on_commit").getAsString();
+                                commitGroups.computeIfAbsent(sha, k -> new ArrayList<>()).add(review);
+                            }
+                        });
+                    }
 
-                    TokenUsage tokens = readAndPurgeLog();
+                    String repo = json.get("full_name").getAsString();
+                    String baseCommit = json.get("base_commit").getAsString();
+                    for (Map.Entry<String, List<JsonObject>> entry : commitGroups.entrySet()) {
+                        String submittedCommit = entry.getKey();
 
-                    BenchResult result = new BenchResult();
-                    result.id = id;
-                    result.output = output;
-                    result.timing = timing;
-                    result.tokensIn = tokens.in;
-                    result.tokensOut = tokens.out;
+                        String rangeUrl = "https://github.com/" + repo + "/compare/" + baseCommit + "..." + submittedCommit;
 
-                    // Store result JSON
-                    Files.write(Paths.get(RESULTS_DIR, id + ".json"),
-                                gson.toJson(result).getBytes(StandardCharsets.UTF_8));
+                        long start = System.currentTimeMillis();
+                        String output = NarrativeRunner.run(rangeUrl);
+                        long end = System.currentTimeMillis();
+                        long timing = end - start;
 
-                    // Store raw output TXT
-                    Files.write(Paths.get(RESULTS_DIR, id + ".txt"),
-                               (output != null ? output : "").getBytes(StandardCharsets.UTF_8));
+                        TokenUsage tokens = readAndPurgeLog();
+
+                        BenchResult result = new BenchResult();
+                        result.id = id;
+                        result.submittedOnCommit = submittedCommit;
+                        result.output = output;
+                        result.timing = timing;
+                        result.tokensIn = tokens.in;
+                        result.tokensOut = tokens.out;
+
+                        // Store result JSON
+                        Files.write(Paths.get(RESULTS_DIR, id + ".json"), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
+
+                        // Store raw output TXT
+                        Files.write(Paths.get(RESULTS_DIR, id + ".txt"), (output != null ? output : "").getBytes(StandardCharsets.UTF_8));
+                    }
 
                 } catch (Exception e) {
                     System.err.println("Error processing " + fileName + ": " + e.getMessage());
@@ -119,6 +133,7 @@ public class ContextCRBenchRunner {
 
     private static class BenchResult {
         String id;
+        String submittedOnCommit;
         String output;
         long timing;
         long tokensIn;

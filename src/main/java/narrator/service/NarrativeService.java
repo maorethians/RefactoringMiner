@@ -106,6 +106,8 @@ public class NarrativeService {
     private Graph<Node, Edge> loadGraph(String url) throws Exception {
         if (url.contains("/pull/") || url.contains("/pr/")) {
             return Driver.getPullRequestGraph(url);
+        } else if (url.contains("/compare/")) {
+            return Driver.getCommitRangeGraph(url);
         } else {
             return Driver.getCommitGraph(url);
         }
