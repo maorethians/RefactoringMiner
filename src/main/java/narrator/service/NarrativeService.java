@@ -107,7 +107,7 @@ public class NarrativeService {
         if (url.contains("/pull/") || url.contains("/pr/")) {
             return Driver.getPullRequestGraph(url);
         } else if (url.contains("/compare/")) {
-            return Driver.getCommitRangeGraph(url);
+            return Driver.getCompareGraph(url);
         } else {
             return Driver.getCommitGraph(url);
         }

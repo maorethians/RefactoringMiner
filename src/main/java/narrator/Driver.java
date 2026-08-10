@@ -36,10 +36,10 @@ public class Driver {
         return getGraph(projectASTDiff);
     }
 
-    public static Graph<Node, Edge> getCommitRangeGraph(String url) throws Exception {
+    public static Graph<Node, Edge> getCompareGraph(String url) throws Exception {
         String repo = URLHelper.getRepo(url);
         Pair<String, String> range = URLHelper.getCommitPairFromGitHubCompareURL(url);
-        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtCommitRange(repo, range.getLeft(), range.getRight());
+        ProjectASTDiff projectASTDiff = new GitHistoryRefactoringMinerImpl().diffAtGitHubCompare(repo, range.getLeft(), range.getRight());
 
         return getGraph(projectASTDiff);
     }
