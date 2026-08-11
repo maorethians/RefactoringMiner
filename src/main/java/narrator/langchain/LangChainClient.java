@@ -70,32 +70,9 @@ public class LangChainClient {
         sb.append(task);
         sb.append("\n</objective>\n\n");
 
-        sb.append("You must produce your output for this chapter in the following format. Any format that may have been requested in the objective will be considered during synthesizing the final result and must be ignored in favor of the format below :\n");
+        sb.append("You must produce your output for this chapter with exactly two sections of understanding and intermediate result in the following format. Any format that may have been requested in the objective will be considered during synthesizing the final result and the format below must be prioritized for your output:\n");
         sb.append("<understanding>{Your analysis and understanding of the current chapter. This understanding must capture all the identifiers and changes made to them in this chapter which may be referenced in other chapters and may act as a dependency in the changes of the other chapters.}</understanding>\n");
         sb.append("<intermediate_result>{The intermediate result of pursuing the objective specifically for the current chapter. This intermediate result will directly contribute to synthesizing the final result beside the intermediate result of the rest of the chapters for fulfilling the objective on the whole commit or PR.}</intermediate_result>\n");
-
-//        sb.append("# INSTRUCTIONS\n");
-//        sb.append("You must produce a response containing exactly two sections: <understanding> and <result>.\n\n");
-//        sb.append("1. **UNDERSTANDING** (The Machinery - How/What):\n");
-//        sb.append("   - Update the architectural state of the system. Treat this block as a living technical specification.\n");
-//        sb.append("   - Document critical API changes, data flow modifications, or logic shifts discovered in this chapter.\n");
-//        sb.append("   - Capture \"load-bearing\" facts that will be essential for analyzing subsequent chapters.\n");
-//        sb.append("   - **Refactor and Prune**: Merge redundant facts, resolve contradictions, and delete information that has been superseded by newer chapters. Your goal is maximum density—minimum tokens.\n");
-//        sb.append("   - Ignore conversational noise or redundant information already captured in the dependency context.\n\n");
-//        sb.append("2. **RESULT** (The Conclusion - So What):\n");
-//        sb.append("   - Provide a concise fragment of the final answer based ONLY on this chapter and the current understanding.\n");
-//        sb.append("   - Write this as a \"building block\"—avoid introductory phrases (\"In this chapter...\", \"I found that...\") or conversational filler.\n");
-//        sb.append("   - If this chapter provides no relevant information for the task, leave this section empty.\n\n");
-//        sb.append("Crucially, the `<understanding>` block is for state tracking (the 'how' and 'what'), while the `<result>` block is for incremental answers (the 'so what'). Do not repeat a raw fact in both; if it belongs in the result, the understanding should only record the architectural shift that enabled that result.\n\n");
-//
-//        sb.append("# OUTPUT FORMAT\n");
-//        sb.append("Strictly adhere to the following XML-style tags. Do not include any text outside these tags.\n\n");
-//        sb.append("<understanding>\n");
-//        sb.append("[Your refactored architectural state updates and critical logic here]\n");
-//        sb.append("</understanding>\n\n");
-//        sb.append("<result>\n");
-//        sb.append("[Your concise answer fragment here]\n");
-//        sb.append("</result>");
 
         return generate(sb.toString());
     }
