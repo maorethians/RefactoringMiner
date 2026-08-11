@@ -67,6 +67,13 @@ public class ContextCRBenchRunner {
                     for (Map.Entry<String, List<JsonObject>> entry : commitGroups.entrySet()) {
                         String submittedCommit = entry.getKey();
 
+                        // Check if result already exists for this commit
+                        String resultFileName = String.format("%s_%s_%s_%s.json", org, repoName, prNumber, submittedCommit);
+                        if (Files.exists(Paths.get(RESULTS_DIR, resultFileName))) {
+                            System.out.println("Skipping existing result: " + resultFileName);
+                            continue;
+                        }
+
                         String rangeUrl = "https://github.com/" + repo + "/compare/" + baseCommit + "..." + submittedCommit;
 
                         long start = System.currentTimeMillis();
@@ -87,7 +94,6 @@ public class ContextCRBenchRunner {
                         result.tokensOut = tokens.out;
 
                         // Store result JSON
-                        String resultFileName = String.format("%s_%s_%s_%s.json", org, repoName, prNumber, submittedCommit);
                         Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
 
                         // Store raw output TXT
