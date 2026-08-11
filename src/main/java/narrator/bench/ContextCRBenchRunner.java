@@ -34,11 +34,21 @@ public class ContextCRBenchRunner {
 
             for (File file : files) {
                 String fileName = file.getName();
-                String id = fileName.substring(0, fileName.lastIndexOf('.'));
 
                 try {
                     String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
                     JsonObject json = JsonParser.parseString(content).getAsJsonObject();
+
+                    // Extract org, repo, and prNumber from fileName (format: org_repo_pr.json)
+                    String nameWithoutExt = fileName.substring(0, fileName.lastIndexOf('.'));
+                    String[] parts = nameWithoutExt.split("_");
+                    if (parts.length < 3) {
+                        System.err.println("Invalid filename format: " + fileName);
+                        continue;
+                    }
+                    String org = parts[0];
+                    String repoName = parts[1];
+                    String prNumber = parts[2];
 
                     // Group review comments by submitted_on_commit
                     Map<String, List<JsonObject>> commitGroups = new HashMap<>();
@@ -67,18 +77,22 @@ public class ContextCRBenchRunner {
                         TokenUsage tokens = readAndPurgeLog();
 
                         BenchResult result = new BenchResult();
-                        result.id = id;
-                        result.submittedOnCommit = submittedCommit;
+                        result.org = org;
+                        result.repo = repoName;
+                        result.prNumber = prNumber;
+                        result.commit = submittedCommit;
                         result.output = output;
                         result.timing = timing;
                         result.tokensIn = tokens.in;
                         result.tokensOut = tokens.out;
 
                         // Store result JSON
-                        Files.write(Paths.get(RESULTS_DIR, id + ".json"), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
+                        String resultFileName = String.format("%s_%s_%s_%s.json", org, repoName, prNumber, submittedCommit);
+                        Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
 
                         // Store raw output TXT
-                        Files.write(Paths.get(RESULTS_DIR, id + ".txt"), (output != null ? output : "").getBytes(StandardCharsets.UTF_8));
+                        String outputFileName = String.format("%s_%s_%s_%s.txt", org, repoName, prNumber, submittedCommit);
+                        Files.write(Paths.get(RESULTS_DIR, outputFileName), (output != null ? output : "").getBytes(StandardCharsets.UTF_8));
                     }
 
                 } catch (Exception e) {
@@ -132,8 +146,10 @@ public class ContextCRBenchRunner {
     }
 
     private static class BenchResult {
-        String id;
-        String submittedOnCommit;
+        String org;
+        String repo;
+        String prNumber;
+        String commit;
         String output;
         long timing;
         long tokensIn;
