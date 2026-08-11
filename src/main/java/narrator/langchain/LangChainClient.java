@@ -95,10 +95,7 @@ public class LangChainClient {
 
         sb.append("### Constraints\n");
         sb.append("- No conversational filler (e.g., \"I have analyzed the chapter...\").\n");
-        sb.append("- Start immediately with the <understanding> tag.\n\n");
-        sb.append("Example:\n");
-        sb.append("<understanding>\nModified 'UserAuthService.validateToken' to include expiration check. \nDependency: This change affects all downstream calls in 'SessionManager'.\nLogic trace: Token -> Expiry Check -> Boolean result.\n</understanding>\n");
-        sb.append("<intermediate_result>\nThe authentication logic now enforces token expiration, which may cause existing long-lived sessions to terminate unexpectedly.\n</intermediate_result>\n");
+        sb.append("- Start immediately with the <understanding> tag.\n");
 
         return generate(sb.toString());
     }
