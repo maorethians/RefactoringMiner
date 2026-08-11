@@ -51,25 +51,43 @@ public class NarrativeProcessor {
         String understanding = "No updated understanding provided.";
         String result = "No intermediate result provided.";
 
-        String lowerResponse = response.toLowerCase();
-        int understandingIdx = lowerResponse.indexOf("understanding:");
-        int resultIdx = lowerResponse.indexOf("result:");
+        // Try new XML-style format first: <understanding>...</understanding>, <intermediate_result>...</intermediate_result>
+        int undStartOpen = response.indexOf("<understanding>");
+        int undStartClose = response.indexOf("</understanding>");
+        int resStartOpen = response.indexOf("<intermediate_result>");
+        int resStartClose = response.indexOf("</intermediate_result>");
 
-        if (understandingIdx != -1 && resultIdx != -1) {
-            if (understandingIdx < resultIdx) {
-                understanding = response.substring(understandingIdx + 14, resultIdx).trim();
+        boolean hasXmlFormat = (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose)
+                || (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose);
+
+        if (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose) {
+            understanding = response.substring(undStartOpen + 15, undStartClose).trim();
+        }
+        if (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose) {
+            result = response.substring(resStartOpen + 21, resStartClose).trim();
+        }
+        if (!hasXmlFormat) {
+            // Fallback to legacy "key:" format
+            String lowerResponse = response.toLowerCase();
+            int understandingIdx = lowerResponse.indexOf("understanding:");
+            int resultIdx = lowerResponse.indexOf("result:");
+
+            if (understandingIdx != -1 && resultIdx != -1) {
+                if (understandingIdx < resultIdx) {
+                    understanding = response.substring(understandingIdx + 14, resultIdx).trim();
+                    result = response.substring(resultIdx + 7).trim();
+                } else {
+                    result = response.substring(resultIdx + 7, understandingIdx).trim();
+                    understanding = response.substring(understandingIdx + 14).trim();
+                }
+            } else if (understandingIdx != -1) {
+                understanding = response.substring(understandingIdx + 14).trim();
+            } else if (resultIdx != -1) {
                 result = response.substring(resultIdx + 7).trim();
             } else {
-                result = response.substring(resultIdx + 7, understandingIdx).trim();
-                understanding = response.substring(understandingIdx + 14).trim();
+                // Final fallback: model just dumped the raw text
+                result = response;
             }
-        } else if (understandingIdx != -1) {
-            understanding = response.substring(understandingIdx + 14).trim();
-        } else if (resultIdx != -1) {
-            result = response.substring(resultIdx + 7).trim();
-        } else {
-            // Fallback: the model might have just written the text
-            result = response;
         }
 
         return new ParsedResponse(understanding, result);
