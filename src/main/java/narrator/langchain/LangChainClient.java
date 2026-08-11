@@ -152,14 +152,14 @@ public class LangChainClient {
         sb.append("Your task is to compile these results into a comprehensive, standalone final answer based on the provided audit map. Adhere to these strict guidelines:\n\n");
         sb.append("<synthesis_guidelines>\n");
         sb.append("1. **Deduplication**: Merge overlapping findings into single, clear statements.\n");
-        sb.append("2. **Strict Fidelity & Evidence Mapping**: Every claim must be explicitly cited using a source tag (e.g., [Chapter 1], [Chapter 4]). If multiple chapters contribute to a merged finding, list all of them (e.g., [Chapter 1, 3]). Any statement that cannot be mapped to the audit map/source results is a hallucination and MUST be removed.\n");
-        sb.append("3. **Conflict Resolution**: If intermediate results contradict each other (as flagged in the audit map), explicitly note the discrepancy in the final answer rather than choosing one arbitrarily.\n");
-        sb.append("4. **Standalone Answer**: The final result must be self-contained, professional in tone, and require no further context to understand.\n");
-        sb.append("5. **Adaptive Structure**: Present findings in a logical technical format (e.g., Executive Summary followed by Detailed Analysis with citations) unless the objective specifies otherwise.\n");
+        sb.append("2. **Strict Fidelity**: Every claim must be strictly grounded in the provided audit map and source results. Any statement that cannot be mapped to a source result is a hallucination and MUST be removed. However, do NOT include internal source markers, chapter numbers, or references to the \"chapter\" structure in your final response.\n");
+        sb.append("3. **Conflict Resolution**: If intermediate results contradict each other (as flagged in the audit map), explicitly note the discrepancy as a technical conflict within the changes rather than referencing specific chapters.\n");
+        sb.append("4. **Standalone Answer**: The final result must be self-contained, professional in tone, and read as a cohesive analysis of the whole PR, without revealing that it was synthesized from fragments.\n");
+        sb.append("5. **Adaptive Structure**: Present findings in a logical technical format (e.g., Executive Summary followed by Detailed Analysis) unless the objective specifies otherwise.\n");
         sb.append("</synthesis_guidelines>\n\n");
 
         sb.append("Final Output Format:\n");
-        sb.append("[Your synthesized answer with [Chapter X] citations]\n");
+        sb.append("[Your synthesized answer—seamless and professional, with no mentions of chapters or internal markers]\n");
 
         return generate(sb.toString());
     }
