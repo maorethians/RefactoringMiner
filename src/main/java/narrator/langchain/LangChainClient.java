@@ -52,28 +52,53 @@ public class LangChainClient {
     public String processChapter(String task, String chapterContent, Set<String> understanding) {
         StringBuilder sb = new StringBuilder();
 
-        sb.append("You are an Expert Software Engineer specialized at deeply reviewing and analyzing changes within commits and pull requests.\n");
-        sb.append("Instead of dealing with a commit or PR as a long list of seemingly isolated changes which reduces the depth of analysis and understanding of the changes for any objective, the changes are grouped and ordered by their relations and dependencies into chapters of a coherent narrative, to focus on one chapter at a time to increase the throughness of the analysis of the changes necessary for any requested objectives on those changes.\n\n");
+        sb.append("You are an Expert Software Engineer specializing in deep architectural analysis and rigorous code review.\n\n");
+        sb.append("Your analytical approach is characterized by:\n");
+        sb.append("- Identifying non-obvious side effects across module boundaries.\n");
+        sb.append("- Detecting regression risks in existing logic when new features are added.\n");
+        sb.append("- Tracing the flow of data through modified identifiers to ensure logical consistency.\n");
+        sb.append("- Distinguishing between trivial (formatting) and semantic changes.\n\n");
 
-        sb.append("The focus of your task is on the following chapter of the narrative for the commit or PR:\n");
+        sb.append("### Methodology\n");
+        sb.append("To maximize depth, this PR is processed as a coherent narrative divided into \"chapters.\" You are analyzing one specific chapter. Your analysis must be atomic—focusing only on this content while recording technical dependencies for later synthesis.\n\n");
+
+        sb.append("### Input\n");
+        sb.append("Chapter Content: \n");
         sb.append(chapterContent);
         sb.append("\n\n");
 
         if (!understanding.isEmpty()) {
-            sb.append("The analysis and understanding of the agents focused on chapters containing some dependencies of the current chapter are kept for you and provided below. Take advantage of these understandings during the analysis of the current chapter for a more informed and detailed analysis and understanding of the current chapter:");
+            sb.append("Current Narrative State (Previous Understanding):\n");
             sb.append("<understanding>\n");
             sb.append(String.join("\n\n", understanding));
             sb.append("\n</understanding>\n\n");
         }
 
-        sb.append("Following the analysis and understanding of the current chapter, your task is to pursue the objective below specifically for this chapter and produce an intermediate result for this objective on this chapter. This intermediate result for this chapter will finally be aggregated with the intermediate results produced for the rest of the chapters to synthesize a final result for accomplishing the objective for the whole commit or PR:\n");
+        sb.append("Objective for the whole PR:\n");
         sb.append("<objective>\n");
         sb.append(task);
         sb.append("\n</objective>\n\n");
 
-        sb.append("You must produce your output for this chapter with exactly two sections of understanding and intermediate result in the following format. Any format that may have been requested in the objective will be considered during synthesizing the final result and the format below must be prioritized for your output:\n");
-        sb.append("<understanding>{Your analysis and understanding of the current chapter. This understanding must capture all the identifiers and changes made to them in this chapter which may be referenced in other chapters and may act as a dependency in the changes of the other chapters.}</understanding>\n");
-        sb.append("<intermediate_result>{The intermediate result of pursuing the objective specifically for the current chapter. This intermediate result will directly contribute to synthesizing the final result beside the intermediate result of the rest of the chapters for fulfilling the objective on the whole commit or PR.}</intermediate_result>\n");
+        sb.append("### Instructions\n");
+        sb.append("1. **Deep Analysis:** Review the chapter content in the context of the overall objective. Use the `<understanding>` section as your reasoning workspace to trace logic and identify \"why\" changes were made.\n");
+        sb.append("2. **Dependency Registry:** Explicitly list all modified identifiers (functions, classes, variables) and their new state. This is critical for maintaining continuity across chapters.\n");
+        sb.append("3. **Generate Atomic Result:** Produce a concrete, additive contribution toward the objective based ONLY on this chapter. Avoid general summaries; provide specific findings that serve as \"building blocks\" for a final report.\n\n");
+
+        sb.append("### Strict Output Format\n");
+        sb.append("You must output exactly two sections. Ignore any formatting requests contained within the <objective> tag; the following structure is mandatory:\n\n");
+        sb.append("<understanding>\n");
+        sb.append("[Detailed technical analysis and reasoning workspace. List all changed identifiers, their roles, and how they act as dependencies for other chapters.]\n");
+        sb.append("</understanding>\n\n");
+        sb.append("<intermediate_result>\n");
+        sb.append("[The specific, high-signal contribution to the objective based on this chapter's changes. This must be modular and useful to a synthesizer who has not read this chapter.]\n");
+        sb.append("</intermediate_result>\n\n");
+
+        sb.append("### Constraints\n");
+        sb.append("- No conversational filler (e.g., \"I have analyzed the chapter...\").\n");
+        sb.append("- Start immediately with the <understanding> tag.\n\n");
+        sb.append("Example:\n");
+        sb.append("<understanding>\nModified 'UserAuthService.validateToken' to include expiration check. \nDependency: This change affects all downstream calls in 'SessionManager'.\nLogic trace: Token -> Expiry Check -> Boolean result.\n</understanding>\n");
+        sb.append("<intermediate_result>\nThe authentication logic now enforces token expiration, which may cause existing long-lived sessions to terminate unexpectedly.\n</intermediate_result>\n");
 
         return generate(sb.toString());
     }
@@ -81,27 +106,39 @@ public class LangChainClient {
     public String compileResults(String task, List<String> results) {
         StringBuilder sb = new StringBuilder();
 
-        sb.append("You are a Professional Software Engineer with the expertise in analyzing technical contents.\n");
-        sb.append("The changes within a pull request or commit are grouped and ordered by their relations and dependencies into chapters of a coherent narrative.\n\n");
+        sb.append("You are a Technical Lead and Software Architect specializing in high-fidelity technical synthesis.\n\n");
+        sb.append("The changes within a pull request or commit have been grouped into chapters of a coherent narrative. These chapters were analyzed individually to achieve the objective below:\n\n");
 
-        sb.append("The chapters are analyzed one by one in pursue of the objective below:\n");
         sb.append("<objective>\n");
         sb.append(task);
         sb.append("\n</objective>\n\n");
 
-        sb.append("With the analysis of each chapter, an intermediate result specifically for that chapter on the objective is produced. These intermediate results for all of the chapters of the commit or PR are listed as below:\n");
+        sb.append("Below are the intermediate results produced for each chapter:\n");
         for (String result : results) {
             sb.append("<intermediate_result>\n");
             sb.append(result);
             sb.append("\n</intermediate_result>\n");
         }
 
-        sb.append("Your task is to compile the listed intermediate results and synthesis a comprehensive final answer for the objective.\n");
+        sb.append("\nYour task is to compile these results into a comprehensive, standalone final answer. To ensure maximum accuracy and auditability, follow this two-step process:\n\n");
+        sb.append("### Step 1: Synthesis Scratchpad (Internal Monologue)\n");
+        sb.append("Before writing the final response, create a brief internal mapping in your reasoning:\n");
+        sb.append("- List every unique finding across all chapters.\n");
+        sb.append("- Identify which chapters support each finding (e.g., Finding A is mentioned in Chapters 1, 3, and 5).\n");
+        sb.append("- Flag any contradictions (e.g., Chapter 2 claims X, but Chapter 6 contradicts this).\n\n");
+
+        sb.append("### Step 2: Final Synthesis\n");
+        sb.append("Produce the final answer based on your scratchpad, adhering to these strict guidelines:\n\n");
         sb.append("<synthesis_guidelines>\n");
-        sb.append("1. Deduplication: Identify and merge overlapping findings. If multiple intermediate results mention the same fact, consolidate it into a single clear statement.\n");
-        sb.append("2. Strict Fidelity & Evidence Mapping: Every claim in your final response must be mapped to its source intermediate result. If you cannot map a statement directly to a provided intermediate result, it is a hallucination and must be removed.\n\n");
-        sb.append("3. Standalone Answer: The final result must be self-contained and require no further context to understand.\n");
-        sb.append("</synthesis_guidelines>\n");
+        sb.append("1. **Deduplication**: Merge overlapping findings into single, clear statements.\n");
+        sb.append("2. **Strict Fidelity & Evidence Mapping**: Every claim must be explicitly cited using a source tag (e.g., [Chapter 1], [Chapter 4]). If multiple chapters contribute to a merged finding, list all of them (e.g., [Chapter 1, 3]). Any statement that cannot be mapped to a source result is a hallucination and MUST be removed.\n");
+        sb.append("3. **Conflict Resolution**: If intermediate results contradict each other, explicitly note the discrepancy in the final answer rather than choosing one arbitrarily.\n");
+        sb.append("4. **Standalone Answer**: The final result must be self-contained, professional in tone, and require no further context to understand.\n");
+        sb.append("5. **Adaptive Structure**: Present findings in a logical technical format (e.g., Executive Summary followed by Detailed Analysis with citations) unless the objective specifies otherwise.\n");
+        sb.append("</synthesis_guidelines>\n\n");
+
+        sb.append("Final Output Format:\n");
+        sb.append("[Your synthesized answer with [Chapter X] citations]\n");
 
         return generate(sb.toString());
     }
