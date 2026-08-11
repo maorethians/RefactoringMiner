@@ -51,6 +51,7 @@ public class LangChainClient {
 
     public String processChapter(String task, String chapterContent, Set<String> understanding) {
         StringBuilder sb = new StringBuilder();
+
         sb.append("You are an Expert Software Engineer specialized at deeply reviewing and analyzing changes within commits and pull requests.\n");
         sb.append("Instead of dealing with a commit or PR as a long list of seemingly isolated changes which reduces the depth of analysis and understanding of the changes for any objective, the changes are grouped and ordered by their relations and dependencies into chapters of a coherent narrative, to focus on one chapter at a time to increase the throughness of the analysis of the changes necessary for any requested objectives on those changes.\n\n");
 
@@ -79,35 +80,28 @@ public class LangChainClient {
 
     public String compileResults(String task, List<String> results) {
         StringBuilder sb = new StringBuilder();
-        sb.append("# PERSONA\n");
-        sb.append("You are a Technical Auditor and Synthesis Expert. Your primary objective is absolute fidelity to the source fragments. You value accuracy over narrative flow; if the data is fragmented, the report should reflect that fragmentation rather than smoothing it over with assumptions.\n\n");
 
-        sb.append("# TASK\n");
-        sb.append(String.format("Compile the following intermediate results into a comprehensive final answer for the objective:\n%s\n\n", task));
+        sb.append("You are a Professional Software Engineer with the expertise in analyzing technical contents.\n");
+        sb.append("The changes within a pull request or commit are grouped and ordered by their relations and dependencies into chapters of a coherent narrative.\n\n");
 
-        sb.append("# INTERMEDIATE RESULTS\n");
-        sb.append("The following fragments were extracted sequentially from the narrative:\n");
-        sb.append("<fragments>\n");
-        for (int i = 0; i < results.size(); i++) {
-            sb.append(String.format("[Fragment %d]: %s\n\n", i + 1, results.get(i)));
+        sb.append("The chapters are analyzed one by one in pursue of the objective below:\n");
+        sb.append("<objective>\n");
+        sb.append(task);
+        sb.append("\n</objective>\n\n");
+
+        sb.append("With the analysis of each chapter, an intermediate result specifically for that chapter on the objective is produced. These intermediate results for all of the chapters of the commit or PR are listed as below:\n");
+        for (String result : results) {
+            sb.append("<intermediate_result>\n");
+            sb.append(result);
+            sb.append("\n</intermediate_result>\n");
         }
-        sb.append("</fragments>\n\n");
 
-        sb.append("# SYNTHESIS GUIDELINES\n");
-        sb.append("When merging these fragments, apply the following logic:\n\n");
-        sb.append("1. **Deduplication**: Identify and merge overlapping findings. If multiple chapters mention the same fact, consolidate it into a single clear statement.\n");
-        sb.append("2. **Conflict Resolution**: If fragments contradict each other, prioritize the information from the later fragment (as it represents a later state in the narrative), but note the evolution of the logic if relevant.\n");
-        sb.append("3. **Logical Structuring**: Organize the final answer by logical flow (e.g., Cause -> Effect or Setup -> Implementation) rather than chronological order of chapters.\n");
-        sb.append("4. **Strict Fidelity & Evidence Mapping**: Every claim in your final response must be mapped to its source fragment using a bracketed index (e.g., [Fragment 2], [Fragment 5]). If you cannot map a statement directly to a provided fragment, it is a hallucination and must be removed.\n\n");
-
-        sb.append("# OUTPUT REQUIREMENTS\n");
-        sb.append("- Provide a professional, technical response.\n");
-        sb.append("- Use headings, bullet points, or tables where appropriate to increase readability.\n");
-        sb.append("- Ensure the final output is a standalone answer that requires no further context to understand.\n");
-        sb.append("- Include a \"Missing Information\" section to explicitly list gaps that prevented a fully coherent narrative based on the provided fragments.\n\n");
-
-        sb.append("# FINAL RESPONSE\n");
-        sb.append("[Your synthesized answer here]");
+        sb.append("Your task is to compile the listed intermediate results and synthesis a comprehensive final answer for the objective.\n");
+        sb.append("<synthesis_guidelines>\n");
+        sb.append("1. Deduplication: Identify and merge overlapping findings. If multiple intermediate results mention the same fact, consolidate it into a single clear statement.\n");
+        sb.append("2. Strict Fidelity & Evidence Mapping: Every claim in your final response must be mapped to its source intermediate result. If you cannot map a statement directly to a provided intermediate result, it is a hallucination and must be removed.\n\n");
+        sb.append("3. Standalone Answer: The final result must be self-contained and require no further context to understand.\n");
+        sb.append("</synthesis_guidelines>\n");
 
         return generate(sb.toString());
     }
