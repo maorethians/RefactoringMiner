@@ -330,6 +330,10 @@ public class OperationInvocation extends AbstractCall {
 		super(locationInfo);
 	}
 
+	private OperationInvocation(String string, LocationInfo locationInfo) {
+		super(string, locationInfo);
+	}
+
 	public OperationInvocation update(String oldExpression, String newExpression) {
 		OperationInvocation newOperationInvocation = new OperationInvocation(this.locationInfo);
 		newOperationInvocation.methodName = this.methodName;
@@ -368,7 +372,18 @@ public class OperationInvocation extends AbstractCall {
 		if(this.methodName.equals(LANG.THIS) && operation.getClassName().equals(callerOperation.getClassName()) && operationName.equals(callerOperation.getName())) {
     		constructorCall = true;
     	}
-    	if(!this.methodName.equals(operationName) && !constructorCall) {
+    	boolean equalName = this.methodName.equals(operationName);
+		if(this.methodName.contains("::") && !operationName.contains("::")) {
+			String lastName = this.methodName.substring(this.methodName.lastIndexOf("::") + 2, this.methodName.length());
+			if(operationName.equals(lastName))
+				equalName = true;
+		}
+		else if(!this.methodName.contains("::") && operationName.contains("::")) {
+			String lastName = operationName.substring(operationName.lastIndexOf("::") + 2, operationName.length());
+			if(this.methodName.equals(lastName))
+				equalName = true;
+		}
+		if(!equalName && !constructorCall) {
     		return false;
     	}
     	Map<String, Set<VariableDeclaration>> variableDeclarationMap = callerOperation.variableDeclarationMap();
@@ -647,7 +662,8 @@ public class OperationInvocation extends AbstractCall {
     }
 
 	private static boolean exactlyMatchingArgumentType(UMLType parameterType, UMLType argumentType) {
-		return parameterType.getClassType().equals(argumentType.toString()) || parameterType.toString().equals(argumentType.toString());
+		return parameterType.getClassType().equals(argumentType.toString()) || parameterType.toString().equals(argumentType.toString())
+				|| parameterType.toString().equals(argumentType.toString() + "&") || parameterType.toString().equals("const " + argumentType.toString() + "&") || parameterType.toString().equals("const " + argumentType.toString());
 	}
 
 	private static String handleNumber(String argument) {
@@ -683,6 +699,15 @@ public class OperationInvocation extends AbstractCall {
     	if(type instanceof InferredType || parameterType instanceof InferredType)
     		return true;
     	if(parameterType.getClassType().length() == 1) {
+    		return true;
+    	}
+    	if(parameterType.toString().equals(type.toString() + "&") || parameterType.toString().equals("const " + type.toString() + "&") || parameterType.toString().equals("const " + type.toString())) {
+    		return true;
+    	}
+    	if(type1.startsWith("int") && type2.startsWith("int")) {
+    		return true;
+    	}
+    	if(type2.equals("auto") || type2.equals("auto*")) {
     		return true;
     	}
     	if(type2.equals("var")) {
@@ -1423,6 +1448,19 @@ public class OperationInvocation extends AbstractCall {
 		}
 		else if(nameExpr instanceof ICPPASTUnaryExpression unary) {
 			this.methodName = unary.getOperand().getRawSignature();
+		}
+	}
+
+	public OperationInvocation(String fullCall, LocationInfo location, VariableDeclarationContainer container, String methodName, String expression, String[] arguments) {
+		this(fullCall, location);
+		this.container = container;
+		this.arguments = new ArrayList<String>();
+		this.numberOfArguments = arguments.length;
+		this.methodName = methodName;
+		if(expression != null)
+			this.expression = expression;
+		for(String arg : arguments) {
+			this.arguments.add(arg);
 		}
 	}
 }

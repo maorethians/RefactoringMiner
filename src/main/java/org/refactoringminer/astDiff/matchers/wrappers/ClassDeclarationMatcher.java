@@ -14,9 +14,11 @@ import gr.uom.java.xmi.UMLType;
 import gr.uom.java.xmi.UMLTypeAlias;
 import gr.uom.java.xmi.UMLTypeParameter;
 import gr.uom.java.xmi.decomposition.LeafExpression;
+import gr.uom.java.xmi.decomposition.UMLOperationBodyMapper;
 import gr.uom.java.xmi.decomposition.VariableDeclaration;
 import gr.uom.java.xmi.diff.UMLAnnotationListDiff;
 import gr.uom.java.xmi.diff.UMLClassBaseDiff;
+import gr.uom.java.xmi.diff.UMLForwardDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportListDiff;
 import gr.uom.java.xmi.diff.UMLTypeAliasListDiff;
@@ -393,7 +395,8 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             }
         }
         if(classDiff.getForwardDeclarationListDiff().isPresent()) {
-            for (org.apache.commons.lang3.tuple.Pair<UMLForwardDeclaration, UMLForwardDeclaration> statementPair : classDiff.getForwardDeclarationListDiff().get().getCommonDeclarations()) {
+            UMLForwardDeclarationListDiff umlForwardDeclarationListDiff = classDiff.getForwardDeclarationListDiff().get();
+            for (org.apache.commons.lang3.tuple.Pair<UMLForwardDeclaration, UMLForwardDeclaration> statementPair : umlForwardDeclarationListDiff.getCommonDeclarations()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
                 if(srcStatement.getType().name.equals(LANG1.FRIEND_KEYWORD))
                     srcStatement = srcStatement.getParent();
@@ -469,6 +472,9 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                         mappingStore.addMapping(t1,t2);
                     }
                 }
+            }
+            for(UMLOperationBodyMapper umlOperationBodyMapper : umlForwardDeclarationListDiff.getOperationBodyMapperList()) {
+                new MethodMatcher(optimizationData, umlOperationBodyMapper, LANG1, LANG2).match(srcTree,dstTree,mappingStore);
             }
         }
         processSuperClasses(srcTypeDeclaration,dstTypeDeclaration,classDiff,mappingStore);
@@ -856,16 +862,22 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 }
             }
         }
+        handleParentNamespace(srcTypeDeclaration, dstTypeDeclaration, mappingStore, LANG1, LANG2);
+    }
+
+    public static void handleParentNamespace(Tree srcTypeDeclaration, Tree dstTypeDeclaration, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
         Tree parent1 = srcTypeDeclaration.getParent();
         Tree parent2 = dstTypeDeclaration.getParent();
         while(parent1 != null && parent2 != null) {
-            if(parent1.getType().equals(parent2.getType())) {
+            boolean methodBody1 = srcTypeDeclaration.getParent().getParent() != null && srcTypeDeclaration.getParent().getParent().getType().name.equals(LANG1.METHOD_DECLARATION);
+            boolean methodBody2 = dstTypeDeclaration.getParent().getParent() != null && dstTypeDeclaration.getParent().getParent().getType().name.equals(LANG2.METHOD_DECLARATION);
+            if(!methodBody1 && !methodBody2 && parent1.getType().equals(parent2.getType())) {
                 mappingStore.addMapping(parent1, parent2);
-                opening = Helpers.findPairOfType(parent1,parent2, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
+                Pair<Tree, Tree> opening = Helpers.findPairOfType(parent1,parent2, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
                 if (opening != null) {
                     mappingStore.addMapping(opening.first,opening.second);
                 }
-                closing = Helpers.findPairOfType(parent1,parent2, LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
+                Pair<Tree, Tree> closing = Helpers.findPairOfType(parent1,parent2, LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
                 if (closing != null) {
                     mappingStore.addMapping(closing.first,closing.second);
                 }
