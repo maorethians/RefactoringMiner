@@ -101,35 +101,59 @@ public class LangChainClient {
     }
 
     public String compileResults(String task, List<String> results) {
-        StringBuilder sb = new StringBuilder();
+        // Step 1: Generate an internal audit map to ensure no findings are missed and contradictions are flagged.
+        String auditMap = performSynthesisAudit(task, results);
 
+        // Step 2: Produce the final high-fidelity report using the audit map for grounding.
+        return produceFinalSynthesis(task, results, auditMap);
+    }
+
+    private String performSynthesisAudit(String task, List<String> results) {
+        StringBuilder sb = new StringBuilder();
         sb.append("You are a Technical Lead and Software Architect specializing in high-fidelity technical synthesis.\n\n");
         sb.append("The changes within a pull request or commit have been grouped into chapters of a coherent narrative. These chapters were analyzed individually to achieve the objective below:\n\n");
-
         sb.append("<objective>\n");
         sb.append(task);
         sb.append("\n</objective>\n\n");
 
         sb.append("Below are the intermediate results produced for each chapter:\n");
-        for (String result : results) {
-            sb.append("<intermediate_result>\n");
-            sb.append(result);
-            sb.append("\n</intermediate_result>\n");
+        for (int i = 0; i < results.size(); i++) {
+            sb.append(String.format("[Chapter %d]\n%s\n\n", i + 1, results.get(i)));
         }
 
-        sb.append("\nYour task is to compile these results into a comprehensive, standalone final answer. To ensure maximum accuracy and auditability, follow this two-step process:\n\n");
-        sb.append("### Step 1: Synthesis Scratchpad (Internal Monologue)\n");
-        sb.append("Before writing the final response, create a brief internal mapping in your reasoning:\n");
-        sb.append("- List every unique finding across all chapters.\n");
-        sb.append("- Identify which chapters support each finding (e.g., Finding A is mentioned in Chapters 1, 3, and 5).\n");
-        sb.append("- Flag any contradictions (e.g., Chapter 2 claims X, but Chapter 6 contradicts this).\n\n");
+        sb.append("\nYour task is to create a synthesis scratchpad/mapping before the final answer is written. This must be an exhaustive audit of the data.\n");
+        sb.append("Please provide:\n");
+        sb.append("1. A list of every unique finding across all chapters, mapped to its source chapter(s).\n");
+        sb.append("2. Explicit identification of any contradictions (e.g., Chapter 2 claims X is fixed, but Chapter 6 shows it's still broken).\n");
+        sb.append("3. A mapping of which findings directly satisfy the objective and which are secondary context.\n\n");
+        sb.append("Output this as a structured audit map. Do not write the final report yet.");
 
-        sb.append("### Step 2: Final Synthesis\n");
-        sb.append("Produce the final answer based on your scratchpad, adhering to these strict guidelines:\n\n");
+        return generate(sb.toString());
+    }
+
+    private String produceFinalSynthesis(String task, List<String> results, String auditMap) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are a Technical Lead and Software Architect specializing in high-fidelity technical synthesis.\n\n");
+        sb.append("The changes within a pull request or commit have been grouped into chapters of a coherent narrative. These chapters were analyzed individually to achieve the objective below:\n\n");
+        sb.append("<objective>\n");
+        sb.append(task);
+        sb.append("\n</objective>\n\n");
+
+        sb.append("Below are the intermediate results produced for each chapter:\n");
+        for (int i = 0; i < results.size(); i++) {
+            sb.append(String.format("[Chapter %d]\n%s\n\n", i + 1, results.get(i)));
+        }
+
+        sb.append("\n### Synthesis Audit Map\n");
+        sb.append("The following audit map has been prepared to ensure maximum fidelity and prevent hallucinations:\n");
+        sb.append(auditMap);
+        sb.append("\n\n");
+
+        sb.append("Your task is to compile these results into a comprehensive, standalone final answer based on the provided audit map. Adhere to these strict guidelines:\n\n");
         sb.append("<synthesis_guidelines>\n");
         sb.append("1. **Deduplication**: Merge overlapping findings into single, clear statements.\n");
-        sb.append("2. **Strict Fidelity & Evidence Mapping**: Every claim must be explicitly cited using a source tag (e.g., [Chapter 1], [Chapter 4]). If multiple chapters contribute to a merged finding, list all of them (e.g., [Chapter 1, 3]). Any statement that cannot be mapped to a source result is a hallucination and MUST be removed.\n");
-        sb.append("3. **Conflict Resolution**: If intermediate results contradict each other, explicitly note the discrepancy in the final answer rather than choosing one arbitrarily.\n");
+        sb.append("2. **Strict Fidelity & Evidence Mapping**: Every claim must be explicitly cited using a source tag (e.g., [Chapter 1], [Chapter 4]). If multiple chapters contribute to a merged finding, list all of them (e.g., [Chapter 1, 3]). Any statement that cannot be mapped to the audit map/source results is a hallucination and MUST be removed.\n");
+        sb.append("3. **Conflict Resolution**: If intermediate results contradict each other (as flagged in the audit map), explicitly note the discrepancy in the final answer rather than choosing one arbitrarily.\n");
         sb.append("4. **Standalone Answer**: The final result must be self-contained, professional in tone, and require no further context to understand.\n");
         sb.append("5. **Adaptive Structure**: Present findings in a logical technical format (e.g., Executive Summary followed by Detailed Analysis with citations) unless the objective specifies otherwise.\n");
         sb.append("</synthesis_guidelines>\n\n");
