@@ -13,6 +13,8 @@ import java.util.*;
 public class ContextCRBenchRunner {
 
     private static final String DATASET_PATH = "dataset/contextCRBench";
+    private static final String DETAILED_PRS_PATH = "dataset/detailedPRs";
+    private static final String MIN_CREATED_AT = "2025-02-01T00:00:00Z";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
 
@@ -49,6 +51,21 @@ public class ContextCRBenchRunner {
                     String org = parts[0];
                     String repoName = parts[1];
                     String prNumber = parts[2];
+
+                    // Filter by creation date using detailed PR
+                    String detailedPrFileName = String.format("%s_%s_%s.json", org, repoName, prNumber);
+                    File detailedPrFile = new File(DETAILED_PRS_PATH, detailedPrFileName);
+                    if (detailedPrFile.exists()) {
+                        String detailedContent = new String(Files.readAllBytes(detailedPrFile.toPath()), StandardCharsets.UTF_8);
+                        JsonObject detailedPrJson = JsonParser.parseString(detailedContent).getAsJsonObject();
+                        String createdAt = detailedPrJson.get("created_at").getAsString();
+                        if (createdAt.compareTo(MIN_CREATED_AT) < 0) {
+                            System.out.println("Skipping PR created before " + MIN_CREATED_AT + ": " + detailedPrFileName);
+                            continue;
+                        }
+                    } else {
+                        System.err.println("Detailed PR not found: " + detailedPrFileName);
+                    }
 
                     // Group review comments by submitted_on_commit
                     Map<String, List<JsonObject>> commitGroups = new HashMap<>();

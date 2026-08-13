@@ -19,7 +19,7 @@ public class LangChainClient {
     public static LangChainClient create() {
         String provider = "ollama";
         String apiKey = "";
-        String modelName = "qwen3.6:35b";
+        String modelName = "gemma4:31b";
         String baseUrl = "http://localhost:11435";
 
         ChatLanguageModel model;
