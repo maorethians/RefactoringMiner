@@ -83,6 +83,7 @@ public class ContextCRBenchRunner {
                     String baseCommit = json.get("base_commit").getAsString();
                     for (Map.Entry<String, List<JsonObject>> entry : commitGroups.entrySet()) {
                         String submittedCommit = entry.getKey();
+                        purgeLog();
 
                         // Check if result already exists for this commit
                         String resultFileName = String.format("%s_%s_%s_%s.json", org, repoName, prNumber, submittedCommit);
@@ -98,7 +99,7 @@ public class ContextCRBenchRunner {
                         long end = System.currentTimeMillis();
                         long timing = end - start;
 
-                        TokenUsage tokens = readAndPurgeLog();
+                        TokenUsage tokens = readLog();
 
                         BenchResult result = new BenchResult();
                         result.org = org;
@@ -130,7 +131,14 @@ public class ContextCRBenchRunner {
         }
     }
 
-    private static TokenUsage readAndPurgeLog() throws IOException {
+    private static void purgeLog() throws IOException {
+        Path logPath = Paths.get(LOG_FILE);
+        if (Files.exists(logPath)) {
+            Files.write(logPath, new byte[0], StandardOpenOption.TRUNCATE_EXISTING);
+        }
+    }
+
+    private static TokenUsage readLog() throws IOException {
         Path logPath = Paths.get(LOG_FILE);
         if (!Files.exists(logPath)) {
             return new TokenUsage(0, 0);
@@ -152,9 +160,6 @@ public class ContextCRBenchRunner {
                 System.err.println("Failed to parse tokens from log line: " + lastLine);
             }
         }
-
-        // Purge the log file
-        Files.write(logPath, new byte[0], StandardOpenOption.TRUNCATE_EXISTING);
 
         return new TokenUsage(in, out);
     }
