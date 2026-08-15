@@ -10,7 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 
-public class ContextCRBenchRunner {
+public class Benchmark {
 
     private static final String DATASET_PATH = "dataset/contextCRBench";
     private static final String DETAILED_PRS_PATH = "dataset/detailedPRs";
