@@ -19,6 +19,10 @@ public class Benchmark {
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
 
     public static void main(String[] args) {
+        runBenchmark();
+    }
+
+    private static void runBenchmark() {
         try {
             File resultsDir = new File(RESULTS_DIR);
             if (!resultsDir.exists()) {
