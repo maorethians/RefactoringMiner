@@ -14,7 +14,7 @@ public class Benchmark {
 
     private static final String DATASET_PATH = "dataset/contextCRBench";
     private static final String DETAILED_PRS_PATH = "dataset/detailedPRs";
-    private static final String MIN_CREATED_AT = "2025-02-01T00:00:00Z";
+    private static final String MIN_CREATED_AT = "2024-03-01T00:00:00Z";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
 

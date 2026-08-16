@@ -10,7 +10,7 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 public class Narrator {
-    public static final int THRESHOLD = 1000;
+    public static final int THRESHOLD = 9999999;
 
     private final TraversalPattern rootPattern;
     private final Map<GrainLevel, List<TraversalPattern>> cache = new HashMap<>();
