@@ -126,7 +126,7 @@ public class NarrativeService {
         }
 
         String rawDiffUrl = url;
-        if ((url.contains("/pull/") || url.contains("/pr/") || url.contains("/commit/")) && !url.endsWith(".diff")) {
+        if ((url.contains("/pull/") || url.contains("/pr/") || url.contains("/commit/") || url.contains("/compare/")) && !url.endsWith(".diff")) {
             rawDiffUrl = url + ".diff";
         }
 
