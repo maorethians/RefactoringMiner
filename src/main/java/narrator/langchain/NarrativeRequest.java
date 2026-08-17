@@ -5,12 +5,10 @@ import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 public class NarrativeRequest {
     private final String url;
     private final GrainLevel grainLevel;
-    private final String task;
 
-    public NarrativeRequest(String url, GrainLevel grainLevel, String task) {
+    public NarrativeRequest(String url, GrainLevel grainLevel) {
         this.url = url;
         this.grainLevel = grainLevel;
-        this.task = task;
     }
 
     public String getUrl() {
@@ -19,9 +17,5 @@ public class NarrativeRequest {
 
     public GrainLevel getGrainLevel() {
         return grainLevel;
-    }
-
-    public String getTask() {
-        return task;
     }
 }

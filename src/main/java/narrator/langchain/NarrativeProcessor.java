@@ -19,7 +19,6 @@ public class NarrativeProcessor {
     public NarrativeResponse process(NarrativeRequest request) throws Exception {
         String url = request.getUrl();
         GrainLevel level = request.getGrainLevel();
-        String task = request.getTask();
 
         // 1. Initialize and get chapters
         narrativeService.initializeNarrative(url);
@@ -33,8 +32,8 @@ public class NarrativeProcessor {
 
             Narrator.ChapterUnit chapter = chapters.get(i);
             String content = chapter.getContent();
-            Set<String> understanding = state.getUnderstanding(chapter);
-            String response = langchainClient.processChapter(task, content, understanding);
+            List<String> understandings = state.getDependencyUnderstandings(chapter);
+            String response = langchainClient.processChapter(content, understandings);
 
             ParsedResponse parsed = parseResponse(response);
 
@@ -43,7 +42,7 @@ public class NarrativeProcessor {
         }
 
         // 3. Final compilation
-        String finalResult = langchainClient.compileResults(task, state.getResults());
+        String finalResult = langchainClient.compileResults(state.getResults(), chapters.stream().map(state::getUnderstanding).toList());
         return new NarrativeResponse(finalResult);
     }
 

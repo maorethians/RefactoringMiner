@@ -21,11 +21,15 @@ public class NarrativeState {
         chapterResult.put(chapter, result);
     }
 
-    public Set<String> getUnderstanding(Narrator.ChapterUnit chapter) {
+    public List<String> getDependencyUnderstandings(Narrator.ChapterUnit chapter) {
         Set<Node> subjectSides = chapter.getSides();
         return chapterUnderstanding.entrySet().stream()
                 .filter(entry -> subjectSides.stream().anyMatch(side -> entry.getKey().getMains().contains(side)))
-                .map(Map.Entry::getValue).collect(Collectors.toSet());
+                .map(Map.Entry::getValue).toList();
+    }
+
+    public String getUnderstanding(Narrator.ChapterUnit chapter) {
+        return chapterUnderstanding.get(chapter);
     }
 
     public List<String> getResults() {
