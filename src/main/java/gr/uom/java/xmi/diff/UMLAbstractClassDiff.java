@@ -3278,6 +3278,9 @@ public abstract class UMLAbstractClassDiff {
 								if(mappings == maxMappings && replacements == minReplacements) {
 									filteredMapperSet2.add(mapper);
 								}
+								else if(mappings <= maxMappings && replacements == minReplacements && addedOperations.size() == 1) {
+									filteredMapperSet2.add(mapper);
+								}
 								else if(mappings <= maxMappings && replacements >= minReplacements && mapper.getOperation1().getName().contains(mapper.getOperation2().getName())) {
 									filteredMapperSet2.add(mapper);
 								}
@@ -4039,7 +4042,7 @@ public abstract class UMLAbstractClassDiff {
 				removedOperation.equalSignatureForAbstractMethods(addedOperation)) {
 			boolean zeroNonMapped = operationBodyMapper.getNonMappedLeavesT1().size() == 0 && operationBodyMapper.getNonMappedLeavesT2().size() == 0 &&
 					operationBodyMapper.getNonMappedInnerNodesT1().size() == 0 && operationBodyMapper.getNonMappedInnerNodesT2().size() == 0 &&
-					removedOperation.hasTestAnnotation() && addedOperation.hasTestAnnotation();
+					removedOperation.hasTestAnnotation() && (addedOperation.hasTestAnnotation() || addedOperation.hasParameterizedTestAnnotation());
 			boolean containsAnonymousClassDiff = operationBodyMapper.getAnonymousClassDiffs().size() > 0 &&
 					!removedOperation.hasTestAnnotation() && !addedOperation.hasTestAnnotation();
 			int absoluteDifferenceInPosition = computeAbsoluteDifferenceInPositionWithinClass(removedOperation, addedOperation);
