@@ -5,7 +5,7 @@ import java.util.Set;
 
 public class ReviewPrompt implements LangChainPrompt {
   @Override
-  public String chapter(String content, Set<String> understandings) {
+  public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
     prompt.append("You are an expert Senior Software Engineer conducting a deep, rigorous code review of a pull request. ")
             .append("The PR's changes have been divided into 'chapters' based on dependencies. You are reviewing one specific chapter. ")
