@@ -28,22 +28,28 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### YOUR TASK\n");
     prompt.append("Perform a thorough review from all necessary aspects (Correctness, Security, Performance, Maintainability, Readability) with maximum depth.\n\n");
 
-    prompt.append("#### Step 1: UNDERSTANDING\n");
+    prompt.append("#### Step 1: understanding\n");
     prompt.append("Create a detailed technical analysis and reasoning workspace. You must:\n")
-            .append("- Analyze all changed identifiers, their roles, and the purpose of the changes.\n")
-            .append("- Explain how these changes interact with the dependency understandings provided above.\n")
-            .append("- Explicitly list identifiers that may act as dependencies for subsequent chapters (i.e., what a later reviewer needs to know about this chapter).\n\n");
+            .append("- Analyze all changed identifiers, their roles, and the purpose of the changes.\n");
+    if (understandings != null && !understandings.isEmpty()) {
+      prompt.append("- Explain how these changes interact with the dependency understandings provided above.\n");
+    }
+    prompt.append("- Explicitly list identifiers that may act as dependencies for subsequent chapters (i.e., what a later reviewer needs to know about this chapter).\n\n");
 
-    prompt.append("#### Step 2: INTERMEDIATE_RESULT\n");
+    prompt.append("#### Step 2: intermediate result\n");
     prompt.append("Based on your understanding, provide the specific, high-signal contributions to the overall code review.\n")
-            .append("- Focus on critical issues, potential bugs, or significant improvements.\n")
+            .append("- Focus on critical issues, potential bugs, or significant improvement opportunities.\n")
             .append("- The result must be modular and useful for a final synthesizer who has not read this chapter's raw content.\n")
-            .append("- IMPORTANT: Every review comment MUST refer to the specific change ID (e.g., 'Change PNHM: ...') provided in the <added id=\"...\"> or <modified id=\"...\"> tags so that the comment can be traced back to the exact hunk.\n\n");
+            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs (e.g., 'Change PNHM: ...') so that the comment can be traced back to the exact hunks.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
-    prompt.append("UNDERSTANDING:\n[Your detailed technical analysis and reasoning workspace]\n\n");
-    prompt.append("INTERMEDIATE_RESULT:\n[Your modular review comments referencing change IDs]");
+    prompt.append("<understanding>\n");
+    prompt.append("[Your detailed technical analysis and reasoning workspace]\n");
+    prompt.append("</understanding>\n\n");
+    prompt.append("<intermediate_result>\n");
+    prompt.append("[Your modular review comments referencing change IDs]\n");
+    prompt.append("</intermediate_result>\n");
 
     return prompt.toString();
   }
