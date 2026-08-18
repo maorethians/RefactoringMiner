@@ -60,48 +60,18 @@ public class ReviewPrompt implements LangChainPrompt {
   }
 
   public static ParsedResponse parseChapter(String response) {
-    String understanding = "No updated understanding provided.";
-    String result = "No intermediate result provided.";
+    int understandingOpen = response.indexOf("<understanding>");
+    int understandingClose = response.indexOf("</understanding>");
+    int resultOpen = response.indexOf("<intermediate_result>");
+    int resultClose = response.indexOf("</intermediate_result>");
 
-    // Try new XML-style format first: <understanding>...</understanding>, <intermediate_result>...</intermediate_result>
-    int undStartOpen = response.indexOf("<understanding>");
-    int undStartClose = response.indexOf("</understanding>");
-    int resStartOpen = response.indexOf("<intermediate_result>");
-    int resStartClose = response.indexOf("</intermediate_result>");
-
-    boolean hasXmlFormat = (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose)
-            || (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose);
-
-    if (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose) {
-      understanding = response.substring(undStartOpen + 15, undStartClose).trim();
-    }
-    if (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose) {
-      result = response.substring(resStartOpen + 21, resStartClose).trim();
-    }
-    if (!hasXmlFormat) {
-      // Fallback to legacy "key:" format
-      String lowerResponse = response.toLowerCase();
-      int understandingIdx = lowerResponse.indexOf("understanding:");
-      int resultIdx = lowerResponse.indexOf("result:");
-
-      if (understandingIdx != -1 && resultIdx != -1) {
-        if (understandingIdx < resultIdx) {
-          understanding = response.substring(understandingIdx + 14, resultIdx).trim();
-          result = response.substring(resultIdx + 7).trim();
-        } else {
-          result = response.substring(resultIdx + 7, understandingIdx).trim();
-          understanding = response.substring(understandingIdx + 14).trim();
-        }
-      } else if (understandingIdx != -1) {
-        understanding = response.substring(understandingIdx + 14).trim();
-      } else if (resultIdx != -1) {
-        result = response.substring(resultIdx + 7).trim();
-      } else {
-        // Final fallback: model just dumped the raw text
-        result = response;
-      }
+    if (understandingOpen == -1 || understandingClose == -1 || understandingOpen >= understandingClose
+            || resultOpen == -1 || resultClose == -1 || resultOpen >= resultClose) {
+      return null;
     }
 
+    String understanding = response.substring(understandingOpen + 15, understandingClose).trim();
+    String result = response.substring(resultOpen + 21, resultClose).trim();
     return new ParsedResponse(understanding, result);
   }
 
@@ -190,11 +160,12 @@ public class ReviewPrompt implements LangChainPrompt {
 
   public static List<ReviewComment> parseResult(String response) {
     List<ReviewComment> comments = new ArrayList<>();
-    if (response == null || response.isEmpty()) return comments;
+    if (response == null || response.isEmpty()) {
+      return comments;
+    };
 
     Pattern commentPattern = Pattern.compile("<comment>(.*?)</comment>", Pattern.DOTALL);
     Matcher commentMatcher = commentPattern.matcher(response);
-
     while (commentMatcher.find()) {
       String content = commentMatcher.group(1);
 
@@ -207,8 +178,11 @@ public class ReviewPrompt implements LangChainPrompt {
                 .filter(s -> !s.isEmpty())
                 .toList();
         comments.add(new ReviewComment(hunkIds, text));
+      } else {
+        System.out.println("Invalid comment");
       }
     }
+
     return comments;
   }
 
