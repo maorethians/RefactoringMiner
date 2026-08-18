@@ -1,10 +1,17 @@
 package narrator.langchain.prompt;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ReviewPrompt implements LangChainPrompt {
+  public record ReviewComment(List<String> hunkIds, String text) {}
+  public record ParsedResponse(String understanding, String result) {}
+
   @Override
+
   public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
     prompt.append("You are an expert Senior Software Engineer conducting a deep, rigorous code review of a pull request. ")
@@ -15,10 +22,8 @@ public class ReviewPrompt implements LangChainPrompt {
       prompt.append("### CONTEXT\n");
       prompt.append("Below are the 'Understandings' from previous chapters that this current chapter depends on. ")
               .append("Use these to understand the state of the code and any identifiers introduced or modified before this chapter:\n");
-      for (String u : understandings) {
-        prompt.append("\n---\n").append(u).append("\n");
-      }
-      prompt.append("\n");
+      prompt.append(String.join("\n", understandings.stream().map(understanding -> "<understanding>\n" + understanding + "\n</understanding>").toList()));
+      prompt.append("\n\n");
     }
 
     prompt.append("### CURRENT CHAPTER CONTENT\n");
@@ -54,6 +59,52 @@ public class ReviewPrompt implements LangChainPrompt {
     return prompt.toString();
   }
 
+  public static ParsedResponse parseChapter(String response) {
+    String understanding = "No updated understanding provided.";
+    String result = "No intermediate result provided.";
+
+    // Try new XML-style format first: <understanding>...</understanding>, <intermediate_result>...</intermediate_result>
+    int undStartOpen = response.indexOf("<understanding>");
+    int undStartClose = response.indexOf("</understanding>");
+    int resStartOpen = response.indexOf("<intermediate_result>");
+    int resStartClose = response.indexOf("</intermediate_result>");
+
+    boolean hasXmlFormat = (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose)
+            || (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose);
+
+    if (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose) {
+      understanding = response.substring(undStartOpen + 15, undStartClose).trim();
+    }
+    if (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose) {
+      result = response.substring(resStartOpen + 21, resStartClose).trim();
+    }
+    if (!hasXmlFormat) {
+      // Fallback to legacy "key:" format
+      String lowerResponse = response.toLowerCase();
+      int understandingIdx = lowerResponse.indexOf("understanding:");
+      int resultIdx = lowerResponse.indexOf("result:");
+
+      if (understandingIdx != -1 && resultIdx != -1) {
+        if (understandingIdx < resultIdx) {
+          understanding = response.substring(understandingIdx + 14, resultIdx).trim();
+          result = response.substring(resultIdx + 7).trim();
+        } else {
+          result = response.substring(resultIdx + 7, understandingIdx).trim();
+          understanding = response.substring(understandingIdx + 14).trim();
+        }
+      } else if (understandingIdx != -1) {
+        understanding = response.substring(understandingIdx + 14).trim();
+      } else if (resultIdx != -1) {
+        result = response.substring(resultIdx + 7).trim();
+      } else {
+        // Final fallback: model just dumped the raw text
+        result = response;
+      }
+    }
+
+    return new ParsedResponse(understanding, result);
+  }
+
   @Override
   public String understanding(List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
@@ -65,8 +116,9 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### INPUT DATA\n");
     prompt.append("Here are the understandings from all chapters:\n");
     for (int i = 0; i < understandings.size(); i++) {
-      prompt.append("\n--- Chapter ").append(i + 1).append(" Understanding ---\n")
-              .append(understandings.get(i)).append("\n");
+      prompt.append("<chapter").append(i + 1).append(">\n");
+      prompt.append(understandings.get(i)).append("\n");
+      prompt.append("</chapter").append(i + 1).append(">\n");
     }
 
     prompt.append("\n### YOUR TASK\n");
@@ -98,12 +150,13 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("1. The GLOBAL PR UNDERSTANDING: A synthesized technical map of the entire change set.\n")
             .append("2. INTERMEDIATE RESULTS: Modular review findings from individual chapters, ordered by their dependencies.\n\n");
 
-    prompt.append("### INPUT DATA\n");
-    prompt.append("#### Global PR Understanding:\n").append(understanding).append("\n\n");
+    prompt.append("### INPUT DATA\n\n");
+    prompt.append("#### Global PR Understanding:\n").append("<understanding>\n").append(understanding).append("\n</understanding>\n\n");
     prompt.append("#### Intermediate Results From Chapters:\n");
     for (int i = 0; i < results.size(); i++) {
-      prompt.append("\n--- Result from Chapter ").append(i + 1).append(" ---\n")
-              .append(results.get(i)).append("\n");
+      prompt.append("<chapter").append(i + 1).append(">\n");
+      prompt.append(results.get(i)).append("\n");
+      prompt.append("</chapter").append(i + 1).append(">\n");
     }
 
     prompt.append("\n### YOUR TASK\n");
@@ -116,16 +169,52 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("3. SIGNAL FILTERING: Ensure only high-signal findings make it to the final report. Redundant or trivial observations should be consolidated.\n\n");
 
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n");
-    prompt.append("Your output must be a simple list of review comments. Do not use JSON or YAML. Instead, follow these strict formatting rules:\n\n")
-            .append("- Each comment must start with the hunk IDs it refers to in this format: `[Hunks: ID1, ID2]` (e.g., `[Hunks: PNHM, ABC1]`).\n")
-            .append("- The review content follows immediately after the hunk IDs.\n")
-            .append("- Use exactly `---COMMENT_SEPARATOR---` as a delimiter between separate review comments.\n\n");
+    prompt.append("Your output must be a structured list of review comments wrapped in <review_comments> tags. Each comment must be enclosed in <comment> tags with separate fields for hunk IDs and the review text:\n\n")
+            .append("- Use `<hunks>` to list the hunk IDs this comment refers to (e.g., `<hunks>PNHM, ABC1</hunks>`).\n")
+            .append("- Use `<text>` for the actual review content.\n\n");
 
     prompt.append("Example Output:\n")
-            .append("[Hunks: PNHM]\nThe topic list fetch logic in AdminBrokerProcessor is missing a null check, which could lead to an NPE if the request header is malformed.\n")
-            .append("---COMMENT_SEPARATOR---\n")
-            .append("[Hunks: ABC1, DEF2]\nThe synchronization strategy across these two methods needs to be unified to prevent potential deadlocks in high-concurrency scenarios.");
+            .append("<review_comments>\n")
+            .append("  <comment>\n")
+            .append("    <hunks>PNHM</hunks>\n")
+            .append("    <text>The topic list fetch logic in AdminBrokerProcessor is missing a null check, which could lead to an NPE if the request header is malformed.</text>\n")
+            .append("  </comment>\n")
+            .append("  <comment>\n")
+            .append("    <hunks>ABC1, DEF2</hunks>\n")
+            .append("    <text>The synchronization strategy across these two methods needs to be unified to prevent potential deadlocks in high-concurrency scenarios.</text>\n")
+            .append("  </comment>\n")
+            .append("</review_comments>");
 
     return prompt.toString();
+  }
+
+  public static List<ReviewComment> parseResult(String response) {
+    List<ReviewComment> comments = new ArrayList<>();
+    if (response == null || response.isEmpty()) return comments;
+
+    Pattern commentPattern = Pattern.compile("<comment>(.*?)</comment>", Pattern.DOTALL);
+    Matcher commentMatcher = commentPattern.matcher(response);
+
+    while (commentMatcher.find()) {
+      String content = commentMatcher.group(1);
+
+      String hunksStr = extractTagContent(content, "hunks");
+      String text = extractTagContent(content, "text");
+
+      if (hunksStr != null && text != null) {
+        List<String> hunkIds = Arrays.stream(hunksStr.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+        comments.add(new ReviewComment(hunkIds, text));
+      }
+    }
+    return comments;
+  }
+
+  private static String extractTagContent(String input, String tag) {
+    Pattern p = Pattern.compile("<" + tag + ">(.*?)</" + tag + ">", Pattern.DOTALL);
+    Matcher m = p.matcher(input);
+    return m.find() ? m.group(1).trim() : null;
   }
 }

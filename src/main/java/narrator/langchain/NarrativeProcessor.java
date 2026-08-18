@@ -1,11 +1,11 @@
 package narrator.langchain;
 
+import narrator.langchain.prompt.ReviewPrompt;
 import narrator.service.NarrativeService;
 import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
 import java.util.List;
-import java.util.Set;
 
 public class NarrativeProcessor {
     private final NarrativeService narrativeService;
@@ -16,7 +16,7 @@ public class NarrativeProcessor {
         this.langchainClient = LangChainClient.create();
     }
 
-    public NarrativeResponse process(NarrativeRequest request) throws Exception {
+    public List<ReviewPrompt.ReviewComment> process(NarrativeRequest request) throws Exception {
         String url = request.getUrl();
         GrainLevel level = request.getGrainLevel();
 
@@ -31,67 +31,18 @@ public class NarrativeProcessor {
             System.out.println(i + 1 + "/" + chapters.size());
 
             Narrator.ChapterUnit chapter = chapters.get(i);
+
             String content = chapter.getContent();
             List<String> understandings = state.getDependencyUnderstandings(chapter);
-            String response = langchainClient.processChapter(content, understandings);
+            String chapterResult = langchainClient.processChapter(content, understandings);
 
-            ParsedResponse parsed = parseResponse(response);
-
-            state.setUnderstanding(chapter, parsed.understanding);
-            state.setResult(chapter, parsed.result);
+            ReviewPrompt.ParsedResponse parsedChapterResult = ReviewPrompt.parseChapter(chapterResult);
+            state.setUnderstanding(chapter, parsedChapterResult.understanding());
+            state.setResult(chapter, parsedChapterResult.result());
         }
 
         // 3. Final compilation
         String finalResult = langchainClient.compileResults(state.getResults(), chapters.stream().map(state::getUnderstanding).toList());
-        return new NarrativeResponse(finalResult);
-    }
-
-    private ParsedResponse parseResponse(String response) {
-        String understanding = "No updated understanding provided.";
-        String result = "No intermediate result provided.";
-
-        // Try new XML-style format first: <understanding>...</understanding>, <intermediate_result>...</intermediate_result>
-        int undStartOpen = response.indexOf("<understanding>");
-        int undStartClose = response.indexOf("</understanding>");
-        int resStartOpen = response.indexOf("<intermediate_result>");
-        int resStartClose = response.indexOf("</intermediate_result>");
-
-        boolean hasXmlFormat = (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose)
-                || (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose);
-
-        if (undStartOpen != -1 && undStartClose != -1 && undStartOpen < undStartClose) {
-            understanding = response.substring(undStartOpen + 15, undStartClose).trim();
-        }
-        if (resStartOpen != -1 && resStartClose != -1 && resStartOpen < resStartClose) {
-            result = response.substring(resStartOpen + 21, resStartClose).trim();
-        }
-        if (!hasXmlFormat) {
-            // Fallback to legacy "key:" format
-            String lowerResponse = response.toLowerCase();
-            int understandingIdx = lowerResponse.indexOf("understanding:");
-            int resultIdx = lowerResponse.indexOf("result:");
-
-            if (understandingIdx != -1 && resultIdx != -1) {
-                if (understandingIdx < resultIdx) {
-                    understanding = response.substring(understandingIdx + 14, resultIdx).trim();
-                    result = response.substring(resultIdx + 7).trim();
-                } else {
-                    result = response.substring(resultIdx + 7, understandingIdx).trim();
-                    understanding = response.substring(understandingIdx + 14).trim();
-                }
-            } else if (understandingIdx != -1) {
-                understanding = response.substring(understandingIdx + 14).trim();
-            } else if (resultIdx != -1) {
-                result = response.substring(resultIdx + 7).trim();
-            } else {
-                // Final fallback: model just dumped the raw text
-                result = response;
-            }
-        }
-
-        return new ParsedResponse(understanding, result);
-    }
-
-    public record ParsedResponse(String understanding, String result) {
+        return ReviewPrompt.parseResult(finalResult);
     }
 }
