@@ -607,7 +607,7 @@ public class MethodMatcher extends BodyMapperMatcher{
                 new RefactoringMatcher(optimizationData, new ArrayList<>(bodyMapper.getRefactoringsAfterPostProcessing())).
                         matchAndUpdateOptimizationStore(srcTree, dstTree, mappingStore);
             }
-            boolean isMovedMethod = refactoringProcessor && !umlOperationBodyMapper.getContainer1().getClassName().equals(umlOperationBodyMapper.getContainer2().getClassName());
+            boolean isMovedMethod = !umlOperationBodyMapper.getContainer1().getClassName().equals(umlOperationBodyMapper.getContainer2().getClassName());
             if(PathFileUtils.isCppFile(umlOperationBodyMapper.getContainer1().getLocationInfo().getFilePath()) && PathFileUtils.isCppFile(umlOperationBodyMapper.getContainer2().getLocationInfo().getFilePath()) &&
                     umlOperationBodyMapper.getContainer1().getLocationInfo().getFilePath().equals(umlOperationBodyMapper.getContainer2().getLocationInfo().getFilePath()) && !isMovedMethod) {
                 ClassDeclarationMatcher.handleParentNamespace(srcOperationNode, dstOperationNode, mappingStore, LANG1, LANG2);
@@ -818,6 +818,13 @@ public class MethodMatcher extends BodyMapperMatcher{
             mappingStore.addMapping(matched.first,matched.second);
             processTreesContainingFunctionDeclarators(matched.first,matched.second, mappingStore);
         }
+        if(srcOperationNode.getType().name.equals(LANG1.REFERENCE_DECLARATOR) && dstOperationNode.getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
+            mappingStore.addMapping(srcOperationNode, dstOperationNode);
+            Tree functionDeclarator1 = TreeUtilFunctions.findChildByType(srcOperationNode, LANG1.FUNCTION_DECLARATOR);
+            if(functionDeclarator1 != null) {
+                processFunctionDeclarators(functionDeclarator1, dstOperationNode, mappingStore);
+            }
+        }
         com.github.gumtreediff.utils.Pair<Tree,Tree> qualified_identifiers = Helpers.findPairOfType(srcOperationNode,dstOperationNode,LANG1.QUALIFIED_IDENTIFIER,LANG2.QUALIFIED_IDENTIFIER);
         if (qualified_identifiers != null) {
             mappingStore.addMappingRecursively(qualified_identifiers.first,qualified_identifiers.second);
@@ -1001,6 +1008,15 @@ public class MethodMatcher extends BodyMapperMatcher{
                 processFunctionDeclarators(matched.first, matched.second, mappingStore);
             }
         }
+        Tree t1 = TreeUtilFunctions.findChildByType(srcOperationNode, LANG1.REFERENCE_DECLARATOR);
+        Tree t2 = TreeUtilFunctions.findChildByType(dstOperationNode, LANG1.FUNCTION_DECLARATOR);
+        if(t1 != null && t2 != null) {
+            mappingStore.addMapping(t1, t2);
+            Tree functionDeclarator1 = TreeUtilFunctions.findChildByType(t1, LANG1.FUNCTION_DECLARATOR);
+            if(functionDeclarator1 != null) {
+                processFunctionDeclarators(functionDeclarator1, t2, mappingStore);
+            }
+        }
         matched = Helpers.findPairOfType(srcOperationNode,dstOperationNode,LANG1.POINTER,LANG2.POINTER);
         if (matched != null) {
             mappingStore.addMapping(matched.first,matched.second);
@@ -1100,6 +1116,10 @@ public class MethodMatcher extends BodyMapperMatcher{
         com.github.gumtreediff.utils.Pair<Tree,Tree> trailing_return_types = Helpers.findPairOfType(functionDeclarator1,functionDeclarator2,LANG1.TRAILING_RETURN_TYPE,LANG2.TRAILING_RETURN_TYPE);
         if (trailing_return_types != null) {
             mappingStore.addMappingRecursively(trailing_return_types.first,trailing_return_types.second);
+        }
+        com.github.gumtreediff.utils.Pair<Tree,Tree> ref_qualifiers = Helpers.findPairOfType(functionDeclarator1,functionDeclarator2,LANG1.REF_QUALIFIER,LANG2.REF_QUALIFIER);
+        if (ref_qualifiers != null) {
+            mappingStore.addMappingRecursively(ref_qualifiers.first,ref_qualifiers.second);
         }
         Tree parent1 = functionDeclarator1.getParent();
         Tree parent2 = functionDeclarator2.getParent();
