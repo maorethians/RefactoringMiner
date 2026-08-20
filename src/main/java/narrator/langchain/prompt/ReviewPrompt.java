@@ -52,7 +52,7 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("- NO GENERIC ADVICE: Forbidden are comments like 'ensure X is handled' or 'consider checking Y'. If you suspect an issue, explain EXACTLY why it is a problem in this specific context and provide the fix.\n")
             .append("- SPECIFIC ALTERNATIVES: When suggesting an improvement, refactoring, or rewrite, do not be vague. Provide the concrete logic, a pseudo-code sketch, or a detailed description of the better approach.\n")
             .append("- FOCUS ON IMPACT: Prioritize critical bugs and architectural flaws over stylistic preferences.\n")
-            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs (e.g., 'Change PNHM: ...') so it can be traced back to the exact hunks.\n\n");
+            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs so it can be traced back to the exact hunks.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
@@ -148,18 +148,9 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n");
     prompt.append("Your output must be a list of review comments wrapped in <review_comments> tags.\n")
             .append("Each comment section should consist of:\n")
-            .append("1. The first line: A comma-separated list of hunk IDs this comment refers to (e.g., PNHM, ABC1).\n")
+            .append("1. The first line: A comma-separated list of hunk IDs this comment refers to.\n")
             .append("2. Subsequent lines: The detailed review text.\n\n")
             .append("Use the exact separator '---COMMENT-SEPARATOR---' between individual comments.\n\n");
-
-    prompt.append("Example Output:\n")
-            .append("<review_comments>\n")
-            .append("PNHM\n")
-            .append("The topic list fetch logic in AdminBrokerProcessor is missing a null check, which could lead to an NPE if the request header is malformed.\n")
-            .append("---COMMENT-SEPARATOR---\n")
-            .append("ABC1, DEF2\n")
-            .append("The synchronization strategy across these two methods needs to be unified to prevent potential deadlocks in high-concurrency scenarios. This is a multi-line comment for demonstration.\n")
-            .append("</review_comments>");
 
     return prompt.toString();
   }
