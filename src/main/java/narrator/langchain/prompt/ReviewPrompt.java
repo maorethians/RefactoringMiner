@@ -158,7 +158,7 @@ public class ReviewPrompt implements LangChainPrompt {
     return prompt.toString();
   }
 
-  public static List<ReviewComment> parseResult(String response) {
+  public static List<ReviewComment> parseResult(String response) throws Exception {
     List<ReviewComment> comments = new ArrayList<>();
     if (response == null || response.isEmpty()) {
       return comments;
@@ -179,7 +179,7 @@ public class ReviewPrompt implements LangChainPrompt {
                 .toList();
         comments.add(new ReviewComment(hunkIds, text));
       } else {
-        System.out.println("Invalid comment");
+        throw new Exception("Invalid Comment Format:" + content);
       }
     }
 

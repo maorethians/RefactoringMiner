@@ -1,14 +1,22 @@
 package narrator.bench;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import narrator.langchain.NarrativeProcessor;
 import narrator.langchain.NarrativeRunner;
+import narrator.langchain.prompt.ReviewPrompt;
+import org.refactoringminer.astDiff.graph.Node;
+import org.refactoringminer.astDiff.graph.NodeType;
+import org.refactoringminer.astDiff.graph.cluster.Cluster;
 
+import javax.annotation.Nullable;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class Benchmark {
 
@@ -97,11 +105,42 @@ public class Benchmark {
                         }
 
                         String rangeUrl = "https://github.com/" + repo + "/compare/" + baseCommit + "..." + submittedCommit;
+                        System.out.println(rangeUrl);
 
                         long start = System.currentTimeMillis();
-                        String output = NarrativeRunner.run(rangeUrl);
+                        NarrativeProcessor.NarrativeProcessResult narrativeResult = NarrativeRunner.run(rangeUrl);
                         long end = System.currentTimeMillis();
                         long timing = end - start;
+
+                        Set<GeneratedCommentNodes> generatedCommentsNodes = new HashSet<>();
+                        for (ReviewPrompt.ReviewComment generatedComment : narrativeResult.comments()) {
+                            List<Node> commentNodes = generatedComment.hunkIds().stream()
+                                    .map(promptId -> findNode(narrativeResult.clusters(), promptId)).toList();
+                            if (commentNodes.stream().anyMatch(Objects::isNull)) {
+                                System.out.println("Hallucinated id detected");
+                            }
+
+                            Set<Node> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
+                            if (validNodes.isEmpty()) {
+                                throw new Exception("No valid nodes found");
+                            }
+
+                            generatedCommentsNodes.add(new GeneratedCommentNodes(generatedComment.text(), validNodes));
+                        }
+
+                        Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
+                        for (JsonObject groundTruthComment : entry.getValue()) {
+                            String path = groundTruthComment.get("path").getAsString();
+                            String side = groundTruthComment.get("side").getAsString();
+                            int line = groundTruthComment.get("line").getAsInt();
+                            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), path, side, line);
+
+                            groundTruthGeneratedComments.put(groundTruthComment, generatedCommentsNodes.stream()
+                                    .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
+                                    .collect(Collectors.toSet()));
+                        }
+
+                        System.out.println("Recall: " + (double) groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count() / groundTruthGeneratedComments.size());
 
                         TokenUsage tokens = readLog();
 
@@ -110,17 +149,17 @@ public class Benchmark {
                         result.repo = repoName;
                         result.prNumber = prNumber;
                         result.commit = submittedCommit;
-                        result.output = output;
+                        result.generatedCommentsNodes = generatedCommentsNodes.stream().map(GeneratedCommentNodes::stringify).toList();
+                        result.groundTruthGeneratedCommentsNodes = groundTruthGeneratedComments.entrySet().stream()
+                                .map(e -> new GroundTruthGeneratedCommentsNodes(e.getKey(), e.getValue().stream().map(GeneratedCommentNodes::stringify).toList())).toList();
+                        result.uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
+                        result.coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
                         result.timing = timing;
                         result.tokensIn = tokens.in;
                         result.tokensOut = tokens.out;
 
                         // Store result JSON
                         Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
-
-                        // Store raw output TXT
-                        String outputFileName = String.format("%s_%s_%s_%s.txt", org, repoName, prNumber, submittedCommit);
-                        Files.write(Paths.get(RESULTS_DIR, outputFileName), (output != null ? output : "").getBytes(StandardCharsets.UTF_8));
                     }
 
                 } catch (Exception e) {
@@ -168,9 +207,23 @@ public class Benchmark {
         return new TokenUsage(in, out);
     }
 
+    @Nullable
+    private static Node findNode(List<Cluster> clusters, String promptId) {
+        return clusters.stream()
+                .map(cluster -> cluster.findNode(promptId)).filter(Objects::nonNull).findFirst().orElse(null);
+    }
+
+    private static Set<Node> findNodes(List<Cluster> clusters, String side, String path, int line) {
+        return clusters.stream()
+                .map(cluster -> cluster.findNodes(path, side, line)).flatMap(Set::stream)
+                .filter(node -> !node.getNodeType().equals(NodeType.LOCATION_CONTEXT))
+                .collect(Collectors.toSet());
+    }
+
     private static class TokenUsage {
         long in;
         long out;
+
         TokenUsage(long in, long out) {
             this.in = in;
             this.out = out;
@@ -182,9 +235,26 @@ public class Benchmark {
         String repo;
         String prNumber;
         String commit;
-        String output;
+        List<StringifiedGeneratedCommentNodes> generatedCommentsNodes;
+        List<GroundTruthGeneratedCommentsNodes> groundTruthGeneratedCommentsNodes;
+        long coveredGroundTruth;
+        long uncoveredGroundTruth;
         long timing;
         long tokensIn;
         long tokensOut;
     }
+
+    private record GroundTruthGeneratedCommentsNodes(JsonObject groundTruth, List<StringifiedGeneratedCommentNodes> generatedCommentsNodes) {}
+
+    private record GeneratedCommentNodes(String comment, Set<Node> nodes) {
+        public StringifiedGeneratedCommentNodes stringify() {
+            JsonArray stringifiedNodes = new JsonArray();
+            for (Node node : nodes) {
+                stringifiedNodes.add(node.stringify());
+            }
+
+            return new StringifiedGeneratedCommentNodes(comment, stringifiedNodes);
+        }
+    }
+    private record StringifiedGeneratedCommentNodes(String comment, JsonArray nodes) {}
 }

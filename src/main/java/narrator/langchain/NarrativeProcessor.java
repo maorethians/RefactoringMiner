@@ -2,6 +2,7 @@ package narrator.langchain;
 
 import narrator.langchain.prompt.ReviewPrompt;
 import narrator.service.NarrativeService;
+import org.refactoringminer.astDiff.graph.cluster.Cluster;
 import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
@@ -16,7 +17,7 @@ public class NarrativeProcessor {
         this.langchainClient = LangChainClient.create();
     }
 
-    public List<ReviewPrompt.ReviewComment> process(NarrativeRequest request) throws Exception {
+    public NarrativeProcessResult process(NarrativeRequest request) throws Exception {
         String url = request.getUrl();
         GrainLevel level = request.getGrainLevel();
 
@@ -46,6 +47,14 @@ public class NarrativeProcessor {
 
         // 3. Final compilation
         String finalResult = langchainClient.compileResults(state.getResults(), chapters.stream().map(state::getUnderstanding).toList());
-        return ReviewPrompt.parseResult(finalResult);
+        List<ReviewPrompt.ReviewComment> finalParsedResult = ReviewPrompt.parseResult(finalResult);
+        return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), finalParsedResult);
+    }
+
+    public record NarrativeProcessResult(List<Cluster> clusters, List<ReviewPrompt.ReviewComment> comments) {
+        public String content() {
+            return String.join("\n\n", comments.stream()
+                    .map(comment -> String.join(", ", comment.hunkIds()) + ": " + comment.text()).toList());
+        }
     }
 }
