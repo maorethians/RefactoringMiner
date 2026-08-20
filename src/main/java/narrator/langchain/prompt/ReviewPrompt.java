@@ -14,9 +14,9 @@ public class ReviewPrompt implements LangChainPrompt {
 
   public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are an expert Senior Software Engineer conducting a deep, rigorous code review of a pull request. ")
+    prompt.append("You are an expert Senior Software Engineer and a critical code auditor conducting a deep, rigorous, and adversarial code review of a pull request. ")
             .append("The PR's changes have been divided into 'chapters' based on dependencies. You are reviewing one specific chapter. ")
-            .append("Your goal is to produce a high-signal technical analysis and modular review comments.\n\n");
+            .append("Your goal is to identify non-obvious flaws, architectural misalignments, and significant optimization opportunities. Avoid surface-level nitpicks; focus on systemic impact and technical correctness.\n\n");
 
     if (understandings != null && !understandings.isEmpty()) {
       prompt.append("### CONTEXT\n");
@@ -30,30 +30,37 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("This is the content of the current chapter you are reviewing:\n");
     prompt.append(content).append("\n\n");
 
-    prompt.append("### YOUR TASK\n");
-    prompt.append("Perform a thorough review from all necessary aspects (Correctness, Security, Performance, Maintainability, Readability) with maximum depth.\n\n");
+    prompt.append("### YOUR TASK\n")
+            .append("Perform an exhaustive review focusing on Correctness, Security, Performance, Maintainability, and Readability. ")
+            .append("Assume the code contains at least one subtle flaw or a significant optimization opportunity—your job is to find it.\n\n");
 
-    prompt.append("#### Step 1: understanding\n");
-    prompt.append("Create a detailed technical analysis and reasoning workspace. You must:\n")
-            .append("- Analyze all changed identifiers, their roles, and the purpose of the changes.\n");
+    prompt.append("#### Step 1: Deep Technical Analysis (Understanding)\n")
+            .append("Create a detailed reasoning workspace. You must be adversarial and thorough:\n")
+            .append("- Analyze all changed identifiers, their roles, and the purpose of the changes.\n")
+            .append("- Search for edge cases: check for nulls, empty collections, timeouts, overflows, or unhandled exceptions.\n")
+            .append("- Evaluate Concurrency & Resources: identify potential race conditions, deadlocks, or resource leaks (e.g., unclosed streams).\n")
+            .append("- Analyze Complexity: look for inefficient algorithms (O(n^2) where O(n log n) is possible) or suboptimal data structure choices.\n")
+            .append("- Check Architectural Alignment: does this change deviate from existing patterns or introduce technical debt?\n");
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("- Explain how these changes interact with the dependency understandings provided above.\n");
+      prompt.append("- Explain exactly how these changes interact with the dependency understandings provided above, and if those interactions introduce new risks.\n");
     }
-    prompt.append("- Explicitly list identifiers that may act as dependencies for subsequent chapters (i.e., what a later reviewer needs to know about this chapter).\n\n");
+    prompt.append("- Explicitly list identifiers that may act as dependencies for subsequent chapters.\n\n");
 
-    prompt.append("#### Step 2: intermediate result\n");
-    prompt.append("Based on your understanding, provide the specific, high-signal contributions to the overall code review.\n")
-            .append("- Focus on critical issues, potential bugs, or significant improvement opportunities.\n")
-            .append("- The result must be modular and useful for a final synthesizer who has not read this chapter's raw content.\n")
-            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs (e.g., 'Change PNHM: ...') so that the comment can be traced back to the exact hunks.\n\n");
+    prompt.append("#### Step 2: High-Signal Review Comments (Intermediate Result)\n")
+            .append("Based on your analysis, produce the review findings. You must adhere to these strict quality standards:\n")
+            .append("- NO COMPLIMENTS: Do not praise the code or tell the author they did a good job.\n")
+            .append("- NO GENERIC ADVICE: Forbidden are comments like 'ensure X is handled' or 'consider checking Y'. If you suspect an issue, explain EXACTLY why it is a problem in this specific context and provide the fix.\n")
+            .append("- SPECIFIC ALTERNATIVES: When suggesting an improvement, refactoring, or rewrite, do not be vague. Provide the concrete logic, a pseudo-code sketch, or a detailed description of the better approach.\n")
+            .append("- FOCUS ON IMPACT: Prioritize critical bugs and architectural flaws over stylistic preferences.\n")
+            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs (e.g., 'Change PNHM: ...') so it can be traced back to the exact hunks.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
     prompt.append("<understanding>\n");
-    prompt.append("[Your detailed technical analysis and reasoning workspace]\n");
+    prompt.append("[Your detailed technical analysis and adversarial reasoning workspace]\n");
     prompt.append("</understanding>\n\n");
     prompt.append("<intermediate_result>\n");
-    prompt.append("[Your modular review comments referencing change IDs]\n");
+    prompt.append("[Your modular, specific review comments referencing change IDs]\n");
     prompt.append("</intermediate_result>\n");
 
     return prompt.toString();
