@@ -52,10 +52,10 @@ public class NarrativeProcessor {
             String finalResult = langchainClient.compileResults(state.getResults(), chapters.stream().map(state::getUnderstanding).toList());
             parsedFinalResult = ReviewPrompt.parseResult(finalResult);
         }
-        return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), parsedFinalResult);
+        return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), parsedFinalResult, state);
     }
 
-    public record NarrativeProcessResult(List<Cluster> clusters, List<ReviewPrompt.ReviewComment> comments) {
+    public record NarrativeProcessResult(List<Cluster> clusters, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
         public String content() {
             return String.join("\n\n", comments.stream()
                     .map(comment -> String.join(", ", comment.hunkIds()) + ": " + comment.text()).toList());
