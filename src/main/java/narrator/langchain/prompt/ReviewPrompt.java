@@ -146,20 +146,19 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("3. SIGNAL FILTERING: Ensure only high-signal findings make it to the final report. Redundant or trivial observations should be consolidated.\n\n");
 
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n");
-    prompt.append("Your output must be a structured list of review comments wrapped in <review_comments> tags. Each comment must be enclosed in <comment> tags with separate fields for hunk IDs and the review text:\n\n")
-            .append("- Use `<hunks>` to list the hunk IDs this comment refers to (e.g., `<hunks>PNHM, ABC1</hunks>`).\n")
-            .append("- Use `<text>` for the actual review content.\n\n");
+    prompt.append("Your output must be a list of review comments wrapped in <review_comments> tags.\n")
+            .append("Each comment section should consist of:\n")
+            .append("1. The first line: A comma-separated list of hunk IDs this comment refers to (e.g., PNHM, ABC1).\n")
+            .append("2. Subsequent lines: The detailed review text.\n\n")
+            .append("Use the exact separator '---COMMENT-SEPARATOR---' between individual comments.\n\n");
 
     prompt.append("Example Output:\n")
             .append("<review_comments>\n")
-            .append("  <comment>\n")
-            .append("    <hunks>PNHM</hunks>\n")
-            .append("    <text>The topic list fetch logic in AdminBrokerProcessor is missing a null check, which could lead to an NPE if the request header is malformed.</text>\n")
-            .append("  </comment>\n")
-            .append("  <comment>\n")
-            .append("    <hunks>ABC1, DEF2</hunks>\n")
-            .append("    <text>The synchronization strategy across these two methods needs to be unified to prevent potential deadlocks in high-concurrency scenarios.</text>\n")
-            .append("  </comment>\n")
+            .append("PNHM\n")
+            .append("The topic list fetch logic in AdminBrokerProcessor is missing a null check, which could lead to an NPE if the request header is malformed.\n")
+            .append("---COMMENT-SEPARATOR---\n")
+            .append("ABC1, DEF2\n")
+            .append("The synchronization strategy across these two methods needs to be unified to prevent potential deadlocks in high-concurrency scenarios. This is a multi-line comment for demonstration.\n")
             .append("</review_comments>");
 
     return prompt.toString();
@@ -172,33 +171,34 @@ public class ReviewPrompt implements LangChainPrompt {
 
     List<ReviewComment> comments = new ArrayList<>();
 
-    Pattern commentPattern = Pattern.compile("<comment>(.*?)</comment>", Pattern.DOTALL);
-    Matcher commentMatcher = commentPattern.matcher(response);
-    while (commentMatcher.find()) {
-      String content = commentMatcher.group(1);
-
-      String hunksStr = extractTagContent(content, "hunks");
-      String text = extractTagContent(content, "text");
-
-      if (hunksStr == null || text == null) {
-        return null;
-      }
-
-      List<String> hunkIds = extractHunkIds(hunksStr);
-      if (hunkIds.isEmpty()) {
-        return null;
-      }
-
-      comments.add(new ReviewComment(hunkIds, text));
+    Pattern outerPattern = Pattern.compile("<review_comments>(.*?)</review_comments>", Pattern.DOTALL);
+    Matcher outerMatcher = outerPattern.matcher(response);
+    if (!outerMatcher.find()) {
+      return null;
     }
 
-    return comments;
-  }
+    String content = outerMatcher.group(1).trim();
+    String[] sections = content.split("---COMMENT-SEPARATOR---");
 
-  private static String extractTagContent(String input, String tag) {
-    Pattern p = Pattern.compile("<" + tag + ">(.*?)</" + tag + ">", Pattern.DOTALL);
-    Matcher m = p.matcher(input);
-    return m.find() ? m.group(1).trim() : null;
+    for (String section : sections) {
+      section = section.trim();
+      if (section.isEmpty()) continue;
+
+      String[] lines = section.split("\\r?\\n", 2);
+      if (lines.length < 1) continue;
+
+      String hunksStr = lines[0].trim();
+      String text = lines.length > 1 ? lines[1].trim() : "";
+
+      if (text.isEmpty()) continue;
+
+      List<String> hunkIds = extractHunkIds(hunksStr);
+      if (!hunkIds.isEmpty()) {
+        comments.add(new ReviewComment(hunkIds, text));
+      }
+    }
+
+    return comments.isEmpty() ? null : comments;
   }
 
   private static List<String> extractHunkIds(String hunksStr) {
