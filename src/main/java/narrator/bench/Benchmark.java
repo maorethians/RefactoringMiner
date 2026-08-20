@@ -117,7 +117,7 @@ public class Benchmark {
                             List<Node> commentNodes = generatedComment.hunkIds().stream()
                                     .map(promptId -> findNode(narrativeResult.clusters(), promptId)).toList();
                             if (commentNodes.stream().anyMatch(Objects::isNull)) {
-                                System.out.println("Hallucinated id detected");
+                                throw new Exception("Hallucinated id detected");
                             }
 
                             Set<Node> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
@@ -160,6 +160,10 @@ public class Benchmark {
 
                         // Store result JSON
                         Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
+
+                        // Store raw output TXT
+                        String outputFileName = String.format("%s_%s_%s_%s.txt", org, repoName, prNumber, submittedCommit);
+                        Files.write(Paths.get(RESULTS_DIR, outputFileName), narrativeResult.content().getBytes(StandardCharsets.UTF_8));
                     }
 
                 } catch (Exception e) {
