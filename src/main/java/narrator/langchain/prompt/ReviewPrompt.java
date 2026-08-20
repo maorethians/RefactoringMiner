@@ -166,10 +166,11 @@ public class ReviewPrompt implements LangChainPrompt {
   }
 
   public static List<ReviewComment> parseResult(String response) throws Exception {
-    List<ReviewComment> comments = new ArrayList<>();
     if (response == null || response.isEmpty()) {
-      return comments;
+      return null;
     };
+
+    List<ReviewComment> comments = new ArrayList<>();
 
     Pattern commentPattern = Pattern.compile("<comment>(.*?)</comment>", Pattern.DOTALL);
     Matcher commentMatcher = commentPattern.matcher(response);
@@ -179,15 +180,16 @@ public class ReviewPrompt implements LangChainPrompt {
       String hunksStr = extractTagContent(content, "hunks");
       String text = extractTagContent(content, "text");
 
-      if (hunksStr != null && text != null) {
-        List<String> hunkIds = Arrays.stream(hunksStr.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .toList();
-        comments.add(new ReviewComment(hunkIds, text));
-      } else {
-        throw new Exception("Invalid Comment Format:" + content);
+      if (hunksStr == null || text == null) {
+        return null;
       }
+
+      List<String> hunkIds = extractHunkIds(hunksStr);
+      if (hunkIds.isEmpty()) {
+        return null;
+      }
+
+      comments.add(new ReviewComment(hunkIds, text));
     }
 
     return comments;
@@ -197,5 +199,22 @@ public class ReviewPrompt implements LangChainPrompt {
     Pattern p = Pattern.compile("<" + tag + ">(.*?)</" + tag + ">", Pattern.DOTALL);
     Matcher m = p.matcher(input);
     return m.find() ? m.group(1).trim() : null;
+  }
+
+  private static List<String> extractHunkIds(String hunksStr) {
+    List<String> ids = new ArrayList<>();
+
+    if (hunksStr == null) {
+      return ids;
+    }
+
+    // Match exactly 4 characters from the ALPHABET (A-Z, 0-9), ensuring they are not part of a longer sequence
+    Pattern p = Pattern.compile("(?<![A-Z0-9])[A-Z0-9]{4}(?![A-Z0-9])");
+    Matcher m = p.matcher(hunksStr);
+    while (m.find()) {
+      ids.add(m.group());
+    }
+
+    return ids;
   }
 }
