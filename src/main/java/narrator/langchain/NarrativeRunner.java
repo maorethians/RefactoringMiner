@@ -7,7 +7,7 @@ import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 import java.util.List;
 
 public class NarrativeRunner {
-    private static final GrainLevel DEFAULT_LEVEL = GrainLevel.FILE;
+    private static final GrainLevel DEFAULT_LEVEL = GrainLevel.SINGLE;
 
     public static void main(String[] args) throws Exception {
         NarrativeProcessor.NarrativeProcessResult response = run("https://github.com/spring-projects/spring-boot/commit/f28caee30d2ea48a0b19405dc604090e4b2f9b3d");
