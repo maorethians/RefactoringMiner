@@ -451,11 +451,23 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         if(classDiff.getPreprocessorStatementListDiff().isPresent()) {
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getCommonStatements()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
-                if(!srcStatement.getLabel().isEmpty())
+                if(!srcStatement.getLabel().isEmpty() && !srcStatement.getLabel().equals("#endif"))
                     srcStatement = srcStatement.getParent();
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(!dstStatement.getLabel().isEmpty())
+                if(!dstStatement.getLabel().isEmpty() && !dstStatement.getLabel().equals("#endif"))
                     dstStatement = dstStatement.getParent();
+                //make sure the preprocessor statement is matched, because TreeSitter puts nested statements under the preprocessor statement, while Eclipse CDT parser does not do the same
+                if(srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1) {
+                    mappingStore.addMappingRecursively(srcStatement.getChild(1), dstStatement.getChild(1));
+                }
+                if(srcStatement.getChildren().size() > 0 && dstStatement.getChildren().size() > 0) {
+                    mappingStore.addMapping(srcStatement.getChild(0), dstStatement.getChild(0));
+                }
+                if(srcStatement.getChildren().size() == 0 && dstStatement.getChildren().size() == 0) {
+                    //this is #endif
+                    mappingStore.addMapping(srcStatement, dstStatement);
+                    mappingStore.addMappingRecursively(srcStatement.getParent(), dstStatement.getParent());
+                }
                 mappingStore.addMappingRecursively(srcStatement, dstStatement);
             }
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getChangedStatements()) {
@@ -620,6 +632,24 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 if(srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1 && srcStatement.getChildren().get(1).getType().name.equals(LANG1.COMPOUND_STATEMENT) && dstStatement.getChildren().get(1).getType().name.equals(LANG2.COMPOUND_STATEMENT)) {
                     Tree srcBlock = srcStatement.getChildren().get(1);
                     Tree dstBlock = dstStatement.getChildren().get(1);
+                    mappingStore.addMapping(srcBlock, dstBlock);
+                    matched = Helpers.findPairOfType(srcBlock,dstBlock, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
+                    if (matched != null) {
+                        mappingStore.addMapping(matched.first,matched.second);
+                    }
+                    matched = Helpers.findPairOfType(srcBlock,dstBlock, LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
+                    if (matched != null) {
+                        mappingStore.addMapping(matched.first,matched.second);
+                    }
+                }
+            }
+            else if(srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1 && srcStatement.getChildren().get(1).getType().name.equals(LANG1.FUNCTION_DECLARATOR) && dstStatement.getChildren().get(1).getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
+                mappingStore.addMapping(srcStatement, dstStatement);
+                mappingStore.addMappingRecursively(srcStatement.getChildren().get(0), dstStatement.getChildren().get(0));
+                mappingStore.addMappingRecursively(srcStatement.getChildren().get(1), dstStatement.getChildren().get(1));
+                if(srcStatement.getChildren().size() > 2 && dstStatement.getChildren().size() > 2 && srcStatement.getChildren().get(2).getType().name.equals(LANG1.COMPOUND_STATEMENT) && dstStatement.getChildren().get(2).getType().name.equals(LANG2.COMPOUND_STATEMENT)) {
+                    Tree srcBlock = srcStatement.getChildren().get(2);
+                    Tree dstBlock = dstStatement.getChildren().get(2);
                     mappingStore.addMapping(srcBlock, dstBlock);
                     matched = Helpers.findPairOfType(srcBlock,dstBlock, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
                     if (matched != null) {
