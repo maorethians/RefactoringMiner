@@ -41,6 +41,7 @@ public class LangChainClient {
                     .baseUrl(baseUrl != null ? baseUrl : "http://localhost:11434")
                     .modelName(modelName)
                     .timeout(Duration.ofSeconds(999)) // Increase timeout for local large models
+                    .temperature(0.0)
                     .build();
         } else {
             throw new IllegalArgumentException("Unsupported provider: " + provider);
