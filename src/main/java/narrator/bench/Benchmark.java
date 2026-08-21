@@ -140,7 +140,9 @@ public class Benchmark {
                                     .collect(Collectors.toSet()));
                         }
 
-                        System.out.println("Recall: " + (double) groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count() / groundTruthGeneratedComments.size());
+                        double recall = (double) groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count()
+                                / groundTruthGeneratedComments.size();
+                        System.out.println(recall);
 
                         TokenUsage tokens = readLog();
 

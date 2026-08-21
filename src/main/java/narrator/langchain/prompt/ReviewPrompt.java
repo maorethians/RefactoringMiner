@@ -147,10 +147,10 @@ public class ReviewPrompt implements LangChainPrompt {
 
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n");
     prompt.append("Your output must be a list of review comments wrapped in <review_comments> tags.\n")
-            .append("Each comment section should consist of:\n")
-            .append("1. The first line: A comma-separated list of hunk IDs this comment refers to.\n")
-            .append("2. Subsequent lines: The detailed review text.\n\n")
-            .append("Use the exact separator '---COMMENT-SEPARATOR---' between individual comments.\n\n");
+            .append("Each review comment must follow this structural pattern:\n")
+            .append("1. FIRST LINE: Must contain ONLY the comma-separated list of hunk IDs this comment refers to.\n")
+            .append("2. SUBSEQUENT LINES: The detailed review text.\n\n")
+            .append("Separate individual comments with one or more blank lines for clarity.");
 
     return prompt.toString();
   }
@@ -169,27 +169,57 @@ public class ReviewPrompt implements LangChainPrompt {
     }
 
     String content = outerMatcher.group(1).trim();
-    String[] sections = content.split("---COMMENT-SEPARATOR---");
+    String[] lines = content.split("\\r?\\n");
 
-    for (String section : sections) {
-      section = section.trim();
-      if (section.isEmpty()) continue;
+    String currentHunksStr = null;
+    StringBuilder currentText = new StringBuilder();
 
-      String[] lines = section.split("\\r?\\n", 2);
-      if (lines.length < 1) continue;
+    for (String line : lines) {
+      String trimmedLine = line.trim();
+      if (trimmedLine.isEmpty()) continue;
 
-      String hunksStr = lines[0].trim();
-      String text = lines.length > 1 ? lines[1].trim() : "";
+      // A header line is one that consists only of valid hunk IDs and separators (commas, spaces)
+      if (isHeaderLine(trimmedLine)) {
+        // Commit previous comment if it exists
+        if (currentHunksStr != null && currentText.length() > 0) {
+          List<String> ids = extractHunkIds(currentHunksStr);
+          if (!ids.isEmpty()) {
+            comments.add(new ReviewComment(ids, currentText.toString().trim()));
+          }
+        }
+        currentHunksStr = trimmedLine;
+        currentText = new StringBuilder();
+      } else {
+        // Append to the current comment's text
+        if (currentHunksStr != null) {
+          if (currentText.length() > 0) {
+            currentText.append("\n");
+          }
+          currentText.append(line);
+        }
+      }
+    }
 
-      if (text.isEmpty()) continue;
-
-      List<String> hunkIds = extractHunkIds(hunksStr);
-      if (!hunkIds.isEmpty()) {
-        comments.add(new ReviewComment(hunkIds, text));
+    // Commit the final comment
+    if (currentHunksStr != null && currentText.length() > 0) {
+      List<String> ids = extractHunkIds(currentHunksStr);
+      if (!ids.isEmpty()) {
+        comments.add(new ReviewComment(ids, currentText.toString().trim()));
       }
     }
 
     return comments.isEmpty() ? null : comments;
+  }
+
+  private static boolean isHeaderLine(String line) {
+    if (line == null || line.isEmpty()) return false;
+    // A line is a header if it contains at least one valid ID and NO other non-separator characters
+    List<String> ids = extractHunkIds(line);
+    if (ids.isEmpty()) return false;
+
+    // Check if the line contains only IDs, commas, spaces
+    String stripped = line.replaceAll("[A-Z0-9]{4}", "").replaceAll("[,\\s]", "");
+    return stripped.isEmpty();
   }
 
   private static List<String> extractHunkIds(String hunksStr) {
