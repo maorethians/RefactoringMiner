@@ -132,17 +132,29 @@ public class Benchmark {
                         for (JsonObject groundTruthComment : entry.getValue()) {
                             String path = groundTruthComment.get("path").getAsString();
                             String side = groundTruthComment.get("side").getAsString();
-                            int line = groundTruthComment.get("line").getAsInt();
-                            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), path, side, line);
+                            int line = groundTruthComment.get("original_line").getAsInt();
+                            Integer startLine = groundTruthComment.get("original_start_line").isJsonNull() ?
+                                    null : groundTruthComment.get("original_start_line").getAsInt();
+                            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), path, side, line, startLine);
 
                             groundTruthGeneratedComments.put(groundTruthComment, generatedCommentsNodes.stream()
                                     .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
                                     .collect(Collectors.toSet()));
                         }
+                        long coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
+                        long uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
 
-                        double recall = (double) groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count()
-                                / groundTruthGeneratedComments.size();
+                        double recall = (double) coveredGroundTruth / groundTruthGeneratedComments.size();
                         System.out.println(recall);
+
+                        Set<Node> allHunkNodes = narrativeResult.clusters().stream()
+                                .map(cluster -> cluster.getGraph().vertexSet().stream().filter(Node::isBase).collect(Collectors.toSet()))
+                                .flatMap(Set::stream).collect(Collectors.toSet());
+                        Set<Node> coveredHunkNodes = generatedCommentsNodes.stream()
+                                .map(generatedCommentNodes -> generatedCommentNodes.nodes.stream().filter(Node::isBase).collect(Collectors.toSet()))
+                                .flatMap(Set::stream).collect(Collectors.toSet());
+                        Set<Node> uncoveredHunkNodes = allHunkNodes.stream().filter(hunkNode -> !coveredHunkNodes.contains(hunkNode))
+                                .collect(Collectors.toSet());
 
                         TokenUsage tokens = readLog();
 
@@ -154,8 +166,10 @@ public class Benchmark {
                         result.generatedCommentsNodes = generatedCommentsNodes.stream().map(GeneratedCommentNodes::stringify).toList();
                         result.groundTruthGeneratedCommentsNodes = groundTruthGeneratedComments.entrySet().stream()
                                 .map(e -> new GroundTruthGeneratedCommentsNodes(e.getKey(), e.getValue().stream().map(GeneratedCommentNodes::stringify).toList())).toList();
-                        result.uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
-                        result.coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
+                        result.uncoveredGroundTruth = uncoveredGroundTruth;
+                        result.coveredGroundTruth = coveredGroundTruth;
+                        result.uncoveredHunkNodes = uncoveredHunkNodes.size();
+                        result.coveredHunkNodes = coveredHunkNodes.size();
                         result.timing = timing;
                         result.tokensIn = tokens.in;
                         result.tokensOut = tokens.out;
@@ -219,9 +233,9 @@ public class Benchmark {
                 .map(cluster -> cluster.findNode(promptId)).filter(Objects::nonNull).findFirst().orElse(null);
     }
 
-    private static Set<Node> findNodes(List<Cluster> clusters, String side, String path, int line) {
+    private static Set<Node> findNodes(List<Cluster> clusters, String side, String path, int line, @Nullable Integer startLine) {
         return clusters.stream()
-                .map(cluster -> cluster.findNodes(path, side, line)).flatMap(Set::stream)
+                .map(cluster -> cluster.findNodes(path, side, line, startLine)).flatMap(Set::stream)
                 .filter(node -> !node.getNodeType().equals(NodeType.LOCATION_CONTEXT))
                 .collect(Collectors.toSet());
     }
@@ -245,6 +259,8 @@ public class Benchmark {
         List<GroundTruthGeneratedCommentsNodes> groundTruthGeneratedCommentsNodes;
         long coveredGroundTruth;
         long uncoveredGroundTruth;
+        long coveredHunkNodes;
+        long uncoveredHunkNodes;
         long timing;
         long tokensIn;
         long tokensOut;
