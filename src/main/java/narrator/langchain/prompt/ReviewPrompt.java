@@ -33,26 +33,16 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("#### Step 1: Technical Mapping (Understanding)\n")
             .append("Create a high-fidelity technical map of the changes. Focus on factual correctness and systemic intent:\n");
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("Leverage the provided dependency context in producing the technical mapping, and ensure that your understanding of this chapter is fully grounded in the state of the code and any identifiers introduced or modified before this chapter");
+      prompt.append("- Leverage the provided dependency context in understanding the dependencies of the current chapter.\n");
     }
     prompt.append("- Map all changed identifiers, their roles, and how they interact.\n")
             .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
 
     prompt.append("#### Step 2: High-Signal Review Comments (Result)\n")
-            .append("Using your technical mapping from Step 1, execute a rigorous, adversarial audit across the dimensions specified below. Produce high-signal review comments adhering to these strict standards:\n")
+            .append("Using your technical mapping from Step 1, conduct a rigorous, adversarial audit across all critical dimensions (including Functional Correctness, Security & Robustness, Resource Efficiency, Architectural Integrity, Maintainability, Observability, and Verification Rigor). Produce high-signal review comments adhering to these strict standards:\n")
             .append("- NO COMPLIMENTS: Do not praise the code or use filler phrases.\n")
             .append("- NO GENERIC ADVICE: If you flag an issue, explain exactly why it is a problem. Provide a concrete fix, or if the flaw is architectural, propose a specific corrective pattern/approach.\n")
             .append("- Every review comment MUST reference the specific change IDs to ensure it is anchored to the exact hunks.\n\n");
-
-    prompt.append("### Dimensions\n")
-            .append("Your change audit and review must be focused on an exhaustive list of dimensions as below:\n")
-            .append("- Functional Correctness: Logic errors, edge cases (nulls/empty collections), and handling of unexpected inputs.\n")
-            .append("- Security & Robustness: Input validation gaps, authorization bypasses, sensitive data exposure, and crash-resilience/error-handling failures.\n")
-            .append("- Resource Efficiency: Algorithmic complexity, redundant I/O or API calls, memory leaks, and locking strategies.\n")
-            .append("- Architectural Integrity & Compatibility: Violation of modular boundaries, deviation from design patterns, and backward compatibility breaks or regressions.\n")
-            .append("- Maintainability & Clean Code: High cognitive complexity, misleading naming, documentation gaps, and general readability.\n")
-            .append("- Observability & Diagnostics: Logging sufficiency, error message quality, and missing telemetry/metrics.\n")
-            .append("- Verification Rigor: Untested edge cases and adequacy of the accompanying tests relative to the risk and complexity of the changes.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
@@ -78,7 +68,7 @@ public class ReviewPrompt implements LangChainPrompt {
     }
 
     String understanding = response.substring(understandingOpen + 15, understandingClose).trim();
-    String result = response.substring(resultOpen + 21, resultClose).trim();
+    String result = response.substring(resultOpen + 8, resultClose).trim();
     return new ParsedResponse(understanding, result);
   }
 
