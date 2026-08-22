@@ -31,8 +31,8 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append(content).append("\n\n");
 
     prompt.append("### YOUR TASK\n")
-            .append("Perform an exhaustive review focusing on Correctness, Security, Performance, Maintainability, and Readability. ")
-            .append("Assume the code contains at least one subtle flaw or a significant optimization opportunity—your job is to find it.\n\n");
+            .append("Perform an exhaustive, adversarial review focusing on Correctness, Security, Performance, Maintainability, and Readability. ")
+            .append("Your objective is to attempt to prove the code incorrect or identify failure modes that could lead to systemic impact.\n\n");
 
     prompt.append("#### Step 1: Deep Technical Analysis (Understanding)\n")
             .append("Create a detailed reasoning workspace. You must be adversarial and thorough:\n")
@@ -52,7 +52,8 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("- NO GENERIC ADVICE: Forbidden are comments like 'ensure X is handled' or 'consider checking Y'. If you suspect an issue, explain EXACTLY why it is a problem in this specific context and provide the fix.\n")
             .append("- SPECIFIC ALTERNATIVES: When suggesting an improvement, refactoring, or rewrite, do not be vague. Provide the concrete logic, a pseudo-code sketch, or a detailed description of the better approach.\n")
             .append("- FOCUS ON IMPACT: Prioritize critical bugs and architectural flaws over stylistic preferences.\n")
-            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs so it can be traced back to the exact hunks.\n\n");
+            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs so it can be traced back to the exact hunks.\n\n")
+            .append("SILENCE CONDITION: If, after a rigorous audit, you find no concrete technical flaws or architectural misalignments, return an empty response. Do not provide compliments, do not explain that you found nothing; simply remain silent.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
