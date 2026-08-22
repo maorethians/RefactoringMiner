@@ -16,52 +16,60 @@ public class ReviewPrompt implements LangChainPrompt {
     StringBuilder prompt = new StringBuilder();
     prompt.append("You are an expert Senior Software Engineer and a critical code auditor conducting a deep, rigorous, and adversarial code review of a pull request. ")
             .append("The PR's changes have been divided into 'chapters' based on dependencies. You are reviewing one specific chapter. ")
-            .append("Your goal is to identify non-obvious flaws, architectural misalignments, and significant optimization opportunities. Avoid surface-level nitpicks; focus on systemic impact and technical correctness.\n\n");
-
-    if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("### CONTEXT\n");
-      prompt.append("Below are the 'Understandings' from previous chapters that this current chapter depends on. ")
-              .append("Use these to understand the state of the code and any identifiers introduced or modified before this chapter:\n");
-      prompt.append(String.join("\n", understandings.stream().map(understanding -> "<understanding>\n" + understanding + "\n</understanding>").toList()));
-      prompt.append("\n\n");
-    }
+            .append("Your goal is to identify critical issues and flaws. Avoid surface-level nitpicks; focus on systemic impact and technical correctness.\n\n");
 
     prompt.append("### CURRENT CHAPTER CONTENT\n");
     prompt.append("This is the content of the current chapter you are reviewing:\n");
     prompt.append(content).append("\n\n");
 
-    prompt.append("### YOUR TASK\n")
-            .append("Perform an exhaustive review focusing on Correctness, Security, Performance, Maintainability, and Readability. ")
-            .append("Assume the code contains at least one subtle flaw or a significant optimization opportunity—your job is to find it.\n\n");
-
-    prompt.append("#### Step 1: Deep Technical Analysis (Understanding)\n")
-            .append("Create a detailed reasoning workspace. You must be adversarial and thorough:\n")
-            .append("- Analyze all changed identifiers, their roles, and the purpose of the changes.\n")
-            .append("- Search for edge cases: check for nulls, empty collections, timeouts, overflows, or unhandled exceptions.\n")
-            .append("- Evaluate Concurrency & Resources: identify potential race conditions, deadlocks, or resource leaks (e.g., unclosed streams).\n")
-            .append("- Analyze Complexity: look for inefficient algorithms (O(n^2) where O(n log n) is possible) or suboptimal data structure choices.\n")
-            .append("- Check Architectural Alignment: does this change deviate from existing patterns or introduce technical debt?\n");
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("- Explain exactly how these changes interact with the dependency understandings provided above, and if those interactions introduce new risks.\n");
+      prompt.append("### CONTEXT\n");
+      prompt.append("Below are the 'Understandings' from previous chapters which this current chapter depends on. ")
+              .append("Use these to understand the state of the code and any identifiers introduced or modified before this chapter:\n");
+      prompt.append(String.join("\n", understandings.stream().map(understanding -> "<understanding>\n" + understanding + "\n</understanding>").toList()));
+      prompt.append("\n\n");
     }
-    prompt.append("- Explicitly list identifiers that may act as dependencies for subsequent chapters.\n\n");
 
-    prompt.append("#### Step 2: High-Signal Review Comments (Intermediate Result)\n")
-            .append("Based on your analysis, produce the review findings. You must adhere to these strict quality standards:\n")
-            .append("- NO COMPLIMENTS: Do not praise the code or tell the author they did a good job.\n")
-            .append("- NO GENERIC ADVICE: Forbidden are comments like 'ensure X is handled' or 'consider checking Y'. If you suspect an issue, explain EXACTLY why it is a problem in this specific context and provide the fix.\n")
-            .append("- SPECIFIC ALTERNATIVES: When suggesting an improvement, refactoring, or rewrite, do not be vague. Provide the concrete logic, a pseudo-code sketch, or a detailed description of the better approach.\n")
+    prompt.append("### YOUR TASK\n")
+            .append("Perform an exhaustive review by auditing the changes:\n\n");
+
+    prompt.append("#### Step 1: Technical Mapping (Understanding)\n")
+            .append("Create a high-fidelity technical map of the changes. Focus on factual correctness and intent:\n")
+            .append("- Map all changed identifiers, their roles, and how they interact.\n")
+            .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
+    if (understandings != null && !understandings.isEmpty()) {
+      prompt.append("- Explain how these changes build upon the provided dependency understandings to reach this new state.\n");
+    }
+
+    prompt.append("#### Step 2: High-Signal Review Comments (Result)\n")
+            .append("Based on your mapping from Step 1");
+    if (understandings != null && !understandings.isEmpty()) {
+      prompt.append(" and dependency understandings");
+    }
+    prompt.append(", conduct a rigorous, adversarial audit, and evaluate the changes from different dimensions, and produce high-signal review comments adhering to these strict standards:\n")
+            .append("- NO COMPLIMENTS: Do not praise the code.\n")
+            .append("- NO GENERIC ADVICE: If you suspect an issue, explain EXACTLY why it is a problem and provide the fix.\n")
             .append("- FOCUS ON IMPACT: Prioritize critical bugs and architectural flaws over stylistic preferences.\n")
             .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs so it can be traced back to the exact hunks.\n\n");
+
+    prompt.append("### Dimensions\n")
+            .append("Your change audit and review must be focused on an exhaustive list of dimensions as below:\n")
+            .append("- Functional Correctness: Logic errors, edge cases (nulls/empty collections), and handling of unexpected inputs.\n")
+            .append("- Security & Robustness: Input validation gaps, authorization bypasses, sensitive data exposure, and crash-resilience/error-handling failures.\n")
+            .append("- Resource Efficiency: Algorithmic complexity, redundant I/O or API calls, memory leaks, and locking strategies.\n")
+            .append("- Architectural Integrity & Compatibility: Violation of modular boundaries, deviation from design patterns, and backward compatibility breaks or regressions.\n")
+            .append("- Maintainability & Clean Code: High cognitive complexity, misleading naming, documentation gaps, and general readability.\n")
+            .append("- Observability & Diagnostics: Logging sufficiency, error message quality, and missing telemetry/metrics.\n")
+            .append("- Verification Rigor: Untested edge cases and adequacy of the accompanying tests relative to the risk and complexity of the changes.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
     prompt.append("<understanding>\n");
-    prompt.append("[Your detailed technical analysis and adversarial reasoning workspace]\n");
+    prompt.append("[Your detailed technical mapping and understanding of the changes and identifiers within chapter]\n");
     prompt.append("</understanding>\n\n");
-    prompt.append("<intermediate_result>\n");
-    prompt.append("[Your modular, specific review comments referencing change IDs]\n");
-    prompt.append("</intermediate_result>\n");
+    prompt.append("<result>\n");
+    prompt.append("[Your modular, high-signal review comments referencing change IDs]\n");
+    prompt.append("</result>\n\n");
 
     return prompt.toString();
   }
@@ -69,8 +77,8 @@ public class ReviewPrompt implements LangChainPrompt {
   public static ParsedResponse parseChapter(String response) {
     int understandingOpen = response.indexOf("<understanding>");
     int understandingClose = response.indexOf("</understanding>");
-    int resultOpen = response.indexOf("<intermediate_result>");
-    int resultClose = response.indexOf("</intermediate_result>");
+    int resultOpen = response.indexOf("<result>");
+    int resultClose = response.indexOf("</result>");
 
     if (understandingOpen == -1 || understandingClose == -1 || understandingOpen >= understandingClose
             || resultOpen == -1 || resultClose == -1 || resultOpen >= resultClose) {
