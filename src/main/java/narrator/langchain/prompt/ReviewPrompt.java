@@ -14,7 +14,7 @@ public class ReviewPrompt implements LangChainPrompt {
 
   public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are an expert Senior Software Engineer and a critical code auditor conducting a deep, rigorous, and adversarial code review of a pull request. ")
+    prompt.append("You are an expert senior software engineer and a critical code auditor conducting a deep, rigorous, and adversarial code review of a pull request. ")
             .append("The PR's changes have been divided into 'chapters' based on dependencies. You are reviewing one specific chapter. ")
             .append("Your goal is to identify critical issues and flaws. Avoid surface-level nitpicks; focus on systemic impact and technical correctness.\n\n");
 
@@ -24,33 +24,25 @@ public class ReviewPrompt implements LangChainPrompt {
 
     if (understandings != null && !understandings.isEmpty()) {
       prompt.append("### CONTEXT\n");
-      prompt.append("Below are the 'Understandings' from previous chapters which this current chapter depends on. ")
-              .append("Use these to understand the state of the code and any identifiers introduced or modified before this chapter:\n");
+      prompt.append("Below are the 'Understandings' from previous chapters which this current chapter depends on:\n");
       prompt.append(String.join("\n", understandings.stream().map(understanding -> "<understanding>\n" + understanding + "\n</understanding>").toList()));
       prompt.append("\n\n");
     }
 
-    prompt.append("### YOUR TASK\n")
-            .append("Perform an exhaustive review by auditing the changes:\n\n");
-
+    prompt.append("### YOUR TASK\n");
     prompt.append("#### Step 1: Technical Mapping (Understanding)\n")
-            .append("Create a high-fidelity technical map of the changes. Focus on factual correctness and intent:\n")
-            .append("- Map all changed identifiers, their roles, and how they interact.\n")
-            .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
+            .append("Create a high-fidelity technical map of the changes. Focus on factual correctness and systemic intent:\n");
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("- Explain how these changes build upon the provided dependency understandings to reach this new state.\n");
+      prompt.append("Leverage the provided dependency context in producing the technical mapping, and ensure that your understanding of this chapter is fully grounded in the state of the code and any identifiers introduced or modified before this chapter");
     }
+    prompt.append("- Map all changed identifiers, their roles, and how they interact.\n")
+            .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
 
     prompt.append("#### Step 2: High-Signal Review Comments (Result)\n")
-            .append("Based on your mapping from Step 1");
-    if (understandings != null && !understandings.isEmpty()) {
-      prompt.append(" and dependency understandings");
-    }
-    prompt.append(", conduct a rigorous, adversarial audit, and evaluate the changes from different dimensions, and produce high-signal review comments adhering to these strict standards:\n")
-            .append("- NO COMPLIMENTS: Do not praise the code.\n")
-            .append("- NO GENERIC ADVICE: If you suspect an issue, explain EXACTLY why it is a problem and provide the fix.\n")
-            .append("- FOCUS ON IMPACT: Prioritize critical bugs and architectural flaws over stylistic preferences.\n")
-            .append("- IMPORTANT: Every review comment MUST refer to the specific change IDs so it can be traced back to the exact hunks.\n\n");
+            .append("Using your technical mapping from Step 1, execute a rigorous, adversarial audit across the dimensions specified below. Produce high-signal review comments adhering to these strict standards:\n")
+            .append("- NO COMPLIMENTS: Do not praise the code or use filler phrases.\n")
+            .append("- NO GENERIC ADVICE: If you flag an issue, explain exactly why it is a problem. Provide a concrete fix, or if the flaw is architectural, propose a specific corrective pattern/approach.\n")
+            .append("- Every review comment MUST reference the specific change IDs to ensure it is anchored to the exact hunks.\n\n");
 
     prompt.append("### Dimensions\n")
             .append("Your change audit and review must be focused on an exhaustive list of dimensions as below:\n")
@@ -65,7 +57,7 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
     prompt.append("<understanding>\n");
-    prompt.append("[Your detailed technical mapping and understanding of the changes and identifiers within chapter]\n");
+    prompt.append("[Your detailed technical mapping and understanding of the changes and identifiers within this chapter]\n");
     prompt.append("</understanding>\n\n");
     prompt.append("<result>\n");
     prompt.append("[Your modular, high-signal review comments referencing change IDs]\n");
