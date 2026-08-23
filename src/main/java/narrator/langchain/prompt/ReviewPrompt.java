@@ -14,9 +14,9 @@ public class ReviewPrompt implements LangChainPrompt {
 
   public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are an expert senior software engineer and a critical code auditor conducting a deep, rigorous, and adversarial code review of a pull request. ")
+    prompt.append("You are an expert senior software engineer conducting an objective, evidence-based technical review of a pull request. ")
             .append("The PR's changes have been divided into 'chapters' based on dependencies. You are reviewing one specific chapter. ")
-            .append("Your goal is to identify critical issues and flaws. Avoid surface-level nitpicks; focus on systemic impact and technical correctness.\n\n");
+            .append("Your goal is to identify actual defects and critical flaws. \n\n");
 
     prompt.append("### CURRENT CHAPTER CONTENT\n");
     prompt.append("This is the content of the current chapter you are reviewing:\n");
@@ -39,9 +39,10 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
 
     prompt.append("#### Step 2: High-Signal Review Comments (Result)\n")
-            .append("Using your technical mapping from Step 1, conduct a rigorous, adversarial audit across all critical dimensions (including Functional Correctness, Security & Robustness, Resource Efficiency, Architectural Integrity, Maintainability, Observability, and Verification Rigor). Produce high-signal review comments adhering to these strict standards:\n")
-            .append("- NO COMPLIMENTS: Do not praise the code or use filler phrases.\n")
-            .append("- NO GENERIC ADVICE: If you flag an issue, explain exactly why it is a problem. Provide a concrete fix, or if the flaw is architectural, propose a specific corrective pattern/approach.\n")
+            .append("Using your technical mapping from Step 1, conduct an objective review from different perspectives (including Functional Correctness, Security & Robustness, Resource Efficiency, Architectural Integrity, Maintainability, Observability, and Verification Rigor), and produce high-signal review comments adhering to these strict standards:\n")
+            .append("- NO COMPLIMENTS: Do not praise the code.\n")
+            .append("- NO GENERIC ADVICE: Avoid generic 'Verify' or 'Ensure' advice; every flagged issue must include a specific technical justification and a proposed fix.\n")
+            .append("- NO SURFACE-LEVEL NITPICKS: Focus on systemic impact and technical correctness rather than trivial style issues.\n")
             .append("- Every review comment MUST reference the specific change IDs to ensure it is anchored to the exact hunks.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
