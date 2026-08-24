@@ -129,12 +129,12 @@ public class ReviewPrompt implements LangChainPrompt {
 
     prompt.append("\n### YOUR TASK\n");
     prompt.append("Synthesize the intermediate results into a final list of review comments. You must follow these logic rules:\n\n")
-            .append("1. DEDUPLICATION & MERGING: If multiple chapters produced similar or overlapping comments on the same change(s), merge them into one clear, coherent comment that captures all relevant points.\n")
-            .append("2. CONFLICT RESOLUTION: If two findings conflict (e.g., one suggests a change is correct and another flags it as a bug):\n")
+            .append("1. DEDUPLICATION & MERGING: If there are multiple similar or overlapping comments, merge them into one clear, coherent comment that captures all relevant points.\n")
+            .append("2. CONFLICT RESOLUTION: If two findings conflict:\n")
             .append("   - Use the GLOBAL PR UNDERSTANDING to determine which finding is technically accurate.\n")
             .append("   - If you can resolve the conflict, keep the correct version.\n")
             .append("   - If the conflict cannot be resolved with the provided information, eliminate both conflicting comments to avoid presenting contradictory advice.\n")
-            .append("3. SIGNAL FILTERING: Ensure only high-signal findings make it to the final report. Redundant or trivial observations should be consolidated.\n\n");
+            .append("3. HUNK ID FIDELITY: You must preserve the exact hunk IDs from the source comments. Do not modify, hallucinate, or guess IDs. When merging multiple comments into one, ensure all associated hunk IDs are accurately collected.\n\n");
 
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n");
     prompt.append("Your output must be a list of review comments wrapped in <review_comments> tags.\n")
