@@ -14,9 +14,9 @@ public class ReviewPrompt implements LangChainPrompt {
 
   public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are an expert senior software engineer conducting an objective, evidence-based technical review of a pull request. ")
-            .append("The PR's changes have been divided into 'chapters' based on dependencies. You are reviewing one specific chapter. ")
-            .append("Your goal is to identify actual defects and critical flaws. \n\n");
+    prompt.append("You are an expert senior software engineer conducting an evidence-based technical review of a pull request. ")
+            .append("The PR's changes have been divided and ordered into chapters of a coherent narrative based on dependencies. ")
+            .append("You are reviewing one specific chapter.\n\n");
 
     prompt.append("### CURRENT CHAPTER CONTENT\n");
     prompt.append("This is the content of the current chapter you are reviewing:\n");
@@ -39,16 +39,17 @@ public class ReviewPrompt implements LangChainPrompt {
             .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
 
     prompt.append("#### Step 2: High-Signal Review Comments (Result)\n")
-            .append("Using your technical mapping from Step 1, conduct an objective review from different perspectives (including Functional Correctness, Security & Robustness, Resource Efficiency, Architectural Integrity, Maintainability, Observability, and Verification Rigor), and produce high-signal review comments adhering to these strict standards:\n")
+            .append("Using your technical mapping from Step 1, conduct an objective review on the changes and produce high-signal review comments adhering to these strict standards:\n")
             .append("- NO COMPLIMENTS: Do not praise the code.\n")
             .append("- NO GENERIC ADVICE: Avoid generic 'Verify' or 'Ensure' advice; every flagged issue must include a specific technical justification and a proposed fix.\n")
             .append("- NO SURFACE-LEVEL NITPICKS: Focus on systemic impact and technical correctness rather than trivial style issues.\n")
+            .append("- NO REPETITION: Avoid repeating the same comment for the same change or separate changes. If there are multiple exact, similar, or overlapping findings for one or multiple changes, merge them into one clear, coherent comment that captures all relevant points with all the associated hunk IDs.")
             .append("- Every review comment MUST reference the specific change IDs to ensure it is anchored to the exact hunks.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("You must provide your response in exactly this format:\n\n");
     prompt.append("<understanding>\n");
-    prompt.append("[Your detailed technical mapping and understanding of the changes and identifiers within this chapter]\n");
+    prompt.append("[Your detailed technical mapping of the changes and identifiers within this chapter]\n");
     prompt.append("</understanding>\n\n");
     prompt.append("<result>\n");
     prompt.append("[Your modular, high-signal review comments referencing change IDs]\n");
@@ -76,13 +77,11 @@ public class ReviewPrompt implements LangChainPrompt {
   @Override
   public String understanding(List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are a Senior System Architect. Your task is to synthesize the technical understandings of multiple components in a pull request into one single, comprehensive 'Global PR Understanding'.\n\n")
-            .append("The changes of the PR have been divided into 'chapters' based on dependencies. ")
-            .append("The input consists of separate understanding blocks from various chapters, ordered by their dependencies. ")
-            .append("Together, they form a coherent narrative of the entire change set.\n\n");
+    prompt.append("You are a Senior System Architect. Your task is to synthesize the technical mapping of multiple components in a pull request into one single, comprehensive 'Global PR Understanding'.\n\n")
+            .append("The changes of the PR have been divided and ordered into chapters of a coherent narrative based on dependencies.\n\n");
 
     prompt.append("### INPUT DATA\n");
-    prompt.append("Here are the understandings from all chapters:\n");
+    prompt.append("Here are the technical mapping from various chapters:\n");
     for (int i = 0; i < understandings.size(); i++) {
       prompt.append("<chapter").append(i + 1).append(">\n");
       prompt.append(understandings.get(i)).append("\n");
@@ -90,14 +89,14 @@ public class ReviewPrompt implements LangChainPrompt {
     }
 
     prompt.append("\n### YOUR TASK\n");
-    prompt.append("Synthesize these fragments into a unified, aggregated technical map of the pull request. ")
+    prompt.append("Synthesize these fragments into a unified, aggregated technical map of the PR. ")
             .append("Your goal is to create a global view that allows any subsequent agent to understand the entire impact of the PR without reading individual chapters.\n\n")
             .append("CRITICAL REQUIREMENTS:\n")
             .append("- NO LOSS OF DETAIL: While you should be compact, you MUST NOT omit any identifiers mentioned across the chapters.\n")
             .append("- IDENTIFIER TRACKING: Extract every changed/introduced identifier and describe its role in the overall change.\n")
             .append("- CHANGE ANALYSIS: For each key entity, summarize exactly what was modified or added.\n")
-            .append("- RELATIONAL MAPPING: Clearly define the cross-relations and dependencies between these identifiers (e.g., 'Identifier A was modified to support the new logic in Identifier B').\n")
-            .append("- COHERENT NARRATIVE: Use the dependency order of the chapters to trace how changes propagate through the system.\n\n");
+            .append("- RELATIONAL MAPPING: Clearly define the cross-relations and dependencies between these identifiers.\n")
+            .append("- COHERENT NARRATIVE: Use the dependency order of the chapters to trace how changes propagate through the PR.\n\n");
 
     prompt.append("### OUTPUT FORMAT\n");
     prompt.append("Please provide the Global PR Understanding using the following structure:\n\n")
@@ -112,11 +111,11 @@ public class ReviewPrompt implements LangChainPrompt {
   @Override
   public String result(List<String> results, String understanding) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are the Lead Reviewer and Final Synthesizer for reviewing a pull request. Your task is to aggregate all intermediate findings of multiple components in a PR into a single, comprehensive, and high-fidelity final report.\n\n")
-            .append("The changes of the PR have been divided into 'chapters' based on dependencies. ")
+    prompt.append("You are the Lead Reviewer and Final Synthesizer for reviewing a pull request. Your task is to aggregate all findings of multiple components in a PR into a single, comprehensive, and high-fidelity final report.\n\n")
+            .append("The changes of the PR have been divided and ordered into chapters of a coherent narrative based on dependencies. ")
             .append("You have two primary inputs:\n")
             .append("1. The GLOBAL PR UNDERSTANDING: A synthesized technical map of the entire change set.\n")
-            .append("2. INTERMEDIATE RESULTS: Modular review findings from individual chapters, ordered by their dependencies.\n\n");
+            .append("2. INTERMEDIATE RESULTS: Modular review findings from individual chapters.\n\n");
 
     prompt.append("### INPUT DATA\n\n");
     prompt.append("#### Global PR Understanding:\n").append("<understanding>\n").append(understanding).append("\n</understanding>\n\n");
