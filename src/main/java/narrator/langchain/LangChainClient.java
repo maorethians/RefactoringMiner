@@ -13,6 +13,7 @@ import java.util.List;
 public class LangChainClient {
     private final ChatLanguageModel model;
     private final LangChainPrompt prompt;
+    private static final double temperature = 0.2;
 
     public LangChainClient(ChatLanguageModel model) {
         this.model = model;
@@ -30,18 +31,20 @@ public class LangChainClient {
             model = AnthropicChatModel.builder()
                     .apiKey(apiKey)
                     .modelName(modelName)
+                    .temperature(temperature)
                     .build();
         } else if ("openai".equalsIgnoreCase(provider)) {
             model = OpenAiChatModel.builder()
                     .apiKey(apiKey)
                     .modelName(modelName)
+                    .temperature(temperature)
                     .build();
         } else if ("ollama".equalsIgnoreCase(provider)) {
             model = OllamaChatModel.builder()
                     .baseUrl(baseUrl != null ? baseUrl : "http://localhost:11434")
                     .modelName(modelName)
                     .timeout(Duration.ofSeconds(999)) // Increase timeout for local large models
-                    .temperature(0.0)
+                    .temperature(temperature)
                     .build();
         } else {
             throw new IllegalArgumentException("Unsupported provider: " + provider);
