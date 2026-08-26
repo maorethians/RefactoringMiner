@@ -51,10 +51,10 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### OUTPUT FORMAT\n")
             .append("You must provide your response in exactly this format:\n\n")
             .append("<mapping>\n")
-            .append("[The high-fidelity technical map, including precise identifier tracking and logic analysis]\n")
+            .append("[Insert the high-fidelity technical map from Step 1, including precise identifier tracking and logic analysis]\n")
             .append("</mapping>\n\n")
             .append("<comments>\n")
-            .append("[The high-signal audit findings, with each comment strictly anchored to change IDs and supported by technical justification]\n")
+            .append("[Insert the high-signal audit findings from Step 2, with each comment strictly anchored to change IDs and supported by technical justification]\n")
             .append("</comments>");
 
     return prompt.toString();
