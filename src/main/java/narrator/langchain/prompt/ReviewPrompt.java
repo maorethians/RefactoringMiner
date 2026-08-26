@@ -16,7 +16,7 @@ public class ReviewPrompt implements LangChainPrompt {
     StringBuilder prompt = new StringBuilder();
 
     prompt.append("You are a Principal Software Engineer specializing in complex system architecture and high-rigor technical audits. ")
-            .append("The changes in this pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
+            .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
             .append("Your current objective is to perform a deep-dive review of a single chapter from this sequence.\n\n");
 
     prompt.append("### CURRENT CHAPTER\n")
@@ -79,33 +79,28 @@ public class ReviewPrompt implements LangChainPrompt {
   @Override
   public String understanding(List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are a Senior System Architect. Your task is to synthesize the technical mapping of multiple components in a pull request into one single, comprehensive 'Global PR Understanding'.\n\n")
-            .append("The changes of the PR have been divided and ordered into chapters of a coherent narrative based on dependencies.\n\n");
 
-    prompt.append("### INPUT DATA\n");
-    prompt.append("Here are the technical mapping from various chapters:\n");
+    prompt.append("You are a Senior System Architect. ")
+            .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
+            .append("For each chapter, a high-fidelity technical map has been produced, focusing on precise identifier tracking and logic analysis. ")
+            .append("Your task is to synthesize the mappings of consecutive chapters into a single, unified comprehensive mapping that preserves the full technical rigor of the originals.");
+
+    prompt.append("\n### INPUT: CHAPTER TECHNICAL MAPPINGS\n")
+            .append("Below are the technical mappings for consecutive chapters:\n");
     for (int i = 0; i < understandings.size(); i++) {
-      prompt.append("<chapter").append(i + 1).append(">\n");
-      prompt.append(understandings.get(i)).append("\n");
-      prompt.append("</chapter").append(i + 1).append(">\n");
+      prompt.append("<chapter").append(i + 1).append(">\n")
+            .append(understandings.get(i)).append("\n")
+            .append("</chapter").append(i + 1).append(">\n");
     }
 
-    prompt.append("\n### YOUR TASK\n");
-    prompt.append("Synthesize these fragments into a unified, aggregated technical map of the PR. ")
-            .append("Your goal is to create a global view that allows any subsequent agent to understand the entire impact of the PR without reading individual chapters.\n\n")
+    prompt.append("\n### YOUR TASK\n")
+            .append("Synthesize these inputs into a unified technical map. The resulting mapping MUST follow the exact structural format of the original chapter mappings, consisting of two primary sections:\n")
+            .append("1. IDENTIFIER TRACKING: A consolidated and precise map of every modified or introduced identifier across all provided chapters, documenting their roles, responsibilities, and systemic interactions.\n")
+            .append("2. LOGIC & INTENT ANALYSIS: A synthesized trace of the logic flow that captures the overall intended behavior and technical justification across these chapters.\n\n")
             .append("CRITICAL REQUIREMENTS:\n")
-            .append("- NO LOSS OF DETAIL: While you should be compact, you MUST NOT omit any identifiers mentioned across the chapters.\n")
-            .append("- IDENTIFIER TRACKING: Extract every changed/introduced identifier and describe its role in the overall change.\n")
-            .append("- CHANGE ANALYSIS: For each key entity, summarize exactly what was modified or added.\n")
-            .append("- RELATIONAL MAPPING: Clearly define the cross-relations and dependencies between these identifiers.\n")
-            .append("- COHERENT NARRATIVE: Use the dependency order of the chapters to trace how changes propagate through the PR.\n\n");
-
-    prompt.append("### OUTPUT FORMAT\n");
-    prompt.append("Please provide the Global PR Understanding using the following structure:\n\n")
-            .append("1. OVERALL PURPOSE: A high-level summary of what this PR achieves technically.\n\n")
-            .append("2. GLOBAL IDENTIFIER MAP: A comprehensive list of all affected identifiers, their roles, and the specific changes made to them.\n\n")
-            .append("3. SYSTEM INTERACTION GRAPH: A description of how these identifiers relate to each other and how the flow of data/control has changed across the PR.\n\n")
-            .append("4. CRITICAL IMPACT AREAS: Identification of the most sensitive parts of the system affected by this change.");
+            .append("- NO LOSS OF DETAIL: This is a technical synthesis, not a summary. You MUST NOT omit any identifiers or critical logic steps mentioned in any of the input mappings.\n")
+            .append("- HIGH-FIDELITY AGGREGATION: While you should eliminate redundancy, you must ensure that the systemic interactions between different chapters are clearly articulated in the unified map.\n")
+            .append("- STRUCTURAL ADHERENCE: The output must be a direct aggregation of the input format; do not introduce new sections or change the existing ones.");
 
     return prompt.toString();
   }
