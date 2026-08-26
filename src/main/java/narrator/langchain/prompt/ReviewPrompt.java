@@ -14,63 +14,65 @@ public class ReviewPrompt implements LangChainPrompt {
 
   public String chapter(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are an expert senior software engineer conducting an evidence-based technical review of a pull request. ")
-            .append("The PR's changes have been divided and ordered into chapters of a coherent narrative based on dependencies. ")
-            .append("You are reviewing one specific chapter.\n\n");
 
-    prompt.append("### CURRENT CHAPTER CONTENT\n");
-    prompt.append("This is the content of the current chapter you are reviewing:\n");
-    prompt.append(content).append("\n\n");
+    prompt.append("You are a Principal Software Engineer specializing in complex system architecture and high-rigor technical audits. ")
+            .append("The changes in this pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
+            .append("Your current objective is to perform a deep-dive review of a single chapter from this sequence.\n\n");
+
+    prompt.append("### CURRENT CHAPTER\n")
+         .append("The following content constitutes the current chapter, containing the actual code changes and diffs that must be reviewed:\n")
+         .append(content).append("\n\n");
 
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("### CONTEXT\n");
-      prompt.append("Below are the 'Understandings' from previous chapters which this current chapter depends on:\n");
-      prompt.append(String.join("\n", understandings.stream().map(understanding -> "<understanding>\n" + understanding + "\n</understanding>").toList()));
-      prompt.append("\n\n");
+      prompt.append("### DEPENDENCY CONTEXT\n")
+              .append("The following technical mappings were synthesized from previous chapters. These represent the prerequisite architectural knowledge that the current chapter depends on:\n")
+              .append(String.join("\n", understandings.stream().map(understanding -> "<mapping>\n" + understanding + "\n</mapping>").toList()))
+              .append("\n\n");
     }
 
     prompt.append("### YOUR TASK\n");
-    prompt.append("#### Step 1: Technical Mapping (Understanding)\n")
-            .append("Create a high-fidelity technical map of the changes. Focus on factual correctness and systemic intent:\n");
+    prompt.append("#### Step 1: High-Fidelity Technical Mapping\n")
+            .append("Before beginning your review, you must construct a comprehensive technical map of the changes in this chapter. ")
+            .append("This is a mandatory analytical phase to prevent surface-level analysis and ensure deep systemic understanding. ");
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("- Leverage the provided dependency context in understanding the dependencies of the current chapter.\n");
+      prompt.append("Integrate the provided Dependency Context to resolve references and understand how these changes build upon previous chapters. ");
     }
-    prompt.append("- Map all changed identifiers, their roles, and how they interact.\n")
-            .append("- Describe the logic flow: what is the intended behavior of these changes?\n");
+    prompt.append("Your mapping must include:\n")
+            .append("- IDENTIFIER TRACKING: A precise map of every modified or introduced identifier (classes, methods, variables), documenting their roles, responsibilities, and systemic interactions.\n")
+            .append("- LOGIC & INTENT ANALYSIS: A trace of the logic flow to deduce the exact intended behavior and its technical justification.\n");
+    prompt.append("#### Step 2: High-Signal Audit\n")
+            .append("Using your Technical Mapping, conduct a rigorous multi-dimensional audit (Correctness, Security, Efficiency, Maintainability, Observability, and Verification). ")
+            .append("Produce high-signal review comments adhering to these absolute standards:\n")
+            .append("- EVIDENCE-BASED ONLY: No compliments and no generic advice. Zero tolerance for hedging language (e.g., 'consider...', 'ensure...', 'it might be...'). Every finding must provide a specific technical justification for the flaw and a concrete, actionable resolution.\n")
+            .append("- SYSTEMIC OVER SURFACE: Prioritize systemic architectural flaws over trivial style or formatting issues.\n")
+            .append("- ATOMICITY & CONSOLIDATION: Consolidate multiple occurrences of the same pattern into a single finding. Explicitly list all affected change IDs for that finding.\n")
+            .append("- STRICT ANCHORING: Every comment MUST be anchored to one or more specific change IDs.\n\n");
 
-    prompt.append("#### Step 2: High-Signal Review Comments (Result)\n")
-            .append("Using your technical mapping from Step 1, conduct an objective review on the changes and produce high-signal review comments adhering to these strict standards:\n")
-            .append("- NO COMPLIMENTS: Do not praise the code.\n")
-            .append("- NO GENERIC ADVICE: Avoid generic 'Verify' or 'Ensure' advice; every flagged issue must include a specific technical justification and a proposed fix.\n")
-            .append("- NO SURFACE-LEVEL NITPICKS: Focus on systemic impact and technical correctness rather than trivial style issues.\n")
-            .append("- NO REPETITION: Avoid repeating the same comment for the same change or separate changes. If there are multiple exact, similar, or overlapping findings for one or multiple changes, merge them into one clear, coherent comment that captures all relevant points with all the associated hunk IDs.")
-            .append("- Every review comment MUST reference the specific change IDs to ensure it is anchored to the exact hunks.\n\n");
-
-    prompt.append("### OUTPUT FORMAT\n");
-    prompt.append("You must provide your response in exactly this format:\n\n");
-    prompt.append("<understanding>\n");
-    prompt.append("[Your detailed technical mapping of the changes and identifiers within this chapter]\n");
-    prompt.append("</understanding>\n\n");
-    prompt.append("<result>\n");
-    prompt.append("[Your modular, high-signal review comments referencing change IDs]\n");
-    prompt.append("</result>\n\n");
+    prompt.append("### OUTPUT FORMAT\n")
+            .append("You must provide your response in exactly this format:\n\n")
+            .append("<mapping>\n")
+            .append("[The high-fidelity technical map, including precise identifier tracking and logic analysis]\n")
+            .append("</mapping>\n\n")
+            .append("<comments>\n")
+            .append("[The high-signal audit findings, with each comment strictly anchored to change IDs and supported by technical justification]\n")
+            .append("</comments>");
 
     return prompt.toString();
   }
 
   public static ParsedResponse parseChapter(String response) {
-    int understandingOpen = response.indexOf("<understanding>");
-    int understandingClose = response.indexOf("</understanding>");
-    int resultOpen = response.indexOf("<result>");
-    int resultClose = response.indexOf("</result>");
+    int understandingOpen = response.indexOf("<mapping>");
+    int understandingClose = response.indexOf("</mapping>");
+    int resultOpen = response.indexOf("<comments>");
+    int resultClose = response.indexOf("</comments>");
 
     if (understandingOpen == -1 || understandingClose == -1 || understandingOpen >= understandingClose
             || resultOpen == -1 || resultClose == -1 || resultOpen >= resultClose) {
       return null;
     }
 
-    String understanding = response.substring(understandingOpen + 15, understandingClose).trim();
-    String result = response.substring(resultOpen + 8, resultClose).trim();
+    String understanding = response.substring(understandingOpen + 9, understandingClose).trim();
+    String result = response.substring(resultOpen + 10, resultClose).trim();
     return new ParsedResponse(understanding, result);
   }
 
