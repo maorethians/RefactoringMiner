@@ -26,7 +26,7 @@ public class ReviewPrompt implements LangChainPrompt {
     if (understandings != null && !understandings.isEmpty()) {
       prompt.append("### DEPENDENCY CONTEXT\n")
               .append("The following technical mappings were synthesized from previous chapters. These represent the prerequisite architectural knowledge that the current chapter depends on:\n")
-              .append(String.join("\n", understandings.stream().map(understanding -> "<mapping>\n" + understanding + "\n</mapping>").toList()))
+              .append(String.join("\n", understandings.stream().map(understanding -> "<technical_mapping>\n" + understanding + "\n</technical_mapping>").toList()))
               .append("\n\n");
     }
 
@@ -51,11 +51,11 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### OUTPUT FORMAT\n")
             .append("You must provide your response in exactly this format:\n\n")
             .append("<mapping>\n")
-            .append("[Insert the high-fidelity technical map from Step 1, including precise identifier tracking and logic analysis]\n")
+            .append("[Complete result of Step 1: High-Fidelity Technical Mapping, including precise identifier tracking and logic analysis]\n")
             .append("</mapping>\n\n")
-            .append("<comments>\n")
-            .append("[Insert the high-signal audit findings from Step 2, with each comment strictly anchored to change IDs and supported by technical justification]\n")
-            .append("</comments>");
+            .append("<findings>\n")
+            .append("[Complete result of Step 2: High-Signal Audit Findings, each strictly anchored to change IDs and supported by technical justification and actionable resolution]\n")
+            .append("</findings>");
 
     return prompt.toString();
   }
@@ -63,8 +63,8 @@ public class ReviewPrompt implements LangChainPrompt {
   public static ParsedResponse parseChapter(String response) {
     int understandingOpen = response.indexOf("<mapping>");
     int understandingClose = response.indexOf("</mapping>");
-    int resultOpen = response.indexOf("<comments>");
-    int resultClose = response.indexOf("</comments>");
+    int resultOpen = response.indexOf("<findings>");
+    int resultClose = response.indexOf("</findings>");
 
     if (understandingOpen == -1 || understandingClose == -1 || understandingOpen >= understandingClose
             || resultOpen == -1 || resultClose == -1 || resultOpen >= resultClose) {
