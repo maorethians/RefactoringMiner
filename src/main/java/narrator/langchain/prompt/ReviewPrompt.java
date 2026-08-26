@@ -83,17 +83,18 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("You are a Senior System Architect. ")
             .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
             .append("For each chapter, a high-fidelity technical map has been produced, focusing on precise identifier tracking and logic analysis. ")
-            .append("Your task is to synthesize the mappings of consecutive chapters into a single, unified comprehensive mapping that preserves the full technical rigor of the originals.");
+            .append("Your task is to synthesize the mappings of consecutive chapters into a single, unified comprehensive mapping that preserves the full technical rigor of the originals.\n\n");
 
-    prompt.append("\n### INPUT: CHAPTER TECHNICAL MAPPINGS\n")
+    prompt.append("### INPUT: CHAPTER TECHNICAL MAPPINGS\n")
             .append("Below are the technical mappings for consecutive chapters:\n");
     for (int i = 0; i < understandings.size(); i++) {
       prompt.append("<chapter").append(i + 1).append(">\n")
             .append(understandings.get(i)).append("\n")
             .append("</chapter").append(i + 1).append(">\n");
     }
+    prompt.append("\n");
 
-    prompt.append("\n### YOUR TASK\n")
+    prompt.append("### YOUR TASK\n")
             .append("Synthesize these inputs into a unified technical map. The resulting mapping MUST follow the exact structural format of the original chapter mappings, consisting of two primary sections:\n")
             .append("1. IDENTIFIER TRACKING: A consolidated and precise map of every modified or introduced identifier across all provided chapters, documenting their roles, responsibilities, and systemic interactions.\n")
             .append("2. LOGIC & INTENT ANALYSIS: A synthesized trace of the logic flow that captures the overall intended behavior and technical justification across these chapters.\n\n")
@@ -108,36 +109,40 @@ public class ReviewPrompt implements LangChainPrompt {
   @Override
   public String result(List<String> results, String understanding) {
     StringBuilder prompt = new StringBuilder();
-    prompt.append("You are the Lead Reviewer and Final Synthesizer for reviewing a pull request. Your task is to aggregate all findings of multiple components in a PR into a single, comprehensive, and high-fidelity final report.\n\n")
-            .append("The changes of the PR have been divided and ordered into chapters of a coherent narrative based on dependencies. ")
+
+    prompt.append("You are a Principal Software Engineer and Lead Synthesizer performing a final technical audit of a pull request. ")
+            .append("The review process has been modularized: the PR was decomposed into chapters, and each chapter was audited independently. ")
+            .append("Your objective is to synthesize these modular findings into a cohesive, high-rigor final report that avoids fragmentation and redundancy.\n\n")
             .append("You have two primary inputs:\n")
-            .append("1. The GLOBAL PR UNDERSTANDING: A synthesized technical map of the entire change set.\n")
-            .append("2. INTERMEDIATE RESULTS: Modular review findings from individual chapters.\n\n");
+            .append("1. THE GLOBAL TECHNICAL MAPPING: A unified technical map of all changes across the PR. Use this as your ground truth for systemic architecture and identifier tracking.\n")
+            .append("2. MODULAR CHAPTER FINDINGS: Independent audit results from each chapter, strictly anchored to change IDs.\n\n");
 
     prompt.append("### INPUT DATA\n\n");
-    prompt.append("#### Global PR Understanding:\n").append("<understanding>\n").append(understanding).append("\n</understanding>\n\n");
-    prompt.append("#### Intermediate Results From Chapters:\n");
+    prompt.append("#### Global Technical Mapping:\n").append("<mapping>\n").append(understanding).append("\n</mapping>\n\n");
+    prompt.append("#### Modular Findings From Chapters:\n");
     for (int i = 0; i < results.size(); i++) {
       prompt.append("<chapter").append(i + 1).append(">\n");
       prompt.append(results.get(i)).append("\n");
       prompt.append("</chapter").append(i + 1).append(">\n");
     }
+    prompt.append("\n");
 
-    prompt.append("\n### YOUR TASK\n");
-    prompt.append("Synthesize the intermediate results into a final list of review comments. You must follow these logic rules:\n\n")
-            .append("1. DEDUPLICATION & MERGING: If there are multiple similar or overlapping comments, merge them into one clear, coherent comment that captures all relevant points.\n")
-            .append("2. CONFLICT RESOLUTION: If two findings conflict:\n")
-            .append("   - Use the GLOBAL PR UNDERSTANDING to determine which finding is technically accurate.\n")
-            .append("   - If you can resolve the conflict, keep the correct version.\n")
-            .append("   - If the conflict cannot be resolved with the provided information, eliminate both conflicting comments to avoid presenting contradictory advice.\n")
-            .append("3. HUNK ID FIDELITY: You must preserve the exact hunk IDs from the source comments. Do not modify, hallucinate, or guess IDs. When merging multiple comments into one, ensure all associated hunk IDs are accurately collected.\n\n");
+    prompt.append("### SYNTHESIS LOGIC & RULES\n")
+            .append("Transform the modular findings into a final list of review comments by applying these rules:\n\n")
+            .append("1. SEMANTIC CONSOLIDATION: Do not simply list findings. Merge overlapping or related comments across different chapters into single, systemic observations. For example, if multiple chapters identify symptoms of the same underlying architectural flaw, synthesize them into one comprehensive finding.\n")
+            .append("2. RIGOROUS CONFLICT RESOLUTION: If findings from different chapters contradict each other:\n")
+            .append("   - Consult the Global Technical Mapping to determine the technically accurate state.\n")
+            .append("   - Keep only the correct version.\n")
+            .append("   - If the conflict cannot be resolved with absolute certainty, discard BOTH comments. It is better to omit a finding than to provide contradictory or incorrect guidance.\n")
+            .append("3. ABSOLUTE ID FIDELITY: Traceability is critical. Preserve the exact hunk IDs from the source findings. Do not modify or hallucinate IDs. When consolidating multiple findings into one, you MUST collect and list all associated hunk IDs for that consolidated comment.\n")
+            .append("4. SIGNAL PRESERVATION: Maintain the high-signal standard of the original audits. Ensure final comments remain evidence-based, actionable, and free of hedging language (e.g., avoid 'consider', 'perhaps', 'maybe').\n\n");
 
-    prompt.append("### OUTPUT FORMAT REQUIREMENTS\n");
-    prompt.append("Your output must be a list of review comments wrapped in <review_comments> tags.\n")
-            .append("Each review comment must follow this structural pattern:\n")
-            .append("1. FIRST LINE: Must contain ONLY the comma-separated list of hunk IDs this comment refers to.\n")
-            .append("2. SUBSEQUENT LINES: The detailed review text.\n\n")
-            .append("Separate individual comments with one or more blank lines for clarity.");
+    prompt.append("### OUTPUT FORMAT REQUIREMENTS\n")
+            .append("Your response must be a list of finalized review comments wrapped in <review_comments> tags.\n")
+            .append("Each comment MUST strictly adhere to this structure:\n")
+            .append("- LINE 1: Only the comma-separated list of hunk IDs.\n")
+            .append("- SUBSEQUENT LINES: The high-fidelity review text.\n\n")
+            .append("Separate individual comments with one or more blank lines.");
 
     return prompt.toString();
   }
