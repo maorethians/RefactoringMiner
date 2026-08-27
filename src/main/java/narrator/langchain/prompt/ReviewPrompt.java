@@ -1,7 +1,6 @@
 package narrator.langchain.prompt;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -77,7 +76,7 @@ public class ReviewPrompt implements LangChainPrompt {
   }
 
   @Override
-  public String understanding(List<String> understandings) {
+  public String understanding(List<StringIndex> understandings) {
     StringBuilder prompt = new StringBuilder();
 
     prompt.append("You are a Senior System Architect. ")
@@ -88,9 +87,15 @@ public class ReviewPrompt implements LangChainPrompt {
     prompt.append("### INPUT: CHAPTER TECHNICAL MAPPINGS\n")
             .append("Below are the technical mappings for consecutive chapters:\n");
     for (int i = 0; i < understandings.size(); i++) {
-      prompt.append("<chapter").append(i + 1).append(">\n")
-            .append(understandings.get(i)).append("\n")
-            .append("</chapter").append(i + 1).append(">\n");
+      String index = "";
+      if (i == 0 && understandings.get(i).index() != 0) {
+        index += "1-";
+      }
+      index += understandings.get(i).index() + 1;
+
+      prompt.append("<chapter_").append(index).append(">\n")
+            .append(understandings.get(i).str()).append("\n")
+            .append("</chapter_").append(index).append(">\n");
     }
     prompt.append("\n");
 
@@ -107,42 +112,50 @@ public class ReviewPrompt implements LangChainPrompt {
   }
 
   @Override
-  public String result(List<String> results, String understanding) {
+  public String result(List<StringIndex> results, String understanding, boolean isFinal) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Principal Software Engineer and Lead Synthesizer performing a final technical audit of a pull request. ")
-            .append("The review process has been modularized: the PR was decomposed into chapters, and each chapter was audited independently. ")
-            .append("Your objective is to synthesize these modular findings into a cohesive, high-rigor final report that avoids fragmentation and redundancy.\n\n")
+    prompt.append("You are a Principal Software Engineer and Lead Synthesizer performing a technical synthesis of audit findings for a set of code changes. ")
+            .append("The review process has been modularized: the changes were decomposed into chapters, and each chapter was audited independently. ")
+            .append("Your objective is to synthesize these modular findings into a cohesive, high-rigor report that avoids fragmentation and redundancy.\n\n")
             .append("You have two primary inputs:\n")
-            .append("1. THE GLOBAL TECHNICAL MAPPING: A unified technical map of all changes across the PR. Use this as your ground truth for systemic architecture and identifier tracking.\n")
+            .append("1. THE UNIFIED TECHNICAL MAPPING: A unified technical map of the changes within this set of chapters. Use this as your ground truth for systemic architecture and identifier tracking.\n")
             .append("2. MODULAR CHAPTER FINDINGS: Independent audit results from each chapter, strictly anchored to change IDs.\n\n");
 
     prompt.append("### INPUT DATA\n\n");
-    prompt.append("#### Global Technical Mapping:\n").append("<mapping>\n").append(understanding).append("\n</mapping>\n\n");
+    prompt.append("#### Unified Technical Mapping:\n").append("<mapping>\n").append(understanding).append("\n</mapping>\n\n");
     prompt.append("#### Modular Findings From Chapters:\n");
     for (int i = 0; i < results.size(); i++) {
-      prompt.append("<chapter").append(i + 1).append(">\n");
-      prompt.append(results.get(i)).append("\n");
-      prompt.append("</chapter").append(i + 1).append(">\n");
+      String index = "";
+      if (i == 0 && results.get(i).index() != 0) {
+        index += "1-";
+      }
+      index += results.get(i).index() + 1;
+
+      prompt.append("<chapter_").append(index).append(">\n");
+      prompt.append(results.get(i).str()).append("\n");
+      prompt.append("</chapter_").append(index).append(">\n");
     }
     prompt.append("\n");
 
     prompt.append("### SYNTHESIS LOGIC & RULES\n")
-            .append("Transform the modular findings into a final list of review comments by applying these rules:\n\n")
+            .append("Transform the modular findings into a synthesized list of review comments by applying these rules:\n\n")
             .append("1. SEMANTIC CONSOLIDATION: Do not simply list findings. Merge overlapping or related comments across different chapters into single, systemic observations. For example, if multiple chapters identify symptoms of the same underlying architectural flaw, synthesize them into one comprehensive finding.\n")
             .append("2. RIGOROUS CONFLICT RESOLUTION: If findings from different chapters contradict each other:\n")
-            .append("   - Consult the Global Technical Mapping to determine the technically accurate state.\n")
+            .append("   - Consult the Unified Technical Mapping to determine the technically accurate state.\n")
             .append("   - Keep only the correct version.\n")
             .append("   - If the conflict cannot be resolved with absolute certainty, discard BOTH comments. It is better to omit a finding than to provide contradictory or incorrect guidance.\n")
             .append("3. ABSOLUTE ID FIDELITY: Traceability is critical. Preserve the exact hunk IDs from the source findings. Do not modify or hallucinate IDs. When consolidating multiple findings into one, you MUST collect and list all associated hunk IDs for that consolidated comment.\n")
-            .append("4. SIGNAL PRESERVATION: Maintain the high-signal standard of the original audits. Ensure final comments remain evidence-based, actionable, and free of hedging language (e.g., avoid 'consider', 'perhaps', 'maybe').\n\n");
+            .append("4. SIGNAL PRESERVATION: Maintain the high-signal standard of the original audits. Ensure final comments remain evidence-based, actionable, and free of hedging language (e.g., avoid 'consider', 'perhaps', 'maybe').");
 
-    prompt.append("### OUTPUT FORMAT REQUIREMENTS\n")
-            .append("Your response must be a list of finalized review comments wrapped in <review_comments> tags.\n")
-            .append("Each comment MUST strictly adhere to this structure:\n")
-            .append("- LINE 1: Only the comma-separated list of hunk IDs.\n")
-            .append("- SUBSEQUENT LINES: The high-fidelity review text.\n\n")
-            .append("Separate individual comments with one or more blank lines.");
+    if (isFinal) {
+      prompt.append("\n\n### OUTPUT FORMAT REQUIREMENTS\n")
+              .append("Your response must be a list of finalized review comments wrapped in <review_comments> tags.\n")
+              .append("Each comment MUST strictly adhere to this structure:\n")
+              .append("- LINE 1: Only the comma-separated list of hunk IDs.\n")
+              .append("- SUBSEQUENT LINES: The high-fidelity review text.\n\n")
+              .append("Separate individual comments with one or more blank lines.");
+    }
 
     return prompt.toString();
   }

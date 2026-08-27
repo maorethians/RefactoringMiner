@@ -3,15 +3,13 @@ package narrator.langchain;
 import org.refactoringminer.astDiff.graph.Node;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.*;
 
 public class NarrativeState {
-    private final Map<Narrator.ChapterUnit, String> chapterUnderstanding = new HashMap<>();
-    private final Map<Narrator.ChapterUnit, String> chapterResult = new HashMap<>();
+    // chapters are ordered by insertion
+    private final Map<Narrator.ChapterUnit, String> chapterUnderstanding = new LinkedHashMap<>();
+    private final Map<Narrator.ChapterUnit, String> chapterResult = new LinkedHashMap<>();
+    public static final int THRESHOLD = 500;
 
     public void setUnderstanding(Narrator.ChapterUnit chapter, String understanding) {
         chapterUnderstanding.put(chapter, understanding);
@@ -28,11 +26,11 @@ public class NarrativeState {
                 .map(Map.Entry::getValue).toList();
     }
 
-    public String getUnderstanding(Narrator.ChapterUnit chapter) {
-        return chapterUnderstanding.get(chapter);
-    }
-
     public List<String> getResults() {
         return chapterResult.values().stream().toList();
+    }
+
+    public List<String> getUnderstandings() {
+        return chapterUnderstanding.values().stream().toList();
     }
 }

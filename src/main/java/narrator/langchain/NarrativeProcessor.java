@@ -49,7 +49,7 @@ public class NarrativeProcessor {
         List<ReviewPrompt.ReviewComment> parsedFinalResult = null;
         while (parsedFinalResult == null) {
             System.out.println("Synthesizing final result.");
-            String finalResult = langchainClient.compileResults(state.getResults(), chapters.stream().map(state::getUnderstanding).toList());
+            String finalResult = langchainClient.compileResults(state.getResults(), state.getUnderstandings());
             parsedFinalResult = ReviewPrompt.parseResult(finalResult);
         }
         return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), parsedFinalResult, state);
