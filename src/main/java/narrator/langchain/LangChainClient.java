@@ -33,13 +33,11 @@ public class LangChainClient {
             model = AnthropicChatModel.builder()
                     .apiKey(apiKey)
                     .modelName(modelName)
-                    .temperature(temperature)
                     .build();
         } else if ("openai".equalsIgnoreCase(provider)) {
             model = OpenAiChatModel.builder()
                     .apiKey(apiKey)
                     .modelName(modelName)
-                    .temperature(temperature)
                     .build();
         } else if ("ollama".equalsIgnoreCase(provider)) {
             model = OllamaChatModel.builder()
@@ -62,9 +60,10 @@ public class LangChainClient {
         return generate(this.prompt.chapter(content, understandings));
     }
 
-    public String compileResults(List<String> results, List<String> understandings) {
+    public List<ReviewPrompt.ReviewComment> compileResults(List<String> results, List<String> understandings) throws Exception {
+        List<ReviewPrompt.ReviewComment> finalResult = new ArrayList<>();
+
         String aggregatedUnderstanding = null;
-        String aggregatedResult = null;
         List<List<Integer>> splits = Splitter.createBalancedSplits(understandings);
         for (int i = 0; i < splits.size(); i++) {
             List<Integer> split = splits.get(i);
@@ -77,15 +76,16 @@ public class LangChainClient {
                     .map(index -> new LangChainPrompt.StringIndex(understandings.get(index), index)).toList());
             aggregatedUnderstanding = model.generate(this.prompt.understanding(splitUnderstandings));
 
-            List<LangChainPrompt.StringIndex> splitResults = new ArrayList<>();
-            if (aggregatedResult != null) {
-                splitResults.add(new LangChainPrompt.StringIndex(aggregatedResult, split.get(0) - 1));
+            List<ReviewPrompt.ReviewComment> parsedSplitResult = null;
+            while (parsedSplitResult == null) {
+                System.out.println("Synthesizing final result part " + (i + 1) + " of " + splits.size());
+                String splitResult = model.generate(this.prompt.result(split.stream().map(results::get).toList(), aggregatedUnderstanding));
+                parsedSplitResult = ReviewPrompt.parseResult(splitResult);
             }
-            splitResults.addAll(split.stream()
-                    .map(index -> new LangChainPrompt.StringIndex(results.get(index), index)).toList());
-            aggregatedResult = model.generate(this.prompt.result(splitResults, aggregatedUnderstanding, i == splits.size() - 1));
+
+            finalResult.addAll(parsedSplitResult);
         }
 
-        return aggregatedResult;
+        return finalResult;
     }
 }

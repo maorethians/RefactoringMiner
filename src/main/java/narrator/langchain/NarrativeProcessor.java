@@ -46,13 +46,8 @@ public class NarrativeProcessor {
         }
 
         // 3. Final compilation
-        List<ReviewPrompt.ReviewComment> parsedFinalResult = null;
-        while (parsedFinalResult == null) {
-            System.out.println("Synthesizing final result.");
-            String finalResult = langchainClient.compileResults(state.getResults(), state.getUnderstandings());
-            parsedFinalResult = ReviewPrompt.parseResult(finalResult);
-        }
-        return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), parsedFinalResult, state);
+        List<ReviewPrompt.ReviewComment> finalResult = langchainClient.compileResults(state.getResults(), state.getUnderstandings());
+        return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), finalResult, state);
     }
 
     public record NarrativeProcessResult(List<Cluster> clusters, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
