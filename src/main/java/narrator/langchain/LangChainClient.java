@@ -75,7 +75,8 @@ public class LangChainClient {
             }
             splitUnderstandings.addAll(split.stream()
                     .map(index -> new ReviewPrompt.StringIndex(understandings.get(index), index)).toList());
-            aggregatedUnderstanding = model.generate(this.prompt.understanding(splitUnderstandings));
+            aggregatedUnderstanding = splitUnderstandings.size() == 1 ?
+                    splitUnderstandings.get(0).str() : model.generate(this.prompt.understanding(splitUnderstandings));
 
             List<ReviewPrompt.ReviewComment> parsedSplitResult = null;
             while (parsedSplitResult == null) {
