@@ -6,64 +6,92 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class ReviewPrompt {
+  // TODO: our representation must be the most effective one for understanding the changes. Are we using it at the highest level of effectiveness?
   public String chapterUnderstanding(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
 
     prompt.append("You are a Principal Software Engineer specializing in complex system architecture. ")
             .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
-            .append("Your objective is to produce a high-fidelity technical mapping of the changes within a single chapter from this sequence.\n\n");
+            .append("Your objective is to architect a high-fidelity technical map of the changes within a single chapter. ")
+            .append("This map must serve as the definitive systemic ground truth for a subsequent rigorous audit")
+            .append("—meaning you must capture the deep semantic intent and architectural implications of every change, rather than providing a surface-level summary.\n\n");
 
     prompt.append("### CURRENT CHAPTER\n")
-         .append("The following content constitutes the current chapter, containing the actual code changes and diffs that must be mapped:\n")
-         .append(content).append("\n\n");
+            .append("The following block contains the raw code changes and diffs for the current chapter. This is your primary source of truth for the technical mapping task:\n")
+            .append(content).append("\n\n");
 
     if (understandings != null && !understandings.isEmpty()) {
       prompt.append("### DEPENDENCY CONTEXT\n")
-              .append("The following technical mappings were synthesized from previous chapters. These represent the prerequisite architectural knowledge that the current chapter depends on:\n")
+              .append("To ensure systemic continuity, you are provided with the technical mappings from preceding chapters. ")
+              .append("These establish the architectural baseline and dependency chain necessary to resolve identifier references and interpret the systemic intent of the current chapter:\n")
               .append(String.join("\n", understandings.stream().map(understanding -> "<technical_mapping>\n" + understanding + "\n</technical_mapping>").toList()))
               .append("\n\n");
     }
 
     prompt.append("### YOUR TASK\n");
-    prompt.append("#### High-Fidelity Technical Mapping\n")
-            .append("You must construct a comprehensive technical map of the changes in this chapter. ")
-            .append("This is a crucial analytical phase before reviewing this chapter to prevent surface-level analysis and ensure deep systemic understanding. ");
+    prompt.append("#### Construction of the High-Fidelity Technical Map\n")
+            .append("You must architect a comprehensive technical map of this chapter. This map is the definitive systemic ground truth for a subsequent high-rigor audit; ")
+            .append("any omission or ambiguity here will directly compromise the quality of the final review. ")
+            .append("Your goal is to eliminate all surface-level interpretation and replace it with deep architectural deduction.\n");
     if (understandings != null && !understandings.isEmpty()) {
-      prompt.append("Integrate the provided Dependency Context to resolve references and understand how these changes build upon previous chapters. ");
+      prompt.append("CRITICAL: Use the provided Dependency Context as your baseline. You must explicitly bridge the gap between previous chapters and this one, resolving identifier references and documenting how these changes evolve the system state established in preceding mappings.\n");
     }
-    prompt.append("Your mapping must include:\n")
-            .append("- IDENTIFIER TRACKING: A precise map of every modified or introduced identifier (classes, methods, variables), documenting their roles, responsibilities, and systemic interactions.\n")
-            .append("- LOGIC & INTENT ANALYSIS: A trace of the logic flow to deduce the exact intended behavior and its technical justification.\n");
+    prompt.append("Your mapping MUST be structured into two rigorous dimensions:\n")
+            .append("1. SYSTEMIC IDENTIFIER TRACKING: Provide a precise map of every modified or introduced identifier (classes, methods, variables). For each, you must document:\n")
+            .append("   - THE DELTA: Exactly how the role or responsibility has changed.\n")
+            .append("   - ARCHITECTURAL IMPACT: The ripple effect this change has on dependent components and systemic interactions.\n")
+            .append("2. LOGIC & INTENT DEDUCTION: Perform a deep trace of the logic flow to deduce the exact intended behavior. You must provide:\n")
+            .append("   - TECHNICAL JUSTIFICATION: The specific technical reason for this implementation path.\n")
+            .append("   - BEHAVIORAL RESULT: The precise resulting systemic behavior.\n")
+            .append("STRICT CONSTRAINT: Zero tolerance for generic summaries. Avoid phrases like 'improved performance' or 'cleaned up code.' Instead, provide evidence-based technical details (e.g., 'replaced linear search with a binary search to reduce lookup time from O(n) to O(log n)').\n");
 
     return prompt.toString();
   }
 
+  // TODO: is checking against mapping is the effective approach?
   public String chapterResult(String content, String understanding) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Principal Software Engineer specializing in high-rigor technical audits. ")
+    prompt.append("You are a Principal Software Engineer and Lead Technical Auditor known for meticulous rigor and a zero-tolerance policy for low-signal noise. ")
             .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
-            .append("Your objective is to perform a deep-dive review of a single chapter from this sequence.\n\n");
+            .append("Your objective is to conduct a high-signal audit of a single chapter, utilizing a pre-synthesized technical map to identify critical flaws, systemic risks, and architectural regressions.\n\n");
 
     prompt.append("### CURRENT CHAPTER\n")
-         .append("The following content constitutes the current chapter, containing the actual code changes and diffs that must be reviewed:\n")
-         .append(content).append("\n\n");
+            .append("The following block contains the raw code changes and diffs for this chapter. This serves as your primary evidentiary source for the audit:\n")
+            .append("<chapter_content>\n")
+            .append(content)
+            .append("\n</chapter_content>\n\n");
 
-    prompt.append("### TECHNICAL MAPPING\n")
-            .append("The following technical map of this chapter has been produced. Use it as your ground truth for identifying systemic interactions and intent:\n")
+    prompt.append("### TECHNICAL MAPPING (THE AUDIT BENCHMARK)\n")
+            .append("Below is the high-fidelity technical map of this chapter. This document serves as your definitive architectural benchmark—it describes the intended systemic state and logic flow.  ")
+            .append("Your primary analytical loop is to verify the raw code evidence against this benchmark: identify where the implementation diverges from the map, ")
+            .append("where the map's stated intent is flawed, or where the realized behavior introduces risks not captured in the mapping.\n")
             .append("<technical_mapping>\n")
             .append(understanding)
             .append("\n</technical_mapping>")
             .append("\n\n");
 
     prompt.append("### YOUR TASK\n");
-    prompt.append("#### High-Signal Audit\n")
-            .append("Using the Technical Mapping, conduct a rigorous multi-dimensional audit (Correctness, Security, Efficiency, Maintainability, Observability, and Verification). ")
-            .append("Produce high-signal review comments adhering to these absolute standards:\n")
-            .append("- EVIDENCE-BASED ONLY: No compliments and no generic advice. Zero tolerance for hedging language (e.g., 'consider...', 'ensure...', 'it might be...'). Every finding must provide a specific technical justification for the flaw.\n")
-            .append("- SYSTEMIC OVER SURFACE: Prioritize systemic architectural flaws over trivial style or formatting issues.\n")
-            .append("- ATOMICITY & UNICITY: Consolidate multiple occurrences of the same pattern into a single finding and explicitly list all affected change IDs for that finding. Each unique issue must be reported exactly once; redundant or repeated comments are strictly forbidden as they degrade signal-to-noise ratio.\n")
-            .append("- STRICT ANCHORING: Every comment MUST be anchored to one or more specific change IDs.\n\n");
+    prompt.append("#### Execution of the High-Signal Adversarial Audit\n")
+            .append("Using the Technical Mapping as your benchmark and the Chapter Content as your evidence, conduct an adversarial audit. ")
+            .append("You are not 'reviewing' code; you are interrogating the implementation to find where it fails the architectural specification (The Map). ")
+            .append("Your goal is to expose the gap between intended design and realized execution.\n\n");
+
+    prompt.append("PRIMARY OBJECTIVE: Hunt for 'Unmapped Behavior'. ")
+            .append("Identify any logic, side effects, or functionality present in the code that is absent from the Technical Mapping. ")
+            .append("Unmapped behavior is a high-probability indicator of architectural drift, undocumented dependencies, or critical bugs.\n\n");
+
+    prompt.append("Analyze the chapter through these three rigorous lenses:\n")
+            .append("1. SEMANTIC INTEGRITY & SECURITY: Does the code execute exactly what the map intends, and nothing more? Where does the implementation diverge from the mapping's logic? Does this divergence introduce security vulnerabilities or fail to handle edge cases explicitly mentioned in the intent?\n")
+            .append("2. RESOURCE EFFICIENCY & OBSERVABILITY: Is the mapped behavior implemented with optimal complexity? Identify systemic bottlenecks or 'blind spots' where a failure would occur without leaving a traceable log or metric.\n")
+            .append("3. ARCHITECTURAL DRIFT & VERIFIABILITY: Does this implementation introduce technical debt that contradicts the architectural baseline? Is the resulting behavior deterministic and verifiable, or does it introduce ambiguity?\n\n");
+
+    prompt.append("OUTPUT STANDARDS (ZERO TOLERANCE POLICY):\n")
+            .append("Produce review comments adhering to these absolute constraints:\n")
+            .append("- EVIDENCE-BASED RCA: Zero tolerance for compliments, generic advice, or hedging ('consider...', 'perhaps...'). Every finding must be a formal Root Cause Analysis following this structure: [Symptom] -> [Technical Cause] -> [Systemic Risk]. If you cannot prove the flaw with specific code references, discard it.\n")
+            .append("- SYSTEMIC OVER SURFACE: Prioritize architectural regressions and systemic flaws over trivial style or formatting issues. If a finding does not represent a systemic risk to the system's integrity, it is noise—discard it.\n")
+            .append("- ATOMICITY & UNICITY: Consolidate multiple occurrences of the same pattern into a single finding. Each unique issue must be reported exactly once; redundant comments are strictly forbidden as they degrade signal-to-noise ratio.\n")
+            .append("- STRICT ANCHORING: Every comment MUST be anchored to one or more specific change IDs.\n");
 
     return prompt.toString();
   }
@@ -86,8 +114,8 @@ public class ReviewPrompt {
       index += understandings.get(i).index() + 1;
 
       prompt.append("<chapter_").append(index).append(">\n")
-            .append(understandings.get(i).str()).append("\n")
-            .append("</chapter_").append(index).append(">\n");
+              .append(understandings.get(i).str()).append("\n")
+              .append("</chapter_").append(index).append(">\n");
     }
     prompt.append("\n");
 
@@ -146,7 +174,8 @@ public class ReviewPrompt {
   public static List<ReviewComment> parseResult(String response) throws Exception {
     if (response == null || response.isEmpty()) {
       return null;
-    };
+    }
+    ;
 
     List<ReviewComment> comments = new ArrayList<>();
 
@@ -227,7 +256,12 @@ public class ReviewPrompt {
     return ids;
   }
 
-  public record ReviewComment(List<String> hunkIds, String text) {}
-  public record ParsedResponse(String understanding, String result) {}
-  public record StringIndex(String str, int index) {}
+  public record ReviewComment(List<String> hunkIds, String text) {
+  }
+
+  public record ParsedResponse(String understanding, String result) {
+  }
+
+  public record StringIndex(String str, int index) {
+  }
 }
