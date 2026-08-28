@@ -99,13 +99,18 @@ public class ReviewPrompt {
   public String understanding(List<StringIndex> understandings) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Senior System Architect. ")
-            .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
-            .append("For each chapter, a high-fidelity technical map has been produced, focusing on precise identifier tracking and logic analysis. ")
-            .append("Your task is to synthesize the mappings of consecutive chapters into a single, unified comprehensive mapping that preserves the full technical rigor of the originals.\n\n");
+    prompt.append("You are a Principal System Architect specializing in high-fidelity technical modeling. ")
+            .append("The changes in a pull request have been decomposed into a sequence of chapters, and for each chapter, a rigorous technical map has been produced. ")
+            .append("Your objective is to aggregate the mappings of consecutive chapters into a single, unified Master Technical Map. ")
+            .append("This document will serve as the definitive architectural ground truth for the final synthesis of all audit findings.\n")
+            .append("CRITICAL REQUIREMENT: This is a LOSSLESS aggregation, not a summary. You are strictly forbidden from abstracting or omitting any technical detail. ")
+            .append("Every single identifier, systemic interaction, and logic step present in the input mappings must be preserved with absolute fidelity in the Master Map. ")
+            .append("Any omission at this stage will create an analytical blind spot in the final audit.\n")
+            .append("Your task is to transform these fragmented maps into a cohesive systemic model that explicitly captures how the changes evolve across chapters, ensuring a seamless technical continuity for the subsequent audit synthesis phase.\n\n");
 
-    prompt.append("### INPUT: CHAPTER TECHNICAL MAPPINGS\n")
-            .append("Below are the technical mappings for consecutive chapters:\n");
+    prompt.append("### SOURCE MATERIAL: SEQUENTIAL CHAPTER MAPPINGS\n")
+            .append("The following mappings are provided in their strict dependency order. Each represents a discrete step in the system's architectural evolution. ")
+            .append("You must process these sequentially to ensure that the Master Map preserves the correct progression of state and identifies how each chapter builds upon its predecessors:\n");
     for (int i = 0; i < understandings.size(); i++) {
       String index = "";
       if (i == 0 && understandings.get(i).index() != 0) {
@@ -120,13 +125,15 @@ public class ReviewPrompt {
     prompt.append("\n");
 
     prompt.append("### YOUR TASK\n")
-            .append("Synthesize these inputs into a unified technical map. The resulting mapping MUST follow the exact structural format of the original chapter mappings, consisting of two primary sections:\n")
-            .append("1. IDENTIFIER TRACKING: A consolidated and precise map of every modified or introduced identifier across all provided chapters, documenting their roles, responsibilities, and systemic interactions.\n")
-            .append("2. LOGIC & INTENT ANALYSIS: A synthesized trace of the logic flow that captures the overall intended behavior and technical justification across these chapters.\n\n")
-            .append("CRITICAL REQUIREMENTS:\n")
-            .append("- NO LOSS OF DETAIL: This is a technical synthesis, not a summary. You MUST NOT omit any identifiers or critical logic steps mentioned in any of the input mappings.\n")
-            .append("- HIGH-FIDELITY AGGREGATION: While you should eliminate redundancy, you must ensure that the systemic interactions between different chapters are clearly articulated in the unified map.\n")
-            .append("- STRUCTURAL ADHERENCE: The output must be a direct aggregation of the input format; do not introduce new sections or change the existing ones.");
+            .append("Consolidate these sequential inputs into a single, unified Master Technical Map. This is not a summary; it is a high-fidelity technical assembly.")
+            .append(" The resulting map MUST adhere strictly to the original structural format, consisting of exactly two primary sections:\n")
+            .append("1. IDENTIFIER TRACKING: A consolidated union of every modified or introduced identifier across all provided chapters. ")
+            .append("You must document their roles, responsibilities, and systemic interactions, ensuring that the evolution of each identifier is preserved if it appears in multiple chapters.\n")
+            .append("2. LOGIC & INTENT ANALYSIS: A comprehensive assembly of the logic flows. This should capture the overarching intended behavior and technical justifications as a continuous narrative across these chapters.\n\n")
+            .append("CRITICAL REQUIREMENTS (THE LOSSLESS MANDATE):\n")
+            .append("- ZERO OMISSION POLICY: You are strictly forbidden from omitting any identifier or critical logic step. Before finalizing, verify that every unique technical detail found in the <chapter_X> tags is represented in your output.\n")
+            .append("- SYSTEMIC CONTINUITY: While you should eliminate redundant phrasing, you must explicitly articulate the systemic interactions and dependencies between different chapters to ensure no context is lost during aggregation.\n")
+            .append("- STRICT STRUCTURAL CONTRACT: The output must be a direct consolidation of the input format. Do not introduce new sections, headers, or meta-commentary. Any deviation from the two-section structure will break the downstream audit pipeline.\n");
 
     return prompt.toString();
   }
@@ -134,39 +141,47 @@ public class ReviewPrompt {
   public String result(List<String> results, String understanding) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Principal Software Engineer and Lead Synthesizer performing a final technical audit of a pull request. ")
-            .append("The review process has been modularized: the PR was decomposed into chapters, and each chapter was audited independently. ")
-            .append("Your objective is to synthesize these modular findings into a cohesive, high-rigor final report that avoids fragmentation and redundancy.\n\n")
-            .append("You have two primary inputs:\n")
-            .append("1. THE GLOBAL TECHNICAL MAPPING: A unified technical map of all changes across the PR. Use this as your ground truth for systemic architecture and identifier tracking.\n")
-            .append("2. MODULAR CHAPTER FINDINGS: Independent audit results from each chapter, strictly anchored to change IDs.\n\n");
+    prompt.append("You are a Principal Software Engineer and Chief Audit Curator responsible for the final synthesis of a high-rigor technical review. ")
+            .append("The audit process was modularized: the PR was decomposed into chapters, which were mapped and audited independently to ensure maximum depth. ")
+            .append("Your objective is to consolidate these independent findings into a unified, cohesive final report that eliminates fragmentation and redundancy while strictly preserving all unique technical insights.\n\n")
+            .append("You are operating without access to the raw source code; therefore, you must rely on the provided inputs as your absolute boundaries:\n")
+            .append("1. THE GLOBAL TECHNICAL MAPPING: The definitive architectural ground truth. Use this as the Supreme Arbitrator to resolve contradictions and verify systemic interactions.\n")
+            .append("2. MODULAR CHAPTER FINDINGS: High-signal audit results from each chapter. Treat these as authoritative discoveries that must be preserved unless they are absolute duplicates or proven incorrect by the Global Mapping.\n\n");
 
-    prompt.append("### INPUT DATA\n\n");
-    prompt.append("#### Global Technical Mapping:\n").append("<mapping>\n").append(understanding).append("\n</mapping>\n\n");
-    prompt.append("#### Modular Findings From Chapters:\n");
+    prompt.append("### AUDIT EVIDENCE BASE\n")
+            .append("The following sources constitute the entirety of the available evidence for this synthesis. You must not assume any information outside these blocks.\n\n")
+            .append("#### [Sourcing 1] THE ARBITRATION BASELINE (Global Technical Mapping)\n")
+            .append("Use this to resolve systemic contradictions and verify architectural intent:\n")
+            .append("<mapping>\n").append(understanding).append("\n</mapping>\n\n")
+            .append("#### [Sourcing 2] AUTHORITATIVE DISCOVERIES (Modular Chapter Findings)\n")
+            .append("These are high-signal findings from independent audits. Preserve all unique insights:\n");
     for (int i = 0; i < results.size(); i++) {
-      prompt.append("<chapter_").append(i + 1).append(">\n");
-      prompt.append(results.get(i)).append("\n");
-      prompt.append("</chapter_").append(i + 1).append(">\n");
+      prompt.append("<chapter_").append(i + 1).append(">\n")
+              .append(results.get(i)).append("\n")
+              .append("</chapter_").append(i + 1).append(">\n");
     }
     prompt.append("\n");
 
-    prompt.append("### SYNTHESIS LOGIC & RULES\n")
-            .append("Transform the modular findings into a final list of review comments by applying these rules:\n\n")
-            .append("1. SEMANTIC CONSOLIDATION: Do not simply list findings. Merge overlapping or related comments across different chapters into single, systemic observations. For example, if multiple chapters identify symptoms of the same underlying architectural flaw, synthesize them into one comprehensive finding.\n")
-            .append("2. RIGOROUS CONFLICT RESOLUTION: If findings from different chapters contradict each other:\n")
-            .append("   - Consult the Global Technical Mapping to determine the technically accurate state.\n")
-            .append("   - Keep only the correct version.\n")
-            .append("   - If the conflict cannot be resolved with absolute certainty, discard BOTH comments. It is better to omit a finding than to provide contradictory or incorrect guidance.\n")
-            .append("3. ABSOLUTE ID FIDELITY: Traceability is critical. Preserve the exact hunk IDs from the source findings. Do not modify or hallucinate IDs. When consolidating multiple findings into one, you MUST collect and list all associated hunk IDs for that consolidated comment.\n")
-            .append("4. SIGNAL PRESERVATION: Maintain the high-signal standard of the original audits. Ensure final comments remain evidence-based, actionable, and free of hedging language (e.g., avoid 'consider', 'perhaps', 'maybe').\n\n");
+    prompt.append("### CURATION FRAMEWORK & SYNTHESIS PROTOCOLS\n")
+            .append("Transform the modular findings into a final list of review comments by applying these high-rigor protocols:\n")
+            .append("1. SYSTEMIC GROUPING & NUANCE PRESERVATION: Do not simply list fragmented findings, nor should you compress them into generic summaries. Merge overlapping or related comments across different chapters into single, systemic observations. ")
+            .append("CRITICAL: The resulting consolidated finding must be an additive assembly of all original nuances. If three findings identify different symptoms of the same flaw, the final comment must detail ALL three symptoms—do not sacrifice specificity for brevity.\n")
+            .append("2. ARBITRATED CONFLICT RESOLUTION: When findings from different chapters contradict each other:\n")
+            .append("   - Use the Global Technical Mapping as the Supreme Arbitrator to determine the technically accurate state.\n")
+            .append("   - If the mapping provides a clear answer, retain only the correct version.\n")
+            .append("   - If the conflict persists despite consulting the mapping, discard BOTH findings. In a high-rigor audit, an unresolvable contradiction is noise that risks providing incorrect guidance.\n")
+            .append("3. EVIDENCE PROVENANCE (ABSOLUTE ID FIDELITY): Traceability to the raw evidence is non-negotiable. Preserve the exact hunk IDs from the source findings without modification or hallucination. ")
+            .append("When grouping multiple findings into one systemic observation, you MUST collect and list every associated hunk ID as a comma-separated list at the top of the comment.\n")
+            .append("4. SIGNAL INTEGRITY: Ensure final consolidated comments maintain the rigor of the original audits. They must remain evidence-based and actionable. Zero tolerance for hedging language ('consider', 'perhaps', 'maybe') or generic filler. Every finding must be a sharp, technical observation anchored in proof.\n\n");
 
-    prompt.append("### OUTPUT FORMAT REQUIREMENTS\n")
-            .append("Your response must be a list of finalized review comments wrapped in <review_comments> tags.\n")
-            .append("Each comment MUST strictly adhere to this structure:\n")
-            .append("- LINE 1: Only the comma-separated list of hunk IDs.\n")
-            .append("- SUBSEQUENT LINES: The high-fidelity review text.\n\n")
-            .append("Separate individual comments with one or more blank lines.");
+    prompt.append("### OUTPUT FORMAT REQUIREMENTS (STRICT MACHINE-READABLE SPECIFICATION)\n")
+            .append("Your response must contain a list of finalized review comments wrapped in <review_comments> tags. ")
+            .append("Do not include any introductory text, meta-commentary, or concluding remarks inside these tags.\n")
+            .append("Each comment MUST strictly adhere to this two-part structure:\n")
+            .append("1. THE HEADER LINE: The first line of each comment must consist ONLY of the comma-separated list of hunk IDs. ")
+            .append("CRITICAL: Do not add labels, prefixes, or text such as 'IDs:' or 'Hunks:'. The line must contain nothing but the 4-character alphanumeric IDs and commas/spaces. Any extra characters will cause the parser to fail.\n")
+            .append("2. THE REVIEW TEXT: All subsequent lines following the header are the high-fidelity review text for that finding.\n")
+            .append("Separate individual comments with one or more blank lines. Ensure every single finding begins with its own Header Line.\n");
 
     return prompt.toString();
   }
