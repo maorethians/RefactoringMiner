@@ -29,20 +29,15 @@ public class NarrativeProcessor {
 
         // 2. Iterative processing
         for (int i = 0; i < chapters.size(); i++) {
+            System.out.println(i + 1 + "/" + chapters.size());
             Narrator.ChapterUnit chapter = chapters.get(i);
 
             String content = chapter.getContent();
             List<String> understandings = state.getDependencyUnderstandings(chapter);
+            ReviewPrompt.ParsedResponse chapterResponse = langchainClient.processChapter(content, understandings);
 
-            ReviewPrompt.ParsedResponse parsedChapterResult = null;
-            while (parsedChapterResult == null) {
-                System.out.println(i + 1 + "/" + chapters.size());
-                String chapterResult = langchainClient.processChapter(content, understandings);
-                parsedChapterResult = ReviewPrompt.parseChapter(chapterResult);
-            }
-
-            state.setUnderstanding(chapter, parsedChapterResult.understanding());
-            state.setResult(chapter, parsedChapterResult.result());
+            state.setUnderstanding(chapter, chapterResponse.understanding());
+            state.setResult(chapter, chapterResponse.result());
         }
 
         // 3. Final compilation

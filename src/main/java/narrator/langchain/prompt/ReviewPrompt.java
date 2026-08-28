@@ -5,21 +5,16 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class ReviewPrompt implements LangChainPrompt {
-  public record ReviewComment(List<String> hunkIds, String text) {}
-  public record ParsedResponse(String understanding, String result) {}
-
-  @Override
-
-  public String chapter(String content, List<String> understandings) {
+public class ReviewPrompt {
+  public String chapterUnderstanding(String content, List<String> understandings) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Principal Software Engineer specializing in complex system architecture and high-rigor technical audits. ")
+    prompt.append("You are a Principal Software Engineer specializing in complex system architecture. ")
             .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
-            .append("Your current objective is to perform a deep-dive review of a single chapter from this sequence.\n\n");
+            .append("Your objective is to produce a high-fidelity technical mapping of the changes within a single chapter from this sequence.\n\n");
 
     prompt.append("### CURRENT CHAPTER\n")
-         .append("The following content constitutes the current chapter, containing the actual code changes and diffs that must be reviewed:\n")
+         .append("The following content constitutes the current chapter, containing the actual code changes and diffs that must be mapped:\n")
          .append(content).append("\n\n");
 
     if (understandings != null && !understandings.isEmpty()) {
@@ -30,52 +25,49 @@ public class ReviewPrompt implements LangChainPrompt {
     }
 
     prompt.append("### YOUR TASK\n");
-    prompt.append("#### Step 1: High-Fidelity Technical Mapping\n")
-            .append("Before beginning your review, you must construct a comprehensive technical map of the changes in this chapter. ")
-            .append("This is a mandatory analytical phase to prevent surface-level analysis and ensure deep systemic understanding. ");
+    prompt.append("#### High-Fidelity Technical Mapping\n")
+            .append("You must construct a comprehensive technical map of the changes in this chapter. ")
+            .append("This is a crucial analytical phase before reviewing this chapter to prevent surface-level analysis and ensure deep systemic understanding. ");
     if (understandings != null && !understandings.isEmpty()) {
       prompt.append("Integrate the provided Dependency Context to resolve references and understand how these changes build upon previous chapters. ");
     }
     prompt.append("Your mapping must include:\n")
             .append("- IDENTIFIER TRACKING: A precise map of every modified or introduced identifier (classes, methods, variables), documenting their roles, responsibilities, and systemic interactions.\n")
             .append("- LOGIC & INTENT ANALYSIS: A trace of the logic flow to deduce the exact intended behavior and its technical justification.\n");
-    prompt.append("#### Step 2: High-Signal Audit\n")
-            .append("Using your Technical Mapping, conduct a rigorous multi-dimensional audit (Correctness, Security, Efficiency, Maintainability, Observability, and Verification). ")
-            .append("Produce high-signal review comments adhering to these absolute standards:\n")
-            .append("- EVIDENCE-BASED ONLY: No compliments and no generic advice. Zero tolerance for hedging language (e.g., 'consider...', 'ensure...', 'it might be...'). Every finding must provide a specific technical justification for the flaw and a concrete, actionable resolution.\n")
-            .append("- SYSTEMIC OVER SURFACE: Prioritize systemic architectural flaws over trivial style or formatting issues.\n")
-            .append("- ATOMICITY & UNICITY: Consolidate multiple occurrences of the same pattern into a single finding and explicitly list all affected change IDs for that finding. Each unique issue must be reported exactly once; redundant or repeated comments are strictly forbidden as they degrade signal-to-noise ratio.\n")
-            .append("- STRICT ANCHORING: Every comment MUST be anchored to one or more specific change IDs.\n\n");
-
-    prompt.append("### OUTPUT FORMAT\n")
-            .append("CRITICAL: You must provide your response in EXACTLY this format. The following tags are mandatory for parsing; any deviation (including omitting the tags) will cause the process to fail.\n\n")
-            .append("<mapping>\n")
-            .append("[Complete result of Step 1: High-Fidelity Technical Mapping, including precise identifier tracking and logic analysis]\n")
-            .append("</mapping>\n\n")
-            .append("<findings>\n")
-            .append("[Complete result of Step 2: High-Signal Audit Findings. Each finding must be unique and reported exactly once; redundant comments are strictly forbidden. All findings must be strictly anchored to change IDs and supported by technical justification and actionable resolution]\n")
-            .append("</findings>");
 
     return prompt.toString();
   }
 
-  public static ParsedResponse parseChapter(String response) {
-    int understandingOpen = response.indexOf("<mapping>");
-    int understandingClose = response.indexOf("</mapping>");
-    int resultOpen = response.indexOf("<findings>");
-    int resultClose = response.indexOf("</findings>");
+  public String chapterResult(String content, String understanding) {
+    StringBuilder prompt = new StringBuilder();
 
-    if (understandingOpen == -1 || understandingClose == -1 || understandingOpen >= understandingClose
-            || resultOpen == -1 || resultClose == -1 || resultOpen >= resultClose) {
-      return null;
-    }
+    prompt.append("You are a Principal Software Engineer specializing in high-rigor technical audits. ")
+            .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
+            .append("Your objective is to perform a deep-dive review of a single chapter from this sequence.\n\n");
 
-    String understanding = response.substring(understandingOpen + 9, understandingClose).trim();
-    String result = response.substring(resultOpen + 10, resultClose).trim();
-    return new ParsedResponse(understanding, result);
+    prompt.append("### CURRENT CHAPTER\n")
+         .append("The following content constitutes the current chapter, containing the actual code changes and diffs that must be reviewed:\n")
+         .append(content).append("\n\n");
+
+    prompt.append("### TECHNICAL MAPPING\n")
+            .append("The following technical map of this chapter has been produced. Use it as your ground truth for identifying systemic interactions and intent:\n")
+            .append("<technical_mapping>\n")
+            .append(understanding)
+            .append("\n</technical_mapping>")
+            .append("\n\n");
+
+    prompt.append("### YOUR TASK\n");
+    prompt.append("#### High-Signal Audit\n")
+            .append("Using the Technical Mapping, conduct a rigorous multi-dimensional audit (Correctness, Security, Efficiency, Maintainability, Observability, and Verification). ")
+            .append("Produce high-signal review comments adhering to these absolute standards:\n")
+            .append("- EVIDENCE-BASED ONLY: No compliments and no generic advice. Zero tolerance for hedging language (e.g., 'consider...', 'ensure...', 'it might be...'). Every finding must provide a specific technical justification for the flaw.\n")
+            .append("- SYSTEMIC OVER SURFACE: Prioritize systemic architectural flaws over trivial style or formatting issues.\n")
+            .append("- ATOMICITY & UNICITY: Consolidate multiple occurrences of the same pattern into a single finding and explicitly list all affected change IDs for that finding. Each unique issue must be reported exactly once; redundant or repeated comments are strictly forbidden as they degrade signal-to-noise ratio.\n")
+            .append("- STRICT ANCHORING: Every comment MUST be anchored to one or more specific change IDs.\n\n");
+
+    return prompt.toString();
   }
 
-  @Override
   public String understanding(List<StringIndex> understandings) {
     StringBuilder prompt = new StringBuilder();
 
@@ -111,7 +103,6 @@ public class ReviewPrompt implements LangChainPrompt {
     return prompt.toString();
   }
 
-  @Override
   public String result(List<String> results, String understanding) {
     StringBuilder prompt = new StringBuilder();
 
@@ -235,4 +226,8 @@ public class ReviewPrompt implements LangChainPrompt {
 
     return ids;
   }
+
+  public record ReviewComment(List<String> hunkIds, String text) {}
+  public record ParsedResponse(String understanding, String result) {}
+  public record StringIndex(String str, int index) {}
 }

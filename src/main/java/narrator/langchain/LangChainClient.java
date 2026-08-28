@@ -4,7 +4,6 @@ import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
-import narrator.langchain.prompt.LangChainPrompt;
 import narrator.langchain.prompt.ReviewPrompt;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Splitter;
 
@@ -14,8 +13,8 @@ import java.util.List;
 
 public class LangChainClient {
     private final ChatLanguageModel model;
-    private final LangChainPrompt prompt;
-    private static final double temperature = 0.2;
+    private final ReviewPrompt prompt;
+    private static final double temperature = 0.0;
 
     public LangChainClient(ChatLanguageModel model) {
         this.model = model;
@@ -56,8 +55,10 @@ public class LangChainClient {
         return model.generate(prompt);
     }
 
-    public String processChapter(String content, List<String> understandings) {
-        return generate(this.prompt.chapter(content, understandings));
+    public ReviewPrompt.ParsedResponse processChapter(String content, List<String> understandings) {
+        String understanding = generate(this.prompt.chapterUnderstanding(content, understandings));
+        String result = generate(this.prompt.chapterResult(content, understanding));
+        return new ReviewPrompt.ParsedResponse(understanding, result);
     }
 
     public List<ReviewPrompt.ReviewComment> compileResults(List<String> results, List<String> understandings) throws Exception {
@@ -68,12 +69,12 @@ public class LangChainClient {
         for (int i = 0; i < splits.size(); i++) {
             List<Integer> split = splits.get(i);
 
-            List<LangChainPrompt.StringIndex> splitUnderstandings = new ArrayList<>();
+            List<ReviewPrompt.StringIndex> splitUnderstandings = new ArrayList<>();
             if (aggregatedUnderstanding != null) {
-                splitUnderstandings.add(new LangChainPrompt.StringIndex(aggregatedUnderstanding, split.get(0) - 1));
+                splitUnderstandings.add(new ReviewPrompt.StringIndex(aggregatedUnderstanding, split.get(0) - 1));
             }
             splitUnderstandings.addAll(split.stream()
-                    .map(index -> new LangChainPrompt.StringIndex(understandings.get(index), index)).toList());
+                    .map(index -> new ReviewPrompt.StringIndex(understandings.get(index), index)).toList());
             aggregatedUnderstanding = model.generate(this.prompt.understanding(splitUnderstandings));
 
             List<ReviewPrompt.ReviewComment> parsedSplitResult = null;
