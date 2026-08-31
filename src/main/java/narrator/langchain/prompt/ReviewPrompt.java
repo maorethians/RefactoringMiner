@@ -58,9 +58,7 @@ public class ReviewPrompt {
 
     prompt.append("### CURRENT CHAPTER\n")
             .append("The following block contains the raw code changes and diffs for this chapter. This serves as your primary evidentiary source for the audit:\n")
-            .append("<chapter_content>\n")
-            .append(content)
-            .append("\n</chapter_content>\n\n");
+            .append(content).append("\n\n");
 
     prompt.append("### TECHNICAL MAPPING (THE AUDIT BENCHMARK)\n")
             .append("Below is the high-fidelity technical map of this chapter. This document serves as your definitive architectural benchmark—it describes the intended systemic state and logic flow.  ")
