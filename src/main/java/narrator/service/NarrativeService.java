@@ -119,7 +119,7 @@ public class NarrativeService {
             return cached;
         }
 
-        List<Narrator.ChapterUnit> fileChapters = narrator.getFlatChapters(GrainLevel.FILE);
+        List<Narrator.ChapterUnit> fileChapters = narrator.getFlatChapters(GrainLevel.SINGLE);
         int numChunks = fileChapters.size();
         if (numChunks == 0) {
             return Collections.emptyList();
