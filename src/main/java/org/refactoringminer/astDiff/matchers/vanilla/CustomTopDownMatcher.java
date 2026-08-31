@@ -267,18 +267,23 @@ public class CustomTopDownMatcher extends GreedySubtreeMatcher {
 		private final double parentsSimilarity;
 		private final double parentPositionDistance;
 		private final int absolutePositionDistance;
+		private final int neighborAnchorScore;
+		private final boolean hasFollowingIdenticalSibling;
 		private final int srcPosition;
 		private final int dstPosition;
 		private final long order;
 
 		private ScoredMapping(Tree first, Tree second, double siblingsSimilarity, double parentsSimilarity,
-							  double parentPositionDistance, int absolutePositionDistance, long order) {
+							  double parentPositionDistance, int absolutePositionDistance, int neighborAnchorScore,
+							  boolean hasFollowingIdenticalSibling, long order) {
 			this.first = first;
 			this.second = second;
 			this.siblingsSimilarity = siblingsSimilarity;
 			this.parentsSimilarity = parentsSimilarity;
 			this.parentPositionDistance = parentPositionDistance;
 			this.absolutePositionDistance = absolutePositionDistance;
+			this.neighborAnchorScore = neighborAnchorScore;
+			this.hasFollowingIdenticalSibling = hasFollowingIdenticalSibling;
 			this.srcPosition = first.getPos();
 			this.dstPosition = second.getPos();
 			this.order = order;
@@ -286,10 +291,31 @@ public class CustomTopDownMatcher extends GreedySubtreeMatcher {
 
 		@Override
 		public int compareTo(ScoredMapping other) {
+			//when a candidate's immediate sibling is already (uniquely) mapped, whether the candidate
+			//sits next to that established mapping's counterpart is the most direct evidence of which
+			//of several structurally-identical siblings (e.g. commas in a list) truly corresponds;
+			//this is checked before the coarser, list-wide similarity metrics below
 			int result = Double.compare(other.siblingsSimilarity, siblingsSimilarity);
 			if (result != 0) return result;
 			result = Double.compare(other.parentsSimilarity, parentsSimilarity);
 			if (result != 0) return result;
+			//once siblings/parents similarity is tied (typically because every candidate shares the exact
+			//same parent, e.g. commas in one list), whether a candidate sits next to an already
+			//uniquely-matched immediate neighbor sibling is more reliable than the position-based
+			//metrics below, which are normalized by sibling count and can favor a shifted candidate
+			//over the untouched one whenever siblings are inserted/removed elsewhere in the same parent
+			result = Integer.compare(other.neighborAnchorScore, neighborAnchorScore);
+			if (result != 0) return result;
+			//an exact absolute-position match can be a pure coincidence between two unrelated trees
+			//when the src side has multiple identical siblings (e.g. repeated isomorphic statements/calls
+			//in the same list): the global traversal index is not a reliable disambiguator there, so this
+			//short-circuit is skipped in that case and the position-distance metrics below decide instead
+			if (!hasFollowingIdenticalSibling && !other.hasFollowingIdenticalSibling) {
+				boolean thisExact = absolutePositionDistance == 0;
+				boolean otherExact = other.absolutePositionDistance == 0;
+				if (thisExact != otherExact)
+					return thisExact ? -1 : 1;
+			}
 			result = Double.compare(parentPositionDistance, other.parentPositionDistance);
 			if (result != 0) return result;
 			result = Integer.compare(absolutePositionDistance, other.absolutePositionDistance);
@@ -388,7 +414,63 @@ public class CustomTopDownMatcher extends GreedySubtreeMatcher {
 					parentsSimilarity(src, dst),
 					parentPositionDistance(src, dst),
 					Math.abs(src.getMetrics().position - dst.getMetrics().position),
+					neighborAnchorScore(src, dst),
+					hasFollowingIdenticalSibling(src),
 					order);
+		}
+
+		//true when a later sibling under src's immediate parent is structurally identical (same hash) to
+		//src itself, e.g. repeated isomorphic calls/statements in the same list; such repetition is exactly
+		//what makes a coincidental exact-position match across src/dst unreliable as a disambiguator.
+		//Leaves (e.g. punctuation like repeated commas in an argument list) are excluded: they trivially
+		//share a hash with every sibling of the same label, yet their exact position is normally the
+		//correct and stable disambiguator, so flagging them here would defeat the exact-tie short-circuit
+		//far more often than the genuine repeated-subtree case this guard targets.
+		private boolean hasFollowingIdenticalSibling(Tree src) {
+			if (src.getChildren().isEmpty()) {
+				return false;
+			}
+			Tree parent = src.getParent();
+			if (parent == null) {
+				return false;
+			}
+			List<Tree> siblings = parent.getChildren();
+			int index = parent.getChildPosition(src);
+			for (int i = index + 1; i < siblings.size(); i++) {
+				if (siblings.get(i).getMetrics().hash == src.getMetrics().hash) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		//+1/-1 per immediate sibling (previous and next) whose own mapping is already established:
+		//+1 if that neighbor's counterpart sits at the matching position on the other side, -1 if it
+		//sits somewhere else. 0 when neither neighbor offers any (dis)confirming evidence yet.
+		private int neighborAnchorScore(Tree src, Tree dst) {
+			Tree srcParent = src.getParent();
+			Tree dstParent = dst.getParent();
+			if (srcParent == null || dstParent == null) {
+				return 0;
+			}
+			int srcIndex = srcParent.getChildPosition(src);
+			int dstIndex = dstParent.getChildPosition(dst);
+			int score = 0;
+			if (srcIndex > 0) {
+				Tree dstForSrcPrev = mappings.getDstForSrc(srcParent.getChild(srcIndex - 1));
+				if (dstForSrcPrev != null && dstForSrcPrev.getParent() == dstParent) {
+					score += (dstIndex > 0 && dstParent.getChild(dstIndex - 1) == dstForSrcPrev) ? 1 : -1;
+				}
+			}
+			int srcChildCount = srcParent.getChildren().size();
+			int dstChildCount = dstParent.getChildren().size();
+			if (srcIndex < srcChildCount - 1) {
+				Tree dstForSrcNext = mappings.getDstForSrc(srcParent.getChild(srcIndex + 1));
+				if (dstForSrcNext != null && dstForSrcNext.getParent() == dstParent) {
+					score += (dstIndex < dstChildCount - 1 && dstParent.getChild(dstIndex + 1) == dstForSrcNext) ? 1 : -1;
+				}
+			}
+			return score;
 		}
 
 		private double siblingsSimilarity(Tree srcParent, Tree dstParent) {

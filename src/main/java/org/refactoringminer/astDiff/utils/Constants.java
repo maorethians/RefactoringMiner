@@ -644,10 +644,12 @@ public class Constants {
     public final String FIELD_EXPRESSION = "field_expression";
     public final String SUBSCRIPT_EXPRESSION = "subscript_expression";
     public final String ENUMERATOR = "enumerator";
+    public final String ENUMERATOR_LIST = "enumerator_list";
     public final String ELLIPSIS = "...";
     public final String STORAGE_CLASS_SPECIFIER = "storage_class_specifier";
     public final String DEFAULT_METHOD_CLAUSE = "default_method_clause";
     public final String DELETE_METHOD_CLAUSE = "delete_method_clause";
+    public final String PURE_VIRTUAL_CLAUSE = "pure_virtual_clause";
     public final String OPERATOR_NAME = "operator_name";
     public final String FRIEND_DECLARATION = "friend_declaration";
     public final String TRAILING_RETURN_TYPE = "trailing_return_type";
@@ -662,6 +664,7 @@ public class Constants {
     public final String CONSTEXPR = "constexpr";
     public final String TYPE_DEFINITION = "type_definition";
     public final String TYPEDEF = "typedef";
+    public final String DEPENDENT_TYPE = "dependent_type";
     public final String PARENTHESIZED_DECLARATOR = "parenthesized_declarator";
     public final String OPTIONAL_PARAMETER_DECLARATION = "optional_parameter_declaration";
     public final String AUTO = "auto";
@@ -669,4 +672,7 @@ public class Constants {
     public final String LAMBDA_CAPTURE_SPECIFIER = "lambda_capture_specifier";
     public final String ABSTRACT_FUNCTION_DECLARATOR = "abstract_function_declarator";
     public final String PREPROC_IFDEF = "preproc_ifdef";
+    public final String PREPROC_CALL = "preproc_call";
+    public final String ENDIF = "#endif";
+    public final String ATTRIBUTE_DECLARATION = "attribute_declaration";
 }

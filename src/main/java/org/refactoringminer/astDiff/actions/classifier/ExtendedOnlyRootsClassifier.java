@@ -2,7 +2,6 @@ package org.refactoringminer.astDiff.actions.classifier;
 
 import com.github.gumtreediff.actions.model.*;
 import com.github.gumtreediff.tree.Tree;
-import org.refactoringminer.astDiff.actions.classifier.ExtendedAbstractITreeClassifier;
 import org.refactoringminer.astDiff.actions.model.MoveIn;
 import org.refactoringminer.astDiff.actions.model.MoveOut;
 import org.refactoringminer.astDiff.actions.model.MultiMove;
@@ -10,7 +9,6 @@ import org.refactoringminer.astDiff.models.ASTDiff;
 
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 
 /**

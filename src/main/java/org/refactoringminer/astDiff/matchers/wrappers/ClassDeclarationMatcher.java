@@ -11,6 +11,7 @@ import gr.uom.java.xmi.UMLForwardDeclaration;
 import gr.uom.java.xmi.UMLNamedExport;
 import gr.uom.java.xmi.UMLPreprocessorStatement;
 import gr.uom.java.xmi.UMLProblemDeclaration;
+import gr.uom.java.xmi.UMLStaticAssertionDeclaration;
 import gr.uom.java.xmi.UMLType;
 import gr.uom.java.xmi.UMLTypeAlias;
 import gr.uom.java.xmi.UMLTypeParameter;
@@ -21,11 +22,13 @@ import gr.uom.java.xmi.decomposition.VariableDeclaration;
 import gr.uom.java.xmi.diff.UMLAnnotationListDiff;
 import gr.uom.java.xmi.diff.UMLClassBaseDiff;
 import gr.uom.java.xmi.diff.UMLClassMoveDiff;
+import gr.uom.java.xmi.diff.UMLClassRenameDiff;
 import gr.uom.java.xmi.diff.UMLCommentListDiff;
 import gr.uom.java.xmi.diff.UMLForwardDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportListDiff;
 import gr.uom.java.xmi.diff.UMLProblemDeclarationListDiff;
+import gr.uom.java.xmi.diff.UMLStaticAssertionDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLTypeAliasListDiff;
 
 import org.refactoringminer.astDiff.models.OptimizationData;
@@ -36,6 +39,7 @@ import org.refactoringminer.astDiff.matchers.TreeMatcher;
 import org.refactoringminer.astDiff.matchers.statement.IgnoringCommentsLeafMatcher;
 import org.refactoringminer.astDiff.utils.TreeUtilFunctions;
 import org.refactoringminer.util.PathFileUtils;
+import org.refactoringminer.util.PrefixSuffixUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -198,6 +202,10 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 if (matched != null) {
                     mappingStore.addMappingRecursively(matched.first,matched.second);
                 }
+                matched = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(), LANG1.DEPENDENT_TYPE, LANG2.DEPENDENT_TYPE);
+                if (matched != null) {
+                    mappingStore.addMappingRecursively(matched.first,matched.second);
+                }
                 matched = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(), LANG1.SEMICOLON, LANG2.SEMICOLON);
                 if (matched != null) {
                     mappingStore.addMapping(matched.first,matched.second);
@@ -253,6 +261,10 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.MODIFIERS,LANG2.MODIFIERS);
         if (matched != null)
             mappingStore.addMapping(matched.first,matched.second);
+        Pair<Tree, Tree> templateTypes = Helpers.findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.TEMPLATE_TYPE,LANG2.TEMPLATE_TYPE);
+        if (templateTypes != null) {
+            mappingStore.addMappingRecursively(templateTypes.first,templateTypes.second);
+        }
 
         if (classDiff.getOriginalClass().isStatic() && classDiff.getNextClass().isStatic())
             new SameModifierMatcher(LANG1, LANG2, LANG1.STATIC).match(srcTypeDeclaration,dstTypeDeclaration,mappingStore);
@@ -290,6 +302,8 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         for (org.apache.commons.lang3.tuple.Pair<UMLTypeParameter, UMLTypeParameter> commonTypeParamSet : classDiff.getTypeParameterDiffList().getCommonTypeParameters()) {
             Tree srcTypeParam = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, commonTypeParamSet.getLeft().getLocationInfo(), LANG1);
             Tree dstTypeParam = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, commonTypeParamSet.getRight().getLocationInfo(), LANG2);
+            if(srcTypeParam == null || dstTypeParam == null)
+                continue;
             mappingStore.addMappingRecursively(srcTypeParam,dstTypeParam);
             if (srcTypeParam.getParent().getType().name.equals(LANG1.TYPE_PARAMETERS) && dstTypeParam.getParent().getType().name.equals(LANG2.TYPE_PARAMETERS)) {
                 mappingStore.addMapping(srcTypeParam.getParent(), dstTypeParam.getParent());
@@ -348,6 +362,8 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 AbstractExpression expr2 = classDiff.getNextClass().getSuperTypeCallEntries().get(i);
                 Tree srcSuperConstructorCall = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, expr1.getLocationInfo(), LANG1);
                 Tree dstSuperConstructorCall = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, expr2.getLocationInfo(), LANG2);
+                if(srcSuperConstructorCall == null || dstSuperConstructorCall == null)
+                    continue;
                 if(srcSuperConstructorCall.getType().name.equals(LANG1.FIELD_INITIALIZER) && dstSuperConstructorCall.getType().name.equals(LANG2.FIELD_INITIALIZER) && !srcSuperConstructorCall.isIsomorphicTo(dstSuperConstructorCall)) {
                     Tree argList1 = TreeUtilFunctions.findChildByType(srcSuperConstructorCall, LANG1.ARGUMENT_LIST);
                     Tree argList2 = TreeUtilFunctions.findChildByType(dstSuperConstructorCall, LANG2.ARGUMENT_LIST);
@@ -382,6 +398,17 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                                 break;
                             }
                         }
+                    }
+                }
+                else if(srcSuperConstructorCall.getType().name.equals(LANG1.METHOD_INVOCATION) && dstSuperConstructorCall.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+                    mappingStore.addMappingRecursively(srcSuperConstructorCall, dstSuperConstructorCall);
+                    int index1 = srcSuperConstructorCall.getParent().getChildPosition(srcSuperConstructorCall);
+                    int index2 = dstSuperConstructorCall.getParent().getChildPosition(dstSuperConstructorCall);
+                    if(srcSuperConstructorCall.getParent().getChildren().size() > index1+1 && srcSuperConstructorCall.getParent().getChild(index1+1).getType().name.equals(LANG1.COMMA) &&
+                            dstSuperConstructorCall.getParent().getChildren().size() > index2+1 && dstSuperConstructorCall.getParent().getChild(index2+1).getType().name.equals(LANG2.COMMA)) {
+                        Tree t1 = srcSuperConstructorCall.getParent().getChild(index1+1);
+                        Tree t2 = dstSuperConstructorCall.getParent().getChild(index2+1);
+                        mappingStore.addMapping(t1,t2);
                     }
                 }
             }
@@ -451,24 +478,31 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         if(classDiff.getPreprocessorStatementListDiff().isPresent()) {
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getCommonStatements()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
-                if(!srcStatement.getLabel().isEmpty() && !srcStatement.getLabel().equals("#endif"))
+                if(srcStatement != null && !srcStatement.getLabel().isEmpty() && !srcStatement.getType().name.equals(LANG1.ENDIF))
                     srcStatement = srcStatement.getParent();
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(!dstStatement.getLabel().isEmpty() && !dstStatement.getLabel().equals("#endif"))
+                if(dstStatement != null && !dstStatement.getLabel().isEmpty() && !dstStatement.getType().name.equals(LANG2.ENDIF))
                     dstStatement = dstStatement.getParent();
                 //make sure the preprocessor statement is matched, because TreeSitter puts nested statements under the preprocessor statement, while Eclipse CDT parser does not do the same
-                if(srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1) {
+                if(srcStatement != null && dstStatement != null && srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1) {
                     mappingStore.addMappingRecursively(srcStatement.getChild(1), dstStatement.getChild(1));
                 }
-                if(srcStatement.getChildren().size() > 0 && dstStatement.getChildren().size() > 0) {
+                if(srcStatement != null && dstStatement != null && srcStatement.getChildren().size() > 0 && dstStatement.getChildren().size() > 0) {
                     mappingStore.addMapping(srcStatement.getChild(0), dstStatement.getChild(0));
                 }
-                if(srcStatement.getChildren().size() == 0 && dstStatement.getChildren().size() == 0) {
+                if(srcStatement != null && dstStatement != null && srcStatement.getChildren().size() == 0 && dstStatement.getChildren().size() == 0) {
                     //this is #endif
                     mappingStore.addMapping(srcStatement, dstStatement);
-                    mappingStore.addMappingRecursively(srcStatement.getParent(), dstStatement.getParent());
+                    if(srcStatement.getParent().getType().name.equals(LANG1.PREPROC_CALL) && dstStatement.getParent().getType().name.equals(LANG2.PREPROC_CALL)) {
+                        mappingStore.addMappingRecursively(srcStatement.getParent(), dstStatement.getParent());
+                    }
                 }
-                mappingStore.addMappingRecursively(srcStatement, dstStatement);
+                boolean ifDef = srcStatement != null && dstStatement != null && srcStatement.getType().name.equals(LANG1.PREPROC_IFDEF) && dstStatement.getType().name.equals(LANG2.PREPROC_IFDEF) &&
+                        (classDiff.getPreprocessorStatementListDiff().get().getAddedStatements().size() > 0 || classDiff.getPreprocessorStatementListDiff().get().getRemovedStatements().size() > 0);
+                if(srcStatement != null && dstStatement != null && !ifDef)
+                    mappingStore.addMappingRecursively(srcStatement, dstStatement);
+                else
+                    mappingStore.addMapping(srcStatement, dstStatement);
             }
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getChangedStatements()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
@@ -485,82 +519,99 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             UMLForwardDeclarationListDiff umlForwardDeclarationListDiff = classDiff.getForwardDeclarationListDiff().get();
             for (org.apache.commons.lang3.tuple.Pair<UMLForwardDeclaration, UMLForwardDeclaration> statementPair : umlForwardDeclarationListDiff.getCommonDeclarations()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
-                if(srcStatement.getType().name.equals(LANG1.FRIEND_KEYWORD))
+                if(srcStatement != null && srcStatement.getType().name.equals(LANG1.FRIEND_KEYWORD))
                     srcStatement = srcStatement.getParent();
-                else if(srcStatement.getType().name.equals(LANG1.ERROR))
+                else if(srcStatement != null && srcStatement.getType().name.equals(LANG1.ERROR))
                     srcStatement = srcStatement.getParent();
-                else if(srcStatement.getType().name.equals(LANG1.TYPE_QUALIFIER))
+                else if(srcStatement != null && srcStatement.getType().name.equals(LANG1.TYPE_QUALIFIER))
                     srcStatement = srcStatement.getParent();
-                else if(srcStatement.getType().name.equals(LANG1.TYPEDEF))
+                else if(srcStatement != null && srcStatement.getType().name.equals(LANG1.TYPEDEF))
                     srcStatement = srcStatement.getParent();
-                else if(srcStatement.getType().name.equals(LANG1.STRUCT_KEYWORD))
+                else if(srcStatement != null && srcStatement.getType().name.equals(LANG1.STRUCT_KEYWORD))
                     srcStatement = TreeUtilFunctions.getParentUntilType(srcStatement, LANG1.METHOD_DECLARATION);
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(dstStatement.getType().name.equals(LANG2.FRIEND_KEYWORD))
+                if(dstStatement != null && dstStatement.getType().name.equals(LANG2.FRIEND_KEYWORD))
                     dstStatement = dstStatement.getParent();
-                else if(dstStatement.getType().name.equals(LANG2.ERROR))
+                else if(dstStatement != null && dstStatement.getType().name.equals(LANG2.ERROR))
                     dstStatement = dstStatement.getParent();
-                else if(dstStatement.getType().name.equals(LANG2.TYPE_QUALIFIER))
+                else if(dstStatement != null && dstStatement.getType().name.equals(LANG2.TYPE_QUALIFIER))
                     dstStatement = dstStatement.getParent();
-                else if(dstStatement.getType().name.equals(LANG2.TYPEDEF))
+                else if(dstStatement != null && dstStatement.getType().name.equals(LANG2.TYPEDEF))
                     dstStatement = dstStatement.getParent();
-                else if(dstStatement.getType().name.equals(LANG2.STRUCT_KEYWORD))
+                else if(dstStatement != null && dstStatement.getType().name.equals(LANG2.STRUCT_KEYWORD))
                     dstStatement = TreeUtilFunctions.getParentUntilType(dstStatement, LANG2.METHOD_DECLARATION);
-                mappingStore.addMappingRecursively(srcStatement, dstStatement);
-                if(srcStatement.getParent() != null && dstStatement.getParent() != null) {
-                    mappingStore.addMapping(srcStatement.getParent(), dstStatement.getParent());
-                    int index1 = srcStatement.getParent().getChildPosition(srcStatement);
-                    int index2 = dstStatement.getParent().getChildPosition(dstStatement);
-                    if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.SEMICOLON) &&
-                            dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.SEMICOLON)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+1);
-                        Tree t2 = dstStatement.getParent().getChild(index2+1);
-                        mappingStore.addMapping(t1,t2);
-                    }
-                    if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.FUNCTION_DECLARATOR) &&
-                            dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+1);
-                        Tree t2 = dstStatement.getParent().getChild(index2+1);
-                        mappingStore.addMappingRecursively(t1,t2);
-                    }
-                    if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.POINTER_DECLARATOR) &&
-                            dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.POINTER_DECLARATOR)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+1);
-                        Tree t2 = dstStatement.getParent().getChild(index2+1);
-                        mappingStore.addMappingRecursively(t1,t2);
-                    }
-                    if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.FIELD_IDENTIFIER) &&
-                            dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.FIELD_IDENTIFIER)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+1);
-                        Tree t2 = dstStatement.getParent().getChild(index2+1);
-                        mappingStore.addMappingRecursively(t1,t2);
-                    }
-                    int second = 2;
-                    if(srcStatement.getParent().getChildren().size() > index1+second && srcStatement.getParent().getChild(index1+second).getType().name.equals(LANG1.EQUAL_OPERATOR) &&
-                            dstStatement.getParent().getChildren().size() > index2+second && dstStatement.getParent().getChild(index2+second).getType().name.equals(LANG2.EQUAL_OPERATOR)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+second);
-                        Tree t2 = dstStatement.getParent().getChild(index2+second);
-                        mappingStore.addMappingRecursively(t1,t2);
-                    }
-                    int third = 3;
-                    if(srcStatement.getParent().getChildren().size() > index1+third && srcStatement.getParent().getChild(index1+third).getType().name.equals(LANG1.SIMPLE_NAME) &&
-                            dstStatement.getParent().getChildren().size() > index2+third && dstStatement.getParent().getChild(index2+third).getType().name.equals(LANG2.SIMPLE_NAME)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+third);
-                        Tree t2 = dstStatement.getParent().getChild(index2+third);
-                        mappingStore.addMappingRecursively(t1,t2);
-                    }
-                    if(srcStatement.getParent().getChildren().size() > index1+second && srcStatement.getParent().getChild(index1+second).getType().name.equals(LANG1.SEMICOLON) &&
-                            dstStatement.getParent().getChildren().size() > index2+second && dstStatement.getParent().getChild(index2+second).getType().name.equals(LANG2.SEMICOLON)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+second);
-                        Tree t2 = dstStatement.getParent().getChild(index2+second);
-                        mappingStore.addMapping(t1,t2);
-                    }
-                    int fourth = 4;
-                    if(srcStatement.getParent().getChildren().size() > index1+fourth && srcStatement.getParent().getChild(index1+fourth).getType().name.equals(LANG1.SEMICOLON) &&
-                            dstStatement.getParent().getChildren().size() > index2+fourth && dstStatement.getParent().getChild(index2+fourth).getType().name.equals(LANG2.SEMICOLON)) {
-                        Tree t1 = srcStatement.getParent().getChild(index1+fourth);
-                        Tree t2 = dstStatement.getParent().getChild(index2+fourth);
-                        mappingStore.addMapping(t1,t2);
+                if(srcStatement != null && dstStatement != null) {
+                    mappingStore.addMappingRecursively(srcStatement, dstStatement);
+                    if(srcStatement.getParent() != null && dstStatement.getParent() != null) {
+                        mappingStore.addMapping(srcStatement.getParent(), dstStatement.getParent());
+                        if(srcStatement.getParent().getType().name.equals(LANG1.TEMPLATE_DECLARATION) && dstStatement.getParent().getType().name.equals(LANG2.TEMPLATE_DECLARATION)) {
+                            Pair<Tree, Tree> templates = Helpers.findPairOfType(srcStatement.getParent(), dstStatement.getParent(),LANG1.TEMPLATE_KEYWORD,LANG2.TEMPLATE_KEYWORD);
+                            if (templates != null) {
+                                mappingStore.addMapping(templates.first,templates.second);
+                            }
+                            Pair<Tree, Tree> templateParameterLists = Helpers.findPairOfType(srcStatement.getParent(), dstStatement.getParent(),LANG1.TEMPLATE_PARAMETER_LIST,LANG2.TEMPLATE_PARAMETER_LIST);
+                            if (templateParameterLists != null) {
+                                mappingStore.addMappingRecursively(templateParameterLists.first,templateParameterLists.second);
+                            }
+                        }
+                        if(srcStatement.getParent().getType().name.equals(LANG1.DECLARATION_LIST) && dstStatement.getParent().getType().name.equals(LANG2.DECLARATION_LIST) &&
+                                srcStatement.getParent().getParent().getType().name.equals(LANG1.PACKAGE_DECLARATION) && dstStatement.getParent().getParent().getType().name.equals(LANG2.PACKAGE_DECLARATION)) {
+                            mappingStore.addMapping(srcStatement.getParent().getParent(), dstStatement.getParent().getParent());
+                            processNamespaceDefinitions(srcStatement.getParent().getParent(), dstStatement.getParent().getParent(), mappingStore, LANG1, LANG2);
+                        }
+                        int index1 = srcStatement.getParent().getChildPosition(srcStatement);
+                        int index2 = dstStatement.getParent().getChildPosition(dstStatement);
+                        if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.SEMICOLON) &&
+                                dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.SEMICOLON)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+1);
+                            Tree t2 = dstStatement.getParent().getChild(index2+1);
+                            mappingStore.addMapping(t1,t2);
+                        }
+                        if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.FUNCTION_DECLARATOR) &&
+                                dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+1);
+                            Tree t2 = dstStatement.getParent().getChild(index2+1);
+                            mappingStore.addMappingRecursively(t1,t2);
+                        }
+                        if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.POINTER_DECLARATOR) &&
+                                dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.POINTER_DECLARATOR)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+1);
+                            Tree t2 = dstStatement.getParent().getChild(index2+1);
+                            mappingStore.addMappingRecursively(t1,t2);
+                        }
+                        if(srcStatement.getParent().getChildren().size() > index1+1 && srcStatement.getParent().getChild(index1+1).getType().name.equals(LANG1.FIELD_IDENTIFIER) &&
+                                dstStatement.getParent().getChildren().size() > index2+1 && dstStatement.getParent().getChild(index2+1).getType().name.equals(LANG2.FIELD_IDENTIFIER)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+1);
+                            Tree t2 = dstStatement.getParent().getChild(index2+1);
+                            mappingStore.addMappingRecursively(t1,t2);
+                        }
+                        int second = 2;
+                        if(srcStatement.getParent().getChildren().size() > index1+second && srcStatement.getParent().getChild(index1+second).getType().name.equals(LANG1.EQUAL_OPERATOR) &&
+                                dstStatement.getParent().getChildren().size() > index2+second && dstStatement.getParent().getChild(index2+second).getType().name.equals(LANG2.EQUAL_OPERATOR)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+second);
+                            Tree t2 = dstStatement.getParent().getChild(index2+second);
+                            mappingStore.addMappingRecursively(t1,t2);
+                        }
+                        int third = 3;
+                        if(srcStatement.getParent().getChildren().size() > index1+third && srcStatement.getParent().getChild(index1+third).getType().name.equals(LANG1.SIMPLE_NAME) &&
+                                dstStatement.getParent().getChildren().size() > index2+third && dstStatement.getParent().getChild(index2+third).getType().name.equals(LANG2.SIMPLE_NAME)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+third);
+                            Tree t2 = dstStatement.getParent().getChild(index2+third);
+                            mappingStore.addMappingRecursively(t1,t2);
+                        }
+                        if(srcStatement.getParent().getChildren().size() > index1+second && srcStatement.getParent().getChild(index1+second).getType().name.equals(LANG1.SEMICOLON) &&
+                                dstStatement.getParent().getChildren().size() > index2+second && dstStatement.getParent().getChild(index2+second).getType().name.equals(LANG2.SEMICOLON)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+second);
+                            Tree t2 = dstStatement.getParent().getChild(index2+second);
+                            mappingStore.addMapping(t1,t2);
+                        }
+                        int fourth = 4;
+                        if(srcStatement.getParent().getChildren().size() > index1+fourth && srcStatement.getParent().getChild(index1+fourth).getType().name.equals(LANG1.SEMICOLON) &&
+                                dstStatement.getParent().getChildren().size() > index2+fourth && dstStatement.getParent().getChild(index2+fourth).getType().name.equals(LANG2.SEMICOLON)) {
+                            Tree t1 = srcStatement.getParent().getChild(index1+fourth);
+                            Tree t2 = dstStatement.getParent().getChild(index2+fourth);
+                            mappingStore.addMapping(t1,t2);
+                        }
                     }
                 }
             }
@@ -576,6 +627,18 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             for (org.apache.commons.lang3.tuple.Pair<UMLProblemDeclaration, UMLProblemDeclaration> statementPair : umlProblemDeclarationListDiff.getChangedDeclarations()) {
                 processProblemDeclarationPair(statementPair, srcTypeDeclaration, dstTypeDeclaration, srcTree, dstTree, mappingStore);
             }
+        }
+        if(classDiff.getStaticAssertionDeclarationListDiff().isPresent()) {
+            UMLStaticAssertionDeclarationListDiff umlAssertionDeclarationListDiff = classDiff.getStaticAssertionDeclarationListDiff().get();
+            for (org.apache.commons.lang3.tuple.Pair<UMLStaticAssertionDeclaration, UMLStaticAssertionDeclaration> statementPair : umlAssertionDeclarationListDiff.getCommonDeclarations()) {
+                Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
+                Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
+                mappingStore.addMappingRecursively(srcStatement, dstStatement);
+            }
+        }
+        Pair<Tree, Tree> attribute_declarations = Helpers.findPairOfType(srcTypeDeclaration,dstTypeDeclaration, LANG1.ATTRIBUTE_DECLARATION, LANG2.ATTRIBUTE_DECLARATION);
+        if(attribute_declarations != null) {
+            mappingStore.addMappingRecursively(attribute_declarations.first, attribute_declarations.second);
         }
         processSuperClasses(srcTypeDeclaration,dstTypeDeclaration,classDiff,mappingStore);
         processClassImplementedInterfaces(srcTypeDeclaration,dstTypeDeclaration,classDiff,mappingStore);
@@ -612,29 +675,29 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             if(tmpDstStatement != null) dstStatement = tmpDstStatement;
         }
         if(srcStatement != null && dstStatement != null) {
-            if(srcStatement.getParent().getType().name.equals(LANG1.DECLARATION_LIST) && dstStatement.getParent().getType().name.equals(LANG2.DECLARATION_LIST)) {
-                mappingStore.addMappingRecursively(srcStatement.getParent(), dstStatement.getParent());
-                matched = Helpers.findPairOfType(srcStatement.getParent(), dstStatement.getParent(), LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
+            Tree parent1 = srcStatement.getParent();
+            Tree parent2 = dstStatement.getParent();
+            if(parent1.getType().name.equals(LANG1.DECLARATION_LIST) && parent2.getType().name.equals(LANG2.DECLARATION_LIST)) {
+                mappingStore.addMappingRecursively(parent1, parent2);
+                matched = Helpers.findPairOfType(parent1, parent2, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
                 if (matched != null) {
                     mappingStore.addMapping(matched.first,matched.second);
                 }
-                matched = Helpers.findPairOfType(srcStatement.getParent(), dstStatement.getParent(), LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
+                matched = Helpers.findPairOfType(parent1, parent2, LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
                 if (matched != null) {
                     mappingStore.addMapping(matched.first,matched.second);
                 }
             }
-            else if(srcStatement.getParent().getType().name.equals(LANG1.PREPROC_IFDEF) && dstStatement.getParent().getType().name.equals(LANG2.PREPROC_IFDEF)) {
-                processIsomorphicChildren(srcStatement.getParent().getChildren(), dstStatement.getParent().getChildren(), mappingStore, srcStatement, dstStatement);
-                Tree namespace1 = TreeUtilFunctions.findChildByType(srcStatement.getParent(), LANG1.PACKAGE_DECLARATION);
-                Tree namespace2 = TreeUtilFunctions.findChildByType(dstStatement.getParent(), LANG2.PACKAGE_DECLARATION);
+            else if(parent1.getType().name.equals(LANG1.PREPROC_IFDEF) && parent2.getType().name.equals(LANG2.PREPROC_IFDEF)) {
+                processIsomorphicChildren(parent1, parent2, mappingStore);
+                Tree namespace1 = TreeUtilFunctions.findChildByType(parent1, LANG1.PACKAGE_DECLARATION);
+                Tree namespace2 = TreeUtilFunctions.findChildByType(parent2, LANG2.PACKAGE_DECLARATION);
                 if(namespace1 != null && namespace2 != null) {
                     mappingStore.addMapping(namespace1, namespace2);
                     processNamespaceDefinitions(namespace1, namespace2, mappingStore, LANG1, LANG2);
                     Pair<Tree,Tree> declaration_lists = Helpers.findPairOfType(namespace1, namespace2, LANG1.DECLARATION_LIST, LANG2.DECLARATION_LIST);
                     if (declaration_lists != null) {
-                        List<Tree> children1 = declaration_lists.first.getChildren();
-                        List<Tree> children2 = declaration_lists.second.getChildren();
-                        processIsomorphicChildren(children1, children2, mappingStore, srcStatement, dstStatement);
+                        processIsomorphicChildren(declaration_lists.first, declaration_lists.second, mappingStore);
                     }
                 }
             }
@@ -656,6 +719,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                     if (matched != null) {
                         mappingStore.addMapping(matched.first,matched.second);
                     }
+                    processIsomorphicChildren(srcBlock, dstBlock, mappingStore);
                 }
             }
             else if(srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1 && srcStatement.getChildren().get(1).getType().name.equals(LANG1.FUNCTION_DECLARATOR) && dstStatement.getChildren().get(1).getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
@@ -674,6 +738,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                     if (matched != null) {
                         mappingStore.addMapping(matched.first,matched.second);
                     }
+                    processIsomorphicChildren(srcBlock, dstBlock, mappingStore);
                 }
             }
         }
@@ -681,26 +746,36 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         new CommentMatcher(optimizationData, diff, LANG1, LANG2).match(srcTree, dstTree, mappingStore);
     }
 
-    private void processIsomorphicChildren(List<Tree> children1, List<Tree> children2,
-            ExtendedMultiMappingStore mappingStore, Tree srcStatement, Tree dstStatement) {
-        if(children1.size() <= children2.size()) {
-            for(int i=0; i<children1.size(); i++) {
-                Tree child1 = children1.get(i);
-                Tree child2 = children2.get(i);
-                if(child1.getPos() >= srcStatement.getPos() && child2.getPos() >= dstStatement.getPos()) {
-                    if(child1.isIsomorphicTo(child2)) {
+    private void processIsomorphicChildren(Tree srcBlock, Tree dstBlock, ExtendedMultiMappingStore mappingStore) {
+        if(srcBlock.getChildren().size() == dstBlock.getChildren().size()) {
+            for(int i=0; i<srcBlock.getChildren().size(); i++) {
+                Tree child1 = srcBlock.getChildren().get(i);
+                Tree child2 = dstBlock.getChildren().get(i);
+                if(child1.getType().name.equals(child2.getType().name)) {
+                    mappingStore.addMappingRecursively(child1, child2);
+                }
+            }
+        }
+        else if(srcBlock.getChildren().size() < dstBlock.getChildren().size()) {
+            for(int i=0; i<srcBlock.getChildren().size(); i++) {
+                Tree child1 = srcBlock.getChildren().get(i);
+                for(int j=i; j<dstBlock.getChildren().size(); j++) {
+                    Tree child2 = dstBlock.getChildren().get(j);
+                    if(child1.getType().name.equals(child2.getType().name) && child1.isIsomorphicTo(child2)) {
                         mappingStore.addMappingRecursively(child1, child2);
+                        break;
                     }
                 }
             }
         }
-        else {
-            for(int i=0; i<children2.size(); i++) {
-                Tree child2 = children2.get(i);
-                Tree child1 = children1.get(i);
-                if(child1.getPos() >= srcStatement.getPos() && child2.getPos() >= dstStatement.getPos()) {
-                    if(child1.isIsomorphicTo(child2)) {
+        else if(srcBlock.getChildren().size() > dstBlock.getChildren().size()) {
+            for(int j=0; j<dstBlock.getChildren().size(); j++) {
+                Tree child2 = dstBlock.getChildren().get(j);
+                for(int i=j; i<srcBlock.getChildren().size(); i++) {
+                    Tree child1 = srcBlock.getChildren().get(i);
+                    if(child1.getType().name.equals(child2.getType().name) && child1.isIsomorphicTo(child2)) {
                         mappingStore.addMappingRecursively(child1, child2);
+                        break;
                     }
                 }
             }
@@ -901,6 +976,22 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             if(types != null) {
                 mappingStore.addMapping(types.first, types.second);
             }
+            Pair<Tree, Tree> colons = Helpers.findPairOfType(srcTypeDeclaration,dstTypeDeclaration, LANG1.COLON, LANG2.COLON);
+            if(colons != null) {
+                mappingStore.addMapping(colons.first, colons.second);
+            }
+            Pair<Tree, Tree> enumerator_lists = Helpers.findPairOfType(srcTypeDeclaration,dstTypeDeclaration, LANG1.ENUMERATOR_LIST, LANG2.ENUMERATOR_LIST);
+            if(enumerator_lists != null) {
+                mappingStore.addMapping(enumerator_lists.first, enumerator_lists.second);
+                com.github.gumtreediff.utils.Pair<Tree, Tree> opening = Helpers.findPairOfType(enumerator_lists.first, enumerator_lists.second, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
+                if (opening != null) {
+                    mappingStore.addMapping(opening.first,opening.second);
+                }
+                com.github.gumtreediff.utils.Pair<Tree, Tree> closing = Helpers.findPairOfType(enumerator_lists.first, enumerator_lists.second, LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
+                if (closing != null) {
+                    mappingStore.addMapping(closing.first,closing.second);
+                }
+            }
             Pair<Tree, Tree> blocks = Helpers.findPairOfType(srcTypeDeclaration,dstTypeDeclaration, LANG1.ENUM_BODY, LANG2.ENUM_BODY);
             if(blocks != null) {
                 mappingStore.addMapping(blocks.first, blocks.second);
@@ -1077,9 +1168,54 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 }
             }
         }
-        if(!(baseClassDiff instanceof UMLClassMoveDiff)) {
+        int childCount1 = 0;
+        if(srcTypeDeclaration.getParent() != null) {
+            for(Tree child : srcTypeDeclaration.getParent().getChildren()) {
+                if(child.getType().name.equals(LANG1.OPENING_CURLY_BRACE) || child.getType().name.equals(LANG1.CLOSING_CURLY_BRACE) || child.getType().name.equals(LANG1.SEMICOLON)) {
+                    continue;
+                }
+                childCount1++;
+            }
+        }
+        int childCount2 = 0;
+        if(dstTypeDeclaration.getParent() != null) {
+            for(Tree child : dstTypeDeclaration.getParent().getChildren()) {
+                if(child.getType().name.equals(LANG2.OPENING_CURLY_BRACE) || child.getType().name.equals(LANG2.CLOSING_CURLY_BRACE) || child.getType().name.equals(LANG2.SEMICOLON)) {
+                    continue;
+                }
+                childCount2++;
+            }
+        }
+        boolean parentNamespaceContainsOnlyClass = childCount1 == childCount2 && childCount1 == 1;
+        boolean movedAndRenamed = baseClassDiff instanceof UMLClassRenameDiff && !baseClassDiff.getOriginalClass().getSourceFile().equals(baseClassDiff.getNextClass().getSourceFile()) && !parentNamespaceContainsOnlyClass;
+        boolean moved = baseClassDiff instanceof UMLClassMoveDiff && !baseClassDiff.getOriginalClass().getSourceFile().equals(baseClassDiff.getNextClass().getSourceFile()) && !parentNamespaceContainsOnlyClass;
+        boolean movedToNestedNameSpace = movedToNestedNamespace(baseClassDiff.getOriginalClass().getPackageName(), baseClassDiff.getNextClass().getPackageName());
+        if(!moved && !movedAndRenamed && !movedToNestedNameSpace) {
             handleParentNamespace(srcTypeDeclaration, dstTypeDeclaration, mappingStore, LANG1, LANG2);
         }
+    }
+
+    private static boolean movedToNestedNamespace(String s1, String s2) {
+        if(s1.equals(s2)) {
+            return false;
+        }
+        String commonPrefix = PrefixSuffixUtils.longestCommonPrefix(s1, s2);
+        String commonSuffix = PrefixSuffixUtils.longestCommonSuffix(s1, s2);
+        if(!commonPrefix.isEmpty()) {
+            int beginIndexS1 = s1.indexOf(commonPrefix) + commonPrefix.length();
+            int endIndexS1 = s1.lastIndexOf(commonSuffix);
+            String diff1 = beginIndexS1 > endIndexS1 ? "" : s1.substring(beginIndexS1, endIndexS1);
+            int beginIndexS2 = s2.indexOf(commonPrefix) + commonPrefix.length();
+            int endIndexS2 = s2.lastIndexOf(commonSuffix);
+            String diff2 = beginIndexS2 > endIndexS2 ? "" : s2.substring(beginIndexS2, endIndexS2);
+            if(diff1.isEmpty() && diff2.equals(".")) {
+                return true;
+            }
+            else if(diff1.isEmpty() && diff2.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static void handleParentNamespace(Tree srcTypeDeclaration, Tree dstTypeDeclaration, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
@@ -1101,6 +1237,9 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 Pair<Tree, Tree> closing = Helpers.findPairOfType(parent1,parent2, LANG1.CLOSING_CURLY_BRACE, LANG2.CLOSING_CURLY_BRACE);
                 if (closing != null) {
                     mappingStore.addMapping(closing.first,closing.second);
+                }
+                if(parent1.getType().name.equals(LANG1.ERROR) && parent2.getType().name.equals(LANG2.ERROR)) {
+                    mappingStore.addMappingRecursively(parent1, parent2);
                 }
                 processNamespaceDefinitions(parent1, parent2, mappingStore, LANG1, LANG2);
             }
@@ -1370,6 +1509,17 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             Tree dstSubTree = TreeUtilFunctions.findByLocationInfo(dstTree, typeAliasPair.getRight().getLocationInfo(), LANG2);
             if (srcSubTree == null || dstSubTree == null) return;
             mappingStore.addMappingRecursively(srcSubTree,dstSubTree);
+            if(srcSubTree.getParent().getType().name.equals(LANG1.TEMPLATE_DECLARATION) && dstSubTree.getParent().getType().name.equals(LANG2.TEMPLATE_DECLARATION)) {
+                mappingStore.addMapping(srcSubTree.getParent(), dstSubTree.getParent());
+                Pair<Tree, Tree> templates = Helpers.findPairOfType(srcSubTree.getParent(), dstSubTree.getParent(),LANG1.TEMPLATE_KEYWORD,LANG2.TEMPLATE_KEYWORD);
+                if (templates != null) {
+                    mappingStore.addMapping(templates.first,templates.second);
+                }
+                Pair<Tree, Tree> templateParameterLists = Helpers.findPairOfType(srcSubTree.getParent(), dstSubTree.getParent(),LANG1.TEMPLATE_PARAMETER_LIST,LANG2.TEMPLATE_PARAMETER_LIST);
+                if (templateParameterLists != null) {
+                    mappingStore.addMappingRecursively(templateParameterLists.first,templateParameterLists.second);
+                }
+            }
         }
     }
 

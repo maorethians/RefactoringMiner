@@ -1065,6 +1065,14 @@ public class StringBasedHeuristics {
 				return true;
 			}
 		}
+		if((s1.contains("+=") && s2.contains("+=")) || (s1.contains("-=") && s2.contains("-="))) {
+			if(s1.equals(commonPrefix + LANG1.STATEMENT_TERMINATION) && commonSuffix.equals(LANG1.STATEMENT_TERMINATION)) {
+				return true;
+			}
+			else if(s2.equals(commonPrefix + LANG2.STATEMENT_TERMINATION) && commonSuffix.equals(LANG2.STATEMENT_TERMINATION)) {
+				return true;
+			}
+		}
 		return false;
 	}
 
@@ -1204,6 +1212,12 @@ public class StringBasedHeuristics {
 						return true;
 					}
 				}
+			}
+			else if(declaration1.getLANG().equals(Constants.CPP) && declaration2.getLANG().equals(Constants.CPP) &&
+					!declaration1.equalType(declaration2) && declaration1.equalInitializer(declaration2)) {
+				Replacement replacement = new Replacement(declaration1.getType().toString(), declaration2.getType().toString(), ReplacementType.TYPE);
+				replacementInfo.addReplacement(replacement);
+				return true;
 			}
 		}
 		return false;
