@@ -33,8 +33,8 @@ public class NarrativeProcessor {
             Narrator.ChapterUnit chapter = chapters.get(i);
 
             String content = chapter.getContent();
-            List<String> understandings = state.getDependencyUnderstandings(chapter);
-            ReviewPrompt.ParsedResponse chapterResponse = langchainClient.processChapter(content, understandings);
+            List<String> dependencyUnderstandings = state.getDependencyUnderstandings(chapter);
+            ReviewPrompt.ParsedResponse chapterResponse = langchainClient.processChapter(content, dependencyUnderstandings);
 
             state.setUnderstanding(chapter, chapterResponse.understanding());
             state.setResult(chapter, chapterResponse.result());
