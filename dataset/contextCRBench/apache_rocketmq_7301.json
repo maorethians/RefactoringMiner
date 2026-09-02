@@ -33,7 +33,10 @@
             "side": "RIGHT",
             "position": 52,
             "original_start_line": null,
-            "submitted_on_commit": "e01ef734d083768d12b7fadc0414cf8de4c7e5df"
+            "submitted_on_commit": "e01ef734d083768d12b7fadc0414cf8de4c7e5df",
+            "diff_hunk": "@@ -101,7 +105,8 @@ public String getBrokerRegisterCheckCode(final Long brokerId) {\n     }\n \n     public void updateBrokerAddress(final Long brokerId, final String brokerAddress) {\n-        if (brokerId == null) return;\n+        if (brokerId == null)",
+            "submitted_start_line": null,
+            "submitted_line": 108
         },
         {
             "original_line": 166,
@@ -58,7 +61,10 @@
             "side": "RIGHT",
             "position": 165,
             "original_start_line": null,
-            "submitted_on_commit": "ed2e82f0584d6f1cbbf639ec158b28b5d513e6c2"
+            "submitted_on_commit": "d775f87044d5dfac9d5adbcc4e44f4014512c2fa",
+            "diff_hunk": "@@ -0,0 +1,280 @@\n+/*\n+ * Licensed to the Apache Software Foundation (ASF) under one or more\n+ * contributor license agreements.  See the NOTICE file distributed with\n+ * this work for additional information regarding copyright ownership.\n+ * The ASF licenses this file to You under the Apache License, Version 2.0\n+ * (the \"License\"); you may not use this file except in compliance with\n+ * the License.  You may obtain a copy of the License at\n+ *\n+ *     http://www.apache.org/licenses/LICENSE-2.0\n+ *\n+ * Unless required by applicable law or agreed to in writing, software\n+ * distributed under the License is distributed on an \"AS IS\" BASIS,\n+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+ * See the License for the specific language governing permissions and\n+ * limitations under the License.\n+ */\n+package org.apache.rocketmq.controller.impl;\n+\n+import com.alipay.sofa.jraft.Node;\n+import com.alipay.sofa.jraft.RaftGroupService;\n+import com.alipay.sofa.jraft.Status;\n+import com.alipay.sofa.jraft.conf.Configuration;\n+import com.alipay.sofa.jraft.entity.NodeId;\n+import com.alipay.sofa.jraft.entity.PeerId;\n+import com.alipay.sofa.jraft.entity.Task;\n+import com.alipay.sofa.jraft.option.NodeOptions;\n+import org.apache.commons.io.FileUtils;\n+import org.apache.rocketmq.common.ControllerConfig;\n+import org.apache.rocketmq.common.constant.LoggerName;\n+import org.apache.rocketmq.controller.Controller;\n+import org.apache.rocketmq.controller.helper.BrokerLifecycleListener;\n+import org.apache.rocketmq.controller.impl.closure.ControllerClosure;\n+import org.apache.rocketmq.controller.impl.task.BrokerCloseChannelRequest;\n+import org.apache.rocketmq.controller.impl.task.CheckNotActiveBrokerRequest;\n+import org.apache.rocketmq.controller.impl.task.GetBrokerLiveInfoRequest;\n+import org.apache.rocketmq.controller.impl.task.GetSyncStateDataRequest;\n+import org.apache.rocketmq.controller.impl.task.RaftBrokerHeartBeatEventRequest;\n+import org.apache.rocketmq.remoting.ChannelEventListener;\n+import org.apache.rocketmq.remoting.CommandCustomHeader;\n+import org.apache.rocketmq.remoting.RemotingServer;\n+import org.apache.rocketmq.remoting.netty.NettyRemotingServer;\n+import org.apache.rocketmq.remoting.netty.NettyServerConfig;\n+import org.apache.rocketmq.remoting.protocol.RemotingCommand;\n+import org.apache.rocketmq.remoting.protocol.RemotingSerializable;\n+import org.apache.rocketmq.remoting.protocol.RequestCode;\n+import org.apache.rocketmq.remoting.protocol.ResponseCode;\n+import org.apache.rocketmq.remoting.protocol.body.SyncStateSet;\n+import org.apache.rocketmq.remoting.protocol.header.controller.AlterSyncStateSetRequestHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.ElectMasterRequestHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.GetMetaDataResponseHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.GetReplicaInfoRequestHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.admin.CleanControllerBrokerDataRequestHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.register.ApplyBrokerIdRequestHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.register.GetNextBrokerIdRequestHeader;\n+import org.apache.rocketmq.remoting.protocol.header.controller.register.RegisterBrokerToControllerRequestHeader;\n+import org.slf4j.Logger;\n+import org.slf4j.LoggerFactory;\n+\n+import java.io.File;\n+import java.io.IOException;\n+import java.util.ArrayList;\n+import java.util.HashMap;\n+import java.util.List;\n+import java.util.Map;\n+import java.util.concurrent.CompletableFuture;\n+\n+public class JRaftController implements Controller {\n+    private static final Logger log = LoggerFactory.getLogger(LoggerName.CONTROLLER_LOGGER_NAME);\n+    private final RaftGroupService raftGroupService;\n+    private final Node node;\n+    private final JRaftControllerStateMachine stateMachine;\n+    private final ControllerConfig controllerConfig;\n+    private final List<BrokerLifecycleListener> brokerLifecycleListeners;\n+    private final Map<PeerId/* jRaft peerId */, String/* Controller RPC Server Addr */> peerIdToAddr;\n+    private final NettyRemotingServer remotingServer;\n+\n+    public JRaftController(ControllerConfig controllerConfig,\n+        final ChannelEventListener channelEventListener) throws IOException {\n+        this.controllerConfig = controllerConfig;\n+        this.brokerLifecycleListeners = new ArrayList<>();\n+\n+        final NodeOptions nodeOptions = new NodeOptions();\n+        nodeOptions.setElectionTimeoutMs(controllerConfig.getjRaftElectionTimeoutMs());\n+        nodeOptions.setSnapshotIntervalSecs(controllerConfig.getjRaftSnapshotIntervalSecs());\n+        final PeerId serverId = new PeerId();\n+        if (!serverId.parse(controllerConfig.getjRaftServerId())) {\n+            throw new IllegalArgumentException(\"Fail to parse serverId:\" + controllerConfig.getjRaftServerId());\n+        }\n+        final Configuration initConf = new Configuration();\n+        if (!initConf.parse(controllerConfig.getjRaftInitConf())) {\n+            throw new IllegalArgumentException(\"Fail to parse initConf:\" + controllerConfig.getjRaftInitConf());\n+        }\n+        nodeOptions.setInitialConf(initConf);\n+\n+        FileUtils.forceMkdir(new File(controllerConfig.getControllerStorePath()));\n+        nodeOptions.setLogUri(controllerConfig.getControllerStorePath() + File.separator + \"log\");\n+        nodeOptions.setRaftMetaUri(controllerConfig.getControllerStorePath() + File.separator + \"raft_meta\");\n+        nodeOptions.setSnapshotUri(controllerConfig.getControllerStorePath() + File.separator + \"snapshot\");\n+\n+        this.stateMachine = new JRaftControllerStateMachine(controllerConfig, new NodeId(controllerConfig.getjRaftGroupId(), serverId));\n+        this.stateMachine.registerOnLeaderStart(this::onLeaderStart);\n+        this.stateMachine.registerOnLeaderStop(this::onLeaderStop);\n+        nodeOptions.setFsm(this.stateMachine);\n+\n+        this.raftGroupService = new RaftGroupService(controllerConfig.getjRaftGroupId(), serverId, nodeOptions);\n+\n+        this.peerIdToAddr = new HashMap<>();\n+        initPeerIdMap();\n+\n+        NettyServerConfig nettyServerConfig = new NettyServerConfig();\n+        nettyServerConfig.setListenPort(Integer.parseInt(this.peerIdToAddr.get(serverId).split(\":\")[1]));\n+        remotingServer = new NettyRemotingServer(nettyServerConfig, channelEventListener);\n+\n+        this.node = this.raftGroupService.start();\n+    }\n+\n+    private void initPeerIdMap() {\n+        String[] peers = this.controllerConfig.getjRaftInitConf().split(\",\");\n+        String[] rpcAddrs = this.controllerConfig.getjRaftControllerRPCAddr().split(\",\");\n+        for (int i = 0; i < peers.length; i++) {\n+            PeerId peerId = new PeerId();\n+            if (!peerId.parse(peers[i])) {\n+                throw new IllegalArgumentException(\"Fail to parse peerId:\" + peers[i]);\n+            }\n+            this.peerIdToAddr.put(peerId, rpcAddrs[i]);\n+        }\n+    }\n+\n+    @Override\n+    public void startup() {\n+        this.remotingServer.start();\n+        log.info(\"Controller {} started.\", node.getNodeId());\n+    }\n+\n+    @Override\n+    public void shutdown() {\n+        this.stopScheduling();\n+        this.raftGroupService.shutdown();\n+        this.remotingServer.shutdown();\n+        log.info(\"Controller {} stopped.\", node.getNodeId());\n+    }\n+\n+    @Override\n+    public void startScheduling() {\n+    }\n+\n+    @Override\n+    public void stopScheduling() {\n+    }\n+\n+    @Override\n+    public boolean isLeaderState() {\n+        return node.isLeader();\n+    }\n+\n+    private <T extends CommandCustomHeader> CompletableFuture<RemotingCommand> applyToJRaft(RemotingCommand request) {\n+        if (!isLeaderState()) {\n+            final RemotingCommand command = RemotingCommand.createResponseCommand(ResponseCode.CONTROLLER_NOT_LEADER, \"The controller is not in leader state\");\n+            final CompletableFuture<RemotingCommand> future = new CompletableFuture<>();\n+            future.complete(command);\n+            log.warn(\"Apply to none leader controller, controller state is {}\", node.getNodeState());\n+            return future;\n+        }\n+        ControllerClosure closure = new ControllerClosure(request);\n+        Task task = closure.taskWithThisClosure();\n+        if (task != null) {",
+            "submitted_start_line": null,
+            "submitted_line": 166
         },
         {
             "original_line": 27,
@@ -80,7 +86,10 @@
             "side": "RIGHT",
             "position": 7,
             "original_start_line": null,
-            "submitted_on_commit": "e01ef734d083768d12b7fadc0414cf8de4c7e5df"
+            "submitted_on_commit": "e01ef734d083768d12b7fadc0414cf8de4c7e5df",
+            "diff_hunk": "@@ -24,7 +24,9 @@ public class ControllerConfig {\n \n     private String rocketmqHome = System.getProperty(MixAll.ROCKETMQ_HOME_PROPERTY, System.getenv(MixAll.ROCKETMQ_HOME_ENV));\n     private String configStorePath = System.getProperty(\"user.home\") + File.separator + \"controller\" + File.separator + \"controller.properties\";\n-\n+    public static final String DLEDGER_CONTROLLER = \"DLedger\";",
+            "submitted_start_line": null,
+            "submitted_line": 27
         },
         {
             "original_line": 168,
@@ -100,7 +109,10 @@
             "side": "RIGHT",
             "position": 35,
             "original_start_line": null,
-            "submitted_on_commit": "ed2e82f0584d6f1cbbf639ec158b28b5d513e6c2"
+            "submitted_on_commit": "d775f87044d5dfac9d5adbcc4e44f4014512c2fa",
+            "diff_hunk": "@@ -156,6 +165,9 @@ public void setMappedFileSize(int mappedFileSize) {\n     }\n \n     public String getControllerStorePath() {\n+        if (controllerStorePath.isEmpty()) {",
+            "submitted_start_line": null,
+            "submitted_line": 168
         },
         {
             "original_line": 278,
@@ -120,7 +132,10 @@
             "side": "RIGHT",
             "position": 4,
             "original_start_line": null,
-            "submitted_on_commit": "75291879286fb64661d12a1bebd90a19db62ab1c"
+            "submitted_on_commit": "75291879286fb64661d12a1bebd90a19db62ab1c",
+            "diff_hunk": "@@ -275,13 +275,17 @@ public class RequestCode {\n      * clean broker data\n      */\n     public static final int CLEAN_BROKER_DATA = 1011;\n+    public static final int CONTROLLER_GET_NEXT_BROKER_ID = 1012;",
+            "submitted_start_line": null,
+            "submitted_line": 278
         },
         {
             "original_line": 31,
@@ -141,7 +156,10 @@
             "side": "RIGHT",
             "position": 12,
             "original_start_line": null,
-            "submitted_on_commit": "e01ef734d083768d12b7fadc0414cf8de4c7e5df"
+            "submitted_on_commit": "e01ef734d083768d12b7fadc0414cf8de4c7e5df",
+            "diff_hunk": "@@ -21,14 +21,15 @@\n import io.openmessaging.storage.dledger.snapshot.SnapshotWriter;\n import io.openmessaging.storage.dledger.statemachine.CommittedEntryIterator;\n import io.openmessaging.storage.dledger.statemachine.StateMachine;\n-import java.util.concurrent.CompletableFuture;\n import org.apache.rocketmq.common.constant.LoggerName;\n import org.apache.rocketmq.controller.impl.event.EventMessage;\n import org.apache.rocketmq.controller.impl.event.EventSerializer;\n import org.apache.rocketmq.controller.impl.manager.ReplicasInfoManager;\n import org.apache.rocketmq.logging.org.slf4j.Logger;\n import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;\n \n+import java.util.concurrent.CompletableFuture;",
+            "submitted_start_line": null,
+            "submitted_line": 31
         },
         {
             "original_line": 24,
@@ -161,7 +179,10 @@
             "side": "RIGHT",
             "position": 26,
             "original_start_line": null,
-            "submitted_on_commit": "ed2e82f0584d6f1cbbf639ec158b28b5d513e6c2"
+            "submitted_on_commit": "d775f87044d5dfac9d5adbcc4e44f4014512c2fa",
+            "diff_hunk": "@@ -0,0 +1,65 @@\n+/*\n+ * Licensed to the Apache Software Foundation (ASF) under one or more\n+ * contributor license agreements.  See the NOTICE file distributed with\n+ * this work for additional information regarding copyright ownership.\n+ * The ASF licenses this file to You under the Apache License, Version 2.0\n+ * (the \"License\"); you may not use this file except in compliance with\n+ * the License.  You may obtain a copy of the License at\n+ *\n+ *     http://www.apache.org/licenses/LICENSE-2.0\n+ *\n+ * Unless required by applicable law or agreed to in writing, software\n+ * distributed under the License is distributed on an \"AS IS\" BASIS,\n+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+ * See the License for the specific language governing permissions and\n+ * limitations under the License.\n+ */\n+package org.apache.rocketmq.controller.impl.task;\n+\n+import org.apache.rocketmq.controller.impl.heartbeat.BrokerIdentityInfo;\n+import org.apache.rocketmq.remoting.CommandCustomHeader;\n+import org.apache.rocketmq.remoting.exception.RemotingCommandException;\n+\n+public class BrokerCloseChannelRequest implements CommandCustomHeader {\n+    private String clusterName;",
+            "submitted_start_line": null,
+            "submitted_line": 24
         }
     ],
     "base_commit": "178421386f728f0320bad550e965b74a0b088d40"

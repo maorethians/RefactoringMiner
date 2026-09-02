@@ -32,7 +32,10 @@
             "side": "RIGHT",
             "position": 12,
             "original_start_line": null,
-            "submitted_on_commit": "05278c62942657dc5eee649bffd9748c3a77bee1"
+            "submitted_on_commit": "05278c62942657dc5eee649bffd9748c3a77bee1",
+            "diff_hunk": "@@ -33,6 +34,7 @@\n import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;\n import static org.hamcrest.Matchers.containsString;\n \n+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST)",
+            "submitted_start_line": null,
+            "submitted_line": 37
         },
         {
             "original_line": 139,
@@ -52,7 +55,10 @@
             "side": "LEFT",
             "position": 122,
             "original_start_line": null,
-            "submitted_on_commit": "05278c62942657dc5eee649bffd9748c3a77bee1"
+            "submitted_on_commit": "05278c62942657dc5eee649bffd9748c3a77bee1",
+            "diff_hunk": "@@ -102,48 +76,46 @@ private FrozenIndexInput(\n         long offset,\n         long compoundFileOffset,\n         long length,\n+        CacheFileReference cacheFileReference,\n         FrozenCacheFile frozenCacheFile,\n-        int rangeSize,\n+        int defaultRangeSize,\n         int recoveryRangeSize,\n         ByteRange headerBlobCacheByteRange,\n         ByteRange footerBlobCacheByteRange\n     ) {\n-        super(logger, name, directory, fileInfo, context, stats, offset, length, headerBlobCacheByteRange, footerBlobCacheByteRange);\n+        super(\n+            logger,\n+            name,\n+            directory,\n+            fileInfo,\n+            context,\n+            stats,\n+            offset,\n+            compoundFileOffset,\n+            length,\n+            cacheFileReference,\n+            defaultRangeSize,\n+            recoveryRangeSize,\n+            headerBlobCacheByteRange,\n+            footerBlobCacheByteRange\n+        );\n         this.frozenCacheFile = frozenCacheFile;\n-        this.lastReadPosition = this.offset;\n-        this.lastSeekPosition = this.offset;\n-        this.defaultRangeSize = rangeSize;\n-        this.recoveryRangeSize = recoveryRangeSize;\n-        this.compoundFileOffset = compoundFileOffset;\n-        assert offset >= compoundFileOffset;\n     }\n \n     @Override\n-    public void doClose() {\n-        // nothing needed to be done here\n-    }\n-\n-    private long getDefaultRangeSize() {\n+    protected long getDefaultRangeSize() {\n         return directory.isRecoveryFinalized() ? defaultRangeSize : recoveryRangeSize;\n     }\n \n-    private ByteRange computeRange(long position) {\n-        final long rangeSize = getDefaultRangeSize();\n-        long start = (position / rangeSize) * rangeSize;\n-        long end = Math.min(start + rangeSize, frozenCacheFile.getLength());\n-        return ByteRange.of(start, end);\n-    }\n-\n     @Override\n-    protected void doReadInternal(ByteBuffer b) throws IOException {\n-        ensureContext(ctx -> ctx != CACHE_WARMING_CONTEXT);",
+            "submitted_start_line": null,
+            "submitted_line": 139
         },
         {
             "original_line": 60,
@@ -74,7 +80,10 @@
             "side": "RIGHT",
             "position": 54,
             "original_start_line": null,
-            "submitted_on_commit": "ab7bb599dd33b3b35ee1dcef7bce0921c2f11420"
+            "submitted_on_commit": "ab7bb599dd33b3b35ee1dcef7bce0921c2f11420",
+            "diff_hunk": "@@ -83,13 +57,13 @@ public FrozenIndexInput(\n             0L,\n             0L,\n             fileInfo.length(),\n+            new CacheFileReference(directory, fileInfo.physicalName(), fileInfo.length()),",
+            "submitted_start_line": null,
+            "submitted_line": 60
         },
         {
             "original_line": 95,
@@ -96,7 +105,10 @@
             "side": "RIGHT",
             "position": 95,
             "original_start_line": null,
-            "submitted_on_commit": "ab7bb599dd33b3b35ee1dcef7bce0921c2f11420"
+            "submitted_on_commit": "ab7bb599dd33b3b35ee1dcef7bce0921c2f11420",
+            "diff_hunk": "@@ -0,0 +1,480 @@\n+/*\n+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one\n+ * or more contributor license agreements. Licensed under the Elastic License\n+ * 2.0; you may not use this file except in compliance with the Elastic License\n+ * 2.0.\n+ */\n+\n+package org.elasticsearch.index.store.cache;\n+\n+import org.apache.logging.log4j.Logger;\n+import org.apache.logging.log4j.message.ParameterizedMessage;\n+import org.apache.lucene.store.AlreadyClosedException;\n+import org.apache.lucene.store.IOContext;\n+import org.apache.lucene.util.BytesRef;\n+import org.apache.lucene.util.BytesRefIterator;\n+import org.elasticsearch.action.ActionListener;\n+import org.elasticsearch.blobstore.cache.BlobStoreCacheService;\n+import org.elasticsearch.blobstore.cache.CachedBlob;\n+import org.elasticsearch.common.SuppressForbidden;\n+import org.elasticsearch.common.bytes.BytesReference;\n+import org.elasticsearch.common.io.Channels;\n+import org.elasticsearch.common.lease.Releasable;\n+import org.elasticsearch.common.unit.ByteSizeUnit;\n+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;\n+import org.elasticsearch.index.store.BaseSearchableSnapshotIndexInput;\n+import org.elasticsearch.index.store.IndexInputStats;\n+import org.elasticsearch.index.store.SearchableSnapshotDirectory;\n+import org.elasticsearch.xpack.searchablesnapshots.cache.ByteRange;\n+\n+import java.io.EOFException;\n+import java.io.IOException;\n+import java.io.InputStream;\n+import java.nio.ByteBuffer;\n+import java.nio.channels.FileChannel;\n+import java.util.Locale;\n+import java.util.concurrent.Future;\n+import java.util.concurrent.atomic.AtomicReference;\n+import java.util.function.Consumer;\n+\n+import static org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshotsUtils.toIntBytes;\n+\n+/**\n+ * Searchable snapshots index input that supports fully caching metadata files as well as header/footer information for each file,\n+ * consisting of a two-level cache (BlobStoreCacheService and CacheService).\n+ */\n+public abstract class MetadataCachingIndexInput extends BaseSearchableSnapshotIndexInput {\n+\n+    protected static final int COPY_BUFFER_SIZE = ByteSizeUnit.KB.toIntBytes(8);\n+\n+    protected final CacheFileReference cacheFileReference;\n+\n+    /**\n+     * If > 0, represents a logical file within a compound (CFS) file or is a slice thereof represents the offset of the logical\n+     * compound file within the physical CFS file\n+     */\n+    protected final long compoundFileOffset;\n+\n+    protected final int defaultRangeSize;\n+    protected final int recoveryRangeSize;\n+\n+    // last read position is kept around in order to detect (non)contiguous reads for stats\n+    protected long lastReadPosition;\n+    // last seek position is kept around in order to detect forward/backward seeks for stats\n+    protected long lastSeekPosition;\n+\n+    public MetadataCachingIndexInput(\n+        Logger logger,\n+        String name,\n+        SearchableSnapshotDirectory directory,\n+        BlobStoreIndexShardSnapshot.FileInfo fileInfo,\n+        IOContext context,\n+        IndexInputStats stats,\n+        long offset,\n+        long compoundFileOffset,\n+        long length,\n+        CacheFileReference cacheFileReference,\n+        int defaultRangeSize,\n+        int recoveryRangeSize,\n+        ByteRange headerBlobCacheByteRange,\n+        ByteRange footerBlobCacheByteRange\n+    ) {\n+        super(logger, name, directory, fileInfo, context, stats, offset, length, headerBlobCacheByteRange, footerBlobCacheByteRange);\n+        this.cacheFileReference = cacheFileReference;\n+        this.compoundFileOffset = compoundFileOffset;\n+        this.defaultRangeSize = defaultRangeSize;\n+        this.recoveryRangeSize = recoveryRangeSize;\n+        this.lastReadPosition = offset;\n+        this.lastSeekPosition = offset;\n+        assert offset >= compoundFileOffset;\n+        assert getBufferSize() <= BlobStoreCacheService.DEFAULT_CACHED_BLOB_SIZE; // must be able to cache at least one buffer's worth\n+    }\n+\n+    @Override\n+    protected void doReadInternal(ByteBuffer b) throws IOException {\n+        final long position = getAbsolutePosition();",
+            "submitted_start_line": null,
+            "submitted_line": 95
         }
     ],
     "base_commit": "5764a188a9fbadf2eec6098541174e9c62f50d0b"
