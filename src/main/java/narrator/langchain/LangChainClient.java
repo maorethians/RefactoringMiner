@@ -56,15 +56,17 @@ public class LangChainClient {
     }
 
     public ReviewPrompt.ParsedResponse processChapter(String content, List<String> dependencyUnderstandings) {
-        String understanding = generate(this.prompt.chapterUnderstanding(content, dependencyUnderstandings));
-        String result = generate(this.prompt.chapterResult(content, understanding));
-        return new ReviewPrompt.ParsedResponse(understanding, result);
+        System.out.println("understanding");
+        String understanding = this.model.generate(this.prompt.chapterUnderstanding(content, dependencyUnderstandings));
+        System.out.println("result");
+        String result = this.model.generate(this.prompt.chapterResult(content, understanding));
+        return new ReviewPrompt.ParsedResponse(understanding, result.replace(ReviewPrompt.END_OF_AUDIT, "").trim());
     }
 
     public List<ReviewPrompt.ReviewComment> compileResults(List<String> results, List<String> understandings) {
         List<ReviewPrompt.ReviewComment> finalResult = new ArrayList<>();
 
-        List<List<Integer>> splits = Splitter.createBalancedSplits(results);
+        List<List<Integer>> splits = Splitter.createBalancedSplits(understandings);
         for (int i = 0; i < splits.size(); i++) {
             List<Integer> split = splits.get(i);
 

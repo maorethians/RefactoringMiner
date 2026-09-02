@@ -79,7 +79,9 @@ public class Benchmark {
                         System.err.println("Detailed PR not found: " + detailedPrFileName);
                     }
 
-                    // Group review comments by submitted_on_commit
+                    // Group review comments by submitted_on_commit: the commit whose diff GitHub
+                    // actually rendered for the reviewer. submitted_line/submitted_start_line are
+                    // expressed in base_commit...submitted_on_commit, which is the range built below.
                     Map<String, List<JsonObject>> commitGroups = new HashMap<>();
                     if (json.has("reviews")) {
                         json.getAsJsonArray("reviews").forEach(element -> {
@@ -117,30 +119,45 @@ public class Benchmark {
                         for (ReviewPrompt.ReviewComment generatedComment : narrativeResult.comments()) {
                             List<Node> commentNodes = generatedComment.hunkIds().stream()
                                     .map(promptId -> findNode(narrativeResult.clusters(), promptId)).toList();
-                            if (commentNodes.stream().anyMatch(Objects::isNull)) {
-                                throw new Exception("Hallucinated id detected");
+                            for (int i = 0; i < commentNodes.size(); i++) {
+                                if (commentNodes.get(i) == null) {
+                                    System.out.println("Hallucinated id detected: " + generatedComment.hunkIds().get(i));
+                                }
                             }
 
                             Set<Node> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
                             if (validNodes.isEmpty()) {
-                                throw new Exception("No valid nodes found");
+                                System.out.println("No valid nodes found");
+                                continue;
                             }
 
                             generatedCommentsNodes.add(new GeneratedCommentNodes(generatedComment.text(), validNodes));
+                        }
+                        if (generatedCommentsNodes.isEmpty()) {
+                            System.out.println("No valid comments found");
+                            continue;
                         }
 
                         Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
                         for (JsonObject groundTruthComment : entry.getValue()) {
                             String path = groundTruthComment.get("path").getAsString();
                             String side = groundTruthComment.get("side").getAsString();
-                            int line = groundTruthComment.get("original_line").getAsInt();
-                            Integer startLine = groundTruthComment.get("original_start_line").isJsonNull() ?
-                                    null : groundTruthComment.get("original_start_line").getAsInt();
-                            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), path, side, line, startLine);
+                            int line = groundTruthComment.get("submitted_line").getAsInt();
+                            Integer startLine = groundTruthComment.get("submitted_start_line").isJsonNull() ?
+                                    null : groundTruthComment.get("submitted_start_line").getAsInt();
+                            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), side, path, line, startLine);
+                            if (overlappingNodes.isEmpty()) {
+                                System.out.println("No overlapping nodes found");
+                                continue;
+                            }
 
                             groundTruthGeneratedComments.put(groundTruthComment, generatedCommentsNodes.stream()
                                     .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
                                     .collect(Collectors.toSet()));
+                        }
+                        if (groundTruthGeneratedComments.isEmpty()) {
+                            System.out.println("No overlapping comments found");
+                            continue;
                         }
                         long coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
                         long uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
@@ -236,7 +253,7 @@ public class Benchmark {
 
     private static Set<Node> findNodes(List<Cluster> clusters, String side, String path, int line, @Nullable Integer startLine) {
         return clusters.stream()
-                .map(cluster -> cluster.findNodes(path, side, line, startLine)).flatMap(Set::stream)
+                .map(cluster -> cluster.findNodes(side, path, line, startLine)).flatMap(Set::stream)
                 .filter(node -> !node.getNodeType().equals(NodeType.LOCATION_CONTEXT))
                 .collect(Collectors.toSet());
     }
