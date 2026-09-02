@@ -9,6 +9,9 @@ import org.jetbrains.annotations.NotNull;
 import org.refactoringminer.astDiff.graph.Node;
 
 public class ReviewPrompt {
+  // This is necessary for terminating the agent and preventing it from falling in a loop
+  public static String END_OF_AUDIT = "### END OF AUDIT";
+
   private String chapterSpecification() {
     StringBuilder spec = new StringBuilder();
 
@@ -124,7 +127,8 @@ public class ReviewPrompt {
             .append("Your response must be a list of review comments. Adhere to this structure for each comment:\n")
             .append("- LINE 1: Only the comma-separated list of change IDs.\n")
             .append("- SUBSEQUENT LINES: The high-fidelity review text.\n")
-            .append("Separate individual comments with one or more blank lines.");
+            .append("Separate individual comments with one or more blank lines.\n")
+            .append("Once every comment has been written, terminate the response with `").append(END_OF_AUDIT).append("` on its own line and output nothing after it.");
 
     return prompt.toString();
   }
@@ -156,7 +160,7 @@ public class ReviewPrompt {
     prompt.append("\n");
 
     prompt.append("### SYNTHESIS LOGIC & RULES\n")
-            .append("Transform the modular findings into a final list of review comments by applying these rules:\n\n")
+            .append("Transform the modular findings into a final list of review comments by applying these rules:\n")
             .append("1. SEMANTIC CONSOLIDATION: Do not simply list findings. Merge overlapping or related comments across different chapters into single, systemic observations. For example, if multiple chapters identify symptoms of the same underlying architectural flaw, synthesize them into one comprehensive finding.\n")
             .append("2. RIGOROUS CONFLICT RESOLUTION: If findings from different chapters contradict each other:\n")
             .append("   - Consult the Technical Mappings to determine the technically accurate state.\n")
@@ -184,12 +188,22 @@ public class ReviewPrompt {
 
     Pattern outerPattern = Pattern.compile("<review_comments>(.*?)</review_comments>", Pattern.DOTALL);
     Matcher outerMatcher = outerPattern.matcher(response);
-    if (!outerMatcher.find()) {
+
+    StringBuilder blocks = new StringBuilder();
+    while (outerMatcher.find()) {
+      String block = outerMatcher.group(1).trim();
+      if (block.isEmpty()) continue;
+
+      if (blocks.length() > 0) {
+        blocks.append("\n\n");
+      }
+      blocks.append(block);
+    }
+    if (blocks.length() == 0) {
       return null;
     }
 
-    String content = outerMatcher.group(1).trim();
-    String[] lines = content.split("\\r?\\n");
+    String[] lines = blocks.toString().split("\\r?\\n");
 
     String currentHunksStr = null;
     StringBuilder currentText = new StringBuilder();
