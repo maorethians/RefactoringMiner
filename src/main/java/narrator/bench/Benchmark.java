@@ -138,7 +138,7 @@ public class Benchmark {
                             continue;
                         }
 
-                        Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
+                        Map<JsonObject, Set<Node>> groundTruthsOverlappingNodes = new HashMap<>();
                         for (JsonObject groundTruthComment : entry.getValue()) {
                             String path = groundTruthComment.get("path").getAsString();
                             String side = groundTruthComment.get("side").getAsString();
@@ -151,13 +151,20 @@ public class Benchmark {
                                 continue;
                             }
 
-                            groundTruthGeneratedComments.put(groundTruthComment, generatedCommentsNodes.stream()
-                                    .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
-                                    .collect(Collectors.toSet()));
+                            groundTruthsOverlappingNodes.put(groundTruthComment, overlappingNodes);
                         }
-                        if (groundTruthGeneratedComments.isEmpty()) {
+                        if (groundTruthsOverlappingNodes.isEmpty()) {
                             System.out.println("No overlapping comments found");
                             continue;
+                        }
+
+                        Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
+                        for (Map.Entry<JsonObject, Set<Node>> groundTruthOverlappingNodes : groundTruthsOverlappingNodes.entrySet()) {
+                            JsonObject groundTruth = groundTruthOverlappingNodes.getKey();
+                            Set<Node> overlappingNodes = groundTruthOverlappingNodes.getValue();
+                            groundTruthGeneratedComments.put(groundTruth, generatedCommentsNodes.stream()
+                                    .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
+                                    .collect(Collectors.toSet()));
                         }
                         long coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
                         long uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
