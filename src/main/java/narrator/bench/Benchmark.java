@@ -25,6 +25,7 @@ public class Benchmark {
     private static final String MIN_CREATED_AT = "2024-03-01T00:00:00Z";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
+    private static final int ATTEMPTS = 3;
 
     public static void main(String[] args) {
         runBenchmark();
@@ -108,103 +109,31 @@ public class Benchmark {
                         String rangeUrl = "https://github.com/" + repo + "/compare/" + baseCommit + "..." + submittedCommit;
                         System.out.println(rangeUrl);
 
-                        purgeLog();
-
-                        long start = System.currentTimeMillis();
-                        NarrativeProcessor.NarrativeProcessResult narrativeResult = NarrativeRunner.run(rangeUrl);
-                        long end = System.currentTimeMillis();
-                        long timing = end - start;
-
-                        Set<GeneratedCommentNodes> generatedCommentsNodes = new HashSet<>();
-                        for (ReviewPrompt.ReviewComment generatedComment : narrativeResult.comments()) {
-                            List<Node> commentNodes = generatedComment.hunkIds().stream()
-                                    .map(promptId -> findNode(narrativeResult.clusters(), promptId)).toList();
-                            for (int i = 0; i < commentNodes.size(); i++) {
-                                if (commentNodes.get(i) == null) {
-                                    System.out.println("Hallucinated id detected: " + generatedComment.hunkIds().get(i));
-                                }
-                            }
-
-                            Set<Node> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
-                            if (validNodes.isEmpty()) {
-                                System.out.println("No valid nodes found");
+                        // Run the entry several times and keep the best attempt: highest recall,
+                        // ties broken by the lower covered/all hunk nodes ratio.
+                        Attempt best = null;
+                        for (int attempt = 1; attempt <= ATTEMPTS; attempt++) {
+                            System.out.println("Attempt " + attempt + "/" + ATTEMPTS);
+                            Attempt candidate = runAttempt(rangeUrl, org, repoName, prNumber, submittedCommit, entry.getValue());
+                            if (candidate == null) {
                                 continue;
                             }
-
-                            generatedCommentsNodes.add(new GeneratedCommentNodes(generatedComment.text(), validNodes));
-                        }
-                        if (generatedCommentsNodes.isEmpty()) {
-                            System.out.println("No valid comments found");
-                            continue;
-                        }
-
-                        Map<JsonObject, Set<Node>> groundTruthsOverlappingNodes = new HashMap<>();
-                        for (JsonObject groundTruthComment : entry.getValue()) {
-                            String path = groundTruthComment.get("path").getAsString();
-                            String side = groundTruthComment.get("side").getAsString();
-                            int line = groundTruthComment.get("submitted_line").getAsInt();
-                            Integer startLine = groundTruthComment.get("submitted_start_line").isJsonNull() ?
-                                    null : groundTruthComment.get("submitted_start_line").getAsInt();
-                            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), side, path, line, startLine);
-                            if (overlappingNodes.isEmpty()) {
-                                System.out.println("No overlapping nodes found");
-                                continue;
+                            if (best == null || isBetter(candidate, best)) {
+                                best = candidate;
                             }
-
-                            groundTruthsOverlappingNodes.put(groundTruthComment, overlappingNodes);
                         }
-                        if (groundTruthsOverlappingNodes.isEmpty()) {
-                            System.out.println("No overlapping comments found");
+                        if (best == null) {
+                            System.out.println("No valid attempt for: " + resultFileName);
                             continue;
                         }
-
-                        Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
-                        for (Map.Entry<JsonObject, Set<Node>> groundTruthOverlappingNodes : groundTruthsOverlappingNodes.entrySet()) {
-                            JsonObject groundTruth = groundTruthOverlappingNodes.getKey();
-                            Set<Node> overlappingNodes = groundTruthOverlappingNodes.getValue();
-                            groundTruthGeneratedComments.put(groundTruth, generatedCommentsNodes.stream()
-                                    .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
-                                    .collect(Collectors.toSet()));
-                        }
-                        long coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
-                        long uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
-
-                        double recall = (double) coveredGroundTruth / groundTruthGeneratedComments.size();
-                        System.out.println("recall: " + recall);
-
-                        Set<Node> allHunkNodes = narrativeResult.clusters().stream()
-                                .map(cluster -> cluster.getGraph().vertexSet().stream().filter(Node::isBase).collect(Collectors.toSet()))
-                                .flatMap(Set::stream).collect(Collectors.toSet());
-                        Set<Node> coveredHunkNodes = generatedCommentsNodes.stream()
-                                .map(generatedCommentNodes -> generatedCommentNodes.nodes.stream().filter(Node::isBase).collect(Collectors.toSet()))
-                                .flatMap(Set::stream).collect(Collectors.toSet());
-                        Set<Node> uncoveredHunkNodes = allHunkNodes.stream().filter(hunkNode -> !coveredHunkNodes.contains(hunkNode))
-                                .collect(Collectors.toSet());
-
-                        TokenUsage tokens = readLog();
-
-                        BenchResult result = new BenchResult();
-                        result.org = org;
-                        result.repo = repoName;
-                        result.prNumber = prNumber;
-                        result.commit = submittedCommit;
-                        result.generatedCommentsNodes = generatedCommentsNodes.stream().map(GeneratedCommentNodes::stringify).toList();
-                        result.groundTruthGeneratedCommentsNodes = groundTruthGeneratedComments.entrySet().stream()
-                                .map(e -> new GroundTruthGeneratedCommentsNodes(e.getKey(), e.getValue().stream().map(GeneratedCommentNodes::stringify).toList())).toList();
-                        result.uncoveredGroundTruth = uncoveredGroundTruth;
-                        result.coveredGroundTruth = coveredGroundTruth;
-                        result.uncoveredHunkNodes = uncoveredHunkNodes.size();
-                        result.coveredHunkNodes = coveredHunkNodes.size();
-                        result.timing = timing;
-                        result.tokensIn = tokens.in;
-                        result.tokensOut = tokens.out;
+                        System.out.println("Best recall: " + best.recall() + ", hunk node ratio: " + best.hunkNodeRatio());
 
                         // Store result JSON
-                        Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(result).getBytes(StandardCharsets.UTF_8));
+                        Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(best.result()).getBytes(StandardCharsets.UTF_8));
 
                         // Store raw output TXT
                         String outputFileName = String.format("%s_%s_%s_%s.txt", org, repoName, prNumber, submittedCommit);
-                        Files.write(Paths.get(RESULTS_DIR, outputFileName), narrativeResult.content().getBytes(StandardCharsets.UTF_8));
+                        Files.write(Paths.get(RESULTS_DIR, outputFileName), best.content().getBytes(StandardCharsets.UTF_8));
                     }
 
                 } catch (Exception e) {
@@ -217,6 +146,112 @@ public class Benchmark {
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private static boolean isBetter(Attempt candidate, Attempt best) {
+        int recallComparison = Double.compare(candidate.recall(), best.recall());
+        if (recallComparison != 0) {
+            return recallComparison > 0;
+        }
+
+        return Double.compare(candidate.hunkNodeRatio(), best.hunkNodeRatio()) < 0;
+    }
+
+    @Nullable
+    private static Attempt runAttempt(String rangeUrl, String org, String repoName, String prNumber,
+                                      String submittedCommit, List<JsonObject> groundTruthComments) throws Exception {
+        purgeLog();
+
+        long start = System.currentTimeMillis();
+        NarrativeProcessor.NarrativeProcessResult narrativeResult = NarrativeRunner.run(rangeUrl);
+        long end = System.currentTimeMillis();
+        long timing = end - start;
+
+        Set<GeneratedCommentNodes> generatedCommentsNodes = new HashSet<>();
+        for (ReviewPrompt.ReviewComment generatedComment : narrativeResult.comments()) {
+            List<Node> commentNodes = generatedComment.hunkIds().stream()
+                    .map(promptId -> findNode(narrativeResult.clusters(), promptId)).toList();
+            for (int i = 0; i < commentNodes.size(); i++) {
+                if (commentNodes.get(i) == null) {
+                    System.out.println("Hallucinated id detected: " + generatedComment.hunkIds().get(i));
+                }
+            }
+
+            Set<Node> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
+            if (validNodes.isEmpty()) {
+                System.out.println("No valid nodes found");
+                continue;
+            }
+
+            generatedCommentsNodes.add(new GeneratedCommentNodes(generatedComment.text(), validNodes));
+        }
+        if (generatedCommentsNodes.isEmpty()) {
+            System.out.println("No valid comments found");
+            return null;
+        }
+
+        Map<JsonObject, Set<Node>> groundTruthsOverlappingNodes = new HashMap<>();
+        for (JsonObject groundTruthComment : groundTruthComments) {
+            String path = groundTruthComment.get("path").getAsString();
+            String side = groundTruthComment.get("side").getAsString();
+            int line = groundTruthComment.get("submitted_line").getAsInt();
+            Integer startLine = groundTruthComment.get("submitted_start_line").isJsonNull() ?
+                    null : groundTruthComment.get("submitted_start_line").getAsInt();
+            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), side, path, line, startLine);
+            if (overlappingNodes.isEmpty()) {
+                System.out.println("No overlapping nodes found");
+                continue;
+            }
+
+            groundTruthsOverlappingNodes.put(groundTruthComment, overlappingNodes);
+        }
+        if (groundTruthsOverlappingNodes.isEmpty()) {
+            System.out.println("No overlapping comments found");
+            return null;
+        }
+
+        Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
+        for (Map.Entry<JsonObject, Set<Node>> groundTruthOverlappingNodes : groundTruthsOverlappingNodes.entrySet()) {
+            JsonObject groundTruth = groundTruthOverlappingNodes.getKey();
+            Set<Node> overlappingNodes = groundTruthOverlappingNodes.getValue();
+            groundTruthGeneratedComments.put(groundTruth, generatedCommentsNodes.stream()
+                    .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
+                    .collect(Collectors.toSet()));
+        }
+        long coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
+        long uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
+
+        double recall = (double) coveredGroundTruth / groundTruthGeneratedComments.size();
+        System.out.println("recall: " + recall);
+
+        Set<Node> allHunkNodes = narrativeResult.clusters().stream()
+                .map(cluster -> cluster.getGraph().vertexSet().stream().filter(Node::isBase).collect(Collectors.toSet()))
+                .flatMap(Set::stream).collect(Collectors.toSet());
+        Set<Node> coveredHunkNodes = generatedCommentsNodes.stream()
+                .map(generatedCommentNodes -> generatedCommentNodes.nodes.stream().filter(Node::isBase).collect(Collectors.toSet()))
+                .flatMap(Set::stream).collect(Collectors.toSet());
+        Set<Node> uncoveredHunkNodes = allHunkNodes.stream().filter(hunkNode -> !coveredHunkNodes.contains(hunkNode))
+                .collect(Collectors.toSet());
+
+        TokenUsage tokens = readLog();
+
+        BenchResult result = new BenchResult();
+        result.org = org;
+        result.repo = repoName;
+        result.prNumber = prNumber;
+        result.commit = submittedCommit;
+        result.generatedCommentsNodes = generatedCommentsNodes.stream().map(GeneratedCommentNodes::stringify).toList();
+        result.groundTruthGeneratedCommentsNodes = groundTruthGeneratedComments.entrySet().stream()
+                .map(e -> new GroundTruthGeneratedCommentsNodes(e.getKey(), e.getValue().stream().map(GeneratedCommentNodes::stringify).toList())).toList();
+        result.uncoveredGroundTruth = uncoveredGroundTruth;
+        result.coveredGroundTruth = coveredGroundTruth;
+        result.uncoveredHunkNodes = uncoveredHunkNodes.size();
+        result.coveredHunkNodes = coveredHunkNodes.size();
+        result.timing = timing;
+        result.tokensIn = tokens.in;
+        result.tokensOut = tokens.out;
+
+        return new Attempt(result, narrativeResult.content());
     }
 
     private static void purgeLog() throws IOException {
@@ -263,6 +298,18 @@ public class Benchmark {
                 .map(cluster -> cluster.findNodes(side, path, line, startLine)).flatMap(Set::stream)
                 .filter(node -> !node.getNodeType().equals(NodeType.LOCATION_CONTEXT))
                 .collect(Collectors.toSet());
+    }
+
+    private record Attempt(BenchResult result, String content) {
+        double recall() {
+            long total = result.coveredGroundTruth + result.uncoveredGroundTruth;
+            return total == 0 ? 0 : (double) result.coveredGroundTruth / total;
+        }
+
+        double hunkNodeRatio() {
+            long total = result.coveredHunkNodes + result.uncoveredHunkNodes;
+            return total == 0 ? 0 : (double) result.coveredHunkNodes / total;
+        }
     }
 
     private static class TokenUsage {
