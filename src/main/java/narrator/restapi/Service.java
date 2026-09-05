@@ -68,6 +68,25 @@ public class Service {
         return emitter;
     }
 
+    @GetMapping(value = "/clusters/compare-sse", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter compareClustersSSE(@RequestParam String url) {
+        System.out.println("hello");
+        SseEmitter emitter = new SseEmitter(0L);
+        taskExecutor.execute(
+                () -> { // Use @Async with ThreadPoolTaskExecutor (virtual threads recommended)
+                    try {
+                        Graph<Node, Edge> graph = Driver.getCompareGraph(url);
+                        String result = respondClusters(graph);
+                        emitter.send(SseEmitter.event().data(result));
+                    } catch (Exception e) {
+                        emitter.completeWithError(e);
+                    } finally {
+                        emitter.complete();
+                    }
+                });
+        return emitter;
+    }
+
     private String respondClusters(Graph<Node, Edge> graph) {
         Clusterer clusterer = new Clusterer(graph);
         List<Cluster> clusters = clusterer.getClusters();
@@ -102,6 +121,24 @@ public class Service {
                 () -> { // Use @Async with ThreadPoolTaskExecutor (virtual threads recommended)
                     try {
                         Graph<Node, Edge> graph = Driver.getPullRequestGraph(url);
+                        String result = respondHierarchy(graph);
+                        emitter.send(SseEmitter.event().data(result));
+                    } catch (Exception e) {
+                        emitter.completeWithError(e);
+                    } finally {
+                        emitter.complete();
+                    }
+                });
+        return emitter;
+    }
+
+    @GetMapping(value = "/hierarchy/compare-sse", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter compareHierarchySSE(@RequestParam String url) {
+        SseEmitter emitter = new SseEmitter(0L);
+        taskExecutor.execute(
+                () -> { // Use @Async with ThreadPoolTaskExecutor (virtual threads recommended)
+                    try {
+                        Graph<Node, Edge> graph = Driver.getCompareGraph(url);
                         String result = respondHierarchy(graph);
                         emitter.send(SseEmitter.event().data(result));
                     } catch (Exception e) {
