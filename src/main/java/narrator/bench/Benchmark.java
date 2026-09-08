@@ -25,7 +25,7 @@ public class Benchmark {
     private static final String MIN_CREATED_AT = "2024-03-01T00:00:00Z";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
-    private static final int ATTEMPTS = 3;
+    private static final int ATTEMPTS = 1;
 
     public static void main(String[] args) {
         runBenchmark();
