@@ -12,6 +12,8 @@ public class ReviewPrompt {
   // This is necessary for terminating the agent and preventing it from falling in a loop
   public static String END_OF_AUDIT = "### END OF AUDIT";
 
+  private static final Pattern ALPHANUMERIC_PATTERN = Pattern.compile("[\\p{Alnum}]");
+
   private String chapterSpecification() {
     StringBuilder spec = new StringBuilder();
 
@@ -251,9 +253,10 @@ public class ReviewPrompt {
     List<String> ids = extractHunkIds(line);
     if (ids.isEmpty()) return false;
 
-    // Check if the line contains only IDs, commas, spaces
-    String stripped = Node.PROMPT_ID_PATTERN.matcher(line).replaceAll("").replaceAll("[,\\s]", "");
-    return stripped.isEmpty();
+    // The IDs may be separated in any way the agent chooses ("A, B", "A -> B", "A & B", "A + B / C", ...),
+    // so anything that is not alphanumeric counts as a separator; only words or numbers disqualify the line
+    String stripped = Node.PROMPT_ID_PATTERN.matcher(line).replaceAll("");
+    return !ALPHANUMERIC_PATTERN.matcher(stripped).find();
   }
 
   private static List<String> extractHunkIds(String hunksStr) {
