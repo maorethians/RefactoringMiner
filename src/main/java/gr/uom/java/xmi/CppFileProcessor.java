@@ -58,7 +58,6 @@ import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionDeclarator;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionDefinition;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionWithTryBlock;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTNamedTypeSpecifier;
-import org.eclipse.cdt.core.dom.ast.gnu.c.GCCLanguage;
 import org.eclipse.cdt.core.dom.ast.gnu.cpp.GPPLanguage;
 import org.eclipse.cdt.core.index.IIndexFileLocation;
 import org.eclipse.cdt.core.parser.DefaultLogService;
@@ -151,7 +150,7 @@ public class CppFileProcessor {
 				options |= GPPLanguage.OPTION_NO_IMAGE_LOCATIONS;
 			}
 
-			if(PathFileUtils.isCppFile(filePath)) {
+			if(PathFileUtils.isCppFile(filePath) || PathFileUtils.isCFile(filePath)) {
 				if (astDiff) {
 					ByteArrayInputStream is = new ByteArrayInputStream(fileContent.getBytes());
 					try {
@@ -179,34 +178,6 @@ public class CppFileProcessor {
 				this.umlModel.addClass(moduleClass);
 				//add remaining comments to moduleClass
 				//TODO consider assigning comments to individual preprocessor statements
-				moduleClass.getComments().addAll(comments);
-			}
-			else if(PathFileUtils.isCFile(filePath)) {
-				if (astDiff) {
-					ByteArrayInputStream is = new ByteArrayInputStream(fileContent.getBytes());
-					try {
-						TreeContext treeContext = new CTreeSitterNgTreeGenerator().generateFrom().stream(is);
-						this.umlModel.getTreeContextMap().put(filePath, treeContext);
-					}
-					catch(Exception e) {}
-				}
-				IASTTranslationUnit ast = GCCLanguage.getDefault().getASTTranslationUnit(
-						content,
-						scanInfo,
-						includeProvider,
-						EmptyCIndex.INSTANCE,
-						options,
-						new DefaultLogService()
-						);
-				String sourceFolder = extractCppSourceFolder();
-				List<UMLComment> comments = extractInternalComments(ast.getComments(), sourceFolder, filePath, fileContent);
-				this.umlModel.getCommentMap().put(filePath, comments);
-				UMLClass moduleClass = createModuleClass(ast, sourceFolder);
-				processPreprocessorStatements(sourceFolder, moduleClass, ast.getAllPreprocessorStatements());
-				preprocessor.processDeclarations(moduleClass.getName(), sourceFolder, moduleClass,
-						ast.getDeclarations(), comments, new ICPPASTTemplateParameter[0]);
-				this.umlModel.addClass(moduleClass);
-				//add remaining comments to moduleClass
 				moduleClass.getComments().addAll(comments);
 			}
 		}
@@ -488,6 +459,14 @@ public class CppFileProcessor {
 			IASTName name = cppNamespaceDefinition.getName();
 			String namespace = name.getRawSignature();
 			String qualifiedNamespace = packageName + "." + namespace;
+			if(parentContainer instanceof UMLClass umlClass) {
+				LocationInfo namespaceLocation = new LocationInfo(sourceFolder, filePath, cppNamespaceDefinition, CodeElementType.PACKAGE_DECLARATION, fileContent);
+				for(UMLPreprocessorStatement statement : umlClass.getPreprocessorStatements()) {
+					if(namespaceLocation.subsumes(statement.getLocationInfo())) {
+						statement.addNamespace(namespace);
+					}
+				}
+			}
 			preprocessor.processDeclarationGroups(qualifiedNamespace, sourceFolder, parentContainer, declaration, comments,
 					templateParameters, inactiveContainerAlternatives);
 		}
@@ -566,10 +545,10 @@ public class CppFileProcessor {
 			umlClass.setVisibility(currentVisibility != null ? currentVisibility : Visibility.PUBLIC);
 			if(compositeTypeSpecifier instanceof ICPPASTCompositeTypeSpecifier cppCompositeTypeSpecifier) {
 				umlClass.setFinal(cppCompositeTypeSpecifier.isFinal());
-				if(cppCompositeTypeSpecifier.toString().contains("struct")) {
+				if(cppCompositeTypeSpecifier.getKey() == IASTCompositeTypeSpecifier.k_struct) {
 					umlClass.setStruct(true);
 				}
-				if(cppCompositeTypeSpecifier.toString().contains("union")) {
+				if(cppCompositeTypeSpecifier.getKey() == IASTCompositeTypeSpecifier.k_union) {
 					umlClass.setUnion(true);
 				}
 				ICPPASTBaseSpecifier[] baseSpecifiers = cppCompositeTypeSpecifier.getBaseSpecifiers();
@@ -667,7 +646,7 @@ public class CppFileProcessor {
 				}
 				umlAttribute.setVariableDeclaration(variableDeclaration);
 				addTemplateParameters(umlAttribute, templateParameters, sourceFolder);
-				preprocessor.addEnumConstant(parentContainer, umlAttribute, name);
+				preprocessor.addEnumConstant(umlClass, umlAttribute, name);
 				distributeComments(comments, locationInfo, umlAttribute.getComments());
 			}
 			this.umlModel.addClass(umlClass);
@@ -722,9 +701,14 @@ public class CppFileProcessor {
 	}
 
 	private UMLOperation processFunctionDeclSpecifier(IASTDeclSpecifier declSpecifier, IASTFunctionDeclarator declarator, String className, String sourceFolder, UMLAbstractClass parentContainer, Visibility currentVisibility, List<UMLComment> comments, ICPPASTTemplateParameter[] templateParameters) {
-		IASTName functionName = declarator.getName();
+		IASTName declaratorName = declarator.getName();
 		LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, declarator, CodeElementType.METHOD_DECLARATION, fileContent);
-		UMLOperation operation = new UMLOperation(functionName.toString(), locationInfo, className);
+		String functionName = declaratorName.toString();
+		if(functionName.isEmpty()) {
+			IASTDeclarator nested = declarator.getNestedDeclarator();
+			functionName = nested.getName().toString();
+		}
+		UMLOperation operation = new UMLOperation(functionName, locationInfo, className);
 		operation.setVisibility(currentVisibility != null ? currentVisibility : Visibility.PUBLIC);
 		operation.setStatic(declSpecifier.getStorageClass() == IASTDeclSpecifier.sc_static);
 		operation.setInline(declSpecifier.isInline());

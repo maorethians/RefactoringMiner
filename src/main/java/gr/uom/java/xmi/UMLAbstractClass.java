@@ -1154,7 +1154,22 @@ public abstract class UMLAbstractClass implements AnnotationProvider, CommentPro
 		}
 		int abstractOperationsToBeDeducted = this.isAbstract() != umlClass.isAbstract() ? totalAbstractOperations : 0;
 		boolean typeScriptObjectWithNonIdenticalValues = this.isObject() && umlClass.isObject() && PathFileUtils.isTypeScriptFile(this.getSourceFile()) && PathFileUtils.isTypeScriptFile(umlClass.getSourceFile()) && identicalInitializerAttributes != commonAttributes.size();
-		if((commonOperations.size() > Math.floor(totalOperations/2.0) && (commonAttributes.size() > 2 || totalAttributes == 0)) ||
+		boolean javaScriptToTypeScript = PathFileUtils.isJavaScriptFile(this.getSourceFile()) && PathFileUtils.isTypeScriptFile(umlClass.getSourceFile());
+		if(this instanceof UMLClass class1 && class1.isModule() && umlClass instanceof UMLClass class2 && class2.isModule() && class1.getContainer().isPresent() && class2.getContainer().isPresent()) {
+			List<UMLAnonymousClass> anonymousList1 = class1.getContainer().get().getAnonymousClassList();
+			List<UMLAnonymousClass> anonymousList2 = class2.getContainer().get().getAnonymousClassList();
+			for(UMLAnonymousClass anonymous1 : anonymousList1) {
+				for(UMLAnonymousClass anonymous2 : anonymousList2) {
+					if(anonymous1.getOperations().size() > 0 && anonymous2.getOperations().size() > 0) {
+						MatchResult matchResult = anonymous1.hasSameAttributesAndOperations(anonymous2);
+						if(matchResult.isMatch()) {
+							return matchResult;
+						}
+					}
+				}
+			}
+		}
+		if((commonOperations.size() > Math.floor(totalOperations/2.0) && (commonAttributes.size() > 2 || totalAttributes == 0 || javaScriptToTypeScript)) ||
 				(commonOperations.size() > Math.floor(totalOperations/3.0*2.0) && (commonAttributes.size() >= 2 || totalAttributes == 0)) ||
 				(identicalOperations.size() > Math.floor(commonOperations.size()/3.0*2.0) && commonOperations.size() >= 2 && identicalOperations.size() >= Math.floor((totalOperations - abstractOperationsToBeDeducted)/3.0*2.0)) ||
 				(commonAttributes.size() > Math.floor(totalAttributes/2.0) && (commonOperations.size() > 2 || totalOperations == 0) && !typeScriptObjectWithNonIdenticalValues) ||
@@ -1316,12 +1331,23 @@ public abstract class UMLAbstractClass implements AnnotationProvider, CommentPro
 			}
 		}
 		boolean emptyModules = this instanceof UMLClass class1 && class1.isModule() && umlClass instanceof UMLClass class2 && class2.isModule() && (this.container.isEmpty() || umlClass.container.isEmpty()) && totalAttributes + totalOperations == 0;
-		if(commonOperations.size() == totalOperations && commonAttributes.size() == totalAttributes && !emptyModules) {
+		boolean modulesWithNestedClasses = this instanceof UMLClass class1 && class1.isModule() && umlClass instanceof UMLClass class2 && class2.isModule() && this.container.isPresent() && umlClass.container.isPresent() && this.container.get().getNestedClasses().size() > 0 && umlClass.container.get().getNestedClasses().size() > 0;
+		boolean testVsNonTest = this instanceof UMLClass class1 && class1.isModule() && umlClass instanceof UMLClass class2 && class2.isModule() && this.container.isPresent() && umlClass.container.isPresent() && this.container.get().getDescribeMap().isEmpty() != umlClass.container.get().getDescribeMap().isEmpty();
+		if(commonOperations.size() == totalOperations && commonAttributes.size() == totalAttributes && !emptyModules && !modulesWithNestedClasses && !testVsNonTest) {
 			if(allAttributes == totalAttributes && identicalAllAttributes != allAttributes && totalOperations == 0) {
 				return new MatchResult(commonOperations.size(), commonAttributes.size(), identicalOperations.size(), identicalInitializerAttributes, totalOperations, totalAttributes, matchedCompanions, totalCompanions, false);
 			}
 			if(this.isObject() && umlClass.isObject() && PathFileUtils.isTypeScriptFile(this.getSourceFile()) && PathFileUtils.isTypeScriptFile(umlClass.getSourceFile()) && identicalInitializerAttributes != commonAttributes.size()) {
 				return new MatchResult(commonOperations.size(), commonAttributes.size(), identicalOperations.size(), identicalInitializerAttributes, totalOperations, totalAttributes, matchedCompanions, totalCompanions, false);
+			}
+			if(this.container.isPresent() && umlClass.container.isPresent() && !this.container.get().getDescribeMap().isEmpty() && !umlClass.container.get().getDescribeMap().isEmpty()) {
+				Set<String> keySet1 = this.container.get().getTestKeysRecursively();
+				Set<String> keySet2 = umlClass.container.get().getTestKeysRecursively();
+				Set<String> intersection = new LinkedHashSet<>(keySet1);
+				intersection.retainAll(keySet2);
+				if(intersection.isEmpty()) {
+					return new MatchResult(commonOperations.size(), commonAttributes.size(), identicalOperations.size(), identicalInitializerAttributes, totalOperations, totalAttributes, matchedCompanions, totalCompanions, false);
+				}
 			}
 			return new MatchResult(commonOperations.size(), commonAttributes.size(), identicalOperations.size(), identicalInitializerAttributes, totalOperations, totalAttributes, matchedCompanions, totalCompanions, true);
 		}

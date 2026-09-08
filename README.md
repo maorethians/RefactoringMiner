@@ -15,7 +15,7 @@
 |<img src="https://upload.wikimedia.org/wikipedia/commons/7/76/Kotlin_logo_%282021-present%29.svg" alt="Kotlin" width="100"/> | ✅ | ✅ | <ul><li>- [ ] Validate precision/recall</li></ul> |
 |<img src="https://upload.wikimedia.org/wikipedia/commons/4/4c/Typescript_logo_2020.svg" alt="TypeScript" width="30"/> | ✅ | ✅ | <ul><li>- [x] swc4j Parser</li><li>- [ ] Create benchmark</li></ul> |
 |<img src="https://upload.wikimedia.org/wikipedia/commons/9/99/Unofficial_JavaScript_logo_2.svg" alt ="JavaScript" width="30"/> | ✅ | ✅ | <ul><li>- [x] swc4j Parser</li><li>- [ ] Validate precision/recall</li></ul> |
-|<img src="https://upload.wikimedia.org/wikipedia/commons/1/18/ISO_C%2B%2B_Logo.svg" alt ="C++" width="30"/> | ✅ | ✅ | <ul><li>- [x] Eclipse CDT Parser</li></ul> |
+|<img src="https://upload.wikimedia.org/wikipedia/commons/1/18/C_Programming_Language.svg" alt ="C" width="30"/> <img src="https://upload.wikimedia.org/wikipedia/commons/1/18/ISO_C%2B%2B_Logo.svg" alt ="C++" width="30"/> | ✅ | ✅ | <ul><li>- [x] Eclipse CDT Parser</li></ul> |
 
 ### Open source projects using RefactoringMiner diff tool for code reviews:
 [<img src="https://www.jabref.org/_nuxt/jabref.4Rtv1swz.svg" alt="JabRef" width="30"/>](https://github.com/JabRef/jabref)
@@ -59,7 +59,7 @@ Table of Contents
       * [Papers using RefactoringMiner](documentation/research.md#papers-using-refactoringminer)
    * [Refactoring detection API usage guidelines](documentation/api.md#refactoring-detection-api-usage-guidelines)
       * [With a locally cloned git repository](documentation/api.md#with-a-locally-cloned-git-repository)
-      * [With two directories containing Java source code](documentation/api.md#with-two-directories-containing-java-source-code)
+      * [With two directories containing source code](documentation/api.md#with-two-directories-containing-source-code)
       * [With file contents as strings](documentation/api.md#with-file-contents-as-strings)
       * [With all information fetched directly from GitHub](documentation/api.md#with-all-information-fetched-directly-from-github)
       * [With each commit in a GitHub Pull request](documentation/api.md#with-each-commit-in-a-github-pull-request)
@@ -70,12 +70,13 @@ Table of Contents
       * [With the files changed in a GitHub Pull Request](documentation/api.md#with-the-files-changed-in-a-github-pull-request)
       * [With two directories](documentation/api.md#with-two-directories)
       * [With commit range](documentation/api.md#with-commit-range)
+      * [With GitHub Compare](documentation/api.md#with-github-compare)
    * [Purity Checker](documentation/purity.md#purity-checker)
    * [Location information for the detected refactorings](documentation/api.md#location-information-for-the-detected-refactorings)
    * [Statement matching information for the detected refactorings](documentation/api.md#statement-matching-information-for-the-detected-refactorings)
 
 # General info
-RefactoringMiner is a library/API written in Java that can detect refactorings applied in the history of a Java project.
+RefactoringMiner is a library/API written in Java that can detect refactorings applied in the history of a project.
 Since version 3.0, RefactoringMiner can also generate Abstract Syntax Tree (AST) diff at **commit**, **pull request** and **commit range** levels.
 You can also use our tool to visualize the diffs in your browser.
 
@@ -85,6 +86,9 @@ You can also use our tool to visualize the diffs in your browser.
 Java methods migrated to Kotlin functions
 <img width="1920" height="1080" alt="JavaToKotlinDiff" src="https://github.com/user-attachments/assets/eeffafcd-b503-472a-b0c4-791fcb0a9472" />
 [A Java test file migrated to Kotlin](https://users.encs.concordia.ca/~nikolaos/diffGallery/MockWebServerTest.html)
+
+JavaScript file migrated to TypeScript
+<img width="1920" height="1080" alt="JavaScriptToTypeScript" src="https://github.com/user-attachments/assets/8671e26a-0f1b-49ed-86f6-0eab2cf98e01" />
 
 ### Refactoring-aware tooltips
 <img width="1920" height="1080" alt="RefactoringAwareTooltips" src="https://github.com/user-attachments/assets/e4e14c4c-a966-46e3-b4c7-6808a0506a9c" />
@@ -248,7 +252,11 @@ Our tool can match Javadoc and inline comments with formatting changes. You can 
 
 # Contributors
 * [Nikolaos Tsantalis](https://github.com/tsantalis): Core + APIs
-* [Tanzim Hossain Romel](https://github.com/thromel): MCP Server, AST diff top-down matcher performance improvement, Processing of inactive C++ preprocessor declarations, UI improvements (merge commit parent selection, `Viewed` toggle in PR diff)
+* [Tanzim Hossain Romel](https://github.com/thromel):
+   * MCP Server
+   * AST diff top-down matcher performance improvement
+   * C++ support: Processing of inactive C++ preprocessor declarations, C++ macro expansion source locations
+   * UI improvements: Merge commit parent selection, `Viewed` toggle in PR diff
 * [Moein Nasr](https://github.com/maorethians): Diff hunk dependency graph + [LLM-assisted code reviewing](https://github.com/maorethians/RefactoringMiner)
 * [Antonino Guarraci](https://github.com/antoguarr): C++ support with Eclipse CDT Parser
 * [Parsa Hejazi](https://github.com/Pogut): [RefactoringMiner Chrome MV3 extension](https://github.com/Pogut/refactoringminer-action-extension) + [RefactoringMiner PR GitHub Action](https://github.com/Pogut/refactoringminer-action-extension)

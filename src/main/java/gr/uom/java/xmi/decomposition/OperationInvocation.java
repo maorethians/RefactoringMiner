@@ -40,11 +40,13 @@ import org.eclipse.cdt.core.dom.ast.IASTFieldReference;
 import org.eclipse.cdt.core.dom.ast.IASTFunctionCallExpression;
 import org.eclipse.cdt.core.dom.ast.IASTIdExpression;
 import org.eclipse.cdt.core.dom.ast.IASTInitializerClause;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTArraySubscriptExpression;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTDeclSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionCallExpression;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTLambdaExpression;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTSimpleTypeConstructorExpression;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTUnaryExpression;
+import org.eclipse.cdt.internal.core.dom.parser.c.CASTArraySubscriptExpression;
 import org.eclipse.jdt.core.dom.ClassInstanceCreation;
 import org.eclipse.jdt.core.dom.CompilationUnit;
 import org.eclipse.jdt.core.dom.ConstructorInvocation;
@@ -81,10 +83,12 @@ import com.caoccao.javet.swc4j.ast.expr.Swc4jAstIdent;
 import com.caoccao.javet.swc4j.ast.expr.Swc4jAstIdentName;
 import com.caoccao.javet.swc4j.ast.expr.Swc4jAstMemberExpr;
 import com.caoccao.javet.swc4j.ast.expr.Swc4jAstParenExpr;
+import com.caoccao.javet.swc4j.ast.expr.Swc4jAstSuperPropExpr;
 import com.caoccao.javet.swc4j.ast.expr.Swc4jAstTsNonNullExpr;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstCallee;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstExpr;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstMemberProp;
+import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstSuperProp;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstTsType;
 import com.caoccao.javet.swc4j.ast.module.Swc4jAstImport;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsTypeParamInstantiation;
@@ -686,7 +690,8 @@ public class OperationInvocation extends AbstractCall {
 
 	private static boolean exactlyMatchingArgumentType(UMLType parameterType, UMLType argumentType) {
 		return parameterType.getClassType().equals(argumentType.toString()) || parameterType.toString().equals(argumentType.toString())
-				|| parameterType.toString().equals(argumentType.toString() + "&") || parameterType.toString().equals("const " + argumentType.toString() + "&") || parameterType.toString().equals("const " + argumentType.toString());
+				|| parameterType.toString().equals(argumentType.toString() + "&") || parameterType.toString().equals("const " + argumentType.toString() + "&") || parameterType.toString().equals("const " + argumentType.toString())
+				|| argumentType.toString().equals(parameterType.toString() + "&") || argumentType.toString().equals("const " + parameterType.toString() + "&") || argumentType.toString().equals("const " + parameterType.toString());
 	}
 
 	private static String handleNumber(String argument) {
@@ -727,10 +732,13 @@ public class OperationInvocation extends AbstractCall {
     	if(parameterType.toString().equals(type.toString() + "&") || parameterType.toString().equals("const " + type.toString() + "&") || parameterType.toString().equals("const " + type.toString())) {
     		return true;
     	}
+    	if(type.toString().equals(parameterType.toString() + "&") || type.toString().equals("const " + parameterType.toString() + "&") || type.toString().equals("const " + parameterType.toString())) {
+    		return true;
+    	}
     	if(type1.startsWith("int") && type2.startsWith("int")) {
     		return true;
     	}
-    	if(type2.equals("auto") || type2.equals("auto*")) {
+    	if(type2.equals("auto") || type2.equals("auto*") || type2.equals("auto&")) {
     		return true;
     	}
     	if(type2.equals("var")) {
@@ -1418,6 +1426,16 @@ public class OperationInvocation extends AbstractCall {
 		else if(callee instanceof Swc4jAstSuper superCall) {
 			this.methodName = "super";
 		}
+		else if(callee instanceof Swc4jAstSuperPropExpr superPropExpr) {
+			ISwc4jAstSuperProp superProp = superPropExpr.getProp();
+			String propertyName = null;
+			if(superProp instanceof Swc4jAstIdentName ident)
+				propertyName = ident.getSym();
+			else if(superProp instanceof Swc4jAstComputedPropName propName) {
+				propertyName = fileContent.substring(propName.getExpr().getSpan().getStart(), propName.getExpr().getSpan().getEnd());
+			}
+			this.methodName = "super." + propertyName;
+		}
 		else if(callee instanceof Swc4jAstFnExpr functionExpr) {
 			//f()() is used to call a function that returns another function
 			this.methodName = "";
@@ -1471,6 +1489,14 @@ public class OperationInvocation extends AbstractCall {
 		}
 		else if(nameExpr instanceof ICPPASTUnaryExpression unary) {
 			this.methodName = unary.getOperand().getRawSignature();
+		}
+		else if(nameExpr instanceof ICPPASTArraySubscriptExpression arraySubscriptExpr) {
+			IASTExpression baseArray = arraySubscriptExpr.getArrayExpression();
+			this.methodName = baseArray.getRawSignature();
+		}
+		else if(nameExpr instanceof CASTArraySubscriptExpression arraySubscriptExpr) {
+			IASTExpression baseArray = arraySubscriptExpr.getArrayExpression();
+			this.methodName = baseArray.getRawSignature();
 		}
 	}
 

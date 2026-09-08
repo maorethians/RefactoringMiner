@@ -29,6 +29,7 @@ import gr.uom.java.xmi.diff.UMLNamedExportDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportListDiff;
 import gr.uom.java.xmi.diff.UMLProblemDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLStaticAssertionDeclarationListDiff;
+import gr.uom.java.xmi.diff.UMLTypeAliasDiff;
 import gr.uom.java.xmi.diff.UMLTypeAliasListDiff;
 
 import org.refactoringminer.astDiff.models.OptimizationData;
@@ -179,9 +180,28 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 if(matched != null) {
                     mappingStore.addMapping(matched.first, matched.second);
                 }
+                com.github.gumtreediff.utils.Pair<Tree,Tree> storage_class_specifiers = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(),LANG1.STORAGE_CLASS_SPECIFIER,LANG2.STORAGE_CLASS_SPECIFIER);
+                if(storage_class_specifiers != null) {
+                    mappingStore.addMappingRecursively(storage_class_specifiers.first, storage_class_specifiers.second);
+                }
+                com.github.gumtreediff.utils.Pair<Tree,Tree> type_qualifiers = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(),LANG1.TYPE_QUALIFIER,LANG2.TYPE_QUALIFIER);
+                if(type_qualifiers != null) {
+                    mappingStore.addMappingRecursively(type_qualifiers.first, type_qualifiers.second);
+                }
+                com.github.gumtreediff.utils.Pair<Tree,Tree> initializer_lists = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(),LANG1.INITIALIZER_LIST,LANG2.INITIALIZER_LIST);
+                if(initializer_lists != null) {
+                    mappingStore.addMappingRecursively(initializer_lists.first, initializer_lists.second);
+                }
                 matched = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(), LANG1.SEMICOLON, LANG2.SEMICOLON);
                 if (matched != null) {
                     mappingStore.addMapping(matched.first,matched.second);
+                }
+            }
+            if (srcTypeDeclaration.getParent().getType().name.equals(LANG1.DECLARATION)
+                    && dstTypeDeclaration.getParent().getType().name.equals(LANG2.DECLARATION)) {
+                com.github.gumtreediff.utils.Pair<Tree,Tree> matched = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(),LANG1.SIMPLE_NAME,LANG2.SIMPLE_NAME);
+                if(matched != null) {
+                    mappingStore.addMapping(matched.first, matched.second);
                 }
             }
             if (srcTypeDeclaration.getParent().getType().name.equals(LANG1.TYPE_DEFINITION)
@@ -247,6 +267,9 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         if (matched != null)
             mappingStore.addMapping(matched.first,matched.second);
         matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.QUALIFIED_IDENTIFIER,LANG2.QUALIFIED_IDENTIFIER);
+        if (matched != null)
+            mappingStore.addMappingRecursively(matched.first,matched.second);
+        matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.VIRTUAL_SPECIFIER,LANG2.VIRTUAL_SPECIFIER);
         if (matched != null)
             mappingStore.addMappingRecursively(matched.first,matched.second);
         matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.TYPE_DECLARATION_KIND,LANG2.TYPE_DECLARATION_KIND);
@@ -561,7 +584,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                         if(srcStatement.getParent().getType().name.equals(LANG1.DECLARATION_LIST) && dstStatement.getParent().getType().name.equals(LANG2.DECLARATION_LIST) &&
                                 srcStatement.getParent().getParent().getType().name.equals(LANG1.PACKAGE_DECLARATION) && dstStatement.getParent().getParent().getType().name.equals(LANG2.PACKAGE_DECLARATION)) {
                             mappingStore.addMapping(srcStatement.getParent().getParent(), dstStatement.getParent().getParent());
-                            processNamespaceDefinitions(srcStatement.getParent().getParent(), dstStatement.getParent().getParent(), mappingStore, LANG1, LANG2);
+                            handleParentNamespace(srcStatement, dstStatement, mappingStore, LANG1, LANG1);
                         }
                         int index1 = srcStatement.getParent().getChildPosition(srcStatement);
                         int index2 = dstStatement.getParent().getChildPosition(dstStatement);
@@ -742,7 +765,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
 
     private void processParentLinkageSpecification(Tree parent1, Tree parent2, ExtendedMultiMappingStore mappingStore) {
         Pair<Tree, Tree> matched;
-        if(parent1.getType().name.equals(LANG1.DECLARATION_LIST) && parent2.getType().name.equals(LANG2.DECLARATION_LIST)) {
+        if(parent1 != null && parent2 != null && parent1.getType().name.equals(LANG1.DECLARATION_LIST) && parent2.getType().name.equals(LANG2.DECLARATION_LIST)) {
             mappingStore.addMappingRecursively(parent1, parent2);
             matched = Helpers.findPairOfType(parent1, parent2, LANG1.OPENING_CURLY_BRACE, LANG2.OPENING_CURLY_BRACE);
             if (matched != null) {
@@ -1207,7 +1230,14 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             }
         }
         boolean parentNamespaceContainsOnlyClass = childCount1 == childCount2 && childCount1 == 1;
-        boolean movedAndRenamed = baseClassDiff instanceof UMLClassRenameDiff && !baseClassDiff.getOriginalClass().getSourceFile().equals(baseClassDiff.getNextClass().getSourceFile()) && !parentNamespaceContainsOnlyClass;
+        boolean justRenamed = false;
+        if(baseClassDiff.getOriginalClass().getSourceFile().contains("/") && baseClassDiff.getNextClass().getSourceFile().contains("/")) {
+            String s1 = baseClassDiff.getOriginalClass().getSourceFile().substring(0, baseClassDiff.getOriginalClass().getSourceFile().lastIndexOf("/"));
+            String s2 = baseClassDiff.getNextClass().getSourceFile().substring(0, baseClassDiff.getNextClass().getSourceFile().lastIndexOf("/"));
+            if(s1.equals(s2))
+                justRenamed = true;
+        }
+        boolean movedAndRenamed = baseClassDiff instanceof UMLClassRenameDiff && !justRenamed && !baseClassDiff.getOriginalClass().getSourceFile().equals(baseClassDiff.getNextClass().getSourceFile()) && !parentNamespaceContainsOnlyClass;
         boolean moved = baseClassDiff instanceof UMLClassMoveDiff && !baseClassDiff.getOriginalClass().getSourceFile().equals(baseClassDiff.getNextClass().getSourceFile()) && !parentNamespaceContainsOnlyClass;
         boolean movedToNestedNameSpace = movedToNestedNamespace(baseClassDiff.getOriginalClass().getPackageName(), baseClassDiff.getNextClass().getPackageName());
         if(!moved && !movedAndRenamed && !movedToNestedNameSpace) {
@@ -1271,7 +1301,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         }
     }
 
-    private static void processNamespaceDefinitions(Tree parent1, Tree parent2, ExtendedMultiMappingStore mappingStore,
+    public static void processNamespaceDefinitions(Tree parent1, Tree parent2, ExtendedMultiMappingStore mappingStore,
             Constants LANG1, Constants LANG2) {
         if(parent1.getType().name.equals(LANG1.PACKAGE_DECLARATION) && parent2.getType().name.equals(LANG2.PACKAGE_DECLARATION)) {
             Pair<Tree,Tree> namespaces = Helpers.findPairOfType(parent1,parent2, LANG1.NAMESPACE, LANG2.NAMESPACE);
@@ -1527,6 +1557,25 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         for (org.apache.commons.lang3.tuple.Pair<UMLTypeAlias, UMLTypeAlias> typeAliasPair : typeAliasListDiff.getCommonTypeAliases()) {
             Tree srcSubTree = TreeUtilFunctions.findByLocationInfo(srcTree, typeAliasPair.getLeft().getLocationInfo(), LANG1);
             Tree dstSubTree = TreeUtilFunctions.findByLocationInfo(dstTree, typeAliasPair.getRight().getLocationInfo(), LANG2);
+            if (srcSubTree == null || dstSubTree == null) return;
+            mappingStore.addMappingRecursively(srcSubTree,dstSubTree);
+            if(srcSubTree.getParent().getType().name.equals(LANG1.TEMPLATE_DECLARATION) && dstSubTree.getParent().getType().name.equals(LANG2.TEMPLATE_DECLARATION)) {
+                mappingStore.addMapping(srcSubTree.getParent(), dstSubTree.getParent());
+                Pair<Tree, Tree> templates = Helpers.findPairOfType(srcSubTree.getParent(), dstSubTree.getParent(),LANG1.TEMPLATE_KEYWORD,LANG2.TEMPLATE_KEYWORD);
+                if (templates != null) {
+                    mappingStore.addMapping(templates.first,templates.second);
+                }
+                Pair<Tree, Tree> templateParameterLists = Helpers.findPairOfType(srcSubTree.getParent(), dstSubTree.getParent(),LANG1.TEMPLATE_PARAMETER_LIST,LANG2.TEMPLATE_PARAMETER_LIST);
+                if (templateParameterLists != null) {
+                    mappingStore.addMappingRecursively(templateParameterLists.first,templateParameterLists.second);
+                }
+            }
+        }
+        for (UMLTypeAliasDiff aliasDiff : typeAliasListDiff.getTypeAliasDiffs()) {
+            UMLTypeAlias alias1 = aliasDiff.getRemovedTypeAlias();
+            UMLTypeAlias alias2 = aliasDiff.getAddedTypeAlias();
+            Tree srcSubTree = TreeUtilFunctions.findByLocationInfo(srcTree, alias1.getLocationInfo(), LANG1);
+            Tree dstSubTree = TreeUtilFunctions.findByLocationInfo(dstTree, alias2.getLocationInfo(), LANG2);
             if (srcSubTree == null || dstSubTree == null) return;
             mappingStore.addMappingRecursively(srcSubTree,dstSubTree);
             if(srcSubTree.getParent().getType().name.equals(LANG1.TEMPLATE_DECLARATION) && dstSubTree.getParent().getType().name.equals(LANG2.TEMPLATE_DECLARATION)) {

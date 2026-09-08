@@ -27,7 +27,7 @@ public class Constants {
         return isNamedMethod(treeType) || treeType.equals(SECONDARY_CONSTRUCTOR) || treeType.equals(LEXICAL_DECLARATION) ||
                 treeType.equals(METHOD_SIGNATURE) || treeType.equals(FUNCTION_SIGNATURE) || treeType.equals(PAIR) ||
                 treeType.equals(FUNCTION_EXPRESSION) || treeType.equals(VARIABLE_DECLARATION) || treeType.equals(POINTER_DECLARATOR) ||
-                treeType.equals(FRIEND_DECLARATION);
+                treeType.equals(FRIEND_DECLARATION) || treeType.equals(INIT_DECLARATOR);
     }
 
     // TODO: FUNCTION_EXPRESSION may have a name, or it may be assigned to a variable which can act as a name (VARIABLE_DECLARATION)
@@ -184,7 +184,7 @@ public class Constants {
 			NUMBER_LITERAL = "number_literal";
 			LAMBDA_EXPRESSION = "lambda_expression";
 		}
-		else if(PathFileUtils.isCppFile(filePath)) {
+		else if(PathFileUtils.isCppFile(filePath) || PathFileUtils.isCFile(filePath)) {
 			CLASS_BLOCK = "field_declaration_list";
 			METHOD_DECLARATION = "function_definition";
 			SIMPLE_NAME = "identifier";
@@ -631,6 +631,7 @@ public class Constants {
     public final String ACCESS_SPECIFIER = "access_specifier";
     public final String TEMPLATE_DECLARATION = "template_declaration";
     public final String FIELD_INITIALIZER_LIST = "field_initializer_list";
+    public final String INITIALIZER_LIST = "initializer_list";
     public final String FIELD_INITIALIZER = "field_initializer";
     public final String REFERENCE_DECLARATOR = "reference_declarator";
     public final String ABSTRACT_REFERENCE_DECLARATOR = "abstract_reference_declarator";
@@ -677,4 +678,5 @@ public class Constants {
     public final String ATTRIBUTE_DECLARATION = "attribute_declaration";
     public final String LINKAGE_SPECIFICATION = "linkage_specification";
     public final String EXTERN = "extern";
+    public final String COMPOUND_LITERAL_EXPRESSION = "compound_literal_expression";
 }
