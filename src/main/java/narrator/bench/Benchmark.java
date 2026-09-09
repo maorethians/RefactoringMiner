@@ -7,9 +7,7 @@ import com.google.gson.JsonParser;
 import narrator.langchain.NarrativeProcessor;
 import narrator.langchain.NarrativeRunner;
 import narrator.langchain.prompt.ReviewPrompt;
-import org.refactoringminer.astDiff.graph.Node;
-import org.refactoringminer.astDiff.graph.NodeType;
-import org.refactoringminer.astDiff.graph.cluster.Cluster;
+import org.refactoringminer.astDiff.graph.ReviewNode;
 
 import javax.annotation.Nullable;
 import java.io.*;
@@ -169,15 +167,15 @@ public class Benchmark {
 
         Set<GeneratedCommentNodes> generatedCommentsNodes = new HashSet<>();
         for (ReviewPrompt.ReviewComment generatedComment : narrativeResult.comments()) {
-            List<Node> commentNodes = generatedComment.hunkIds().stream()
-                    .map(promptId -> findNode(narrativeResult.clusters(), promptId)).toList();
+            List<ReviewNode> commentNodes = generatedComment.hunkIds().stream()
+                    .map(promptId -> findNode(narrativeResult.nodes(), promptId)).toList();
             for (int i = 0; i < commentNodes.size(); i++) {
                 if (commentNodes.get(i) == null) {
                     System.out.println("Hallucinated id detected: " + generatedComment.hunkIds().get(i));
                 }
             }
 
-            Set<Node> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
+            Set<ReviewNode> validNodes = commentNodes.stream().filter(Objects::nonNull).collect(Collectors.toSet());
             if (validNodes.isEmpty()) {
                 System.out.println("No valid nodes found");
                 continue;
@@ -190,14 +188,14 @@ public class Benchmark {
             return null;
         }
 
-        Map<JsonObject, Set<Node>> groundTruthsOverlappingNodes = new HashMap<>();
+        Map<JsonObject, Set<ReviewNode>> groundTruthsOverlappingNodes = new HashMap<>();
         for (JsonObject groundTruthComment : groundTruthComments) {
             String path = groundTruthComment.get("path").getAsString();
             String side = groundTruthComment.get("side").getAsString();
             int line = groundTruthComment.get("submitted_line").getAsInt();
             Integer startLine = groundTruthComment.get("submitted_start_line").isJsonNull() ?
                     null : groundTruthComment.get("submitted_start_line").getAsInt();
-            Set<Node> overlappingNodes = findNodes(narrativeResult.clusters(), side, path, line, startLine);
+            Set<ReviewNode> overlappingNodes = findNodes(narrativeResult.nodes(), side, path, line, startLine);
             if (overlappingNodes.isEmpty()) {
                 System.out.println("No overlapping nodes found");
                 continue;
@@ -211,9 +209,9 @@ public class Benchmark {
         }
 
         Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
-        for (Map.Entry<JsonObject, Set<Node>> groundTruthOverlappingNodes : groundTruthsOverlappingNodes.entrySet()) {
+        for (Map.Entry<JsonObject, Set<ReviewNode>> groundTruthOverlappingNodes : groundTruthsOverlappingNodes.entrySet()) {
             JsonObject groundTruth = groundTruthOverlappingNodes.getKey();
-            Set<Node> overlappingNodes = groundTruthOverlappingNodes.getValue();
+            Set<ReviewNode> overlappingNodes = groundTruthOverlappingNodes.getValue();
             groundTruthGeneratedComments.put(groundTruth, generatedCommentsNodes.stream()
                     .filter(generatedCommentNodes -> generatedCommentNodes.nodes().stream().anyMatch(overlappingNodes::contains))
                     .collect(Collectors.toSet()));
@@ -224,13 +222,12 @@ public class Benchmark {
         double recall = (double) coveredGroundTruth / groundTruthGeneratedComments.size();
         System.out.println("recall: " + recall);
 
-        Set<Node> allHunkNodes = narrativeResult.clusters().stream()
-                .map(cluster -> cluster.getGraph().vertexSet().stream().filter(Node::isBase).collect(Collectors.toSet()))
+        Set<ReviewNode> allHunkNodes = narrativeResult.nodes().stream().filter(ReviewNode::isBase)
+                .collect(Collectors.toSet());
+        Set<ReviewNode> coveredHunkNodes = generatedCommentsNodes.stream()
+                .map(generatedCommentNodes -> generatedCommentNodes.nodes.stream().filter(ReviewNode::isBase).collect(Collectors.toSet()))
                 .flatMap(Set::stream).collect(Collectors.toSet());
-        Set<Node> coveredHunkNodes = generatedCommentsNodes.stream()
-                .map(generatedCommentNodes -> generatedCommentNodes.nodes.stream().filter(Node::isBase).collect(Collectors.toSet()))
-                .flatMap(Set::stream).collect(Collectors.toSet());
-        Set<Node> uncoveredHunkNodes = allHunkNodes.stream().filter(hunkNode -> !coveredHunkNodes.contains(hunkNode))
+        Set<ReviewNode> uncoveredHunkNodes = allHunkNodes.stream().filter(hunkNode -> !coveredHunkNodes.contains(hunkNode))
                 .collect(Collectors.toSet());
 
         TokenUsage tokens = readLog();
@@ -288,15 +285,15 @@ public class Benchmark {
     }
 
     @Nullable
-    private static Node findNode(List<Cluster> clusters, String promptId) {
-        return clusters.stream()
-                .map(cluster -> cluster.findNode(promptId)).filter(Objects::nonNull).findFirst().orElse(null);
+    private static ReviewNode findNode(List<ReviewNode> nodes, String promptId) {
+        return nodes.stream()
+                .filter(node -> node.getPromptId().equals(promptId)).findFirst().orElse(null);
     }
 
-    private static Set<Node> findNodes(List<Cluster> clusters, String side, String path, int line, @Nullable Integer startLine) {
-        return clusters.stream()
-                .map(cluster -> cluster.findNodes(side, path, line, startLine)).flatMap(Set::stream)
-                .filter(node -> !node.getNodeType().equals(NodeType.LOCATION_CONTEXT))
+    private static Set<ReviewNode> findNodes(List<ReviewNode> nodes, String side, String path, int line, @Nullable Integer startLine) {
+        return nodes.stream()
+                .filter(ReviewNode::isMatchable)
+                .filter(node -> node.overlapLine(path, side, line, startLine))
                 .collect(Collectors.toSet());
     }
 
@@ -340,10 +337,10 @@ public class Benchmark {
 
     private record GroundTruthGeneratedCommentsNodes(JsonObject groundTruth, List<StringifiedGeneratedCommentNodes> generatedCommentsNodes) {}
 
-    private record GeneratedCommentNodes(String comment, Set<Node> nodes) {
+    private record GeneratedCommentNodes(String comment, Set<ReviewNode> nodes) {
         public StringifiedGeneratedCommentNodes stringify() {
             JsonArray stringifiedNodes = new JsonArray();
-            for (Node node : nodes) {
+            for (ReviewNode node : nodes) {
                 stringifiedNodes.add(node.stringify());
             }
 

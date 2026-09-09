@@ -17,6 +17,27 @@ public class ReviewPrompt {
   private static final Pattern OPTIONAL_PREFIX_ID_PATTERN = Pattern.compile(
           "(?<![\\p{Alnum}#])" + Pattern.quote(Node.PROMPT_ID_PREFIX) + "?" + Node.PROMPT_ID_BODY_REGEX);
 
+  private String specification(boolean rawDiff) {
+    return rawDiff ? rawDiffSpecification() : chapterSpecification();
+  }
+
+  private String rawDiffSpecification() {
+    StringBuilder spec = new StringBuilder();
+
+    spec.append("### CHANGE REPRESENTATION\n")
+            .append("The chapter is a set of single diffs taken from the unified diff of the two revisions. ")
+            .append("Each diff is one hunk: a contiguous region of one file that changed, together with the surrounding lines the diff carries for context.\n")
+            .append("- Every <diff> element holds exactly one hunk, verbatim, starting with its `@@ -<src>,<len> +<dst>,<len> @@` header, ")
+            .append("which gives the line numbers the hunk covers in each revision.\n")
+            .append("- Inside a hunk, a line starting with `-` was removed from the source revision, a line starting with `+` was added in the destination revision, ")
+            .append("and a line starting with a space is unchanged context. Context is orientation, not additional change.\n")
+            .append("- Each <diff> carries file=\"<path>\", the file it belongs to, which the hunk itself does not name, ")
+            .append("and id=\"#XXXXX\", which identifies it uniquely within the pull request.\n")
+            .append("The diffs, and the chapters that group them, appear in the order the unified diff lists them.\n\n");
+
+    return spec.toString();
+  }
+
   private String chapterSpecification() {
     StringBuilder spec = new StringBuilder();
 
@@ -39,16 +60,17 @@ public class ReviewPrompt {
   }
 
   // TODO: our representation must be the most effective one for understanding the changes. Are we using it at the highest level of effectiveness?
-  public String chapterUnderstanding(String content, List<String> dependencyUnderstandings) {
+  public String chapterUnderstanding(String content, List<String> dependencyUnderstandings, boolean rawDiff) {
     StringBuilder prompt = new StringBuilder();
 
     prompt.append("You are a Principal Software Engineer specializing in complex system architecture. ")
-            .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
+            .append(rawDiff ? "The changes in a pull request have been decomposed into a sequence of chapters. "
+                    : "The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
             .append("Your objective is to architect a high-fidelity technical map of the changes within a single chapter. ")
             .append("This map must serve as the definitive systemic ground truth for a subsequent rigorous audit")
             .append("—meaning you must capture the deep semantic intent and architectural implications of every change, rather than providing a surface-level summary.\n\n");
 
-    prompt.append(chapterSpecification());
+    prompt.append(specification(rawDiff));
 
     prompt.append("### CURRENT CHAPTER\n")
             .append("The following block contains the changes that make up the current chapter, in the representation described above. This is your primary source of truth for the technical mapping task:\n")
@@ -84,14 +106,14 @@ public class ReviewPrompt {
   }
 
   // TODO: is checking against mapping is the effective approach?
-  public String chapterResult(String content, String understanding) {
+  public String chapterResult(String content, String understanding, boolean rawDiff) {
     StringBuilder prompt = new StringBuilder();
 
     prompt.append("You are a Principal Software Engineer and Lead Technical Auditor known for meticulous rigor and a zero-tolerance policy for low-signal noise. ")
-            .append("The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
+            .append("The changes in a pull request have been decomposed into a sequence of chapters. ")
             .append("Your objective is to conduct a high-signal audit of a single chapter, utilizing a pre-synthesized technical map to identify critical flaws, systemic risks, and architectural regressions.\n\n");
 
-    prompt.append(chapterSpecification());
+    prompt.append(specification(rawDiff));
 
     prompt.append("### CURRENT CHAPTER\n")
             .append("The following block contains the changes that make up this chapter, in the representation described above. This serves as your primary evidentiary source for the audit:\n")

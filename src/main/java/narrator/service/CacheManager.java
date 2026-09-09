@@ -4,6 +4,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.List;
 import narrator.mcp.html.NarrativeHtmlGenerator;
+import org.refactoringminer.astDiff.graph.RawNode;
 import org.refactoringminer.astDiff.graph.cluster.Cluster;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 import org.refactoringminer.astDiff.graph.cluster.traverse.TraversalPattern;
@@ -13,7 +14,8 @@ public class CacheManager {
     private final Map<String, TraversalPattern> hierarchyCache = new ConcurrentHashMap<>();
 
     private final Map<String, NarrativeHtmlGenerator> htmlGeneratorsCache = new ConcurrentHashMap<>();
-    private final Map<String, List<Narrator.ChapterUnit>> rawDiffsCache = new ConcurrentHashMap<>();
+    private final Map<String, List<RawNode>> rawNodesCache = new ConcurrentHashMap<>();
+    private final Map<String, List<Narrator.ChapterUnit>> rawDiffChaptersCache = new ConcurrentHashMap<>();
 
     public List<Cluster> getClusters(String url) {
         return clustersCache.get(url);
@@ -42,12 +44,20 @@ public class CacheManager {
         htmlGeneratorsCache.put(url, generator);
     }
 
-    public List<Narrator.ChapterUnit> getRawDiffChunks(String url) {
-        return rawDiffsCache.get(url);
+    public List<RawNode> getRawNodes(String url) {
+        return rawNodesCache.get(url);
     }
 
-    public void putRawDiffChunks(String url, List<Narrator.ChapterUnit> units) {
-        rawDiffsCache.put(url, units);
+    public void putRawNodes(String url, List<RawNode> rawNodes) {
+        rawNodesCache.put(url, rawNodes);
+    }
+
+    public List<Narrator.ChapterUnit> getRawDiffChapters(String url) {
+        return rawDiffChaptersCache.get(url);
+    }
+
+    public void putRawDiffChapters(String url, List<Narrator.ChapterUnit> chapters) {
+        rawDiffChaptersCache.put(url, chapters);
     }
 
     public void clear() {

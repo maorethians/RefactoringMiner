@@ -55,11 +55,11 @@ public class LangChainClient {
         return model.generate(prompt);
     }
 
-    public ReviewPrompt.ParsedResponse processChapter(String content, List<String> dependencyUnderstandings) {
+    public ReviewPrompt.ParsedResponse processChapter(String content, List<String> dependencyUnderstandings, boolean rawDiff) {
         System.out.println("understanding");
-        String understanding = this.model.generate(this.prompt.chapterUnderstanding(content, dependencyUnderstandings));
+        String understanding = this.model.generate(this.prompt.chapterUnderstanding(content, dependencyUnderstandings, rawDiff));
         System.out.println("result");
-        String result = this.model.generate(this.prompt.chapterResult(content, understanding));
+        String result = this.model.generate(this.prompt.chapterResult(content, understanding, rawDiff));
         return new ReviewPrompt.ParsedResponse(understanding, result.replace(ReviewPrompt.END_OF_AUDIT, "").trim());
     }
 

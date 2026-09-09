@@ -5,6 +5,8 @@ import narrator.mcp.html.NarrativeHtmlGenerator;
 import org.jgrapht.Graph;
 import org.refactoringminer.astDiff.graph.Edge;
 import org.refactoringminer.astDiff.graph.Node;
+import org.refactoringminer.astDiff.graph.RawNode;
+import org.refactoringminer.astDiff.graph.ReviewNode;
 import org.refactoringminer.astDiff.graph.cluster.Cluster;
 import org.refactoringminer.astDiff.graph.cluster.Clusterer;
 import org.refactoringminer.astDiff.graph.cluster.traverse.*;
@@ -18,6 +20,8 @@ import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public class NarrativeService {
     private static final Logger logger = LoggerFactory.getLogger(NarrativeService.class);
@@ -40,17 +44,26 @@ public class NarrativeService {
     }
 
     public List<Narrator.ChapterUnit> getFlatChapters(String url, GrainLevel level) throws Exception {
+        if (level == GrainLevel.RAW_DIFF) {
+            return getRawDiffChapters(url);
+        }
+
         TraversalPattern root = cacheManager.getHierarchy(getHierarchyCacheKey(url));
         if (root == null) {
             throw new IllegalStateException("No narrative initialized for this URL: " + url);
         }
 
-        Narrator narrator = root.getNarrator();
+        return root.getNarrator().getFlatChapters(level);
+    }
+
+    public List<ReviewNode> getReviewNodes(String url, GrainLevel level) throws Exception {
         if (level == GrainLevel.RAW_DIFF) {
-            return getRawDiffChunks(url, narrator);
-        } else {
-            return narrator.getFlatChapters(level);
+            return new ArrayList<>(getOrComputeRawNodes(url));
         }
+
+        return getOrComputeClusters(url).stream()
+                .flatMap(cluster -> cluster.getGraph().vertexSet().stream())
+                .collect(Collectors.toList());
     }
 
     public void updateHtmlPage(String url, GrainLevel level, int progress) {
@@ -113,18 +126,44 @@ public class NarrativeService {
         }
     }
 
-    private List<Narrator.ChapterUnit> getRawDiffChunks(String url, Narrator narrator) throws Exception {
-        List<Narrator.ChapterUnit> cached = cacheManager.getRawDiffChunks(url);
+    public List<RawNode> getOrComputeRawNodes(String url) throws Exception {
+        List<RawNode> cached = cacheManager.getRawNodes(url);
         if (cached != null) {
             return cached;
         }
 
-        List<Narrator.ChapterUnit> fileChapters = narrator.getFlatChapters(GrainLevel.SINGLE);
-        int numChunks = fileChapters.size();
-        if (numChunks == 0) {
+        List<RawNode> rawNodes = RawNode.parse(fetchRawDiff(url));
+        cacheManager.putRawNodes(url, rawNodes);
+        return rawNodes;
+    }
+
+    private List<Narrator.ChapterUnit> getRawDiffChapters(String url) throws Exception {
+        List<Narrator.ChapterUnit> cached = cacheManager.getRawDiffChapters(url);
+        if (cached != null) {
+            return cached;
+        }
+
+        List<RawNode> rawNodes = getOrComputeRawNodes(url);
+        if (rawNodes.isEmpty()) {
             return Collections.emptyList();
         }
 
+        List<String> prompts = rawNodes.stream().map(RawNode::prompt).toList();
+        List<Narrator.ChapterUnit> chapters = new ArrayList<>();
+        for (List<Integer> split : Splitter.createBalancedSplits(prompts)) {
+            Narrator.ChapterUnit chapter = new Narrator.ChapterUnit();
+            for (Integer index : split) {
+                chapter.append(prompts.get(index));
+                chapter.addMains(Set.of(rawNodes.get(index)));
+            }
+            chapters.add(chapter);
+        }
+
+        cacheManager.putRawDiffChapters(url, chapters);
+        return chapters;
+    }
+
+    private String fetchRawDiff(String url) throws Exception {
         String rawDiffUrl = url;
         if ((url.contains("/pull/") || url.contains("/pr/") || url.contains("/commit/") || url.contains("/compare/")) && !url.endsWith(".diff")) {
             rawDiffUrl = url + ".diff";
@@ -141,33 +180,8 @@ public class NarrativeService {
         if (response.statusCode() != 200) {
             throw new Exception("Failed to fetch raw diff from " + rawDiffUrl + ". Status code: " + response.statusCode());
         }
-        String diffContent = response.body();
 
-        String[] lines = diffContent.split("\n");
-        int totalLines = lines.length;
-        List<String> chunks = new ArrayList<>();
-
-        int baseSize = totalLines / numChunks;
-        int remainder = totalLines % numChunks;
-        int currentLine = 0;
-
-        for (int i = 0; i < numChunks; i++) {
-            int chunkSize = baseSize + (i < remainder ? 1 : 0);
-            StringBuilder chunkBuilder = new StringBuilder();
-            for (int j = 0; j < chunkSize && currentLine < totalLines; j++) {
-                chunkBuilder.append(lines[currentLine++]).append("\n");
-            }
-            chunks.add(chunkBuilder.toString());
-        }
-
-        List<Narrator.ChapterUnit> units = chunks.stream().map(chunk -> {
-            Narrator.ChapterUnit chu = new Narrator.ChapterUnit();
-            chu.append(chunk);
-            return chu;
-        }).toList();
-
-        cacheManager.putRawDiffChunks(url, units);
-        return units;
+        return response.body();
     }
 
     private String getHierarchyCacheKey(String url) {

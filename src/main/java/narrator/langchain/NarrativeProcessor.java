@@ -2,7 +2,7 @@ package narrator.langchain;
 
 import narrator.langchain.prompt.ReviewPrompt;
 import narrator.service.NarrativeService;
-import org.refactoringminer.astDiff.graph.cluster.Cluster;
+import org.refactoringminer.astDiff.graph.ReviewNode;
 import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
@@ -20,9 +20,11 @@ public class NarrativeProcessor {
     public NarrativeProcessResult process(NarrativeRequest request) throws Exception {
         String url = request.getUrl();
         GrainLevel level = request.getGrainLevel();
+        boolean rawDiff = level == GrainLevel.RAW_DIFF;
 
-        // 1. Initialize and get chapters
-        narrativeService.initializeNarrative(url);
+        if (!rawDiff) {
+            narrativeService.initializeNarrative(url);
+        }
         List<Narrator.ChapterUnit> chapters = narrativeService.getFlatChapters(url, level);
 
         NarrativeState state = new NarrativeState();
@@ -34,7 +36,7 @@ public class NarrativeProcessor {
 
             String content = chapter.getContent();
             List<String> dependencyUnderstandings = state.getDependencyUnderstandings(chapter);
-            ReviewPrompt.ParsedResponse chapterResponse = langchainClient.processChapter(content, dependencyUnderstandings);
+            ReviewPrompt.ParsedResponse chapterResponse = langchainClient.processChapter(content, dependencyUnderstandings, rawDiff);
 
             state.setUnderstanding(chapter, chapterResponse.understanding());
             state.setResult(chapter, chapterResponse.result());
@@ -42,10 +44,10 @@ public class NarrativeProcessor {
 
         // 3. Final compilation
         List<ReviewPrompt.ReviewComment> finalResult = langchainClient.compileResults(state.getResults(), state.getUnderstandings());
-        return new NarrativeProcessResult(narrativeService.getOrComputeClusters(url), finalResult, state);
+        return new NarrativeProcessResult(narrativeService.getReviewNodes(url, level), finalResult, state);
     }
 
-    public record NarrativeProcessResult(List<Cluster> clusters, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
+    public record NarrativeProcessResult(List<ReviewNode> nodes, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
         public String content() {
             return String.join("\n\n", comments.stream()
                     .map(comment -> String.join(", ", comment.hunkIds()) + ": " + comment.text()).toList());

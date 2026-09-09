@@ -1,6 +1,6 @@
 package narrator.langchain;
 
-import org.refactoringminer.astDiff.graph.Node;
+import org.refactoringminer.astDiff.graph.ReviewNode;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
 import java.util.*;
@@ -20,7 +20,7 @@ public class NarrativeState {
     }
 
     public List<String> getDependencyUnderstandings(Narrator.ChapterUnit chapter) {
-        Set<Node> subjectSides = chapter.getSides();
+        Set<ReviewNode> subjectSides = chapter.getSides();
         return chapterUnderstanding.entrySet().stream()
                 .filter(entry -> subjectSides.stream().anyMatch(side -> entry.getKey().getMains().contains(side)))
                 .map(Map.Entry::getValue).toList();
