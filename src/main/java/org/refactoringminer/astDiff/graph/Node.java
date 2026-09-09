@@ -29,9 +29,8 @@ public class Node {
   private static final String ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
   static final int PROMPT_ID_LENGTH = 5;
   static final int MAX_PROMPT_ID_LENGTH = 12;
-  private static final String PROMPT_ID_PREFIX = "#";
-  public static final Pattern PROMPT_ID_PATTERN = Pattern.compile(
-      PROMPT_ID_PREFIX + "[0-9A-HJKMNP-TV-Z]{" + PROMPT_ID_LENGTH + ",}(?![0-9A-Z])");
+  public static final String PROMPT_ID_PREFIX = "#";
+  public static final String PROMPT_ID_BODY_REGEX = "[0-9A-HJKMNP-TV-Z]{" + PROMPT_ID_LENGTH + ",}(?![0-9A-Z])";
 
   private final String id;
   private String promptId;
