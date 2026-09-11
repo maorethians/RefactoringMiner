@@ -55,25 +55,29 @@ public class LangChainClient {
         return model.generate(prompt);
     }
 
-    public ReviewPrompt.ParsedResponse processChapter(String content, List<String> dependencyUnderstandings, boolean rawDiff) {
-        System.out.println("understanding");
-        String understanding = this.model.generate(this.prompt.chapterUnderstanding(content, dependencyUnderstandings, rawDiff));
-        System.out.println("result");
-        String result = this.model.generate(this.prompt.chapterResult(content, understanding, rawDiff));
-        return new ReviewPrompt.ParsedResponse(understanding, result.replace(ReviewPrompt.END_OF_AUDIT, "").trim());
+    public List<ReviewPrompt.Identifier> generateIdentifiers(String content, List<ReviewPrompt.Identifier> dependencyIdentifiers, boolean rawDiff) {
+        System.out.println("identifiers");
+        String identifiers = this.model.generate(this.prompt.chapterIdentifiers(content, dependencyIdentifiers, rawDiff));
+        return ReviewPrompt.parseIdentifiers(identifiers.replace(ReviewPrompt.END_OF_ENTRIES, ""));
     }
 
-    public List<ReviewPrompt.ReviewComment> compileResults(List<String> results, List<String> understandings) {
+    public String reviewChapter(String content, List<ReviewPrompt.Identifier> dependencyIdentifiers, boolean rawDiff) {
+        System.out.println("result");
+        String result = this.model.generate(this.prompt.chapterResult(content, dependencyIdentifiers, rawDiff));
+        return result.replace(ReviewPrompt.END_OF_AUDIT, "").trim();
+    }
+
+    public List<ReviewPrompt.ReviewComment> compileResults(List<String> results) {
         List<ReviewPrompt.ReviewComment> finalResult = new ArrayList<>();
 
-        List<List<Integer>> splits = Splitter.createBalancedSplits(understandings);
+        List<List<Integer>> splits = Splitter.createBalancedSplits(results);
         for (int i = 0; i < splits.size(); i++) {
             List<Integer> split = splits.get(i);
 
             List<ReviewPrompt.ReviewComment> parsedSplitResult = null;
             while (parsedSplitResult == null) {
                 System.out.println("Synthesizing final result part " + (i + 1) + " of " + splits.size());
-                String splitResult = model.generate(this.prompt.result(split.stream().map(results::get).toList(), split.stream().map(understandings::get).toList()));
+                String splitResult = model.generate(this.prompt.result(split.stream().map(results::get).toList()));
                 parsedSplitResult = ReviewPrompt.parseResult(splitResult);
             }
 

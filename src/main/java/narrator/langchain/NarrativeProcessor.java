@@ -6,7 +6,9 @@ import org.refactoringminer.astDiff.graph.ReviewNode;
 import org.refactoringminer.astDiff.graph.cluster.traverse.GrainLevel;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 public class NarrativeProcessor {
     private final NarrativeService narrativeService;
@@ -34,17 +36,60 @@ public class NarrativeProcessor {
             System.out.println(i + 1 + "/" + chapters.size());
             Narrator.ChapterUnit chapter = chapters.get(i);
 
-            String content = chapter.getContent();
-            List<String> dependencyUnderstandings = state.getDependencyUnderstandings(chapter);
-            ReviewPrompt.ParsedResponse chapterResponse = langchainClient.processChapter(content, dependencyUnderstandings, rawDiff);
+            // Identifiers are produced only for chapters some later chapter actually depends on
+            List<Integer> dependencies = dependencyIndices(i, chapters);
+            for (Integer dependency : dependencies) {
+                ensureIdentifiers(dependency, chapters, state, rawDiff);
+            }
 
-            state.setUnderstanding(chapter, chapterResponse.understanding());
-            state.setResult(chapter, chapterResponse.result());
+            List<ReviewPrompt.Identifier> dependencyIdentifiers = dependencies.stream()
+                    .flatMap(dependency -> state.getIdentifiers(chapters.get(dependency)).stream()).toList();
+            state.setResult(chapter, langchainClient.reviewChapter(chapter.getContent(), dependencyIdentifiers, rawDiff));
         }
 
         // 3. Final compilation
-        List<ReviewPrompt.ReviewComment> finalResult = langchainClient.compileResults(state.getResults(), state.getUnderstandings());
+        List<ReviewPrompt.ReviewComment> finalResult = langchainClient.compileResults(state.getResults());
         return new NarrativeProcessResult(narrativeService.getReviewNodes(url, level), finalResult, state);
+    }
+
+
+
+    // The chapters preceding index that own a node this chapter references. Raw diff chapters carry no
+    // sides, so this is always empty there and no identifiers are ever produced for them.
+    private static List<Integer> dependencyIndices(int index, List<Narrator.ChapterUnit> chapters) {
+        Set<ReviewNode> sides = chapters.get(index).getSides();
+        if (sides.isEmpty()) {
+            return List.of();
+        }
+
+        List<Integer> dependencies = new ArrayList<>();
+        for (int i = 0; i < index; i++) {
+            Narrator.ChapterUnit candidate = chapters.get(i);
+            if (sides.stream().anyMatch(side -> candidate.getMains().contains(side))) {
+                dependencies.add(i);
+            }
+        }
+
+        return dependencies;
+    }
+
+    // A dependency's own dependencies are resolved first, so its identifiers are built with the same
+    // context they would have had when every chapter was indexed up front. Only lower indices are ever
+    // visited, so the recursion strictly descends and cannot cycle.
+    private void ensureIdentifiers(int index, List<Narrator.ChapterUnit> chapters, NarrativeState state, boolean rawDiff) {
+        Narrator.ChapterUnit chapter = chapters.get(index);
+        if (state.hasIdentifiers(chapter)) {
+            return;
+        }
+
+        List<Integer> dependencies = dependencyIndices(index, chapters);
+        for (Integer dependency : dependencies) {
+            ensureIdentifiers(dependency, chapters, state, rawDiff);
+        }
+
+        List<ReviewPrompt.Identifier> dependencyIdentifiers = dependencies.stream()
+                .flatMap(dependency -> state.getIdentifiers(chapters.get(dependency)).stream()).toList();
+        state.setIdentifiers(chapter, langchainClient.generateIdentifiers(chapter.getContent(), dependencyIdentifiers, rawDiff));
     }
 
     public record NarrativeProcessResult(List<ReviewNode> nodes, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {

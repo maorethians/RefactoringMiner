@@ -11,11 +11,17 @@ import org.refactoringminer.astDiff.graph.Node;
 public class ReviewPrompt {
   // This is necessary for terminating the agent and preventing it from falling in a loop
   public static String END_OF_AUDIT = "### END OF AUDIT";
+  public static String END_OF_ENTRIES = "### END OF ENTRIES";
 
   private static final Pattern ALPHANUMERIC_PATTERN = Pattern.compile("[\\p{Alnum}]");
 
   private static final Pattern OPTIONAL_PREFIX_ID_PATTERN = Pattern.compile(
           "(?<![\\p{Alnum}#])" + Pattern.quote(Node.PROMPT_ID_PREFIX) + "?" + Node.PROMPT_ID_BODY_REGEX);
+
+  private static final List<String> IDENTIFIER_FIELDS = List.of("IDENTIFIER", "KIND", "BEFORE", "AFTER", "CHANGE");
+
+  private static final Pattern IDENTIFIER_FIELD_PATTERN = Pattern.compile(
+          "^[\\s\\-*]*(" + String.join("|", IDENTIFIER_FIELDS) + ")\\**\\s*:\\s*(.*)$", Pattern.CASE_INSENSITIVE);
 
   private String specification(boolean rawDiff) {
     return rawDiff ? rawDiffSpecification() : chapterSpecification();
@@ -59,126 +65,177 @@ public class ReviewPrompt {
     return spec.toString();
   }
 
-  // TODO: our representation must be the most effective one for understanding the changes. Are we using it at the highest level of effectiveness?
-  public String chapterUnderstanding(String content, List<String> dependencyUnderstandings, boolean rawDiff) {
+  public String chapterIdentifiers(String content, List<Identifier> dependencyIdentifiers, boolean rawDiff) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Principal Software Engineer specializing in complex system architecture. ")
+    prompt.append("You are a Software Engineer building a symbol-level index of a code change. ")
             .append(rawDiff ? "The changes in a pull request have been decomposed into a sequence of chapters. "
                     : "The changes in a pull request have been decomposed into a sequence of chapters, ordered by their dependency graph. ")
-            .append("Your objective is to architect a high-fidelity technical map of the changes within a single chapter. ")
-            .append("This map must serve as the definitive systemic ground truth for a subsequent rigorous audit")
-            .append("—meaning you must capture the deep semantic intent and architectural implications of every change, rather than providing a surface-level summary.\n\n");
+            .append("Later chapters reference the identifiers this chapter changes, but never see its code. ")
+            .append("Your index stands in for that code: for every identifier it must say what that identifier was before this chapter, what it is after, and how it changed.\n\n");
 
     prompt.append(specification(rawDiff));
 
-    prompt.append("### CURRENT CHAPTER\n")
-            .append("The following block contains the changes that make up the current chapter, in the representation described above. This is your primary source of truth for the technical mapping task:\n")
-            .append(content).append("\n\n");
-
-    if (dependencyUnderstandings != null && !dependencyUnderstandings.isEmpty()) {
-      prompt.append("### DEPENDENCY CONTEXT\n")
-              .append("To ensure systemic continuity, you are provided with the technical mappings from preceding chapters. ")
-              .append("These establish the architectural baseline and dependency chain necessary to resolve identifier references and interpret the systemic intent of the current chapter:\n")
-              .append(String.join("\n", dependencyUnderstandings.stream().map(dependencyUnderstanding -> "<technical_mapping>\n" + dependencyUnderstanding + "\n</technical_mapping>").toList()))
+    if (dependencyIdentifiers != null && !dependencyIdentifiers.isEmpty()) {
+      prompt.append("### KNOWN IDENTIFIERS\n")
+              .append("Other chapters changed the identifiers below, and they are already in the index. This chapter references them but does not declare them. ")
+              .append("Use them to resolve what this chapter calls or reads. They are context, not material: they are not yours to index again.\n")
+              .append(renderKnownIdentifiers(dependencyIdentifiers))
               .append("\n\n");
     }
 
-    prompt.append("### YOUR TASK\n");
-    prompt.append("#### Construction of the High-Fidelity Technical Map\n")
-            .append("You must architect a comprehensive technical map of this chapter. This map is the definitive systemic ground truth for a subsequent high-rigor audit; ")
-            .append("any omission or ambiguity here will directly compromise the quality of the final review. ")
-            .append("Your goal is to eliminate all surface-level interpretation and replace it with deep architectural deduction. ")
-            .append("Zero tolerance for generic summaries. Avoid phrases like 'improved performance' or 'cleaned up code.' Instead, provide evidence-based technical details (e.g., 'replaced linear search with a binary search to reduce lookup time from O(n) to O(log n)').\n")
-            .append("STRICT ANCHORING: Every mapping MUST be anchored to one or more specific change IDs.\n");
-    if (dependencyUnderstandings != null && !dependencyUnderstandings.isEmpty()) {
-      prompt.append("CRITICAL: Use the provided Dependency Context as your baseline. You must explicitly bridge the gap between previous chapters and this one, resolving identifier references and documenting how these changes evolve the system state established in preceding mappings.\n");
-    }
-    prompt.append("Your mapping MUST be structured into two rigorous dimensions:\n")
-            .append("1. SYSTEMIC IDENTIFIER TRACKING: Provide a precise map of every modified or introduced identifier (classes, methods, variables). For each, you must document:\n")
-            .append("   - THE DELTA: Exactly how the role or responsibility has changed.\n")
-            .append("   - ARCHITECTURAL IMPACT: The ripple effect this change has on dependent components and systemic interactions.\n")
-            .append("2. LOGIC & INTENT DEDUCTION: Perform a deep trace of the logic flow to deduce the exact intended behavior. You must provide:\n")
-            .append("   - TECHNICAL JUSTIFICATION: The specific technical reason for this implementation path.\n")
-            .append("   - BEHAVIORAL RESULT: The precise resulting systemic behavior.\n");
+    prompt.append("### CURRENT CHAPTER\n")
+            .append("The changes that make up the current chapter, in the representation described above. Every entry you write comes from here:\n")
+            .append(content).append("\n\n");
+
+    prompt.append("### YOUR TASK\n")
+            .append("Index every identifier this chapter changes—types, methods, fields, parameters, and variables. ")
+            .append("An identifier is changed when this chapter introduces it, removes it, moves it, or alters what it does or what it offers. ")
+            .append("Altered behaviour counts even when the declaration itself is untouched. An identifier the chapter only mentions is not changed and gets no entry.\n")
+            .append("Read the change blocks one by one, name the identifier each one changes, and write that identifier's entry.\n\n");
+
+    prompt.append("### OUTPUT FORMAT\n")
+            .append("Write each entry as exactly these five lines, in this order:\n")
+            .append("IDENTIFIER: the name, alone\n")
+            .append("KIND: type, method, field, parameter, or variable\n")
+            .append("BEFORE: what it was and what it offered before this chapter, or `did not exist`\n")
+            .append("AFTER: what it is and what it offers after this chapter, or `removed`\n")
+            .append("CHANGE: the transition between the two—introduced, removed, renamed (give both names), moved (give where from and where to), or what specifically differs\n")
+            .append("For a method, BEFORE and AFTER give what it accepts, what it returns, and what it does to state outside itself; ")
+            .append("for a field or variable, what it holds and what a reader of it gets; for a type, what it models and what it exposes.\n")
+            .append("Keep each field on one line. Separate entries with a blank line. Write nothing else: no headings, no numbering, no commentary.\n\n");
+
+    prompt.append("Rules:\n")
+            .append("- Write the specification, not the code. Later chapters read this in place of this chapter's code, so hand them the digest instead of what they would have to derive themselves.\n")
+            .append("- Each entry stands on its own. It is read far from here, so it cannot lean on the change blocks, on the surrounding code, or on another entry.\n")
+            .append("- Record only what the code shows. Do not infer motivation or intent, and do not judge whether the change is correct or an improvement.\n")
+            .append("- Where several change blocks change one identifier, give it a single entry covering all of them.\n")
+            .append("- Identify code by name. Change IDs refer to nothing in the chapters that read this index, so keep them out of your entries.\n")
+            .append("- Index this chapter only. An identifier you know of from the known identifiers above, or that appears only in the context surrounding the changes, was changed elsewhere and gets no entry from you.\n")
+            .append("- If this chapter changes no identifier, write no entries.\n")
+            .append("- When you have written every entry, or if you have none, end your response with `").append(END_OF_ENTRIES).append("` on its own line and output nothing after it.\n\n");
 
     return prompt.toString();
   }
 
-  // TODO: is checking against mapping is the effective approach?
-  public String chapterResult(String content, String understanding, boolean rawDiff) {
-    StringBuilder prompt = new StringBuilder();
+  private static String renderKnownIdentifiers(List<Identifier> identifiers) {
+    return String.join("\n", identifiers.stream()
+            .map(identifier -> "<known name=\"" + oneLine(identifier.name()) + "\" kind=\"" + oneLine(identifier.kind()) + "\">\n"
+                    + "  was: " + oneLine(identifier.before()) + "\n"
+                    + "  now: " + oneLine(identifier.after()) + "\n"
+                    + "  changed: " + oneLine(identifier.change()) + "\n"
+                    + "</known>").toList());
+  }
 
-    prompt.append("You are a Principal Software Engineer and Lead Technical Auditor known for meticulous rigor and a zero-tolerance policy for low-signal noise. ")
-            .append("The changes in a pull request have been decomposed into a sequence of chapters. ")
-            .append("Your objective is to conduct a high-signal audit of a single chapter, utilizing a pre-synthesized technical map to identify critical flaws, systemic risks, and architectural regressions.\n\n");
+  private static String oneLine(String value) {
+    return value == null ? "" : value.replaceAll("\\s+", " ").trim();
+  }
+
+  public String chapterResult(String content, List<Identifier> dependencyIdentifiers, boolean rawDiff) {
+    StringBuilder prompt = new StringBuilder();
+    boolean hasDependencyIdentifiers = dependencyIdentifiers != null && !dependencyIdentifiers.isEmpty();
+
+    prompt.append("## Role\n")
+            .append("You are a code review assistant. You are responsible for producing professional review feedback on pull requests before they are merged. ")
+            .append("The changes in a pull request have been decomposed into a sequence of chapters; you are shown one of them, together with the context needed to judge it.\n")
+            .append("Please keep your responses concise and objective.\n\n");
 
     prompt.append(specification(rawDiff));
 
+    prompt.append("## Capabilities\n")
+            .append("- Think step by step progressively.\n")
+            .append("- First understand the code changes to be reviewed, in the representation described above.\n")
+            .append("- Be objective and neutral, make judgments based on facts and logic, avoid subjective assumptions. ")
+            .append(rawDiff
+                    ? "The unchanged lines each hunk carries are the context available to you; judge against them rather than against assumptions about code you cannot see.\n"
+                    : "The context you would otherwise have to go looking for has already been gathered: <context> shows the enclosing construct, <dependencies> supplies the code the edits depend on"
+                            + (hasDependencyIdentifiers ? ", and the dependency identifiers below record how identifiers this chapter references were changed elsewhere in this pull request" : "")
+                            + ". Judge against them rather than against assumptions about code you cannot see.\n")
+            .append("- For the current code changes, provide feedback opinions, pointing out areas for improvement or potential issues. Focus on issues in newly added code.\n")
+            .append("- Avoid commenting on correct code or unchanged code.\n")
+            .append(rawDiff
+                    ? "- Avoid commenting on deleted code; lines starting with `-` serve only as reference context.\n"
+                    : "- Avoid commenting on deleted code; <deleted> elements and the before_* side of a paired change serve only as reference context.\n")
+            .append("- Focus on clarity, practicality, and comprehensiveness.\n")
+            .append("- Use developer-friendly terminology and analogies in explanations.\n")
+            .append("- Focus primarily on the actual code logic and functionality. Avoid commenting on or providing feedback about non-functional elements ")
+            .append("such as code comments, tool-generated indicators (like @Generated annotations), or other metadata.\n\n");
+
+    prompt.append("## Strict Focus Rules\n")
+            .append(rawDiff
+                    ? "- Review every <diff> in the chapter individually.\n"
+                    : "- Review every <sub_chapter> in the chapter individually.\n")
+            .append("- Cross-file observations within the chapter are encouraged — look for inconsistencies, missing updates, and broken contracts across related files.\n")
+            .append(rawDiff
+                    ? "- The unchanged context lines are background information only. Your comments must address the changed lines — never produce comments targeting code outside this chapter.\n"
+                    : (hasDependencyIdentifiers
+                            ? "- <context>, <dependencies>, and the dependency identifiers are background information only. Your comments must address the <change> elements of this chapter — never produce comments targeting code outside it.\n"
+                            : "- <context> and <dependencies> are background information only. Your comments must address the <change> elements of this chapter — never produce comments targeting code outside it.\n"))
+            .append("\n");
+
+    prompt.append("## Reply limit\n")
+            .append(rawDiff
+                    ? "- Before ending your response, confirm you have given every <diff> in the chapter its own pass. "
+                    : "- Before ending your response, confirm you have given every <sub_chapter> in the chapter its own pass. ")
+            .append("Reviewing an implementation does not cover its header, interface, or configuration counterpart—being the smaller or secondary member of the chapter is not a reason to skip it.\n")
+            .append("- If a code issue has been identified and confirmed, write a review comment for it in the format given below.\n\n");
+
     prompt.append("### CURRENT CHAPTER\n")
-            .append("The following block contains the changes that make up this chapter, in the representation described above. This serves as your primary evidentiary source for the audit:\n")
+            .append("The following block contains the changes that make up the current chapter, in the representation described above. It is the code under review:\n")
             .append(content).append("\n\n");
 
-    prompt.append("### TECHNICAL MAPPING (THE AUDIT BENCHMARK)\n")
-            .append("Below is the high-fidelity technical map of this chapter. This document serves as your definitive architectural benchmark—it describes the intended systemic state and logic flow.  ")
-            .append("Your primary analytical loop is to verify the raw code evidence against this benchmark: identify where the implementation diverges from the map, ")
-            .append("where the map's stated intent is flawed, or where the realized behavior introduces risks not captured in the mapping.\n")
-            .append("<technical_mapping>\n")
-            .append(understanding)
-            .append("\n</technical_mapping>")
-            .append("\n\n");
+    if (hasDependencyIdentifiers) {
+      prompt.append("### DEPENDENCY IDENTIFIERS\n")
+              .append("Other chapters of this pull request changed identifiers that this chapter references. The entries below record what those identifiers were, what they are now, and how they changed. ")
+              .append("They are background information: use them to resolve references leaving this chapter, and do not produce comments targeting them.\n")
+              .append(renderKnownIdentifiers(dependencyIdentifiers))
+              .append("\n\n");
+    }
 
-    prompt.append("### YOUR TASK\n");
-    prompt.append("#### Execution of the High-Signal Adversarial Audit\n")
-            .append("Using the Technical Mapping as your benchmark and the Chapter Content as your evidence, conduct an adversarial audit. ")
-            .append("You are not 'reviewing' code; you are interrogating the implementation to find where it fails the architectural specification (The Map). ")
-            .append("Your goal is to expose the gap between intended design and realized execution.\n\n");
-
-    prompt.append("PRIMARY OBJECTIVE: Hunt for 'Unmapped Behavior'. ")
-            .append("Identify any logic, side effects, or functionality present in the code that is absent from the Technical Mapping. ")
-            .append("Unmapped behavior is a high-probability indicator of architectural drift, undocumented dependencies, or critical bugs.\n\n");
-
-    prompt.append("Analyze the chapter through these three rigorous lenses:\n")
-            .append("1. SEMANTIC INTEGRITY & SECURITY: Does the code execute exactly what the map intends, and nothing more? Where does the implementation diverge from the mapping's logic? Does this divergence introduce security vulnerabilities or fail to handle edge cases explicitly mentioned in the intent?\n")
-            .append("2. RESOURCE EFFICIENCY & OBSERVABILITY: Is the mapped behavior implemented with optimal complexity? Identify systemic bottlenecks or 'blind spots' where a failure would occur without leaving a traceable log or metric.\n")
-            .append("3. ARCHITECTURAL DRIFT & VERIFIABILITY: Does this implementation introduce technical debt that contradicts the architectural baseline? Is the resulting behavior deterministic and verifiable, or does it introduce ambiguity?\n\n");
-
-    prompt.append("OUTPUT STANDARDS (ZERO TOLERANCE POLICY):\n")
-            .append("Produce review comments adhering to these absolute constraints:\n")
-            .append("- EVIDENCE-BASED RCA: Zero tolerance for compliments, generic advice, or hedging ('consider...', 'perhaps...'). Every finding must be a formal Root Cause Analysis following this structure: [Symptom] -> [Technical Cause] -> [Systemic Risk]. If you cannot prove the flaw with specific code references, discard it.\n")
-            .append("- SYSTEMIC OVER SURFACE: Prioritize architectural regressions and systemic flaws over trivial style or formatting issues. If a finding does not represent a systemic risk to the system's integrity, it is noise—discard it.\n")
-            .append("- ATOMICITY & UNICITY: Consolidate multiple occurrences of the same pattern into a single finding. Each unique issue must be reported exactly once; redundant comments are strictly forbidden as they degrade signal-to-noise ratio.\n")
-            .append("- STRICT ANCHORING: Every comment MUST be anchored to one or more specific change IDs.\n\n");
+    prompt.append("### Review Checklist\n")
+            .append("#### Correctness\n")
+            .append("Is the logic correct? Are there missing boundary conditions?\n")
+            .append("Are exceptions handled properly?\n")
+            .append("Is it thread-safe in concurrent scenarios?\n\n")
+            .append("#### Security\n")
+            .append("Are there security vulnerabilities such as SQL injection or XSS?\n")
+            .append("Is sensitive information handled correctly?\n")
+            .append("Is permission validation complete?\n\n")
+            .append("#### Performance\n")
+            .append("Are there obvious performance issues (e.g., N+1 queries, unnecessary loops)?\n")
+            .append("Are resources properly released?\n\n")
+            .append("#### Maintainability\n")
+            .append("Is the code clear and easy to understand?\n")
+            .append("Do names accurately express intent?\n")
+            .append("Does it follow the project’s existing code style and architecture patterns?\n\n")
+            .append("#### Test Coverage\n")
+            .append("Do critical logic paths have corresponding test cases?\n")
+            .append("Do test cases cover boundary conditions?\n\n");
 
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n")
-            .append("Your response must be a list of review comments. Adhere to this structure for each comment:\n")
-            .append("- LINE 1: Only the comma-separated list of change IDs.\n")
-            .append("- SUBSEQUENT LINES: The high-fidelity review text.\n")
-            .append("Separate individual comments with one or more blank lines.\n")
-            .append("Once every comment has been written, terminate the response with `").append(END_OF_AUDIT).append("` on its own line and output nothing after it.");
+            .append("Write each review comment as:\n")
+            .append("- LINE 1: Only the comma-separated list of change IDs the comment addresses.\n")
+            .append("- SUBSEQUENT LINES: The review text.\n")
+            .append("Separate individual comments with one or more blank lines. Report each distinct issue once—if one issue repeats across several places, write it once and list every ID involved.\n")
+            .append("When you have written every comment, or if you have none, end your response with `").append(END_OF_AUDIT).append("` on its own line and output nothing after it.\n\n");
+
+    prompt.append("Now please review the code changes in the current chapter above.");
 
     return prompt.toString();
   }
 
-  public String result(List<String> results, List<String> understandings) {
+  public String result(List<String> results) {
     StringBuilder prompt = new StringBuilder();
 
-    prompt.append("You are a Principal Software Engineer and Lead Synthesizer performing a final technical audit of a pull request. ")
-            .append("The review process has been modularized: the PR was decomposed into chapters, and each chapter was audited independently. ")
-            .append("Your objective is to synthesize these modular findings into a cohesive, high-rigor final report that avoids fragmentation and redundancy.\n\n")
-            .append("You have two primary inputs:\n")
-            .append("1. TECHNICAL MAPPINGS: The technical map of each chapter. Use them as your ground truth for systemic architecture and identifier tracking.\n")
-            .append("2. MODULAR CHAPTER FINDINGS: Independent audit results from each chapter, strictly anchored to change IDs.\n\n");
+    prompt.append("You are a software engineer assembling the final review of a pull request. ")
+            .append("The pull request was decomposed into chapters, and each chapter was reviewed independently, so the same problem may have been reported more than once and two chapters may disagree. ")
+            .append("Your objective is to merge the duplicates and drop the disagreements. Nothing else.\n\n");
 
-    prompt.append("### INPUT DATA\n\n");
-    prompt.append("#### Technical Mappings:\n");
-    for (int i = 0; i < understandings.size(); i++) {
-      prompt.append("<chapter_").append(i + 1).append(">\n");
-      prompt.append(understandings.get(i)).append("\n");
-      prompt.append("</chapter_").append(i + 1).append(">\n");
-    }
-    prompt.append("\n");
-    prompt.append("#### Modular Findings From Chapters:\n");
+    prompt.append("You are given the findings only. You do not have the code they refer to, and you cannot re-check them. ")
+            .append("Do not judge whether a finding is correct, and do not add findings of your own: you have no evidence for either. ")
+            .append("Decide only what the findings themselves establish—whether two of them are the same finding, or whether they cannot both be true.\n\n");
+
+    prompt.append("### FINDINGS BY CHAPTER\n");
     for (int i = 0; i < results.size(); i++) {
       prompt.append("<chapter_").append(i + 1).append(">\n");
       prompt.append(results.get(i)).append("\n");
@@ -186,24 +243,68 @@ public class ReviewPrompt {
     }
     prompt.append("\n");
 
-    prompt.append("### SYNTHESIS LOGIC & RULES\n")
-            .append("Transform the modular findings into a final list of review comments by applying these rules:\n")
-            .append("1. SEMANTIC CONSOLIDATION: Do not simply list findings. Merge overlapping or related comments across different chapters into single, systemic observations. For example, if multiple chapters identify symptoms of the same underlying architectural flaw, synthesize them into one comprehensive finding.\n")
-            .append("2. RIGOROUS CONFLICT RESOLUTION: If findings from different chapters contradict each other:\n")
-            .append("   - Consult the Technical Mappings to determine the technically accurate state.\n")
-            .append("   - Keep only the correct version.\n")
-            .append("   - If the conflict cannot be resolved with absolute certainty, discard BOTH comments. It is better to omit a finding than to provide contradictory or incorrect guidance.\n")
-            .append("3. ABSOLUTE ID FIDELITY: Traceability is critical. Preserve the exact hunk IDs from the source findings. Do not modify or hallucinate IDs. When consolidating multiple findings into one, you MUST collect and list all associated hunk IDs for that consolidated comment.\n")
-            .append("4. SIGNAL PRESERVATION: Maintain the high-signal standard of the original audits. Ensure final comments remain evidence-based, actionable, and free of hedging language (e.g., avoid 'consider', 'perhaps', 'maybe').\n\n");
+    prompt.append("### YOUR TASK\n")
+            .append("Produce the final list of comments by applying these rules:\n")
+            .append("1. MERGE DUPLICATES: Where two or more findings report the same problem—the same mistake in the same place, or one mistake repeated across places—emit one comment for it. ")
+            .append("Keep the clearest of the wordings rather than writing a new one, and list the change IDs of every finding you merged.\n")
+            .append("2. DROP CONTRADICTIONS: Where two findings cannot both be true—one says a value is always set and another says it can be absent, one says a branch is unreachable and another reports what happens inside it—discard both. ")
+            .append("You have no way to tell which is right, and a confident wrong comment costs more than a missing one. Findings that merely differ, or address different aspects of the same code, are not contradictions: keep them.\n")
+            .append("3. PASS EVERYTHING ELSE THROUGH: A finding that is neither duplicated nor contradicted is kept as it is. Do not reword it, soften it, expand it, or merge unrelated findings because they sit in the same file.\n")
+            .append("4. PRESERVE IDS EXACTLY: Copy change IDs verbatim from the findings you keep. Never invent, alter, or drop one. A merged comment carries the IDs of every finding that went into it.\n\n");
 
     prompt.append("### OUTPUT FORMAT REQUIREMENTS\n")
-            .append("Your response must be a list of finalized review comments wrapped in <review_comments> tags.\n")
-            .append("Each comment MUST strictly adhere to this structure:\n")
-            .append("- LINE 1: Only the comma-separated list of hunk IDs.\n")
-            .append("- SUBSEQUENT LINES: The high-fidelity review text.\n")
-            .append("Separate individual comments with one or more blank lines.");
+            .append("Your response must be the final list of comments wrapped in <review_comments> tags.\n")
+            .append("Each comment must have this structure:\n")
+            .append("- LINE 1: Only the comma-separated list of change IDs.\n")
+            .append("- SUBSEQUENT LINES: The review text.\n")
+            .append("Separate individual comments with one or more blank lines.\n")
+            .append("If every finding was dropped, or there were none to begin with, emit empty <review_comments> tags.");
 
     return prompt.toString();
+  }
+
+  public static List<Identifier> parseIdentifiers(String response) {
+    List<Identifier> identifiers = new ArrayList<>();
+    if (response == null || response.isEmpty()) {
+      return identifiers;
+    }
+
+    String[] fields = new String[IDENTIFIER_FIELDS.size()];
+    int openField = -1;
+
+    for (String line : response.split("\\r?\\n")) {
+      String trimmedLine = line.trim();
+
+      Matcher matcher = IDENTIFIER_FIELD_PATTERN.matcher(trimmedLine);
+      if (matcher.matches()) {
+        int field = IDENTIFIER_FIELDS.indexOf(matcher.group(1).toUpperCase());
+        // The name opens an entry; everything up to the next name belongs to it
+        if (field == 0) {
+          addIdentifier(identifiers, fields);
+          fields = new String[IDENTIFIER_FIELDS.size()];
+        }
+        // The label may come wrapped in markdown emphasis, which is not part of the value
+        fields[field] = matcher.group(2).replaceAll("^\\**\\s*|\\s*\\**$", "").trim();
+        openField = field;
+        continue;
+      }
+
+      // A field the model wrapped onto the following lines
+      if (openField >= 0 && !trimmedLine.isEmpty()) {
+        fields[openField] = (fields[openField] + " " + trimmedLine).trim();
+      }
+    }
+    addIdentifier(identifiers, fields);
+
+    return identifiers;
+  }
+
+  private static void addIdentifier(List<Identifier> identifiers, String[] fields) {
+    if (fields[0] == null || fields[0].isEmpty()) {
+      return;
+    }
+
+    identifiers.add(new Identifier(fields[0], fields[1], fields[2], fields[3], fields[4]));
   }
 
   public static List<ReviewComment> parseResult(String response) {
@@ -300,14 +401,14 @@ public class ReviewPrompt {
     return ids;
   }
 
+  public record Identifier(String name, String kind, String before, String after, String change) {
+  }
+
   public record ReviewComment(List<String> hunkIds, String text) {
     @NotNull
     @Override
     public String toString() {
       return String.join(",", hunkIds) + "\n" + text;
     }
-  }
-
-  public record ParsedResponse(String understanding, String result) {
   }
 }

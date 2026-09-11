@@ -1,36 +1,32 @@
 package narrator.langchain;
 
-import org.refactoringminer.astDiff.graph.ReviewNode;
+import narrator.langchain.prompt.ReviewPrompt;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 
 import java.util.*;
 
 public class NarrativeState {
     // chapters are ordered by insertion
-    private final Map<Narrator.ChapterUnit, String> chapterUnderstanding = new LinkedHashMap<>();
+    private final Map<Narrator.ChapterUnit, List<ReviewPrompt.Identifier>> chapterIdentifiers = new LinkedHashMap<>();
     private final Map<Narrator.ChapterUnit, String> chapterResult = new LinkedHashMap<>();
-    public static final int THRESHOLD = 500;
 
-    public void setUnderstanding(Narrator.ChapterUnit chapter, String understanding) {
-        chapterUnderstanding.put(chapter, understanding);
+    public void setIdentifiers(Narrator.ChapterUnit chapter, List<ReviewPrompt.Identifier> identifiers) {
+        chapterIdentifiers.put(chapter, identifiers);
     }
 
     public void setResult(Narrator.ChapterUnit chapter, String result) {
         chapterResult.put(chapter, result);
     }
 
-    public List<String> getDependencyUnderstandings(Narrator.ChapterUnit chapter) {
-        Set<ReviewNode> subjectSides = chapter.getSides();
-        return chapterUnderstanding.entrySet().stream()
-                .filter(entry -> subjectSides.stream().anyMatch(side -> entry.getKey().getMains().contains(side)))
-                .map(Map.Entry::getValue).toList();
+    public boolean hasIdentifiers(Narrator.ChapterUnit chapter) {
+        return chapterIdentifiers.containsKey(chapter);
+    }
+
+    public List<ReviewPrompt.Identifier> getIdentifiers(Narrator.ChapterUnit chapter) {
+        return chapterIdentifiers.get(chapter);
     }
 
     public List<String> getResults() {
         return chapterResult.values().stream().toList();
-    }
-
-    public List<String> getUnderstandings() {
-        return chapterUnderstanding.values().stream().toList();
     }
 }
