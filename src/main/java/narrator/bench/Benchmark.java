@@ -205,7 +205,6 @@ public class Benchmark {
         }
         if (groundTruthsOverlappingNodes.isEmpty()) {
             System.out.println("No overlapping comments found");
-            return null;
         }
 
         Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
@@ -219,7 +218,8 @@ public class Benchmark {
         long coveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(gc -> !gc.isEmpty()).count();
         long uncoveredGroundTruth = groundTruthGeneratedComments.values().stream().filter(Set::isEmpty).count();
 
-        double recall = (double) coveredGroundTruth / groundTruthGeneratedComments.size();
+        double recall = groundTruthGeneratedComments.isEmpty() ? 0 :
+                (double) coveredGroundTruth / groundTruthGeneratedComments.size();
         System.out.println("recall: " + recall);
 
         Set<ReviewNode> allHunkNodes = narrativeResult.nodes().stream().filter(ReviewNode::isBase)
