@@ -65,7 +65,7 @@ public class ReviewPrompt {
     return spec.toString();
   }
 
-  public String chapterIdentifiers(String content, List<Identifier> dependencyIdentifiers, boolean rawDiff) {
+  public String chapterIdentifiers(String content, boolean rawDiff) {
     StringBuilder prompt = new StringBuilder();
 
     prompt.append("You are a Software Engineer building a symbol-level index of a code change. ")
@@ -75,14 +75,6 @@ public class ReviewPrompt {
             .append("Your index stands in for that code: for every identifier it must say what that identifier was before this chapter, what it is after, and how it changed.\n\n");
 
     prompt.append(specification(rawDiff));
-
-    if (dependencyIdentifiers != null && !dependencyIdentifiers.isEmpty()) {
-      prompt.append("### KNOWN IDENTIFIERS\n")
-              .append("Other chapters changed the identifiers below, and they are already in the index. This chapter references them but does not declare them. ")
-              .append("Use them to resolve what this chapter calls or reads. They are context, not material: they are not yours to index again.\n")
-              .append(renderKnownIdentifiers(dependencyIdentifiers))
-              .append("\n\n");
-    }
 
     prompt.append("### CURRENT CHAPTER\n")
             .append("The changes that make up the current chapter, in the representation described above. Every entry you write comes from here:\n")
@@ -111,7 +103,7 @@ public class ReviewPrompt {
             .append("- Record only what the code shows. Do not infer motivation or intent, and do not judge whether the change is correct or an improvement.\n")
             .append("- Where several change blocks change one identifier, give it a single entry covering all of them.\n")
             .append("- Identify code by name. Change IDs refer to nothing in the chapters that read this index, so keep them out of your entries.\n")
-            .append("- Index this chapter only. An identifier you know of from the known identifiers above, or that appears only in the context surrounding the changes, was changed elsewhere and gets no entry from you.\n")
+            .append("- Index this chapter only. An identifier that appears only in the context surrounding the changes was changed elsewhere and gets no entry from you.\n")
             .append("- If this chapter changes no identifier, write no entries.\n")
             .append("- When you have written every entry, or if you have none, end your response with `").append(END_OF_ENTRIES).append("` on its own line and output nothing after it.\n\n");
 
@@ -148,24 +140,15 @@ public class ReviewPrompt {
             .append("- Be objective and neutral, make judgments based on facts and logic, avoid subjective assumptions. ")
             .append(rawDiff
                     ? "The unchanged lines each hunk carries are the context available to you; judge against them rather than against assumptions about code you cannot see.\n"
-                    : "The context you would otherwise have to go looking for has already been gathered: <context> shows the enclosing construct, <dependencies> supplies the code the edits depend on"
-                            + (hasDependencyIdentifiers ? ", and the dependency identifiers below record how identifiers this chapter references were changed elsewhere in this pull request" : "")
-                            + ". Judge against them rather than against assumptions about code you cannot see.\n")
-            .append("- For the current code changes, provide feedback opinions, pointing out areas for improvement or potential issues. Focus on issues in newly added code.\n")
+                    : hasDependencyIdentifiers ? "Dependency identifiers below record how identifiers this chapter references were changed elsewhere in this pull request. Judge against them rather than against assumptions about code you cannot see.\n" : "")
+            .append("- For the current code changes, provide feedback opinions, pointing out areas for improvement or potential issues.\n")
             .append("- Avoid commenting on correct code or unchanged code.\n")
-            .append(rawDiff
-                    ? "- Avoid commenting on deleted code; lines starting with `-` serve only as reference context.\n"
-                    : "- Avoid commenting on deleted code; <deleted> elements and the before_* side of a paired change serve only as reference context.\n")
             .append("- Focus on clarity, practicality, and comprehensiveness.\n")
             .append("- Use developer-friendly terminology and analogies in explanations.\n")
             .append("- Focus primarily on the actual code logic and functionality. Avoid commenting on or providing feedback about non-functional elements ")
             .append("such as code comments, tool-generated indicators (like @Generated annotations), or other metadata.\n\n");
 
     prompt.append("## Strict Focus Rules\n")
-            .append(rawDiff
-                    ? "- Review every <diff> in the chapter individually.\n"
-                    : "- Review every <sub_chapter> in the chapter individually.\n")
-            .append("- Cross-file observations within the chapter are encouraged — look for inconsistencies, missing updates, and broken contracts across related files.\n")
             .append(rawDiff
                     ? "- The unchanged context lines are background information only. Your comments must address the changed lines — never produce comments targeting code outside this chapter.\n"
                     : (hasDependencyIdentifiers
@@ -175,8 +158,8 @@ public class ReviewPrompt {
 
     prompt.append("## Reply limit\n")
             .append(rawDiff
-                    ? "- Before ending your response, confirm you have given every <diff> in the chapter its own pass. "
-                    : "- Before ending your response, confirm you have given every <sub_chapter> in the chapter its own pass. ")
+                    ? "- Before ending your response, confirm you have given every <diff> in the chapter one pass. "
+                    : "- Before ending your response, confirm you have given every <sub_chapter> in the chapter one pass. ")
             .append("Reviewing an implementation does not cover its header, interface, or configuration counterpart—being the smaller or secondary member of the chapter is not a reason to skip it.\n")
             .append("- If a code issue has been identified and confirmed, write a review comment for it in the format given below.\n\n");
 

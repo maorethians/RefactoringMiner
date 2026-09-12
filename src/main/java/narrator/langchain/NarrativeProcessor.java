@@ -73,23 +73,14 @@ public class NarrativeProcessor {
         return dependencies;
     }
 
-    // A dependency's own dependencies are resolved first, so its identifiers are built with the same
-    // context they would have had when every chapter was indexed up front. Only lower indices are ever
-    // visited, so the recursion strictly descends and cannot cycle.
+    // A chapter is indexed from its own content alone, so nothing else has to be resolved first.
     private void ensureIdentifiers(int index, List<Narrator.ChapterUnit> chapters, NarrativeState state, boolean rawDiff) {
         Narrator.ChapterUnit chapter = chapters.get(index);
         if (state.hasIdentifiers(chapter)) {
             return;
         }
 
-        List<Integer> dependencies = dependencyIndices(index, chapters);
-        for (Integer dependency : dependencies) {
-            ensureIdentifiers(dependency, chapters, state, rawDiff);
-        }
-
-        List<ReviewPrompt.Identifier> dependencyIdentifiers = dependencies.stream()
-                .flatMap(dependency -> state.getIdentifiers(chapters.get(dependency)).stream()).toList();
-        state.setIdentifiers(chapter, langchainClient.generateIdentifiers(chapter.getContent(), dependencyIdentifiers, rawDiff));
+        state.setIdentifiers(chapter, langchainClient.generateIdentifiers(chapter.getContent(), rawDiff));
     }
 
     public record NarrativeProcessResult(List<ReviewNode> nodes, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
