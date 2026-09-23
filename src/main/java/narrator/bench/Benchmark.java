@@ -23,6 +23,7 @@ public class Benchmark {
     private static final String MIN_CREATED_AT = "2024-03-01T00:00:00Z";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
+    private static final String TRACK_FILE = "track.txt";
     private static final int ATTEMPTS = 1;
 
     public static void main(String[] args) {
@@ -43,6 +44,7 @@ public class Benchmark {
                 return;
             }
 
+            Set<String> processed = readTrack();
             Gson gson = new Gson();
 
             for (File file : files) {
@@ -97,8 +99,12 @@ public class Benchmark {
                     for (Map.Entry<String, List<JsonObject>> entry : commitGroups.entrySet()) {
                         String submittedCommit = entry.getKey();
 
-                        // Check if result already exists for this commit
-                        String resultFileName = String.format("%s_%s_%s_%s.json", org, repoName, prNumber, submittedCommit);
+                        String resultKey = String.format("%s_%s_%s_%s", org, repoName, prNumber, submittedCommit);
+                        String resultFileName = resultKey + ".json";
+                        if (processed.contains(resultKey)) {
+                            System.out.println("Skipping processed commit: " + resultKey);
+                            continue;
+                        }
                         if (Files.exists(Paths.get(RESULTS_DIR, resultFileName))) {
                             System.out.println("Skipping existing result: " + resultFileName);
                             continue;
@@ -122,6 +128,7 @@ public class Benchmark {
                         }
                         if (best == null) {
                             System.out.println("No valid attempt for: " + resultFileName);
+                            track(processed, resultKey);
                             continue;
                         }
                         System.out.println("Best recall: " + best.recall() + ", hunk node ratio: " + best.hunkNodeRatio());
@@ -130,8 +137,10 @@ public class Benchmark {
                         Files.write(Paths.get(RESULTS_DIR, resultFileName), gson.toJson(best.result()).getBytes(StandardCharsets.UTF_8));
 
                         // Store raw output TXT
-                        String outputFileName = String.format("%s_%s_%s_%s.txt", org, repoName, prNumber, submittedCommit);
+                        String outputFileName = resultKey + ".txt";
                         Files.write(Paths.get(RESULTS_DIR, outputFileName), best.content().getBytes(StandardCharsets.UTF_8));
+
+                        track(processed, resultKey);
                     }
 
                 } catch (Exception e) {
@@ -168,7 +177,7 @@ public class Benchmark {
         Set<GeneratedCommentNodes> generatedCommentsNodes = new HashSet<>();
         for (ReviewPrompt.ReviewComment generatedComment : narrativeResult.comments()) {
             List<ReviewNode> commentNodes = generatedComment.hunkIds().stream()
-                    .map(promptId -> findNode(narrativeResult.nodes(), promptId)).toList();
+                    .map(promptId -> findNode(narrativeResult.getNodes(), promptId)).toList();
             for (int i = 0; i < commentNodes.size(); i++) {
                 if (commentNodes.get(i) == null) {
                     System.out.println("Hallucinated id detected: " + generatedComment.hunkIds().get(i));
@@ -195,7 +204,7 @@ public class Benchmark {
             int line = groundTruthComment.get("submitted_line").getAsInt();
             Integer startLine = groundTruthComment.get("submitted_start_line").isJsonNull() ?
                     null : groundTruthComment.get("submitted_start_line").getAsInt();
-            Set<ReviewNode> overlappingNodes = findNodes(narrativeResult.nodes(), side, path, line, startLine);
+            Set<ReviewNode> overlappingNodes = findNodes(narrativeResult.getNodes(), side, path, line, startLine);
             if (overlappingNodes.isEmpty()) {
                 System.out.println("No overlapping nodes found");
                 continue;
@@ -205,6 +214,7 @@ public class Benchmark {
         }
         if (groundTruthsOverlappingNodes.isEmpty()) {
             System.out.println("No overlapping comments found");
+            return null;
         }
 
         Map<JsonObject, Set<GeneratedCommentNodes>> groundTruthGeneratedComments = new HashMap<>();
@@ -220,15 +230,16 @@ public class Benchmark {
 
         double recall = groundTruthGeneratedComments.isEmpty() ? 0 :
                 (double) coveredGroundTruth / groundTruthGeneratedComments.size();
-        System.out.println("recall: " + recall);
 
-        Set<ReviewNode> allHunkNodes = narrativeResult.nodes().stream().filter(ReviewNode::isBase)
-                .collect(Collectors.toSet());
-        Set<ReviewNode> coveredHunkNodes = generatedCommentsNodes.stream()
-                .map(generatedCommentNodes -> generatedCommentNodes.nodes.stream().filter(ReviewNode::isBase).collect(Collectors.toSet()))
+        Set<ReviewNode> allMatchable = narrativeResult.getNodes();
+        Set<ReviewNode> coveredMatchable = generatedCommentsNodes.stream()
+                .map(generatedCommentNodes -> generatedCommentNodes.nodes)
                 .flatMap(Set::stream).collect(Collectors.toSet());
-        Set<ReviewNode> uncoveredHunkNodes = allHunkNodes.stream().filter(hunkNode -> !coveredHunkNodes.contains(hunkNode))
+        Set<ReviewNode> uncoveredMatchable = allMatchable.stream().filter(hunkNode -> !coveredMatchable.contains(hunkNode))
                 .collect(Collectors.toSet());
+        double ratio = (double) coveredMatchable.size() / allMatchable.size();
+
+        System.out.println("recall: " + recall + ", ratio: " + ratio);
 
         TokenUsage tokens = readLog();
 
@@ -242,13 +253,29 @@ public class Benchmark {
                 .map(e -> new GroundTruthGeneratedCommentsNodes(e.getKey(), e.getValue().stream().map(GeneratedCommentNodes::stringify).toList())).toList();
         result.uncoveredGroundTruth = uncoveredGroundTruth;
         result.coveredGroundTruth = coveredGroundTruth;
-        result.uncoveredHunkNodes = uncoveredHunkNodes.size();
-        result.coveredHunkNodes = coveredHunkNodes.size();
+        result.uncoveredMatchable = uncoveredMatchable.size();
+        result.coveredMatchable = coveredMatchable.size();
         result.timing = timing;
         result.tokensIn = tokens.in;
         result.tokensOut = tokens.out;
 
         return new Attempt(result, narrativeResult.content());
+    }
+
+    private static Set<String> readTrack() throws IOException {
+        Path trackPath = Paths.get(TRACK_FILE);
+        if (!Files.exists(trackPath)) {
+            return new HashSet<>();
+        }
+
+        return Files.readAllLines(trackPath).stream().map(String::trim).filter(line -> !line.isEmpty())
+                .collect(Collectors.toCollection(HashSet::new));
+    }
+
+    private static void track(Set<String> processed, String resultKey) throws IOException {
+        processed.add(resultKey);
+        Files.write(Paths.get(TRACK_FILE), (resultKey + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
     private static void purgeLog() throws IOException {
@@ -285,14 +312,13 @@ public class Benchmark {
     }
 
     @Nullable
-    private static ReviewNode findNode(List<ReviewNode> nodes, String promptId) {
+    private static ReviewNode findNode(Set<ReviewNode> nodes, String promptId) {
         return nodes.stream()
                 .filter(node -> node.getPromptId().equals(promptId)).findFirst().orElse(null);
     }
 
-    private static Set<ReviewNode> findNodes(List<ReviewNode> nodes, String side, String path, int line, @Nullable Integer startLine) {
+    private static Set<ReviewNode> findNodes(Set<ReviewNode> nodes, String side, String path, int line, @Nullable Integer startLine) {
         return nodes.stream()
-                .filter(ReviewNode::isMatchable)
                 .filter(node -> node.overlapLine(path, side, line, startLine))
                 .collect(Collectors.toSet());
     }
@@ -304,8 +330,8 @@ public class Benchmark {
         }
 
         double hunkNodeRatio() {
-            long total = result.coveredHunkNodes + result.uncoveredHunkNodes;
-            return total == 0 ? 0 : (double) result.coveredHunkNodes / total;
+            long total = result.coveredMatchable + result.uncoveredMatchable;
+            return total == 0 ? 0 : (double) result.coveredMatchable / total;
         }
     }
 
@@ -328,8 +354,8 @@ public class Benchmark {
         List<GroundTruthGeneratedCommentsNodes> groundTruthGeneratedCommentsNodes;
         long coveredGroundTruth;
         long uncoveredGroundTruth;
-        long coveredHunkNodes;
-        long uncoveredHunkNodes;
+        long coveredMatchable;
+        long uncoveredMatchable;
         long timing;
         long tokensIn;
         long tokensOut;
