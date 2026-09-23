@@ -9,6 +9,7 @@ import org.refactoringminer.astDiff.graph.cluster.traverse.Narrator;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 public class NarrativeProcessor {
     private final NarrativeService narrativeService;
@@ -39,7 +40,7 @@ public class NarrativeProcessor {
             // Identifiers are produced only for chapters some later chapter actually depends on
             List<Integer> dependencies = dependencyIndices(i, chapters);
             for (Integer dependency : dependencies) {
-                ensureIdentifiers(dependency, chapters, state, rawDiff);
+                ensureIdentifiers(dependency, chapters, state);
             }
 
             List<ReviewPrompt.Identifier> dependencyIdentifiers = dependencies.stream()
@@ -49,13 +50,9 @@ public class NarrativeProcessor {
 
         // 3. Final compilation
         List<ReviewPrompt.ReviewComment> finalResult = langchainClient.compileResults(state.getResults());
-        return new NarrativeProcessResult(narrativeService.getReviewNodes(url, level), finalResult, state);
+        return new NarrativeProcessResult(chapters, finalResult, state);
     }
 
-
-
-    // The chapters preceding index that own a node this chapter references. Raw diff chapters carry no
-    // sides, so this is always empty there and no identifiers are ever produced for them.
     private static List<Integer> dependencyIndices(int index, List<Narrator.ChapterUnit> chapters) {
         Set<ReviewNode> sides = chapters.get(index).getSides();
         if (sides.isEmpty()) {
@@ -73,20 +70,23 @@ public class NarrativeProcessor {
         return dependencies;
     }
 
-    // A chapter is indexed from its own content alone, so nothing else has to be resolved first.
-    private void ensureIdentifiers(int index, List<Narrator.ChapterUnit> chapters, NarrativeState state, boolean rawDiff) {
+    private void ensureIdentifiers(int index, List<Narrator.ChapterUnit> chapters, NarrativeState state) {
         Narrator.ChapterUnit chapter = chapters.get(index);
         if (state.hasIdentifiers(chapter)) {
             return;
         }
 
-        state.setIdentifiers(chapter, langchainClient.generateIdentifiers(chapter.getContent(), rawDiff));
+        state.setIdentifiers(chapter, langchainClient.generateIdentifiers(chapter.getContent()));
     }
 
-    public record NarrativeProcessResult(List<ReviewNode> nodes, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
+    public record NarrativeProcessResult(List<Narrator.ChapterUnit> chapters, List<ReviewPrompt.ReviewComment> comments, NarrativeState state) {
         public String content() {
             return String.join("\n\n", comments.stream()
                     .map(comment -> String.join(", ", comment.hunkIds()) + ": " + comment.text()).toList());
+        }
+
+        public Set<ReviewNode> getNodes() {
+            return chapters.stream().map(Narrator.ChapterUnit::getAnchoredNodes).flatMap(Set::stream).collect(Collectors.toSet());
         }
     }
 }

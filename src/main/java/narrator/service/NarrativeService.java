@@ -17,11 +17,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.*;
 
 public class NarrativeService {
     private static final Logger logger = LoggerFactory.getLogger(NarrativeService.class);
@@ -53,17 +49,19 @@ public class NarrativeService {
             throw new IllegalStateException("No narrative initialized for this URL: " + url);
         }
 
-        return root.getNarrator().getFlatChapters(level);
-    }
+        List<Narrator.ChapterUnit> flatChapters = null;
+        for (int length = Node.PROMPT_ID_LENGTH; length <= Node.MAX_PROMPT_ID_LENGTH; length++) {
+            flatChapters = root.getNarrator().getFlatChapters(level, length, true);
 
-    public List<ReviewNode> getReviewNodes(String url, GrainLevel level) throws Exception {
-        if (level == GrainLevel.RAW_DIFF) {
-            return new ArrayList<>(getOrComputeRawNodes(url));
+            List<String> promptIds = flatChapters.stream()
+                .map(fc -> fc.getAnchoredNodes().stream().map(ReviewNode::getPromptId).toList())
+                    .flatMap(List::stream).toList();
+            if (promptIds.size() == new HashSet<>(promptIds).size()) {
+                break;
+            }
         }
 
-        return getOrComputeClusters(url).stream()
-                .flatMap(cluster -> cluster.getGraph().vertexSet().stream())
-                .collect(Collectors.toList());
+        return flatChapters;
     }
 
     public void updateHtmlPage(String url, GrainLevel level, int progress) {
@@ -155,6 +153,7 @@ public class NarrativeService {
             for (Integer index : split) {
                 chapter.append(prompts.get(index));
                 chapter.addMains(Set.of(rawNodes.get(index)));
+                chapter.addAnchoredNodes(Set.of(rawNodes.get(index)));
             }
             chapters.add(chapter);
         }
