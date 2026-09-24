@@ -158,6 +158,22 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 		return lambdaMappers;
 	}
 
+	public boolean containsMappingInLambdaMappersForFragment2(AbstractCodeFragment fragment2) {
+		for(UMLOperationBodyMapper lambdaMapper : lambdaMappers) {
+			if(lambdaMapper.alreadyMatched2(fragment2))
+				return true;
+		}
+		return false;
+	}
+
+	public boolean containsMappingInLambdaMappersForFragment1(AbstractCodeFragment fragment1) {
+		for(UMLOperationBodyMapper lambdaMapper : lambdaMappers) {
+			if(lambdaMapper.alreadyMatched1(fragment1))
+				return true;
+		}
+		return false;
+	}
+
 	public boolean containsRefactoringOfType(RefactoringType type) {
 		for(Refactoring r : refactorings) {
 			if(r.getRefactoringType().equals(type)) {
@@ -177,7 +193,18 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 
 	public boolean isExact() {
 		return  !fragment1.isKeyword() && (argumentizedStringExact() || argumentizedStringExactAfterTypeReplacement() ||
-				fragment1.getString().equals(fragment2.getString()) || isExactAfterAbstraction() || containsIdenticalOrCompositeReplacement() || callChainMatch());
+				fragment1.getString().equals(fragment2.getString()) || isExactAfterAbstraction() || containsIdenticalOrCompositeReplacement() || callChainMatch() || ignoreFormattingChanges());
+	}
+
+	private boolean ignoreFormattingChanges() {
+		if(LANG1.equals(Constants.TYPESCRIPT) && LANG2.equals(Constants.TYPESCRIPT) && fragment1.getString().contains("\n") && fragment2.getString().contains("\n")) {
+			String s1 = fragment1.getString().replaceAll("\s", "").replaceAll("\n", "").replaceAll(",", "");
+			String s2 = fragment2.getString().replaceAll("\s", "").replaceAll("\n", "").replaceAll(",", "");
+			if(s1.equals(s2)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private boolean argumentizedStringExact() {

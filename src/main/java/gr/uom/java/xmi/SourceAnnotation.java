@@ -10,17 +10,18 @@ import java.util.List;
 import java.util.Map;
 
 public abstract class SourceAnnotation {
-    protected static final Map<String, TriFunction<UMLAnnotation, UMLOperation, UMLAbstractClass, SourceAnnotation>> implementations = Map.of(
-            CsvSourceAnnotation.ANNOTATION_TYPENAME, CsvSourceAnnotation::new,
-            CsvFileSourceAnnotation.ANNOTATION_TYPENAME, CsvFileSourceAnnotation::new,
-            ValueSourceAnnotation.ANNOTATION_TYPENAME, ValueSourceAnnotation::new,
-            EnumSourceAnnotation.ANNOTATION_TYPENAME, EnumSourceAnnotation::new,
-            NullAndEmptySourceAnnotation.ANNOTATION_TYPENAME, NullAndEmptySourceAnnotation::new,
-            EmptySourceAnnotation.ANNOTATION_TYPENAME, EmptySourceAnnotation::new,
-            NullSourceAnnotation.ANNOTATION_TYPENAME, NullSourceAnnotation::new,
-            MethodSourceAnnotation.ANNOTATION_TYPENAME, MethodSourceAnnotation::new,
-            ParametersAnnotation.ANNOTATION_TYPENAME, ParametersAnnotation::new,
-            ParametersAnnotation.QUALIFIED_ANNOTATION_TYPENAME, ParametersAnnotation::new
+    protected static final Map<String, TriFunction<UMLAnnotation, UMLOperation, List<UMLAbstractClass>, SourceAnnotation>> implementations = Map.ofEntries(
+            Map.entry(CsvSourceAnnotation.ANNOTATION_TYPENAME, CsvSourceAnnotation::new),
+            Map.entry(CsvFileSourceAnnotation.ANNOTATION_TYPENAME, CsvFileSourceAnnotation::new),
+            Map.entry(ValueSourceAnnotation.ANNOTATION_TYPENAME, ValueSourceAnnotation::new),
+            Map.entry(EnumSourceAnnotation.ANNOTATION_TYPENAME, EnumSourceAnnotation::new),
+            Map.entry(NullAndEmptySourceAnnotation.ANNOTATION_TYPENAME, NullAndEmptySourceAnnotation::new),
+            Map.entry(EmptySourceAnnotation.ANNOTATION_TYPENAME, EmptySourceAnnotation::new),
+            Map.entry(NullSourceAnnotation.ANNOTATION_TYPENAME, NullSourceAnnotation::new),
+            Map.entry(MethodSourceAnnotation.ANNOTATION_TYPENAME, MethodSourceAnnotation::new),
+            Map.entry(ArgumentsSourceAnnotation.ANNOTATION_TYPENAME, ArgumentsSourceAnnotation::new),
+            Map.entry(ParametersAnnotation.ANNOTATION_TYPENAME, ParametersAnnotation::new),
+            Map.entry(ParametersAnnotation.QUALIFIED_ANNOTATION_TYPENAME, ParametersAnnotation::new)
     );
     protected List<List<String>> testParameters;
     protected List<List<LeafExpression>> testParameterLeafExpressions;
@@ -33,9 +34,9 @@ public abstract class SourceAnnotation {
         this.testParameterLeafExpressions = new ArrayList<>();
     }
 
-    public static SourceAnnotation create(UMLAnnotation annotation, UMLOperation operation, UMLAbstractClass declaringClass) {
+    public static SourceAnnotation create(UMLAnnotation annotation, UMLOperation operation, List<UMLAbstractClass> declaringClasses) {
         if (implementations.containsKey(annotation.getTypeName())) {
-            return implementations.get(annotation.getTypeName()).apply(annotation, operation, declaringClass);
+            return implementations.get(annotation.getTypeName()).apply(annotation, operation, declaringClasses);
         }
         throw new IllegalArgumentException("Annotation type " + annotation.getTypeName() + " is not supported");
     }

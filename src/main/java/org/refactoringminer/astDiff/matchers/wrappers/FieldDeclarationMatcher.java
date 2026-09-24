@@ -125,7 +125,9 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
                 if(matched != null) {
                     mappingStore.addMapping(matched.first, matched.second);
                 }
+                ClassDeclarationMatcher.processParentInternalModule(srcFieldDeclaration.getParent(), dstFieldDeclaration.getParent(), mappingStore, LANG1, LANG2);
             }
+            ClassDeclarationMatcher.processParentInternalModule(srcFieldDeclaration, dstFieldDeclaration, mappingStore, LANG1, LANG2);
             boolean isMovedAttribute = !srcUMLAttribute.getClassName().equals(dstUMLAttribute.getClassName());
             if(PathFileUtils.isCppFile(srcUMLAttribute.getLocationInfo().getFilePath()) && PathFileUtils.isCppFile(dstUMLAttribute.getLocationInfo().getFilePath()) &&
                     srcUMLAttribute.getLocationInfo().getFilePath().equals(dstUMLAttribute.getLocationInfo().getFilePath()) && !isMovedAttribute) {
@@ -153,7 +155,9 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
             if(matched != null) {
                 mappingStore.addMapping(matched.first, matched.second);
             }
+            ClassDeclarationMatcher.processParentInternalModule(srcFieldDeclaration.getParent(), dstFieldDeclaration.getParent(), mappingStore, LANG1, LANG2);
         }
+        ClassDeclarationMatcher.processParentInternalModule(srcFieldDeclaration, dstFieldDeclaration, mappingStore, LANG1, LANG2);
         if((srcAttr.getType().name.equals(LANG1.PROPERTY_SIGNATURE) && dstAttr.getType().name.equals(LANG2.PROPERTY_SIGNATURE)) ||
                 (srcAttr.getType().name.equals(LANG1.PUBLIC_FIELD_DEFINITION) && dstAttr.getType().name.equals(LANG2.PUBLIC_FIELD_DEFINITION)) ||
                 (srcAttr.getType().name.equals(LANG1.SHORTHAND_PROPERTY_IDENTIFIER) && dstAttr.getType().name.equals(LANG2.SHORTHAND_PROPERTY_IDENTIFIER)) ||
@@ -164,7 +168,8 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
                 (srcAttr.getType().name.equals(LANG1.ARRAY_DECLARATOR) && dstAttr.getType().name.equals(LANG2.ARRAY_DECLARATOR)) ||
                 (srcAttr.getType().name.equals(LANG1.FIELD_IDENTIFIER) && dstAttr.getType().name.equals(LANG2.FIELD_IDENTIFIER)) ||
                 (srcAttr.getType().name.equals(LANG1.TYPE_IDENTIFIER) && dstAttr.getType().name.equals(LANG2.TYPE_IDENTIFIER)) ||
-                (srcAttr.getType().name.equals(LANG1.ENUMERATOR) && dstAttr.getType().name.equals(LANG2.ENUMERATOR))) {
+                (srcAttr.getType().name.equals(LANG1.ENUMERATOR) && dstAttr.getType().name.equals(LANG2.ENUMERATOR)) ||
+                (srcAttr.getType().name.equals(LANG1.INDEX_SIGNATURE) && dstAttr.getType().name.equals(LANG2.INDEX_SIGNATURE))) {
             if(srcAttr.getParent() != null && dstAttr.getParent() != null) {
                 int index1 = srcAttr.getParent().getChildPosition(srcAttr);
                 int index2 = dstAttr.getParent().getChildPosition(dstAttr);

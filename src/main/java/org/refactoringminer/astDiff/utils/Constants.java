@@ -27,7 +27,7 @@ public class Constants {
         return isNamedMethod(treeType) || treeType.equals(SECONDARY_CONSTRUCTOR) || treeType.equals(LEXICAL_DECLARATION) ||
                 treeType.equals(METHOD_SIGNATURE) || treeType.equals(FUNCTION_SIGNATURE) || treeType.equals(PAIR) ||
                 treeType.equals(FUNCTION_EXPRESSION) || treeType.equals(VARIABLE_DECLARATION) || treeType.equals(POINTER_DECLARATOR) ||
-                treeType.equals(FRIEND_DECLARATION) || treeType.equals(INIT_DECLARATOR);
+                treeType.equals(FRIEND_DECLARATION) || treeType.equals(INIT_DECLARATOR) || treeType.equals(PUBLIC_FIELD_DEFINITION);
     }
 
     // TODO: FUNCTION_EXPRESSION may have a name, or it may be assigned to a variable which can act as a name (VARIABLE_DECLARATION)
@@ -353,6 +353,7 @@ public class Constants {
     public final String WHILE_STATEMENT;
     public final String CONDITIONAL_EXPRESSION;
     public final String CAST_EXPRESSION = "CastExpression";
+    public final String THIS_EXPRESSION = "ThisExpression";
 
     public final String INFIX_EXPRESSION = "InfixExpression";
     public final String LAMBDA_EXPRESSION;
@@ -492,9 +493,11 @@ public class Constants {
     public final String COMPARISON_OPERATOR = "comparison_operator";
     public final String NOT_PREFIX_OPERATOR = "!";
     public final String DISJUNCTION_EXPRESSION = "disjunction_expression";
+    public final String CONJUNCTION_EXPRESSION = "conjunction_expression";
     public final String EQUALITY_EXPRESSION = "equality_expression";
     public final String ADDITIVE_EXPRESSION = "additive_expression";
     public final String MULTIPLICATIVE_EXPRESSION = "multiplicative_expression";
+    public final String COMPARISON_EXPRESSION = "comparison_expression";
     public final String INTERPOLATED_IDENTIFIER = "interpolated_identifier";
     public final String INTERPOLATED_EXPRESSION = "interpolated_expression";
     public final String AT = "at";
@@ -502,6 +505,7 @@ public class Constants {
     public final String TYPE_ARGUMENTS = "type_arguments";
     public final String STRING_CONTENT = "string_content";
     public final String LAMBDA_PARAMETERS = "lambda_parameters";
+    public final String VALUE_ARGUMENT = "value_argument";
 
     //TypeScript specific
     public final String FOR_IN_STATEMENT = "for_in_statement";
@@ -600,6 +604,10 @@ public class Constants {
     public final String ASSIGNMENT_EXPRESSION = "assignment_expression";
     public final String UPDATE_EXPRESSION = "update_expression";
     public final String SPREAD_ELEMENT = "spread_element";
+    public final String INTERNAL_MODULE = "internal_module";
+    public final String INDEX_SIGNATURE = "index_signature";
+    public final String IMPORT_ATTRIBUTE = "import_attribute";
+    public final String ARRAY = "array";
 
     //C++ specific
     public final String TRANSLATION_UNIT = "translation_unit"; // This is the root of all trees in C++

@@ -60,6 +60,10 @@ public class TypeScriptFileProcessor {
 	}
 
 	public void processTypeScriptFile(String filePath, String fileContent, boolean astDiff, Swc4j swc4j) {
+		//skip minified JavaScript files
+		if(filePath.endsWith(".min.js")) {
+			return;
+		}
 		try {
 			Swc4jMediaType mediaType = null;
 			if(filePath.endsWith(".tsx"))
@@ -67,10 +71,13 @@ public class TypeScriptFileProcessor {
 			else if(filePath.endsWith(".ts"))
 				mediaType = Swc4jMediaType.TypeScript;
 			else if(filePath.endsWith(".js")) {
-				if(filePath.endsWith("spec.js") || fileContent.contains("</div>") || fileContent.contains("</ul>") || fileContent.contains("</Route>") || fileContent.contains("</Provider>"))
+				if(filePath.endsWith("spec.js") || fileContent.contains("</div>") || fileContent.contains("</ul>") || fileContent.contains("</Route>") || fileContent.contains("</Provider>") || fileContent.contains("/>"))
 					mediaType = Swc4jMediaType.Jsx;
 				else
 					mediaType = Swc4jMediaType.JavaScript;
+			}
+			else if(filePath.endsWith(".jsx")) {
+				mediaType = Swc4jMediaType.Jsx;
 			}
 			URL specifier = Path.of(filePath).toUri().toURL();
 			Swc4jParseOptions options = new Swc4jParseOptions()
@@ -92,6 +99,9 @@ public class TypeScriptFileProcessor {
 				else if(filePath.endsWith(".tsx")) {
 					treeContext = new TsxTreeSitterNgTreeGenerator().generateFrom().stream(is);
 				}
+				else if(filePath.endsWith(".jsx")) {
+					treeContext = new TsxTreeSitterNgTreeGenerator().generateFrom().stream(is);
+				}
 				else {
 					treeContext = new TypeScriptTreeSitterNgTreeGenerator().generateFrom().stream(is);
 				}
@@ -101,7 +111,7 @@ public class TypeScriptFileProcessor {
 				List<ISwc4jAstModuleItem> list = module.getBody();
 				List<UMLImport> imports = new ArrayList<>();
 				String sourceFolder = UMLAdapterUtil.extractSourceFolder(filePath);
-				int extensionLength = filePath.endsWith(".tsx") ? 4 : 3;
+				int extensionLength = filePath.endsWith(".tsx") || filePath.endsWith(".jsx") ? 4 : 3;
 				String moduleName = filePath.contains("/") ? filePath.substring(filePath.lastIndexOf("/") + 1, filePath.length() - extensionLength) : filePath.substring(0, filePath.length() - extensionLength);
 				LocationInfo location = new LocationInfo(sourceFolder, filePath, module.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
 				List<UMLComment> commentList = extractComments(comments, sourceFolder, filePath, fileContent);

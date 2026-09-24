@@ -73,7 +73,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	private boolean importsTestCase;
 	private Optional<UMLType> receiver;
 	private Optional<AbstractExpression> trailingReturnType;
-	
+
 	public UMLOperation(String name, LocationInfo locationInfo, String className) {
 		this.locationInfo = locationInfo;
         this.name = name;
@@ -653,6 +653,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			return thisReturnParameter.equals(otherReturnParameter);
 		else if(thisReturnParameter == null && otherReturnParameter == null)
 			return true;
+		else if(!this.LANG.equals(operation.LANG) && (thisReturnParameter == null) != (otherReturnParameter == null))
+			return true; // allow missing return type when language is different, e.g., Java to Kotlin
 		else
 			return false;
 	}
@@ -806,8 +808,30 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			return false;
 		if(this.isFinal != operation.isFinal)
 			return false;*/
-		if(this.parameters.size() != operation.parameters.size())
-			return false;
+		if(this.getReturnParameter() == null && operation.getReturnParameter() != null && this.getParametersWithoutReturnType().size() == operation.getParametersWithoutReturnType().size()) {
+			int i=0;
+			for(UMLParameter thisParameter : this.getParametersWithoutReturnType()) {
+				UMLParameter otherParameter = operation.getParametersWithoutReturnType().get(i);
+				if(!thisParameter.equals(otherParameter) && !thisParameter.equalsExcludingType(otherParameter))
+					return false;
+				i++;
+			}
+			return true;
+		}
+		else if(this.getReturnParameter() != null && operation.getReturnParameter() == null && this.getParametersWithoutReturnType().size() == operation.getParametersWithoutReturnType().size()) {
+			int i=0;
+			for(UMLParameter thisParameter : this.getParametersWithoutReturnType()) {
+				UMLParameter otherParameter = operation.getParametersWithoutReturnType().get(i);
+				if(!thisParameter.equals(otherParameter) && !thisParameter.equalsExcludingType(otherParameter))
+					return false;
+				i++;
+			}
+			return true;
+		}
+		else {
+			if(this.parameters.size() != operation.parameters.size())
+				return false;
+		}
 		if(!equalTypeParameters(operation))
 			return false;
 		int i=0;
@@ -837,8 +861,30 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			return false;
 		if(this.isFinal != operation.isFinal)
 			return false;*/
-		if(this.parameters.size() != operation.parameters.size())
-			return false;
+		if(this.getReturnParameter() == null && operation.getReturnParameter() != null && this.getParametersWithoutReturnType().size() == operation.getParametersWithoutReturnType().size()) {
+			int i=0;
+			for(UMLParameter thisParameter : this.getParametersWithoutReturnType()) {
+				UMLParameter otherParameter = operation.getParametersWithoutReturnType().get(i);
+				if(!thisParameter.equals(otherParameter) && !thisParameter.equalsExcludingType(otherParameter))
+					return false;
+				i++;
+			}
+			return true;
+		}
+		else if(this.getReturnParameter() != null && operation.getReturnParameter() == null && this.getParametersWithoutReturnType().size() == operation.getParametersWithoutReturnType().size()) {
+			int i=0;
+			for(UMLParameter thisParameter : this.getParametersWithoutReturnType()) {
+				UMLParameter otherParameter = operation.getParametersWithoutReturnType().get(i);
+				if(!thisParameter.equals(otherParameter) && !thisParameter.equalsExcludingType(otherParameter))
+					return false;
+				i++;
+			}
+			return true;
+		}
+		else {
+			if(this.parameters.size() != operation.parameters.size())
+				return false;
+		}
 		if(!equalTypeParameters(operation))
 			return false;
 		int i=0;
@@ -1210,8 +1256,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	public boolean equalsIgnoringVisibility(UMLOperation operation) {
-		boolean thisEmptyBody = this.getBody() == null || this.hasEmptyBody();
-		boolean otherEmptyBody = operation.getBody() == null || operation.hasEmptyBody();
+		boolean thisEmptyBody = emptyBodyOrNoBody();
+		boolean otherEmptyBody = operation.emptyBodyOrNoBody();
 		return this.name.equals(operation.name) &&
 				this.isAbstract == operation.isAbstract &&
 				this.isConst == operation.isConst &&
@@ -1225,8 +1271,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	public boolean equalsIgnoringNameCase(UMLOperation operation) {
-		boolean thisEmptyBody = this.getBody() == null || this.hasEmptyBody();
-		boolean otherEmptyBody = operation.getBody() == null || operation.hasEmptyBody();
+		boolean thisEmptyBody = emptyBodyOrNoBody();
+		boolean otherEmptyBody = operation.emptyBodyOrNoBody();
 		return this.name.equalsIgnoreCase(operation.name) &&
 				this.visibility.equals(operation.visibility) &&
 				this.isAbstract == operation.isAbstract &&
@@ -1247,8 +1293,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		
 		if(o instanceof UMLOperation) {
 			UMLOperation operation = (UMLOperation)o;
-			boolean thisEmptyBody = this.getBody() == null || this.hasEmptyBody();
-			boolean otherEmptyBody = operation.getBody() == null || operation.hasEmptyBody();
+			boolean thisEmptyBody = emptyBodyOrNoBody();
+			boolean otherEmptyBody = operation.emptyBodyOrNoBody();
 			return this.className.equals(operation.className) &&
 				this.name.equals(operation.name) &&
 				this.visibility.equals(operation.visibility) &&
@@ -1265,8 +1311,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	public boolean equalsIgnoringTypeParameters(UMLOperation operation) {
-		boolean thisEmptyBody = this.getBody() == null || this.hasEmptyBody();
-		boolean otherEmptyBody = operation.getBody() == null || operation.hasEmptyBody();
+		boolean thisEmptyBody = emptyBodyOrNoBody();
+		boolean otherEmptyBody = operation.emptyBodyOrNoBody();
 		return this.name.equals(operation.name) &&
 			this.visibility.equals(operation.visibility) &&
 			this.isAbstract == operation.isAbstract &&
@@ -1276,6 +1322,10 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			this.isForwardDeclaration() == operation.isForwardDeclaration() &&
 			thisEmptyBody == otherEmptyBody &&
 			this.getParameterTypeList().equals(operation.getParameterTypeList());
+	}
+
+	private boolean emptyBodyOrNoBody() {
+		return (this.getBody() == null && this.defaultExpression == null) || this.hasEmptyBody();
 	}
 
 	public boolean equalsQualified(UMLOperation operation) {
@@ -1315,7 +1365,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	public int hashCode() {
 		final int prime = 31;
 		int result = 1;
-		boolean thisEmptyBody = this.getBody() == null || this.hasEmptyBody();
+		boolean thisEmptyBody = emptyBodyOrNoBody();
 		result = prime * result + ((className == null) ? 0 : className.hashCode());
 		result = prime * result + (isAbstract ? 1231 : 1237);
 		result = prime * result + (isConst ? 1231 : 1237);
@@ -1718,14 +1768,11 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		return false;
 	}
 
-    public boolean hasMethodSourceAnnotation() {
-        return annotations.stream().anyMatch(MethodSourceAnnotation::isMethodSourceAnnotation);
-    }
+	public boolean hasMethodSourceAnnotation() {
+		return annotations.stream().anyMatch(MethodSourceAnnotation::isMethodSourceAnnotation);
+	}
 
-	public MethodSourceAnnotation getMethodSourceAnnotation(UMLAbstractClass declaringClass) {
-		Optional<UMLAnnotation> maybeAnnotation = annotations.stream().filter(MethodSourceAnnotation::isMethodSourceAnnotation).findFirst();
-		assert maybeAnnotation.isPresent() : "MethodSource annotation not found, you must guard getMethodSourceAnnotation method invocation with hasMethodSourceAnnotation";
-		UMLAnnotation annotation = maybeAnnotation.get();
-		return new MethodSourceAnnotation(annotation, this, declaringClass);
+	public Optional<UMLAnnotation> getMethodSourceAnnotation() {
+		return annotations.stream().filter(MethodSourceAnnotation::isMethodSourceAnnotation).findFirst();
 	}
 }

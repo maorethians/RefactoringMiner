@@ -17,6 +17,7 @@ import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -318,7 +319,29 @@ public abstract class UMLAbstractClassDiff {
 	}
 
 	private void processNestedClasses(UMLOperation operation1, UMLOperation operation2) throws RefactoringMinerTimedOutException {
-		if(operation1.getNestedClasses().size() == operation2.getNestedClasses().size() && operation1.getNestedClasses().toString().equals(operation2.getNestedClasses().toString())) {
+		String name1 = operation1.getNestedClasses().toString();
+		String name2 = operation2.getNestedClasses().toString();
+		boolean condition = name1.equals(name2);
+		if(!condition && name1.contains("module.exports.")) {
+			String updated = name1.replace("module.exports.", ".");
+			if(updated.equals(name2)) {
+				condition = true;
+			}
+			String commonPrefix = PrefixSuffixUtils.longestCommonPrefix(updated, name2);
+			String commonSuffix = PrefixSuffixUtils.longestCommonSuffix(updated, name2);
+			if(!commonPrefix.isEmpty() || !commonSuffix.isEmpty()) {
+				int beginIndexS1 = updated.indexOf(commonPrefix) + commonPrefix.length();
+				int endIndexS1 = updated.lastIndexOf(commonSuffix);
+				String diff1 = beginIndexS1 > endIndexS1 ? "" :	updated.substring(beginIndexS1, endIndexS1);
+				int beginIndexS2 = name2.indexOf(commonPrefix) + commonPrefix.length();
+				int endIndexS2 = name2.lastIndexOf(commonSuffix);
+				String diff2 = beginIndexS2 > endIndexS2 ? "" :	name2.substring(beginIndexS2, endIndexS2);
+				if(diff1.isEmpty() && diff2.isEmpty()) {
+					condition = true;
+				}
+			}
+		}
+		if(operation1.getNestedClasses().size() == operation2.getNestedClasses().size() && condition) {
 			for(int i=0; i<operation1.getNestedClasses().size(); i++) {
 				UMLClass class1 = operation1.getNestedClasses().get(i);
 				UMLClass class2 = operation2.getNestedClasses().get(i);
@@ -532,6 +555,10 @@ public abstract class UMLAbstractClassDiff {
 		for(UMLOperation operation : operations) {
 			if(invocation.matchesOperation(operation, callerOperation, this, modelDiff))
 				return operation;
+			for(UMLOperation nestedOperation : operation.getNestedOperations()) {
+				if(invocation.matchesOperation(nestedOperation, callerOperation, this, modelDiff))
+					return nestedOperation;
+			}
 		}
 		return null;
 	}
@@ -541,6 +568,10 @@ public abstract class UMLAbstractClassDiff {
 		for(UMLOperation operation : operations) {
 			if(invocation.matchesOperation(operation, callerOperation, this, modelDiff))
 				matches.add(operation);
+			for(UMLOperation nestedOperation : operation.getNestedOperations()) {
+				if(invocation.matchesOperation(nestedOperation, callerOperation, this, modelDiff))
+					matches.add(nestedOperation);
+			}
 		}
 		return matches;
 	}
@@ -3098,32 +3129,43 @@ public abstract class UMLAbstractClassDiff {
 						}
 					}
 					if(!matchingMergeCandidateFound && !matchingSplitCandidateFound) {
-						UMLOperationBodyMapper bestMapper = findBestMapper(mapperSet);
-						int size = mapperSet.size();
-						betterMatchForAddedOperation(mapperSet, bestMapper);
-						if(mapperSet.size() > size) {
-							bestMapper = findBestMapper(mapperSet);
+						List<List<String>> parameterValues = getParameterValues(firstMapper.getOperation2());
+						if(firstMapper.getOperation2().hasParameterizedTestAnnotation() && !parameterValues.isEmpty() && !firstMapper.getContainer1().hasParameterizedTestAnnotation()) {
+							checkForParameterizedTest(removedOperations, addedOperations, firstMapper.getOperation2(), mapperSet,
+									firstMapperWithIdenticalMethodName, parameterValues,
+									(UMLOperationBodyMapper mapper) -> {
+										removedOperationIterator.remove();
+									},
+									() -> addedOperations.remove(firstMapper.getOperation2()));
 						}
-						if(bestMapper != null && !modelDiffContainsConflictingMoveOperationRefactoring(bestMapper) && !potentialExtractFixture(bestMapper) && !conflictWithExtractMethodCandidate(bestMapper)) {
-							removedOperation = bestMapper.getOperation1();
-							UMLOperation addedOperation = bestMapper.getOperation2();
-							addedOperations.remove(addedOperation);
-							removedOperationIterator.remove();
-							if(!removedOperation.getName().equals(addedOperation.getName()) &&
-									!(removedOperation.isConstructor() && addedOperation.isConstructor())) {
-								Set<MethodInvocationReplacement> callReferences = getCallReferences(removedOperation, addedOperation);
-								RenameOperationRefactoring rename = new RenameOperationRefactoring(bestMapper, callReferences);
-								refactorings.add(rename);
+						else {
+							UMLOperationBodyMapper bestMapper = findBestMapper(mapperSet);
+							int size = mapperSet.size();
+							betterMatchForAddedOperation(mapperSet, bestMapper);
+							if(mapperSet.size() > size) {
+								bestMapper = findBestMapper(mapperSet);
 							}
-							for(UMLOperationBodyMapper mapper : operationBodyMapperList) {
-								if(containCallToOperation(bestMapper.getContainer1(), mapper.getContainer1()) && containCallToOperation(bestMapper.getContainer2(), mapper.getContainer2())) {
-									Pair<UMLOperationBodyMapper, UMLOperationBodyMapper> pair = Pair.of(bestMapper, mapper);
-									calledBy.add(pair);
+							if(bestMapper != null && !modelDiffContainsConflictingMoveOperationRefactoring(bestMapper) && !potentialExtractFixture(bestMapper) && !conflictWithExtractMethodCandidate(bestMapper)) {
+								removedOperation = bestMapper.getOperation1();
+								UMLOperation addedOperation = bestMapper.getOperation2();
+								addedOperations.remove(addedOperation);
+								removedOperationIterator.remove();
+								if(!removedOperation.getName().equals(addedOperation.getName()) &&
+										!(removedOperation.isConstructor() && addedOperation.isConstructor())) {
+									Set<MethodInvocationReplacement> callReferences = getCallReferences(removedOperation, addedOperation);
+									RenameOperationRefactoring rename = new RenameOperationRefactoring(bestMapper, callReferences);
+									refactorings.add(rename);
 								}
+								for(UMLOperationBodyMapper mapper : operationBodyMapperList) {
+									if(containCallToOperation(bestMapper.getContainer1(), mapper.getContainer1()) && containCallToOperation(bestMapper.getContainer2(), mapper.getContainer2())) {
+										Pair<UMLOperationBodyMapper, UMLOperationBodyMapper> pair = Pair.of(bestMapper, mapper);
+										calledBy.add(pair);
+									}
+								}
+								this.addOperationBodyMapper(bestMapper);
+								consistentMethodInvocationRenames = findConsistentMethodInvocationRenames();
+								processNestedTypeDeclarationStatements(removedOperation, addedOperation);
 							}
-							this.addOperationBodyMapper(bestMapper);
-							consistentMethodInvocationRenames = findConsistentMethodInvocationRenames();
-							processNestedTypeDeclarationStatements(removedOperation, addedOperation);
 						}
 					}
 					else {
@@ -3277,136 +3319,13 @@ public abstract class UMLAbstractClassDiff {
 					if(!matchingMergeCandidateFound && !matchingSplitCandidateFound) {
 						List<List<String>> parameterValues = getParameterValues(addedOperation);
 						if(addedOperation.hasParameterizedTestAnnotation() && !parameterValues.isEmpty() && !firstMapper.getContainer1().hasParameterizedTestAnnotation()) {
-							Set<UMLOperationBodyMapper> filteredMapperSet = new LinkedHashSet<UMLOperationBodyMapper>();
-							int mappersWithIdenticalRightSide = 0;
-							for(UMLOperationBodyMapper mapper : mapperSet) {
-								if(mapper.equalMappingHashCodesT2(mapperSet.first())) {
-									mappersWithIdenticalRightSide++;
-								}
-							}
-							List<String> parameterNames = addedOperation.getParameterNameList();
-							int overallMaxMatchingTestParameters = -1;
-							Map<Integer, Integer> overallMatchingTestParameters = new LinkedHashMap<Integer, Integer>();
-							boolean internalParameterizeTest = false;
-							Set<String> commonTokensInName = null;
-							for(UMLOperationBodyMapper mapper : mapperSet) {
-								Set<String> commonTokens = new LinkedHashSet<>();
-								String[] tokens1 = LeafType.CAMEL_CASE_SPLIT_PATTERN.split(mapper.getContainer1().getName());
-								String[] tokens2 = LeafType.CAMEL_CASE_SPLIT_PATTERN.split(mapper.getContainer2().getName());
-								if(tokens1.length >= 1 && tokens2.length >= 1 && tokens1[0].contains("_") && tokens2[0].contains("_")) {
-									tokens1 = mapper.getContainer1().getName().split("_");
-									tokens2 = mapper.getContainer2().getName().split("_");
-								}
-								boolean commonTokenCheck = false;
-								for(String token1 : tokens1) {
-									for(String token2 : tokens2) {
-										if(token1.equals(token2) || token1.startsWith(token2)) {
-											commonTokens.add(token2);
-										}
-									}
-								}
-								if(commonTokensInName == null) {
-									commonTokensInName = commonTokens;
-									if(Arrays.equals(tokens1, tokens2) || Arrays.equals(commonTokens.toArray(), tokens2) || mappersWithIdenticalRightSide == mapperSet.size()) {
-										commonTokenCheck = true;
-									}
-								}
-								else if(commonTokens.size() > commonTokensInName.size()) {
-									if(commonTokens.containsAll(commonTokensInName)) {
-										commonTokenCheck = true;
-									}
-									else {
-										commonTokensInName = commonTokens;
-										filteredMapperSet.clear();
-									}
-								}
-								else if(commonTokensInName.equals(commonTokens)) {
-									commonTokenCheck = true;
-								}
-								if(mapper.getInternalParameterizeTestMultiMappings().size() > 0) {
-									internalParameterizeTest = true;
-								}
-								Map<Integer, Integer> matchingTestParameters = matchParamsWithReplacements(parameterValues, parameterNames, mapper.getReplacements(), mapper, getOriginalClass());
-								if (matchingTestParameters.isEmpty()) {
-									matchingTestParameters = matchParamsWithRemovedStatements(parameterValues, parameterNames, mapper.getNonMappedLeavesT1());
-								}
-								int max = matchingTestParameters.isEmpty() ? 0 : Collections.max(matchingTestParameters.values());
-								if(max >= 1 && (overallMaxMatchingTestParameters == -1 || max >= overallMaxMatchingTestParameters)) {
-									if(max > overallMaxMatchingTestParameters) {
-										overallMaxMatchingTestParameters = max;
-									}
-									int exactMatchCount = 0;
-									for(Map.Entry<Integer, Integer> entry  : matchingTestParameters.entrySet()) {
-										if(overallMatchingTestParameters.containsKey(entry.getKey()) &&
-												overallMatchingTestParameters.get(entry.getKey()).equals(entry.getValue())) {
-											exactMatchCount++;
-										}
-									}
-									boolean containsAll = exactMatchCount == matchingTestParameters.size() && exactMatchCount > 0;
-									int sizeBefore = overallMatchingTestParameters.size();
-									overallMatchingTestParameters.putAll(matchingTestParameters);
-									if(internalParameterizeTest) {
-										if(overallMatchingTestParameters.size() > sizeBefore) {
-											filteredMapperSet.add(mapper);
-										}
-										else if(overallMatchingTestParameters.size() == sizeBefore && !containsAll) {
-											filteredMapperSet.add(mapper);
-										}
-									}
-									else {
-										filteredMapperSet.add(mapper);
-									}
-								}
-								else if(commonTokenCheck) {
-									filteredMapperSet.add(mapper);
-								}
-								else if(mapper.getContainer1().getName().equals(mapper.getContainer2().getName())) {
-									filteredMapperSet.add(mapper);
-								}
-							}
-							//cluster mappers based on number of mappings and number of total replacements
-							Set<UMLOperationBodyMapper> filteredMapperSet2 = new LinkedHashSet<UMLOperationBodyMapper>();
-							int maxMappings = -1;
-							int minReplacements = Integer.MAX_VALUE;
-							for(UMLOperationBodyMapper mapper : filteredMapperSet) {
-								int mappings = mapper.countMappingsForInternalParameterizedTest();
-								if(mappings > maxMappings) {
-									maxMappings = mappings;
-								}
-								int replacements = mapper.countReplacementsForInternalParameterizedTest();
-								if(replacements < minReplacements) {
-									minReplacements = replacements;
-								}
-								if(mappings == maxMappings && replacements == minReplacements) {
-									filteredMapperSet2.add(mapper);
-								}
-								else if(mappings <= maxMappings && replacements == minReplacements && addedOperations.size() == 1) {
-									filteredMapperSet2.add(mapper);
-								}
-								else if(mappings <= maxMappings && replacements >= minReplacements && mapper.getOperation1().getName().contains(mapper.getOperation2().getName())) {
-									filteredMapperSet2.add(mapper);
-								}
-								else if(mappings == maxMappings && replacements <= 2*minReplacements && mapper.getOperation1().commonNameTokensExceptForOne(mapper.getOperation2())) {
-									filteredMapperSet2.add(mapper);
-								}
-							}
-							for(UMLOperationBodyMapper mapper : filteredMapperSet2) {
-								ParameterizeTestRefactoring refactoring = new ParameterizeTestRefactoring(mapper);
-								refactorings.add(refactoring);
-								mapper.computeRefactoringsWithinBody();
-								refactorings.addAll(mapper.getRefactoringsAfterPostProcessing());
-								detectDataProviderRowLinks(mapper, refactoring, addedOperation, parameterValues, parameterNames);
-								UMLOperation removedOperation = mapper.getOperation1();
-								removedOperations.remove(removedOperation);
-								//check for JUnit migration from @Parameterized.Parameters to @ParameterizedTest
-								mapDataProviderValues(refactoring, addedOperation, removedOperations);
-								if(mapperSet.size() == 1 || (firstMapperWithIdenticalMethodName && filteredMapperSet2.size() == 1)) {
-									this.addOperationBodyMapper(mapper);
-								}
-							}
-							if(overallMaxMatchingTestParameters > -1 || mapperSet.size() == 1 || (firstMapperWithIdenticalMethodName && filteredMapperSet2.size() == 1)) {
-								addedOperationIterator.remove();
-							}
+							checkForParameterizedTest(removedOperations, addedOperations, addedOperation, mapperSet,
+									firstMapperWithIdenticalMethodName, parameterValues,
+									(UMLOperationBodyMapper mapper) -> {
+										UMLOperation removedOperation = mapper.getOperation1();
+										removedOperations.remove(removedOperation);
+									},
+									() -> addedOperationIterator.remove());
 						}
 						else {
 							UMLOperationBodyMapper bestMapper = findBestMapper(mapperSet);
@@ -3525,6 +3444,155 @@ public abstract class UMLAbstractClassDiff {
 		}
 	}
 
+	private void checkForParameterizedTest(List<UMLOperation> removedOperations, List<UMLOperation> addedOperations,
+			UMLOperation addedOperation, TreeSet<UMLOperationBodyMapper> mapperSet,
+			boolean firstMapperWithIdenticalMethodName, List<List<String>> parameterValues,
+			Consumer<UMLOperationBodyMapper> removedOperationHandler,
+			Runnable addedOperationHandler)
+			throws RefactoringMinerTimedOutException {
+		Set<UMLOperationBodyMapper> filteredMapperSet = new LinkedHashSet<UMLOperationBodyMapper>();
+		int mappersWithIdenticalRightSide = 0;
+		for(UMLOperationBodyMapper mapper : mapperSet) {
+			if(mapper.equalMappingHashCodesT2(mapperSet.first())) {
+				mappersWithIdenticalRightSide++;
+			}
+		}
+		List<String> parameterNames = addedOperation.getParameterNameList();
+		int overallMaxMatchingTestParameters = -1;
+		Map<Integer, Integer> overallMatchingTestParameters = new LinkedHashMap<Integer, Integer>();
+		boolean internalParameterizeTest = false;
+		Set<String> commonTokensInName = null;
+		for(UMLOperationBodyMapper mapper : mapperSet) {
+			Set<String> commonTokens = new LinkedHashSet<>();
+			String[] tokens1 = LeafType.CAMEL_CASE_SPLIT_PATTERN.split(mapper.getContainer1().getName());
+			String[] tokens2 = LeafType.CAMEL_CASE_SPLIT_PATTERN.split(mapper.getContainer2().getName());
+			if(tokens1.length >= 1 && tokens2.length >= 1 && tokens1[0].contains("_") && tokens2[0].contains("_")) {
+				tokens1 = mapper.getContainer1().getName().split("_");
+				tokens2 = mapper.getContainer2().getName().split("_");
+			}
+			boolean commonTokenCheck = false;
+			for(String token1 : tokens1) {
+				for(String token2 : tokens2) {
+					if(token1.equals(token2) || token1.startsWith(token2)) {
+						commonTokens.add(token2);
+					}
+				}
+			}
+			if(commonTokensInName == null) {
+				commonTokensInName = commonTokens;
+				if(Arrays.equals(tokens1, tokens2) || Arrays.equals(commonTokens.toArray(), tokens2) || mappersWithIdenticalRightSide == mapperSet.size() || (tokens1.length == tokens2.length && tokens1.length == commonTokens.size()+1)) {
+					commonTokenCheck = true;
+				}
+			}
+			else if(commonTokens.size() > commonTokensInName.size()) {
+				if(commonTokens.containsAll(commonTokensInName)) {
+					commonTokenCheck = true;
+				}
+				else {
+					commonTokensInName = commonTokens;
+					filteredMapperSet.clear();
+				}
+			}
+			else if(commonTokensInName.equals(commonTokens)) {
+				commonTokenCheck = true;
+			}
+			if(mapper.getInternalParameterizeTestMultiMappings().size() > 0) {
+				internalParameterizeTest = true;
+			}
+			Map<Integer, Integer> matchingTestParameters = matchParamsWithReplacements(parameterValues, parameterNames, mapper.getReplacements(), mapper, getOriginalClass());
+			if (matchingTestParameters.isEmpty()) {
+				matchingTestParameters = matchParamsWithRemovedStatements(parameterValues, parameterNames, mapper.getNonMappedLeavesT1());
+			}
+			int max = matchingTestParameters.isEmpty() ? 0 : Collections.max(matchingTestParameters.values());
+			if(max >= 1 && (overallMaxMatchingTestParameters == -1 || max >= overallMaxMatchingTestParameters)) {
+				if(max > overallMaxMatchingTestParameters) {
+					overallMaxMatchingTestParameters = max;
+				}
+				int exactMatchCount = 0;
+				for(Map.Entry<Integer, Integer> entry  : matchingTestParameters.entrySet()) {
+					if(overallMatchingTestParameters.containsKey(entry.getKey()) &&
+							overallMatchingTestParameters.get(entry.getKey()).equals(entry.getValue())) {
+						exactMatchCount++;
+					}
+				}
+				boolean containsAll = exactMatchCount == matchingTestParameters.size() && exactMatchCount > 0;
+				int sizeBefore = overallMatchingTestParameters.size();
+				overallMatchingTestParameters.putAll(matchingTestParameters);
+				if(internalParameterizeTest) {
+					if(overallMatchingTestParameters.size() > sizeBefore) {
+						filteredMapperSet.add(mapper);
+					}
+					else if(overallMatchingTestParameters.size() == sizeBefore && !containsAll) {
+						filteredMapperSet.add(mapper);
+					}
+				}
+				else {
+					filteredMapperSet.add(mapper);
+				}
+			}
+			else if(commonTokenCheck) {
+				filteredMapperSet.add(mapper);
+			}
+			else if(mapper.getContainer1().getName().equals(mapper.getContainer2().getName())) {
+				filteredMapperSet.add(mapper);
+			}
+		}
+		//cluster mappers based on number of mappings and number of total replacements
+		Set<UMLOperationBodyMapper> filteredMapperSet2 = new LinkedHashSet<UMLOperationBodyMapper>();
+		int maxMappings = -1;
+		int minReplacements = Integer.MAX_VALUE;
+		for(UMLOperationBodyMapper mapper : filteredMapperSet) {
+			boolean addedOpetationWithTheSameName = false;
+			for(UMLOperation addedOperation2 : addedOperations) {
+				if(!mapper.getContainer2().equals(addedOperation2) && mapper.getContainer1().getName().equals(addedOperation2.getName())) {
+					addedOpetationWithTheSameName = true;
+					break;
+				}
+			}
+			int mappings = mapper.countMappingsForInternalParameterizedTest();
+			if(mappings > maxMappings) {
+				maxMappings = mappings;
+			}
+			int replacements = mapper.countReplacementsForInternalParameterizedTest();
+			if(replacements < minReplacements) {
+				minReplacements = replacements;
+			}
+			boolean skip = firstMapperWithIdenticalMethodName && !mapper.containsLeafExpressionMapping() && !mapper.getContainer1().getName().equals(mapper.getContainer2().getName());
+			if(mappings == maxMappings && replacements == minReplacements && !skip) {
+				filteredMapperSet2.add(mapper);
+			}
+			else if(mappings <= maxMappings && replacements == minReplacements && addedOperations.size() == 1) {
+				filteredMapperSet2.add(mapper);
+			}
+			else if(mappings <= maxMappings && replacements >= minReplacements && mapper.getOperation1().getName().contains(mapper.getOperation2().getName()) && !addedOpetationWithTheSameName) {
+				filteredMapperSet2.add(mapper);
+			}
+			else if(mappings == maxMappings && replacements <= 2*minReplacements && mapper.getOperation1().commonNameTokensExceptForOne(mapper.getOperation2())) {
+				filteredMapperSet2.add(mapper);
+			}
+		}
+		UMLOperation previouslyRemovedOperation = null;
+		for(UMLOperationBodyMapper mapper : filteredMapperSet2) {
+			ParameterizeTestRefactoring refactoring = new ParameterizeTestRefactoring(mapper);
+			refactorings.add(refactoring);
+			mapper.computeRefactoringsWithinBody();
+			refactorings.addAll(mapper.getRefactoringsAfterPostProcessing());
+			detectDataProviderRowLinks(mapper, refactoring, addedOperation, parameterValues, parameterNames);
+			if(!mapper.getOperation1().equals(previouslyRemovedOperation)) {
+				removedOperationHandler.accept(mapper);
+				previouslyRemovedOperation = mapper.getOperation1();
+			}
+			//check for JUnit migration from @Parameterized.Parameters to @ParameterizedTest
+			mapDataProviderValues(refactoring, addedOperation, removedOperations);
+			if(mapperSet.size() == 1 || (firstMapperWithIdenticalMethodName && filteredMapperSet2.size() == 1)) {
+				this.addOperationBodyMapper(mapper);
+			}
+		}
+		if(overallMaxMatchingTestParameters > -1 || mapperSet.size() == 1 || (firstMapperWithIdenticalMethodName && filteredMapperSet2.size() == 1)) {
+			addedOperationHandler.run();
+		}
+	}
+
 	//resolves the JUnit4 @Parameters DataProvider and JUnit5 @MethodSource DataProvider methods for
 	//a migrated parameterized test, and maps their literal values onto the ParameterizeTestRefactoring.
 	private void mapDataProviderValues(ParameterizeTestRefactoring refactoring, UMLOperation addedOperation, List<UMLOperation> removedOperations) throws RefactoringMinerTimedOutException {
@@ -3538,13 +3606,18 @@ public abstract class UMLAbstractClassDiff {
 		}
 	}
 
-	ParameterizeTestRefactoring.DataProviderOverride resolveDataProviderMapping(UMLOperation addedOperation, List<UMLOperation> removedOperations) throws RefactoringMinerTimedOutException {
-		UMLOperation junit5DataProvider;
+	public ParameterizeTestRefactoring.DataProviderOverride resolveDataProviderMapping(UMLOperation addedOperation, List<UMLOperation> removedOperations) throws RefactoringMinerTimedOutException {
+		UMLOperation junit5DataProvider = null;
 		if(addedOperation.hasMethodSourceAnnotation()) {
-			MethodSourceAnnotation methodSourceAnnotation = addedOperation.getMethodSourceAnnotation(nextClass);
-			junit5DataProvider = methodSourceAnnotation.getResolvedProviderMethod();
-			if(junit5DataProvider == null) {
-				return null;
+			Optional<UMLAnnotation> maybeAnnotation = addedOperation.getMethodSourceAnnotation();
+			if(maybeAnnotation.isPresent()) {
+				SourceAnnotation sourceAnnotation = generateSourceAnnotation(maybeAnnotation.get(), addedOperation);
+				if(sourceAnnotation instanceof MethodSourceAnnotation methodSourceAnnotation) {
+					junit5DataProvider = methodSourceAnnotation.getResolvedProviderMethod();
+					if(junit5DataProvider == null) {
+						return null;
+					}
+				}
 			}
 		}
 		else {
@@ -3827,7 +3900,8 @@ public abstract class UMLAbstractClassDiff {
 	}
 
 	private SourceAnnotation generateSourceAnnotation(UMLAnnotation annotation, UMLOperation addedOperation) {
-		UMLAbstractClass inputDeclaration = nextClass;
+		List<UMLAbstractClass> inputDeclarations = new ArrayList<>();
+		inputDeclarations.add(nextClass);
 		if(annotation.getTypeName().equals("EnumSource") && modelDiff != null) {
 			String enumClassLiteral = null;
 			if (annotation.isMarkerAnnotation() || (Objects.isNull(annotation.getValue()) && Objects.isNull(annotation.getMemberValuePairs().get("value")))) {
@@ -3841,11 +3915,36 @@ public abstract class UMLAbstractClassDiff {
 			if(enumClassLiteral != null) {
 				UMLClass enumClassDeclaration = findEnumDeclaration(modelDiff.getChildModel(), enumClassLiteral);
 				if(enumClassDeclaration != null) {
-					inputDeclaration = enumClassDeclaration;
+					inputDeclarations.add(enumClassDeclaration);
 				}
 			}
 		}
-		SourceAnnotation sourceAnnotation = SourceAnnotation.create(annotation, addedOperation, inputDeclaration);
+		if(annotation.getTypeName().equals("ArgumentsSource") && modelDiff != null) {
+			AbstractExpression value = annotation.isSingleMemberAnnotation() ? annotation.getValue() : null;
+			if(value != null) {
+				List<LeafExpression> typeLiterals = value.getTypeLiterals();
+				if(typeLiterals.size() > 0) {
+					String providerClassLiteral = SourceAnnotation.sanitizeLiteral(typeLiterals.get(0).getString());
+					UMLAbstractClass providerClass = modelDiff.findClassInChildModel(providerClassLiteral);
+					if(providerClass != null) {
+						inputDeclarations.add(providerClass);
+					}
+				}
+			}
+		}
+		if(modelDiff != null && nextClass.getSuperclass() != null) {
+			UMLClassBaseDiff superclassDiff = modelDiff.getUMLClassDiff(nextClass.getSuperclass());
+			if(superclassDiff != null) {
+				inputDeclarations.add(superclassDiff.getNextClass());
+			}
+			else {
+				UMLAbstractClass superclass = modelDiff.findClassInChildModel(nextClass.getSuperclass().getClassType());
+				if(superclass != null) {
+					inputDeclarations.add(superclass);
+				}
+			}
+		}
+		SourceAnnotation sourceAnnotation = SourceAnnotation.create(annotation, addedOperation, inputDeclarations);
 		return sourceAnnotation;
 	}
 
@@ -5521,6 +5620,9 @@ public abstract class UMLAbstractClassDiff {
 		}
 		List<UMLOperation> allAddedOperations = new ArrayList<>(addedOperations);
 		allAddedOperations.addAll(addedNestedOperations);
+		for(UMLOperation addedOp : addedOperations) {
+			allAddedOperations.addAll(addedOp.getNestedOperations());
+		}
 		allAddedOperations.addAll(outerClassAddedOperations);
 		List<UMLOperationBodyMapper> allMappers = getOperationBodyMapperListIncludingNestedMappersInAnonymousClassDiffs();
 		for(UMLOperationBodyMapper mapper : allMappers) {

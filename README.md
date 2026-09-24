@@ -17,6 +17,14 @@
 |<img src="https://upload.wikimedia.org/wikipedia/commons/9/99/Unofficial_JavaScript_logo_2.svg" alt ="JavaScript" width="30"/> | ✅ | ✅ | <ul><li>- [x] swc4j Parser</li><li>- [ ] Validate precision/recall</li></ul> |
 |<img src="https://upload.wikimedia.org/wikipedia/commons/1/18/C_Programming_Language.svg" alt ="C" width="30"/> <img src="https://upload.wikimedia.org/wikipedia/commons/1/18/ISO_C%2B%2B_Logo.svg" alt ="C++" width="30"/> | ✅ | ✅ | <ul><li>- [x] Eclipse CDT Parser</li></ul> |
 
+### Cross-language diff scenarios supported by RefactoringMiner:
+| Languages | Case studies |
+|:-----------------------|:-----------|
+|<img src="https://upload.wikimedia.org/wikipedia/en/3/30/Java_programming_language_logo.svg" alt="Java" height="60"/> → <img src="https://upload.wikimedia.org/wikipedia/commons/7/76/Kotlin_logo_%282021-present%29.svg" alt="Kotlin" width="100"/> | [JetBrains/intellij-community@2f6c8c0](https://github.com/JetBrains/intellij-community/commit/2f6c8c057c950b8eaaea5a48c478c593aa977720)<br>[square/okhttp@34bb125](https://github.com/square/okhttp/commit/34bb12533b56eacd7b03c13b87dede4204d48629)<br>[carlphilipp/chicago-commutes@3638be6](https://github.com/carlphilipp/chicago-commutes/commit/3638be60c8bd144b968f044c0ded218e19697d69)|
+|<img src="https://upload.wikimedia.org/wikipedia/commons/9/99/Unofficial_JavaScript_logo_2.svg" alt ="JavaScript" width="30"/> → <img src="https://upload.wikimedia.org/wikipedia/commons/4/4c/Typescript_logo_2020.svg" alt="TypeScript" width="30"/> | [vuejs/eslint-plugin-vue@7dc4d85](https://github.com/vuejs/eslint-plugin-vue/commit/7dc4d851ef21d5388967ead035e609b5534f1523)<br>[Musish/Musish@8194e52](https://github.com/Musish/Musish/commit/8194e5276709cbbce798262861baf16068520119)<br>[Musish/Musish@eadddbc](https://github.com/Musish/Musish/commit/eadddbcd766ad77b944c9b294cc067ca320c1229)<br>[naver/egjs-view360@9faaf8f](https://github.com/naver/egjs-view360/commit/9faaf8f2b71de1fdba2172eb765b40a1fa2c12db)<br>[iCrawl/yuudachi@e00f37b](https://github.com/iCrawl/yuudachi/commit/e00f37b65545ca82999413f5f38175bfd5dde52e)<br>[algorand/js-algorand-sdk@65ef211](https://github.com/algorand/js-algorand-sdk/commit/65ef211b186ed06110f75ee1afee6ed8cfc16ff6)<br>[zendeskgarden/react-containers@ae86a2d](https://github.com/zendeskgarden/react-containers/commit/ae86a2d419f09e97914e13c6adb77ed77b74dd54)<br>[sqlectron/sqlectron@6d20036](https://github.com/sqlectron/sqlectron/commit/6d20036cf0569b26d0a51a4237b9b23a6ccb5dfd)|
+<img src="https://upload.wikimedia.org/wikipedia/commons/1/18/C_Programming_Language.svg" alt ="C" width="30"/> → <img src="https://upload.wikimedia.org/wikipedia/commons/1/18/ISO_C%2B%2B_Logo.svg" alt ="C++" width="30"/> | [alexbatalov/fallout2-ce@98c6acb](https://github.com/alexbatalov/fallout2-ce/commit/98c6acbf11c434dea899876d8d195acbc0e9b634)<br>|
+
+
 ### Open source projects using RefactoringMiner diff tool for code reviews:
 [<img src="https://www.jabref.org/_nuxt/jabref.4Rtv1swz.svg" alt="JabRef" width="30"/>](https://github.com/JabRef/jabref)
 
@@ -34,6 +42,7 @@ Table of Contents
          * [On-demand diff generation](#on-demand-diff-generation)
          * [Javadoc and comment reformatting](#javadoc-and-comment-reformatting)
       * [MCP server](#mcp-server)
+      * [GitHub action and Chrome extension demo](#github-action-and-chrome-extension-demo)
    * [Refactoring Support History](documentation/history.md#refactoring-support-history) 
    * [Supported Refactoring Types](#supported-refactoring-types)
    * [Contributors](#contributors)
@@ -47,6 +56,7 @@ Table of Contents
    * [How to test RefactoringMiner](documentation/how-to.md#how-to-test-refactoringminer)
    * [How to use RefactoringMiner as a maven dependency](documentation/how-to.md#how-to-use-refactoringminer-as-a-maven-dependency)
    * [How to use RefactoringMiner as a docker image](documentation/how-to.md#how-to-use-refactoringminer-as-a-docker-image)
+   * [How to use RefactoringMiner as a GitHub action](documentation/how-to.md#how-to-use-refactoringminer-as-a-github-action)
    * [How to use RefactoringMiner as a Chrome extension](documentation/how-to.md#how-to-use-refactoringminer-as-a-chrome-extension)
    * [How to run RefactoringMiner from the command line](documentation/how-to.md#how-to-run-refactoringminer-from-the-command-line)
       * [Refactoring detection command line options](documentation/how-to.md#refactoring-detection-command-line-options)
@@ -61,6 +71,7 @@ Table of Contents
       * [With a locally cloned git repository](documentation/api.md#with-a-locally-cloned-git-repository)
       * [With two directories containing source code](documentation/api.md#with-two-directories-containing-source-code)
       * [With file contents as strings](documentation/api.md#with-file-contents-as-strings)
+      * [With a worktree](documentation/api.md#with-a-worktree)
       * [With all information fetched directly from GitHub](documentation/api.md#with-all-information-fetched-directly-from-github)
       * [With each commit in a GitHub Pull request](documentation/api.md#with-each-commit-in-a-github-pull-request)
       * [With a commit range](documentation/api.md#with-a-commit-range)
@@ -71,6 +82,7 @@ Table of Contents
       * [With two directories](documentation/api.md#with-two-directories)
       * [With commit range](documentation/api.md#with-commit-range)
       * [With GitHub Compare](documentation/api.md#with-github-compare)
+      * [With worktree changes](documentation/api.md#with-worktree-changes)
    * [Purity Checker](documentation/purity.md#purity-checker)
    * [Location information for the detected refactorings](documentation/api.md#location-information-for-the-detected-refactorings)
    * [Statement matching information for the detected refactorings](documentation/api.md#statement-matching-information-for-the-detected-refactorings)
@@ -121,6 +133,9 @@ Our tool can match Javadoc and inline comments with formatting changes. You can 
 ## MCP Server
 <img width="2025" height="1226" alt="claude_cli" src="https://github.com/user-attachments/assets/c7c24ab1-ffea-4249-ac38-ac85fd3509f6" />
 <img width="2350" height="1225" alt="copilot_cli" src="https://github.com/user-attachments/assets/03a93833-b2be-48ce-9982-892825e37272" />
+
+## GitHub action and Chrome extension demo
+[![Refactoring Aware Commit Review Chrome Extension](https://img.youtube.com/vi/eLCOk-38T2g/hqdefault.jpg)](http://www.youtube.com/watch?v=eLCOk-38T2g)
 
 # Supported Refactoring Types
 
@@ -259,7 +274,7 @@ Our tool can match Javadoc and inline comments with formatting changes. You can 
    * UI improvements: Merge commit parent selection, `Viewed` toggle in PR diff
 * [Moein Nasr](https://github.com/maorethians): Diff hunk dependency graph + [LLM-assisted code reviewing](https://github.com/maorethians/RefactoringMiner)
 * [Antonino Guarraci](https://github.com/antoguarr): C++ support with Eclipse CDT Parser
-* [Parsa Hejazi](https://github.com/Pogut): [RefactoringMiner Chrome MV3 extension](https://github.com/Pogut/refactoringminer-action-extension) + [RefactoringMiner PR GitHub Action](https://github.com/Pogut/refactoringminer-action-extension)
+* [Parsa Hejazi](https://github.com/Pogut): [RefactoringMiner Chrome MV3 extension](https://github.com/Pogut/refactoringminer-action-extension) + [RefactoringMiner PR GitHub Action](https://github.com/Pogut/RefactoringMiner-action)
 * [Dimitris Kalaitzidis](https://github.com/dkalaitz): Lang AST infrastructure for multi-language extension
 * [Danilo Ferreira e Silva](https://github.com/danilofes): Git repository mining infrastructure + APIs
 * [Pouria Alikhani Fard](https://github.com/pouryafard75): [AST diff](https://github.com/pouryafard75/RM-ASTDiff) + [AST diff benchmark](https://github.com/pouryafard75/DiffBenchmark)

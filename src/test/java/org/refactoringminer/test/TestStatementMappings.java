@@ -1233,6 +1233,10 @@ public class TestStatementMappings {
 		"https://github.com/webauthn4j/webauthn4j.git, e960a741f5259e0127339f0e0af024ccb66100b2, webauthn4j-e960a741f5259e0127339f0e0af024ccb66100b2.txt",
 		"https://github.com/xlate/staedi.git, 97ccd83c5e33aa8b81056dc2ee690fdf8547c952, staedi-97ccd83c5e33aa8b81056dc2ee690fdf8547c952.txt",
 		"https://github.com/xlate/staedi.git, f8b4a918ed30812635aa15e357bec7ef6f3c786d, staedi-f8b4a918ed30812635aa15e357bec7ef6f3c786d.txt",
+		"https://github.com/adorsys/xs2a-adapter.git, a0141f7fdd4a5252a2e5706e0b6589dd0f0e1f13, xs2a-adapter-a0141f7fdd4a5252a2e5706e0b6589dd0f0e1f13.txt",
+		"https://github.com/luhenry/netlib.git, 0762ddcf6a5dc972294fc771a25e9823338fc0ba, netlib-0762ddcf6a5dc972294fc771a25e9823338fc0ba.txt",
+		"https://github.com/A248/LibertyBans.git, 77736f9b95d708f9a5dfc38336ac7a296aad144a, LibertyBans-77736f9b95d708f9a5dfc38336ac7a296aad144a.txt",
+		"https://github.com/usethesource/vallang.git, d58363bc7bcf3f350e55bac9bba3727fa4304385, vallang-d58363bc7bcf3f350e55bac9bba3727fa4304385.txt",
 	})
 	public void testParameterizedTestMappings(String url, String commit, String testResultFileName) throws Exception {
 		GitHistoryRefactoringMinerImpl miner = new GitHistoryRefactoringMinerImpl();
@@ -1250,6 +1254,42 @@ public class TestStatementMappings {
 		List<String> expected = IOUtils.readLines(new FileReader(EXPECTED_PATH + testResultFileName));
 		Assertions.assertTrue(expected.size() == actual.size() && expected.containsAll(actual) && actual.containsAll(expected));
 	}
+
+    @Test
+    public void testGraphhopperArgumentsSourceParameterizedTestMappings() throws Exception {
+        Map<String, String> filePathsByCacheName = Map.of(
+                "graphhopper-AlternativeRouteTest", "core/src/test/java/com/graphhopper/routing/AlternativeRouteTest.java",
+                "graphhopper-CHQueryWithTurnCostsTest", "core/src/test/java/com/graphhopper/routing/CHQueryWithTurnCostsTest.java",
+                "graphhopper-EdgeBasedRoutingAlgorithmTest", "core/src/test/java/com/graphhopper/routing/EdgeBasedRoutingAlgorithmTest.java",
+                "graphhopper-RandomCHRoutingTest", "core/src/test/java/com/graphhopper/routing/RandomCHRoutingTest.java",
+                "graphhopper-RoutingAlgorithmTest", "core/src/test/java/com/graphhopper/routing/RoutingAlgorithmTest.java",
+                "graphhopper-TrafficChangeWithNodeOrderingReusingTest", "core/src/test/java/com/graphhopper/routing/TrafficChangeWithNodeOrderingReusingTest.java",
+                "graphhopper-ShortcutUnpackerTest", "core/src/test/java/com/graphhopper/storage/ShortcutUnpackerTest.java",
+                "graphhopper-MapMatchingTest", "web/src/test/java/com/graphhopper/http/MapMatchingTest.java"
+        );
+        final List<String> actual = new ArrayList<>();
+        Map<String, String> fileContentsBefore = new LinkedHashMap<>();
+        Map<String, String> fileContentsCurrent = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : filePathsByCacheName.entrySet()) {
+            String contentsV1 = FileUtils.readFileToString(new File(EXPECTED_PATH + entry.getKey() + "-v1.txt"));
+            String contentsV2 = FileUtils.readFileToString(new File(EXPECTED_PATH + entry.getKey() + "-v2.txt"));
+            fileContentsBefore.put(entry.getValue(), contentsV1);
+            fileContentsCurrent.put(entry.getValue(), contentsV2);
+        }
+        UMLModel parentUMLModel = GitHistoryRefactoringMinerImpl.createModel(fileContentsBefore, new LinkedHashSet<>());
+        UMLModel currentUMLModel = GitHistoryRefactoringMinerImpl.createModel(fileContentsCurrent, new LinkedHashSet<>());
+        UMLModelDiff modelDiff = parentUMLModel.diff(currentUMLModel);
+        for (Refactoring ref : modelDiff.getRefactorings()) {
+            if(ref instanceof ParameterizeTestRefactoring) {
+                ParameterizeTestRefactoring parameterizeTest = (ParameterizeTestRefactoring)ref;
+                UMLOperationBodyMapper mapper = parameterizeTest.getBodyMapper();
+                mapperInfo(mapper, actual);
+            }
+        }
+        List<String> expected = IOUtils.readLines(new FileReader(EXPECTED_PATH + "graphhopper-fb2a259a6177d78b01c27944c4fdb45baf3412ce.txt"));
+        actual.forEach(System.err::println);
+        Assertions.assertTrue(expected.size() == actual.size() && expected.containsAll(actual) && actual.containsAll(expected));
+    }
 
 	@Test
 	public void testRestructuredStatementMappings3() throws Exception {
@@ -2116,6 +2156,10 @@ public class TestStatementMappings {
             for (Refactoring ref : refactorings) {
                 if(ref instanceof RenameOperationRefactoring) {
                     RenameOperationRefactoring rename = (RenameOperationRefactoring)ref;
+                    mapperInfoWithLeafExpressionMappings(rename.getBodyMapper(), actual);
+                }
+                else if(ref instanceof ParameterizeTestRefactoring) {
+                    ParameterizeTestRefactoring rename = (ParameterizeTestRefactoring)ref;
                     mapperInfoWithLeafExpressionMappings(rename.getBodyMapper(), actual);
                 }
             }
