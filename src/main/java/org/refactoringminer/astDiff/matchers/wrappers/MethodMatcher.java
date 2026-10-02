@@ -1192,6 +1192,10 @@ public class MethodMatcher extends BodyMapperMatcher{
                 new SameModifierMatcher(LANG1, LANG2, LANG1.ABSTRACT).match(srcOperationNode,dstOperationNode,mappingStore);
             if (umlOperationBodyMapper.getOperation1().isSynchronized() && umlOperationBodyMapper.getOperation2().isSynchronized())
                 new SameModifierMatcher(LANG1, LANG2, LANG1.SYNCHRONIZED).match(srcOperationNode,dstOperationNode,mappingStore);
+            if (umlOperationBodyMapper.getOperation1().isSynchronized() && Constants.isCrossLanguage(LANG1, LANG2))
+                JavaToKotlinMigration.handleSynchronizedMapping(mappingStore, srcOperationNode, dstOperationNode, LANG1, LANG2);
+            if (Constants.isCrossLanguage(LANG1, LANG2))
+                JavaToKotlinMigration.handleOverrideMapping(mappingStore, srcOperationNode, dstOperationNode, LANG1, LANG2);
             if (umlOperationBodyMapper.getOperation1().isNative() && umlOperationBodyMapper.getOperation2().isNative())
                 new SameModifierMatcher(LANG1, LANG2, LANG1.NATIVE).match(srcOperationNode,dstOperationNode,mappingStore);
             if (umlOperationBodyMapper.getOperation1().isDefault() && umlOperationBodyMapper.getOperation2().isDefault())
@@ -1654,7 +1658,7 @@ public class MethodMatcher extends BodyMapperMatcher{
             if (srcNode.isIsoStructuralTo(dstNode))
                 mappingStore.addMappingRecursively(srcNode,dstNode);
             else if(Constants.isCrossLanguage(LANG1, LANG2)) {
-                JavaToKotlinMigration.handleTypeMapping(mappingStore, srcNode, dstNode, LANG1, LANG2);
+                JavaToKotlinMigration.handleTypeMapping(mappingStore, srcNode, dstNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
             }
             else if(!srcNode.getType().name.equals(LANG1.METHOD_DECLARATION) && !dstNode.getType().name.equals(LANG2.METHOD_DECLARATION)) {
                 new LeafMatcher(LANG1, LANG2).match(srcNode,dstNode,mappingStore);
@@ -1734,7 +1738,7 @@ public class MethodMatcher extends BodyMapperMatcher{
             if (TreeUtilFunctions.isIsomorphicTo(rightTree, leftTree))
                 mappingStore.addMappingRecursively(leftTree, rightTree);
             else if(Constants.isCrossLanguage(LANG1, LANG2)) {
-                JavaToKotlinMigration.handleParameterMapping(mappingStore, leftTree, rightTree, LANG1, LANG2);
+                JavaToKotlinMigration.handleParameterMapping(mappingStore, leftTree, rightTree, LANG1, LANG2, optimizationData.getDeferredFlattenings());
             }
             else {
                 new LeafMatcher(LANG1, LANG2).match(leftTree,rightTree,mappingStore);

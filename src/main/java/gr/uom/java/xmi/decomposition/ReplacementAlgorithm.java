@@ -1012,6 +1012,7 @@ public class ReplacementAlgorithm {
 				variablesToBeConsidered1.remove(s);
 			}
 		}
+		findReplacements(creations1, convertLambdasToStringSet(lambdas2), replacementInfo, ReplacementType.CLASS_INSTANCE_CREATION_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
 		findReplacements(variablesToBeConsidered1, creations2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
 		findReplacements(creations1, variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
 		findReplacements(variables1, convertLambdasToStringSet(lambdas2), replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
@@ -4988,7 +4989,94 @@ public class ReplacementAlgorithm {
 				}
 			}
 		}
+		if(anonymousArgumentReplacedWithLambdaInParentMapper(statement1, statement2, replacementInfo, operationBodyMapper)) {
+			return replacementInfo.getReplacements();
+		}
 		return null;
+	}
+
+	//inlined method, whose parameter is passed as argument to a call, and the argument at the call site is an anonymous class replaced with lambda in the parent mapper,
+	//i.e., pushExecutorExecute(new NamedRunnable(...) {...}) inlined as pushExecutor.execute(...) {...}, where pushExecutorExecute(namedRunnable) calls pushExecutor.execute(namedRunnable)
+	private static boolean anonymousArgumentReplacedWithLambdaInParentMapper(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
+			ReplacementInfo replacementInfo, UMLOperationBodyMapper operationBodyMapper) {
+		UMLOperationBodyMapper parentMapper = operationBodyMapper.getParentMapper();
+		AbstractCall callSiteInvocation = operationBodyMapper.getOperationInvocation();
+		if(parentMapper == null || callSiteInvocation == null)
+			return false;
+		AbstractCall invocation1 = statement1.invocationCoveringEntireFragment();
+		AbstractCall invocation2 = statement2.invocationCoveringEntireFragment();
+		if(invocation1 == null || invocation2 == null || invocation1.getExpression() == null || !invocation1.getExpression().equals(invocation2.getExpression()))
+			return false;
+		Optional<Map<String, String>> parameterToArgumentMap2 = operationBodyMapper.getParameterToArgumentMap2();
+		if(parameterToArgumentMap2.isPresent() && anonymousArgumentReplacedWithLambdaInExtractedMethod(statement1, invocation1, invocation2, callSiteInvocation, parameterToArgumentMap2.get(), parentMapper, replacementInfo)) {
+			return true;
+		}
+		Optional<Map<String, String>> parameterToArgumentMap = operationBodyMapper.getParameterToArgumentMap1();
+		if(parameterToArgumentMap.isEmpty())
+			return false;
+		for(Refactoring r : parentMapper.getRefactoringsAfterPostProcessing()) {
+			if(r instanceof ReplaceAnonymousWithLambdaRefactoring) {
+				ReplaceAnonymousWithLambdaRefactoring ref = (ReplaceAnonymousWithLambdaRefactoring)r;
+				if(ref.getLambdaOwner().equals(statement2) && callSiteInvocation.getLocationInfo().subsumes(ref.getAnonymousClass().getLocationInfo())) {
+					for(String argument1 : invocation1.arguments()) {
+						String callSiteArgument = parameterToArgumentMap.get().get(argument1);
+						if(callSiteArgument != null && callSiteInvocation.arguments().contains(callSiteArgument)) {
+							replacementInfo.addReplacement(new Replacement(argument1, ref.getLambda().toString(), ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA));
+							if(!invocation1.getName().equals(invocation2.getName())) {
+								replacementInfo.addReplacement(new Replacement(invocation1.getName(), invocation2.getName(), ReplacementType.METHOD_INVOCATION_NAME));
+							}
+							return true;
+						}
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	//extracted method, whose parameter is passed as argument to a call, and the argument at the call site is a lambda replacing an anonymous class in the parent mapper,
+	//i.e., pushExecutor.execute(new NamedRunnable(...) {...}) extracted as pushExecutorExecute(...) {...}, where pushExecutorExecute(name, block) calls pushExecutor.execute(name, block)
+	private static boolean anonymousArgumentReplacedWithLambdaInExtractedMethod(AbstractCodeFragment statement1, AbstractCall invocation1, AbstractCall invocation2,
+			AbstractCall callSiteInvocation, Map<String, String> parameterToArgumentMap2, UMLOperationBodyMapper parentMapper, ReplacementInfo replacementInfo) {
+		List<String> callSiteArguments = callSiteInvocation.arguments();
+		if(callSiteArguments.isEmpty())
+			return false;
+		for(Refactoring r : parentMapper.getRefactoringsAfterPostProcessing()) {
+			if(r instanceof ReplaceAnonymousWithLambdaRefactoring) {
+				ReplaceAnonymousWithLambdaRefactoring ref = (ReplaceAnonymousWithLambdaRefactoring)r;
+				if(ref.getAnonymousOwner().equals(statement1) && callSiteInvocation.getLocationInfo().subsumes(ref.getLambda().getLocationInfo())) {
+					//the lambda is the trailing (last) argument of the call site
+					boolean trailingLambda = callSiteInvocation.getLocationInfo().getEndOffset() == ref.getLambda().getLocationInfo().getEndOffset();
+					String lambdaArgument = trailingLambda ? callSiteArguments.get(callSiteArguments.size() - 1) : ref.getLambda().toString();
+					for(String argument2 : invocation2.arguments()) {
+						String callSiteArgument = parameterToArgumentMap2.get(argument2);
+						if(callSiteArgument != null && callSiteArgument.equals(lambdaArgument)) {
+							//the argument of statement1 containing the anonymous class declaration replaced with the lambda
+							String anonymousArgument1 = null;
+							for(AnonymousClassDeclarationObject anonymous : statement1.getAnonymousClassDeclarations()) {
+								if(anonymous.getLocationInfo().equals(ref.getAnonymousClass().getLocationInfo())) {
+									for(String argument1 : invocation1.arguments()) {
+										if(argument1.contains(anonymous.toString())) {
+											anonymousArgument1 = argument1;
+											break;
+										}
+									}
+									break;
+								}
+							}
+							if(anonymousArgument1 == null)
+								return false;
+							replacementInfo.addReplacement(new Replacement(anonymousArgument1, argument2, ReplacementType.ANONYMOUS_CLASS_DECLARATION_REPLACED_WITH_LAMBDA));
+							if(!invocation1.getName().equals(invocation2.getName())) {
+								replacementInfo.addReplacement(new Replacement(invocation1.getName(), invocation2.getName(), ReplacementType.METHOD_INVOCATION_NAME));
+							}
+							return true;
+						}
+					}
+				}
+			}
+		}
+		return false;
 	}
 
 	private static boolean multipleVariableDeclarationMatch(List<VariableDeclaration> variableDeclarations1, List<VariableDeclaration> variableDeclarations2) {
@@ -6439,10 +6527,10 @@ public class ReplacementAlgorithm {
 					}
 				}
 				if(identical.size() == 1 && nonIdentical.size() > 0) {
-					operationBodyMapper.getMappings().removeAll(nonIdentical);
+					operationBodyMapper.removeAllMappings(nonIdentical);
 				}
 				else if((identical.size() == lambdas1.size() || identical.size() == lambdas2.size()) && nonIdentical.size() > 0) {
-					operationBodyMapper.getMappings().removeAll(nonIdentical);
+					operationBodyMapper.removeAllMappings(nonIdentical);
 				}
 			}
 		}

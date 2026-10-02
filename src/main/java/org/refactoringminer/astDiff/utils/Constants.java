@@ -99,6 +99,8 @@ public class Constants {
 			CONDITIONAL_EXPRESSION = "conditional_expression";
 			NUMBER_LITERAL = "number_literal";
 			LAMBDA_EXPRESSION = "lambda_expression";
+			THIS_EXPRESSION = "this_expression";
+			PARENTHESIZED_EXPRESSION = "parenthesized_expression";
 		}
 		else if(PathFileUtils.isKotlinFile(filePath)) {
 			CLASS_BLOCK = "type_body";
@@ -141,6 +143,8 @@ public class Constants {
 			CONDITIONAL_EXPRESSION = "conditional_expression";
 			NUMBER_LITERAL = "number_literal";
 			LAMBDA_EXPRESSION = "lambda_expression";
+			THIS_EXPRESSION = "this_expression";
+			PARENTHESIZED_EXPRESSION = "parenthesized_expression";
 		}
 		else if(PathFileUtils.isTypeScriptFile(filePath)) {
 			CLASS_BLOCK = "block";
@@ -183,6 +187,8 @@ public class Constants {
 			CONDITIONAL_EXPRESSION = "conditional_expression";
 			NUMBER_LITERAL = "number_literal";
 			LAMBDA_EXPRESSION = "lambda_expression";
+			THIS_EXPRESSION = "this_expression";
+			PARENTHESIZED_EXPRESSION = "parenthesized_expression";
 		}
 		else if(PathFileUtils.isCppFile(filePath) || PathFileUtils.isCFile(filePath)) {
 			CLASS_BLOCK = "field_declaration_list";
@@ -225,6 +231,8 @@ public class Constants {
 			CONDITIONAL_EXPRESSION = "conditional_expression";
 			NUMBER_LITERAL = "number_literal";
 			LAMBDA_EXPRESSION = "lambda_expression";
+			THIS_EXPRESSION = "this_expression";
+			PARENTHESIZED_EXPRESSION = "parenthesized_expression";
 		}
 		else {
 			// Java values as default
@@ -268,6 +276,8 @@ public class Constants {
 			CONDITIONAL_EXPRESSION = "ConditionalExpression";
 			NUMBER_LITERAL = "NumberLiteral";
 			LAMBDA_EXPRESSION = "LambdaExpression";
+			THIS_EXPRESSION = "ThisExpression";
+			PARENTHESIZED_EXPRESSION = "ParenthesizedExpression";
 		}
 	}
 
@@ -353,7 +363,7 @@ public class Constants {
     public final String WHILE_STATEMENT;
     public final String CONDITIONAL_EXPRESSION;
     public final String CAST_EXPRESSION = "CastExpression";
-    public final String THIS_EXPRESSION = "ThisExpression";
+    public final String THIS_EXPRESSION;
 
     public final String INFIX_EXPRESSION = "InfixExpression";
     public final String LAMBDA_EXPRESSION;
@@ -376,6 +386,8 @@ public class Constants {
     public final String TEXT_ELEMENT = "TextElement";
     public final String TAG_ELEMENT = "TagElement";
     public final String TAG_NAME = "TAG_NAME";
+    public final String METHOD_REF = "MethodRef";
+    public final String MEMBER_REF = "MemberRef";
 
     public final String SIMPLE_TYPE = "SimpleType";
     public final String PARAMETERIZED_TYPE = "ParameterizedType";
@@ -471,6 +483,9 @@ public class Constants {
     public final String CONTROL_STRUCTURE_BODY = "control_structure_body";
     public final String CLASS_PARAMETER = "class_parameter";
     public final String USER_TYPE = "user_type";
+    public final String NULLABLE_TYPE = "nullable_type";
+    public final String KOTLIN_POSTFIX_EXPRESSION = "postfix_expression";
+    public final String NON_NULL_ASSERTION_OPERATOR = "non-null_assertion_operator";
     public final String ERROR = "ERROR";
     public final String ENUM_ENTRY = "enum_entry";
     public final String JUMP_EXPRESSION = "jump_expression";
@@ -503,9 +518,11 @@ public class Constants {
     public final String AT = "at";
     public final String PACKAGE = "package";
     public final String TYPE_ARGUMENTS = "type_arguments";
+    public final String TYPE_PROJECTION = "type_projection";
     public final String STRING_CONTENT = "string_content";
     public final String LAMBDA_PARAMETERS = "lambda_parameters";
     public final String VALUE_ARGUMENT = "value_argument";
+    public final String BINDING_PATTERN_KIND = "binding_pattern_kind";
 
     //TypeScript specific
     public final String FOR_IN_STATEMENT = "for_in_statement";
@@ -521,7 +538,7 @@ public class Constants {
     public final String TYPE_KEYWORD = "type";
     public final String RETURN_KEYWORD = "return";
     public final String INTERFACE_KEYWORD = "interface";
-    public final String PARENTHESIZED_EXPRESSION = "parenthesized_expression";
+    public final String PARENTHESIZED_EXPRESSION;
     public final String LEXICAL_DECLARATION = "lexical_declaration";
     public final String SEMICOLON = ";";
     public final String COLON = ":";

@@ -326,7 +326,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		if(body1 != null && body2 != null) {
 			List<AbstractCodeFragment> leaves1 = new ArrayList<>(body1.getCompositeStatement().getLeaves());
 			List<AbstractCodeFragment> leaves2 = new ArrayList<>(body2.getCompositeStatement().getLeaves());
-			List<CompositeStatementObject> innerNodes1 = new ArrayList<>(body2.getCompositeStatement().getInnerNodes());
+			List<CompositeStatementObject> innerNodes1 = new ArrayList<>(body1.getCompositeStatement().getInnerNodes());
 			List<CompositeStatementObject> innerNodes2 = new ArrayList<>(body2.getCompositeStatement().getInnerNodes());
 			resetNodes(leaves1);
 			resetNodes(leaves2);
@@ -1179,7 +1179,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					m.temporaryVariableAssignment(refactorings, leaves2, parentMapper != null);
 				}
 				else {
-					this.mappings.remove(m);
+					this.removeMapping(m);
 					if(!leaves2.contains(m.getFragment2())) {
 						leaves2.add(m.getFragment2());
 					}
@@ -2388,6 +2388,30 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			}
 		}
 		return false;
+	}
+
+	public UMLOperationBodyMapper(AbstractCodeFragment fragment2,
+			VariableDeclarationContainer container1, VariableDeclarationContainer container2,
+			UMLAbstractClassDiff classDiff, UMLModelDiff modelDiff) throws RefactoringMinerTimedOutException {
+		this.classDiff = classDiff;
+		this.modelDiff = modelDiff;
+		this.container1 = container1;
+		this.container2 = container2;
+		this.LANG1 = PathFileUtils.getLang(container1.getLocationInfo().getFilePath());
+		this.LANG2 = PathFileUtils.getLang(container2.getLocationInfo().getFilePath());
+		this.mappings = new LinkedHashSet<AbstractCodeMapping>();
+		this.nonMappedLeavesT1 = new ArrayList<AbstractCodeFragment>();
+		this.nonMappedLeavesT2 = new ArrayList<AbstractCodeFragment>();
+		this.nonMappedInnerNodesT1 = new ArrayList<CompositeStatementObject>();
+		this.nonMappedInnerNodesT2 = new ArrayList<CompositeStatementObject>();
+		this.parameterNameList1 = container1.getParameterNameList();
+		this.parameterNameList2 = container2.getParameterNameList();
+		if(container1.getBody() != null && fragment2 != null) {
+			List<AbstractCodeFragment> leaves1 = new ArrayList<>(container1.getBody().getCompositeStatement().getLeaves());
+			List<AbstractCodeFragment> leaves2 = new ArrayList<AbstractCodeFragment>();
+			leaves2.add(fragment2);
+			processLeaves(leaves1, leaves2, new LinkedHashMap<String, String>(), false);
+		}
 	}
 
 	public UMLOperationBodyMapper(AbstractCodeFragment fragment1, AbstractCodeFragment fragment2,
@@ -9611,7 +9635,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					else {
 						List<AbstractCodeMapping> mappings = new ArrayList<>(this.mappings);
 						for(int i = mappingsBefore; i < mappings.size(); i++) {
-							this.mappings.remove(mappings.get(i));
+							this.removeMapping(mappings.get(i));
 						}
 					}
 				}
@@ -9708,7 +9732,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					else {
 						List<AbstractCodeMapping> mappings = new ArrayList<>(this.mappings);
 						for(int i = mappingsBefore; i < mappings.size(); i++) {
-							this.mappings.remove(mappings.get(i));
+							this.removeMapping(mappings.get(i));
 						}
 					}
 				}
@@ -11658,7 +11682,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		}
 	}
 
-	private void removeAllMappings(Set<AbstractCodeMapping> mappings) {
+	public void removeAllMappings(Set<AbstractCodeMapping> mappings) {
 		this.mappings.removeAll(mappings);
 		for(AbstractCodeMapping mapping : mappings) {
 			mappingHashcodesT1.remove(mapping.getFragment1().hashCode());

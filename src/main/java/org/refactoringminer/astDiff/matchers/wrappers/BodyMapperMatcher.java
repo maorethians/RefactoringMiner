@@ -85,15 +85,73 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         Set<AbstractCodeMapping> mappingSet = bodyMapper.getMappings();
         ArrayList<AbstractCodeMapping> mappings = new ArrayList<>(mappingSet);
         for (AbstractCodeMapping abstractCodeMapping : mappings) {
-            if (abstractCodeMapping instanceof LeafMapping)
-                processLeafMapping(srcTree,dstTree,abstractCodeMapping,mappingStore, isPartOfExtractedMethod);
+            if (abstractCodeMapping instanceof LeafMapping) {
+                if (optimizationData.getProcessedLeafMappings().add(abstractCodeMapping))
+                    processLeafMapping(srcTree,dstTree,abstractCodeMapping,mappingStore, isPartOfExtractedMethod);
+            }
             else if (abstractCodeMapping instanceof CompositeStatementObjectMapping)
                 processCompositeMapping(srcTree,dstTree,abstractCodeMapping,mappingStore);
         }
+        if (Constants.isCrossLanguage(LANG1, LANG2) && bodyMapper.getOperationInvocation() != null)
+            processAnonymousArgumentReplacedWithLambda(srcTree, dstTree, bodyMapper, mappingStore);
         if (isPartOfExtractedMethod)
             new JavaDocMatcher(optimizationData, bodyMapper.getContainer1().getJavadoc(), bodyMapper.getContainer2().getJavadoc(), bodyMapper.getJavadocDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
         new CommentMatcher(optimizationData, bodyMapper.getCommentListDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
 
+    }
+
+    //post-processing of the call site of the inlined method, whose argument is an anonymous class replaced with a lambda,
+    //i.e., pushExecutorExecute(new NamedRunnable("OkHttp %s", connectionName) {...}) inlined as pushExecutor.execute("OkHttp $connectionName") {...}
+    private void processAnonymousArgumentReplacedWithLambda(Tree srcTree, Tree dstTree, UMLOperationBodyMapper bodyMapper, ExtendedMultiMappingStore mappingStore) {
+        //the extracted method mapper shares container1 with its parent mapper, while the call site is in container2 of the parent mapper
+        if (bodyMapper.getParentMapper() != null && bodyMapper.getContainer1().equals(bodyMapper.getParentMapper().getContainer1())) {
+            processAnonymousArgumentReplacedWithLambdaInExtractedMethod(srcTree, dstTree, bodyMapper, mappingStore);
+            return;
+        }
+        Tree call1 = TreeUtilFunctions.findByLocationInfo(srcTree, bodyMapper.getOperationInvocation().getLocationInfo(), LANG1, LANG1.METHOD_INVOCATION);
+        if (call1 == null)
+            return;
+        for (AbstractCodeMapping mapping : bodyMapper.getMappings()) {
+            if (mapping instanceof LeafMapping && mapping.getReplacements().stream().anyMatch(r -> r.getType().equals(Replacement.ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA))) {
+                Tree dstStatementNode = TreeUtilFunctions.findByLocationInfo(dstTree, mapping.getFragment2().getLocationInfo(), LANG2);
+                if (dstStatementNode != null) {
+                    JavaToKotlinMigration.handleAnonymousArgumentReplacedWithLambda(mappingStore, call1, dstStatementNode, LANG1, LANG2);
+                }
+            }
+        }
+    }
+
+    //post-processing of the call site of the extracted method, whose argument is a lambda replacing an anonymous class passed as argument in the extracted statement,
+    //i.e., pushExecutor.execute(new NamedRunnable("OkHttp %s", connectionName) {...}) extracted as pushExecutorExecute("OkHttp $connectionName") {...}
+    private void processAnonymousArgumentReplacedWithLambdaInExtractedMethod(Tree srcTree, Tree dstTree, UMLOperationBodyMapper bodyMapper, ExtendedMultiMappingStore mappingStore) {
+        Tree callSite2 = TreeUtilFunctions.findByLocationInfo(dstTree, bodyMapper.getOperationInvocation().getLocationInfo(), LANG2, LANG2.METHOD_INVOCATION);
+        if (callSite2 == null)
+            return;
+        for (AbstractCodeMapping mapping : bodyMapper.getMappings()) {
+            if (mapping instanceof LeafMapping && mapping.getReplacements().stream().anyMatch(r -> r.getType().equals(Replacement.ReplacementType.ANONYMOUS_CLASS_DECLARATION_REPLACED_WITH_LAMBDA))) {
+                AbstractCall invocation1 = mapping.getFragment1().invocationCoveringEntireFragment();
+                if (invocation1 == null)
+                    continue;
+                Tree call1 = TreeUtilFunctions.findByLocationInfo(srcTree, invocation1.getLocationInfo(), LANG1, LANG1.METHOD_INVOCATION);
+                Tree dstStatementNode = TreeUtilFunctions.findByLocationInfo(dstTree, mapping.getFragment2().getLocationInfo(), LANG2);
+                if (call1 != null && dstStatementNode != null) {
+                    JavaToKotlinMigration.handleAnonymousArgumentReplacedWithLambdaInExtractedMethod(mappingStore, call1, dstStatementNode, callSite2, LANG1, LANG2);
+                }
+            }
+        }
+    }
+
+    private static Tree findIfStatementWithinRange(Tree tree, Tree statementNode, LocationInfo locationInfo, Constants LANG) {
+        if (statementNode == null || !locationInfo.getCodeElementType().equals(CodeElementType.IF_STATEMENT) ||
+                statementNode.getType().name.equals(LANG.IF_STATEMENT) || statementNode.getType().name.equals(LANG.CLASS_BLOCK))
+            return statementNode;
+        //the node spans exactly the if statement, i.e., Kotlin control_structure_body of else wrapping the nested if in else if
+        if (statementNode.getPos() == locationInfo.getStartOffset() && statementNode.getEndPos() == locationInfo.getEndOffset())
+            return statementNode;
+        Tree ifStatementNode = TreeUtilFunctions.findByLocationInfo(tree, locationInfo, LANG, LANG.IF_STATEMENT);
+        if (ifStatementNode != null && ifStatementNode.getType().name.equals(LANG.IF_STATEMENT) && ifStatementNode.getPos() == locationInfo.getStartOffset())
+            return ifStatementNode;
+        return statementNode;
     }
 
     private void processCompositeMapping(Tree srcTree, Tree dstTree, AbstractCodeMapping abstractCodeMapping, ExtendedMultiMappingStore mappingStore) {
@@ -150,6 +208,10 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 dstStatementNode.getChild(0).getType().name.equals(LANG2.IF_STATEMENT)) {
             dstStatementNode = dstStatementNode.getChild(0);
         }
+        //handle misparsed if statement, which is not the outermost node in its range, i.e., Kotlin if (...) { ... call().second += x } else { ... }
+        //is parsed by tree-sitter as assignment -> [directly_assignable_expression -> if_expression, +=, x], and the else branch becomes an ERROR node
+        srcStatementNode = findIfStatementWithinRange(srcTree, srcStatementNode, srcLocationInfo, LANG1);
+        dstStatementNode = findIfStatementWithinRange(dstTree, dstStatementNode, dstLocationInfo, LANG2);
         //handle case where the parent block has only a single statement and the locationInfo of compositeStatement is identical with the parent block locationInfo in Python
         //the solution uses reflection to obtain the value of Constants value from the CodeElementType constant name
         if (srcStatementNode != null && srcStatementNode.getType().name.equals(LANG1.CLASS_BLOCK) && !srcLocationInfo.getCodeElementType().equals(CodeElementType.BLOCK)) {
@@ -168,7 +230,28 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             }
         }
         if(Constants.isCrossLanguage(LANG1, LANG2) && dstStatementNode.getType().name.equals(LANG2.STATEMENTS) && abstractCodeMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.TRY_STATEMENT)) {
+            Tree statements2 = dstStatementNode;
             dstStatementNode = TreeUtilFunctions.findByLocationInfo(dstTree,dstLocationInfo, LANG2, LANG2.TRY_STATEMENT);
+            //ignoreIoExceptions {} is modeled as a try statement, and it is the only statement of the enclosing statements with the same location
+            if((dstStatementNode == null || !dstStatementNode.getType().name.equals(LANG2.TRY_STATEMENT)) && statements2.getChildren().size() == 1 &&
+                    statements2.getChild(0).getType().name.equals(LANG2.METHOD_INVOCATION)) {
+                dstStatementNode = statements2.getChild(0);
+            }
+        }
+        //the statements of a lambda aligned with a Java Block are moved to the lambda_literal including the braces of the block, i.e., synchronized(this) {...}
+        if(Constants.isCrossLanguage(LANG1, LANG2) && dstStatementNode != null && dstLocationInfo.getCodeElementType().equals(CodeElementType.BLOCK) &&
+                !dstStatementNode.getType().name.equals(LANG2.STATEMENTS) &&
+                dstStatementNode.getParent() != null && dstStatementNode.getParent().getType().name.equals(LANG2.LAMBDA_LITERAL)) {
+            Tree lambdaLiteral2 = dstStatementNode.getParent();
+            Tree first2 = lambdaLiteral2.getChild(0);
+            Tree last2 = lambdaLiteral2.getChild(lambdaLiteral2.getChildren().size() - 1);
+            if(first2.getPos() == dstLocationInfo.getStartOffset() && last2.getEndPos() == dstLocationInfo.getEndOffset()) {
+                //the lambda_literal matching the body of an anonymous class method is mapped to the anonymous class, and the method body is deleted
+                Set<Tree> lambdaSrcs = mappingStore.getSrcs(lambdaLiteral2);
+                if(lambdaSrcs != null && srcStatementNode != null && !lambdaSrcs.contains(srcStatementNode))
+                    return;
+                dstStatementNode = lambdaLiteral2;
+            }
         }
         if (dstStatementNode != null && dstStatementNode.getType().name.equals(LANG2.CLASS_BLOCK) && !dstLocationInfo.getCodeElementType().equals(CodeElementType.BLOCK)) {
             String astTypeName = dstLocationInfo.getCodeElementType().name();
@@ -239,34 +322,19 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         }
                     }
                 }
+                if(compositeStatementObjectMapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.TRY_STATEMENT) &&
+                        compositeStatementObjectMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.TRY_STATEMENT) &&
+                        srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) &&
+                        srcStatementNode.getChildren().size() > 1 && dstStatementNode.getChildren().size() > 1) {
+                    //handle ignoreIoException {} in Kotlin to Kotlin
+                    processCallExpressionsModeledAsCompositeStatements(mappingStore, srcStatementNode, dstStatementNode);
+                }
                 if(compositeStatementObjectMapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.SYNCHRONIZED_STATEMENT) &&
                         compositeStatementObjectMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.SYNCHRONIZED_STATEMENT) &&
                         srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) &&
                         srcStatementNode.getChildren().size() > 1 && dstStatementNode.getChildren().size() > 1) {
-                    if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
-                        mappingStore.addMapping(srcStatementNode.getParent(), dstStatementNode.getParent());
-                    }
-                    mappingStore.addMappingRecursively(srcStatementNode.getChild(0), dstStatementNode.getChild(0));
-                    Tree suffix1 = srcStatementNode.getChild(1);
-                    Tree suffix2 = dstStatementNode.getChild(1);
-                    if(suffix1.getType().name.equals(LANG1.CALL_SUFFIX) && suffix2.getType().name.equals(LANG2.CALL_SUFFIX)) {
-                        mappingStore.addMapping(suffix1, suffix2);
-                        if(suffix1.getChildren().size() > 0 && suffix2.getChildren().size() > 0 &&
-                                suffix1.getChild(0).getType().name.equals(LANG1.ANNOTATED_LAMBDA) && suffix2.getChild(0).getType().name.equals(LANG2.ANNOTATED_LAMBDA)) {
-                            mappingStore.addMapping(suffix1.getChild(0), suffix2.getChild(0));
-                            if(suffix1.getChild(0).getChildren().size() > 0 && suffix2.getChild(0).getChildren().size() > 0 &&
-                                    suffix1.getChild(0).getChild(0).getType().name.equals(LANG1.LAMBDA_LITERAL) &&
-                                    suffix2.getChild(0).getChild(0).getType().name.equals(LANG2.LAMBDA_LITERAL)) {
-                                Tree lambdaLiteral1 = suffix1.getChild(0).getChild(0);
-                                Tree lambdaLiteral2 = suffix2.getChild(0).getChild(0);
-                                mappingStore.addMapping(lambdaLiteral1, lambdaLiteral2);
-                                if(lambdaLiteral1.getChildren().size() > 0 && lambdaLiteral2.getChildren().size() > 0 &&
-                                        lambdaLiteral1.getChild(0).getType().name.equals(LANG1.STATEMENTS) && lambdaLiteral2.getChild(0).getType().name.equals(LANG2.STATEMENTS)) {
-                                    mappingStore.addMapping(lambdaLiteral1.getChild(0), lambdaLiteral2.getChild(0));
-                                }
-                            }
-                        }
-                    }
+                    //handle synchronized(lock) {} in Kotlin to Kotlin
+                    processCallExpressionsModeledAsCompositeStatements(mappingStore, srcStatementNode, dstStatementNode);
                 }
                 if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
                     Tree parent1 = srcStatementNode.getParent();
@@ -290,9 +358,12 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 }
             }
             else if(Constants.isCrossLanguage(LANG1, LANG2)) {
-                mappingStore.addMapping(srcStatementNode, dstStatementNode);
-                JavaToKotlinMigration.handleCompositeMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2);
-                return;
+                boolean skip = srcStatementNode.getType().name.equals(LANG1.BLOCK) && dstStatementNode.getType().name.equals(LANG2.STATEMENTS) && !dstStatementNode.getParent().getType().name.equals(LANG2.LAMBDA_LITERAL);
+                if(!skip) {
+                    mappingStore.addMapping(srcStatementNode, dstStatementNode);
+                    JavaToKotlinMigration.handleCompositeMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+                    return;
+                }
             }
             if (srcStatementNode.getType().name.equals(LANG1.IF_STATEMENT) && dstStatementNode.getType().name.equals(LANG2.IF_STATEMENT)) {
                 if(srcStatementNode.getParent().getType().name.equals(LANG1.FIELD_DECLARATION) && dstStatementNode.getParent().getType().name.equals(LANG2.FIELD_DECLARATION)) {
@@ -775,6 +846,34 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         }
     }
 
+    private void processCallExpressionsModeledAsCompositeStatements(ExtendedMultiMappingStore mappingStore,
+            Tree srcStatementNode, Tree dstStatementNode) {
+        if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
+            mappingStore.addMapping(srcStatementNode.getParent(), dstStatementNode.getParent());
+        }
+        mappingStore.addMappingRecursively(srcStatementNode.getChild(0), dstStatementNode.getChild(0));
+        Tree suffix1 = srcStatementNode.getChild(1);
+        Tree suffix2 = dstStatementNode.getChild(1);
+        if(suffix1.getType().name.equals(LANG1.CALL_SUFFIX) && suffix2.getType().name.equals(LANG2.CALL_SUFFIX)) {
+            mappingStore.addMapping(suffix1, suffix2);
+            if(suffix1.getChildren().size() > 0 && suffix2.getChildren().size() > 0 &&
+                    suffix1.getChild(0).getType().name.equals(LANG1.ANNOTATED_LAMBDA) && suffix2.getChild(0).getType().name.equals(LANG2.ANNOTATED_LAMBDA)) {
+                mappingStore.addMapping(suffix1.getChild(0), suffix2.getChild(0));
+                if(suffix1.getChild(0).getChildren().size() > 0 && suffix2.getChild(0).getChildren().size() > 0 &&
+                        suffix1.getChild(0).getChild(0).getType().name.equals(LANG1.LAMBDA_LITERAL) &&
+                        suffix2.getChild(0).getChild(0).getType().name.equals(LANG2.LAMBDA_LITERAL)) {
+                    Tree lambdaLiteral1 = suffix1.getChild(0).getChild(0);
+                    Tree lambdaLiteral2 = suffix2.getChild(0).getChild(0);
+                    mappingStore.addMapping(lambdaLiteral1, lambdaLiteral2);
+                    if(lambdaLiteral1.getChildren().size() > 0 && lambdaLiteral2.getChildren().size() > 0 &&
+                            lambdaLiteral1.getChild(0).getType().name.equals(LANG1.STATEMENTS) && lambdaLiteral2.getChild(0).getType().name.equals(LANG2.STATEMENTS)) {
+                        mappingStore.addMapping(lambdaLiteral1.getChild(0), lambdaLiteral2.getChild(0));
+                    }
+                }
+            }
+        }
+    }
+
     public static void matchBlocks(Tree srcStatementNode, Tree dstStatementNode, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
         Pair<Tree, Tree> matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.BLOCK, LANG2.BLOCK);
         if (matched != null)
@@ -990,6 +1089,9 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         else if(srcStatementNode != null && srcStatementNode.getType().name.equals(LANG1.RETURN_KEYWORD)) {
             srcStatementNode = srcStatementNode.getParent();
         }
+        else if(srcStatementNode != null && srcStatementNode.getType().name.equals(LANG1.BINDING_PATTERN_KIND)) {
+            srcStatementNode = srcStatementNode.getParent();
+        }
         else if(srcStatementNode != null && srcStatementNode.getType().name.equals(LANG1.CALL_SUFFIX)) {
             srcStatementNode = srcStatementNode.getParent();
             if(srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && srcStatementNode.getParent().getType().name.equals(LANG1.NAVIGATION_EXPRESSION) &&
@@ -1047,6 +1149,9 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             dstStatementNode = dstStatementNode.getParent();
         }
         else if(dstStatementNode != null && dstStatementNode.getType().name.equals(LANG2.RETURN_KEYWORD)) {
+            dstStatementNode = dstStatementNode.getParent();
+        }
+        else if(dstStatementNode != null && dstStatementNode.getType().name.equals(LANG2.BINDING_PATTERN_KIND)) {
             dstStatementNode = dstStatementNode.getParent();
         }
         else if(dstStatementNode != null && dstStatementNode.getType().name.equals(LANG2.CALL_SUFFIX)) {
@@ -1124,7 +1229,14 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 if(matched != null) {
                     mappingStore.addMapping(matched.first, matched.second);
                 }
-                matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode,LANG1.METHOD_INVOCATION,LANG2.METHOD_INVOCATION);
+                if(srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+                    //the statements are method invocations themselves, i.e., Kotlin calls with trailing lambda
+                    matched = new Pair<>(srcStatementNode, dstStatementNode);
+                    processCallWithTrailingLambda(srcStatementNode, dstStatementNode, mappingStore);
+                }
+                else {
+                    matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode,LANG1.METHOD_INVOCATION,LANG2.METHOD_INVOCATION);
+                }
                 if(matched != null) {
                     mappingStore.addMapping(matched.first, matched.second);
                     Pair<Tree,Tree> argument_lists = Helpers.findPairOfType(matched.first, matched.second,LANG1.ARGUMENT_LIST,LANG2.ARGUMENT_LIST);
@@ -1265,8 +1377,13 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 }
             }
         else if(Constants.isCrossLanguage(LANG1, LANG2)) {
-            mappingStore.addMapping(srcStatementNode, dstStatementNode);
-            JavaToKotlinMigration.handleLeafMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2);
+            //an assignment moved to the initializer of the assigned field, i.e., the statement client = builder.client; in the constructor
+            boolean assignmentToInitializer = leafMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_INITIALIZER) &&
+                    JavaToKotlinMigration.handleAssignmentToInitializerMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+            if(!assignmentToInitializer) {
+                mappingStore.addMapping(srcStatementNode, dstStatementNode);
+                JavaToKotlinMigration.handleLeafMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+            }
         }
         if(srcStatementNode.getParent() != null && srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent() != null && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
             mappingStore.addMapping(srcStatementNode.getParent(), dstStatementNode.getParent());
@@ -1296,6 +1413,42 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         }
         if (!abstractCodeMapping.getRefactorings().isEmpty()) {
             leafMappingRefactoringAwareness(dstTree, abstractCodeMapping, mappingStore);
+        }
+    }
+
+    //Kotlin call_expression -> [callee, call_suffix -> [value_arguments?, annotated_lambda -> lambda_literal -> [lambda_parameters?, arrow?, statements]]],
+    //match everything except the body of the lambda, which is matched by the lambda mappers, i.e., list.forEachIndexed { index, item -> ... }
+    private void processCallWithTrailingLambda(Tree srcStatementNode, Tree dstStatementNode, ExtendedMultiMappingStore mappingStore) {
+        Tree suffix1 = TreeUtilFunctions.findChildByType(srcStatementNode, LANG1.CALL_SUFFIX);
+        Tree suffix2 = TreeUtilFunctions.findChildByType(dstStatementNode, LANG2.CALL_SUFFIX);
+        if(suffix1 == null || suffix2 == null)
+            return;
+        //the callee, i.e., list.forEachIndexed
+        Tree callee1 = srcStatementNode.getChild(0);
+        Tree callee2 = dstStatementNode.getChild(0);
+        if(callee1 != suffix1 && callee2 != suffix2) {
+            new LeafMatcher(LANG1, LANG2).match(callee1, callee2, mappingStore);
+        }
+        mappingStore.addMapping(suffix1, suffix2);
+        Pair<Tree,Tree> arguments = Helpers.findPairOfType(suffix1, suffix2, LANG1.METHOD_INVOCATION_ARGUMENTS, LANG2.METHOD_INVOCATION_ARGUMENTS);
+        if(arguments != null) {
+            new LeafMatcher(LANG1, LANG2).match(arguments.first, arguments.second, mappingStore);
+        }
+        Pair<Tree,Tree> annotatedLambdas = Helpers.findPairOfType(suffix1, suffix2, LANG1.ANNOTATED_LAMBDA, LANG2.ANNOTATED_LAMBDA);
+        if(annotatedLambdas == null)
+            return;
+        mappingStore.addMapping(annotatedLambdas.first, annotatedLambdas.second);
+        Pair<Tree,Tree> lambdaLiterals = Helpers.findPairOfType(annotatedLambdas.first, annotatedLambdas.second, LANG1.LAMBDA_LITERAL, LANG2.LAMBDA_LITERAL);
+        if(lambdaLiterals == null)
+            return;
+        mappingStore.addMapping(lambdaLiterals.first, lambdaLiterals.second);
+        Pair<Tree,Tree> parameters = Helpers.findPairOfType(lambdaLiterals.first, lambdaLiterals.second, LANG1.LAMBDA_PARAMETERS, LANG2.LAMBDA_PARAMETERS);
+        if(parameters != null) {
+            new LeafMatcher(LANG1, LANG2).match(parameters.first, parameters.second, mappingStore);
+        }
+        Pair<Tree,Tree> arrows = Helpers.findPairOfType(lambdaLiterals.first, lambdaLiterals.second, LANG1.ARROW, LANG2.ARROW);
+        if(arrows != null) {
+            mappingStore.addMapping(arrows.first, arrows.second);
         }
     }
 

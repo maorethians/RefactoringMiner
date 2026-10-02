@@ -103,6 +103,20 @@ public class StringBasedHeuristics {
 					temp = ReplacementUtil.performReplacement(temp, before, after);
 					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
 				}
+				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 1 && !methodInvocations2.contains(call) &&
+						call.getName().equals("toArray")) {
+					String before = ".toArray(" + call.arguments.get(0) + ")";
+					String after = ".toTypedArray()";
+					temp = ReplacementUtil.performReplacement(temp, before, after);
+					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
+				}
+				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 0 && !methodInvocations2.contains(call) &&
+						call.getName().equals("values")) {
+					String before = ".values()";
+					String after = ".values";
+					temp = ReplacementUtil.performReplacement(temp, before, after);
+					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
+				}
 				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 2 && !methodInvocations2.contains(call) &&
 						call.getName().startsWith("min")) {
 					temp = ReplacementUtil.performReplacement(temp, "Math.min", "minOf");
@@ -153,12 +167,22 @@ public class StringBasedHeuristics {
 					}
 				}
 			}
-			if(temp.endsWith(LANG1.STATEMENT_TERMINATION) && s2.endsWith(LANG2.STATEMENT_TERMINATION)) {
+			if(temp.endsWith(LANG1.STATEMENT_TERMINATION) && (s2.endsWith(LANG2.STATEMENT_TERMINATION) || statement2 instanceof AbstractExpression)) {
 				String ss1 = temp.substring(0, temp.length()-LANG1.STATEMENT_TERMINATION.length());
-				String ss2 = s2.substring(0, s2.length()-LANG2.STATEMENT_TERMINATION.length());
+				String ss2 = statement2 instanceof AbstractExpression ? s2 : s2.substring(0, s2.length()-LANG2.STATEMENT_TERMINATION.length());
+				for(Replacement r : info.getReplacements()) {
+					if(r.getType().equals(ReplacementType.CLASS_INSTANCE_CREATION_REPLACED_WITH_LAMBDA)) {
+						ss1 = ss1.replaceAll("\\R\\s*", "");
+						break;
+					}
+				}
 				//eliminate formatting differences
 				ss2 = ss2.replaceAll("\\R\\s*", "");
 				if(!ss1.contains(", ") && ss2.contains(", ")) {
+					ss2 = ss2.replaceAll(",\\s*", ",");
+				}
+				else if(ss1.contains(", ") && ss2.contains(", ")) {
+					ss1 = ss1.replaceAll(",\\s*", ",");
 					ss2 = ss2.replaceAll(",\\s*", ",");
 				}
 				if(!ss1.contains("!!") && ss2.contains("!!")) {
@@ -173,11 +197,23 @@ public class StringBasedHeuristics {
 				if(ss1.contains("(int)") && !ss2.contains("(int)")) {
 					ss1 = ss1.replaceAll("\\(int\\)", "");
 				}
+				if(ss1.contains("new ") && !ss2.contains("new ")) {
+					ss1 = ss1.replaceAll("new ", "");
+				}
 				if(ss2.endsWith(".toInt()") && !ss1.endsWith(".toInt()")) {
 					ss2 = ss2.substring(0, ss2.length() - ".toInt()".length());
 				}
 				if(ss2.endsWith(".toLong()") && !ss1.endsWith(".toLong()")) {
 					ss2 = ss2.substring(0, ss2.length() - ".toLong()".length());
+				}
+				if(ss2.contains(".toLong()") && !ss1.contains(".toLong()")) {
+					ss2 = ss2.replaceAll(".toLong\\(\\)", "");
+				}
+				for(LeafExpression numberLiteral2 : statement2.getNumberLiterals()) {
+					String l = numberLiteral2.getString();
+					if(l.endsWith("L") && !ss1.contains(l)) {
+						ss2 = ss2.replaceAll(l, l.substring(0, l.length()-1));
+					}
 				}
 				if(ss1.equals(ss2)) {
 					return true;
@@ -253,11 +289,17 @@ public class StringBasedHeuristics {
 					if(diff2.endsWith(".") && !diff2.contains(LANG2.ASSIGNMENT)) {
 						return true;
 					}
+					if(diff2.isEmpty()) {
+						return true;
+					}
 				}
 				else if(!commonPrefix.isEmpty() && commonPrefix.length() > 1 && commonSuffix.isEmpty()) {
 					int beginIndexS2 = ss2.indexOf(commonPrefix) + commonPrefix.length();
 					String diff2 = ss2.substring(beginIndexS2, ss2.length());
 					if(diff2.equals(".toLong()") || diff2.endsWith(".toInt()")) {
+						return true;
+					}
+					if(diff2.startsWith(" as ")) {
 						return true;
 					}
 				}

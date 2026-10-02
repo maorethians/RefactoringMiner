@@ -2,11 +2,18 @@ package org.refactoringminer.astDiff.models;
 
 import gr.uom.java.xmi.decomposition.AbstractCodeMapping;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 public class OptimizationData {
     private final List<AbstractCodeMapping> lastStepMappings;
     private final ExtendedMultiMappingStore subtreeMappings;
+    //the same leaf mapping may belong to more than one body mapper (e.g., a refactoring body mapper and the enclosing method body mapper)
+    private final Set<AbstractCodeMapping> processedLeafMappings = Collections.newSetFromMap(new IdentityHashMap<>());
+    //the flattenings of the source trees, shared by all OptimizationData of the project and applied after all diffs are matched
+    private DeferredFlattenings deferredFlattenings;
 
     public List<AbstractCodeMapping> getLastStepMappings() {
         return lastStepMappings;
@@ -14,6 +21,18 @@ public class OptimizationData {
 
     public ExtendedMultiMappingStore getSubtreeMappings() {
         return subtreeMappings;
+    }
+
+    public Set<AbstractCodeMapping> getProcessedLeafMappings() {
+        return processedLeafMappings;
+    }
+
+    public DeferredFlattenings getDeferredFlattenings() {
+        return deferredFlattenings;
+    }
+
+    public void setDeferredFlattenings(DeferredFlattenings deferredFlattenings) {
+        this.deferredFlattenings = deferredFlattenings;
     }
 
     public OptimizationData(List<AbstractCodeMapping> lastStepMappings, ExtendedMultiMappingStore subtreeMappings) {

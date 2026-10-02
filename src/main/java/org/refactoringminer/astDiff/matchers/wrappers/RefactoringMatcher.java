@@ -25,7 +25,6 @@ import java.util.Set;
 public class RefactoringMatcher extends OptimizationAwareMatcher {
 
     private final List<Refactoring> refactoringList;
-    private static final List<Refactoring> processed = new ArrayList<>();
 
     public RefactoringMatcher(OptimizationData optimizationData, List<Refactoring> modelDiffRefactorings, UMLClassBaseDiff baseClassDiff) {
         super(optimizationData);
@@ -66,7 +65,15 @@ public class RefactoringMatcher extends OptimizationAwareMatcher {
                         if (variableDeclaration != null) {
                             Tree srcNode = TreeUtilFunctions.findByLocationInfo(srcTree,variableDeclaration.getLocationInfo(),LANG1);
                             Tree dstNode = TreeUtilFunctions.findByLocationInfo(dstTree,parameter.getLocationInfo(),LANG2);
-                            new LeafMatcher(LANG1, LANG2).match(srcNode,dstNode,mappingStore);
+                            if(dstNode.getType().name.equals(LANG2.LAMBDA_PARAMETERS) && dstNode.getChildren().size() > 0) {
+                                dstNode = dstNode.getChild(0);
+                            }
+                            if(Constants.isCrossLanguage(LANG1, LANG2)) {
+                                JavaToKotlinMigration.handleParameterMapping(mappingStore, srcNode, dstNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+                            }
+                            else {
+                                new LeafMatcher(LANG1, LANG2).match(srcNode,dstNode,mappingStore);
+                            }
                         }
                     }
                 }
@@ -98,7 +105,12 @@ public class RefactoringMatcher extends OptimizationAwareMatcher {
                             continue;
                         Tree srcNode = TreeUtilFunctions.findByLocationInfo(srcTree,parameter.getLocationInfo(),LANG1);
                         Tree dstNode = TreeUtilFunctions.findByLocationInfo(dstTree,variableDeclaration.getLocationInfo(),LANG2);
-                        new LeafMatcher(LANG1, LANG2).match(srcNode,dstNode,mappingStore);
+                        if(Constants.isCrossLanguage(LANG1, LANG2)) {
+                            JavaToKotlinMigration.handleParameterMapping(mappingStore, srcNode, dstNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+                        }
+                        else {
+                            new LeafMatcher(LANG1, LANG2).match(srcNode,dstNode,mappingStore);
+                        }
                     }
                 }
                 Tree srcSt = TreeUtilFunctions.findByLocationInfo(srcTree,next.getLocationInfo(),LANG1);
@@ -154,14 +166,17 @@ public class RefactoringMatcher extends OptimizationAwareMatcher {
                     new BodyMapperMatcher(optimizationData, bodyMapper, false, LANG1, LANG2).match(srcTree,dstTree,mappingStore);
                 }
             } else if (refactoring instanceof ReplaceAnonymousWithLambdaRefactoring) {
-                if(processed.contains(refactoring))
-                    continue;
-                processed.add(refactoring);
                 ReplaceAnonymousWithLambdaRefactoring replaceAnonymousWithLambdaRefactoring = (ReplaceAnonymousWithLambdaRefactoring) refactoring;
                 UMLOperationBodyMapper bodyMapper = replaceAnonymousWithLambdaRefactoring.getBodyMapper();
                 Constants LANG1 = new Constants(bodyMapper.getContainer1().getLocationInfo().getFilePath());
                 Constants LANG2 = new Constants(bodyMapper.getContainer2().getLocationInfo().getFilePath());
                 new BodyMapperMatcher(optimizationData, bodyMapper, false, LANG1, LANG2).match(srcTree,dstTree,mappingStore);
+                if (Constants.isCrossLanguage(LANG1, LANG2)) {
+                    Tree anonymousClass1 = TreeUtilFunctions.findByLocationInfo(srcTree, replaceAnonymousWithLambdaRefactoring.getAnonymousClass().getLocationInfo(), LANG1);
+                    //call_suffix, annotated_lambda, and lambda_literal have the same location
+                    Tree lambda2 = TreeUtilFunctions.findByLocationInfo(dstTree, replaceAnonymousWithLambdaRefactoring.getLambda().getLocationInfo(), LANG2, LANG2.LAMBDA_LITERAL);
+                    JavaToKotlinMigration.handleAnonymousToLambdaMapping(mappingStore, anonymousClass1, lambda2, LANG1, LANG2);
+                }
             } else if (refactoring instanceof ParameterizeTestRefactoring) {
                 ParameterizeTestRefactoring parameterizeTestRefactoring = (ParameterizeTestRefactoring) refactoring;
                 UMLOperationBodyMapper bodyMapper = parameterizeTestRefactoring.getBodyMapper();
