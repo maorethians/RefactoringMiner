@@ -22,8 +22,10 @@ Rubric (apply exactly, every pair, no skipping):
   - Consistency: `show` lists comments already judged for the same ground truth (any run).
     A new comment making the same point as one judged Y is Y, as one judged N is N.
 
-Verdicts are cached in relevance_verdicts.jsonl next to this script, keyed by
-(file, ground truth id, comment text), so identical texts from any run reuse one verdict.
+Verdicts are cached in relevance_verdicts.jsonl next to this script (or --cache PATH), keyed
+by (file, ground truth id, comment text), so identical texts from any run reuse one verdict.
+For repeated trials, judge each trial into its own --cache file, then `vote` writes the
+majority verdict of every pair into the cache.
 
 Metrics (same definitions as sum_ground_truths.py / calculate_precision.py):
   recall    -- ground truths with at least one matched comment judged Y / ground truths
@@ -40,6 +42,9 @@ Usage:
       gi:c2=Y,c5=Y (those Y, the other pending ones N)
   python judge_relevance.py report [results_dir ...] [--items-from dir]
       metrics per run, and pairwise sign tests when several runs are given
+  python judge_relevance.py vote TRIAL_CACHE...
+      majority verdict of each pair over the trial caches (odd count, every pair in each
+      trial), appended to --cache for pairs it does not have yet
 """
 
 import json
@@ -62,10 +67,11 @@ def pop_option(args, name, default):
     return default
 
 
-def load_cache():
+def load_cache(path=None):
+    path = path or CACHE
     cache = {}
-    if CACHE.exists():
-        for line in CACHE.read_text(encoding='utf-8').splitlines():
+    if path.exists():
+        for line in path.read_text(encoding='utf-8').splitlines():
             if line.strip():
                 r = json.loads(line)
                 cache[(r['file'], r['gt_id'], r['comment'])] = r['verdict'] == 'Y'
@@ -225,15 +231,41 @@ def report(dirs, items, cache):
                 print(f"  {names[i]} vs {names[j]}: {x} / {y} / {len(a & b)}  p={sign_p(x, y):.3f}")
 
 
+def vote(trial_paths, cache):
+    if len(trial_paths) % 2 == 0:
+        sys.exit("vote needs an odd number of trial caches")
+    trials = [load_cache(Path(t)) for t in trial_paths]
+    keys = set().union(*trials)
+    partial = [k for k in keys if any(k not in t for t in trials)]
+    if partial:
+        sys.exit(f"{len(partial)} pairs are not judged in every trial")
+    rows, split = [], 0
+    for k in sorted(keys):
+        votes = sum(t[k] for t in trials)
+        split += 0 < votes < len(trials)
+        if k not in cache:
+            rows.append({'file': k[0], 'gt_id': k[1], 'comment': k[2],
+                         'verdict': 'Y' if votes * 2 > len(trials) else 'N'})
+    with open(CACHE, 'a', encoding='utf-8') as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + '\n')
+    print(f"{len(keys)} pairs, {split} without unanimous trials; {len(rows)} majority verdicts recorded")
+
+
 def main():
+    global CACHE
     args = sys.argv[1:]
-    if not args or args[0] not in ('show', 'record', 'report'):
+    if not args or args[0] not in ('show', 'record', 'report', 'vote'):
         sys.exit(__doc__)
     cmd = args.pop(0)
+    CACHE = Path(pop_option(args, '--cache', CACHE))
     items_from = pop_option(args, '--items-from', None)
     items = {f.name for f in Path(items_from).glob('*.json')} if items_from else None
     limit = int(pop_option(args, '--limit', DEFAULT_LIMIT))
     cache = load_cache()
+    if cmd == 'vote':
+        vote(args, cache)
+        return
     if cmd == 'report':
         report([Path(a) for a in args] or [DEFAULT_DIR], items, cache)
         return
