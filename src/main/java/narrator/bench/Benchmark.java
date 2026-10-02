@@ -194,7 +194,6 @@ public class Benchmark {
         }
         if (generatedCommentsNodes.isEmpty()) {
             System.out.println("No valid comments found");
-            return null;
         }
 
         Map<JsonObject, Set<ReviewNode>> groundTruthsOverlappingNodes = new HashMap<>();

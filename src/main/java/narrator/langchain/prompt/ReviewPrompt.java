@@ -7,29 +7,19 @@ import java.util.regex.Pattern;
 
 import org.jetbrains.annotations.NotNull;
 import org.refactoringminer.astDiff.graph.Node;
-import org.refactoringminer.astDiff.graph.cluster.representation.Representation;
+import org.refactoringminer.astDiff.graph.cluster.representation.RawRepresentation;
 
 public class ReviewPrompt {
   // This is necessary for terminating the agent and preventing it from falling in a loop
   public static String END_OF_AUDIT = "### END OF AUDIT";
-  public static String END_OF_ENTRIES = "### END OF ENTRIES";
 
   private static final Pattern ALPHANUMERIC_PATTERN = Pattern.compile("[\\p{Alnum}]");
 
   private static final Pattern OPTIONAL_PREFIX_ID_PATTERN = Pattern.compile(
           "(?<![\\p{Alnum}#])" + Pattern.quote(Node.PROMPT_ID_PREFIX) + "?" + Node.PROMPT_ID_BODY_REGEX);
 
-  private static final List<String> IDENTIFIER_FIELDS = List.of("IDENTIFIER", "KIND", "BEFORE", "AFTER", "CHANGE");
-
-  private static final Pattern IDENTIFIER_FIELD_PATTERN = Pattern.compile(
-          "^[\\s\\-*]*(" + String.join("|", IDENTIFIER_FIELDS) + ")\\**\\s*:\\s*(.*)$", Pattern.CASE_INSENSITIVE);
-
   private String specification(boolean rawDiff) {
-    return rawDiff ? rawDiffSpecification() : Representation.DEFAULT.specification();
-  }
-
-  private String specification() {
-    return specification(false);
+    return rawDiff ? rawDiffSpecification() : RawRepresentation.specification();
   }
 
   private String rawDiffSpecification() {
@@ -49,66 +39,8 @@ public class ReviewPrompt {
     return spec.toString();
   }
 
-  // identifiers only work for non-raw representations
-  public String chapterIdentifiers(String content) {
+  public String chapterResult(String content, boolean rawDiff) {
     StringBuilder prompt = new StringBuilder();
-
-    prompt.append("You are a Software Engineer building a symbol-level index of a code change. ")
-            .append("The changes in a pull request have been ordered by their dependency graph, and split into a sequence of chapters. ")
-            .append("Later chapters reference the identifiers this chapter changes, but never see its code. ")
-            .append("Your index stands in for that code: for every identifier it must say what that identifier was before this chapter, what it is after, and how it changed.\n\n");
-
-    prompt.append(specification());
-
-    prompt.append("### CURRENT CHAPTER\n")
-            .append("The changes that make up the current chapter, in the representation described above. Every entry you write comes from here:\n")
-            .append(content).append("\n\n");
-
-    prompt.append("### YOUR TASK\n")
-            .append("Index every identifier this chapter changes—types, methods, fields, parameters, and variables. ")
-            .append("An identifier is changed when this chapter introduces it, removes it, moves it, or alters what it does or what it offers. ")
-            .append("Altered behaviour counts even when the declaration itself is untouched. An identifier the chapter only mentions is not changed and gets no entry.\n")
-            .append("Read the changes one by one, name the identifier each one changes, and write that identifier's entry.\n\n");
-
-    prompt.append("### OUTPUT FORMAT\n")
-            .append("Write each entry as exactly these five lines, in this order:\n")
-            .append("IDENTIFIER: the name, alone\n")
-            .append("KIND: type, method, field, parameter, or variable\n")
-            .append("BEFORE: what it was and what it offered before this chapter, or `did not exist`\n")
-            .append("AFTER: what it is and what it offers after this chapter, or `removed`\n")
-            .append("CHANGE: the transition between the two—introduced, removed, renamed (give both names), moved (give where from and where to), or what specifically differs\n")
-            .append("For a method, BEFORE and AFTER give what it accepts, what it returns, and what it does to state outside itself; ")
-            .append("for a field or variable, what it holds and what a reader of it gets; for a type, what it models and what it exposes.\n")
-            .append("Keep each field on one line. Separate entries with a blank line. Write nothing else: no headings, no numbering, no commentary.\n\n");
-
-    prompt.append("Rules:\n")
-            .append("- Write the specification, not the code. Later chapters read this in place of this chapter's code, so hand them the digest instead of what they would have to derive themselves.\n")
-            .append("- Each entry stands on its own. It is read far from here, so it cannot lean on the changes, on the surrounding code, or on another entry.\n")
-            .append("- Record only what the code shows. Do not infer motivation or intent, and do not judge whether the change is correct or an improvement.\n")
-            .append("- Where several changes change one identifier, give it a single entry covering all of them.\n")
-            .append("- Identify code by name. Change IDs refer to nothing in the chapters that read this index, so keep them out of your entries.\n")
-            .append("- If this chapter changes no identifier, write no entries.\n")
-            .append("- When you have written every entry, or if you have none, end your response with `").append(END_OF_ENTRIES).append("` on its own line and output nothing after it.\n\n");
-
-    return prompt.toString();
-  }
-
-  private static String renderKnownIdentifiers(List<Identifier> identifiers) {
-    return String.join("\n", identifiers.stream()
-            .map(identifier -> "<known name=\"" + oneLine(identifier.name()) + "\" kind=\"" + oneLine(identifier.kind()) + "\">\n"
-                    + "  was: " + oneLine(identifier.before()) + "\n"
-                    + "  now: " + oneLine(identifier.after()) + "\n"
-                    + "  changed: " + oneLine(identifier.change()) + "\n"
-                    + "</known>").toList());
-  }
-
-  private static String oneLine(String value) {
-    return value == null ? "" : value.replaceAll("\\s+", " ").trim();
-  }
-
-  public String chapterResult(String content, List<Identifier> dependencyIdentifiers, boolean rawDiff) {
-    StringBuilder prompt = new StringBuilder();
-    boolean hasDependencyIdentifiers = dependencyIdentifiers != null && !dependencyIdentifiers.isEmpty();
 
     prompt.append("## Role\n")
             .append("You are a code review assistant. You are responsible for producing professional review feedback on pull requests before they are merged. ")
@@ -122,7 +54,6 @@ public class ReviewPrompt {
             .append("- First understand the code changes to be reviewed, in the representation described above.\n")
             .append("- Be objective and neutral, make judgments based on facts and logic, avoid subjective assumptions. ")
             .append("The unchanged lines each <diff> carries are the context available to you. ")
-            .append(hasDependencyIdentifiers ? "Dependency identifiers below record how identifiers this chapter references were changed elsewhere in this pull request. " : "")
             .append("Judge against what you are shown rather than against assumptions about code you cannot see.\n")
             .append("- For the current code changes, provide feedback opinions, pointing out areas for improvement or potential issues.\n")
             .append("- Avoid commenting on correct code or unchanged code.\n")
@@ -143,14 +74,6 @@ public class ReviewPrompt {
     prompt.append("### CURRENT CHAPTER\n")
             .append("The following block contains the changes that make up the current chapter, in the representation described above. It is the code under review:\n")
             .append(content).append("\n\n");
-
-    if (hasDependencyIdentifiers) {
-      prompt.append("### DEPENDENCY IDENTIFIERS\n")
-              .append("Other chapters of this pull request changed identifiers that this chapter references. The entries below record what those identifiers were, what they are now, and how they changed. ")
-              .append("They are background information: use them to resolve references leaving this chapter, and do not produce comments targeting them.\n")
-              .append(renderKnownIdentifiers(dependencyIdentifiers))
-              .append("\n\n");
-    }
 
     prompt.append("### Review Checklist\n")
             .append("#### Correctness\n")
@@ -223,50 +146,6 @@ public class ReviewPrompt {
     return prompt.toString();
   }
 
-  public static List<Identifier> parseIdentifiers(String response) {
-    List<Identifier> identifiers = new ArrayList<>();
-    if (response == null || response.isEmpty()) {
-      return identifiers;
-    }
-
-    String[] fields = new String[IDENTIFIER_FIELDS.size()];
-    int openField = -1;
-
-    for (String line : response.split("\\r?\\n")) {
-      String trimmedLine = line.trim();
-
-      Matcher matcher = IDENTIFIER_FIELD_PATTERN.matcher(trimmedLine);
-      if (matcher.matches()) {
-        int field = IDENTIFIER_FIELDS.indexOf(matcher.group(1).toUpperCase());
-        // The name opens an entry; everything up to the next name belongs to it
-        if (field == 0) {
-          addIdentifier(identifiers, fields);
-          fields = new String[IDENTIFIER_FIELDS.size()];
-        }
-        // The label may come wrapped in markdown emphasis, which is not part of the value
-        fields[field] = matcher.group(2).replaceAll("^\\**\\s*|\\s*\\**$", "").trim();
-        openField = field;
-        continue;
-      }
-
-      // A field the model wrapped onto the following lines
-      if (openField >= 0 && !trimmedLine.isEmpty()) {
-        fields[openField] = (fields[openField] + " " + trimmedLine).trim();
-      }
-    }
-    addIdentifier(identifiers, fields);
-
-    return identifiers;
-  }
-
-  private static void addIdentifier(List<Identifier> identifiers, String[] fields) {
-    if (fields[0] == null || fields[0].isEmpty()) {
-      return;
-    }
-
-    identifiers.add(new Identifier(fields[0], fields[1], fields[2], fields[3], fields[4]));
-  }
-
   public static List<ReviewComment> parseResult(String response) {
     if (response == null || response.isEmpty()) {
       return null;
@@ -277,8 +156,10 @@ public class ReviewPrompt {
     Pattern outerPattern = Pattern.compile("<review_comments>(.*?)</review_comments>", Pattern.DOTALL);
     Matcher outerMatcher = outerPattern.matcher(response);
 
+    boolean foundTags = false;
     StringBuilder blocks = new StringBuilder();
     while (outerMatcher.find()) {
+      foundTags = true;
       String block = outerMatcher.group(1).trim();
       if (block.isEmpty()) continue;
 
@@ -287,8 +168,12 @@ public class ReviewPrompt {
       }
       blocks.append(block);
     }
-    if (blocks.length() == 0) {
+    if (!foundTags) {
       return null;
+    }
+    // Empty tags are the agreed way of reporting no comments
+    if (blocks.length() == 0) {
+      return comments;
     }
 
     String[] lines = blocks.toString().split("\\r?\\n");
@@ -359,9 +244,6 @@ public class ReviewPrompt {
     }
 
     return ids;
-  }
-
-  public record Identifier(String name, String kind, String before, String after, String change) {
   }
 
   public record ReviewComment(List<String> hunkIds, String text) {

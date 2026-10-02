@@ -55,15 +55,9 @@ public class LangChainClient {
         return model.generate(prompt);
     }
 
-    public List<ReviewPrompt.Identifier> generateIdentifiers(String content) {
-        System.out.println("identifiers");
-        String identifiers = this.model.generate(this.prompt.chapterIdentifiers(content));
-        return ReviewPrompt.parseIdentifiers(identifiers.replace(ReviewPrompt.END_OF_ENTRIES, ""));
-    }
-
-    public String reviewChapter(String content, List<ReviewPrompt.Identifier> dependencyIdentifiers, boolean rawDiff) {
+    public String reviewChapter(String content, boolean rawDiff) {
         System.out.println("result");
-        String result = this.model.generate(this.prompt.chapterResult(content, dependencyIdentifiers, rawDiff));
+        String result = this.model.generate(this.prompt.chapterResult(content, rawDiff));
         return result.replace(ReviewPrompt.END_OF_AUDIT, "").trim();
     }
 
