@@ -69,7 +69,9 @@ public class JavaToKotlinMigration {
                 srcStatementNode.getChildren().size() > 0 && dstStatementNode.getChildren().size() > 0) {
             Tree expression1 = srcStatementNode.getChild(0);
             Tree expression2 = dstStatementNode.getChild(0);
-            handleLeafMapping(mappingStore, expression1, expression2, LANG1, LANG2, deferredFlattenings);
+            if(!handleWhileConditionMovedToBody(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, deferredFlattenings)) {
+                handleLeafMapping(mappingStore, expression1, expression2, LANG1, LANG2, deferredFlattenings);
+            }
         }
         else if(srcStatementNode.getType().name.equals(LANG1.SYNCHRONIZED_STATEMENT) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) && dstStatementNode.getChildren().size() > 1) {
             //the Kotlin nodes flattened into the call, to compute its children when the flattenings are deferred
@@ -179,6 +181,48 @@ public class JavaToKotlinMigration {
         children1.removeAll(thisExpressionsWithSimpleName1);
         if(mathSimpleNames1.size() > 0 && mathSimpleNames2.isEmpty()) {
             children1.removeAll(mathSimpleNames1);
+        }
+        //the Java parseLong call is replaced with the Kotlin toLong call on its argument, i.e., Long.parseLong(header.trim()) -> header.trim().toLong()
+        List<Tree> parseLongInvocations1 = findParseLongInvocationsOnlyInJava(srcStatementNode, children2, LANG1);
+        for(Tree parseLongInvocation1 : parseLongInvocations1) {
+            children1.remove(TreeUtilFunctions.findChildByType(parseLongInvocation1, LANG1.SIMPLE_NAME));
+            Tree receiver1 = TreeUtilFunctions.findChildByType(parseLongInvocation1, LANG1.METHOD_INVOCATION_RECEIVER);
+            if(receiver1 != null) {
+                children1.removeAll(TreeUtilFunctions.findChildrenByTypeRecursively(receiver1, LANG1.SIMPLE_NAME));
+            }
+        }
+        //the Java equalsIgnoreCase call is replaced with the Kotlin equals call with the ignoreCase named argument, i.e., s.equalsIgnoreCase(x) -> s.equals(x, ignoreCase = true)
+        //the named argument has no Java counterpart, so that equalsIgnoreCase is matched with equals by position (see nameCompliance)
+        //the Kotlin equals names with the ignoreCase named argument are not counterparts of the Java equals names (see equalsMismatch below)
+        List<Tree> equalsIgnoreCaseNames2 = new ArrayList<>();
+        if(children1.stream().anyMatch(t -> t.getLabel().equals("equalsIgnoreCase"))) {
+            children2.removeIf(t -> t.getLabel().equals("ignoreCase") && t.getParent() != null && t.getParent().getType().name.equals(LANG2.VALUE_ARGUMENT));
+            for(Tree child2 : children2) {
+                if(child2.getLabel().equals("equals") && hasIgnoreCaseArgument(child2, LANG2)) {
+                    equalsIgnoreCaseNames2.add(child2);
+                }
+            }
+        }
+        //the Java get call is replaced with the Kotlin indexing expression, i.e., response.getHeaders().get("Transfer-Encoding") -> response.getHeaders()["Transfer-Encoding"]
+        //the get name is not matched, as the Kotlin [] has no name
+        Map<Tree, Tree> getInvocations = findGetInvocationsReplacedWithIndexing(srcStatementNode, dstStatementNode, LANG1, LANG2);
+        for(Tree getInvocation1 : getInvocations.keySet()) {
+            children1.remove(getInvocation1.getChild(1));
+        }
+        //the Java static call is replaced with the Kotlin extension call on its argument, i.e., Okio.buffer(stream.getSink()) -> stream.getSink().buffer()
+        //the type has no Kotlin counterpart, and the names are matched explicitly, as they are in different positions (see alignStaticCallWithExtensionCall)
+        Map<Tree, Tree> staticCalls = findStaticCallsReplacedWithExtensionCalls(srcStatementNode, dstStatementNode, children2, LANG1, LANG2);
+        for(Map.Entry<Tree, Tree> entry : staticCalls.entrySet()) {
+            children1.remove(staticCallTypeName1(entry.getKey(), LANG1));
+            children1.remove(entry.getKey().getChild(1));
+            children2.remove(callWithoutArgumentsName2(entry.getValue(), LANG2));
+        }
+        //the Java length/size comparison with zero is replaced with the Kotlin isEmpty/isNotEmpty call, i.e., request.length() == 0 -> request.isEmpty()
+        //the length and isEmpty names are not matched, as with parseLong above
+        Map<Tree, Tree> lengthComparisons = findLengthComparisonsReplacedWithIsEmpty(srcStatementNode, dstStatementNode, LANG1, LANG2);
+        for(Map.Entry<Tree, Tree> entry : lengthComparisons.entrySet()) {
+            children1.remove(lengthComparisonName1(entry.getKey(), LANG1));
+            children2.remove(isEmptyCallName2(entry.getValue(), LANG2));
         }
         List<Tree> interpolatedIdentifiers2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.INTERPOLATED_IDENTIFIER);
         List<Tree> interpolatedExpressions2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.INTERPOLATED_EXPRESSION);
@@ -401,6 +445,14 @@ public class JavaToKotlinMigration {
         }
         inv1.removeAll(builderNodes1);
         inv2.removeAll(builderNodes2);
+        inv1.removeAll(parseLongInvocations1);
+        inv1.removeAll(getInvocations.keySet());
+        inv1.removeAll(staticCalls.keySet());
+        inv2.removeAll(staticCalls.values());
+        for(Map.Entry<Tree, Tree> entry : lengthComparisons.entrySet()) {
+            inv1.remove(entry.getKey().getChild(0));
+            inv2.remove(entry.getValue());
+        }
         //the Java variable initializer is the receiver of the Kotlin apply call, i.e., RealCall call = new RealCall(x); -> return RealCall(x).apply {...}
         Tree applyCall2 = findApplyCallWithInitializerReceiver(srcStatementNode, dstStatementNode, LANG1, LANG2);
         if(applyCall2 != null) {
@@ -473,7 +525,7 @@ public class JavaToKotlinMigration {
             }
         }
         boolean equalsMismatch = children1.stream().anyMatch(node -> node.getLabel().equals("equals")) &&
-                !children2.stream().anyMatch(node -> node.getLabel().equals("equals"));
+                !children2.stream().anyMatch(node -> node.getLabel().equals("equals") && !equalsIgnoreCaseNames2.contains(node));
         if(children1.size() != children2.size() || equalsMismatch) {
             List<Tree> toBeRemoved1 = new ArrayList<>();
             for(Tree child1 : children1) {
@@ -483,7 +535,7 @@ public class JavaToKotlinMigration {
             }
             List<Tree> toBeRemoved2 = new ArrayList<>();
             for(Tree child2 : children2) {
-                if(child2.getLabel().equals("get") || child2.getLabel().equals("put") || child2.getLabel().equals("equals")) {
+                if((child2.getLabel().equals("get") || child2.getLabel().equals("put") || child2.getLabel().equals("equals")) && !equalsIgnoreCaseNames2.contains(child2)) {
                     toBeRemoved2.add(child2);
                 }
             }
@@ -552,15 +604,24 @@ public class JavaToKotlinMigration {
             }
         }
         else if(children2.size() > children1.size()) {
-            //match only the children with identical labels on a first match basis
+            //match only the children with identical labels on a first match basis, each child of children1 is matched at most once,
+            //i.e., the second lowercaseHeader in lowercaseHeader.startsWith("expect:") && lowercaseHeader.substring(7)...
+            Set<Tree> matched1 = Collections.newSetFromMap(new IdentityHashMap<>());
             for(int i=0; i<children2.size(); i++) {
                 for(int j=0; j<children1.size(); j++) {
-                    if(children2.get(i).getLabel().equals(children1.get(j).getLabel())) {
+                    if(!matched1.contains(children1.get(j)) && children2.get(i).getLabel().equals(children1.get(j).getLabel())) {
                         mappingStore.addMapping(children1.get(j), children2.get(i));
+                        matched1.add(children1.get(j));
                         break;
                     }
                 }
             }
+        }
+        if(equalsMismatch) {
+            //the Java equals calls replaced with Kotlin == have no Kotlin call counterpart, so they are removed before matching the invocations by position,
+            //i.e., name.equals("expect") && value.equalsIgnoreCase("100-continue") -> name == "expect" && value.equals("100-continue", ignoreCase = true)
+            //the receiver and arguments of the equals call may be already flattened by a previous mapping of the same statement (see alignEqualsWithEqualityExpressions)
+            inv1.removeIf(t1 -> t1.getChildren().stream().anyMatch(child1 -> child1.getType().name.equals(LANG1.SIMPLE_NAME) && child1.getLabel().equals("equals")));
         }
         List<Tree> invocationsToBeRemoved = new ArrayList<>();
         if(nameCompliance(inv1, inv2, LANG1, LANG2)) {
@@ -580,6 +641,18 @@ public class JavaToKotlinMigration {
             }
         }
         inv1.removeAll(invocationsToBeRemoved);
+        for(Map.Entry<Tree, Tree> entry : lengthComparisons.entrySet()) {
+            alignLengthComparisonWithIsEmpty(mappingStore, entry.getKey(), entry.getValue(), LANG1, LANG2, deferredFlattenings);
+        }
+        for(Map.Entry<Tree, Tree> entry : staticCalls.entrySet()) {
+            alignStaticCallWithExtensionCall(mappingStore, entry.getKey(), entry.getValue(), LANG1, LANG2, deferredFlattenings);
+        }
+        for(Map.Entry<Tree, Tree> entry : getInvocations.entrySet()) {
+            Tree propertyAccessReceiver1 = alignGetInvocationWithIndexing(mappingStore, entry.getKey(), entry.getValue(), LANG1, LANG2, deferredFlattenings);
+            if(propertyAccessReceiver1 != null) {
+                inv1.remove(propertyAccessReceiver1);
+            }
+        }
         List<Tree> casts1 = new ArrayList<>(castExpressions1);
         if(srcStatementNode.getType().name.equals(LANG1.CAST_EXPRESSION)) {
             casts1.add(0, srcStatementNode);
@@ -748,6 +821,9 @@ public class JavaToKotlinMigration {
             }
         }
         children1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.NUMBER_LITERAL);
+        for(Tree lengthComparison1 : lengthComparisons.keySet()) {
+            children1.remove(lengthComparison1.getChild(lengthComparison1.getChildren().size() - 1));
+        }
         children2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.INTEGER_LITERAL, LANG2.FLOAT_LITERAL);
         if(children1.size() == children2.size()) {
             for(int i=0; i<children1.size(); i++) {
@@ -825,6 +901,7 @@ public class JavaToKotlinMigration {
         if(srcStatementNode.getType().name.equals(LANG1.INFIX_EXPRESSION)) {
             nestedInfix1.add(0, srcStatementNode);
         }
+        nestedInfix1.removeAll(lengthComparisons.keySet());
         List<Tree> nestedInfix2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.DISJUNCTION_EXPRESSION, LANG2.CONJUNCTION_EXPRESSION, LANG2.EQUALITY_EXPRESSION, LANG2.ADDITIVE_EXPRESSION, LANG2.COMPARISON_EXPRESSION, LANG2.MULTIPLICATIVE_EXPRESSION);
         if(dstStatementNode.getType().name.equals(LANG2.DISJUNCTION_EXPRESSION) ||
                 dstStatementNode.getType().name.equals(LANG2.CONJUNCTION_EXPRESSION) ||
@@ -833,6 +910,10 @@ public class JavaToKotlinMigration {
                 dstStatementNode.getType().name.equals(LANG2.COMPARISON_EXPRESSION) ||
                 dstStatementNode.getType().name.equals(LANG2.MULTIPLICATIVE_EXPRESSION)) {
             nestedInfix2.add(0, dstStatementNode);
+        }
+        if(equalsMismatch) {
+            //the Kotlin equality expressions replacing Java equals calls have no Java infix expression counterpart
+            nestedInfix2.removeAll(alignEqualsWithEqualityExpressions(mappingStore, srcStatementNode, nestedInfix2, LANG1, LANG2, deferredFlattenings));
         }
         alignAndMatchInfixExpressions(nestedInfix1, nestedInfix2, LANG1, LANG2, mappingStore);
         Tree variableDeclarationFragment = TreeUtilFunctions.findChildByType(srcStatementNode, LANG1.VARIABLE_DECLARATION_FRAGMENT);
@@ -865,16 +946,6 @@ public class JavaToKotlinMigration {
         }
         if(dstStatementNode.getType().name.equals(LANG2.NAVIGATION_EXPRESSION)) {
             children2.add(0, dstStatementNode);
-        }
-        if(equalsMismatch) {
-            Iterator<Tree> iterator1 = inv1.iterator();
-            while(iterator1.hasNext()) {
-                Tree t1 = iterator1.next();
-                Tree simpleName = TreeUtilFunctions.findChildByType(t1, LANG1.SIMPLE_NAME);
-                if(simpleName != null && simpleName.getLabel().equals("equals")) {
-                    iterator1.remove();
-                }
-            }
         }
         Iterator<Tree> iterator2 = children2.iterator();
         while(iterator2.hasNext()) {
@@ -1256,6 +1327,373 @@ public class JavaToKotlinMigration {
         }
     }
 
+    //align Java MethodInvocation -> [METHOD_INVOCATION_RECEIVER -> x, equals, METHOD_INVOCATION_ARGUMENTS -> y] with Kotlin equality_expression -> [x, ==, y],
+    //i.e., lowercaseHeader.substring(18).trim().equals("chunked") -> lowercaseHeader.substring(18).trim() == "chunked", based on the already mapped operands
+    //the receiver and arguments are flattened, as they have no Kotlin counterpart (or the flattening is deferred)
+    //returns the mapped Kotlin equality expressions
+    private static List<Tree> alignEqualsWithEqualityExpressions(ExtendedMultiMappingStore mappingStore, Tree srcStatementNode, List<Tree> nestedInfix2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        List<Tree> invocations1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.METHOD_INVOCATION);
+        if(srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            invocations1.add(0, srcStatementNode);
+        }
+        List<Tree> matched2 = new ArrayList<>();
+        for(Tree invocation1 : invocations1) {
+            if(invocation1.getChildren().size() != 3)
+                continue;
+            Tree receiver1 = invocation1.getChild(0);
+            Tree name1 = invocation1.getChild(1);
+            Tree arguments1 = invocation1.getChild(2);
+            if(!name1.getType().name.equals(LANG1.SIMPLE_NAME) || !name1.getLabel().equals("equals"))
+                continue;
+            boolean wrapped1 = receiver1.getType().name.equals(LANG1.METHOD_INVOCATION_RECEIVER) && receiver1.getChildren().size() == 1 &&
+                    arguments1.getType().name.equals(LANG1.METHOD_INVOCATION_ARGUMENTS) && arguments1.getChildren().size() == 1;
+            //the receiver and arguments are already flattened by a previous mapping of the same statement
+            boolean flattened1 = !receiver1.getType().name.equals(LANG1.METHOD_INVOCATION_RECEIVER) && !arguments1.getType().name.equals(LANG1.METHOD_INVOCATION_ARGUMENTS);
+            if(!wrapped1 && !flattened1)
+                continue;
+            Tree operand1 = wrapped1 ? receiver1.getChild(0) : receiver1;
+            Tree argument1 = wrapped1 ? arguments1.getChild(0) : arguments1;
+            for(Tree infix2 : nestedInfix2) {
+                if(matched2.contains(infix2) || !infix2.getType().name.equals(LANG2.EQUALITY_EXPRESSION) || infix2.getChildren().size() != 3 ||
+                        !infix2.getChild(1).getLabel().equals("=="))
+                    continue;
+                Tree left2 = infix2.getChild(0);
+                Tree right2 = infix2.getChild(2);
+                if((isMappedTo(mappingStore, operand1, left2) && isMappedTo(mappingStore, argument1, right2)) ||
+                        (isMappedTo(mappingStore, operand1, right2) && isMappedTo(mappingStore, argument1, left2))) {
+                    mappingStore.addMapping(invocation1, infix2);
+                    matched2.add(infix2);
+                    if(wrapped1) {
+                        flattenSrcChild(mappingStore, deferredFlattenings, invocation1, receiver1);
+                        flattenSrcChild(mappingStore, deferredFlattenings, invocation1, arguments1);
+                    }
+                    break;
+                }
+            }
+        }
+        return matched2;
+    }
+
+    //Kotlin does not allow assignments in expressions, so the Java while condition assignment becomes a variable declaration followed by an if-break in the Kotlin while(true) body
+    //(see StringBasedHeuristics.whileConditionAssignmentMovedToBody), i.e., while((header = source.readUtf8LineStrict()).length() != 0) {...} ->
+    //while(true) { val header = source.readUtf8LineStrict(); if(header.isEmpty()) { break } ...}
+    //aligns the Java Assignment with the Kotlin property_declaration, and the Java length comparison with the Kotlin isEmpty condition of the if-break
+    private static boolean handleWhileConditionMovedToBody(ExtendedMultiMappingStore mappingStore, Tree while1, Tree while2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        Tree condition1 = while1.getChild(0);
+        Tree condition2 = while2.getChild(0);
+        boolean trueCondition2 = condition2.getType().name.equals(LANG2.BOOLEAN_LITERAL) &&
+                (condition2.getLabel().equals("true") || (condition2.getChildren().size() == 1 && condition2.getChild(0).getLabel().equals("true")));
+        Tree body2 = TreeUtilFunctions.findChildByType(while2, LANG2.CONTROL_STRUCTURE_BODY);
+        if(!trueCondition2 || body2 == null)
+            return false;
+        Tree statements2 = TreeUtilFunctions.findChildByType(body2, LANG2.STATEMENTS);
+        if(statements2 != null) {
+            body2 = statements2;
+        }
+        if(body2.getChildren().size() < 2)
+            return false;
+        Tree declaration2 = body2.getChild(0);
+        Tree if2 = body2.getChild(1);
+        if(!declaration2.getType().name.equals(LANG2.FIELD_DECLARATION) || !if2.getType().name.equals(LANG2.IF_STATEMENT) || if2.getChildren().size() < 2 ||
+                TreeUtilFunctions.findChildrenByTypeRecursively(if2.getChild(1), LANG2.JUMP_KEYWORD).stream().noneMatch(t -> t.getLabel().equals("break")))
+            return false;
+        //the variable_declaration is already flattened by a previous mapping of the same statement
+        Tree variableDeclaration2 = TreeUtilFunctions.findChildByType(declaration2, LANG2.VARIABLE_DECLARATION);
+        Tree name2 = variableDeclaration2 != null ? TreeUtilFunctions.findChildByType(variableDeclaration2, LANG2.SIMPLE_NAME) : TreeUtilFunctions.findChildByType(declaration2, LANG2.SIMPLE_NAME);
+        Tree affectationOperator2 = TreeUtilFunctions.findChildByType(declaration2, LANG2.AFFECTATION_OPERATOR);
+        if(name2 == null || affectationOperator2 == null || declaration2.getChildPosition(affectationOperator2) == declaration2.getChildren().size() - 1)
+            return false;
+        Tree initializer2 = declaration2.getChild(declaration2.getChildPosition(affectationOperator2) + 1);
+        Tree assignment1 = null;
+        for(Tree candidate1 : TreeUtilFunctions.findChildrenByTypeRecursively(condition1, LANG1.ASSIGNMENT)) {
+            if(candidate1.getChildren().size() == 3 && candidate1.getChild(0).getLabel().equals(name2.getLabel())) {
+                assignment1 = candidate1;
+                break;
+            }
+        }
+        if(assignment1 == null)
+            return false;
+        //the loop continues while the length is not zero, so the if-break condition is the inverse
+        String operator1 = lengthComparisonName1(condition1, LANG1) != null ? condition1.getChild(condition1.getChildren().size() - 2).getLabel() : null;
+        Tree isEmptyName2 = isEmptyCallName2(if2.getChild(0), LANG2);
+        boolean invertedLengthComparison = operator1 != null && isEmptyName2 != null &&
+                ((operator1.equals("!=") && isEmptyName2.getLabel().equals("isEmpty")) || (operator1.equals("==") && isEmptyName2.getLabel().equals("isNotEmpty")));
+        //align Java Assignment -> [name, =, value] with Kotlin property_declaration -> [val, variable_declaration -> name, =, value]
+        mappingStore.addMapping(assignment1, declaration2);
+        mappingStore.addMapping(assignment1.getChild(0), name2);
+        mappingStore.addMapping(assignment1.getChild(1), affectationOperator2);
+        if(variableDeclaration2 != null) {
+            flattenDstChildKeepingMappings(deferredFlattenings, declaration2, variableDeclaration2);
+        }
+        handleLeafMapping(mappingStore, assignment1.getChild(2), initializer2, LANG1, LANG2, deferredFlattenings);
+        if(invertedLengthComparison) {
+            alignLengthComparisonWithIsEmpty(mappingStore, condition1, if2.getChild(0), LANG1, LANG2, deferredFlattenings);
+        }
+        return true;
+    }
+
+    //the Java get invocations paired with the Kotlin indexing expressions in order, i.e., response.getHeaders().get("Transfer-Encoding") -> response.getHeaders()["Transfer-Encoding"]
+    private static Map<Tree, Tree> findGetInvocationsReplacedWithIndexing(Tree srcStatementNode, Tree dstStatementNode, Constants LANG1, Constants LANG2) {
+        List<Tree> invocations1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.METHOD_INVOCATION);
+        if(srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            invocations1.add(0, srcStatementNode);
+        }
+        invocations1.removeIf(invocation1 -> !isGetInvocationWithOneArgument(invocation1, LANG1));
+        List<Tree> indexing2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.INDEXING_EXPRESSION);
+        if(dstStatementNode.getType().name.equals(LANG2.INDEXING_EXPRESSION)) {
+            indexing2.add(0, dstStatementNode);
+        }
+        indexing2.removeIf(indexingExpression2 -> indexingArgument2(indexingExpression2, LANG2) == null);
+        Map<Tree, Tree> pairs = new LinkedHashMap<>();
+        if(invocations1.size() == indexing2.size()) {
+            for(int i=0; i<invocations1.size(); i++) {
+                pairs.put(invocations1.get(i), indexing2.get(i));
+            }
+        }
+        return pairs;
+    }
+
+    //Java MethodInvocation -> [METHOD_INVOCATION_RECEIVER -> receiver, get, METHOD_INVOCATION_ARGUMENTS -> argument],
+    //or MethodInvocation -> [receiver, get, METHOD_INVOCATION_ARGUMENTS -> argument] if the receiver is already flattened by a previous mapping of the same statement
+    private static boolean isGetInvocationWithOneArgument(Tree invocation1, Constants LANG1) {
+        if(invocation1.getChildren().size() != 3)
+            return false;
+        Tree name1 = invocation1.getChild(1);
+        Tree arguments1 = invocation1.getChild(2);
+        return name1.getType().name.equals(LANG1.SIMPLE_NAME) && name1.getLabel().equals("get") &&
+                arguments1.getType().name.equals(LANG1.METHOD_INVOCATION_ARGUMENTS) && arguments1.getChildren().size() == 1;
+    }
+
+    //the argument of Kotlin indexing_expression -> [receiver, indexing_suffix -> [[, argument, ]]]
+    private static Tree indexingArgument2(Tree indexingExpression2, Constants LANG2) {
+        if(indexingExpression2.getChildren().size() != 2 || !indexingExpression2.getChild(1).getType().name.equals(LANG2.INDEXING_SUFFIX))
+            return null;
+        Tree suffix2 = indexingExpression2.getChild(1);
+        if(suffix2.getChildren().size() != 3 || !suffix2.getChild(0).getLabel().equals("[") || !suffix2.getChild(2).getLabel().equals("]"))
+            return null;
+        return suffix2.getChild(1);
+    }
+
+    //align Java MethodInvocation -> [METHOD_INVOCATION_RECEIVER -> receiver, get, METHOD_INVOCATION_ARGUMENTS -> argument]
+    //with Kotlin indexing_expression -> [receiver, indexing_suffix -> [[, argument, ]]], by flattening the Java receiver, which has no Kotlin counterpart (or deferring the flattening)
+    //returns the Java receiver invocation, if it is aligned with a Kotlin property access, i.e., request.getHeaders().get("Accept-Language") -> request.headers["Accept-Language"]
+    private static Tree alignGetInvocationWithIndexing(ExtendedMultiMappingStore mappingStore, Tree invocation1, Tree indexingExpression2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        mappingStore.addMapping(invocation1, indexingExpression2);
+        mappingStore.addMapping(invocation1.getChild(2), indexingExpression2.getChild(1));
+        Tree receiver1 = invocation1.getChild(0);
+        //the receiver expression, whether or not the METHOD_INVOCATION_RECEIVER is already flattened
+        boolean wrapped1 = receiver1.getType().name.equals(LANG1.METHOD_INVOCATION_RECEIVER);
+        Tree receiverExpression1 = wrapped1 && receiver1.getChildren().size() == 1 ? receiver1.getChild(0) : receiver1;
+        Tree receiverExpression2 = indexingExpression2.getChild(0);
+        Tree propertyAccessReceiver1 = null;
+        if(receiverExpression1.isLeaf() && receiverExpression2.isLeaf()) {
+            mappingStore.addMapping(receiverExpression1, receiverExpression2);
+        }
+        else if(!mappingStore.isSrcMapped(receiverExpression1) &&
+                alignMethodInvocationWithPropertyAccess(mappingStore, receiverExpression1, receiverExpression2, LANG1, LANG2, deferredFlattenings)) {
+            propertyAccessReceiver1 = receiverExpression1;
+        }
+        if(wrapped1) {
+            flattenSrcChild(mappingStore, deferredFlattenings, invocation1, receiver1);
+        }
+        return propertyAccessReceiver1;
+    }
+
+    //the Java length/size comparisons with zero paired with the Kotlin isEmpty/isNotEmpty calls, i.e., request.length() == 0 -> request.isEmpty()
+    private static Map<Tree, Tree> findLengthComparisonsReplacedWithIsEmpty(Tree srcStatementNode, Tree dstStatementNode, Constants LANG1, Constants LANG2) {
+        List<Tree> infix1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.INFIX_EXPRESSION);
+        if(srcStatementNode.getType().name.equals(LANG1.INFIX_EXPRESSION)) {
+            infix1.add(0, srcStatementNode);
+        }
+        List<Tree> calls2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.METHOD_INVOCATION);
+        if(dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+            calls2.add(0, dstStatementNode);
+        }
+        Map<Tree, Tree> pairs = new LinkedHashMap<>();
+        for(Tree comparison1 : infix1) {
+            if(lengthComparisonName1(comparison1, LANG1) == null)
+                continue;
+            String operator1 = comparison1.getChild(comparison1.getChildren().size() - 2).getLabel();
+            for(Tree call2 : calls2) {
+                Tree name2 = isEmptyCallName2(call2, LANG2);
+                if(name2 != null && !pairs.containsValue(call2) &&
+                        ((operator1.equals("==") && name2.getLabel().equals("isEmpty")) || ((operator1.equals("!=") || operator1.equals(">")) && name2.getLabel().equals("isNotEmpty")))) {
+                    pairs.put(comparison1, call2);
+                    break;
+                }
+            }
+        }
+        return pairs;
+    }
+
+    //the length/size name of Java InfixExpression -> [MethodInvocation -> [METHOD_INVOCATION_RECEIVER, length], ==|!=|>, 0],
+    //or InfixExpression -> [METHOD_INVOCATION_RECEIVER, length, ==|!=|>, 0] if the invocation is already flattened by a previous mapping of the same statement
+    private static Tree lengthComparisonName1(Tree comparison1, Constants LANG1) {
+        if(!comparison1.getType().name.equals(LANG1.INFIX_EXPRESSION))
+            return null;
+        List<Tree> children1 = comparison1.getChildren();
+        Tree zero1 = children1.get(children1.size() - 1);
+        Tree operator1 = children1.size() > 1 ? children1.get(children1.size() - 2) : null;
+        if(!zero1.getType().name.equals(LANG1.NUMBER_LITERAL) || !zero1.getLabel().equals("0") || operator1 == null ||
+                !operator1.getType().name.equals(LANG1.INFIX_EXPRESSION_OPERATOR))
+            return null;
+        List<Tree> invocationChildren1 = null;
+        if(children1.size() == 3 && children1.get(0).getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            invocationChildren1 = children1.get(0).getChildren();
+        }
+        else if(children1.size() == 4) {
+            invocationChildren1 = children1.subList(0, 2);
+        }
+        if(invocationChildren1 == null || invocationChildren1.size() != 2 || !invocationChildren1.get(0).getType().name.equals(LANG1.METHOD_INVOCATION_RECEIVER))
+            return null;
+        Tree name1 = invocationChildren1.get(1);
+        if(name1.getType().name.equals(LANG1.SIMPLE_NAME) && (name1.getLabel().equals("length") || name1.getLabel().equals("size")))
+            return name1;
+        return null;
+    }
+
+    //the isEmpty/isNotEmpty name of Kotlin call_expression -> [navigation_expression -> [receiver, navigation_suffix -> name], call_suffix -> value_arguments],
+    //or call_expression -> [navigation_expression -> receiver, name] if the call is already aligned by a previous mapping of the same statement
+    private static Tree isEmptyCallName2(Tree call2, Constants LANG2) {
+        Tree name2 = callWithoutArgumentsName2(call2, LANG2);
+        if(name2 == null || !(name2.getLabel().equals("isEmpty") || name2.getLabel().equals("isNotEmpty")))
+            return null;
+        return name2;
+    }
+
+    //the name of Kotlin call_expression -> [navigation_expression -> [receiver, navigation_suffix -> name], call_suffix -> value_arguments] without arguments,
+    //or call_expression -> [navigation_expression -> receiver, name] if the call is already aligned by a previous mapping of the same statement
+    private static Tree callWithoutArgumentsName2(Tree call2, Constants LANG2) {
+        if(!call2.getType().name.equals(LANG2.METHOD_INVOCATION) || call2.getChildren().isEmpty() || !call2.getChild(0).getType().name.equals(LANG2.NAVIGATION_EXPRESSION))
+            return null;
+        Tree name2 = null;
+        Tree navigation2 = call2.getChild(0);
+        Tree suffix2 = navigation2.getChild(navigation2.getChildren().size() - 1);
+        if(navigation2.getChildren().size() == 2 && suffix2.getType().name.equals(LANG2.NAVIGATION_SUFFIX) && suffix2.getChildren().size() == 1) {
+            name2 = suffix2.getChild(0);
+        }
+        else if(navigation2.getChildren().size() == 1 && call2.getChildren().size() > 1) {
+            name2 = call2.getChild(1);
+        }
+        if(name2 == null || !name2.getType().name.equals(LANG2.SIMPLE_NAME))
+            return null;
+        Tree callSuffix2 = TreeUtilFunctions.findChildByType(call2, LANG2.CALL_SUFFIX);
+        if(callSuffix2 != null) {
+            Tree valueArguments2 = TreeUtilFunctions.findChildByType(callSuffix2, LANG2.METHOD_INVOCATION_ARGUMENTS);
+            if(callSuffix2.getChildren().size() != 1 || valueArguments2 == null || !valueArguments2.getChildren().isEmpty())
+                return null;
+        }
+        return name2;
+    }
+
+    //the Java static calls paired with the Kotlin extension calls having the Java argument as receiver, i.e., Okio.buffer(stream.getSink()) -> stream.getSink().buffer()
+    private static Map<Tree, Tree> findStaticCallsReplacedWithExtensionCalls(Tree srcStatementNode, Tree dstStatementNode, List<Tree> simpleNames2, Constants LANG1, Constants LANG2) {
+        List<Tree> invocations1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.METHOD_INVOCATION);
+        if(srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            invocations1.add(0, srcStatementNode);
+        }
+        List<Tree> calls2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.METHOD_INVOCATION);
+        if(dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+            calls2.add(0, dstStatementNode);
+        }
+        Map<Tree, Tree> pairs = new LinkedHashMap<>();
+        for(Tree invocation1 : invocations1) {
+            Tree type1 = staticCallTypeName1(invocation1, LANG1);
+            //the Kotlin statement has no reference to the type of the static call
+            if(type1 == null || simpleNames2.stream().anyMatch(t -> t.getLabel().equals(type1.getLabel())))
+                continue;
+            String name1 = invocation1.getChild(1).getLabel();
+            for(Tree call2 : calls2) {
+                Tree name2 = callWithoutArgumentsName2(call2, LANG2);
+                if(name2 != null && name2.getLabel().equals(name1) && !pairs.containsValue(call2)) {
+                    pairs.put(invocation1, call2);
+                    break;
+                }
+            }
+        }
+        return pairs;
+    }
+
+    //the type name of Java MethodInvocation -> [METHOD_INVOCATION_RECEIVER -> Type, name, METHOD_INVOCATION_ARGUMENTS -> argument], i.e., Okio in Okio.buffer(x)
+    private static Tree staticCallTypeName1(Tree invocation1, Constants LANG1) {
+        if(!invocation1.getType().name.equals(LANG1.METHOD_INVOCATION) || invocation1.getChildren().size() != 3)
+            return null;
+        Tree receiver1 = invocation1.getChild(0);
+        Tree name1 = invocation1.getChild(1);
+        Tree arguments1 = invocation1.getChild(2);
+        if(!receiver1.getType().name.equals(LANG1.METHOD_INVOCATION_RECEIVER) || receiver1.getChildren().size() != 1 || !name1.getType().name.equals(LANG1.SIMPLE_NAME) ||
+                !arguments1.getType().name.equals(LANG1.METHOD_INVOCATION_ARGUMENTS) || arguments1.getChildren().size() != 1)
+            return null;
+        Tree type1 = receiver1.getChild(0);
+        if(!type1.getType().name.equals(LANG1.SIMPLE_NAME) || type1.getLabel().isEmpty() || !Character.isUpperCase(type1.getLabel().charAt(0)))
+            return null;
+        return type1;
+    }
+
+    //align Java MethodInvocation -> [METHOD_INVOCATION_RECEIVER -> Type, name, METHOD_INVOCATION_ARGUMENTS -> x] with Kotlin call_expression -> [navigation_expression -> x, name],
+    //by moving the Kotlin name out of the navigation_suffix and removing the empty value_arguments (or deferring the removal), i.e., Okio.buffer(stream.getSink()) -> stream.getSink().buffer()
+    //the Java arguments wrap the Kotlin receiver, while the Java type has no Kotlin counterpart
+    private static void alignStaticCallWithExtensionCall(ExtendedMultiMappingStore mappingStore, Tree invocation1, Tree call2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        Tree name2 = callWithoutArgumentsName2(call2, LANG2);
+        Tree navigation2 = call2.getChild(0);
+        if(navigation2.getChildren().size() == 2) {
+            Tree suffix2 = navigation2.getChild(1);
+            navigation2.getChildren().remove(suffix2);
+            call2.getChildren().addAll(1, suffix2.getChildren());
+            for(Tree t : suffix2.getChildren())
+                t.setParent(call2);
+        }
+        alignCallSuffix(mappingStore, invocation1, call2, false, LANG2, deferredFlattenings);
+        mappingStore.addMapping(invocation1, call2);
+        mappingStore.addMapping(invocation1.getChild(1), name2);
+        mappingStore.addMapping(invocation1.getChild(2), navigation2);
+    }
+
+    //align Java InfixExpression -> [MethodInvocation -> [METHOD_INVOCATION_RECEIVER -> x, length], ==, 0] with Kotlin call_expression -> [navigation_expression -> x, isEmpty],
+    //by flattening the Java invocation, which has no Kotlin counterpart (or deferring the flattening)
+    private static void alignLengthComparisonWithIsEmpty(ExtendedMultiMappingStore mappingStore, Tree comparison1, Tree call2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        mappingStore.addMapping(comparison1, call2);
+        Tree invocation1 = comparison1.getChild(0);
+        if(invocation1.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            alignMethodInvocation(mappingStore, invocation1, call2, LANG1, LANG2, deferredFlattenings);
+            flattenSrcChild(mappingStore, deferredFlattenings, comparison1, invocation1);
+        }
+        else {
+            //the invocation is already flattened by a previous mapping of the same statement
+            mappingStore.addMapping(invocation1, call2.getChild(0));
+        }
+    }
+
+    private static boolean isMappedTo(ExtendedMultiMappingStore mappingStore, Tree src, Tree dst) {
+        return mappingStore.getDsts(src) != null && mappingStore.getDsts(src).contains(dst);
+    }
+
+    //the Kotlin name of a call_expression -> [navigation_expression -> [receiver, navigation_suffix -> name], call_suffix -> value_arguments -> value_argument -> [ignoreCase, =, value]]
+    private static boolean hasIgnoreCaseArgument(Tree name2, Constants LANG2) {
+        Tree call2 = name2.getParent();
+        while(call2 != null && !call2.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+            call2 = call2.getParent();
+        }
+        if(call2 == null)
+            return false;
+        Tree callSuffix2 = TreeUtilFunctions.findChildByType(call2, LANG2.CALL_SUFFIX);
+        Tree valueArguments2 = TreeUtilFunctions.findChildByType(callSuffix2 != null ? callSuffix2 : call2, LANG2.METHOD_INVOCATION_ARGUMENTS);
+        if(valueArguments2 == null)
+            return false;
+        for(Tree valueArgument2 : valueArguments2.getChildren()) {
+            if(valueArgument2.getType().name.equals(LANG2.VALUE_ARGUMENT) && valueArgument2.getChildren().size() > 1 && valueArgument2.getChild(0).getLabel().equals("ignoreCase"))
+                return true;
+        }
+        return false;
+    }
+
+    //the number of arguments of the Kotlin call_expression -> [..., call_suffix -> value_arguments], or call_expression -> [..., value_arguments] if the call_suffix is already flattened
+    private static int argumentCount2(Tree call2, Constants LANG2) {
+        Tree callSuffix2 = TreeUtilFunctions.findChildByType(call2, LANG2.CALL_SUFFIX);
+        Tree valueArguments2 = TreeUtilFunctions.findChildByType(callSuffix2 != null ? callSuffix2 : call2, LANG2.METHOD_INVOCATION_ARGUMENTS);
+        return valueArguments2 != null ? valueArguments2.getChildren().size() : 0;
+    }
+
     private static boolean nameCompliance(List<Tree> children1, List<Tree> children2, Constants LANG1, Constants LANG2) {
         List<String> callNames1 = new ArrayList<>();
         for(Tree child1 : children1) {
@@ -1276,6 +1714,8 @@ public class JavaToKotlinMigration {
             }
         }
         List<String> callNames2 = new ArrayList<>();
+        //the Kotlin calls of callNames2, at the same positions
+        List<Tree> namedCalls2 = new ArrayList<>();
         List<Tree> toBeRemoved2 = new ArrayList<>();
         for(Tree child2 : children2) {
             Tree receiver2 = TreeUtilFunctions.findChildByType(child2, LANG2.NAVIGATION_EXPRESSION);
@@ -1287,15 +1727,18 @@ public class JavaToKotlinMigration {
                         callNames2.add(simpleName.getChild(0).getLabel());
                     else
                         callNames2.add(simpleName.getLabel());
+                    namedCalls2.add(child2);
                 }
                 else if(receiver2.getLabel() != null){
                     callNames2.add(receiver2.getLabel());
+                    namedCalls2.add(child2);
                 }
             }
             else {
                 Tree simpleName = TreeUtilFunctions.findChildByType(child2, LANG2.SIMPLE_NAME);
                 if(simpleName != null) {
                     callNames2.add(simpleName.getLabel());
+                    namedCalls2.add(child2);
                 }
                 else {
                     toBeRemoved2.add(child2);
@@ -1319,6 +1762,11 @@ public class JavaToKotlinMigration {
                 else if(synonyms.containsKey(s1) && synonyms.get(s1).equals(s2)) {
                     matches++;
                 }
+                else if(s1.equals("equalsIgnoreCase") && s2.equals("equals")) {
+                    //i.e., s.equalsIgnoreCase(x) -> s.equals(x, ignoreCase = true)
+                    if(argumentCount2(namedCalls2.get(i), LANG2) == 2)
+                        matches++;
+                }
                 else if(s1.startsWith(s2) || s2.startsWith(s1)) {
                     matches++;
                 }
@@ -1341,6 +1789,11 @@ public class JavaToKotlinMigration {
                 }
                 else if(synonyms.containsKey(s1) && synonyms.get(s1).equals(s2)) {
                     matches++;
+                }
+                else if(s1.equals("equalsIgnoreCase") && s2.equals("equals")) {
+                    //i.e., s.equalsIgnoreCase(x) -> s.equals(x, ignoreCase = true)
+                    if(argumentCount2(namedCalls2.get(i), LANG2) == 2)
+                        matches++;
                 }
                 else if(s1.startsWith(s2) || s2.startsWith(s1)) {
                     matches++;
@@ -1532,6 +1985,24 @@ public class JavaToKotlinMigration {
     }
 
     //the receivers of the Java invocations, which are called without receiver in Kotlin, i.e., the class name of a static method moved to a companion object
+    //the Java parseLong invocations, i.e., Long.parseLong(x), when the Kotlin statement has no parseLong call
+    private static List<Tree> findParseLongInvocationsOnlyInJava(Tree srcStatementNode, List<Tree> simpleNames2, Constants LANG1) {
+        if(simpleNames2.stream().anyMatch(t -> t.getLabel().equals("parseLong")))
+            return Collections.emptyList();
+        List<Tree> invocations1 = TreeUtilFunctions.findChildrenByTypeRecursively(srcStatementNode, LANG1.METHOD_INVOCATION);
+        if(srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+            invocations1.add(0, srcStatementNode);
+        }
+        List<Tree> parseLongInvocations1 = new ArrayList<>();
+        for(Tree invocation1 : invocations1) {
+            Tree name1 = TreeUtilFunctions.findChildByType(invocation1, LANG1.SIMPLE_NAME);
+            if(name1 != null && name1.getLabel().equals("parseLong")) {
+                parseLongInvocations1.add(invocation1);
+            }
+        }
+        return parseLongInvocations1;
+    }
+
     private static List<Tree> droppedReceivers(List<Tree> inv1, List<Tree> inv2, Constants LANG1, Constants LANG2) {
         List<Tree> receivers1 = new ArrayList<>();
         for(Tree invocation1 : inv1) {
@@ -1691,7 +2162,9 @@ public class JavaToKotlinMigration {
         if(receiver1 != null && navigation2 != null && navigation2.getType().name.equals(LANG2.NAVIGATION_EXPRESSION) && navigation2.getChildren().size() > 1) {
             Tree suffix2 = navigation2.getChild(navigation2.getChildren().size() - 1);
             if(suffix2.getType().name.equals(LANG2.NAVIGATION_SUFFIX)) {
-                mappingStore.removeMapping(receiver1, suffix2);
+                if(isMappedTo(mappingStore, receiver1, suffix2)) {
+                    mappingStore.removeMapping(receiver1, suffix2);
+                }
                 navigation2.getChildren().remove(suffix2);
                 invocation2.getChildren().addAll(1, suffix2.getChildren());
                 for(Tree t : suffix2.getChildren())
@@ -1753,7 +2226,9 @@ public class JavaToKotlinMigration {
         if(valueArguments2 != null) {
             if(!arguments1 && valueArguments2.getChildren().isEmpty()) {
                 //Java side has no node for an empty argument list
-                mappingStore.removeMapping(call1, valueArguments2);
+                if(isMappedTo(mappingStore, call1, valueArguments2)) {
+                    mappingStore.removeMapping(call1, valueArguments2);
+                }
                 removeDstChild(mappingStore, deferredFlattenings, callSuffix2, valueArguments2);
                 valueArguments2 = null;
             }
@@ -1938,7 +2413,7 @@ public class JavaToKotlinMigration {
             return false;
         List<Pair<Tree, Tree>> pairs = new ArrayList<>();
         if(dstComment.isLeaf()) {
-            //the label is the source code of the comment, as restored by KotlinTreeSitterTreeFixer, so the offsets are computed from the start of the comment
+            //the label is the source code of the comment, so the offsets are computed from the start of the comment
             String text = dstComment.getLabel();
             int offset = dstComment.getPos();
             if(!text.startsWith("/*") || !text.endsWith("*/"))
@@ -2606,11 +3081,17 @@ public class JavaToKotlinMigration {
 
     //align Kotlin call_expression -> [simple_identifier, call_suffix -> annotated_lambda -> lambda_literal -> statements -> stmt*] with Java TryStatement -> [try, Block -> stmt*, CatchClause*],
     //when the try statement is replaced with a call to a function taking the try block as lambda, i.e., try {...} catch (IOException ignored) {} -> ignoreIoExceptions {...}
+    //also aligns Kotlin call_expression -> [navigation_expression -> [receiver, navigation_suffix -> use], call_suffix -> annotated_lambda -> lambda_literal -> [lambda_parameters, ->, statements]]
+    //with Java TryStatement -> [try, VariableDeclarationExpression*, Block], i.e., try (BufferedSink sink = Okio.buffer(stream.getSink())) {...} -> stream.getSink().buffer().use { sink -> ...}
     private static void handleTryToLambdaCallMapping(ExtendedMultiMappingStore mappingStore, Tree try1, Tree call2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
         if(call2.getChildren().size() != 2)
             return;
         Tree name2 = call2.getChild(0);
         Tree suffix2 = call2.getChild(1);
+        boolean useCall2 = useCallName2(call2, LANG2) != null;
+        if(useCall2) {
+            name2 = useCallName2(call2, LANG2);
+        }
         if(!name2.getType().name.equals(LANG2.SIMPLE_NAME) || !suffix2.getType().name.equals(LANG2.CALL_SUFFIX) || suffix2.getChildren().size() != 1)
             return;
         Tree annotatedLambda2 = suffix2.getChild(0);
@@ -2640,6 +3121,73 @@ public class JavaToKotlinMigration {
         }
         if(!mappingStore.isDstMapped(name2)) {
             mappingStore.addMapping(keyword1, name2);
+        }
+        if(useCall2) {
+            alignTryResourcesWithUseCalls(mappingStore, try1, call2, LANG1, LANG2, deferredFlattenings);
+        }
+    }
+
+    //the use name of Kotlin call_expression -> [navigation_expression -> [receiver, navigation_suffix -> use], call_suffix -> annotated_lambda]
+    private static Tree useCallName2(Tree call2, Constants LANG2) {
+        if(!call2.getType().name.equals(LANG2.METHOD_INVOCATION) || call2.getChildren().size() != 2)
+            return null;
+        Tree navigation2 = call2.getChild(0);
+        if(!navigation2.getType().name.equals(LANG2.NAVIGATION_EXPRESSION) || navigation2.getChildren().size() != 2)
+            return null;
+        Tree suffix2 = navigation2.getChild(1);
+        if(!suffix2.getType().name.equals(LANG2.NAVIGATION_SUFFIX) || suffix2.getChildren().size() != 1 || !suffix2.getChild(0).getLabel().equals("use"))
+            return null;
+        return suffix2.getChild(0);
+    }
+
+    //the lambda parameter name of Kotlin call_expression -> [..., call_suffix -> annotated_lambda -> lambda_literal -> lambda_parameters -> variable_declaration -> name],
+    //or call_expression -> [..., lambda_literal -> ...] if the call_suffix and annotated_lambda are already flattened (see handleTryToLambdaCallMapping)
+    private static Tree lambdaParameterName2(Tree call2, Constants LANG2) {
+        Tree lambdaLiteral2 = call2.getChild(1);
+        if(lambdaLiteral2.getType().name.equals(LANG2.CALL_SUFFIX) && lambdaLiteral2.getChildren().size() == 1) {
+            lambdaLiteral2 = lambdaLiteral2.getChild(0);
+        }
+        if(lambdaLiteral2.getType().name.equals(LANG2.ANNOTATED_LAMBDA) && lambdaLiteral2.getChildren().size() == 1) {
+            lambdaLiteral2 = lambdaLiteral2.getChild(0);
+        }
+        if(!lambdaLiteral2.getType().name.equals(LANG2.LAMBDA_LITERAL))
+            return null;
+        Tree parameters2 = TreeUtilFunctions.findChildByType(lambdaLiteral2, LANG2.LAMBDA_PARAMETERS);
+        if(parameters2 == null || parameters2.getChildren().size() != 1)
+            return null;
+        Tree declaration2 = parameters2.getChild(0);
+        Tree name2 = declaration2.getType().name.equals(LANG2.VARIABLE_DECLARATION) ? TreeUtilFunctions.findChildByType(declaration2, LANG2.SIMPLE_NAME) : null;
+        return name2;
+    }
+
+    //align each Java try resource VariableDeclarationExpression -> [type, VariableDeclarationFragment -> [name, initializer]] with the Kotlin use call having
+    //the resource as receiver and lambda parameter, which is either the use call mapped to the try statement or an enclosing use call for multiple resources,
+    //i.e., try (BufferedSink sink = Okio.buffer(stream.getSink()); BufferedSource source = Okio.buffer(stream.getSource())) {...} ->
+    //stream.getSink().buffer().use { sink -> stream.getSource().buffer().use { source -> ...} }
+    private static void alignTryResourcesWithUseCalls(ExtendedMultiMappingStore mappingStore, Tree try1, Tree call2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        List<Tree> useCalls2 = new ArrayList<>();
+        for(Tree t2 = call2; t2 != null; t2 = t2.getParent()) {
+            if(useCallName2(t2, LANG2) != null) {
+                useCalls2.add(t2);
+            }
+        }
+        for(Tree resource1 : try1.getChildren()) {
+            if(!resource1.getType().name.equals(LANG1.VARIABLE_DECLARATION_EXPRESSION))
+                continue;
+            Tree fragment1 = TreeUtilFunctions.findChildByType(resource1, LANG1.VARIABLE_DECLARATION_FRAGMENT);
+            if(fragment1 == null || fragment1.getChildren().size() != 2)
+                continue;
+            Tree name1 = fragment1.getChild(0);
+            Tree initializer1 = fragment1.getChild(1);
+            for(Tree useCall2 : useCalls2) {
+                Tree parameterName2 = lambdaParameterName2(useCall2, LANG2);
+                if(parameterName2 != null && parameterName2.getLabel().equals(name1.getLabel())) {
+                    mappingStore.addMapping(name1, parameterName2);
+                    //the use receiver is the resource initializer
+                    handleLeafMapping(mappingStore, initializer1, useCall2.getChild(0).getChild(0), LANG1, LANG2, deferredFlattenings);
+                    break;
+                }
+            }
         }
     }
 

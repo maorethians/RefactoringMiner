@@ -776,11 +776,11 @@ public class MethodMatcher extends BodyMapperMatcher{
             if(srcTree.getType().name.equals(LANG1.MODULE) || srcTree.getType().name.equals(LANG1.PROGRAM))
                 srcOperationNode = srcTree;
             else
-                srcOperationNode = TreeUtilFunctions.findByLocationInfo(srcTree, umlOperationBodyMapper.getContainer1().getLocationInfo(), LANG1);
+                srcOperationNode = findInitializer(srcTree, umlOperationBodyMapper.getContainer1().getLocationInfo(), LANG1);
             if(dstTree.getType().name.equals(LANG2.MODULE) || dstTree.getType().name.equals(LANG2.PROGRAM))
                 dstOperationNode = dstTree;
             else
-                dstOperationNode = TreeUtilFunctions.findByLocationInfo(dstTree, umlOperationBodyMapper.getContainer2().getLocationInfo(), LANG2);
+                dstOperationNode = findInitializer(dstTree, umlOperationBodyMapper.getContainer2().getLocationInfo(), LANG2);
             if (srcOperationNode != null && dstOperationNode != null) {
                 if (srcOperationNode.getType().name.equals(LANG1.INITIALIZER) && dstOperationNode.getType().name.equals(LANG2.INITIALIZER)) {
                     mappingStore.addMapping(srcOperationNode, dstOperationNode);
@@ -805,10 +805,6 @@ public class MethodMatcher extends BodyMapperMatcher{
                                     .match(srcOperationNode, dstOperationNode, mappingStore);
                         }
                     }
-                }
-                //sometimes Kotlin treesitter models initializer blocks as call expressions. Very bad parser!
-                if (srcOperationNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstOperationNode.getType().name.equals(LANG2.METHOD_INVOCATION)) {
-                    ClassDeclarationMatcher.processCallExpressionsInDelegationSpecifiers(mappingStore, new com.github.gumtreediff.utils.Pair<Tree, Tree>(srcOperationNode,dstOperationNode), LANG1, LANG2);
                 }
             }
         }
@@ -1574,6 +1570,16 @@ public class MethodMatcher extends BodyMapperMatcher{
         }
     }
 
+    //the initializer is searched by type, as its location might include the comments preceding it, which are its siblings in the tree, i.e., Kotlin /** ... */ init { ... }
+    private static Tree findInitializer(Tree tree, LocationInfo locationInfo, Constants LANG) {
+        if (!LANG.INITIALIZER.isEmpty()) {
+            Tree initializer = TreeUtilFunctions.findByLocationInfo(tree, locationInfo, LANG, LANG.INITIALIZER);
+            if (initializer != null && initializer.getType().name.equals(LANG.INITIALIZER))
+                return initializer;
+        }
+        return TreeUtilFunctions.findByLocationInfo(tree, locationInfo, LANG);
+    }
+
     private void processOperationDiff(Tree srcTree, Tree dstTree, UMLOperationBodyMapper umlOperationBodyMapper, ExtendedMultiMappingStore mappingStore) {
         UMLOperationDiff umlOperationDiff = umlOperationBodyMapper.getOperationSignatureDiff().isPresent() ? umlOperationBodyMapper.getOperationSignatureDiff().get() : null;
         if (umlOperationDiff == null) return;
@@ -1702,20 +1708,20 @@ public class MethodMatcher extends BodyMapperMatcher{
             VariableDeclaration rightVarDecl = matchedPair.getRight();
             processParameterPair(srcTree, dstTree, mappingStore, leftVarDecl, rightVarDecl);
         }
-        boolean proceed = (umlOperationBodyMapper.getContainer1().getBody() == null && umlOperationBodyMapper.getContainer2().getBody() == null) || !umlOperationBodyMapper.sameFileExtension();
-        if(proceed && umlOperationBodyMapper.getOperationSignatureDiff().isPresent()) {
+        if(umlOperationBodyMapper.getOperationSignatureDiff().isPresent()) {
             UMLOperationDiff operationDiff = umlOperationBodyMapper.getOperationSignatureDiff().get();
+            //the parameters with changes, which are not matched through their references in the mapped statements, i.e., item: T -> item: Any?
             for(UMLParameterDiff parameterDiff : operationDiff.getParameterDiffList()) {
                 VariableDeclaration leftVarDecl = parameterDiff.getRemovedParameter();
                 VariableDeclaration rightVarDecl = parameterDiff.getAddedParameter();
-                processParameterPair(srcTree, dstTree, mappingStore, leftVarDecl, rightVarDecl);
+                if(!matchedVariables.contains(Pair.of(leftVarDecl, rightVarDecl)))
+                    processParameterPair(srcTree, dstTree, mappingStore, leftVarDecl, rightVarDecl);
             }
             if(!umlOperationBodyMapper.sameFileExtension()) {
                 //the parameters without changes, which are not matched through their references in the mapped statements
                 for(Pair<VariableDeclaration, VariableDeclaration> commonParameter : operationDiff.getCommonParameters()) {
-                    if(!matchedVariables.contains(commonParameter)) {
+                    if(!matchedVariables.contains(commonParameter))
                         processParameterPair(srcTree, dstTree, mappingStore, commonParameter.getLeft(), commonParameter.getRight());
-                    }
                 }
             }
         }

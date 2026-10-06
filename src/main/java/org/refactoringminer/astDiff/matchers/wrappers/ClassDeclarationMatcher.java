@@ -27,6 +27,7 @@ import gr.uom.java.xmi.diff.UMLCommentListDiff;
 import gr.uom.java.xmi.diff.UMLForwardDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportListDiff;
+import gr.uom.java.xmi.diff.UMLParameterDiff;
 import gr.uom.java.xmi.diff.UMLProblemDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLStaticAssertionDeclarationListDiff;
 import gr.uom.java.xmi.diff.UMLTypeAliasDiff;
@@ -38,6 +39,7 @@ import org.refactoringminer.astDiff.utils.Helpers;
 import org.refactoringminer.astDiff.models.ExtendedMultiMappingStore;
 import org.refactoringminer.astDiff.matchers.TreeMatcher;
 import org.refactoringminer.astDiff.matchers.statement.IgnoringCommentsLeafMatcher;
+import org.refactoringminer.astDiff.matchers.statement.LeafMatcher;
 import org.refactoringminer.astDiff.utils.TreeUtilFunctions;
 import org.refactoringminer.util.PathFileUtils;
 import org.refactoringminer.util.PrefixSuffixUtils;
@@ -245,10 +247,6 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             }
         }
 
-        if(classDiff.getOriginalClass().isFunctionalInterface() && classDiff.getNextClass().isFunctionalInterface()) {
-            new MethodMatcher(optimizationData, classDiff.getOperationBodyMapperList().get(0), LANG1, LANG2).match(srcTypeDeclaration,dstTypeDeclaration,mappingStore);
-            return;
-        }
         mappingStore.addMapping(srcTypeDeclaration,dstTypeDeclaration);
         if(srcTypeDeclaration.getParent() != null && dstTypeDeclaration.getParent() != null &&
                 srcTypeDeclaration.getParent().getType().name.equals(LANG1.DECORATED_METHOD) && dstTypeDeclaration.getParent().getType().name.equals(LANG1.DECORATED_METHOD)) {
@@ -308,6 +306,8 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         new SameModifierMatcher(LANG1, LANG2, LANG1.COMPANION).match(srcTypeDeclaration,dstTypeDeclaration,mappingStore);
         new SameModifierMatcher(LANG1, LANG2, LANG1.INNER).match(srcTypeDeclaration,dstTypeDeclaration,mappingStore);
         new SameModifierMatcher(LANG1, LANG2, LANG1.VALUE).match(srcTypeDeclaration,dstTypeDeclaration,mappingStore);
+        if (classDiff.getOriginalClass().isFunctionalInterface() && classDiff.getNextClass().isFunctionalInterface())
+            new SameModifierMatcher(LANG1, LANG2, LANG1.FUN).match(srcTypeDeclaration,dstTypeDeclaration,mappingStore);
 
         Tree parent1 = srcTypeDeclaration.getParent();
         Tree parent2 = dstTypeDeclaration.getParent();
@@ -354,16 +354,11 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         if (classDiff.getPrimaryConstructorParameterListDiff().isPresent()) {
             Set<org.apache.commons.lang3.tuple.Pair<VariableDeclaration, VariableDeclaration>> pairs = classDiff.getPrimaryConstructorParameterListDiff().get().getCommonParameters();
             for (org.apache.commons.lang3.tuple.Pair<VariableDeclaration, VariableDeclaration> pair : pairs) {
-                Tree srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, pair.getLeft().getLocationInfo(), LANG1);
-                Tree dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, pair.getRight().getLocationInfo(), LANG2);
-                if (srcFieldDeclaration == null || srcFieldDeclaration.getType().name.endsWith("_comment")) {
-                    srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, pair.getLeft().getLocationInfo(), LANG1, LANG1.CLASS_PARAMETER);
-                }
-                if (dstFieldDeclaration == null || dstFieldDeclaration.getType().name.endsWith("_comment")) {
-                    dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, pair.getRight().getLocationInfo(), LANG2, LANG2.CLASS_PARAMETER);
-                }
-                if (srcFieldDeclaration != null && dstFieldDeclaration != null && srcFieldDeclaration.isIsoStructuralTo(dstFieldDeclaration))
-                    mappingStore.addMappingRecursively(srcFieldDeclaration,dstFieldDeclaration);
+                processPrimaryConstructorParameterPair(srcTypeDeclaration, dstTypeDeclaration, pair.getLeft(), pair.getRight(), mappingStore);
+            }
+            //the parameters with changes, i.e., a changed type
+            for (UMLParameterDiff parameterDiff : classDiff.getPrimaryConstructorParameterListDiff().get().getParameterDiffList()) {
+                processPrimaryConstructorParameterPair(srcTypeDeclaration, dstTypeDeclaration, parameterDiff.getRemovedParameter(), parameterDiff.getAddedParameter(), mappingStore);
             }
             Tree srcSubTree = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, classDiff.getOriginalClass().getPrimaryConstructor().get().getLocationInfo(), LANG1);
             Tree dstSubTree = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, classDiff.getNextClass().getPrimaryConstructor().get().getLocationInfo(), LANG2);
@@ -372,8 +367,10 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 new SameModifierMatcher(LANG1, LANG2, LANG1.INTERNAL).match(srcSubTree,dstSubTree,mappingStore);
                 new SameModifierMatcher(LANG1, LANG2, LANG1.PRIVATE).match(srcSubTree,dstSubTree,mappingStore);
                 matched = findPairOfType(srcSubTree,dstSubTree,LANG1.MODIFIERS,LANG2.MODIFIERS);
-                if (matched != null)
+                if (matched != null) {
                     mappingStore.addMapping(matched.first,matched.second);
+                    processPrimaryConstructorAnnotations(matched.first, matched.second, mappingStore);
+                }
                 matched = findPairOfType(srcSubTree,dstSubTree,LANG1.CONSTRUCTOR_KEYWORD,LANG2.CONSTRUCTOR_KEYWORD);
                 if (matched != null)
                     mappingStore.addMapping(matched.first,matched.second);
@@ -884,8 +881,6 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             type = LANG.MODULE;
         else if (umlClass.isObject())
             type = LANG.COMPANION_OBJECT;
-        else if (umlClass.isFunctionalInterface())
-            type = LANG.METHOD_DECLARATION;
         else if (umlClass.isStruct())
             type = LANG.STRUCT_SPECIFIER;
         else if (umlClass.isUnion())
@@ -1380,7 +1375,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         }
     }
 
-    public static void processCallExpressionsInDelegationSpecifiers(ExtendedMultiMappingStore mappingStore, Pair<Tree, Tree> callExpressions, Constants LANG1, Constants LANG2) {
+    private static void processCallExpressionsInDelegationSpecifiers(ExtendedMultiMappingStore mappingStore, Pair<Tree, Tree> callExpressions, Constants LANG1, Constants LANG2) {
         mappingStore.addMapping(callExpressions.first,callExpressions.second);
         Pair<Tree, Tree> byIdentifiers = Helpers.findPairOfType(callExpressions.first,callExpressions.second, LANG1.SIMPLE_NAME, LANG2.SIMPLE_NAME);
         if(byIdentifiers != null) {
@@ -1402,6 +1397,55 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 }
             }
         }
+    }
+
+    private void processPrimaryConstructorParameterPair(Tree srcTypeDeclaration, Tree dstTypeDeclaration, VariableDeclaration left, VariableDeclaration right, ExtendedMultiMappingStore mappingStore) {
+        Tree srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, left.getLocationInfo(), LANG1);
+        Tree dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, right.getLocationInfo(), LANG2);
+        if (srcFieldDeclaration == null || srcFieldDeclaration.getType().name.endsWith("_comment")) {
+            srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, left.getLocationInfo(), LANG1, LANG1.CLASS_PARAMETER);
+        }
+        if (dstFieldDeclaration == null || dstFieldDeclaration.getType().name.endsWith("_comment")) {
+            dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, right.getLocationInfo(), LANG2, LANG2.CLASS_PARAMETER);
+        }
+        if (srcFieldDeclaration == null || dstFieldDeclaration == null)
+            return;
+        if (srcFieldDeclaration.isIsoStructuralTo(dstFieldDeclaration))
+            mappingStore.addMappingRecursively(srcFieldDeclaration,dstFieldDeclaration);
+        //the parameter with a changed type, or becoming a property, i.e., viewBinding: T -> val viewBinding: T
+        else if (!Constants.isCrossLanguage(LANG1, LANG2) && srcFieldDeclaration.getType().name.equals(dstFieldDeclaration.getType().name)) {
+            new LeafMatcher(LANG1, LANG2).match(srcFieldDeclaration,dstFieldDeclaration,mappingStore);
+            mappingStore.addMapping(srcFieldDeclaration,dstFieldDeclaration);
+        }
+    }
+
+    //the primary constructor has no annotations in the model, so its annotations are matched by name, i.e., class TaskDetailViewModel @Inject constructor(...)
+    private void processPrimaryConstructorAnnotations(Tree srcModifiers, Tree dstModifiers, ExtendedMultiMappingStore mappingStore) {
+        for (Tree srcAnnotation : srcModifiers.getChildren()) {
+            String name = annotationName(srcAnnotation, LANG1);
+            if (name == null)
+                continue;
+            for (Tree dstAnnotation : dstModifiers.getChildren()) {
+                if (!name.equals(annotationName(dstAnnotation, LANG2)) || mappingStore.isDstMapped(dstAnnotation))
+                    continue;
+                if (srcAnnotation.isIsoStructuralTo(dstAnnotation))
+                    mappingStore.addMappingRecursively(srcAnnotation, dstAnnotation);
+                else
+                    new IgnoringCommentsLeafMatcher(LANG1, LANG2).match(srcAnnotation, dstAnnotation, mappingStore);
+                break;
+            }
+        }
+    }
+
+    //the name of an annotation, i.e., class_modifier -> [at, user_type -> type_identifier], or null for a modifier keyword
+    private static String annotationName(Tree modifier, Constants LANG) {
+        if (!modifier.getType().name.equals(LANG.CLASS_MODIFIER) || modifier.getChildren().isEmpty() || !modifier.getChild(0).getType().name.equals(LANG.AT))
+            return null;
+        for (Tree t : modifier.preOrder()) {
+            if (t.getType().name.equals(LANG.TYPE_IDENTIFIER))
+                return t.getLabel();
+        }
+        return null;
     }
 
     private void processVariableDeclaratorPair(Tree tree1, Tree tree2, ExtendedMultiMappingStore mappingStore) {
@@ -1725,12 +1769,12 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
     private void processClassAnnotations(Tree srcTree, Tree dstTree, UMLAnnotationListDiff annotationListDiff, ExtendedMultiMappingStore mappingStore) {
         for (org.apache.commons.lang3.tuple.Pair<UMLAnnotation, UMLAnnotation> umlAnnotationUMLAnnotationPair : annotationListDiff.getCommonAnnotations()) {
             Tree srcClassAnnotationTree = TreeUtilFunctions.findByLocationInfo(srcTree , umlAnnotationUMLAnnotationPair.getLeft().getLocationInfo(), LANG1);
+            Tree dstClassAnnotationTree = TreeUtilFunctions.findByLocationInfo(dstTree, umlAnnotationUMLAnnotationPair.getRight().getLocationInfo(), LANG2);
+            if (srcClassAnnotationTree == null || dstClassAnnotationTree == null) continue;
             if(srcClassAnnotationTree.getParent() != null && srcClassAnnotationTree.getParent().getType().name.equals(LANG1.DECORATOR))
                 srcClassAnnotationTree = srcClassAnnotationTree.getParent();
-            Tree dstClassAnnotationTree = TreeUtilFunctions.findByLocationInfo(dstTree, umlAnnotationUMLAnnotationPair.getRight().getLocationInfo(), LANG2);
             if(dstClassAnnotationTree.getParent() != null && dstClassAnnotationTree.getParent().getType().name.equals(LANG1.DECORATOR))
                 dstClassAnnotationTree = dstClassAnnotationTree.getParent();
-            if (srcClassAnnotationTree == null || dstClassAnnotationTree == null) continue;
             if (srcClassAnnotationTree.isIsoStructuralTo(dstClassAnnotationTree))
                 mappingStore.addMappingRecursively(srcClassAnnotationTree, dstClassAnnotationTree);
             else if(Constants.isCrossLanguage(LANG1, LANG2)) {

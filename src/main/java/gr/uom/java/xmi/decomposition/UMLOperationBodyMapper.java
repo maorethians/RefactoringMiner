@@ -6484,6 +6484,29 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			innerNodes1.remove(mappings.get(i).getFragment1());
 			innerNodes2.remove(mappings.get(i).getFragment2());
 		}
+		//in Kotlin, return when/if/try and val x = when/if/try are represented by the composite followed by a parent leaf containing the entire statement
+		for(AbstractCodeMapping mapping : mappings) {
+			if(mapping instanceof CompositeStatementObjectMapping) {
+				AbstractCodeFragment parentLeaf1 = parentLeaf((CompositeStatementObject)mapping.getFragment1());
+				AbstractCodeFragment parentLeaf2 = parentLeaf((CompositeStatementObject)mapping.getFragment2());
+				if(parentLeaf1 != null && parentLeaf2 != null && leaves1.contains(parentLeaf1) && leaves2.contains(parentLeaf2)) {
+					addMapping(createLeafMapping(parentLeaf1, parentLeaf2, parameterToArgumentMap, false, isomorphic));
+					leaves1.remove(parentLeaf1);
+					leaves2.remove(parentLeaf2);
+				}
+			}
+		}
+	}
+
+	private static AbstractCodeFragment parentLeaf(CompositeStatementObject composite) {
+		if(composite.getParent() != null) {
+			List<AbstractStatement> statements = composite.getParent().getStatements();
+			int index = statements.indexOf(composite);
+			if(index < statements.size()-1 && statements.get(index+1) instanceof StatementObject leaf && leaf.getLocationInfo().subsumes(composite.getLocationInfo())) {
+				return leaf;
+			}
+		}
+		return null;
 	}
 
 	private boolean isInMergeConditionalRefactoring(CompositeStatementObject innerNode1) {
@@ -7601,6 +7624,11 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		return commentsWithinStatement1.size() > 0 && commentsWithinStatement1.equals(commentsWithinStatement2);
 	}
 
+	//the same name with and without qualification, i.e., LeakTraceElement.Type.STATIC_FIELD and STATIC_FIELD
+	private static boolean equalOrQualified(String s1, String s2) {
+		return s1.equals(s2) || s1.endsWith("." + s2) || s2.endsWith("." + s1);
+	}
+
 	private boolean identicalBody(CompositeStatementObject statement1, CompositeStatementObject statement2) {
 		if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.SWITCH_STATEMENT) && statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT)) {
 			return false;
@@ -7622,8 +7650,8 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		}
 		else if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY) && statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY) &&
 				statement1.getExpressions().size() > 1 && statement2.getExpressions().size() > 1) {
-			if(!statement1.getExpressions().get(0).getString().equals(statement2.getExpressions().get(0).getString()) &&
-					!statement1.getExpressions().get(1).getString().equals(statement2.getExpressions().get(1).getString())) {
+			if(!equalOrQualified(statement1.getExpressions().get(0).getString(), statement2.getExpressions().get(0).getString()) &&
+					!equalOrQualified(statement1.getExpressions().get(1).getString(), statement2.getExpressions().get(1).getString())) {
 				return false;
 			}
 		}
@@ -8480,6 +8508,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 									LeafMapping minStatementMapping = mappingSet.first();
 									if(canBeAdded(minStatementMapping, parameterToArgumentMap)) {
 										addToMappings(minStatementMapping, mappingSet);
+										processAnonymousClassDeclarationsInStaticCallArgument(minStatementMapping);
 										leaves2.remove(minStatementMapping.getFragment2());
 										if(minStatementMapping.getFragment1().equals(leaf1)) {
 											leafIterator1.remove();
@@ -9011,6 +9040,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 												boolean split = checkForSplitVariableDeclaration(minStatementMapping.getFragment1(), leaves1, leaves2, minStatementMapping, parameterToArgumentMap, equalNumberOfAssertions, isomorphic, leaves2ToBeRemoved);
 												if(split) {
 													addToMappings(minStatementMapping, mappingSet);
+													processAnonymousClassDeclarationsInStaticCallArgument(minStatementMapping);
 													leaves1.remove(minStatementMapping.getFragment1());
 													if(minStatementMapping.getFragment2().equals(leaf2)) {
 														leafIterator2.remove();
@@ -11562,6 +11592,16 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			}
 		}
 		return false;
+	}
+
+	//the anonymous class receiver of a Kotlin extension call moved to the argument of the static call, i.e., object : Source {...}.buffer() -> Okio.buffer(object : Source {...})
+	private void processAnonymousClassDeclarationsInStaticCallArgument(LeafMapping mapping) throws RefactoringMinerTimedOutException {
+		for(Replacement replacement : mapping.getReplacements()) {
+			if(replacement.getType().equals(ReplacementType.METHOD_INVOCATION_EXPRESSION_MOVED_TO_STATIC_CALL_ARGUMENT)) {
+				processAnonymousClassDeclarationsInIdenticalStatements(mapping);
+				break;
+			}
+		}
 	}
 
 	private void processAnonymousClassDeclarationsInIdenticalStatements(LeafMapping minStatementMapping) throws RefactoringMinerTimedOutException {

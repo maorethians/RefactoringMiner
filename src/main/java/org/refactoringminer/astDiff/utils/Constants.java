@@ -290,6 +290,7 @@ public class Constants {
     public final String CATCH_CLAUSE;
     public final String BLOCK = "Block";
     public final String VARIABLE_DECLARATION_FRAGMENT = "VariableDeclarationFragment";
+    public final String VARIABLE_DECLARATION_EXPRESSION = "VariableDeclarationExpression";
     public final String FIELD_DECLARATION;
     public final String ACCESS_MODIFIER = "AccessModifier";
     public final String PACKAGE_DECLARATION;
@@ -341,6 +342,7 @@ public class Constants {
     public final String INFIX = "infix";
     public final String INNER = "inner";
     public final String VALUE = "value";
+    public final String FUN = "fun";
 
     public final String METHOD_INVOCATION_ARGUMENTS;
     public final String METHOD_INVOCATION_RECEIVER = "METHOD_INVOCATION_RECEIVER";
@@ -455,6 +457,7 @@ public class Constants {
     public final String CONSTRUCTOR_KEYWORD = "constructor_keyword";
     public final String FUNCTION_PARAMETERS = "function_value_parameters";
     public final String STATEMENTS = "statements"; // This is a node that wraps each leaf statement in Kotlin
+    public final String FINALLY_BLOCK = "finally_block";
     public final String IMPORT_LIST = "import_list";
     public final String MODIFIERS = "modifiers"; // This is a node that wraps all modifiers
     public final String TYPE_PARAMETERS = "type_parameters";
@@ -493,6 +496,8 @@ public class Constants {
     public final String CALL_SUFFIX = "call_suffix";
     public final String NAVIGATION_EXPRESSION = "navigation_expression";
     public final String NAVIGATION_SUFFIX = "navigation_suffix";
+    public final String INDEXING_EXPRESSION = "indexing_expression";
+    public final String INDEXING_SUFFIX = "indexing_suffix";
     public final String INTEGER_LITERAL = "integer_literal";
     public final String FLOAT_LITERAL = "real_literal";
     public final String VARIABLE_DECLARATION = "variable_declaration";

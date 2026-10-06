@@ -316,7 +316,12 @@ public class MonacoCore {
     private static boolean isStatement(Tree t) {
     	String type = t.getType().toString();
 		return type.endsWith("Statement") || type.equals("Block") || type.endsWith("ConstructorInvocation") || type.equals("SwitchCase") ||
-				type.endsWith("_statement") || type.endsWith("block");
+				type.endsWith("_statement") || type.endsWith("block") || isKotlinStatement(t);
+    }
+
+    //the Kotlin statements are the children of a statements node, i.e., call_expression, assignment, property_declaration, jump_expression, and the statements node itself is a block
+    private static boolean isKotlinStatement(Tree t) {
+    	return t.getType().name.equals("statements") || (t.getParent() != null && t.getParent().getType().name.equals("statements"));
     }
 
     private static boolean isExpression(Tree t) {
@@ -330,33 +335,14 @@ public class MonacoCore {
     	String type = t.getType().toString();
     	return type.startsWith("LineComment") || type.startsWith("BlockComment") || type.endsWith("_comment");
     }
-    //private Map<Tree, Set<String>> appliedTooltips = new HashMap<>();
 
     private void appendRange(StringBuilder b, Tree t, String kind, String tip) {
         Set<String> tooltips = kind.equals("updated") ? updateTooltip(t) : tooltip(t);
         if(!tooltips.isEmpty() && (isStatement(t) || isDeclaration(t) || isExpression(t) || isComment(t)) &&
         		(kind.equals("moved") || kind.startsWith("mm") || kind.equals("moveOut") || kind.equals("moveIn"))) {
         	for(String tooltip : tooltips) {
-        		//TODO the problem with duplicated tooltips seems to be related with cascading tooltips from parent nodes
-        		//when an AST in nested under a parent with tooltips, it inherits all tooltips from its parent
-        		//the solution below does not fix the problem
-        		/*
-        		boolean tipExists = false;
-        		if(appliedTooltips.containsKey(t)) {
-        			Set<String> tips = appliedTooltips.get(t);
-        			if(tips.contains(tooltip)) {
-        				tipExists = true;
-        			}
-        			else {
-        				tips.add(tooltip);
-        			}
-        		}
-        		else {
-        			Set<String> tips = new HashSet<>();
-        			tips.add(tooltip);
-        			appliedTooltips.put(t, tooltips);
-        		}
-        		*/
+        		//the ranges of nested AST nodes overlap, and Monaco shows the hover messages of all decorations containing the mouse position,
+        		//so decorations.js (getTooltipDecorations) shows the tooltips of each AST node only outside its nested AST nodes with tooltips
         		String requestPath = "";
         		if((kind.equals("moveOut") || kind.equals("mm")) && tooltip.contains("moved to file: ")) {
         			String prefix = "moved to file: ";
@@ -780,6 +766,13 @@ public class MonacoCore {
 			}
 		}
 		if(bodyMapper != null) {
+			//a Kotlin statements block moved as a whole, i.e., the body of an extracted method, as its statements are mapped individually
+			if(tree.getType().name.equals("statements")) {
+				if((classifier.getMovedSrcs().contains(tree) || classifier.getMultiMapSrc().containsKey(tree)) && allStatementsMapped(bodyMapper, tree, true))
+					return tooltipLeft;
+				if((classifier.getMovedDsts().contains(tree) || classifier.getMultiMapDst().containsKey(tree)) && allStatementsMapped(bodyMapper, tree, false))
+					return tooltipRight;
+			}
 			for(AbstractCodeMapping mapping : bodyMapper.getMappings()) {
 				if(subsumes(mapping.getFragment1().codeRange(),tree) && (classifier.getMovedSrcs().contains(tree) || classifier.getMultiMapSrc().containsKey(tree))) {
 					return tooltipLeft;
@@ -809,6 +802,14 @@ public class MonacoCore {
 		}
 		return null;
 	}
+
+    private static boolean allStatementsMapped(UMLOperationBodyMapper bodyMapper, Tree statements, boolean left) {
+    	for(Tree statement : statements.getChildren()) {
+    		if(!isComment(statement) && bodyMapper.getMappings().stream().noneMatch(m -> subsumes(left ? m.getFragment1().codeRange() : m.getFragment2().codeRange(), statement)))
+    			return false;
+    	}
+    	return !statements.getChildren().isEmpty();
+    }
 
     private static boolean subsumes(CodeRange range, Tree t) {
     	if(range.getStartOffset() <= t.getPos() &&

@@ -76,9 +76,46 @@ public class StringBasedHeuristics {
 		return expression.replace("new ", "").replaceAll("\\s", "");
 	}
 
+	//Kotlin does not allow assignments in expressions, so the Java while condition assignment becomes a variable declaration followed by an if-break in the Kotlin while(true) body,
+	//i.e., while((header = source.readUtf8LineStrict()).length() != 0) {...} -> while(true) { val header = source.readUtf8LineStrict(); if(header.isEmpty()) { break } ...}
+	private static boolean whileConditionAssignmentMovedToBody(AbstractCodeFragment statement1, AbstractCodeFragment statement2, ReplacementInfo info) {
+		if(!(statement1 instanceof CompositeStatementObject comp1) || !(statement2 instanceof CompositeStatementObject comp2))
+			return false;
+		if(!comp1.getLocationInfo().getCodeElementType().equals(CodeElementType.WHILE_STATEMENT) ||
+				!comp2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHILE_STATEMENT))
+			return false;
+		if(comp1.getExpressions().size() != 1 || comp2.getExpressions().size() != 1 || !comp2.getExpressions().get(0).getString().equals("true"))
+			return false;
+		List<AbstractStatement> body2 = comp2.getStatements();
+		if(body2.size() == 1 && body2.get(0).getLocationInfo().getCodeElementType().equals(CodeElementType.BLOCK)) {
+			body2 = ((CompositeStatementObject)body2.get(0)).getStatements();
+		}
+		if(body2.size() < 2)
+			return false;
+		List<VariableDeclaration> declarations2 = body2.get(0).getVariableDeclarations();
+		if(declarations2.size() != 1 || declarations2.get(0).getInitializer() == null)
+			return false;
+		VariableDeclaration declaration2 = declarations2.get(0);
+		String condition1 = comp1.getExpressions().get(0).getString();
+		if(!condition1.startsWith("(" + declaration2.getVariableName() + "=" + declaration2.getInitializer().getString() + ")"))
+			return false;
+		if(!(body2.get(1) instanceof CompositeStatementObject if2) || !if2.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT))
+			return false;
+		for(AbstractCodeFragment leaf2 : if2.getLeaves()) {
+			if(leaf2.getLocationInfo().getCodeElementType().equals(CodeElementType.BREAK_STATEMENT)) {
+				info.addReplacement(new Replacement(condition1, comp2.getExpressions().get(0).getString(), ReplacementType.WHILE_CONDITION_MOVED_TO_BODY));
+				return true;
+			}
+		}
+		return false;
+	}
+
 	protected static boolean javaToKotlin(String s1, String s2, AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			ReplacementInfo info, Constants LANG1, Constants LANG2) {
 		if(LANG1.equals(Constants.JAVA) && LANG2.equals(Constants.KOTLIN)) {
+			if(whileConditionAssignmentMovedToBody(statement1, statement2, info)) {
+				return true;
+			}
 			List<AbstractCall> methodInvocations1 = statement1.getMethodInvocations();
 			List<AbstractCall> methodInvocations2 = statement2.getMethodInvocations();
 			List<LeafExpression> castExpressions1 = statement1.getCastExpressions();
@@ -128,6 +165,16 @@ public class StringBasedHeuristics {
 						call.getName().equals("toArray")) {
 					String before = ".toArray(" + call.arguments.get(0) + ")";
 					String after = ".toTypedArray()";
+					temp = ReplacementUtil.performReplacement(temp, before, after);
+					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
+				}
+				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 1 && !methodInvocations2.contains(call) &&
+						call.getName().equals("parseLong")) {
+					String before = "parseLong(" + call.arguments.get(0) + ")";
+					if(call.getExpression() != null) {
+						before = call.getExpression() + "." + before;
+					}
+					String after = call.arguments.get(0);
 					temp = ReplacementUtil.performReplacement(temp, before, after);
 					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
 				}
@@ -1142,6 +1189,13 @@ public class StringBasedHeuristics {
 				return true;
 			}
 			else if(diff2.isEmpty() && diff1.equals("== null")) {
+				return true;
+			}
+			else if(diff1.isEmpty() && diff2.equals("!!")) {
+				//not-null assertion operator is added, i.e., x -> x!!
+				return true;
+			}
+			else if(diff2.isEmpty() && diff1.equals("!!")) {
 				return true;
 			}
 			else if(diff1.isEmpty() && diff2.startsWith("@")) {
