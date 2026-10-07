@@ -304,7 +304,8 @@ public class JavaToKotlinMigration {
                             found = true;
                             break;
                         }
-                        else if(name.toLowerCase().endsWith(simpleName2.getLabel())) {
+                        else if(name.equalsIgnoreCase("get" + simpleName2.getLabel())) {
+                            //the Java getter is replaced with the Kotlin property access, i.e., e.getMessage() -> ${e.message}
                             mappingStore.addMapping(t1, simpleName2);
                             iter1.remove();
                             found = true;
@@ -353,15 +354,16 @@ public class JavaToKotlinMigration {
                     for(Tree child2 : children2) {
                         if(isQualifiedNameSegment(qualifiedType, child2.getLabel())) {
                             toBeRemoved2.add(child2);
-                            if(child2.getParent().getType().name.equals(LANG2.NAVIGATION_EXPRESSION) &&
+                            Tree navigation2 = outermostQualifiedNavigation(child2.getParent(), qualifiedType, LANG2);
+                            if(navigation2.getType().name.equals(LANG2.NAVIGATION_EXPRESSION) &&
                                     //important: skip qualified types whose parent is a variable declaration statement, because these are replaced with var in Kotlin
                                     !type1.getParent().getType().name.equals(LANG1.VARIABLE_DECLARATION_STATEMENT) &&
                                     !qualifiedNameToNavigationExpression.containsKey(type1.getChild(0)) &&
-                                    !qualifiedNameToNavigationExpression.containsValue(child2.getParent())) {
-                                Tree lastChild = child2.getParent().getChild(child2.getParent().getChildren().size() - 1);
+                                    !qualifiedNameToNavigationExpression.containsValue(navigation2)) {
+                                Tree lastChild = navigation2.getChild(navigation2.getChildren().size() - 1);
                                 if(lastChild.getType().name.equals(LANG2.NAVIGATION_SUFFIX) && lastChild.getChildren().size() > 0 &&
                                         isQualifiedNameSegment(qualifiedType, lastChild.getChild(0).getLabel())) {
-                                    qualifiedNameToNavigationExpression.put(type1.getChild(0), child2.getParent());
+                                    qualifiedNameToNavigationExpression.put(type1.getChild(0), navigation2);
                                 }
                             }
                         }
@@ -386,13 +388,14 @@ public class JavaToKotlinMigration {
                         if(!skip) {
                             toBeRemoved2.add(child2);
                         }
-                        if(child2.getParent().getType().name.equals(LANG2.NAVIGATION_EXPRESSION) &&
+                        Tree navigation2 = outermostQualifiedNavigation(child2.getParent(), qualifiedType, LANG2);
+                        if(navigation2.getType().name.equals(LANG2.NAVIGATION_EXPRESSION) &&
                                 !qualifiedNameToNavigationExpression.containsKey(qualified1) &&
-                                !qualifiedNameToNavigationExpression.containsValue(child2.getParent())) {
-                            Tree lastChild = child2.getParent().getChild(child2.getParent().getChildren().size() - 1);
+                                !qualifiedNameToNavigationExpression.containsValue(navigation2)) {
+                            Tree lastChild = navigation2.getChild(navigation2.getChildren().size() - 1);
                             if(lastChild.getType().name.equals(LANG2.NAVIGATION_SUFFIX) && lastChild.getChildren().size() > 0 &&
                                     isQualifiedNameSegment(qualifiedType, lastChild.getChild(0).getLabel())) {
-                                qualifiedNameToNavigationExpression.put(qualified1, child2.getParent());
+                                qualifiedNameToNavigationExpression.put(qualified1, navigation2);
                             }
                         }
                     }
@@ -439,7 +442,7 @@ public class JavaToKotlinMigration {
             inv1.add(0, srcStatementNode);
         }
         List<Tree> inv2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.METHOD_INVOCATION);
-        if(dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) && !isFlattenedReturnExpression(srcStatementNode, dstStatementNode, LANG1, LANG2) &&
+        if(dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) && !isFlattenedExpressionBody(srcStatementNode, dstStatementNode, LANG1, LANG2) &&
                 !isAssertCall(srcStatementNode, dstStatementNode, LANG1, LANG2)) {
             inv2.add(0, dstStatementNode);
         }
@@ -595,6 +598,16 @@ public class JavaToKotlinMigration {
                 }
                 if(matchingNames > 0) {
                     start1 = 1;
+                }
+            }
+            Tree fragment1 = TreeUtilFunctions.findChildByType(srcStatementNode, LANG1.VARIABLE_DECLARATION_FRAGMENT);
+            if(start1 == -1 && fragment1 != null) {
+                //the Java type has multiple simple names and the variable is renamed, so the type names are the simple names outside the fragment,
+                //i.e., Iterator<Socket> s = openClientSockets.iterator() -> val openClientSocket = openClientSockets.iterator()
+                List<Tree> fragmentNames1 = TreeUtilFunctions.findChildrenByTypeRecursively(fragment1, LANG1.SIMPLE_NAME);
+                int typeNames1 = (int)children1.stream().filter(child1 -> !fragmentNames1.contains(child1)).count();
+                if(typeNames1 > 0 && children1.size() - typeNames1 == children2.size()) {
+                    start1 = typeNames1;
                 }
             }
             if(children2.size() == children1.size() - start1) {
@@ -956,19 +969,32 @@ public class JavaToKotlinMigration {
                 iterator2.remove();
             }
         }
-        if(inv1.size() == children2.size()) {
-            for(int i=0; i<inv1.size(); i++) {
-                if(alignMethodInvocationWithPropertyAccess(mappingStore, inv1.get(i), children2.get(i), LANG1, LANG2, deferredFlattenings))
+        //the Java setter invocation is the extra invocation, when its value has property accesses,
+        //i.e., serverSocket.setReuseAddress(inetSocketAddress.getPort() != 0); -> serverSocket!!.reuseAddress = inetSocketAddress.port != 0
+        boolean setterWithPropertyAccesses1 = assignableExpression != null && children2.size() > 0 && inv1.size() == children2.size() + 1;
+        List<Tree> propertyAccesses1 = setterWithPropertyAccesses1 ? inv1.subList(1, inv1.size()) : inv1;
+        if(propertyAccesses1.size() != children2.size()) {
+            //the Java invocations without receiver and arguments have no Kotlin navigation expression counterpart, as they are converted to properties of the same class,
+            //i.e., new InetSocketAddress(inetSocketAddress.getAddress().getCanonicalHostName(), getPort()) -> InetSocketAddress(inetSocketAddress!!.address.canonicalHostName, port)
+            List<Tree> withReceiver1 = propertyAccesses1.stream().filter(t -> !(t.getType().name.equals(LANG1.METHOD_INVOCATION) &&
+                    t.getChildren().size() == 1 && t.getChild(0).getType().name.equals(LANG1.SIMPLE_NAME))).collect(Collectors.toList());
+            if(withReceiver1.size() == children2.size()) {
+                propertyAccesses1 = withReceiver1;
+            }
+        }
+        if(propertyAccesses1.size() == children2.size()) {
+            for(int i=0; i<propertyAccesses1.size(); i++) {
+                if(alignMethodInvocationWithPropertyAccess(mappingStore, propertyAccesses1.get(i), children2.get(i), LANG1, LANG2, deferredFlattenings))
                     continue;
                 Tree navigationSuffix = TreeUtilFunctions.findChildByType(children2.get(i), LANG2.NAVIGATION_SUFFIX);
                 if(navigationSuffix != null)
-                    mappingStore.addMapping(inv1.get(i), navigationSuffix);
-                boolean skip = inv1.get(i).getParent().getType().name.equals(LANG1.EXPRESSION_STATEMENT) && children2.get(i).getParent().getType().name.equals(LANG2.VALUE_ARGUMENT);
+                    mappingStore.addMapping(propertyAccesses1.get(i), navigationSuffix);
+                boolean skip = propertyAccesses1.get(i).getParent().getType().name.equals(LANG1.EXPRESSION_STATEMENT) && children2.get(i).getParent().getType().name.equals(LANG2.VALUE_ARGUMENT);
                 if(!skip)
-                    mappingStore.addMapping(inv1.get(i), children2.get(i));
+                    mappingStore.addMapping(propertyAccesses1.get(i), children2.get(i));
             }
         }
-        if(inv1.size() == 1 && assignableExpression != null) {
+        if((inv1.size() == 1 || setterWithPropertyAccesses1) && assignableExpression != null) {
             Tree navigationSuffix = TreeUtilFunctions.findChildByType(assignableExpression, LANG2.NAVIGATION_SUFFIX);
             if(navigationSuffix != null)
                 mappingStore.addMapping(inv1.get(0), navigationSuffix);
@@ -1971,10 +1997,12 @@ public class JavaToKotlinMigration {
         }
     }
 
-    //the Java ReturnStatement -> expression is already flattened, when aligned with the Kotlin function_body -> [=, expression] of a previous mapping,
-    //so the ReturnStatement corresponds to the Kotlin expression, i.e., return originalRequest.url().host(); -> = originalRequest.url().host()
-    private static boolean isFlattenedReturnExpression(Tree srcStatementNode, Tree dstStatementNode, Constants LANG1, Constants LANG2) {
-        if(!srcStatementNode.getType().name.equals(LANG1.RETURN_STATEMENT) || srcStatementNode.getChildren().isEmpty())
+    //the Java ReturnStatement|ExpressionStatement -> expression is already flattened, when aligned with the Kotlin function_body -> [=, expression] of a previous mapping,
+    //so the statement corresponds to the Kotlin expression, i.e., return originalRequest.url().host(); -> = originalRequest.url().host()
+    //or ((QueueDispatcher) dispatcher).enqueueResponse(response.clone()); -> = (dispatcher as QueueDispatcher).enqueueResponse(response.clone())
+    private static boolean isFlattenedExpressionBody(Tree srcStatementNode, Tree dstStatementNode, Constants LANG1, Constants LANG2) {
+        boolean statement1 = srcStatementNode.getType().name.equals(LANG1.RETURN_STATEMENT) || srcStatementNode.getType().name.equals(LANG1.EXPRESSION_STATEMENT);
+        if(!statement1 || srcStatementNode.getChildren().isEmpty())
             return false;
         if(dstStatementNode.getParent() == null || !dstStatementNode.getParent().getType().name.equals(LANG2.FUNCTION_BODY) ||
                 TreeUtilFunctions.findChildByType(dstStatementNode.getParent(), LANG2.AFFECTATION_OPERATOR) == null)
@@ -3195,14 +3223,15 @@ public class JavaToKotlinMigration {
     //Java ClassInstanceCreation -> AnonymousClassDeclaration -> MethodDeclaration -> Block -> stmt*, when the anonymous class is replaced with a lambda,
     //i.e., new NamedRunnable("OkHttp %s", connectionName) { public void execute() {...} } -> tryExecute("OkHttp $connectionName") {...}
     //the body of the anonymous class becomes the lambda, while the method, including the braces of its body, is deleted
-    public static void handleAnonymousToLambdaMapping(ExtendedMultiMappingStore mappingStore, Tree anonymousClass1, Tree lambda2, Constants LANG1, Constants LANG2) {
+    //if the anonymous class declares more methods, which are moved to the container class, the body of the method replaced with the lambda becomes the lambda,
+    //i.e., new NamedRunnable("MockWebServer %s", port) { protected void execute() {...} private void acceptConnections() {...} } -> execute("MockWebServer $port") {...}
+    public static void handleAnonymousToLambdaMapping(ExtendedMultiMappingStore mappingStore, Tree anonymousClass1, Tree anonymousMethod1, Tree lambda2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
         if(anonymousClass1 == null || !anonymousClass1.getType().name.equals(LANG1.ANONYMOUS_CLASS_DECLARATION) || lambda2 == null)
             return;
-        //the anonymous class implements a single method, i.e., execute() of NamedRunnable
-        List<Tree> methods1 = TreeUtilFunctions.findChildrenByType(anonymousClass1, LANG1.METHOD_DECLARATION);
-        if(methods1.size() != 1)
+        //the method replaced with the lambda, i.e., execute() of NamedRunnable
+        if(anonymousMethod1 == null || anonymousMethod1.getParent() != anonymousClass1 || !anonymousMethod1.getType().name.equals(LANG1.METHOD_DECLARATION))
             return;
-        Tree anonymousMethod1 = methods1.get(0);
+        boolean singleMethod = TreeUtilFunctions.findChildrenByType(anonymousClass1, LANG1.METHOD_DECLARATION).size() == 1;
         Tree lambdaLiteral2 = lambda2;
         if(lambdaLiteral2.getType().name.equals(LANG2.ANNOTATED_LAMBDA))
             lambdaLiteral2 = TreeUtilFunctions.findChildByType(lambdaLiteral2, LANG2.LAMBDA_LITERAL);
@@ -3240,12 +3269,23 @@ public class JavaToKotlinMigration {
             flattenChild(lambdaLiteral2, statements2);
         }
         removeDstMappings(mappingStore, lambdaLiteral2);
-        mappingStore.addMapping(anonymousClass1, lambdaLiteral2);
+        if(singleMethod)
+            mappingStore.addMapping(anonymousClass1, lambdaLiteral2);
+        else if(block1 != null)
+            mappingStore.addMapping(block1, lambdaLiteral2);
         Tree classInstanceCreation1 = anonymousClass1.getParent();
         Tree annotatedLambda2 = lambdaLiteral2.getParent();
         if(classInstanceCreation1 != null && annotatedLambda2 != null && classInstanceCreation1.getType().name.equals(LANG1.CLASS_INSTANCE_CREATION) &&
                 annotatedLambda2.getType().name.equals(LANG2.ANNOTATED_LAMBDA)) {
             mappingStore.addMapping(classInstanceCreation1, annotatedLambda2);
+            //match the arguments of the anonymous class creation with the arguments of the call having the trailing lambda,
+            //which are not matched by handleLeafMapping, if the other methods of the anonymous class contain string literals
+            Tree arguments1 = classInstanceCreation1.getParent();
+            Tree call2 = annotatedLambda2.getParent();
+            while(call2 != null && !call2.getType().name.equals(LANG2.METHOD_INVOCATION))
+                call2 = call2.getParent();
+            if(arguments1 != null && arguments1.getType().name.equals(LANG1.METHOD_INVOCATION_ARGUMENTS) && call2 != null)
+                handleAnonymousArgumentReplacedWithLambda(mappingStore, arguments1.getParent(), call2, LANG1, LANG2, deferredFlattenings);
         }
     }
 
@@ -3417,9 +3457,27 @@ public class JavaToKotlinMigration {
         return !name.isEmpty() && Arrays.asList(qualifiedName.split("\\.")).contains(name);
     }
 
+    //the outermost navigation expression covering the segments of the qualified name, as the navigation expression of the first segment covers only the first two segments,
+    //i.e., Proxy.Type.HTTP -> navigation_expression -> [navigation_expression -> [Proxy, navigation_suffix -> Type], navigation_suffix -> HTTP]
+    private static Tree outermostQualifiedNavigation(Tree navigation2, String qualifiedName, Constants LANG2) {
+        int segments = qualifiedName.split("\\.").length;
+        int coveredSegments = 2;
+        while(coveredSegments < segments && navigation2.getType().name.equals(LANG2.NAVIGATION_EXPRESSION) && navigation2.getParent() != null &&
+                navigation2.getParent().getType().name.equals(LANG2.NAVIGATION_EXPRESSION) && navigation2.getParent().getChild(0) == navigation2) {
+            Tree parent2 = navigation2.getParent();
+            Tree lastChild = parent2.getChild(parent2.getChildren().size() - 1);
+            if(!lastChild.getType().name.equals(LANG2.NAVIGATION_SUFFIX) || lastChild.getChildren().isEmpty() ||
+                    !isQualifiedNameSegment(qualifiedName, lastChild.getChild(0).getLabel()))
+                break;
+            navigation2 = parent2;
+            coveredSegments++;
+        }
+        return navigation2;
+    }
+
     //post-processing of the Java anonymous class creation passed as argument at the call site of an inlined method, replaced with the lambda of the Kotlin call,
     //i.e., call(new NamedRunnable("OkHttp %s", connectionName) {...}) -> call("OkHttp $connectionName") {...}, match the string literal and variables with the interpolated string
-    public static void handleAnonymousArgumentReplacedWithLambda(ExtendedMultiMappingStore mappingStore, Tree call1, Tree dstStatementNode, Constants LANG1, Constants LANG2) {
+    public static void handleAnonymousArgumentReplacedWithLambda(ExtendedMultiMappingStore mappingStore, Tree call1, Tree dstStatementNode, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
         Tree arguments1 = TreeUtilFunctions.findChildByType(call1, LANG1.METHOD_INVOCATION_ARGUMENTS);
         if(arguments1 == null)
             return;
@@ -3435,6 +3493,7 @@ public class JavaToKotlinMigration {
         //the string literals and interpolated identifiers of the Kotlin call outside the lambda
         List<Tree> stringLiterals2 = new ArrayList<>();
         List<Tree> interpolatedIdentifiers2 = new ArrayList<>();
+        List<Tree> navigations2 = new ArrayList<>();
         for(Tree t2 : dstStatementNode.preOrder()) {
             if(isWithinLambda(t2, dstStatementNode, LANG2))
                 continue;
@@ -3442,6 +3501,8 @@ public class JavaToKotlinMigration {
                 stringLiterals2.add(t2);
             else if(t2.getType().name.equals(LANG2.INTERPOLATED_IDENTIFIER))
                 interpolatedIdentifiers2.add(t2);
+            else if(t2.getType().name.equals(LANG2.NAVIGATION_EXPRESSION))
+                navigations2.add(t2);
         }
         //the arguments of the anonymous class creation, excluding the body of the anonymous class
         List<Tree> stringLiterals1 = TreeUtilFunctions.findChildrenByType(creation1, LANG1.STRING_LITERAL);
@@ -3463,12 +3524,26 @@ public class JavaToKotlinMigration {
                 }
             }
         }
+        //the getters of the anonymous class creation replaced with property accesses, i.e., raw.getRemoteSocketAddress() -> ${raw.remoteSocketAddress}
+        for(Tree invocation1 : TreeUtilFunctions.findChildrenByType(creation1, LANG1.METHOD_INVOCATION)) {
+            Tree name1 = invocation1.getChildren().size() == 2 ? invocation1.getChild(1) : null;
+            if(name1 == null)
+                continue;
+            for(Tree navigation2 : navigations2) {
+                Tree suffix2 = navigation2.getChildren().size() == 2 ? navigation2.getChild(1) : null;
+                if(suffix2 != null && suffix2.getChildren().size() == 1 && name1.getLabel().equalsIgnoreCase("get" + suffix2.getChild(0).getLabel()) &&
+                        alignMethodInvocationWithPropertyAccess(mappingStore, invocation1, navigation2, LANG1, LANG2, deferredFlattenings)) {
+                    navigations2.remove(navigation2);
+                    break;
+                }
+            }
+        }
     }
 
     //post-processing of the Java anonymous class creation passed as argument in the statement of an extracted method, whose parameter is passed as argument to the call,
     //i.e., call(new NamedRunnable("OkHttp %s", connectionName) {...}) -> extracted("OkHttp $connectionName") {...}, where extracted(name, block) calls call(name, block),
     //match the string literal and variables with the interpolated string at the call site of the extracted method, instead of the parameters of the extracted method
-    public static void handleAnonymousArgumentReplacedWithLambdaInExtractedMethod(ExtendedMultiMappingStore mappingStore, Tree call1, Tree dstStatementNode, Tree callSite2, Constants LANG1, Constants LANG2) {
+    public static void handleAnonymousArgumentReplacedWithLambdaInExtractedMethod(ExtendedMultiMappingStore mappingStore, Tree call1, Tree dstStatementNode, Tree callSite2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
         Tree arguments1 = TreeUtilFunctions.findChildByType(call1, LANG1.METHOD_INVOCATION_ARGUMENTS);
         if(arguments1 == null)
             return;
@@ -3489,7 +3564,7 @@ public class JavaToKotlinMigration {
                 }
             }
         }
-        handleAnonymousArgumentReplacedWithLambda(mappingStore, call1, callSite2, LANG1, LANG2);
+        handleAnonymousArgumentReplacedWithLambda(mappingStore, call1, callSite2, LANG1, LANG2, deferredFlattenings);
     }
 
     private static boolean isDescendantOf(Tree t, Tree ancestor) {
