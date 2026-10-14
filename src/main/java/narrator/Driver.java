@@ -1,8 +1,6 @@
 package narrator;
 
-import com.github.gumtreediff.tree.TreeContext;
 import java.util.LinkedHashSet;
-import java.util.Map;
 import java.util.Set;
 
 import org.apache.commons.lang3.tuple.Pair;
@@ -11,7 +9,7 @@ import org.kohsuke.github.GHRepository;
 import org.refactoringminer.astDiff.graph.Edge;
 import org.refactoringminer.astDiff.graph.HunkNetwork;
 import org.refactoringminer.astDiff.graph.Node;
-import org.refactoringminer.astDiff.graph.RepositoryStateFiles;
+import gr.uom.java.xmi.RepositoryStateFiles;
 import org.refactoringminer.astDiff.models.ASTDiff;
 import org.refactoringminer.astDiff.models.ProjectASTDiff;
 import org.refactoringminer.astDiff.utils.URLHelper;

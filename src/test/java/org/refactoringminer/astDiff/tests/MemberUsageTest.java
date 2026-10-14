@@ -11,7 +11,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.kohsuke.github.GHRepository;
 import org.refactoringminer.astDiff.graph.MemberUsageFinder;
 import org.refactoringminer.astDiff.graph.ReceiverTypeResolver;
-import org.refactoringminer.astDiff.graph.RepositoryStateFiles;
+import gr.uom.java.xmi.RepositoryStateFiles;
 import org.refactoringminer.astDiff.utils.RmGap;
 import org.refactoringminer.rm1.GitHistoryRefactoringMinerImpl;
 
