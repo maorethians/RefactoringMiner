@@ -61,23 +61,29 @@ public class LangChainClient {
         return result.replace(ReviewPrompt.END_OF_AUDIT, "").trim();
     }
 
-    public List<ReviewPrompt.ReviewComment> compileResults(List<String> results) {
+    public List<ReviewPrompt.ReviewComment> compileResults(List<String> results) throws SynthesisFailedException {
         List<ReviewPrompt.ReviewComment> finalResult = new ArrayList<>();
 
         List<List<Integer>> splits = Splitter.createBalancedSplits(results);
         for (int i = 0; i < splits.size(); i++) {
             List<Integer> split = splits.get(i);
 
-            List<ReviewPrompt.ReviewComment> parsedSplitResult = null;
-            while (parsedSplitResult == null) {
-                System.out.println("Synthesizing final result part " + (i + 1) + " of " + splits.size());
-                String splitResult = model.generate(this.prompt.result(split.stream().map(results::get).toList()));
-                parsedSplitResult = ReviewPrompt.parseResult(splitResult);
+            System.out.println("Synthesizing final result part " + (i + 1) + " of " + splits.size());
+            String splitResult = model.generate(this.prompt.result(split.stream().map(results::get).toList()));
+            List<ReviewPrompt.ReviewComment> parsedSplitResult = ReviewPrompt.parseResult(splitResult);
+            if (parsedSplitResult == null) {
+                throw new SynthesisFailedException("Failed to parse final result part " + (i + 1) + " of " + splits.size());
             }
 
             finalResult.addAll(parsedSplitResult);
         }
 
         return finalResult;
+    }
+
+    public static class SynthesisFailedException extends Exception {
+        public SynthesisFailedException(String message) {
+            super(message);
+        }
     }
 }

@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import narrator.langchain.LangChainClient;
 import narrator.langchain.NarrativeProcessor;
 import narrator.langchain.NarrativeRunner;
 import narrator.langchain.prompt.ReviewPrompt;
@@ -116,15 +117,21 @@ public class Benchmark {
                         // Run the entry several times and keep the best attempt: highest recall,
                         // ties broken by the lower covered/all hunk nodes ratio.
                         Attempt best = null;
-                        for (int attempt = 1; attempt <= ATTEMPTS; attempt++) {
-                            System.out.println("Attempt " + attempt + "/" + ATTEMPTS);
-                            Attempt candidate = runAttempt(rangeUrl, org, repoName, prNumber, submittedCommit, entry.getValue());
-                            if (candidate == null) {
-                                continue;
+                        try {
+                            for (int attempt = 1; attempt <= ATTEMPTS; attempt++) {
+                                System.out.println("Attempt " + attempt + "/" + ATTEMPTS);
+                                Attempt candidate = runAttempt(rangeUrl, org, repoName, prNumber, submittedCommit, entry.getValue());
+                                if (candidate == null) {
+                                    continue;
+                                }
+                                if (best == null || isBetter(candidate, best)) {
+                                    best = candidate;
+                                }
                             }
-                            if (best == null || isBetter(candidate, best)) {
-                                best = candidate;
-                            }
+                        } catch (LangChainClient.SynthesisFailedException e) {
+                            // Leave untracked and without result so a rerun retries it
+                            System.out.println("Synthesis failed, skipping " + resultKey + ": " + e.getMessage());
+                            continue;
                         }
                         if (best == null) {
                             System.out.println("No valid attempt for: " + resultFileName);
