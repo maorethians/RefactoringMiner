@@ -1,8 +1,55 @@
 """LLM-as-a-judge relevance of generated comments to ground truth review comments,
-with Claude (the assistant running this script) as the judge, in the SWR-Bench style.
+with Claude as the judge, in the SWR-Bench style.
 
 Every ground truth is paired with each generated comment matched to it by line overlap
-(groundTruthGeneratedCommentsNodes). Each pair gets one verdict, Y or N, for:
+(groundTruthGeneratedCommentsNodes). Each pair is judged in full isolation by `judge`: one
+fresh `claude -p` process per pair, started in an empty temporary directory with no tools,
+no MCP servers, no skills and no session persistence, given only RUBRIC and that pair's
+information (the ground truth's path, diff hunk tail and reviewer thread, and the one
+generated comment), never other pairs or their verdicts.
+
+Verdicts are cached in relevance_verdicts.jsonl next to this script (or --cache PATH), keyed
+by (file, ground truth id, comment text), so identical texts from any run reuse one verdict.
+For repeated trials, judge each trial into its own --cache file, then `vote` writes the
+majority verdict of every pair into the cache.
+
+Metrics (same definitions as sum_ground_truths.py / calculate_precision.py):
+  recall    -- ground truths with at least one matched comment judged Y / ground truths
+  precision -- generated comments (text + target node ids) judged Y for at least one
+               ground truth / generated comments; unmatched comments are not relevant
+  F1        -- from pooled precision and recall; per file, paired per file
+  pairwise  -- ground truths hit by only one of two runs, two-sided exact sign test
+
+Usage:
+  python judge_relevance.py judge  [results_dir] [--items-from dir] [--limit n] [--model claude-opus-5-5]
+      judge every unjudged pair (or the first n) in its own claude process, recording
+      each verdict as it arrives
+  python judge_relevance.py show   [results_dir] [--items-from dir] [--limit 1]
+      print unjudged pairs, one self-contained block each, with stable ids
+  python judge_relevance.py record [results_dir] [--items-from dir] SPEC...
+      SPEC is pi:Y / pi:N, the verdict of unjudged pair pi
+  python judge_relevance.py report [results_dir ...] [--items-from dir]
+      metrics per run, and pairwise sign tests when several runs are given
+  python judge_relevance.py vote TRIAL_CACHE...
+      majority verdict of each pair over the trial caches (odd count, every pair in each
+      trial), appended to --cache for pairs it does not have yet
+"""
+
+import json
+import subprocess
+import sys
+import tempfile
+from math import comb
+from pathlib import Path
+
+DEFAULT_DIR = Path('results/ContextCRBench')
+CACHE = Path(__file__).with_name('relevance_verdicts.jsonl')
+DEFAULT_LIMIT = 1
+HUNK_TAIL = 10
+DEFAULT_MODEL = 'claude-opus-5-5'
+
+RUBRIC = """You judge one pair: a reviewer's comment (with its thread) on a code change, and one
+generated review comment on the same code. Answer one question with Y or N:
 
   Does the generated comment raise the same issue, concern or point as the reviewer's
   comment, read together with its thread?
@@ -19,43 +66,8 @@ Rubric (apply exactly, every pair, no skipping):
     Y if the generated comment captures the same point or purpose.
   - Question about a change ("why is this removed?"): Y if the generated comment raises
     or answers the same question about the same code.
-  - Consistency: `show` lists comments already judged for the same ground truth (any run).
-    A new comment making the same point as one judged Y is Y, as one judged N is N.
 
-Verdicts are cached in relevance_verdicts.jsonl next to this script (or --cache PATH), keyed
-by (file, ground truth id, comment text), so identical texts from any run reuse one verdict.
-For repeated trials, judge each trial into its own --cache file, then `vote` writes the
-majority verdict of every pair into the cache.
-
-Metrics (same definitions as sum_ground_truths.py / calculate_precision.py):
-  recall    -- ground truths with at least one matched comment judged Y / ground truths
-  precision -- generated comments (text + target node ids) judged Y for at least one
-               ground truth / generated comments; unmatched comments are not relevant
-  F1        -- from pooled precision and recall; per file, paired per file
-  pairwise  -- ground truths hit by only one of two runs, two-sided exact sign test
-
-Usage:
-  python judge_relevance.py show   [results_dir] [--items-from dir] [--limit 30]
-      print ground truths that still have unjudged comments, with stable ids
-  python judge_relevance.py record [results_dir] [--items-from dir] SPEC...
-      SPEC is gi:Y / gi:N (every pending comment of ground truth gi) or
-      gi:c2=Y,c5=Y (those Y, the other pending ones N)
-  python judge_relevance.py report [results_dir ...] [--items-from dir]
-      metrics per run, and pairwise sign tests when several runs are given
-  python judge_relevance.py vote TRIAL_CACHE...
-      majority verdict of each pair over the trial caches (odd count, every pair in each
-      trial), appended to --cache for pairs it does not have yet
-"""
-
-import json
-import sys
-from math import comb
-from pathlib import Path
-
-DEFAULT_DIR = Path('results/ContextCRBench')
-CACHE = Path(__file__).with_name('relevance_verdicts.jsonl')
-DEFAULT_LIMIT = 30
-HUNK_TAIL = 10
+Reply with your reasoning if you need it, then a last line holding only Y or N."""
 
 
 def pop_option(args, name, default):
@@ -89,66 +101,75 @@ def load(results_dir, items):
     return out
 
 
-def ground_truths(files):
-    """Stable list of judgeable ground truths: (file, entry, thread, unique matched texts)."""
-    gts = []
+def pairs(files):
+    """Stable list of judgeable pairs: (file, entry, thread, matched text), one per unique text."""
+    out = []
     for name, data in files:
         for e in data.get('groundTruthGeneratedCommentsNodes', []):
             thread = [c for c in e['groundTruth'].get('review_comment', []) if c.strip()]
             if not thread:
                 continue
-            texts = list(dict.fromkeys(c['comment'] for c in e.get('generatedCommentsNodes', []) if c['comment'].strip()))
-            gts.append((name, e, thread, texts))
-    return gts
+            texts = dict.fromkeys(c['comment'] for c in e.get('generatedCommentsNodes', []) if c['comment'].strip())
+            out.extend((name, e, thread, t) for t in texts)
+    return out
 
 
-def pending(gt, cache):
-    name, e, _, texts = gt
-    return [(f'c{j + 1}', t) for j, t in enumerate(texts) if (name, e['groundTruth']['id'], t) not in cache]
+def pair_key(pair):
+    name, e, _, text = pair
+    return (name, e['groundTruth']['id'], text)
 
 
-def show(gts, cache, limit):
-    todo = [(gi, gt) for gi, gt in enumerate(gts) if pending(gt, cache)]
-    print(f"{len(todo)} ground truths with unjudged comments; showing {min(limit, len(todo))}")
-    judged = {}
-    for (f, gid, t), v in cache.items():
-        judged.setdefault((f, gid), []).append((t, v))
-    for gi, gt in todo[:limit]:
-        name, e, thread, _ = gt
+def pair_block(pair):
+    name, e, thread, text = pair
+    lines = [f"path: {e['groundTruth'].get('path', name)}", '-- diff hunk (tail):']
+    lines += ['   ' + line for line in e['groundTruth'].get('diff_hunk', '').splitlines()[-HUNK_TAIL:]]
+    lines.append('-- reviewer thread:')
+    lines += [('  GT: ' if j == 0 else '  reply: ') + c.replace('\n', ' ') for j, c in enumerate(thread)]
+    lines.append('-- generated comment: ' + text.replace('\n', ' '))
+    return '\n'.join(lines)
+
+
+def show(prs, cache, limit):
+    todo = [(pi, pr) for pi, pr in enumerate(prs) if pair_key(pr) not in cache]
+    print(f"{len(todo)} unjudged pairs; showing {min(limit, len(todo))}")
+    for pi, pr in todo[:limit]:
         print('=' * 100)
-        print(f"GT {gi}  {e['groundTruth'].get('path', name)}")
-        print('-- diff hunk (tail):')
-        for line in e['groundTruth'].get('diff_hunk', '').splitlines()[-HUNK_TAIL:]:
-            print('   ' + line)
-        print('-- reviewer thread:')
-        for j, c in enumerate(thread):
-            print(('  GT: ' if j == 0 else '  reply: ') + c.replace('\n', ' '))
-        for t, v in judged.get((name, e['groundTruth']['id']), []):
-            print(f"-- already judged {'Y' if v else 'N'}: " + t.replace('\n', ' '))
-        for cid, t in pending(gt, cache):
-            print(f"-- {cid}: " + t.replace('\n', ' '))
+        print(f"PAIR {pi}")
+        print(pair_block(pr))
 
 
-def record(gts, cache, specs):
+def judge(prs, cache, limit, model):
+    todo = [(pi, pr) for pi, pr in enumerate(prs) if pair_key(pr) not in cache]
+    todo = todo[:limit] if limit is not None else todo
+    print(f"{len(todo)} pairs to judge with {model}")
+    for pi, pr in todo:
+        with tempfile.TemporaryDirectory() as empty:
+            out = subprocess.run(
+                ['claude', '-p', '--model', model, '--system-prompt', RUBRIC, '--tools', '',
+                 '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence'],
+                input=pair_block(pr), capture_output=True, text=True, cwd=empty, check=True).stdout
+        lines = out.strip().splitlines()
+        v = lines[-1].strip() if lines else ''
+        if v not in ('Y', 'N'):
+            sys.exit(f"pair {pi}: no Y/N verdict in judge output:\n{out}")
+        k = pair_key(pr)
+        cache[k] = v == 'Y'
+        with open(CACHE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'file': k[0], 'gt_id': k[1], 'comment': k[2], 'verdict': v}, ensure_ascii=False) + '\n')
+        print(f"pair {pi}: {v}")
+
+
+def record(prs, cache, specs):
     rows = []
     for spec in specs:
-        gi, rest = spec.split(':')
-        gt = gts[int(gi)]
-        todo = dict(pending(gt, cache))
-        default, yes = 'N', set()
-        for part in rest.split(','):
-            if part in ('Y', 'N'):
-                default = part
-            else:
-                cid, v = part.split('=')
-                if cid not in todo:
-                    sys.exit(f"GT {gi}: {cid} is not a pending comment ({sorted(todo)})")
-                if v == 'Y':
-                    yes.add(cid)
-        name, e, _, _ = gt
-        for cid, t in todo.items():
-            rows.append({'file': name, 'gt_id': e['groundTruth']['id'], 'comment': t,
-                         'verdict': 'Y' if cid in yes else default})
+        pi, v = spec.split(':')
+        if v not in ('Y', 'N'):
+            sys.exit(f"pair {pi}: verdict must be Y or N, got {v!r}")
+        k = pair_key(prs[int(pi)])
+        if k in cache:
+            sys.exit(f"pair {pi} is already judged")
+        cache[k] = v == 'Y'
+        rows.append({'file': k[0], 'gt_id': k[1], 'comment': k[2], 'verdict': v})
     with open(CACHE, 'a', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
@@ -255,13 +276,14 @@ def vote(trial_paths, cache):
 def main():
     global CACHE
     args = sys.argv[1:]
-    if not args or args[0] not in ('show', 'record', 'report', 'vote'):
+    if not args or args[0] not in ('judge', 'show', 'record', 'report', 'vote'):
         sys.exit(__doc__)
     cmd = args.pop(0)
     CACHE = Path(pop_option(args, '--cache', CACHE))
     items_from = pop_option(args, '--items-from', None)
     items = {f.name for f in Path(items_from).glob('*.json')} if items_from else None
-    limit = int(pop_option(args, '--limit', DEFAULT_LIMIT))
+    limit = pop_option(args, '--limit', None)
+    model = pop_option(args, '--model', DEFAULT_MODEL)
     cache = load_cache()
     if cmd == 'vote':
         vote(args, cache)
@@ -270,11 +292,13 @@ def main():
         report([Path(a) for a in args] or [DEFAULT_DIR], items, cache)
         return
     results_dir = Path(args.pop(0)) if args and ':' not in args[0] else DEFAULT_DIR
-    gts = ground_truths(load(results_dir, items))
-    if cmd == 'show':
-        show(gts, cache, limit)
+    prs = pairs(load(results_dir, items))
+    if cmd == 'judge':
+        judge(prs, cache, int(limit) if limit else None, model)
+    elif cmd == 'show':
+        show(prs, cache, int(limit or DEFAULT_LIMIT))
     else:
-        record(gts, cache, args)
+        record(prs, cache, args)
 
 
 if __name__ == '__main__':
