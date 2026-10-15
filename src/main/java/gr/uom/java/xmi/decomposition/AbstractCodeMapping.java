@@ -61,6 +61,7 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 	private boolean matchedWithNullReplacements;
 	private Set<UMLAnonymousClassDiff> anonymousClassDiffs = new LinkedHashSet<UMLAnonymousClassDiff>();
 	private List<UMLOperationBodyMapper> lambdaMappers = new ArrayList<UMLOperationBodyMapper>();
+	private Argumentization argumentization;
 	protected final Constants LANG1;
 	protected final Constants LANG2;
 	
@@ -77,6 +78,26 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 	}
 
 	public abstract double editDistance();
+
+	public Argumentization getArgumentization() {
+		return argumentization;
+	}
+
+	public void setArgumentization(Argumentization argumentization) {
+		this.argumentization = argumentization;
+	}
+
+	public String getArgumentizedString(AbstractCodeFragment fragment) {
+		return argumentization != null ? argumentization.get(fragment) : fragment.getString();
+	}
+
+	public String getArgumentizedString1() {
+		return getArgumentizedString(fragment1);
+	}
+
+	public String getArgumentizedString2() {
+		return getArgumentizedString(fragment2);
+	}
 
 	public boolean equalContainer() {
 		return operation1.equals(operation2);
@@ -192,8 +213,12 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 	}
 
 	public boolean isExact() {
-		return  !fragment1.isKeyword() && (argumentizedStringExact() || argumentizedStringExactAfterTypeReplacement() ||
-				fragment1.getString().equals(fragment2.getString()) || isExactAfterAbstraction() || containsIdenticalOrCompositeReplacement() || callChainMatch() || ignoreFormattingChanges());
+		return isExact(getArgumentizedString1(), getArgumentizedString2());
+	}
+
+	public boolean isExact(String argumentizedString1, String argumentizedString2) {
+		return  !fragment1.isKeyword() && (argumentizedStringExact(argumentizedString1, argumentizedString2) || argumentizedStringExactAfterTypeReplacement(argumentizedString1, argumentizedString2) ||
+				fragment1.getString().equals(fragment2.getString()) || isExactAfterAbstraction() || containsIdenticalOrCompositeReplacement() || callChainMatch(argumentizedString1, argumentizedString2) || ignoreFormattingChanges());
 	}
 
 	private boolean ignoreFormattingChanges() {
@@ -207,17 +232,15 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 		return false;
 	}
 
-	private boolean argumentizedStringExact() {
-		return fragment1.getArgumentizedString().equals(fragment2.getArgumentizedString()) ||
-				fragment1.getArgumentizedString().equals(LANG2.THIS_DOT + fragment2.getArgumentizedString()) ||
-				fragment2.getArgumentizedString().equals(LANG1.THIS_DOT + fragment1.getArgumentizedString()) ||
-				fragment1.getArgumentizedString().equals("val " + fragment2.getArgumentizedString()) ||
-				fragment2.getArgumentizedString().equals("val " + fragment1.getArgumentizedString());
+	private boolean argumentizedStringExact(String s1, String s2) {
+		return s1.equals(s2) ||
+				s1.equals(LANG2.THIS_DOT + s2) ||
+				s2.equals(LANG1.THIS_DOT + s1) ||
+				s1.equals("val " + s2) ||
+				s2.equals("val " + s1);
 	}
 
-	private boolean callChainMatch() {
-		String s1 = fragment1.getArgumentizedString();
-		String s2 = fragment2.getArgumentizedString();
+	private boolean callChainMatch(String s1, String s2) {
 		String longestCommonPrefix = PrefixSuffixUtils.longestCommonPrefix(s1, s2);
 		String longestCommonSuffix = PrefixSuffixUtils.longestCommonSuffix(s1, s2);
 		if(longestCommonSuffix.startsWith(").")) {
@@ -239,9 +262,7 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 		return false;
 	}
 
-	private boolean argumentizedStringExactAfterTypeReplacement() {
-		String s1 = fragment1.getArgumentizedString();
-		String s2 = fragment2.getArgumentizedString();
+	private boolean argumentizedStringExactAfterTypeReplacement(String s1, String s2) {
 		int numberLiteralExactMatches = 0;
 		for(Replacement r : replacements) {
 			if(r.getType().equals(ReplacementType.TYPE)) {
@@ -854,6 +875,7 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 							wrappedAsArgument(initializer, before) ||
 							stringConcatMatch(initializer, before) ||
 							diamondClassInstanceCreationMatch(initializer, before) ||
+							classInstanceCreationWithAdditionalArgumentsMatch(initializer, before) ||
 							reservedTokenMatch(initializer, replacement, before) ||
 							classInstanceCreationToCreationReference(initializer, before) ||
 							anonymousWithMethodSignatureChange(initializer, before, classDiff)) {
@@ -972,7 +994,7 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 						!getFragment2().getString().equals(LANG2.RETURN_SPACE + variableName + LANG2.STATEMENT_TERMINATION)) {
 					boolean mappingFound = false;
 					for(AbstractCodeMapping m : currentMappings) {
-						if(m.getFragment2().equalFragment(statement)) {
+						if(m.getFragment2().equalFragment(statement, m.getArgumentizedString2())) {
 							mappingFound = true;
 							break;
 						}
@@ -1057,7 +1079,7 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 		if(getFragment2().getVariableDeclarations().size() > 0 && getFragment2().getVariableDeclarations().get(0).getInitializer() != null && replacements.size() == 1) {
 			checkForAliasedVariable(getFragment2().getVariableDeclarations().get(0).getInitializer(), replacements.iterator().next(), nonMappedLeavesT2, classDiff, insideExtractedOrInlinedMethod);
 		}
-		String argumentizedString = statement.getArgumentizedString();
+		String argumentizedString = getArgumentizedString(statement);
 		if(argumentizedString.contains(LANG2.ASSIGNMENT) && !getFragment1().getString().equals(LANG2.THIS_DOT + statement.getString())  && (statement.getLocationInfo().before(fragment2.getLocationInfo()) || fragment2.getLocationInfo().getCodeElementType().equals(CodeElementType.DO_STATEMENT))) {
 			String beforeAssignment = argumentizedString.substring(0, argumentizedString.indexOf(LANG2.ASSIGNMENT));
 			String[] tokens = beforeAssignment.split("\\s");
@@ -1136,6 +1158,10 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 							if(declaration.isParameter() && replacement.getType().equals(ReplacementType.VARIABLE_NAME)) {
 								skip = true;
 							}
+							//the assignment already exists in the original method, i.e., return false; -> return reuseSocket, when reuseSocket = false exists before and after
+							if(statement.getVariableDeclarations().isEmpty() && assignmentExistsInOperation1(variable, initializer)) {
+								skip = true;
+							}
 							if(!declarationMappingFound && !skip) {
 								ExtractVariableRefactoring ref = new ExtractVariableRefactoring(declaration, operation1, operation2, insideExtractedOrInlinedMethod);
 								List<LeafExpression> subExpressions = getFragment1().findExpression(replacement.getBefore());
@@ -1158,6 +1184,18 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 				}
 			}
 		}
+	}
+
+	private boolean assignmentExistsInOperation1(String variable, String initializer) {
+		if(operation1.getBody() == null)
+			return false;
+		String assignment = variable + LANG1.ASSIGNMENT + initializer + LANG1.STATEMENT_TERMINATION;
+		for(AbstractCodeFragment leaf : operation1.getBody().getCompositeStatement().getLeaves()) {
+			if(leaf.getString().equals(assignment)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private void addSubExpressionMappingsForExtract(AbstractExpression initializer, String before,
@@ -1502,7 +1540,7 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 				}
 			}
 		}
-		String argumentizedString = statement.getArgumentizedString();
+		String argumentizedString = getArgumentizedString(statement);
 		if(argumentizedString.contains(LANG1.ASSIGNMENT) && !getFragment2().getString().equals(LANG1.THIS_DOT + statement.getString()) && (statement.getLocationInfo().before(fragment1.getLocationInfo()) || fragment1.getLocationInfo().getCodeElementType().equals(CodeElementType.DO_STATEMENT))) {
 			String beforeAssignment = argumentizedString.substring(0, argumentizedString.indexOf(LANG1.ASSIGNMENT));
 			String[] tokens = beforeAssignment.split("\\s");
@@ -1970,6 +2008,30 @@ public abstract class AbstractCodeMapping implements LeafMappingProvider {
 			if(tmp.equals(replacedExpression)) {
 				return true;
 			}
+		}
+		return false;
+	}
+
+	//new A(x) extracted as new B(x, y, z): all arguments of the replaced creation are kept and new ones are added
+	private boolean classInstanceCreationWithAdditionalArgumentsMatch(AbstractExpression initializer, String replacedExpression) {
+		AbstractCall creation1 = null;
+		for(AbstractCall creation : fragment1.getCreations()) {
+			if(creation.actualString().equals(replacedExpression)) {
+				creation1 = creation;
+				break;
+			}
+		}
+		AbstractCall creation2 = null;
+		for(AbstractCall creation : initializer.getCreations()) {
+			if(creation.actualString().equals(initializer.getString())) {
+				creation2 = creation;
+				break;
+			}
+		}
+		if(creation1 != null && creation2 != null) {
+			List<String> arguments1 = creation1.arguments();
+			List<String> arguments2 = creation2.arguments();
+			return arguments1.size() > 0 && arguments2.size() > arguments1.size() && arguments2.containsAll(arguments1);
 		}
 		return false;
 	}

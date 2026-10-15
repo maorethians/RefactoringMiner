@@ -64,7 +64,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	private List<UMLAnnotation> annotations;
 	private List<UMLModifier> modifiers;
 	private List<UMLComment> comments;
-	private Map<String, Set<VariableDeclaration>> variableDeclarationMap;
+	private volatile Map<String, Set<VariableDeclaration>> variableDeclarationMap;
 	private String actualSignature;
 	private List<UMLOperation> nestedOperations;
 	private List<UMLImport> nestedImports;
@@ -556,8 +556,10 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	public Map<String, Set<VariableDeclaration>> variableDeclarationMap() {
-		if(this.variableDeclarationMap == null) {
-			this.variableDeclarationMap = new LinkedHashMap<String, Set<VariableDeclaration>>();
+		//build the map before publishing it, because operations are shared between mappers constructed in parallel
+		Map<String, Set<VariableDeclaration>> variableDeclarationMap = this.variableDeclarationMap;
+		if(variableDeclarationMap == null) {
+			variableDeclarationMap = new LinkedHashMap<String, Set<VariableDeclaration>>();
 			for(VariableDeclaration declaration : getAllVariableDeclarations()) {
 				if(variableDeclarationMap.containsKey(declaration.getVariableName())) {
 					variableDeclarationMap.get(declaration.getVariableName()).add(declaration);
@@ -568,6 +570,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 					variableDeclarationMap.put(declaration.getVariableName(), variableDeclarations);
 				}
 			}
+			this.variableDeclarationMap = variableDeclarationMap;
 		}
 		return variableDeclarationMap;
 	}
@@ -698,11 +701,11 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	public boolean equalSignature(UMLOperation operation) {
-		boolean equalParameterTypes = this.getParameterTypeList().equals(operation.getParameterTypeList());
+		List<UMLType> thisParameterTypeList = this.getParameterTypeList();
+		List<UMLType> otherParameterTypeList = operation.getParameterTypeList();
+		boolean equalParameterTypes = thisParameterTypeList.equals(otherParameterTypeList);
 		boolean compatibleParameterTypes = false;
 		if(!equalParameterTypes) {
-			List<UMLType> thisParameterTypeList = this.getParameterTypeList();
-			List<UMLType> otherParameterTypeList = operation.getParameterTypeList();
 			if(thisParameterTypeList.size() == otherParameterTypeList.size()) {
 				int compatibleTypes = 0;
 				int equalTypes = 0;
@@ -952,6 +955,21 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				params.add(parameter);
 		}
 		return params;
+	}
+
+	//the parameters following the given number of arguments have default values, i.e., fun start(port: Int = 0) called as start()
+	public boolean hasDefaultParameterValuesAfter(int numberOfArguments) {
+		List<UMLParameter> params = getParametersWithoutReturnType();
+		if(params.size() <= numberOfArguments) {
+			return false;
+		}
+		for(int i=numberOfArguments; i<params.size(); i++) {
+			VariableDeclaration declaration = params.get(i).getVariableDeclaration();
+			if(declaration == null || declaration.getInitializer() == null) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	public List<UMLParameter> getParameterizedTypesInSignature() {
@@ -1701,7 +1719,27 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				return true;
 			}
 		}
-		return (this.equalReturnParameter(removedOperation) && (equalParameterTypes(removedOperation) || overloadedParameterTypes(removedOperation) || equalParameterNames(removedOperation))) || replacedParameterTypes(removedOperation);
+		return ((this.equalReturnParameter(removedOperation) || this.voidCompatibleReturnParameter(removedOperation)) && (equalParameterTypes(removedOperation) || overloadedParameterTypes(removedOperation) || equalParameterNames(removedOperation))) || replacedParameterTypes(removedOperation);
+	}
+
+	//void is compatible with a single Void type argument, e.g., CompletableFuture<Void>
+	private boolean voidCompatibleReturnParameter(UMLOperation operation) {
+		UMLParameter thisReturnParameter = this.getReturnParameter();
+		UMLParameter otherReturnParameter = operation.getReturnParameter();
+		if(thisReturnParameter != null && otherReturnParameter != null) {
+			UMLType thisType = thisReturnParameter.getType();
+			UMLType otherType = otherReturnParameter.getType();
+			return (isVoid(thisType) && hasSingleVoidTypeArgument(otherType)) || (isVoid(otherType) && hasSingleVoidTypeArgument(thisType));
+		}
+		return false;
+	}
+
+	private static boolean isVoid(UMLType type) {
+		return type.getArrayDimension() == 0 && type.toString().equals("void");
+	}
+
+	private static boolean hasSingleVoidTypeArgument(UMLType type) {
+		return type.getArrayDimension() == 0 && type.getTypeArguments().size() == 1 && type.getTypeArguments().get(0).toString().equals("Void");
 	}
 
 	public boolean compatibleSignature(UMLOperation removedOperation, Map<UMLTypeParameter, UMLType> typeParameterToTypeArgumentMap) {

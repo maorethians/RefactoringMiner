@@ -74,6 +74,7 @@ public class Constants {
 			WHILE_STATEMENT = "while_statement";
 			DO_STATEMENT = "do_statement";
 			FOR_STATEMENT = "for_statement";
+			RETURN_STATEMENT = "return_statement";
 			ENHANCED_FOR_STATEMENT = "for_statement";
 			PACKAGE_DECLARATION = "";
 			FIELD_DECLARATION = "";
@@ -118,6 +119,7 @@ public class Constants {
 			WHILE_STATEMENT = "while_statement";
 			DO_STATEMENT = "do_statement";
 			FOR_STATEMENT = "for_statement";
+			RETURN_STATEMENT = "return_expression";
 			ENHANCED_FOR_STATEMENT = "for_statement";
 			PACKAGE_DECLARATION = "package_header";
 			FIELD_DECLARATION = "property_declaration";
@@ -162,6 +164,7 @@ public class Constants {
 			WHILE_STATEMENT = "while_statement";
 			DO_STATEMENT = "do_statement";
 			FOR_STATEMENT = "for_statement";
+			RETURN_STATEMENT = "return_statement";
 			ENHANCED_FOR_STATEMENT = "for_statement";
 			PACKAGE_DECLARATION = "";
 			FIELD_DECLARATION = "";
@@ -206,7 +209,8 @@ public class Constants {
 			WHILE_STATEMENT = "while_statement";
 			DO_STATEMENT = "do_statement";
 			FOR_STATEMENT = "for_statement";
-			ENHANCED_FOR_STATEMENT = "EnhancedForStatement";
+			RETURN_STATEMENT = "return_statement";
+			ENHANCED_FOR_STATEMENT = "for_range_loop";
 			PACKAGE_DECLARATION = "namespace_definition";
 			FIELD_DECLARATION = "field_declaration";
 			MODIFIER = "Modifier";
@@ -251,6 +255,7 @@ public class Constants {
 			WHILE_STATEMENT = "WhileStatement";
 			DO_STATEMENT = "DoStatement";
 			FOR_STATEMENT = "ForStatement";
+			RETURN_STATEMENT = "ReturnStatement";
 			ENHANCED_FOR_STATEMENT = "EnhancedForStatement";
 			PACKAGE_DECLARATION = "PackageDeclaration";
 			FIELD_DECLARATION = "FieldDeclaration";
@@ -299,6 +304,8 @@ public class Constants {
     public final String LABELED_STATEMENT = "LabeledStatement";
     public final String SIMPLE_NAME;
     public final String VARIABLE_DECLARATION_STATEMENT = "VariableDeclarationStatement";
+    //the declarations of C and C++, which are statements in the bodies
+    public final String DECLARATION_STATEMENT = "declaration";
     public final String EXPRESSION_STATEMENT;
     public final String MODIFIER;
     public final String IMPORT_DECLARATION;
@@ -356,7 +363,7 @@ public class Constants {
     public final String ENHANCED_FOR_STATEMENT;
     public final String FOR_STATEMENT;
     public final String IF_STATEMENT;
-    public final String RETURN_STATEMENT = "ReturnStatement";
+    public final String RETURN_STATEMENT;
     public final String SUPER_CONSTRUCTOR_INVOCATION = "SuperConstructorInvocation";
     public final String SWITCH_CASE;
     public final String SWITCH_STATEMENT;
@@ -371,6 +378,8 @@ public class Constants {
     public final String LAMBDA_EXPRESSION;
     public final String INFIX_EXPRESSION_OPERATOR = "INFIX_EXPRESSION_OPERATOR";
     public final String PREFIX_EXPRESSION_OPERATOR = "PREFIX_EXPRESSION_OPERATOR";
+    public final String POSTFIX_EXPRESSION = "PostfixExpression";
+    public final String POSTFIX_EXPRESSION_OPERATOR = "POSTFIX_EXPRESSION_OPERATOR";
 
     public final String STRING_LITERAL;
     public final String CHARACTER_LITERAL;
@@ -392,6 +401,8 @@ public class Constants {
     public final String MEMBER_REF = "MemberRef";
 
     public final String SIMPLE_TYPE = "SimpleType";
+    public final String TYPE_LITERAL = "TypeLiteral";
+    public final String ARRAY_TYPE = "ArrayType";
     public final String PARAMETERIZED_TYPE = "ParameterizedType";
     public final String EXPRESSION_METHOD_REFERENCE = "ExpressionMethodReference";
     public final String PREFIX_EXPRESSION;
@@ -496,6 +507,7 @@ public class Constants {
     public final String CALL_SUFFIX = "call_suffix";
     public final String NAVIGATION_EXPRESSION = "navigation_expression";
     public final String NAVIGATION_SUFFIX = "navigation_suffix";
+    public final String CALLABLE_REFERENCE = "callable_reference";
     public final String INDEXING_EXPRESSION = "indexing_expression";
     public final String INDEXING_SUFFIX = "indexing_suffix";
     public final String INTEGER_LITERAL = "integer_literal";
@@ -518,6 +530,9 @@ public class Constants {
     public final String ADDITIVE_EXPRESSION = "additive_expression";
     public final String MULTIPLICATIVE_EXPRESSION = "multiplicative_expression";
     public final String COMPARISON_EXPRESSION = "comparison_expression";
+    public final String CHECK_EXPRESSION = "check_expression";
+    public final String COLLECTION_CONTAINS = "collection_contains";
+    public final String COLLECTION_NOT_CONTAINS = "collection_not_contains";
     public final String INTERPOLATED_IDENTIFIER = "interpolated_identifier";
     public final String INTERPOLATED_EXPRESSION = "interpolated_expression";
     public final String AT = "at";
@@ -578,6 +593,8 @@ public class Constants {
     public final String UNION_TYPE = "union_type";
     public final String GENERIC_TYPE = "generic_type";
     public final String REQUIRED_PARAMETER = "required_parameter";
+    public final String OPTIONAL_PARAMETER = "optional_parameter";
+    public final String ASSIGNMENT_PATTERN = "assignment_pattern";
     public final String OPENING_TAG = "<";
     public final String CLOSING_TAG = ">";
     public final String INTERFACE_DECLARATION = "interface_declaration";

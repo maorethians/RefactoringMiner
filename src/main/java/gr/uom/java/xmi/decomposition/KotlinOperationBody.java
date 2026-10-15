@@ -141,6 +141,40 @@ public class KotlinOperationBody extends OperationBody {
 		this.activeVariableDeclarations = null;
 	}
 
+	// Use this constructor when the body of a Kotlin function is try expression
+	public KotlinOperationBody(KtFile ktFile, String sourceFolder, String filePath, KtTryExpression tryExpression, VariableDeclarationContainer container, List<UMLAttribute> attributes, String fileContent) {
+		this.comments = container.getComments();
+		this.container = container;
+		// TODO replace with stringify
+		this.bodyHashCode = tryExpression.getText().hashCode();
+		this.activeVariableDeclarations = new HashMap<String, Set<VariableDeclaration>>();
+		for(UMLAttribute attribute : attributes) {
+			addInActiveVariableDeclarations(attribute.getVariableDeclaration());
+		}
+		addAllInActiveVariableDeclarations(container != null ? container.getParameterDeclarationList() : Collections.emptyList());
+		if(container.isDeclaredInAnonymousClass()) {
+			UMLAnonymousClass anonymousClassContainer = container.getAnonymousClassContainer().get();
+			for(VariableDeclarationContainer parentContainer : anonymousClassContainer.getParentContainers()) {
+				for(VariableDeclaration parameterDeclaration : parentContainer.getParameterDeclarationList()) {
+					if(parameterDeclaration.isFinal()) {
+						addInActiveVariableDeclarations(parameterDeclaration);
+					}
+				}
+			}
+		}
+		//the try and catch clauses are siblings, so they need a parent block, as in a Java method body with a try statement
+		this.compositeStatement = new CompositeStatementObject(ktFile, sourceFolder, filePath, tryExpression, 0, CodeElementType.BLOCK, fileContent);
+		this.compositeStatement.setOwner(container);
+		processTryStatement(ktFile, sourceFolder, filePath, compositeStatement, fileContent, tryExpression);
+		for(AbstractCall invocation : getAllOperationInvocations()) {
+			if(invocation.isAssertion()) {
+				containsAssertion = true;
+				break;
+			}
+		}
+		this.activeVariableDeclarations = null;
+	}
+
 	public KotlinOperationBody(KtFile ktFile, String sourceFolder, String filePath, KtBlockExpression methodBody, VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
 		this.compositeStatement = new CompositeStatementObject(ktFile, sourceFolder, filePath, methodBody, 0, CodeElementType.BLOCK, fileContent);
 		this.compositeStatement.setOwner(container);
@@ -337,7 +371,22 @@ public class KotlinOperationBody extends OperationBody {
 			// model as a composite synchronized statement
 			CompositeStatementObject child = new CompositeStatementObject(ktFile, sourceFolder, filePath, statement, parent.getDepth()+1, CodeElementType.SYNCHRONIZED_STATEMENT, fileContent);
 			parent.addStatement(child);
-			AbstractExpression abstractExpression = new AbstractExpression(ktFile, sourceFolder, filePath, invocation.getValueArguments().get(0), CodeElementType.SYNCHRONIZED_STATEMENT_EXPRESSION, container, activeVariableDeclarations, fileContent);
+			AbstractExpression abstractExpression = new AbstractExpression(ktFile, sourceFolder, filePath, invocation.getValueArguments().get(0).getArgumentExpression(), CodeElementType.SYNCHRONIZED_STATEMENT_EXPRESSION, container, activeVariableDeclarations, fileContent);
+			child.addExpression(abstractExpression);
+			addStatementInVariableScopes(child);
+			KtValueArgument lambdaArgument = invocation.getValueArguments().get(1);
+			if(lambdaArgument instanceof KtLambdaArgument lambda) {
+				processStatement(ktFile, sourceFolder, filePath, child, lambda.getLambdaExpression().getBodyExpression(), fileContent);
+			}
+		}
+		else if(statement instanceof KtCallExpression invocation && invocation.getCalleeExpression() instanceof KtNameReferenceExpression nameReference && (nameReference.getReferencedName().equals("require") || nameReference.getReferencedName().equals("check") ||
+				nameReference.getReferencedName().equals("requireNotNull") || nameReference.getReferencedName().equals("checkNotNull")) && invocation.getValueArguments().size() == 2) {
+			// require/check/requireNotNull/checkNotNull(condition) {}
+			// first argument is the condition, second argument is a lambda
+			// model as a composite if statement
+			CompositeStatementObject child = new CompositeStatementObject(ktFile, sourceFolder, filePath, statement, parent.getDepth()+1, CodeElementType.IF_STATEMENT, fileContent);
+			parent.addStatement(child);
+			AbstractExpression abstractExpression = new AbstractExpression(ktFile, sourceFolder, filePath, invocation.getValueArguments().get(0).getArgumentExpression(), CodeElementType.IF_STATEMENT_CONDITION, container, activeVariableDeclarations, fileContent);
 			child.addExpression(abstractExpression);
 			addStatementInVariableScopes(child);
 			KtValueArgument lambdaArgument = invocation.getValueArguments().get(1);
@@ -414,7 +463,7 @@ public class KotlinOperationBody extends OperationBody {
 		List<KtCatchClause> catchClauses = tryStatement.getCatchClauses();
 		for(KtCatchClause catchClause : catchClauses) {
 			KtExpression catchClauseBody = catchClause.getCatchBody();
-			CompositeStatementObject catchClauseStatementObject = new CompositeStatementObject(ktFile, sourceFolder, filePath, catchClause, parent.getDepth()+1, CodeElementType.CATCH_CLAUSE, fileContent);
+			CompositeStatementObject catchClauseStatementObject = new CompositeStatementObject(ktFile, sourceFolder, filePath, catchClause, depth, CodeElementType.CATCH_CLAUSE, fileContent);
 			child.addCatchClause(catchClauseStatementObject);
 			if (parent != null)
 				parent.addStatement(catchClauseStatementObject);
@@ -440,7 +489,7 @@ public class KotlinOperationBody extends OperationBody {
 		}
 		KtFinallySection finallyBlock = tryStatement.getFinallyBlock();
 		if(finallyBlock != null) {
-			CompositeStatementObject finallyClauseStatementObject = new CompositeStatementObject(ktFile, sourceFolder, filePath, finallyBlock, parent.getDepth()+1, CodeElementType.FINALLY_BLOCK, fileContent);
+			CompositeStatementObject finallyClauseStatementObject = new CompositeStatementObject(ktFile, sourceFolder, filePath, finallyBlock, depth, CodeElementType.FINALLY_BLOCK, fileContent);
 			child.setFinallyClause(finallyClauseStatementObject);
 			if (parent != null)
 				parent.addStatement(finallyClauseStatementObject);

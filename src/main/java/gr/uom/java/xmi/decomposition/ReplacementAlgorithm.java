@@ -16,6 +16,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.refactoringminer.api.Refactoring;
@@ -70,6 +72,14 @@ public class ReplacementAlgorithm {
 			}
 		}
 		return null;
+	}
+
+	//the statements of the Java switch case are nested under the block of the Kotlin when entry, i.e., switch(x) { case A: return null; } -> when(x) { A -> { return null } }
+	private static boolean switchCaseStatementInWhenEntry(AbstractCodeFragment statement1, AbstractCodeFragment statement2) {
+		CompositeStatementObject parent2 = statement2.getParent();
+		return statement1.getParent().getLocationInfo().getCodeElementType().equals(CodeElementType.SWITCH_STATEMENT) &&
+				parent2.getLocationInfo().getCodeElementType().equals(CodeElementType.BLOCK) && parent2.getParent() != null &&
+				parent2.getParent().getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY);
 	}
 
 	private static boolean advancedAssertJTypeNarrowingConversion(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
@@ -257,6 +267,66 @@ public class ReplacementAlgorithm {
 			}
 		}
 		return null;
+	}
+
+	private static final Pattern IN_SUB_CONDITION = Pattern.compile("(.+?) (!?in) (.+)");
+
+	//the Java contains call replaced with the Kotlin in/!in operator, i.e., !c.contains(x) -> x !in c, c.contains(x) -> x in c
+	//the Kotlin collection may be cast to accept null elements, i.e., c.contains(null) -> null !in (c as List<T?>)
+	//the receiver and argument of the call are updated with the replacements already applied to s1, i.e., renamed variables and getters replaced with properties
+	//the Kotlin collection may be a renamed variable, which is added to renames, i.e., protocols = new ArrayList<>(protocols); protocols.contains(x) -> val protocolsCopy = protocols.toMutableList(); x in protocolsCopy
+	private static Replacement containsReplacedWithInOperator(String s1, String s2, AbstractCall call, AbstractCodeFragment statement1, AbstractCodeFragment statement2,
+			Set<Replacement> replacements, Set<Replacement> renames, Constants LANG1) {
+		if(!call.getName().equals("contains") || call.arguments().size() != 1 || call.getExpression() == null)
+			return null;
+		String receiver = call.getExpression();
+		String argument = call.arguments().get(0);
+		for(Replacement r : replacements) {
+			receiver = ReplacementUtil.performReplacement(receiver, r.getBefore(), r.getAfter());
+			argument = ReplacementUtil.performReplacement(argument, r.getBefore(), r.getAfter());
+		}
+		String before = receiver + ".contains(" + argument + ")";
+		if(!s1.contains(before))
+			return null;
+		boolean negated1 = s1.contains(LANG1.NOT + before);
+		boolean plain1 = s1.replace(LANG1.NOT + before, "").contains(before);
+		//the Kotlin in/!in checks of the same element are compared as whole infix expressions, so that x !in protocols is not found in x !in protocolsCopy
+		for(LeafExpression infix2 : statement2.getInfixExpressions()) {
+			Matcher m2 = IN_SUB_CONDITION.matcher(infix2.getString());
+			if(!m2.matches() || !m2.group(1).equals(argument) || !s2.contains(infix2.getString()))
+				continue;
+			String variable2 = collectionVariable2(m2.group(3));
+			boolean renamed = !variable2.equals(receiver);
+			if(renamed && !(isVariable(receiver, statement1) && isVariable(variable2, statement2)))
+				continue;
+			if(renamed) {
+				renames.add(new Replacement(receiver, variable2, ReplacementType.VARIABLE_NAME));
+			}
+			boolean notIn2 = m2.group(2).equals("!in");
+			//the same condition, i.e., !c.contains(x) -> x !in c, c.contains(x) -> x in c,
+			//otherwise the inverted condition, i.e., if (c.contains(x)) throw ... -> require(x !in c)
+			boolean inverted = !(notIn2 ? negated1 : plain1);
+			String before1 = notIn2 != inverted ? LANG1.NOT + before : before;
+			return new Replacement(before1, infix2.getString(), inverted ? ReplacementType.INVERT_CONDITIONAL : ReplacementType.VARIABLE_NAME);
+		}
+		return null;
+	}
+
+	private static boolean isVariable(String name, AbstractCodeFragment statement) {
+		for(LeafExpression variable : statement.getVariables()) {
+			if(variable.getString().equals(name))
+				return true;
+		}
+		return false;
+	}
+
+	//the Kotlin collection variable of an in/!in check, which may be cast to accept null elements, i.e., (c as List<T?>) -> c
+	private static String collectionVariable2(String collection2) {
+		if(collection2.startsWith("(") && collection2.endsWith(")"))
+			collection2 = collection2.substring(1, collection2.length() - 1);
+		if(collection2.contains(" as "))
+			collection2 = collection2.substring(0, collection2.indexOf(" as "));
+		return collection2;
 	}
 
 	protected static Set<Replacement> findReplacementsWithExactMatching(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
@@ -591,6 +661,30 @@ public class ReplacementAlgorithm {
 		// remove common variables from the two sets
 		variables1.removeAll(variableIntersection);
 		variables2.removeAll(variableIntersection);
+		
+		if(LANG1.equals(Constants.JAVA) && LANG2.equals(Constants.KOTLIN)) {
+			//the Java contains calls replaced with the Kotlin in/!in checks before the other replacements, i.e., !c.contains(x) -> x !in c,
+			//so that the contains calls are not replaced with Kotlin variables, and the Kotlin in/!in operators with Java operators
+			//the renamed collections are not applied to the receivers of the next contains calls, which are still in the argumentized string
+			Set<Replacement> previousReplacements = new LinkedHashSet<Replacement>(replacementInfo.getReplacements());
+			Set<Replacement> renames = new LinkedHashSet<Replacement>();
+			for(AbstractCall call1 : statement1.getMethodInvocations()) {
+				Replacement containsReplacement = containsReplacedWithInOperator(replacementInfo.getArgumentizedString1(), replacementInfo.getArgumentizedString2(),
+						call1, statement1, statement2, previousReplacements, renames, LANG1);
+				if(containsReplacement != null) {
+					replacementInfo.addReplacement(containsReplacement);
+					replacementInfo.setArgumentizedString1(replacementInfo.getArgumentizedString1().replace(containsReplacement.getBefore(), containsReplacement.getAfter()));
+					methodInvocationMap1.values().removeIf(calls -> calls.contains(call1));
+				}
+			}
+			//the renamed collections are applied to their remaining occurrences, i.e., protocols.size() -> protocolsCopy.size()
+			for(Replacement rename : renames) {
+				replacementInfo.addReplacement(rename);
+				replacementInfo.setArgumentizedString1(ReplacementUtil.performReplacement(replacementInfo.getArgumentizedString1(), rename.getBefore(), rename.getAfter()));
+				variables1.remove(rename.getBefore());
+				variables2.remove(rename.getAfter());
+			}
+		}
 		
 		// replace variables with the corresponding arguments
 		replaceVariablesWithArguments(variables1, parameterToArgumentMap);
@@ -1046,7 +1140,6 @@ public class ReplacementAlgorithm {
 							prefixMatch = true;
 						}
 					}
-					boolean multipleInstances = ReplacementUtil.countInstances(temp, s2) > 1;
 					boolean typeContainsVariableName = false;
 					if(variableDeclarations1.size() > 0 && !s1.equals(s2)) {
 						VariableDeclaration variableDeclaration = variableDeclarations1.get(0);
@@ -1075,10 +1168,12 @@ public class ReplacementAlgorithm {
 							}
 						}
 					}
-					if(distanceRaw == -1 && (multipleInstances || typeContainsVariableName || prefixMatch)) {
+					//countInstances is evaluated last, because it is more expensive than the other conditions, and at most once
+					int instances = -1;
+					if(distanceRaw == -1 && (typeContainsVariableName || prefixMatch || (instances = ReplacementUtil.countInstances(temp, s2)) > 1)) {
 						distanceRaw = StringDistance.editDistance(temp, replacementInfo.getArgumentizedString2());
 					}
-					boolean allowReplacementIncreasingDistance = (multipleInstances && Math.abs(s1.length() - s2.length()) == Math.abs(distanceRaw - minDistance) && !s1.equals(s2)) || typeContainsVariableName || prefixMatch;
+					boolean allowReplacementIncreasingDistance = (!s1.equals(s2) && Math.abs(s1.length() - s2.length()) == Math.abs(distanceRaw - minDistance) && (instances != -1 ? instances : ReplacementUtil.countInstances(temp, s2)) > 1) || typeContainsVariableName || prefixMatch;
 					if(distanceRaw >= 0 && (distanceRaw < replacementInfo.getRawDistance() || allowReplacementIncreasingDistance)) {
 						minDistance = distanceRaw;
 						Replacement replacement = null;
@@ -1941,7 +2036,8 @@ public class ReplacementAlgorithm {
 			if(statement1.getString().startsWith(LANG1.RETURN_SPACE) && statement2.getString().startsWith(LANG2.RETURN_SPACE) &&
 					(statement1.commonReturnStatement() || statement2.commonReturnStatement()) &&
 					statement1.getParent() != null && statement2.getParent() != null &&
-					!statement1.getParent().getLocationInfo().getCodeElementType().equals(statement2.getParent().getLocationInfo().getCodeElementType())) {
+					!statement1.getParent().getLocationInfo().getCodeElementType().equals(statement2.getParent().getLocationInfo().getCodeElementType()) &&
+					!switchCaseStatementInWhenEntry(statement1, statement2)) {
 				if(!(statement1.isLastStatementInParentBlock() && statement1.getParent() instanceof TryStatementObject && statement2.isLastStatement()) &&
 						!(statement2.isLastStatementInParentBlock() && statement2.getParent() instanceof TryStatementObject && statement1.isLastStatement())) {
 					return null;
@@ -2751,7 +2847,7 @@ public class ReplacementAlgorithm {
 		}
 		//Kotlin extension call is identical with the static call having the receiver as first argument, i.e., source.buffer() -> Okio.buffer(source)
 		if(invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null &&
-				invocationCoveringTheEntireStatement1.identicalWithExpressionMovedToStaticCallArgument(invocationCoveringTheEntireStatement2)) {
+				invocationCoveringTheEntireStatement1.identicalWithExpressionMovedToStaticCallArgument(invocationCoveringTheEntireStatement2, statement1.getMethodInvocations(), statement2.getMethodInvocations())) {
 			Replacement replacement = new MethodInvocationReplacement(invocationCoveringTheEntireStatement1.actualString(),
 					invocationCoveringTheEntireStatement2.actualString(), invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, ReplacementType.METHOD_INVOCATION_EXPRESSION_MOVED_TO_STATIC_CALL_ARGUMENT);
 			replacementInfo.addReplacement(replacement);
@@ -3441,7 +3537,7 @@ public class ReplacementAlgorithm {
 							List<String> arguments = invocation2.arguments();
 							if(arguments.size() == 1) {
 								for(String arg : invocationCoveringTheEntireStatement1.arguments()) {
-									if(statement2.getArgumentizedString().contains(arg)) {
+									if(operationBodyMapper.getArgumentizedString(statement2).contains(arg)) {
 										Replacement replacement = new MethodInvocationReplacement(
 												invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 												invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3450,7 +3546,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(".")) {
 										String trim = arg.substring(arg.indexOf(".") + 1, arg.length());
-										if(statement2.getArgumentizedString().contains(trim)) {
+										if(operationBodyMapper.getArgumentizedString(statement2).contains(trim)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3461,7 +3557,7 @@ public class ReplacementAlgorithm {
 									if(arg.contains(" instanceof ")) {
 										String before = arg.substring(0, arg.indexOf(" instanceof "));
 										String after = arg.substring(arg.indexOf(" instanceof ") + " instanceof ".length(), arg.length());
-										if(statement2.getArgumentizedString().contains(before) && statement2.getArgumentizedString().contains(after)) {
+										if(operationBodyMapper.getArgumentizedString(statement2).contains(before) && operationBodyMapper.getArgumentizedString(statement2).contains(after)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3471,7 +3567,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(" > 0")) {
 										String before = arg.substring(0, arg.indexOf(" > 0"));
-										if(statement2.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement2).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3481,7 +3577,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(" < 0")) {
 										String before = arg.substring(0, arg.indexOf(" < 0"));
-										if(statement2.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement2).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3491,7 +3587,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(" == 0")) {
 										String before = arg.substring(0, arg.indexOf(" == 0"));
-										if(statement2.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement2).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3501,7 +3597,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.endsWith(".isEmpty()")) {
 										String before = arg.substring(0, arg.indexOf(".isEmpty()"));
-										if(statement2.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement2).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3586,7 +3682,7 @@ public class ReplacementAlgorithm {
 							List<String> arguments = invocation1.arguments();
 							if(arguments.size() == 1) {
 								for(String arg : invocationCoveringTheEntireStatement2.arguments()) {
-									if(statement1.getArgumentizedString().contains(arg)) {
+									if(operationBodyMapper.getArgumentizedString(statement1).contains(arg)) {
 										Replacement replacement = new MethodInvocationReplacement(
 												invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 												invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -3595,7 +3691,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(".")) {
 										String trim = arg.substring(arg.indexOf(".") + 1, arg.length());
-										if(statement1.getArgumentizedString().contains(trim)) {
+										if(operationBodyMapper.getArgumentizedString(statement1).contains(trim)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -3606,7 +3702,7 @@ public class ReplacementAlgorithm {
 									if(arg.contains(" instanceof ")) {
 										String before = arg.substring(0, arg.indexOf(" instanceof "));
 										String after = arg.substring(arg.indexOf(" instanceof ") + " instanceof ".length(), arg.length());
-										if(statement1.getArgumentizedString().contains(before) && statement1.getArgumentizedString().contains(after)) {
+										if(operationBodyMapper.getArgumentizedString(statement1).contains(before) && operationBodyMapper.getArgumentizedString(statement1).contains(after)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -3616,7 +3712,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(" > 0")) {
 										String before = arg.substring(0, arg.indexOf(" > 0"));
-										if(statement1.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement1).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -3626,7 +3722,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(" < 0")) {
 										String before = arg.substring(0, arg.indexOf(" < 0"));
-										if(statement1.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement1).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -3636,7 +3732,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.contains(" == 0")) {
 										String before = arg.substring(0, arg.indexOf(" == 0"));
-										if(statement1.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement1).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -3646,7 +3742,7 @@ public class ReplacementAlgorithm {
 									}
 									else if(arg.endsWith(".isEmpty()")) {
 										String before = arg.substring(0, arg.indexOf(".isEmpty()"));
-										if(statement1.getArgumentizedString().contains(before)) {
+										if(operationBodyMapper.getArgumentizedString(statement1).contains(before)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -6648,6 +6744,9 @@ public class ReplacementAlgorithm {
 
 	protected static void processLambdas(LambdaExpressionObject lambda1, LambdaExpressionObject lambda2,
 			ReplacementInfo replacementInfo, UMLOperationBodyMapper operationBodyMapper, boolean sameNumberOfLambdas) throws RefactoringMinerTimedOutException {
+		if(operationBodyMapper.withinMatchedAnonymousClasses(lambda1, lambda2)) {
+			return;
+		}
 		boolean methodReference1 = lambda1.getLocationInfo().getCodeElementType().equals(CodeElementType.METHOD_REFERENCE);
 		boolean methodReference2 = lambda2.getLocationInfo().getCodeElementType().equals(CodeElementType.METHOD_REFERENCE);
 		UMLAbstractClassDiff classDiff = operationBodyMapper.getClassDiff();
@@ -6880,6 +6979,9 @@ public class ReplacementAlgorithm {
 		UMLOperationBodyMapper parentMapper = operationBodyMapper.getParentMapper();
 		String statementWithoutAnonymous1 = statementWithoutAnonymous(statement1, anonymousClassDeclaration1, container1);
 		String statementWithoutAnonymous2 = statementWithoutAnonymous(statement2, anonymousClassDeclaration2, container2);
+		if(operationBodyMapper.anonymousClassMatchedByParentMapper(anonymousClassDeclaration1, anonymousClassDeclaration2)) {
+			return replacementAdded;
+		}
 		if(replacementInfo.getRawDistance() == 0 || statementWithoutAnonymous1.equals(statementWithoutAnonymous2) || anonymousClassDeclaration1.toString().equals(anonymousClassDeclaration2.toString()) ||
 				identicalAfterVariableAndTypeReplacements(statementWithoutAnonymous1, statementWithoutAnonymous2, replacementInfo.getReplacements(), LANG1, LANG2) ||
 				extractedToVariable(statementWithoutAnonymous1, statementWithoutAnonymous2, statement1, statement2, replacementInfo) ||
@@ -6916,11 +7018,8 @@ public class ReplacementAlgorithm {
 				if(parentMapper != null && statement1 instanceof AbstractExpression && statement2 instanceof AbstractExpression) {
 					parentMapper.getAnonymousClassDiffs().add(anonymousClassDiff);
 				}
-				if(classDiff != null && classDiff.getRemovedAnonymousClasses().contains(anonymousClass1)) {
-					classDiff.getRemovedAnonymousClasses().remove(anonymousClass1);
-				}
-				if(classDiff != null && classDiff.getAddedAnonymousClasses().contains(anonymousClass2)) {
-					classDiff.getAddedAnonymousClasses().remove(anonymousClass2);
+				if(classDiff != null) {
+					classDiff.anonymousClassesMatched(anonymousClass1, anonymousClass2);
 				}
 				if(!anonymousClassDeclaration1.toString().equals(anonymousClassDeclaration2.toString())) {
 					Replacement replacement = new Replacement(anonymousClassDeclaration1.toString(), anonymousClassDeclaration2.toString(), ReplacementType.ANONYMOUS_CLASS_DECLARATION);

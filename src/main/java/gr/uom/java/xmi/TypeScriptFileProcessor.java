@@ -1,14 +1,17 @@
 package gr.uom.java.xmi;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+
+import org.refactoringminer.astDiff.utils.TypeScriptTreeGenerator;
 
 import com.caoccao.javet.swc4j.Swc4j;
 import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstClassMethod;
@@ -22,6 +25,7 @@ import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstPat;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstStmt;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstTsFnParam;
 import com.caoccao.javet.swc4j.ast.pat.Swc4jAstArrayPat;
+import com.caoccao.javet.swc4j.ast.pat.Swc4jAstAssignPat;
 import com.caoccao.javet.swc4j.ast.pat.Swc4jAstBindingIdent;
 import com.caoccao.javet.swc4j.ast.pat.Swc4jAstObjectPat;
 import com.caoccao.javet.swc4j.ast.pat.Swc4jAstRestPat;
@@ -30,6 +34,7 @@ import com.caoccao.javet.swc4j.ast.program.Swc4jAstScript;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstBlockStmt;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstFnDecl;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsMethodSignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsParamProp;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsTypeAnn;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsTypeParam;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsTypeParamDecl;
@@ -41,13 +46,11 @@ import com.caoccao.javet.swc4j.enums.Swc4jParseMode;
 import com.caoccao.javet.swc4j.exceptions.Swc4jCoreException;
 import com.caoccao.javet.swc4j.options.Swc4jParseOptions;
 import com.caoccao.javet.swc4j.outputs.Swc4jParseOutput;
-import com.github.gumtreediff.gen.treesitterng.JavaScriptTreeSitterNgTreeGenerator;
-import com.github.gumtreediff.gen.treesitterng.TsxTreeSitterNgTreeGenerator;
-import com.github.gumtreediff.gen.treesitterng.TypeScriptTreeSitterNgTreeGenerator;
 import com.github.gumtreediff.tree.TreeContext;
 
 import extension.umladapter.UMLAdapterUtil;
 import gr.uom.java.xmi.LocationInfo.CodeElementType;
+import gr.uom.java.xmi.decomposition.AbstractExpression;
 import gr.uom.java.xmi.decomposition.OperationBody;
 import gr.uom.java.xmi.decomposition.TypeScriptOperationBody;
 import gr.uom.java.xmi.decomposition.VariableDeclaration;
@@ -59,26 +62,41 @@ public class TypeScriptFileProcessor {
 		this.umlModel = umlModel;
 	}
 
+	/**
+	 * swc4j gives the offsets in code points, so the source is parsed with each UTF-16 unit of a surrogate pair, i.e., an emoji, replaced by a private use character,
+	 * to get UTF-16 offsets, i.e., the offsets of Java strings. The mapping is one-to-one, so different emoji remain different, and the source code text is taken from the original content.
+	 */
+	public static String utf16Source(String content) {
+		char[] chars = null;
+		for(int i = 0; i < content.length(); i++) {
+			char character = content.charAt(i);
+			if(Character.isSurrogate(character)) {
+				if(chars == null) {
+					chars = content.toCharArray();
+				}
+				//U+D800-U+DFFF to U+E000-U+E7FF
+				chars[i] = (char) (character + 0x800);
+			}
+		}
+		return chars == null ? content : new String(chars);
+	}
+
+	//JSX does not conflict with JavaScript, because an expression cannot start with <, while it conflicts with the TypeScript type assertions <T>x
+	public static Swc4jMediaType mediaType(String filePath) {
+		if(filePath.endsWith(".tsx"))
+			return Swc4jMediaType.Tsx;
+		if(filePath.endsWith(".ts"))
+			return Swc4jMediaType.TypeScript;
+		return Swc4jMediaType.Jsx;
+	}
+
 	public void processTypeScriptFile(String filePath, String fileContent, boolean astDiff, Swc4j swc4j) {
 		//skip minified JavaScript files
 		if(filePath.endsWith(".min.js")) {
 			return;
 		}
 		try {
-			Swc4jMediaType mediaType = null;
-			if(filePath.endsWith(".tsx"))
-				mediaType = Swc4jMediaType.Tsx;
-			else if(filePath.endsWith(".ts"))
-				mediaType = Swc4jMediaType.TypeScript;
-			else if(filePath.endsWith(".js")) {
-				if(filePath.endsWith("spec.js") || fileContent.contains("</div>") || fileContent.contains("</ul>") || fileContent.contains("</Route>") || fileContent.contains("</Provider>") || fileContent.contains("/>"))
-					mediaType = Swc4jMediaType.Jsx;
-				else
-					mediaType = Swc4jMediaType.JavaScript;
-			}
-			else if(filePath.endsWith(".jsx")) {
-				mediaType = Swc4jMediaType.Jsx;
-			}
+			Swc4jMediaType mediaType = mediaType(filePath);
 			URL specifier = Path.of(filePath).toUri().toURL();
 			Swc4jParseOptions options = new Swc4jParseOptions()
 					.setSpecifier(specifier)
@@ -87,24 +105,11 @@ public class TypeScriptFileProcessor {
 					.setCaptureComments(true)
 					.setParseMode(Swc4jParseMode.Module);
 			// Parse the code.
-			Swc4jParseOutput output = swc4j.parse(fileContent, options);
+			Swc4jParseOutput output = swc4j.parse(utf16Source(fileContent), options);
 			Swc4jComments comments = output.getComments();
 			//System.out.println(output.getProgram().toDebugString());
 			if (astDiff) {
-				ByteArrayInputStream is = new ByteArrayInputStream(fileContent.getBytes());
-				TreeContext treeContext = null;
-				if(filePath.endsWith(".js")) {
-					treeContext = new JavaScriptTreeSitterNgTreeGenerator().generateFrom().stream(is);
-				}
-				else if(filePath.endsWith(".tsx")) {
-					treeContext = new TsxTreeSitterNgTreeGenerator().generateFrom().stream(is);
-				}
-				else if(filePath.endsWith(".jsx")) {
-					treeContext = new TsxTreeSitterNgTreeGenerator().generateFrom().stream(is);
-				}
-				else {
-					treeContext = new TypeScriptTreeSitterNgTreeGenerator().generateFrom().stream(is);
-				}
+				TreeContext treeContext = TypeScriptTreeGenerator.generate(filePath, fileContent, output.getProgram(), comments);
 				this.umlModel.getTreeContextMap().put(filePath, treeContext);
 			}
 			if(output.getProgram() instanceof Swc4jAstModule module) {
@@ -157,6 +162,8 @@ public class TypeScriptFileProcessor {
 			List<Swc4jComment> list = trailing.get(key);
 			processCommentList(sourceFolder, filePath, fileContent, commentList, list);
 		}
+		//like in the other languages, the comments are in the order they appear in the file
+		commentList.sort(Comparator.comparingInt(comment -> comment.getLocationInfo().getStartOffset()));
 		return commentList;
 	}
 
@@ -207,7 +214,14 @@ public class TypeScriptFileProcessor {
 	public static UMLOperation processFunction(String sourceFolder, String filePath, Swc4jAstFunction function,
 			Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent,
 			UMLOperation operation, List<UMLComment> comments) {
-		TypeScriptOperationBody.processComments(comments, operation);
+		return processFunction(sourceFolder, filePath, function, activeVariableDeclarations, fileContent, operation, comments, true);
+	}
+
+	//leadingComment: whether the function takes the comment in the line before it
+	public static UMLOperation processFunction(String sourceFolder, String filePath, Swc4jAstFunction function,
+			Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent,
+			UMLOperation operation, List<UMLComment> comments, boolean leadingComment) {
+		TypeScriptOperationBody.processComments(comments, operation, leadingComment);
 		Optional<Swc4jAstTsTypeAnn> returnType = function.getReturnType();
 		if(returnType.isPresent()) {
 			UMLType type = UMLType.extractTypeObject(sourceFolder, filePath, fileContent, returnType.get().getTypeAnn(), 0);
@@ -230,6 +244,7 @@ public class TypeScriptFileProcessor {
 			for(Swc4jAstBindingIdent identifier : identifiers) {
 				VariableDeclaration parameter = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, operation, activeVariableDeclarations, fileContent);
 				parameter.setParameter(true);
+				setDefaultValue(parameter, identifier, pat, sourceFolder, filePath, operation, activeVariableDeclarations, fileContent);
 				if(parameter.getType() != null) {
 					UMLParameter umlParameter = new UMLParameter(parameter.getVariableName(), parameter.getType(), "in", false);
 					umlParameter.setVariableDeclaration(parameter);
@@ -251,6 +266,14 @@ public class TypeScriptFileProcessor {
 		return operation;
 	}
 
+	//the default value of a parameter is its initializer, i.e., function start(port = 0)
+	private static void setDefaultValue(VariableDeclaration parameter, Swc4jAstBindingIdent identifier, ISwc4jAstPat pat, String sourceFolder, String filePath,
+			UMLOperation operation, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
+		if(pat instanceof Swc4jAstAssignPat assignPat && assignPat.getLeft() == identifier) {
+			parameter.setInitializer(new AbstractExpression(sourceFolder, filePath, assignPat.getRight(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, operation, activeVariableDeclarations, fileContent, Collections.emptyList()));
+		}
+	}
+
 	public static UMLOperation processConstructor(String sourceFolder, String filePath, Swc4jAstConstructor functionDecl,
 			Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent, String className, List<UMLComment> comments) {
 		LocationInfo location = new LocationInfo(sourceFolder, filePath, functionDecl.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
@@ -258,13 +281,21 @@ public class TypeScriptFileProcessor {
 		TypeScriptOperationBody.processComments(comments, operation);
 		operation.setVisibility(Visibility.PRIVATE);
 		for(ISwc4jAstParamOrTsParamProp param : functionDecl.getParams()) {
+			ISwc4jAstPat pat = null;
 			if(param instanceof Swc4jAstParam p) {
-				ISwc4jAstPat pat = p.getPat();
+				pat = p.getPat();
+			}
+			else if(param instanceof Swc4jAstTsParamProp paramProp && paramProp.getParam() instanceof ISwc4jAstPat paramPropPat) {
+				//the parameter property, i.e., constructor(private source: string)
+				pat = paramPropPat;
+			}
+			if(pat != null) {
 				Swc4jAstTsTypeAnn typeAnnotation = VariableDeclaration.extractTypeAnnotation(pat);
 				List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(pat);
 				for(Swc4jAstBindingIdent identifier : identifiers) {
 					VariableDeclaration parameter = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, operation, activeVariableDeclarations, fileContent);
 					parameter.setParameter(true);
+					setDefaultValue(parameter, identifier, pat, sourceFolder, filePath, operation, activeVariableDeclarations, fileContent);
 					if(parameter.getType() != null) {
 						UMLParameter umlParameter = new UMLParameter(parameter.getVariableName(), parameter.getType(), "in", false);
 						umlParameter.setVariableDeclaration(parameter);

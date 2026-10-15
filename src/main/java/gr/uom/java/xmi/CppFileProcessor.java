@@ -1,6 +1,5 @@
 package gr.uom.java.xmi;
 
-import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -97,10 +96,9 @@ import org.eclipse.cdt.internal.core.parser.IMacroDictionary;
 import org.eclipse.cdt.internal.core.parser.scanner.InternalFileContent;
 import org.eclipse.cdt.internal.core.parser.scanner.InternalFileContentProvider;
 import org.eclipse.core.runtime.CoreException;
+import org.refactoringminer.astDiff.utils.CppTreeGenerator;
 import org.refactoringminer.util.PathFileUtils;
 
-import com.github.gumtreediff.gen.treesitterng.CTreeSitterNgTreeGenerator;
-import com.github.gumtreediff.gen.treesitterng.CppTreeSitterNgTreeGenerator;
 import com.github.gumtreediff.tree.TreeContext;
 
 import extension.umladapter.UMLAdapterUtil;
@@ -126,47 +124,13 @@ public class CppFileProcessor {
 		this.fileContent = fileContent;
 		this.preprocessor = new CppPreprocessor(this);
 		try {
-			FileContent content = FileContent.create(filePath, fileContent.toCharArray());
-			Map<String, String> predefinedMacros = new HashMap<>();
-			ScannerInfo scanInfo = new ExtendedScannerInfo(predefinedMacros, getIncludePaths(filePath));
-			//IncludeFileContentProvider includeProvider = IncludeFileContentProvider.getSavedFilesProvider();
-			IncludeFileContentProvider includeProvider = new InternalFileContentProvider() {
-				@Override
-				public InternalFileContent getContentForInclusion(String path, IMacroDictionary macroDictionary) {
-					File file = new File(path);
-					if (file.exists()) {
-						return (InternalFileContent) FileContent.createForExternalFileLocation(path);
-					}
-					return null;
-				}
-
-				@Override
-				public InternalFileContent getContentForInclusion(IIndexFileLocation location, String astPath) {
-					return (InternalFileContent) FileContent.createForExternalFileLocation(astPath);
-				}
-			};
-			int options = GPPLanguage.OPTION_IS_SOURCE_UNIT | GPPLanguage.OPTION_PARSE_INACTIVE_CODE;
-			if(!astDiff) {
-				options |= GPPLanguage.OPTION_NO_IMAGE_LOCATIONS;
-			}
-
 			if(PathFileUtils.isCppFile(filePath) || PathFileUtils.isCFile(filePath)) {
+				IASTTranslationUnit ast = parse(filePath, fileContent, astDiff);
 				if (astDiff) {
-					ByteArrayInputStream is = new ByteArrayInputStream(fileContent.getBytes());
-					try {
-						TreeContext treeContext = new CppTreeSitterNgTreeGenerator().generateFrom().stream(is);
-						this.umlModel.getTreeContextMap().put(filePath, treeContext);
-					}
-					catch(Exception e) {}
+					//a single parse for the model and the AST diff tree
+					TreeContext treeContext = CppTreeGenerator.generate(fileContent, ast);
+					this.umlModel.getTreeContextMap().put(filePath, treeContext);
 				}
-				IASTTranslationUnit ast = GPPLanguage.getDefault().getASTTranslationUnit(
-						content,
-						scanInfo,
-						includeProvider,
-						EmptyCIndex.INSTANCE,
-						options,
-						new DefaultLogService()
-						);
 				String sourceFolder = extractCppSourceFolder();
 				List<UMLComment> comments = extractInternalComments(ast.getComments(), sourceFolder, filePath, fileContent);
 				this.umlModel.getCommentMap().put(filePath, comments);
@@ -318,11 +282,45 @@ public class CppFileProcessor {
 		}
 	}
 
-	private String[] getIncludePaths(String filePath) {
+	public static IASTTranslationUnit parse(String filePath, String fileContent, boolean astDiff) throws CoreException {
+		FileContent content = FileContent.create(filePath, fileContent.toCharArray());
+		Map<String, String> predefinedMacros = new HashMap<>();
+		ScannerInfo scanInfo = new ExtendedScannerInfo(predefinedMacros, getIncludePaths(filePath, fileContent));
+		//IncludeFileContentProvider includeProvider = IncludeFileContentProvider.getSavedFilesProvider();
+		IncludeFileContentProvider includeProvider = new InternalFileContentProvider() {
+			@Override
+			public InternalFileContent getContentForInclusion(String path, IMacroDictionary macroDictionary) {
+				File file = new File(path);
+				if (file.exists()) {
+					return (InternalFileContent) FileContent.createForExternalFileLocation(path);
+				}
+				return null;
+			}
+
+			@Override
+			public InternalFileContent getContentForInclusion(IIndexFileLocation location, String astPath) {
+				return (InternalFileContent) FileContent.createForExternalFileLocation(astPath);
+			}
+		};
+		int options = GPPLanguage.OPTION_IS_SOURCE_UNIT | GPPLanguage.OPTION_PARSE_INACTIVE_CODE;
+		if(!astDiff) {
+			options |= GPPLanguage.OPTION_NO_IMAGE_LOCATIONS;
+		}
+		return GPPLanguage.getDefault().getASTTranslationUnit(
+				content,
+				scanInfo,
+				includeProvider,
+				EmptyCIndex.INSTANCE,
+				options,
+				new DefaultLogService()
+				);
+	}
+
+	private static String[] getIncludePaths(String filePath, String fileContent) {
 		Set<String> includePaths = new LinkedHashSet<>();
 		includePaths.add(".");
-		if(this.fileContent.contains("#include \"gtest/") || this.fileContent.contains("#include \"gmock/") ||
-			this.fileContent.contains("#include <gtest/") || this.fileContent.contains("#include <gmock/")) {
+		if(fileContent.contains("#include \"gtest/") || fileContent.contains("#include \"gmock/") ||
+			fileContent.contains("#include <gtest/") || fileContent.contains("#include <gmock/")) {
 			includePaths.add(System.getProperty("user.dir") + "/include");
 		}
 		includePaths.add("src/include");
