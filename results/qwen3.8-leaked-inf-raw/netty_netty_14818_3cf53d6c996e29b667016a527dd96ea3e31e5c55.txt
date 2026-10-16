@@ -1,0 +1,21 @@
+#D1DNN: There is a clear bug in the `else if (res == Native.ERRNO_ECANCELED_NEGATIVE)` branch (the outer one, reached when `recvBufAllocHandle().isReadComplete()` is false). `doBeginReadNow()` is called both conditionally inside `if (pending)` and then unconditionally on the very next line:
+```java
+} else if (res == Native.ERRNO_ECANCELED_NEGATIVE) {
+    if (pending) {
+        doBeginReadNow();
+    }
+    doBeginReadNow();  // <-- unconditional second call
+}
+```
+This will always schedule a read (and twice if `pending` is true), regardless of whether the user actually requested another read. The unconditional `doBeginReadNow()` should be removed, leaving only the conditional call guarded by `pending`.
+
+#D5MQW, #D1DNN: Moving `readPending = true` before the `inReadComplete || !isActive()` guard changes its semantics from "a read was requested but deferred" to "a read was initiated." For the non-multi-shot path (`numOutstandingReads != -1`), `readPending` is never reset back to `false` in `readComplete()`. This has two consequences:
+1. Any subsequent call to `doBeginRead()` will hit the `if (readPending) return;` guard and silently drop the request, since the flag is never cleared.
+2. In the `finally` block, the `if (readPending)` check for the non-multi-shot case will always be true, meaning `doBeginReadNow()` is unconditionally re-scheduled after every completed read, even if the user did not signal a desire to continue reading.
+Consider resetting `readPending = false` after the read completes (e.g., in the `finally` block or at the top of `readComplete` for the non-multi-shot path), so that the flag truly reflects a *pending* (deferred) read request rather than a read that was already dispatched.
+
+#XZMX6: The early-return path for `ERRNO_ECANCELED_NEGATIVE` releases `byteBuf` and returns, but the `finally` block in `readComplete` (see #D1DNN) still executes and may call `doBeginReadNow()`. Ensure this interaction is intentional — specifically, that scheduling a new read after a cancellation completion is the desired behavior in all cases (e.g., when the channel is being closed).
+
+#0NR1Y: When multi-shot is used, `len` is set to `0`. Verify that the underlying `IoUringIoOps.newRecv(...)` and the kernel correctly interpret a zero-length recv with `IORING_RECV_MULTISHOT` + `IOSQE_BUFFER_SELECT` as "use the buffer ring's chunk size." If the kernel expects the actual buffer size even in multi-shot mode, passing `0` could cause unexpected behavior or a `EINVAL`.
+
+#NNA87, #AHHBR: The new `assert id != 0` on the cancel submission is a good defensive addition. However, if `registration.submit(ops)` can legitimately return `0` under certain race conditions (e.g., the operation was already completed between the check and the submit), this assert would fire in production debug builds. Consider whether a warning log + graceful fallback would be more appropriate than a hard assert.

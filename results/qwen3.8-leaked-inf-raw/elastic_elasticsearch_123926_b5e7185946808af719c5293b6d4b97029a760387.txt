@@ -1,0 +1,31 @@
+#JPHYR, #11C5T: In `migrateDataStream`, the success callback of `ActionListener.wrap` throws an `ElasticsearchException` when `startMigrationResponse.isAcknowledged() == false`:
+```java
+ActionListener.wrap(startMigrationResponse -> {
+    if (startMigrationResponse.isAcknowledged() == false) {
+        logger.error("failed to migrate indices from data stream [{}]", dataStreamName);
+        throw new ElasticsearchException(...);
+    }
+    ...
+```
+This exception is thrown inside an asynchronous callback, so it will **not** be caught by the surrounding `try { ... } catch (Exception ex) { markAsFailed(ex); }` block (which only catches synchronous exceptions from `execute()`). The task state will not be properly updated via `markAsFailed()`. The same pattern appears in `cancelExistingDataStreamMigrationAndRetry` where a non-acknowledged cancel response triggers a `throw`, and in `dataStreamMigrationFailed` (called from the success callback of `ActionListener.wrap` in `checkDataStreamMigrationStatus`) which also throws directly. In each case, a thrown exception in an async callback will not be caught by any surrounding try-catch and will not invoke `markAsFailed()`, leaving the persistent task in an indeterminate state. Consider calling `markAsFailed(new ElasticsearchException(...))` instead of throwing, to ensure the persistent task state is correctly transitioned to failed.
+
+#75PEN, #K559B: The refactored `getRestoreFromSnapshotAffectedResources` now uses `feature.getSystemResourceDescriptors()` which includes data stream descriptors, and their `getMatchingIndices()` returns backing index names. The old code had explicit logic to remove data stream backing indices from `affectedIndices` and instead add the owning feature name to `affectedFeatureStates` (with the comment "the feature state will cover the restore of these indices too").
+With this change, data stream backing indices will now appear as individual affected `INDEX` resources in the diagnostic output rather than being represented by their parent feature state. Please confirm this is the intended behavioral change for the shards availability health indicator, as it changes what operators see in the diagnostic API.
+
+#GSQ26, #43SHT: The `origin` field in `SystemDataStreamDescriptor` is assigned without null validation:
+```java
+this.origin = origin;
+```
+While `dataStreamName` uses `Objects.requireNonNull(dataStreamName, "dataStreamName must be specified")`, `origin` can be null. Since `getOrigin()` is used to construct an `OriginSettingClient` (see `SystemResourceMigrationInfo.createClient`), a null origin could lead to an NPE or unexpected behavior during migration. Consider either adding a `Objects.requireNonNull` or documenting that null is acceptable (as is done in `SystemIndexDescriptor` with its TODO comment).
+
+#JPHYR: In `checkDataStreamMigrationStatus`, the polling loop schedules a new check every 1 second indefinitely while `status.complete() == false`:
+```java
+if (status.complete() == false) {
+    threadPool.schedule(
+        () -> checkDataStreamMigrationStatus(migrationInfo, completionListener, false),
+        TimeValue.timeValueSeconds(1),
+        threadPool.generic()
+    );
+}
+```
+There is no timeout or maximum retry limit. If the underlying data stream migration task gets stuck (e.g., a node failure that doesn't properly cancel the task), this will poll forever, holding a reference to `migrationInfo` and `completionListener`. Consider adding a maximum elapsed time or retry count after which the migration is marked as failed.

@@ -1,0 +1,87 @@
+#P3819: The `clearCache` method has an inverted lock-acquisition loop:
+```java
+public void clearCache(String groupId, String topicId, int queueId) {
+    while (consumerLockService.tryLock(groupId, topicId)) {
+    }
+    ...
+}
+```
+Tracing the logic: if the lock is **free**, `tryLock` succeeds (returns `true`), the loop body executes (empty), then `tryLock` is called again — now the lock is held by this thread so `compareAndSet` fails and returns `false`, exiting the loop. The lock ends up held. If the lock is **held by another thread**, `tryLock` returns `false` immediately, the loop exits, and the code proceeds to `removeRecords` **without holding the lock**, then calls `unlock` in the `finally` block on a lock it never acquired.
+The correct pattern (used consistently in `ackOrderlyNew` and `processChangeInvisibleTimeForOrderNew`) is:
+```java
+while (!consumerLockService.tryLock(groupId, topicId)) {
+    // optionally Thread.yield()
+}
+```
+
+#P3819: In `popAsync`, the lock is acquired before the `try` block but only released inside the `whenComplete` callback. If any exception is thrown during the synchronous setup inside the `try` block (e.g., an NPE from one of the chained calls before `thenCompose`/`whenComplete` are attached), the `catch (Throwable t)` block logs the error but never releases the lock:
+```java
+if (topicConfig == null || !consumerLockService.tryLock(groupId, topicId)) {
+    return CompletableFuture.completedFuture(popConsumerContext);
+}
+...
+try {
+    // ... setup code that could throw ...
+    return getMessageFuture.thenCompose(...).whenComplete((result, throwable) -> {
+        ...
+        consumerLockService.unlock(groupId, topicId);
+    });
+} catch (Throwable t) {
+    log.error("PopConsumerService popAsync error", t);
+    // lock is leaked here
+}
+```
+The `catch` block should release the lock:
+```java
+} catch (Throwable t) {
+    log.error("PopConsumerService popAsync error", t);
+    consumerLockService.unlock(groupId, topicId);
+}
+```
+
+#KSW19: The `dryRun` flag logic is inverted and confusing:
+```java
+boolean dryRun = commandLine.hasOption('d') &&
+    Boolean.FALSE.toString().equalsIgnoreCase(commandLine.getOptionValue('d'));
+```
+This means `--dryRun false` sets `dryRun = true` (suppresses the export), while `--dryRun true` sets `dryRun = false` (performs the export). The user-facing semantics are backwards: passing `--dryRun true` (intuitively "yes, do a dry run") actually triggers the real export, and omitting the flag also triggers the real export. The condition should be:
+```java
+boolean dryRun = commandLine.hasOption('d') &&
+    Boolean.TRUE.toString().equalsIgnoreCase(commandLine.getOptionValue('d'));
+```
+Or simply `boolean dryRun = commandLine.hasOption('d');` if the flag's presence alone should indicate a dry run.
+
+#SGRSM: In `getKeyBytes()`, the buffer length is computed using `groupId.length()` and `topicId.length()` (Java char counts), but the actual bytes written use `groupId.getBytes(StandardCharsets.UTF_8)` whose length can exceed the char count for non-ASCII characters. This would cause a `BufferOverflowException` at runtime for group/topic names containing multi-byte characters:
+```java
+int length = Long.BYTES + groupId.length() + 1 + topicId.length() + 1 + Integer.BYTES + 1 + Long.BYTES;
+```
+Should use the byte-array lengths:
+```java
+byte[] groupBytes = groupId.getBytes(StandardCharsets.UTF_8);
+byte[] topicBytes = topicId.getBytes(StandardCharsets.UTF_8);
+int length = Long.BYTES + groupBytes.length + 1 + topicBytes.length + 1 + Integer.BYTES + 1 + Long.BYTES;
+```
+
+#P3819: In `revive`, the backoff index calculation is fragile:
+```java
+long backoffInterval = 1000L * REWRITE_INTERVALS_IN_SECONDS[
+    Math.min(REWRITE_INTERVALS_IN_SECONDS.length, record.getAttemptTimes())];
+```
+`REWRITE_INTERVALS_IN_SECONDS` has 16 elements (indices 0–15). The guard `record.getAttemptTimes() < brokerConfig.getPopReviveMaxAttemptTimes()` (default 16) prevents out-of-bounds access *today*, but if an operator sets `popReviveMaxAttemptTimes` to 17 or higher, `Math.min(16, 16)` = 16, which is an invalid index. Use `REWRITE_INTERVALS_IN_SECONDS.length - 1` as the upper bound:
+```java
+Math.min(REWRITE_INTERVALS_IN_SECONDS.length - 1, record.getAttemptTimes())
+```
+
+#HJYDF, #P3819: `transferToFsStore()` is `synchronized` and contains an unbounded `while (true)` loop that scans, writes, and deletes records in batches. It is invoked synchronously from the RPC handler thread (`AdminBrokerProcessor.transferPopToFsStore`). For a large KV store this will block the Netty I/O thread (or the thread pool handling admin requests) for an indeterminate duration, potentially causing request timeouts and thread starvation. Consider executing the transfer on a dedicated background thread and returning a "transfer started" acknowledgment to the caller, or at minimum adding a maximum iteration/timeout guard to the loop.
+
+#8XR2F, #0N9W1, #P3819: Multiple call sites use a tight busy-wait to acquire the `PopConsumerLockService` lock:
+```java
+while (!consumerLockService.tryLock(consumeGroup, topic)) {
+}
+```
+Under contention (e.g., concurrent acks and pops for the same group/topic), this spins at 100% CPU with no backoff. Adding a short `Thread.yield()` or `LockSupport.parkNanos(...)` inside the loop would reduce CPU pressure without materially increasing latency:
+```java
+while (!consumerLockService.tryLock(consumeGroup, topic)) {
+    Thread.yield();
+}
+```

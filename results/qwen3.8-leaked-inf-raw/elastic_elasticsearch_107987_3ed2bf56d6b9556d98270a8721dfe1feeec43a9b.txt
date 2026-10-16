@@ -1,0 +1,44 @@
+#PBBZA, #0NGBW, #G5SH8: The `equals` method in `Lookup` compares `tableName` against `lookup.matchFields` instead of `lookup.tableName`:
+```java
+return Objects.equals(tableName, lookup.matchFields)  // BUG: should be lookup.tableName
+    && Objects.equals(matchFields, lookup.matchFields)
+```
+This means two `Lookup` instances with the same `tableName` but different `matchFields` could incorrectly compare as equal, and two with different `tableName` but the same `matchFields` could incorrectly compare as unequal.
+The same `equals` bug exists in `HashJoinExec`:
+```java
+return Objects.equals(tableName, lookup.matchFields)  // BUG: should be lookup.tableName
+    && Objects.equals(matchFields, lookup.matchFields)
+```
+`tableName` is being compared to `lookup.matchFields` rather than `lookup.tableName`.
+
+#78QAF: The `Lookup` → `HashJoinExec` mapping in `Mapper.java` is a stub that passes `null` for `tableName`, `emptyList()` for `matchFields`, and `null` for both `matchValues` and `mergeValues`. This will cause a `NullPointerException` at runtime in `LocalExecutionPlanner.planLookup()` when it calls `lookup.matchValues().size()` and iterates over `lookup.mergeValues()`. The actual `Lookup` node's `tableName`, `matchFields`, and the resolved `matchValues`/`mergeValues` (from the `localRelation`) should be passed through.
+
+#Q8Z16: In `planLookup`, there is no null-safety check before dereferencing `lookup.matchValues()` and `lookup.mergeValues()`. Given that the `Mapper` currently passes `null` for these (see the stub in `Mapper.java`), this will throw a `NullPointerException`. Even after the mapper is fixed, a defensive check or a clear precondition assertion with a helpful message would be preferable to a bare NPE.
+
+#EKXQ2: In `randomTables()`, the loop always iterates 10 times regardless of the `count` variable:
+```java
+int count = between(1, 10);
+Map<String, Map<String, Column>> tables = new HashMap<>(count);
+try {
+    for (int i = 0; i < 10; i++) {  // BUG: should be `i < count`
+        tables.put(randomAlphaOfLength(i + 1), randomColumns());
+    }
+    return tables;
+} finally {
+    if (tables.size() != count) {
+        Releasables.close(...);
+    }
+}
+```
+Since the loop always adds 10 entries (or fewer due to key collisions) but `count` is between 1 and 10, the `finally` block will almost always trigger `Releasables.close(...)` even on the success path, closing the `Block` resources that are about to be returned to the caller. This is a resource leak / use-after-close bug.
+
+#EKXQ2: In `mutateInstance()`, when case 9 replaces `tables` with a new map, the old `Column` objects (which hold `Block` resources) from `in.tables()` are never released. The old `Block` data will leak. The old tables should be closed before (or after) assigning the new ones.
+
+#0XB2B, #W38Q7: The `BlockStreamInput` (and the `BlockFactory` it wraps) created in the deserialization constructors of `ClusterComputeRequest` and `DataNodeRequest` is never released. The `Block` objects read from the stream hold native memory allocated via `BigArrays`. The TODO comment acknowledges this, but in production this will leak native memory for every request. At minimum, the `EsqlConfiguration` (or the request objects) should implement `Releasable` and close the underlying `BlockFactory`/`Block` resources after use.
+
+#9QVP5: Including `tables` (which contains `Column` objects wrapping binary `Block` data) in both `equals()` and `hashCode()` is problematic:
+1. **Performance**: Hashing and comparing potentially large binary blocks on every equality check is expensive.
+2. **Correctness**: Two logically equivalent configurations with different `Block` implementations (e.g., different internal array sizes) would not be equal, and `hashCode` would be unstable across serialization round-trips if the block layout changes.
+Consider excluding `tables` from `equals`/`hashCode` or comparing only the table/column names and types rather than the data.
+
+#C4563: The `toString()` method includes `tables`, which contains `Column` objects with potentially large binary `Block` data. If this is ever logged (e.g., in error messages or debug output), it could produce extremely large and unreadable log entries. Consider limiting the representation (e.g., just table names and column names/types).

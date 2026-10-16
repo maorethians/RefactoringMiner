@@ -1,0 +1,29 @@
+#5TQ82: **`getLocks()` will throw `ClassCastException` at runtime.**
+`this.locks.values()` returns a `Collection<AdaptiveBackOffSpinLock>`, not a `List`. The unchecked cast `(List<AdaptiveBackOffSpinLock>) this.locks.values()` will fail the moment the method is actually invoked. Either change the return type to `Collection<AdaptiveBackOffSpinLock>`, or wrap it: `new ArrayList<>(this.locks.values())`.
+
+#KKJM4: **Memory leak: `threadTable` entries are never removed.**
+In `lock()`, every calling thread inserts itself into `threadTable.get(slot)` via `putIfAbsent`. The only removal path is `threadTable.get(slot).clear()` inside `swap()`, which only clears the *other* slot (the one not currently being written to). Over time, as threads come and go, the `ConcurrentHashMap` in each slot accumulates stale `Thread` references indefinitely. This is a slow memory leak in a long-running broker process. Consider removing the entry in `unlock()` or using a bounded structure.
+
+#FCY2Y: **Busy-wait loops with no yield can peg a CPU core.**
+Two tight spin loops are present:
+- `lock()`: `do { state = this.state.get(); } while (!state);`
+- `swap()`: `do { currentThreadNum = this.currentThreadNum.get(); } while (currentThreadNum != 0);`
+Neither loop calls `Thread.yield()` or `Thread.sleep()`. Under contention (e.g., a swap is in progress while many producers are calling `lock()`), these threads will consume 100% of a core. Add `Thread.yield()` inside the loop body.
+
+#1D5XN: **`Thread.sleep(0)` is effectively a no-op.**
+In `BackOffSpinLock.lock()`, the back-off after a failed spin round calls `Thread.sleep(0)`. Per the Javadoc, a sleep of 0 ms does not guarantee any actual suspension; on HotSpot it returns immediately. The intent is clearly to yield the CPU to the lock holder. Replace with `Thread.yield()`.
+
+#VDYA6: **Race condition in `swap()` slot processing.**
+`swap()` is invoked from every `unlock()` call. Multiple threads can enter `swap()` concurrently and read the same `tpsTable`/`threadTable` slot before any of them sets the sentinel `-1`. This means the swap decision logic (tps, threadNum, needSwap) can be evaluated multiple times against the same data, and `setNumberOfRetreat(slot, 0)` can be called concurrently. Guard the per-slot processing with a per-slot lock or an `AtomicBoolean` "processed" flag.
+
+#9SW39: **Inconsistent boolean getter naming.**
+The existing config uses `isUseReentrantLockWhenPutMessage()` (JavaBean `is`-prefix for booleans). The new field uses `getUseABSLock()`. For consistency with the surrounding code and standard JavaBean conventions, prefer `isUseABSLock()`.
+
+#1FST7: **`adaptiveBackOffSpinLock` is instantiated unconditionally.**
+In `CommitLog`'s constructor, `new AdaptiveBackOffSpinLockImpl()` is always created, even when `getUseABSLock()` is `false`. While the object is small, it eagerly constructs two lock objects, two `ConcurrentHashMap`s, and two `AtomicInteger`s. Move the instantiation inside the ternary branch so it is only created when actually selected.
+
+#4TZ94: **Test fragility: slot-based timing assumptions.**
+`AdaptiveLockTest` relies on `Thread.sleep(1000)` to guarantee that `LocalTime.now().getSecond() % 2` flips to the other slot. If the test thread is descheduled or the JVM is under load, the second may not advance, and the assertions on `optimalDegree` / `swapCriticalPoint` / lock type will fail non-deterministically. Consider injecting a clock or using a barrier that explicitly advances the slot rather than sleeping.
+
+#C6A0F: **`BackOffSpinLock.lock()` has no starvation protection.**
+The CAS spin loop retries indefinitely. Under sustained contention, a single thread can be starved while others keep winning the CAS. At minimum, document this limitation; ideally, after a configurable number of failed rounds, fall back to a blocking mechanism (e.g., `ReentrantLock`) to guarantee forward progress.

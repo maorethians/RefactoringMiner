@@ -1,0 +1,20 @@
+#X5YW3, #9FNRX, #B4KZN: **Critical: The "expired lock" fast-path in `lock()` bypasses the semaphore, breaking mutual exclusion.**
+When `tryAcquire` fails and the lock is deemed expired, the code enters the `synchronized(this)` block, updates `lastLockTimeMs`, and returns — but it never acquires the semaphore. This means:
+1. The original holder (Thread A) may still be inside the critical section (it was just slow, not truly dead).
+2. Thread B is now also in the critical section without holding the semaphore.
+3. If Thread A later calls `unlock()` and its elapsed time is ≤ 2× timeout, it will call `semaphore.release()`, incrementing the count from 0 → 1. A third thread (Thread C) can then `tryAcquire` successfully while both A and B are still operating on shared state.
+The `synchronized(this)` block only serializes the check-and-set of `lastLockTimeMs`; it does **not** provide mutual exclusion for the caller's critical section. Consider either:
+- Actually forcing the semaphore state (e.g., `semaphore.drainPermits()` + `semaphore.release()` before returning), or
+- Using a dedicated `AtomicBoolean` / `ReentrantLock` with a `tryLock`-style timeout that can be forcibly broken, so the invariant "exactly one thread holds the lock" is maintained.
+
+#B4KZN: **Threshold mismatch creates a lock-stuck window.**
+The skip-release threshold in `unlock()` is `lockTimeoutMs * 2`, while the force-acquire threshold in `lock()` is `lockTimeoutMs * 3`. If a thread holds the lock for a duration between 2× and 3× timeout:
+- `unlock()` skips `semaphore.release()` (elapsed > 2×) → semaphore stays at 0.
+- No other thread can force-acquire (elapsed < 3×) → all subsequent `lock()` calls return `null`.
+During this window every `put`/`get`/`remove`/`computeIfPresent` on that `HandleData` will throw `ProxyException("try to … handle failed")`. Consider aligning the two thresholds (or making the force-acquire threshold ≤ the skip-release threshold) so the lock can always be recovered.
+
+#B4KZN, #G8G64, #KYFY8, #H0DVB, #TABJV, #7K4MB, #XEKSS, #AY40D, #7HEYE: **`unlock()` may release a semaphore permit that was never acquired.**
+If a thread obtained the lock via the expired fast-path (semaphore was never acquired, count remained 0) and then finishes within 2× timeout, `unlock()` will call `semaphore.release()`, pushing the count to 1. This corrupts the semaphore state and allows a spurious concurrent acquisition. The fix depends on resolving the root issue above (ensuring the expired path either acquires the semaphore or `unlock` knows not to release it). One approach: have `lock()` return a flag indicating whether the semaphore was actually acquired, and have `unlock()` only release in that case.
+
+#B4KZN: **Minor: `Long` as a nullable return type for a lock timestamp.**
+Returning `Long` (boxed) to signal "lock not acquired" via `null` works, but it is easy to misuse (e.g., accidental auto-unboxing to `long` causing an NPE). A small result object (e.g., `LockResult { boolean acquired; long timestampMs; }`) or a `Pair<Boolean, Long>` would make the contract more explicit and prevent accidental NPEs at call sites. This is a style/robustness suggestion, not a blocker.

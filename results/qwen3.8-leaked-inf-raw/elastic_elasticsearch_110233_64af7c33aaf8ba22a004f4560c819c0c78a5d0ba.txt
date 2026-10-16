@@ -1,0 +1,44 @@
+#C9C9W: Missing upper-bound validation on `k`
+The constructor validates `k >= 1` and `numCands <= NUM_CANDS_LIMIT`, and checks `numCands >= k` when both are explicitly set. However, there is no upper bound on `k` itself. Consider this scenario:
+- User sets `k = 20000`, does not set `num_candidates`.
+- In `doToQuery` (#G0DE8): `requestSize = k = 20000`, so `adjustedNumCands = Math.round(Math.min(1.5 * 20000, 10000)) = 10000`.
+- The Lucene query searches 10000 candidates, but `TopDocs.merge(20000, ...)` is requested — the user silently gets at most 10000 results, violating the semantic contract that `k <= num_candidates`.
+The explicit `numCands < k` check in the constructor only fires when both values are provided. When `numCands` is null, the default calculation can produce a value smaller than `k`.
+Suggested fix — add a validation in the private constructor alongside the existing checks:
+```java
+if (k != null && k > NUM_CANDS_LIMIT) {
+    throw new IllegalArgumentException(
+        "[" + K_FIELD.getPreferredName() + "] cannot exceed [" + NUM_CANDS_LIMIT + "]"
+    );
+}
+```
+This is consistent with the existing `numCands` upper-bound check and prevents the silent under-delivery of results. A corresponding YAML test case (e.g., `k: 10001` expecting a 400) would also be appropriate.
+
+#E40EG: Test coverage gap for `k` upper bound
+The "Incorrect k param" section tests `k: 0` (too small) and `k: 5, num_candidates: 3` (inconsistent pair), but does not test `k` exceeding `NUM_CANDS_LIMIT` (10000). Given the missing validation noted above, a test like:
+```yaml
+- do:
+    catch: bad_request
+    search:
+      index: my_index
+      body:
+        query:
+          knn:
+            field: my_vector
+            query_vector: [1, 1, 1, 1]
+            k: 10001
+- match: { status: 400 }
+```
+would guard against the regression.
+
+#7M729, #YA5NB, #73YZ1, #2PA1J: Duplicated `mergeLeafResults` logic across four classes
+All four KNN query subclasses (`ESKnnByteVectorQuery`, `ESKnnFloatVectorQuery`, `ESDiversifyingChildrenByteKnnVectorQuery`, `ESDiversifyingChildrenFloatKnnVectorQuery`) contain the identical `mergeLeafResults` override:
+```java
+TopDocs topK = kParam == null ? super.mergeLeafResults(perLeafResults) : TopDocs.merge(kParam, perLeafResults);
+vectorOpsCount = topK.totalHits.value;
+return topK;
+```
+This is a pre-existing pattern (the `vectorOpsCount` tracking was already duplicated), so it's not a new concern introduced by this PR. However, if the merge logic ever needs to change (e.g., adding a secondary sort or a minimum-score filter), it must be updated in four places. A small shared utility or a common base class for the `kParam`-aware merge would reduce the risk of divergence. This is a minor maintainability note, not a blocker.
+
+#SXDVJ: `READ_FROM` lambda: fragile positional indexing
+The `READ_FROM` lambda accesses `args[0]` through `args[5]` by position. The insertion of `k` at index 2 shifted `numCands` to index 3 and `vectorSimilarity` to index 4. This works, but the positional coupling makes the code brittle — a future reordering of `PARSER.declare*` calls would silently produce wrong values with no compile-time error. This is an existing pattern in the codebase, so it's not a regression, but worth being aware of when adding further optional parameters.
