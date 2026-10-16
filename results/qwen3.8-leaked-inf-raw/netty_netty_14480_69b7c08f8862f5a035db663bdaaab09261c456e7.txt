@@ -1,0 +1,41 @@
+#S18F5: The refactored logic introduces a behavioral regression: bytes are now consumed from the underlying stream *before* the limit violation is detected. In the old code, `checkMaxBytesRead(n)` was called **before** `super.read(...)`, so no bytes were consumed when the limit was already reached. In the new code, the pattern is:
+1. `checkMaxBytesRead()` — passes because `numRead == maxBytesRead` (not strictly greater)
+2. `super.read(...)` — **consumes bytes from the underlying stream**
+3. `numRead` is incremented past the limit
+4. `checkMaxBytesRead()` — throws
+For `read()`, this means one byte is always lost from the underlying stream when the caller is at the limit. For `read(byte[], int, int)`, the expression `maxBytesRead - numRead + 1` (retained from the old code) allows attempting to read one byte *beyond* the limit, so up to `maxBytesRead + 1` bytes can be consumed before the exception fires. If the underlying stream is a socket, pipe, or file, those bytes are irrecoverably consumed.
+A safer pattern would be to compute the remaining allowance **before** reading and refuse to read if it is zero or negative:
+```java
+int remaining = maxBytesRead - numRead;
+if (remaining <= 0) {
+    throw new IOException("Maximum number of bytes read: " + maxBytesRead);
+}
+int num = Math.min(len, remaining);
+int b = super.read(buf, off, num);
+if (b > 0) {
+    numRead += b;
+}
+return b;
+```
+This preserves the "fail before consuming" guarantee of the original implementation.
+
+#S18F5: The exception message changed from reporting the configured limit (`maxBytesRead`) to reporting the actual count (`numRead`):
+```java
+throw new IOException("Maximum number of bytes read: " + numRead);
+```
+For a caller debugging a protocol or parsing issue, the configured limit is the more useful value (it tells them *what bound was set*). The actual count is only one or a few bytes above it and adds little diagnostic value. Consider keeping `maxBytesRead` in the message.
+
+#R1J6D: The new test is a good addition covering the case where the requested buffer is larger than both the bound and the underlying data. However, it does not exercise the boundary where `numRead` reaches exactly `maxBytesRead` and a subsequent read is attempted. Given the behavioral concern noted above (bytes consumed before the exception), a test that asserts the underlying stream is **not** advanced when the limit is already hit would be valuable:
+```java
+@Test
+void testNoBytesConsumedWhenAtLimit() throws IOException {
+    final byte[] bytes = new byte[]{1, 2, 3, 4};
+    final BoundedInputStream reader = new BoundedInputStream(new ByteArrayInputStream(bytes), 2);
+    byte[] buf = new byte[4];
+    assertEquals(2, reader.read(buf, 0, 4));
+    // At this point numRead == maxBytesRead; next read should throw
+    // without consuming bytes 3 and 4 from the underlying stream.
+    assertThrows(IOException.class, () -> reader.read(buf, 0, 4));
+}
+```
+This would guard against the "read-then-check" regression described above.

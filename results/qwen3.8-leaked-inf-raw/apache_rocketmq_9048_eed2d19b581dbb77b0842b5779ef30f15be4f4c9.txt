@@ -1,0 +1,113 @@
+#SKDDZ: **ArrayIndexOutOfBoundsException in `revive()` backoff calculation:**
+```java
+long backoffInterval = 1000L * REWRITE_INTERVALS_IN_SECONDS[
+    Math.min(REWRITE_INTERVALS_IN_SECONDS.length, record.getAttemptTimes())];
+```
+`REWRITE_INTERVALS_IN_SECONDS` has 16 elements (valid indices 0–15). When `record.getAttemptTimes() >= 16`, `Math.min(16, attemptTimes)` evaluates to `16`, which is out of bounds. This will throw `ArrayIndexOutOfBoundsException` on the 17th retry attempt. The fix is to use `REWRITE_INTERVALS_IN_SECONDS.length - 1`:
+```java
+Math.min(REWRITE_INTERVALS_IN_SECONDS.length - 1, record.getAttemptTimes())
+```
+
+#SKDDZ, #QTNF0, #0N9W1: **Busy-wait spin loops will consume 100% CPU:**
+Three locations use a tight spin loop to acquire the lock:
+```java
+// PopConsumerService.clearCache()
+while (consumerLockService.tryLock(groupId, topicId)) {
+}
+// AckMessageProcessor.ackOrderlyNew()
+while (!consumerLockService.tryLock(consumeGroup, topic)) {
+}
+// ChangeInvisibleTimeProcessor.processChangeInvisibleTimeForOrderNew()
+while (!consumerLockService.tryLock(groupId, topicId)) {
+}
+```
+These will spin at full CPU speed until the lock is released. Under contention (e.g., a long-running `popAsync` holding the lock), this will peg a CPU core. Consider adding a short `Thread.sleep(1)` or `LockSupport.parkNanos(...)` inside the loop, or redesigning `TimedLock` to support a blocking `lock()` with timeout.
+
+#SKDDZ: **Lock leak in `popAsync()` on exception path:**
+```java
+if (topicConfig == null || !consumerLockService.tryLock(groupId, topicId)) {
+    return CompletableFuture.completedFuture(popConsumerContext);
+}
+// ...
+try {
+    // ... build getMessageFuture ...
+    return getMessageFuture.thenCompose(...).whenComplete((result, throwable) -> {
+        // ...
+        consumerLockService.unlock(groupId, topicId);  // only released here
+    });
+} catch (Throwable t) {
+    log.error("PopConsumerService popAsync error", t);
+}
+return getMessageFuture;  // lock is NEVER released on this path
+```
+If any exception is thrown inside the `try` block before `whenComplete` is attached (e.g., an NPE in one of the `getMessageAsync` calls), execution falls through to the final `return getMessageFuture` without ever calling `unlock`. The lock is permanently leaked, and all subsequent `popAsync`/`ackOrderlyNew`/`processChangeInvisibleTimeForOrderNew` calls for the same group+topic will spin forever. The `unlock` should be in a `finally` block or the catch block should release the lock.
+
+#P9F6T: **Potential NPE when long-polling succeeds in the KV-service path:**
+```java
+popAsyncFuture.thenApply(result -> {
+    // ...
+    } else {
+        PollingResult pollingResult = popLongPollingService.polling(...);
+        if (PollingResult.POLLING_SUC == pollingResult) {
+            // ...
+            return null;  // <-- returns null
+        }
+        // ...
+    }
+    // ...
+    return response;
+}).thenAccept(result -> NettyRemotingAbstract.writeResponse(channel, request, result));
+```
+When `POLLING_SUC` is returned, `thenApply` yields `null`, and the subsequent `thenAccept` calls `NettyRemotingAbstract.writeResponse(channel, request, null)`. This will throw a `NullPointerException` (or produce undefined behavior) because the response object is null. In the polling-success case, the response is sent later by the polling service when a message arrives, so the immediate write should be skipped. Add a null guard:
+```java
+}).thenAccept(result -> {
+    if (result != null) {
+        NettyRemotingAbstract.writeResponse(channel, request, result);
+    }
+});
+```
+
+#6FXMQ: **`columnFamilyHandle` is never closed in `preShutdown()`:**
+```java
+@Override
+protected void preShutdown() {
+    if (this.writeOptions != null) {
+        this.writeOptions.close();
+    }
+    if (this.deleteOptions != null) {
+        this.deleteOptions.close();
+    }
+    if (this.defaultCFHandle != null) {
+        this.defaultCFHandle.close();
+    }
+    // columnFamilyHandle is missing
+}
+```
+The `columnFamilyHandle` (the "popState" column family) is allocated in `postLoad()` but never released. This leaks a native RocksDB resource. Add:
+```java
+if (this.columnFamilyHandle != null) {
+    this.columnFamilyHandle.close();
+}
+```
+
+#56P22: **Unsynchronized reads on `TreeMap` in `ConsumerRecords`:**
+`getMinOffsetInBuffer()` and `getInFlightRecordCount()` read from `recordTreeMap` without acquiring the `ReentrantLock`, while `write()` and `delete()` mutate it under the lock:
+```java
+public long getMinOffsetInBuffer() {
+    Map.Entry<Long, PopConsumerRecord> entry = recordTreeMap.firstEntry(); // no lock
+    return entry != null ? entry.getKey() : OFFSET_NOT_EXIST;
+}
+public int getInFlightRecordCount() {
+    return recordTreeMap.size(); // no lock
+}
+```
+These are called from `PopConsumerCache.getMinOffsetInCache()`, `getPopInFlightMessageCount()`, and `cleanupRecords()` — all of which can execute concurrently with `write()`/`delete()` from request-handling threads. Since `TreeMap` is not thread-safe, concurrent structural modification can cause `ConcurrentModificationException` or corrupted reads. Wrap these reads in the same `lock.lock()/unlock()` block.
+
+#3R2YR: **`toString()` reports the wrong class name:**
+```java
+@Override
+public String toString() {
+    return "PopDeliveryRecord{" + ...
+}
+```
+The class is `PopConsumerRecord`, but `toString()` prints `"PopDeliveryRecord"`. This will be misleading in log output and debugging. Change to `"PopConsumerRecord{"`.

@@ -1,0 +1,39 @@
+#MENZX, #J8EZP, #29QN1, #MHDET: The same `if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel())` conditional is duplicated in four call sites. Consider encapsulating the strategy choice inside `MappedFile` (e.g., a single `appendMessage(byte[])` that internally delegates to the file-channel or mapped-buffer path based on a flag set at construction time). This would eliminate the repeated branching, make it impossible for a future call site to forget the check, and keep the config concern in one place.
+
+#K8Y51: **Bug: write position is advanced and `true` is returned even when the write fails.** The `WROTE_POSITION_UPDATER.addAndGet(...)` and `return true` sit *outside* the `try-catch`. If `fileChannel.position(...)` or `fileChannel.write(...)` throws, the code still advances the write offset and reports success to the caller. Subsequent appends will then skip over the unwritten region, silently corrupting the consume queue. Move both statements inside the `try` block (after a successful write) and return `false` in the `catch` path:
+```java
+@Override
+public boolean appendMessageUsingFileChannel(byte[] data) {
+    int currentPos = WROTE_POSITION_UPDATER.get(this);
+    if ((currentPos + data.length) <= this.fileSize) {
+        try {
+            this.fileChannel.position(currentPos);
+            this.fileChannel.write(ByteBuffer.wrap(data, 0, data.length));
+            WROTE_POSITION_UPDATER.addAndGet(this, data.length);
+            return true;
+        } catch (Throwable e) {
+            log.error("Error occurred when append message to mappedFile.", e);
+            return false;
+        }
+    }
+    return false;
+}
+```
+
+#K8Y51: **`FileChannel.write(ByteBuffer)` does not guarantee all bytes are written in a single call.** The Javadoc states it writes "some or all" of the remaining bytes. For a regular file on local disk this is almost always a full write, but the API contract allows a short write. The existing `MappedByteBuffer.put()` path writes all bytes unconditionally. To be safe, either check the return value of `write()` and loop until the buffer is fully consumed, or at minimum assert that the number of bytes written equals `data.length` before advancing the position.
+
+#K8Y51: **Thread-safety concern: `position()` + `write()` is a non-atomic compound operation.** `FileChannel` synchronizes individual method calls, but the sequence "read `WROTE_POSITION_UPDATER` → `position(pos)` → `write(...)` → `addAndGet`" is not atomic. If two threads invoke this concurrently on the same `MappedFile`, they can both read the same `currentPos`, both set the channel position to that value, and the second write overwrites the first. The existing `MappedByteBuffer`-based path avoids this because each thread writes to its own offset in the shared buffer. If the consume-queue write path is guaranteed to be single-threaded in practice this is acceptable, but it is worth a comment or an assertion documenting that assumption.
+
+#J8EZP: The config flag `isPutConsumeQueueDataByFileChannel()` is evaluated on every iteration of the `for` loop. Hoist it before the loop so it is read once:
+```java
+boolean useFileChannel = messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel();
+for (int i = 0; i < until; i += CQ_STORE_UNIT_SIZE) {
+    if (useFileChannel) {
+        mappedFile.appendMessageUsingFileChannel(byteBuffer.array());
+    } else {
+        mappedFile.appendMessage(byteBuffer.array());
+    }
+}
+```
+
+#3YFQ9: The new flag defaults to `true`, which means every existing deployment will immediately switch to the `FileChannel`-based write path on upgrade. Given the error-handling bug noted above (position advanced on failure), shipping this as the default carries real risk. Consider defaulting to `false` (preserving the existing `MappedByteBuffer` behavior) and letting operators opt in after validation, or at minimum ensure the `FileChannel` path is fully correct before making it the default.

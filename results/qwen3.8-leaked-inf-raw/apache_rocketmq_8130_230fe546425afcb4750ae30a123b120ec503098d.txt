@@ -1,0 +1,19 @@
+#88D13, #EQWC1: Adding `//tieredstore` as a dependency of `broker` is a significant architectural coupling. The broker now depends on the tiered store module. Consider whether this could be abstracted behind an interface (e.g., a `TieredStoreAccessor` or similar) to avoid the broker having a hard compile-time dependency on the tiered store implementation. This would also make the `instanceof TieredMessageStore` check in `TopicConfigManager` unnecessary.
+
+#VP4W9: Two issues here:
+1. **`synchronized` on `this` (TopicConfigManager) while performing I/O on the metadata store.** This method holds the `TopicConfigManager` monitor lock while calling `metadataStore.getTopic()`, `metadataStore.addTopic()`, or `metadataStore.updateTopic()`. If the metadata store performs network or disk I/O, this will block all other synchronized operations on `TopicConfigManager` (e.g., `updateTopicConfig`, `persist`, etc.). Consider performing the metadata store operations outside the lock, or using a finer-grained lock.
+2. **Inconsistent use of the `newAttributes` parameter.** The method accepts `newAttributes` but only uses it in the early-return guard. For the actual reserve-time value it reads from `topicConfig.getAttributes()`. Since the caller sets `topicConfig.setAttributes(finalAttributes)` before invoking this method, the two are equivalent, but the dual source is confusing. Either read from `newAttributes` consistently, or drop the parameter and read from `topicConfig` in both places.
+
+#TJDFG: **Potential `NullPointerException`.** If `topicMetadata` is null (e.g., the topic was never registered in the metadata store, or the metadata store was reset), `topicMetadata.getReserveTime()` will throw an NPE. This method is called from the periodic cleanup loop in `FlatFileStore` and from the metrics initialization path, so an NPE here would disrupt file expiry and metrics. Add a null guard:
+```java
+public long getFileReservedHours() {
+    if (topicMetadata != null && topicMetadata.getReserveTime() > 0) {
+        return topicMetadata.getReserveTime();
+    }
+    return storeConfig.getTieredStoreFileReservedTime();
+}
+```
+
+#MS79F: **`required = true` may be a breaking change.** Marking `TOPIC_RESERVE_TIME_ATTRIBUTE` as required means every topic must carry this attribute. Existing topics created before this change will not have it, which could cause validation failures or unexpected behavior when those topics are read or updated. If the intent is to make it optional with a default of `-1` (meaning "use the global config"), consider setting `required` to `false`.
+
+#GE0RG, #T07T1, #FF94Q: These three changes consistently replace the global `storeConfig.getTieredStoreFileReservedTime()` with the per-file `flatFile.getFileReservedHours()`, which is the correct direction. However, note that in `FlatFileStore.load()` (#GE0RG), the `expiredTimeStamp` is now computed per-file inside the loop. If `getFileReservedHours()` triggers any non-trivial work (e.g., a metadata store lookup), this could add overhead to the periodic cleanup. Given the current implementation it's a simple field read, so this is fine, but worth keeping in mind if `getFileReservedHours()` evolves.

@@ -1,0 +1,23 @@
+#HKNEJ, #Z55GT, #ZFHV4: The most significant concern: the old `PlanningMetrics.gatherPreAnalysisMetrics` traversed the entire plan tree with `plan.forEachDown(p -> add(commands, p.commandName()))`, counting every command node. The new implementation only checks the single top-level node returned by `plan()`:
+```java
+LogicalPlan p = ParserUtils.typedParsing(this, ctx, LogicalPlan.class);
+if (p instanceof MetricsAware ma) {
+    metrics.command(ma);
+}
+```
+For a pipeline like `FROM idx | EVAL x = 1`, the plan tree is `Eval → UnresolvedRelation`. Only `Eval` (the root) is checked. `UnresolvedRelation` (FROM) is a child and is never inspected. Yet the new test in `TelemetryIT` expects both `FROM: 1` and `EVAL: 1`. This will not be satisfied by the current code — only the last command in the pipeline gets counted. The individual command visitors (`visitFromCommand`, `visitEvalCommand`, etc.) do not call `metrics.command()`.
+To fix this, either:
+- Call `metrics.command()` inside each command visitor (e.g., in `visitEvalCommand`, `visitFromCommand`, etc.) after constructing the node, or
+- Retain a tree-walk approach but filter on `instanceof MetricsAware` instead of calling `commandName()`.
+
+#2Q6HR: `functionName(Class)` performs a linear scan over all registered function definitions on every call. This is invoked from `PlanningMetrics.function(Class)`, which in turn is called from `ExpressionBuilder.castToType` for every cast expression in the query. For queries with many casts, this becomes O(casts × functions). A reverse-lookup `Map<Class<? extends Function>, String>` built once at registry construction time would make this O(1).
+
+#Z55GT: Two related issues in `PlanningMetrics`:
+1. **Inconsistent failure modes.** `function(String name)` silently skips unknown functions (guarded by `functionExists`), while `function(Class<? extends Function> clazz)` throws `QlIllegalArgumentException` if the class isn't found. If a cast converter returns a class not present in the registry, parsing will fail with an exception rather than simply not recording a metric. Consider aligning the two: either both log-and-skip, or both throw.
+2. **`metricsAwares` HashSet deduplication.** The `command()` method uses `metricsAwares.add(command)` to prevent double-counting. `HashSet` relies on `equals()`/`hashCode()`. Two structurally identical plan nodes (e.g., two `Limit(10)` nodes in a pipeline) would be considered equal, and only one would be counted. The old `forEachDown` approach counted each occurrence. If deduplication is intentional, a comment explaining why would help; if not, consider using `System.identityHashCode`-based dedup or removing the set entirely (since `plan()` is called once per query, the same node object shouldn't be passed twice).
+
+#0VAJ7: `visitFunctionName` now calls `metrics.function(name)` for every function name token encountered during parsing, including names that will later fail resolution (typos, unregistered functions). The old code only counted `UnresolvedFunction` nodes that survived into the final plan. This means the metrics now include rejected/invalid function usages, inflating counts. If this is intentional (tracking "attempted" vs "resolved" functions), it's a semantic shift worth documenting; if not, the counting should be deferred to after validation.
+
+#C57RH: `metrics.function(convertFunction.getClass())` passes the runtime class of the returned expression. If `converterToFactory.apply` ever returns a subclass, anonymous class, or wrapper that differs from the class registered in `EsqlFunctionRegistry`, the `functionName(Class)` lookup (which uses `==` identity) will throw. This is fragile — consider passing the expected function name as a `String` instead, or ensuring the registry lookup is tolerant of subclasses.
+
+#909MJ: Minor: the default `metricName()` derives the name from `getClass().getSimpleName().toUpperCase()`. For `MvExpand` this yields `"MVEXPAND"`, but the expected metric name is `"MV_EXPAND"` (as overridden in `#2HQXS`). Similarly, `LookupJoin` would yield `"LOOKUPJOIN"` vs the expected `"LOOKUP JOIN"` (`#RFNQB`). This works because those classes override the method, but it means the default is a trap: any new `MetricsAware` class whose simple name doesn't match the desired metric spelling must remember to override. A brief note in the interface Javadoc about this pitfall (beyond the existing "only needs to be overridden" note) would reduce the chance of a silent mismatch.

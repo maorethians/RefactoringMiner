@@ -1,0 +1,30 @@
+#AYHV6: The `dataType` field in `StEnvelope` is only assigned inside `resolveType()`, but it is not serialized in the `StreamInput` constructor. After deserialization (e.g., in a distributed execution plan), `dataType()` will return `null` because `resolveType()` has not been re-invoked. Compare with `StXMax`/`StXMin`/`StYMax`/`StYMin`, which always return the constant `DOUBLE`. A safe fix is to compute the return type directly in `dataType()` from the field's type:
+```java
+@Override
+public DataType dataType() {
+    return switch (field().dataType()) {
+        case GEO_POINT, GEO_SHAPE -> GEO_SHAPE;
+        case CARTESIAN_POINT, CARTESIAN_SHAPE -> CARTESIAN_SHAPE;
+        default -> NULL;
+    };
+}
+```
+This eliminates the mutable field entirely and makes the class safe across serialization boundaries.
+
+#M0EZK: `GeoPointVisitor.visitRectangle` does not handle the case where a `Rectangle` crosses the antimeridian (i.e., `minX > maxX`, which is the valid representation for a dateline-crossing bbox in geo coordinates). The method simply calls `visitLongitude(minX)` and `visitLongitude(maxX)`, treating them as two independent points. For a rectangle like `BBOX(170, -170, 10, -10)`, this produces a bounding box spanning from -170 to 170 (nearly the whole globe) instead of the intended 20-degree band around the dateline.
+The `CartesianPointVisitor` explicitly rejects `minX > maxX` with an `IllegalArgumentException`. The geo variant should either:
+- Detect the crossing case (`minX > maxX`) and record it so `getResult()` can produce the correct wrapped rectangle, or
+- Throw a clear error if the crossing-rectangle case is not yet supported.
+As-is, the result is silently wrong for this input.
+
+#M0EZK: `GeoPointVisitor.getResult()` can return `null` (when `Double.isInfinite(maxY)`), but the method signature declares a non-nullable `Rectangle` return. In `SpatialEnvelopeVisitor.visit(Geometry, boolean)`, the call path is:
+```java
+if (geometry.visit(visitor)) {          // isValid() == true
+    return Optional.of(visitor.getResult()); // NPE if getResult() returns null
+}
+```
+`Optional.of(null)` throws `NullPointerException`. Although the guard in `isValid()` makes this path unreachable in practice (minY and maxY are updated together), the defensive `null` return is a latent hazard. Consider throwing an `IllegalStateException` instead, or removing the check since `isValid()` already guarantees the state is valid.
+
+#S58KJ: The test method `testVisitGeoShapeWrap` is misleadingly named. It generates geometries with `randomGeometryWithoutCircle(0, true)` (which may cross the dateline) but then calls `SpatialEnvelopeVisitor.visit(geometry, false)` — i.e., wrapping is **disabled**. The assertion `result.getMinX() <= result.getMaxX()` always passes because the no-wrap path in `getResult()` always returns `Rectangle(minNegX, maxPosX, …)`. The test does not actually exercise the wrapping logic. Consider renaming it to `testVisitGeoShapeNoWrapWithDatelineGeometries` or adding a companion test that passes `true` for `wrapLongitude` and asserts the wrapped result.
+
+#EF415: The expected result for `st_envelope` shows `BBOX(12.453, 12.6398, 55.7327, 55.6318)`. Note the argument order in the `BBOX` WKT representation is `(minX, maxX, maxY, minY)`. This is consistent with the `Rectangle` constructor `new Rectangle(minX, maxX, maxY, minY)` used throughout the code. However, the standard WKT `BBOX` syntax is `BBOX(minX, minY, maxX, maxY)`. If the WKB→WKT rendering in the test harness follows the standard WKT order, the expected string in the spec file may be incorrect (swapped y values). Please verify that the test harness's WKT serialization matches the `Rectangle` constructor's parameter order.
