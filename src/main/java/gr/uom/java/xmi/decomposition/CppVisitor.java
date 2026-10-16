@@ -20,9 +20,19 @@ import org.eclipse.cdt.core.dom.ast.IASTLiteralExpression;
 import org.eclipse.cdt.core.dom.ast.IASTName;
 import org.eclipse.cdt.core.dom.ast.IASTProblemStatement;
 import org.eclipse.cdt.core.dom.ast.IASTSimpleDeclaration;
+import org.eclipse.cdt.core.dom.ast.IASTSimpleDeclSpecifier;
 import org.eclipse.cdt.core.dom.ast.IASTStatement;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTLambdaExpression;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTNewExpression;
+import org.eclipse.cdt.core.dom.ast.IASTCastExpression;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTConstructorInitializer;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTInitializerList;
+import org.eclipse.cdt.core.dom.ast.IASTEqualsInitializer;
+import org.eclipse.cdt.core.dom.ast.IASTInitializer;
+import org.eclipse.cdt.core.dom.ast.IASTFunctionDeclarator;
+import org.eclipse.cdt.core.dom.ast.IASTArrayDeclarator;
+import org.eclipse.cdt.core.dom.ast.IASTNamedTypeSpecifier;
+import org.eclipse.cdt.core.dom.ast.IASTDeclSpecifier;
 import org.refactoringminer.util.PathFileUtils;
 
 import gr.uom.java.xmi.LocationInfo;
@@ -84,13 +94,54 @@ public class CppVisitor extends ASTVisitor {
 
 	public int visit(IASTDeclaration declaration) {
 		if(declaration instanceof IASTSimpleDeclaration simpleDeclaration) {
+			String type = declaredType(simpleDeclaration.getDeclSpecifier());
+			if(type != null) {
+				types.add(type);
+			}
 			IASTDeclarator[] declarators = simpleDeclaration.getDeclarators();
 			for(IASTDeclarator declarator : declarators) {
 				VariableDeclaration variableDeclaration = new VariableDeclaration(sourceFolder, filePath, declarator, simpleDeclaration.getDeclSpecifier(), container, activeVariableDeclarations, fileContent);
 				variableDeclarations.add(variableDeclaration);
+				ObjectCreation creation = construction(declarator, simpleDeclaration.getDeclSpecifier(), variableDeclaration);
+				if(creation != null) {
+					creations.add(creation);
+				}
 			}
 		}
 		return super.visit(declaration);
+	}
+
+	//the type of the declared variables without the storage classes and qualifiers, i.e., std::vector<int> in static const std::vector<int> x;, like the types of Java
+	private static String declaredType(IASTDeclSpecifier declSpecifier) {
+		if(declSpecifier instanceof IASTNamedTypeSpecifier named) {
+			return singleLine(named.getName().getRawSignature());
+		}
+		if(declSpecifier instanceof IASTSimpleDeclSpecifier) {
+			String type = DECLARATION_KEYWORDS.matcher(singleLine(declSpecifier.getRawSignature())).replaceAll("").strip();
+			return type.isEmpty() ? null : type;
+		}
+		return null;
+	}
+
+	private static final Pattern DECLARATION_KEYWORDS = Pattern.compile("\\b(static|const|volatile|constexpr|inline|extern|mutable|thread_local|register)\\b\\s*");
+
+	//the construction of a variable of a class type with arguments, i.e., T x(a, b), T x{a, b} and T x = {a, b}, but not int x{0} or int x[] = {1, 2}
+	private ObjectCreation construction(IASTDeclarator declarator, IASTDeclSpecifier declSpecifier, VariableDeclaration variableDeclaration) {
+		if(!(declSpecifier instanceof IASTNamedTypeSpecifier) || declarator instanceof IASTArrayDeclarator || declarator instanceof IASTFunctionDeclarator) {
+			return null;
+		}
+		IASTInitializer initializer = declarator.getInitializer();
+		//the creation of T x = {a, b} includes =, like the initializer of the variable declaration, so that it covers the initializer
+		if(initializer instanceof IASTEqualsInitializer equalsInitializer && equalsInitializer.getInitializerClause() instanceof ICPPASTInitializerList list) {
+			return new ObjectCreation(sourceFolder, filePath, equalsInitializer, list.getClauses(), variableDeclaration.getType(), container, fileContent);
+		}
+		if(initializer instanceof ICPPASTInitializerList list) {
+			return new ObjectCreation(sourceFolder, filePath, list, list.getClauses(), variableDeclaration.getType(), container, fileContent);
+		}
+		if(initializer instanceof ICPPASTConstructorInitializer constructorInitializer) {
+			return new ObjectCreation(sourceFolder, filePath, constructorInitializer, constructorInitializer.getArguments(), variableDeclaration.getType(), container, fileContent);
+		}
+		return null;
 	}
 
 	public int visit(IASTName name) {
@@ -108,14 +159,14 @@ public class CppVisitor extends ASTVisitor {
 		while (matcher.find(searchIdx)) {
 			int startOfCall = matcher.start();
 			int openParenIdx = matcher.end() - 1; // Index of the opening '('
-			String beforeParenthesis = input.substring(startOfCall, openParenIdx);
+			String beforeParenthesis = singleLine(input.substring(startOfCall, openParenIdx));
 
 			// Find the true matching closing parenthesis
 			int closeParenIdx = findMatchingParenthesis(input, openParenIdx);
 
 			if (closeParenIdx != -1) {
 				// Extract the full method call
-				String fullCall = input.substring(startOfCall, closeParenIdx + 1);
+				String fullCall = singleLine(input.substring(startOfCall, closeParenIdx + 1));
 				int start = startOffset + startOfCall;
 				int end = startOffset + closeParenIdx + 1;
 				int length = end - start;
@@ -134,7 +185,7 @@ public class CppVisitor extends ASTVisitor {
 					expression = beforeParenthesis.substring(0, beforeParenthesis.lastIndexOf("."));
 					name = beforeParenthesis.substring(beforeParenthesis.lastIndexOf(".") + 1, beforeParenthesis.length());
 				}
-				String arguments = input.substring(openParenIdx + 1, closeParenIdx);
+				String arguments = singleLine(input.substring(openParenIdx + 1, closeParenIdx)).strip();
 				String[] args = arguments.length() > 0 ? arguments.split("\\s*,\\s*") : new String[] {};
 				OperationInvocation invocation = new OperationInvocation(fullCall, location, container, name, expression, args);
 				results.put(fullCall, invocation);
@@ -161,6 +212,31 @@ public class CppVisitor extends ASTVisitor {
 		}
 		return -1; // Unmatched parenthesis
 	}
+
+	//the line breaks and the indentation of a construct written on several lines as one space, or as nothing after ( and [ and before ) ] , . and ->,
+	//so that the code is compared like the code written on one line, i.e., f(\n    a,\n    b) as f(a, b)
+	public static String singleLine(String code) {
+		if(code.indexOf('\n') < 0) {
+			return code;
+		}
+		Matcher matcher = LINE_BREAK.matcher(code);
+		StringBuilder sb = new StringBuilder();
+		int last = 0;
+		while(matcher.find()) {
+			sb.append(code, last, matcher.start());
+			char previous = matcher.start() > 0 ? code.charAt(matcher.start() - 1) : ' ';
+			String next = code.substring(matcher.end());
+			boolean join = previous == '(' || previous == '[' || next.startsWith(")") || next.startsWith("]") || next.startsWith(",") || next.startsWith(".") || next.startsWith("->");
+			if(!join && matcher.end() < code.length() && matcher.start() > 0) {
+				sb.append(' ');
+			}
+			last = matcher.end();
+		}
+		sb.append(code, last, code.length());
+		return sb.toString();
+	}
+
+	private static final Pattern LINE_BREAK = Pattern.compile("[ \\t]*(\\\\)?\\r?\\n\\s*");
 
 	public int visit(IASTStatement statement) {
 		if(statement instanceof IASTProblemStatement problem) {
@@ -215,6 +291,10 @@ public class CppVisitor extends ASTVisitor {
 		else if(expression instanceof ICPPASTNewExpression newExpression) {
 			ObjectCreation invocation = new ObjectCreation(sourceFolder, filePath, newExpression, container, fileContent);
 			creations.add(invocation);
+		}
+		else if(expression instanceof IASTCastExpression castExpression) {
+			LeafExpression leafExpression = new LeafExpression(sourceFolder, filePath, castExpression, CodeElementType.CAST_EXPRESSION, container, fileContent);
+			castExpressions.add(leafExpression);
 		}
 		else if(expression instanceof IASTConditionalExpression conditionalExpression) {
 			TernaryOperatorExpression ternary = new TernaryOperatorExpression(sourceFolder, filePath, conditionalExpression, container, activeVariableDeclarations, fileContent);

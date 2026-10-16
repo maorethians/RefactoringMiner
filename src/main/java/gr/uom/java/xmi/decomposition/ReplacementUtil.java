@@ -3,6 +3,8 @@ package gr.uom.java.xmi.decomposition;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -12,8 +14,14 @@ import static gr.uom.java.xmi.decomposition.StringBasedHeuristics.containsMethod
 
 public class ReplacementUtil {
 	private static final String[] SPECIAL_CHARACTERS = {";", ",", ")", "=", "+", "-", ">", "<", ".", "]", " ", "(", "[", "}", "{", "`"};
+	private static final String SPECIAL_CHARACTER_SET = String.join("", SPECIAL_CHARACTERS);
 	private static final String[] SPECIAL_ARGUMENT_CHARACTERS = {";", ",", ")", "=", "+", "-", ">", "<", ".", "]", " "};
 	private static final Pattern DOUBLE_QUOTES = Pattern.compile("\"([^\"]*)\"|(\\S+)");
+	//the same replacements are performed repeatedly, e.g., when the same pair of statements is compared by different mappers
+	private static final int MAX_CACHE_SIZE = 100000;
+	private static final Map<ReplacementKey, String> REPLACEMENT_CACHE = new ConcurrentHashMap<>();
+	//the language ordinals are used, because Enum.hashCode() is an identity hash code and computing it shifts the identity hash codes of other objects
+	private record ReplacementKey(String completeString1, String completeString2, String subString1, String subString2, int language1, int language2) {}
 
 	public static boolean isInsideSingleQuotes(String argument, int indexOfChar) {
 		if(indexOfChar > 0 && indexOfChar < argument.length()-1) {
@@ -39,11 +47,8 @@ public class ReplacementUtil {
 		StringBuilder sb = new StringBuilder();
 		for(int i=0; i<input.length(); i++) {
 			char c = input.charAt(i);
-			for(String character : SPECIAL_CHARACTERS) {
-				if(character.equals(Character.toString(c))) {
-					sb.append(c);
-					break;
-				}
+			if(SPECIAL_CHARACTER_SET.indexOf(c) != -1) {
+				sb.append(c);
 			}
 		}
 		return sb.toString();
@@ -102,7 +107,51 @@ public class ReplacementUtil {
 		return temp;
 	}
 
-	public static String performReplacement(String completeString1, String completeString2, String subString1, String subString2, Constants LANG1, Constants LANG2) {	
+	//equivalent to s.contains(subString + suffix) without creating the concatenated string
+	private static boolean containsFollowedBy(String s, String subString, String suffix) {
+		int index = s.indexOf(subString);
+		while(index != -1) {
+			if(s.startsWith(suffix, index + subString.length())) {
+				return true;
+			}
+			if(index == s.length()) {
+				return false;
+			}
+			index = s.indexOf(subString, index + 1);
+		}
+		return false;
+	}
+
+	//equivalent to s.contains(prefix + subString) without creating the concatenated string
+	private static boolean containsPrecededBy(String s, String prefix, String subString) {
+		int index = s.indexOf(subString, prefix.length());
+		while(index != -1) {
+			if(s.startsWith(prefix, index - prefix.length())) {
+				return true;
+			}
+			if(index == s.length()) {
+				return false;
+			}
+			index = s.indexOf(subString, index + 1);
+		}
+		return false;
+	}
+
+	public static String performReplacement(String completeString1, String completeString2, String subString1, String subString2, Constants LANG1, Constants LANG2) {
+		ReplacementKey key = new ReplacementKey(completeString1, completeString2, subString1, subString2, LANG1.ordinal(), LANG2.ordinal());
+		String cached = REPLACEMENT_CACHE.get(key);
+		if(cached != null) {
+			return cached;
+		}
+		String result = computeReplacement(completeString1, completeString2, subString1, subString2, LANG1, LANG2);
+		if(REPLACEMENT_CACHE.size() >= MAX_CACHE_SIZE) {
+			REPLACEMENT_CACHE.clear();
+		}
+		REPLACEMENT_CACHE.put(key, result);
+		return result;
+	}
+
+	private static String computeReplacement(String completeString1, String completeString2, String subString1, String subString2, Constants LANG1, Constants LANG2) {
 		String temp = new String(completeString1);
 		boolean replacementOccurred = false;
 		for(String character : SPECIAL_CHARACTERS) {
@@ -112,7 +161,18 @@ public class ReplacementUtil {
 					temp.startsWith(subString1 + character) && completeString2.startsWith(subString2 + LANG2.ASSIGNMENT)) {
 				character2 = LANG2.ASSIGNMENT;
 			}
-			if(temp.contains(subString1 + character) && completeString2.contains(subString2 + character2)) {
+			//cross-language compound assignment with different formatting, i.e., Java x-=y; and Kotlin x -= y
+			else if((character.equals("+") || character.equals("-")) && !LANG1.equals(LANG2) &&
+					temp.startsWith(subString1 + character + "=") && completeString2.startsWith(subString2 + " " + character + "=")) {
+				character2 = " ";
+			}
+			//cross-language statement termination, i.e., Java return x; and Kotlin return x
+			//the Kotlin trailing lambda is not the last expression of a Java statement, i.e., return shutdown; -> pushExecutorExecute("...") {...}
+			else if(character.equals(";") && !LANG1.equals(LANG2) && !subString2.startsWith("{") &&
+					temp.endsWith(subString1 + LANG1.STATEMENT_TERMINATION) && completeString2.endsWith(subString2 + LANG2.STATEMENT_TERMINATION)) {
+				character2 = LANG2.STATEMENT_TERMINATION;
+			}
+			if(containsFollowedBy(temp, subString1, character) && containsFollowedBy(completeString2, subString2, character2)) {
 				StringBuffer sb = new StringBuffer();
 				Pattern p1 = Pattern.compile(Pattern.quote(subString1 + character));
 				Matcher m1 = p1.matcher(temp);
@@ -123,6 +183,11 @@ public class ReplacementUtil {
 					int start2 = m2.start();
 					String characterBeforeMatch1 = start1 == 0 ? "" : String.valueOf(temp.charAt(start1 - 1));
 					String characterBeforeMatch2 = start2 == 0 ? "" : String.valueOf(completeString2.charAt(start2 - 1));
+					//cross-language arguments with different formatting, i.e., Java min(x,y) and Kotlin min(x, y)
+					//the Kotlin trailing lambda is not an argument replacing a Java argument, i.e., pushExecutor.execute(new NamedRunnable("...",streamId) {...}) -> pushExecutorExecute("...") {...}
+					if(!LANG1.equals(LANG2) && !subString2.startsWith("{") && characterBeforeMatch1.equals(",") && characterBeforeMatch2.equals(" ") && start2 > 1 && completeString2.charAt(start2 - 2) == ',') {
+						characterBeforeMatch2 = ",";
+					}
 					if(compatibleCharacterBeforeMatch(characterBeforeMatch1, characterBeforeMatch2, LANG1, LANG2)) {
 						m1.appendReplacement(sb, Matcher.quoteReplacement(subString2 + character));
 						replacementOccurred = true;
@@ -135,7 +200,7 @@ public class ReplacementUtil {
 		boolean resume = !replacementOccurred || (temp.contains(": " + subString1) && completeString2.contains(": " + subString2));
 		if(resume && !containsMethodSignatureOfAnonymousClass(completeString1, LANG1) && !containsMethodSignatureOfAnonymousClass(completeString2, LANG2)) {
 			for(String character : SPECIAL_CHARACTERS) {
-				if(temp.contains(character + subString1) && completeString2.contains(character + subString2)) {
+				if(containsPrecededBy(temp, character, subString1) && containsPrecededBy(completeString2, character, subString2)) {
 					StringBuffer sb = new StringBuffer();
 					Pattern p1 = Pattern.compile(Pattern.quote(character + subString1));
 					Matcher m1 = p1.matcher(temp);

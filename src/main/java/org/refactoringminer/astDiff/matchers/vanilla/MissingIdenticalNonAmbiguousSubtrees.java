@@ -98,6 +98,8 @@ public class MissingIdenticalNonAmbiguousSubtrees extends GreedySubtreeMatcher i
                 if (multiMappings.isDstUnique(dst)) {
                     if (acceptance.test(new Mapping(src,dst)))
                         mappings.addMappingRecursively(src,dst);
+                    else
+                        addAcceptableDescendants(src, dst);
                     isMappingUnique = true;
                 }
             }
@@ -136,6 +138,22 @@ public class MissingIdenticalNonAmbiguousSubtrees extends GreedySubtreeMatcher i
         }
     }
 
+    //an identical subtree of a type that is not acceptable, i.e., an await expression, may contain identical subtrees of acceptable types, i.e., a method invocation
+    private void addAcceptableDescendants(Tree src, Tree dst) {
+        if (TreeUtilFunctions.isStatement(src.getType().name, LANG1) || src.getChildren().size() != dst.getChildren().size())
+            return;
+        if (!notBelongingToMethodWithTestAnnotation(src, LANG1) || !notBelongingToMethodWithTestAnnotation(dst, LANG2))
+            return;
+        for (int i = 0; i < src.getChildren().size(); i++) {
+            Tree srcChild = src.getChild(i);
+            Tree dstChild = dst.getChild(i);
+            if (acceptance.test(new Mapping(srcChild, dstChild)))
+                mappings.addMappingRecursively(srcChild, dstChild);
+            else
+                addAcceptableDescendants(srcChild, dstChild);
+        }
+    }
+
     private static void rankInTextualOrder(Set<Tree> trees, Map<Tree, Integer> ranks) {
         List<Tree> sorted = new ArrayList<>(trees);
         sorted.sort(Comparator.comparingInt(Tree::getPos));
@@ -156,6 +174,9 @@ public class MissingIdenticalNonAmbiguousSubtrees extends GreedySubtreeMatcher i
         else {
             if (TreeUtilFunctions.isStatement(src.getType().name, LANG1) && !src.getType().name.equals(LANG1.BLOCK))
                 if (src.getType().name.equals(LANG1.RETURN_STATEMENT) && src.getMetrics().height <= 2)
+                    ret =  false;
+                //the initializer of a for statement in C and C++, i.e., size_t i = 0;
+                else if (src.getType().name.equals(LANG1.DECLARATION_STATEMENT) && src.getParent() != null && src.getParent().getType().name.equals(LANG1.FOR_STATEMENT))
                     ret =  false;
                 else
                     ret =  true;

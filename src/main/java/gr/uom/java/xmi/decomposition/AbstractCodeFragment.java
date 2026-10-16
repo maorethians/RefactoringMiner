@@ -23,7 +23,6 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 	private static final String AWAIT = "await ";
 	private int depth;
 	private int index;
-	private String codeFragmentAfterReplacingParametersWithArguments;
 	protected LocationInfo locationInfo;
 	protected final Constants LANG;
 
@@ -44,10 +43,6 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 	@Override
 	public CodeRange codeRange() {
 		return locationInfo.codeRange();
-	}
-
-	public String getArgumentizedString() {
-		return codeFragmentAfterReplacingParametersWithArguments != null ? codeFragmentAfterReplacingParametersWithArguments : getString();
 	}
 
     public int getDepth() {
@@ -313,11 +308,11 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 		return false;
 	}
 
-	public void replaceParametersWithArguments(Map<String, String> parameterToArgumentMap) {
+	public String replaceParametersWithArguments(Map<String, String> parameterToArgumentMap) {
 		String afterReplacements = getString();
 		Set<String> anonymousClassMethodDeclarationLines = new LinkedHashSet<>();
 		if(StringBasedHeuristics.containsMethodSignatureOfAnonymousClass(afterReplacements, LANG)) {
-			String[] lines = afterReplacements.split("\\n");
+			String[] lines = afterReplacements.split("\n");
 			for(String line : lines) {
 				line = VariableReplacementAnalysis.prepareLine(line);
 				if(Visitor.METHOD_SIGNATURE_PATTERN.matcher(line).matches()) {
@@ -385,7 +380,7 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 				afterReplacements = sb.toString();
 			}
 		}
-		this.codeFragmentAfterReplacingParametersWithArguments = afterReplacements;
+		return afterReplacements;
 	}
 
 	private static boolean quoteBefore(String beforeMatch) {
@@ -426,7 +421,7 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 		return false;
 	}
 
-	public boolean equalFragment(AbstractCodeFragment other) {
+	public boolean equalFragment(AbstractCodeFragment other, String argumentizedString) {
 		if(this.getString().equals(other.getString())) {
 			return true;
 		}
@@ -436,17 +431,7 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 		else if(other.getString().contains(this.getString())) {
 			return true;
 		}
-		else if(this.codeFragmentAfterReplacingParametersWithArguments != null) {
-			return this.codeFragmentAfterReplacingParametersWithArguments.equals(other.getString());
-		}
-		else if(other.codeFragmentAfterReplacingParametersWithArguments != null) {
-			return other.codeFragmentAfterReplacingParametersWithArguments.equals(this.getString());
-		}
-		return false;
-	}
-
-	public void resetArgumentization() {
-		this.codeFragmentAfterReplacingParametersWithArguments = getString();
+		return argumentizedString.equals(other.getString());
 	}
 
 	public String infixExpressionCoveringTheEntireFragment() {
@@ -484,7 +469,9 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 				creation.coverage = StatementCoverageType.RETURN_CALL;
 				return creation;
 			}
-			else if((LANG.THROW_SPACE + objectCreation + LANG.STATEMENT_TERMINATION).equals(statement)) {
+			//the expression has no statement termination, i.e., the Kotlin when entry else -> throw IOException("a")
+			else if((LANG.THROW_SPACE + objectCreation + LANG.STATEMENT_TERMINATION).equals(statement) ||
+					(this instanceof AbstractExpression && (LANG.THROW_SPACE + objectCreation).equals(statement))) {
 				creation.coverage = StatementCoverageType.THROW_CALL;
 				return creation;
 			}

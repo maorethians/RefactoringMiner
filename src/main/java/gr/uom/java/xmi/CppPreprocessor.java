@@ -96,12 +96,8 @@ public class CppPreprocessor {
 		for(DeclarationGroup group : declarationGroups) {
 			Visibility currentVisibility = group.initialVisibility;
 			for(IASTDeclaration declaration : group.declarations) {
-				String raw = declaration.getRawSignature();
-				if(raw.startsWith("TEST(") || raw.startsWith("TEST_F(") || raw.startsWith("TEST_P(") || raw.startsWith("TYPED_TEST(") || raw.startsWith("TYPED_TEST_P(")) {
-					if(declaration instanceof IASTFunctionDefinition functionDefinition && functionDefinition.getBody() == null)
-						continue;
-					else if(declaration instanceof IASTSimpleDeclaration)
-						continue;
+				if(CppFileProcessor.generatedByStub(declaration)) {
+					continue;
 				}
 				if(fileProcessor.shouldProcessDeclaration(declaration) && !mergedInactiveContainers.contains(declaration)) {
 					currentVisibility = fileProcessor.processDeclaration(packageName, sourceFolder, parentContainer, comments, currentVisibility,
@@ -297,7 +293,7 @@ public class CppPreprocessor {
 	private Map<Integer, Integer> enclosingConditionalBranches(IASTNode node) {
 		Map<Integer, Integer> branches = new HashMap<>();
 		IASTFileLocation location = node.getFileLocation();
-		if(location == null || !node.isPartOfTranslationUnitFile()) {
+		if(location == null || !CppFileProcessor.isPartOfFile(node)) {
 			return branches;
 		}
 		int offset = location.getNodeOffset();
@@ -328,7 +324,7 @@ public class CppPreprocessor {
 		int nextGroupId = 0;
 		for(IASTPreprocessorStatement statement : statements) {
 			IASTFileLocation location = statement.getFileLocation();
-			if(location == null || !statement.isPartOfTranslationUnitFile()) {
+			if(location == null || !CppFileProcessor.isPartOfFile(statement)) {
 				continue;
 			}
 			int start = location.getNodeOffset();

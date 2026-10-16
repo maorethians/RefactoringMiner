@@ -177,6 +177,18 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 }
                 processParentInternalModule(srcTypeDeclaration.getParent(), dstTypeDeclaration.getParent(), mappingStore, LANG1, LANG2);
             }
+            else if(!srcTypeDeclaration.getParent().getType().name.equals(LANG1.EXPORT_STATEMENT) && dstTypeDeclaration.getParent().getType().name.equals(LANG2.EXPORT_STATEMENT) &&
+                    dstTypeDeclaration.getParent().getParent() != null) {
+                //the exported class has the same parent as the original class, i.e., class X {} -> export default class X {}
+                //the export statement is replaced with its children, so that the class contents are not moved
+                Tree export2 = dstTypeDeclaration.getParent();
+                Tree parent2 = export2.getParent();
+                int index = parent2.getChildPosition(export2);
+                parent2.getChildren().remove(index);
+                for(Tree child : new ArrayList<>(export2.getChildren())) {
+                    parent2.insertChild(child, index++);
+                }
+            }
             processParentInternalModule(srcTypeDeclaration, dstTypeDeclaration, mappingStore, LANG1, LANG2);
             if (srcTypeDeclaration.getParent().getType().name.equals(LANG1.FIELD_DECLARATION)
                     && dstTypeDeclaration.getParent().getType().name.equals(LANG2.FIELD_DECLARATION)) {
@@ -265,6 +277,10 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             mappingStore.addMapping(matched.first,matched.second);
         matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.TYPE_IDENTIFIER,LANG2.TYPE_IDENTIFIER);
         if (matched != null)
+            mappingStore.addMapping(matched.first,matched.second);
+        //the JavaScript class name is an identifier, and the TypeScript class name a type_identifier, i.e., class X {} -> export class X {}
+        matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.SIMPLE_NAME,LANG2.TYPE_IDENTIFIER);
+        if (matched != null && !mappingStore.isSrcMapped(matched.first) && !mappingStore.isDstMapped(matched.second))
             mappingStore.addMapping(matched.first,matched.second);
         matched = findPairOfType(srcTypeDeclaration,dstTypeDeclaration,LANG1.QUALIFIED_IDENTIFIER,LANG2.QUALIFIED_IDENTIFIER);
         if (matched != null)
@@ -891,8 +907,8 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
     private void processClassBlock(Tree srcTypeDeclaration, Tree dstTypeDeclaration, ExtendedMultiMappingStore mappingStore) {
         Tree srcBlock = TreeUtilFunctions.findFirstByType(srcTypeDeclaration, LANG1.CLASS_BLOCK);
         Tree dstBlock = TreeUtilFunctions.findFirstByType(dstTypeDeclaration, LANG2.CLASS_BLOCK);
-        if (srcTypeDeclaration.getType().name.equals(LANG1.TYPE_DECLARATION) && dstTypeDeclaration.getType().name.equals(LANG2.CLASS_DECLARATION) && dstBlock != null && srcBlock == null) {
-            //handle Java to Kotlin migration
+        if (srcTypeDeclaration.getType().name.equals(LANG1.TYPE_DECLARATION) && (dstTypeDeclaration.getType().name.equals(LANG2.CLASS_DECLARATION) || dstTypeDeclaration.getType().name.equals(LANG2.OBJECT_DECLARATION)) && dstBlock != null && srcBlock == null) {
+            //handle Java to Kotlin migration, i.e., a Java class that becomes a Kotlin class or Kotlin object
             dstTypeDeclaration.getChildren().addAll(dstBlock.getChildren());
             for(Tree t : dstBlock.getChildren())
                 t.setParent(dstTypeDeclaration);
@@ -1026,11 +1042,10 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                     mappingStore.addMapping(closing.first,closing.second);
                 }
             }
-            //find last delegation specifier
-            if(srcTypeDeclaration.getChildren().size() > 0 && srcTypeDeclaration.getChildren().get(srcTypeDeclaration.getChildren().size()-1).getType().name.equals(LANG1.DELEGATION_SPECIFIER) &&
-                    dstTypeDeclaration.getChildren().size() > 0 && dstTypeDeclaration.getChildren().get(dstTypeDeclaration.getChildren().size()-1).getType().name.equals(LANG2.DELEGATION_SPECIFIER)) {
-                Tree delegationSpecifier1 = srcTypeDeclaration.getChildren().get(srcTypeDeclaration.getChildren().size()-1);
-                Tree delegationSpecifier2 = dstTypeDeclaration.getChildren().get(dstTypeDeclaration.getChildren().size()-1);
+            //find last delegation specifier, which is followed by the class body
+            Tree delegationSpecifier1 = lastChildOfType(srcTypeDeclaration, LANG1.DELEGATION_SPECIFIER);
+            Tree delegationSpecifier2 = lastChildOfType(dstTypeDeclaration, LANG2.DELEGATION_SPECIFIER);
+            if(delegationSpecifier1 != null && delegationSpecifier2 != null) {
                 mappingStore.addMapping(delegationSpecifier1, delegationSpecifier2);
                 Pair<Tree,Tree> explicitDelegations = Helpers.findPairOfType(delegationSpecifier1,delegationSpecifier2, LANG1.EXPLICIT_DELEGATION, LANG2.EXPLICIT_DELEGATION);
                 if (explicitDelegations != null) {
@@ -1278,7 +1293,9 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         if(baseClassDiff.getOriginalClass().getSourceFile().contains("/") && baseClassDiff.getNextClass().getSourceFile().contains("/")) {
             String s1 = baseClassDiff.getOriginalClass().getSourceFile().substring(0, baseClassDiff.getOriginalClass().getSourceFile().lastIndexOf("/"));
             String s2 = baseClassDiff.getNextClass().getSourceFile().substring(0, baseClassDiff.getNextClass().getSourceFile().lastIndexOf("/"));
-            if(s1.equals(s2))
+            //a nested class moved to another outer class of the same directory is not just renamed, i.e., LeakSentryListener.None -> InternalLeakSentry.NoLeakCanary
+            if(s1.equals(s2) && (baseClassDiff.getOriginalClass().isTopLevel() && baseClassDiff.getNextClass().isTopLevel() ||
+                    baseClassDiff.getOriginalClass().getPackageName().equals(baseClassDiff.getNextClass().getPackageName())))
                 justRenamed = true;
         }
         boolean movedAndRenamed = baseClassDiff instanceof UMLClassRenameDiff && !justRenamed && !baseClassDiff.getOriginalClass().getSourceFile().equals(baseClassDiff.getNextClass().getSourceFile()) && !parentNamespaceContainsOnlyClass;
@@ -1375,28 +1392,18 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         }
     }
 
+    private static Tree lastChildOfType(Tree tree, String type) {
+        for(int i = tree.getChildren().size() - 1; i >= 0; i--) {
+            if(tree.getChild(i).getType().name.equals(type))
+                return tree.getChild(i);
+        }
+        return null;
+    }
+
     private static void processCallExpressionsInDelegationSpecifiers(ExtendedMultiMappingStore mappingStore, Pair<Tree, Tree> callExpressions, Constants LANG1, Constants LANG2) {
         mappingStore.addMapping(callExpressions.first,callExpressions.second);
-        Pair<Tree, Tree> byIdentifiers = Helpers.findPairOfType(callExpressions.first,callExpressions.second, LANG1.SIMPLE_NAME, LANG2.SIMPLE_NAME);
-        if(byIdentifiers != null) {
-            mappingStore.addMapping(byIdentifiers.first,byIdentifiers.second);
-        }
-        Pair<Tree, Tree> callSuffixes = Helpers.findPairOfType(callExpressions.first,callExpressions.second, LANG1.CALL_SUFFIX, LANG2.CALL_SUFFIX);
-        if (callSuffixes != null) {
-            mappingStore.addMapping(callSuffixes.first,callSuffixes.second);
-            Pair<Tree, Tree> annotatedLambdas = Helpers.findPairOfType(callSuffixes.first,callSuffixes.second, LANG1.ANNOTATED_LAMBDA, LANG2.ANNOTATED_LAMBDA);
-            if (annotatedLambdas != null) {
-                mappingStore.addMapping(annotatedLambdas.first,annotatedLambdas.second);
-                Pair<Tree, Tree> lambdaLiterals = Helpers.findPairOfType(annotatedLambdas.first,annotatedLambdas.second, LANG1.LAMBDA_LITERAL, LANG2.LAMBDA_LITERAL);
-                if (lambdaLiterals != null) {
-                    mappingStore.addMapping(lambdaLiterals.first,lambdaLiterals.second);
-                    Pair<Tree, Tree> statements = Helpers.findPairOfType(lambdaLiterals.first,lambdaLiterals.second, LANG1.STATEMENTS, LANG2.STATEMENTS);
-                    if (statements != null) {
-                        mappingStore.addMapping(statements.first,statements.second);
-                    }
-                }
-            }
-        }
+        //the delegate calls, i.e., createDelegate(a, 1) in I by createDelegate(a, 1), are matched like statements
+        new LeafMatcher(LANG1, LANG2).match(callExpressions.first, callExpressions.second, mappingStore);
     }
 
     private void processPrimaryConstructorParameterPair(Tree srcTypeDeclaration, Tree dstTypeDeclaration, VariableDeclaration left, VariableDeclaration right, ExtendedMultiMappingStore mappingStore) {
@@ -1630,6 +1637,18 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 Pair<Tree, Tree> type_arguments = Helpers.findPairOfType(extendClauses.first,extendClauses.second, LANG1.TYPE_ARGUMENTS, LANG2.TYPE_ARGUMENTS);
                 if(type_arguments != null) {
                     mappingStore.addMappingRecursively(type_arguments.first, type_arguments.second);
+                }
+            }
+            else {
+                Tree extendClause2 = TreeUtilFunctions.findChildByType(classHeritage.second, LANG2.EXTENDS_CLAUSE);
+                if(extendClause2 != null && TreeUtilFunctions.findChildByType(classHeritage.first, LANG1.EXTENDS_CLAUSE) == null) {
+                    //the JavaScript class_heritage has no extends_clause, i.e., class X extends Y {} -> class X extends Y {} in TypeScript
+                    //the extends_clause is replaced with its children after all diffs are matched, so that the supertype is not moved
+                    optimizationData.getDeferredFlattenings().flattenKeepingMappings(classHeritage.second, extendClause2);
+                    Pair<Tree, Tree> extendKeywords = Helpers.findPairOfType(classHeritage.first, extendClause2, LANG1.EXTENDS_KEYWORD, LANG2.EXTENDS_KEYWORD);
+                    if(extendKeywords != null) {
+                        mappingStore.addMapping(extendKeywords.first,extendKeywords.second);
+                    }
                 }
             }
         }

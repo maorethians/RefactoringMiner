@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.refactoringminer.api.Refactoring;
@@ -52,6 +54,7 @@ public class StringBasedHeuristics {
 	protected static final Pattern SPLIT_CONDITIONAL_PATTERN_JAVA = Pattern.compile("( \\|\\| )|( && )|( \\? )|( : )");
 	protected static final Pattern SPLIT_CONDITIONAL_PATTERN_PYTHON = Pattern.compile("( or )|( and )|( if )|( else )");
 	protected static final Pattern SPLIT_CONCAT_STRING_PATTERN = Pattern.compile("(\\s)*( \\+ )(\\s)*");
+	private static final Pattern TEMPLATE_VARIABLE = Pattern.compile("\\$\\{(\\w+)\\}");
 	protected static final Pattern SPLIT_COMMA_PATTERN = Pattern.compile("(\\s)*(\\,)(\\s)*");
 	protected static final Pattern SPLIT_TAB_PATTERN = Pattern.compile("(\\s)*(\\\\t)(\\s)*");
 
@@ -110,10 +113,68 @@ public class StringBasedHeuristics {
 		return false;
 	}
 
+	private static boolean throwReplacedWithRequireOrCheckMessage(String s1, String s2, AbstractCodeFragment statement1, AbstractCodeFragment statement2, Constants LANG1) {
+		//Java thrown exception message replaced with the message of Kotlin require/check, i.e., if (x) throw new IllegalStateException("a" + b); -> check(!x) { "a$b" }
+		CompositeStatementObject parent2 = statement2.getParent();
+		if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.THROW_STATEMENT) &&
+				statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.EXPRESSION_STATEMENT) &&
+				parent2 != null && parent2.getParent() != null && parent2.getParent().getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
+				statement1.getCreations().size() == 1 && statement1.getCreations().get(0).arguments().size() == 1) {
+			String message2 = s2.strip();
+			String prefix1 = "throw new ";
+			String suffix1 = ")" + LANG1.STATEMENT_TERMINATION;
+			if(message2.startsWith("\"") && message2.endsWith("\"") && s1.startsWith(prefix1) && s1.endsWith(suffix1) && s1.contains("(")) {
+				//s1 includes the variable replacements, i.e., renamed variables in the message
+				String message1 = s1.substring(s1.indexOf("(") + 1, s1.length() - suffix1.length());
+				StringBuilder template = new StringBuilder("\"");
+				for(String token : SPLIT_CONCAT_STRING_PATTERN.split(message1)) {
+					if(token.startsWith("\"") && token.endsWith("\"") && token.length() > 1) {
+						template.append(token.substring(1, token.length()-1));
+					}
+					else {
+						template.append("${" + token + "}");
+					}
+				}
+				template.append("\"");
+				String template1 = template.toString();
+				String template2 = message2.replaceAll("\\$(\\w+)", "\\${$1}");
+				if(template1.equals(template2)) {
+					return true;
+				}
+				//identical message with renamed variables, i.e., "a: " + protocols -> "a: $protocolsCopy"
+				List<String> names1 = new ArrayList<>();
+				List<String> names2 = new ArrayList<>();
+				Matcher matcher1 = TEMPLATE_VARIABLE.matcher(template1);
+				while(matcher1.find()) {
+					names1.add(matcher1.group(1));
+				}
+				Matcher matcher2 = TEMPLATE_VARIABLE.matcher(template2);
+				while(matcher2.find()) {
+					names2.add(matcher2.group(1));
+				}
+				if(names1.size() > 0 && names1.size() == names2.size() &&
+						TEMPLATE_VARIABLE.matcher(template1).replaceAll("\\${}").equals(TEMPLATE_VARIABLE.matcher(template2).replaceAll("\\${}"))) {
+					Set<String> variables1 = convertToStringSet(statement1.getVariables());
+					Set<String> variables2 = convertToStringSet(statement2.getVariables());
+					for(int i=0; i<names1.size(); i++) {
+						if(!names1.get(i).equals(names2.get(i)) && (!variables1.contains(names1.get(i)) || !variables2.contains(names2.get(i)))) {
+							return false;
+						}
+					}
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	protected static boolean javaToKotlin(String s1, String s2, AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			ReplacementInfo info, Constants LANG1, Constants LANG2) {
 		if(LANG1.equals(Constants.JAVA) && LANG2.equals(Constants.KOTLIN)) {
 			if(whileConditionAssignmentMovedToBody(statement1, statement2, info)) {
+				return true;
+			}
+			if(throwReplacedWithRequireOrCheckMessage(s1, s2, statement1, statement2, LANG1)) {
 				return true;
 			}
 			List<AbstractCall> methodInvocations1 = statement1.getMethodInvocations();
@@ -122,8 +183,26 @@ public class StringBasedHeuristics {
 			List<LeafExpression> castExpressions2 = statement2.getCastExpressions();
 			List<VariableDeclaration> variableDeclarations1 = statement1.getVariableDeclarations();
 			List<VariableDeclaration> variableDeclarations2 = statement2.getVariableDeclarations();
+			if(variableDeclarations1.size() == 1 && variableDeclarations2.size() == 1) {
+				//Java variable declaration without initializer replaced with Kotlin variable declaration with explicit type, i.e., Socket socket; -> val socket: Socket
+				VariableDeclaration declaration1 = variableDeclarations1.get(0);
+				VariableDeclaration declaration2 = variableDeclarations2.get(0);
+				if(declaration1.getInitializer() == null && declaration2.getInitializer() == null &&
+						declaration1.getVariableName().equals(declaration2.getVariableName()) && declaration1.equalType(declaration2)) {
+					return true;
+				}
+			}
 			String temp = new String(s1);
 			Set<Replacement> appliedReplacements = new LinkedHashSet<>();
+			for(TernaryOperatorExpression ternary1 : statement1.getTernaryOperatorExpressions()) {
+				//Java ternary operator replaced with Kotlin if expression, i.e., x != null ? a : b -> if (x != null) a else b
+				String before = ternary1.getString();
+				String after = "if (" + ternary1.getCondition().getString() + ") " + ternary1.getThenExpression().getString() + " else " + ternary1.getElseExpression().getString();
+				if(temp.contains(before) && s2.replaceAll("\\s+", " ").contains(after)) {
+					temp = temp.replace(before, after);
+					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
+				}
+			}
 			for(AbstractCall call : methodInvocations1) {
 				if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 0 && !methodInvocations2.contains(call) &&
 						call.getName().equals("isEmpty") && s2.contains(".isNotEmpty()")) {
@@ -153,6 +232,14 @@ public class StringBasedHeuristics {
 					if(temp.endsWith(");\n")) {
 						temp = temp.replace(");\n", ";\n");
 					}
+				}
+				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 1 && !methodInvocations2.contains(call) &&
+						call.getName().equals("equalsIgnoreCase")) {
+					//i.e., s.equalsIgnoreCase(x) -> s.equals(x, ignoreCase = true)
+					String before = ".equalsIgnoreCase(" + call.arguments.get(0) + ")";
+					String after = ".equals(" + call.arguments.get(0) + ",ignoreCase = true)";
+					temp = ReplacementUtil.performReplacement(temp, before, after);
+					appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
 				}
 				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 1 && !methodInvocations2.contains(call) &&
 						call.getName().startsWith("equals")) {
@@ -187,7 +274,8 @@ public class StringBasedHeuristics {
 				}
 				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 2 && !methodInvocations2.contains(call) &&
 						call.getName().startsWith("min")) {
-					temp = ReplacementUtil.performReplacement(temp, "Math.min", "minOf");
+					//Math.min is replaced with the Kotlin minOf, or with min, if kotlin.math.min is imported
+					temp = ReplacementUtil.performReplacement(temp, "Math.min", s2.contains("minOf(") || !s2.contains("min(") ? "minOf" : "min");
 				}
 				else if((s1.contains(call.actualString()) || statement1.getString().contains(call.actualString())) && call.arguments.size() == 2 && !methodInvocations2.contains(call) &&
 						call.getName().startsWith("put")) {
@@ -201,7 +289,7 @@ public class StringBasedHeuristics {
 					//Map.get() replaced with square bracket []
 					String before = ".get(" + call.arguments().get(0) + ")";
 					String after = "[" + call.arguments().get(0) + "]";
-					if(temp.contains(before)) {
+					if(temp.contains(before) && !s2.contains(before)) {
 						temp = temp.replace(before, after);
 						appliedReplacements.add(new Replacement(before, after, ReplacementType.VARIABLE_NAME));
 					}
@@ -265,14 +353,30 @@ public class StringBasedHeuristics {
 			if(temp.endsWith(LANG1.STATEMENT_TERMINATION) && (s2.endsWith(LANG2.STATEMENT_TERMINATION) || statement2 instanceof AbstractExpression)) {
 				String ss1 = temp.substring(0, temp.length()-LANG1.STATEMENT_TERMINATION.length());
 				String ss2 = statement2 instanceof AbstractExpression ? s2 : s2.substring(0, s2.length()-LANG2.STATEMENT_TERMINATION.length());
+				//the Kotlin code is entirely the result of a replacement, i.e., return headerList; -> "$key: $value" with headerList -> "$key: $value"
+				boolean replacedKotlinCode = info.getReplacements().stream().map(Replacement::getAfter).anyMatch(ss2::equals);
 				for(Replacement r : info.getReplacements()) {
-					if(r.getType().equals(ReplacementType.CLASS_INSTANCE_CREATION_REPLACED_WITH_LAMBDA)) {
+					//the replacement brings the formatting of the Kotlin statement, i.e., "Upgrade".equals(request.getHeader("Connection"),\n ignoreCase = true)
+					if(r.getType().equals(ReplacementType.CLASS_INSTANCE_CREATION_REPLACED_WITH_LAMBDA) || r.getAfter().contains("\n")) {
 						ss1 = ss1.replaceAll("\\R\\s*", "");
 						break;
 					}
 				}
-				//eliminate formatting differences
+				//eliminate formatting differences, keeping the space after a logical operator, i.e., x &&\n y -> x && y
+				ss2 = ss2.replaceAll("(&&|\\|\\|)\\R\\s*", "$1 ");
 				ss2 = ss2.replaceAll("\\R\\s*", "");
+				if(variableDeclarations1.size() == 1 && variableDeclarations2.size() == 1) {
+					//Kotlin redundant parentheses around the initializer, i.e., boolean b = x && y; -> val b = (x && y)
+					AbstractExpression initializer1 = variableDeclarations1.get(0).getInitializer();
+					AbstractExpression initializer2 = variableDeclarations2.get(0).getInitializer();
+					if(initializer1 != null && initializer2 != null && !initializer1.getString().startsWith("(") && ss2.endsWith(")") &&
+							statement2.getParenthesizedExpressions().stream().anyMatch(p -> p.getString().equals(initializer2.getString()))) {
+						int index = ss2.indexOf(LANG2.ASSIGNMENT + "(");
+						if(index != -1) {
+							ss2 = ss2.substring(0, index) + LANG2.ASSIGNMENT + ss2.substring(index + LANG2.ASSIGNMENT.length() + 1, ss2.length() - 1);
+						}
+					}
+				}
 				if(!ss1.contains(", ") && ss2.contains(", ")) {
 					ss2 = ss2.replaceAll(",\\s*", ",");
 				}
@@ -313,7 +417,7 @@ public class StringBasedHeuristics {
 				if(ss1.equals(ss2)) {
 					return true;
 				}
-				if(equalAfterParenthesisElimination(ss1, ss2, info, LANG1, LANG2)) {
+				if(!replacedKotlinCode && equalAfterParenthesisElimination(ss1, ss2, info, LANG1, LANG2)) {
 					return true;
 				}
 				String commonPrefix = PrefixSuffixUtils.longestCommonPrefix(ss1, ss2);
@@ -381,10 +485,20 @@ public class StringBasedHeuristics {
 							}
 						}
 					}
+					//the Java field assignment becomes a Kotlin local variable declaration, i.e., http2Connection = x; -> val http2Connection = x
+					//a Java local variable has its own declaration as counterpart, i.e., boolean readBody = true; -> var readBody = true
+					if(variableDeclarations1.isEmpty() && variableDeclarations2.size() > 0 && (diff2.endsWith("=") || diff2.endsWith("= "))) {
+						String diff1 = ss1.substring(0, ss1.lastIndexOf(commonSuffix));
+						String name2 = variableDeclarations2.get(0).getVariableName();
+						if((diff1.equals(name2 + LANG1.ASSIGNMENT) || diff1.equals(LANG1.THIS_DOT + name2 + LANG1.ASSIGNMENT)) && statement1.searchVariableDeclaration(name2) == null) {
+							return true;
+						}
+					}
 					if(diff2.endsWith(".") && !diff2.contains(LANG2.ASSIGNMENT)) {
 						return true;
 					}
-					if(diff2.isEmpty()) {
+					//the Kotlin code is the right-hand side of the Java assignment, i.e., this.x = foo; -> val x = foo
+					if(diff2.isEmpty() && !replacedKotlinCode) {
 						return true;
 					}
 				}
@@ -593,8 +707,28 @@ public class StringBasedHeuristics {
 		return false;
 	}
 
+	//the same statement strings are checked repeatedly, e.g., by ReplacementUtil.performReplacement for every pair of compared variables and method invocations
+	private static final int MAX_CACHE_SIZE = 100000;
+	private static final Map<StringAndLanguage, Boolean> ANONYMOUS_CLASS_SIGNATURE_CACHE = new ConcurrentHashMap<>();
+	//the language ordinal is used, because Enum.hashCode() is an identity hash code and computing it shifts the identity hash codes of other objects
+	private record StringAndLanguage(String s, int language) {}
+
 	protected static boolean containsMethodSignatureOfAnonymousClass(String s, Constants LANG) {
-		String[] lines = s.split("\\n");
+		StringAndLanguage key = new StringAndLanguage(s, LANG.ordinal());
+		Boolean cached = ANONYMOUS_CLASS_SIGNATURE_CACHE.get(key);
+		if(cached != null) {
+			return cached;
+		}
+		boolean result = computeContainsMethodSignatureOfAnonymousClass(s, LANG);
+		if(ANONYMOUS_CLASS_SIGNATURE_CACHE.size() >= MAX_CACHE_SIZE) {
+			ANONYMOUS_CLASS_SIGNATURE_CACHE.clear();
+		}
+		ANONYMOUS_CLASS_SIGNATURE_CACHE.put(key, result);
+		return result;
+	}
+
+	private static boolean computeContainsMethodSignatureOfAnonymousClass(String s, Constants LANG) {
+		String[] lines = s.split("\n");
 		if(s.contains(LANG.LAMBDA_ARROW)) {
 			if(lines.length > 1)
 				return true;
@@ -611,7 +745,7 @@ public class StringBasedHeuristics {
 	}
 
 	protected static boolean containsAnonymousClass(String s) {
-		String[] lines = s.split("\\n");
+		String[] lines = s.split("\n");
 		for(String line : lines) {
 			line = VariableReplacementAnalysis.prepareLine(line);
 			if(Visitor.METHOD_SIGNATURE_PATTERN.matcher(line).matches()) {
@@ -2137,6 +2271,37 @@ public class StringBasedHeuristics {
 		return true;
 	}
 
+	//the operator joining the pieces of a string, which is << in the C++ stream insertion chains, i.e., VLOG(1) << "Compiled " << n << " configs.";
+	private static String concatenationOperator(String s, Constants LANG) {
+		return streamInsertionChain(s, LANG) ? STREAM_INSERTION : LANG.STRING_CONCATENATION;
+	}
+
+	private static Pattern concatenationPattern(String s, Constants LANG) {
+		return streamInsertionChain(s, LANG) ? SPLIT_STREAM_INSERTION_PATTERN : SPLIT_CONCAT_STRING_PATTERN;
+	}
+
+	//whether the code is a C++ stream insertion chain, which starts with a stream, i.e., a logging or check macro call like VLOG(1) and TF_RET_CHECK(x) or std::cout,
+	//and contains string literals, unlike a shift like 1 << n
+	private static boolean streamInsertionChain(String s, Constants LANG) {
+		if(!LANG.equals(Constants.CPP) || !s.contains(STREAM_INSERTION)) {
+			return false;
+		}
+		String[] tokens = SPLIT_STREAM_INSERTION_PATTERN.split(s);
+		if(tokens.length < 2 || !STREAM.matcher(tokens[0].strip()).matches()) {
+			return false;
+		}
+		for(int i=1; i<tokens.length; i++) {
+			if(tokens[i].strip().startsWith("\"")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static final String STREAM_INSERTION = " << ";
+	private static final Pattern SPLIT_STREAM_INSERTION_PATTERN = Pattern.compile("(\\s)*( << )(\\s)*");
+	private static final Pattern STREAM = Pattern.compile("[A-Za-z_][\\w:]*\\(.*\\)|(std::)?(cout|cerr|clog)");
+
 	protected static boolean commonConcat(String s1, String s2, Map<String, String> parameterToArgumentMap, ReplacementInfo info, AbstractCodeFragment statement1, AbstractCodeFragment statement2, UMLOperationBodyMapper mapper) {
 		Constants LANG1 = mapper.LANG1;
 		Constants LANG2 = mapper.LANG2;
@@ -2155,9 +2320,9 @@ public class StringBasedHeuristics {
 					return true;
 				}
 			}
-			else if(s1.contains(LANG1.STRING_CONCATENATION) && s2.contains(LANG2.STRING_CONCATENATION)) {
-				Set<String> tokens1 = new LinkedHashSet<String>(Arrays.asList(SPLIT_CONCAT_STRING_PATTERN.split(s1)));
-				Set<String> tokens2 = new LinkedHashSet<String>(Arrays.asList(SPLIT_CONCAT_STRING_PATTERN.split(s2)));
+			else if(s1.contains(concatenationOperator(s1, LANG1)) && s2.contains(concatenationOperator(s2, LANG2))) {
+				Set<String> tokens1 = new LinkedHashSet<String>(Arrays.asList(concatenationPattern(s1, LANG1).split(s1)));
+				Set<String> tokens2 = new LinkedHashSet<String>(Arrays.asList(concatenationPattern(s2, LANG2).split(s2)));
 				Set<String> intersection = new LinkedHashSet<String>();
 				for(String token1 : tokens1) {
 					for(String token2 : tokens2) {
@@ -2577,24 +2742,35 @@ public class StringBasedHeuristics {
 						boolean tokenMatchesArgument = false;
 						Set<String> tokens1 = new LinkedHashSet<String>(Arrays.asList(SPLIT_CONCAT_STRING_PATTERN.split(arg1)));
 						StringBuilder sb = new StringBuilder();
+						//Kotlin string template, i.e., "a" + b.c() -> "a${b.c()}"
+						StringBuilder template = new StringBuilder();
 						sb.append("\"");
+						template.append("\"");
 						for(String token : tokens1) {
 							if(arguments2.contains(token) && arguments1.size() == arguments2.size() && tokens1.size() <= 2) {
 								tokenMatchesArgument = true;
 							}
 							if(token.startsWith("\"") && token.endsWith("\"") && token.length() > 1) {
 								sb.append(token.substring(1, token.length()-1));
+								template.append(token.substring(1, token.length()-1));
 							}
 							else if(parameterToArgumentMap.containsKey(token)) {
 								sb.append(parameterToArgumentMap.get(token));
+								template.append("${" + parameterToArgumentMap.get(token) + "}");
 							}
 							else {
 								sb.append(token);
+								template.append("${" + token + "}");
 							}
 						}
 						sb.append("\"");
+						template.append("\"");
 						String concatenatedString = sb.toString();
-						if(concatenatedString.equals(arg2)) {
+						if(LANG1.equals(Constants.JAVA) && LANG2.equals(Constants.KOTLIN) && template.toString().equals(arg2.replaceAll("\\$(\\w+)", "\\${$1}"))) {
+							concatReplacements.add(new Replacement(arg1, arg2, ReplacementType.CONCATENATION));
+							concatenatedArguments++;
+						}
+						else if(concatenatedString.equals(arg2)) {
 							concatReplacements.add(new Replacement(arg1, arg2, ReplacementType.CONCATENATION));
 							concatenatedArguments++;
 						}
@@ -3012,6 +3188,23 @@ public class StringBasedHeuristics {
 		return false;
 	}
 
+	//the string literal is replaced with a constant initialized with the same literal, i.e., x = ""; becomes x = EMPTY;
+	private static boolean literalReplacedWithConstant(String assignment1, String assignment2, UMLAbstractClassDiff classDiff) {
+		if(classDiff != null) {
+			UMLAttribute attribute2 = classDiff.findAttributeInNextClass(assignment2);
+			if(attribute2 != null && attribute2.getVariableDeclaration().getInitializer() != null &&
+					attribute2.getVariableDeclaration().getInitializer().getString().equals(assignment1)) {
+				return true;
+			}
+			UMLAttribute attribute1 = classDiff.findAttributeInOriginalClass(assignment1);
+			if(attribute1 != null && attribute1.getVariableDeclaration().getInitializer() != null &&
+					attribute1.getVariableDeclaration().getInitializer().getString().equals(assignment2)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	protected static boolean variableAssignmentWithEverythingReplaced(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			ReplacementInfo replacementInfo, UMLOperationBodyMapper mapper) {
 		Constants LANG1 = mapper.LANG1;
@@ -3105,6 +3298,9 @@ public class StringBasedHeuristics {
 					typeReplacement = true;
 					if(string1.contains("new " + replacement.getBefore() + "(") && string2.contains("new " + replacement.getAfter() + "("))
 						classInstanceCreationReplacement = true;
+					//the type of a variable declaration is a renamed type parameter, i.e., T total = initial; and Element result = seed;
+					if(map.containsKey(replacement.getBefore()) && map.get(replacement.getBefore()).equals(replacement.getAfter()))
+						typeParameterRename = true;
 				}
 				else if((replacement.getType().equals(ReplacementType.VARIABLE_NAME) || replacement.getType().equals(ReplacementType.VARIABLE_REPLACED_WITH_ARRAY_ACCESS)) &&
 						(variableName1.equals(replacement.getBefore()) || variableName1.endsWith(" " + replacement.getBefore()) || variableName1.equals(LANG1.THIS_DOT + replacement.getBefore())) &&
@@ -3119,6 +3315,11 @@ public class StringBasedHeuristics {
 				else if(replacement.getType().equals(ReplacementType.VARIABLE_REPLACED_WITH_NULL_LITERAL) &&
 						assignment1.equals(replacement.getBefore()) &&
 						assignment2.equals(replacement.getAfter()))
+					rightHandSideReplacement = true;
+				else if(replacement.getType().equals(ReplacementType.VARIABLE_REPLACED_WITH_STRING_LITERAL) &&
+						assignment1.equals(replacement.getBefore()) &&
+						assignment2.equals(replacement.getAfter()) &&
+						!literalReplacedWithConstant(assignment1, assignment2, mapper.getClassDiff()))
 					rightHandSideReplacement = true;
 				else if(replacement.getType().equals(ReplacementType.VARIABLE_REPLACED_WITH_PARENTHESIZED_EXPRESSION) &&
 						assignment1.equals(replacement.getBefore()) &&
@@ -3156,7 +3357,10 @@ public class StringBasedHeuristics {
 					AbstractCall invocationAfter = ((MethodInvocationReplacement)replacement).getInvokedOperationAfter();
 					if((assignment1.equals(replacement.getBefore()) || assignment1.equals(invocationBefore.actualString())) &&
 							(assignment2.equals(replacement.getAfter()) || assignment2.equals(invocationAfter.actualString()))) {
-						if(!invocationBefore.getName().contains(invocationAfter.getName()) && !invocationAfter.getName().contains(invocationBefore.getName())) {
+						//the C++ calls of the same function template with other template arguments, i.e., std::make_unique<A>(x) and std::make_unique<B>(), call the same function
+						String name1 = withoutTemplateArguments(invocationBefore.getName());
+						String name2 = withoutTemplateArguments(invocationAfter.getName());
+						if(!name1.contains(name2) && !name2.contains(name1)) {
 							rightHandSideReplacement = true;
 						}
 					}
@@ -3545,6 +3749,11 @@ public class StringBasedHeuristics {
 			}
 		}
 		return false;
+	}
+
+	private static String withoutTemplateArguments(String name) {
+		int index = name.indexOf('<');
+		return index > 0 && name.endsWith(">") ? name.substring(0, index) : name;
 	}
 
 	protected static String statementWithoutAnonymous(AbstractCodeFragment statement, AnonymousClassDeclarationObject anonymousClassDeclaration, VariableDeclarationContainer operation) {

@@ -12,6 +12,8 @@ import org.jetbrains.kotlin.com.intellij.psi.stubs.IStubElementType;
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType;
 import org.jetbrains.kotlin.lexer.KtSingleValueToken;
 import org.jetbrains.kotlin.psi.KtArrayAccessExpression;
+import org.jetbrains.kotlin.psi.KtWhenConditionInRange;
+import org.jetbrains.kotlin.psi.KtWhenConditionWithExpression;
 import org.jetbrains.kotlin.psi.KtBinaryExpression;
 import org.jetbrains.kotlin.psi.KtBinaryExpressionWithTypeRHS;
 import org.jetbrains.kotlin.psi.KtCallExpression;
@@ -42,6 +44,7 @@ import org.jetbrains.kotlin.psi.KtSuperTypeCallEntry;
 import org.jetbrains.kotlin.psi.KtSuperTypeEntry;
 import org.jetbrains.kotlin.psi.KtSuperTypeListEntry;
 import org.jetbrains.kotlin.psi.KtThisExpression;
+import org.jetbrains.kotlin.psi.KtThrowExpression;
 import org.jetbrains.kotlin.psi.KtTypeReference;
 import org.jetbrains.kotlin.psi.KtUserType;
 import org.jetbrains.kotlin.psi.KtValueArgument;
@@ -114,6 +117,8 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 			this.processBinaryExpression(binaryExpression, data);
 		} else if (expression instanceof KtReturnExpression) {
 			this.processReturnExpression((KtReturnExpression) expression, data);
+		} else if (expression instanceof KtThrowExpression throwExpression) {
+			this.processThrowExpression(throwExpression, data);
 		} else if (expression instanceof KtDotQualifiedExpression dotQualifiedExpression) {
 			this.processDotQualifiedExpression(dotQualifiedExpression, data);
 		} else if (expression instanceof KtCallExpression callExpression) {
@@ -186,7 +191,8 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 		else {
 			leftSide = ".";
 		}
-		String codePath = container.getName() + leftSide + type.getClassType();
+		//the object expression without supertypes implicitly extends Object, i.e., object {}.javaClass.classLoader
+		String codePath = container.getName() + leftSide + (type != null ? type.getClassType() : "Object");
 		UMLAnonymousClass anonymousClass =  new UMLAnonymousClass(container.getClassName(), codePath, codePath, anonymousLocationInfo, Collections.emptyList());
 		KotlinFileProcessor.processClassBody(cu, sourceFolder, filePath, fileContent, Collections.emptyList(), container.getComments(), anonymousClass, activeVariableDeclarations, objectDeclaration.getBody(), null);
 		if(container instanceof LambdaExpressionObject lambda) {
@@ -221,6 +227,19 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 			processArgument(argument, data);
 		}
 		return super.visitSuperTypeCallEntry(entry, data);
+	}
+
+	//the condition of a when entry, i.e., x in c -> ..., is not an expression, so its expression is visited
+	public Object visitWhenConditionWithExpression(KtWhenConditionWithExpression condition, Object data) {
+		if(condition.getExpression() != null)
+			this.visitExpression(condition.getExpression(), data);
+		return super.visitWhenConditionWithExpression(condition, data);
+	}
+
+	public Object visitWhenConditionInRange(KtWhenConditionInRange condition, Object data) {
+		if(condition.getRangeExpression() != null)
+			this.visitExpression(condition.getRangeExpression(), data);
+		return super.visitWhenConditionInRange(condition, data);
 	}
 
 	public Object visitSuperTypeEntry(KtSuperTypeEntry entry, Object data) {
@@ -360,6 +379,11 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 			this.visitExpression(expression.getReturnedExpression(), data);
 	}
 
+	private void processThrowExpression(KtThrowExpression expression, Object data) {
+		if (expression.getThrownExpression() != null)
+			this.visitExpression(expression.getThrownExpression(), data);
+	}
+
 	private void processParenthesizedExpression(KtParenthesizedExpression expression, Object data) {
 		LeafExpression parenthesized = new LeafExpression(cu, sourceFolder, filePath, expression, CodeElementType.PARENTHESIZED_EXPRESSION, container);
 		parenthesizedExpressions.add(parenthesized);
@@ -409,7 +433,20 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 			LeafExpression valueArgument = new LeafExpression(cu, sourceFolder, filePath, expression, CodeElementType.FIELD_ACCESS, container);
 			arguments.add(valueArgument);
 		}
-		this.visitExpression(expression.getReceiverExpression(), data);
+		if(expression.getReceiverExpression() instanceof KtNameReferenceExpression receiver && Character.isUpperCase(receiver.getReferencedName().charAt(0)) &&
+				expression.getSelectorExpression() instanceof KtCallExpression call && call.getCalleeExpression() instanceof KtNameReferenceExpression callee &&
+				Character.isUpperCase(callee.getReferencedName().charAt(0))) {
+			//the outer class of a nested class instance creation is a type, i.e., Http2Connection.Builder(false)
+			types.add(receiver.getText());
+		}
+		else if(expression.getReceiverExpression() instanceof KtNameReferenceExpression receiver && Character.isUpperCase(receiver.getReferencedName().charAt(0)) &&
+				expression.getSelectorExpression() instanceof KtNameReferenceExpression) {
+			//the class of a static field access is a type, i.e., Protocol.HTTP_1_1
+			types.add(receiver.getText());
+		}
+		else {
+			this.visitExpression(expression.getReceiverExpression(), data);
+		}
 		if (expression.getSelectorExpression() != null)
 			this.visitExpression(expression.getSelectorExpression(), data);
 	}

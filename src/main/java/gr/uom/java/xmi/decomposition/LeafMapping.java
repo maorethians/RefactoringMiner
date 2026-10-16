@@ -23,6 +23,7 @@ import gr.uom.java.xmi.decomposition.replacement.Replacement;
 import gr.uom.java.xmi.decomposition.replacement.Replacement.ReplacementType;
 import gr.uom.java.xmi.Constants;
 import gr.uom.java.xmi.LeafType;
+import gr.uom.java.xmi.InferredType;
 import gr.uom.java.xmi.LocationInfo.CodeElementType;
 import gr.uom.java.xmi.UMLComment;
 import gr.uom.java.xmi.UMLOperation;
@@ -1104,7 +1105,9 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 			if(list1.size() == list2.size() && list1.size() > 0) {
 				VariableDeclaration v1 = list1.get(0);
 				VariableDeclaration v2 = list2.get(0);
-				if(v1.equalType(v2) && v1.getInitializer() != null && v2.getInitializer() != null &&
+				//the Kotlin variable without declared type has the type of its initializer, i.e., String protocolString=x; -> val protocolString = x
+				boolean inferredType = v1.getType() instanceof InferredType || v2.getType() instanceof InferredType;
+				if((v1.equalType(v2) || inferredType) && v1.getInitializer() != null && v2.getInitializer() != null &&
 						v1.getInitializer().getString().equals(v2.getInitializer().getString())) {
 					equalTypeAndInitializer = true;
 				}
@@ -1151,7 +1154,7 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 		return false;
 	}
 
-	//-1 when there are no variable renames, 1 when all renamed variables are declared with identical initializers, 0 otherwise
+	//-1 when there are no variable renames or a renamed variable has no declaration with initializer, 1 when all renamed variables are declared with identical initializers, 0 otherwise
 	//the renamed variables declared by the mapped statements themselves are not considered, as their initializers are part of the mapped statements
 	private int renamedVariablesWithIdenticalInitializers() {
 		if(this.renamedVariablesWithIdenticalInitializers != null) {
@@ -1168,8 +1171,13 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 				renamedVariables++;
 				VariableDeclaration v1 = getFragment1().searchVariableDeclaration(r.getBefore());
 				VariableDeclaration v2 = getFragment2().searchVariableDeclaration(r.getAfter());
-				if(v1 != null && v2 != null && v1.getInitializer() != null && v2.getInitializer() != null &&
-						v1.getInitializer().getString().equals(v2.getInitializer().getString())) {
+				if(v1 == null || v2 == null || v1.getInitializer() == null || v2.getInitializer() == null) {
+					//a renamed variable without declaration (i.e., a field) or initializer gives no evidence, so the other criteria decide,
+					//i.e., mergeThreads.get(i) -> activeMerges.get(threadIdx), when mergeThreads is a field
+					this.renamedVariablesWithIdenticalInitializers = -1;
+					return this.renamedVariablesWithIdenticalInitializers;
+				}
+				if(v1.getInitializer().getString().equals(v2.getInitializer().getString())) {
 					identicalInitializers++;
 				}
 			}
@@ -1457,10 +1465,10 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 		}
 		String s1 = parent1.getString();
 		String s2 = parent2.getString();
-		if(!s1.equals(parent1.getArgumentizedString()) && s2.equals(parent1.getArgumentizedString())) {
+		if(!s1.equals(getArgumentizedString(parent1)) && s2.equals(getArgumentizedString(parent1))) {
 			return 0;
 		}
-		if(!s2.equals(parent2.getArgumentizedString()) && s1.equals(parent2.getArgumentizedString())) {
+		if(!s2.equals(getArgumentizedString(parent2)) && s1.equals(getArgumentizedString(parent2))) {
 			return 0;
 		}
 		int distance = StringDistance.editDistance(s1, s2);

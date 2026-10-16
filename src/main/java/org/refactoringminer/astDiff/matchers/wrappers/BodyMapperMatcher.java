@@ -7,6 +7,7 @@ import gr.uom.java.xmi.LocationInfo.CodeElementType;
 import gr.uom.java.xmi.decomposition.*;
 import gr.uom.java.xmi.decomposition.replacement.CompositeReplacement;
 import gr.uom.java.xmi.decomposition.replacement.Replacement;
+import gr.uom.java.xmi.decomposition.replacement.Replacement.ReplacementType;
 import gr.uom.java.xmi.diff.ExtractVariableRefactoring;
 import gr.uom.java.xmi.diff.UMLAnonymousClassDiff;
 import gr.uom.java.xmi.diff.UMLClassDiff;
@@ -64,6 +65,8 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 for (UMLClassDiff nestedClassDiff : anonymousClassDiff.getNestedClassDiffList()) {
                     new ClassDiffMatcher(optimizationData, nestedClassDiff, true, Collections.emptyList(), LANG1, LANG2).match(srcTree, dstTree, mappingStore);
                 }
+                //the comments inside the anonymous class, which are not inside its operations
+                new CommentMatcher(optimizationData, anonymousClassDiff.getCommentListDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
                 Tree srcTypeDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,anonymousClassDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.OBJECT);
                 Tree dstTypeDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,anonymousClassDiff.getNextClass().getLocationInfo(),LANG2,LANG2.OBJECT);
                 if(srcTypeDeclaration != null && dstTypeDeclaration != null) {
@@ -86,8 +89,15 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         ArrayList<AbstractCodeMapping> mappings = new ArrayList<>(mappingSet);
         for (AbstractCodeMapping abstractCodeMapping : mappings) {
             if (abstractCodeMapping instanceof LeafMapping) {
-                if (optimizationData.getProcessedLeafMappings().add(abstractCodeMapping))
+                if (optimizationData.getProcessedLeafMappings().add(abstractCodeMapping)) {
                     processLeafMapping(srcTree,dstTree,abstractCodeMapping,mappingStore, isPartOfExtractedMethod);
+                    if (containsReplacementOfType(abstractCodeMapping, ReplacementType.ARGUMENT_REPLACED_WITH_RIGHT_HAND_SIDE_OF_ASSIGNMENT_EXPRESSION)) {
+                        Tree srcStatementNode = TreeUtilFunctions.findByLocationInfo(srcTree, abstractCodeMapping.getFragment1().getLocationInfo(), LANG1);
+                        Tree dstStatementNode = TreeUtilFunctions.findByLocationInfo(dstTree, abstractCodeMapping.getFragment2().getLocationInfo(), LANG2);
+                        if (srcStatementNode != null && dstStatementNode != null)
+                            alignAssignmentReplacedWithSetterCall(srcStatementNode, dstStatementNode, mappingStore, LANG1, LANG2);
+                    }
+                }
             }
             else if (abstractCodeMapping instanceof CompositeStatementObjectMapping)
                 processCompositeMapping(srcTree,dstTree,abstractCodeMapping,mappingStore);
@@ -98,6 +108,94 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             new JavaDocMatcher(optimizationData, bodyMapper.getContainer1().getJavadoc(), bodyMapper.getContainer2().getJavadoc(), bodyMapper.getJavadocDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
         new CommentMatcher(optimizationData, bodyMapper.getCommentListDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
 
+    }
+
+    private static boolean containsReplacementOfType(AbstractCodeMapping mapping, ReplacementType type) {
+        for (Replacement replacement : mapping.getReplacements()) {
+            if (replacement.getType().equals(type))
+                return true;
+        }
+        return false;
+    }
+
+    //object.name = value replaced with object._set('name', value), where the values are mapped
+    protected static void alignAssignmentWithSetterCall(Tree value1, Tree value2, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
+        Tree assignment1 = value1.getParent();
+        Tree arguments2 = value2.getParent();
+        Tree call2 = arguments2.getParent();
+        //remove the arguments node, so that the values have mapped parents and are not reported as moved
+        Set<Tree> srcs = mappingStore.getSrcs(arguments2);
+        if(srcs != null) {
+            for(Tree src : new ArrayList<>(srcs)) {
+                mappingStore.removeMapping(src, arguments2);
+            }
+        }
+        int index = call2.getChildPosition(arguments2);
+        call2.getChildren().remove(index);
+        for(Tree argumentChild : new ArrayList<>(arguments2.getChildren())) {
+            call2.insertChild(argumentChild, index++);
+        }
+        mappingStore.addMapping(assignment1, call2);
+        if(assignment1.getParent().getType().name.equals(LANG1.EXPRESSION_STATEMENT) && call2.getParent().getType().name.equals(LANG2.EXPRESSION_STATEMENT)) {
+            Tree statement1 = assignment1.getParent();
+            Tree statement2 = call2.getParent();
+            mappingStore.addMapping(statement1, statement2);
+            com.github.gumtreediff.utils.Pair<Tree,Tree> semicolons = Helpers.findPairOfType(statement1, statement2,LANG1.SEMICOLON,LANG2.SEMICOLON);
+            if (semicolons != null) {
+                mappingStore.addMapping(semicolons.first, semicolons.second);
+            }
+        }
+    }
+
+    //aligns the statements of a leaf mapping where object.name = value; is replaced with object._set('name', value);
+    private static void alignAssignmentReplacedWithSetterCall(Tree statement1, Tree statement2, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
+        if(!statement1.getType().name.equals(LANG1.EXPRESSION_STATEMENT) || !statement2.getType().name.equals(LANG2.EXPRESSION_STATEMENT) ||
+                statement1.getChildren().isEmpty() || statement2.getChildren().isEmpty()) {
+            return;
+        }
+        Tree assignment1 = statement1.getChild(0);
+        Tree call2 = statement2.getChild(0);
+        if(!assignment1.getType().name.equals(LANG1.ASSIGNMENT_EXPRESSION) || !call2.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+            return;
+        }
+        Tree arguments2 = TreeUtilFunctions.findChildByType(call2, LANG2.METHOD_INVOCATION_ARGUMENTS);
+        if(arguments2 == null || !propertyNamePassedAsArgument(assignment1, arguments2, LANG1, LANG2)) {
+            return;
+        }
+        Tree value1 = assignment1.getChild(assignment1.getChildren().size()-1);
+        for(Tree argument2 : arguments2.getChildren()) {
+            if(value1.isIsomorphicTo(argument2)) {
+                mappingStore.addMappingRecursively(value1, argument2);
+                alignAssignmentWithSetterCall(value1, argument2, mappingStore, LANG1, LANG2);
+                return;
+            }
+        }
+    }
+
+    private static boolean stringArgument(Tree arguments, String value, Constants LANG) {
+        for(Tree argument : arguments.getChildren()) {
+            if(argument.getType().name.equals(LANG.STRING)) {
+                for(Tree stringChild : argument.getChildren()) {
+                    if(stringChild.getLabel().equals(value)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    //the name of the assigned property is passed as a string argument, i.e., object.name = value replaced with object._set('name', value)
+    protected static boolean propertyNamePassedAsArgument(Tree assignment1, Tree arguments2, Constants LANG1, Constants LANG2) {
+        Tree leftHandSide1 = assignment1.getChild(0);
+        if(!leftHandSide1.getType().name.equals(LANG1.MEMBER_EXPRESSION) || leftHandSide1.getChildren().isEmpty()) {
+            return false;
+        }
+        Tree property1 = leftHandSide1.getChild(leftHandSide1.getChildren().size()-1);
+        if(!property1.getType().name.equals(LANG1.PROPERTY_IDENTIFIER)) {
+            return false;
+        }
+        return stringArgument(arguments2, property1.getLabel(), LANG2);
     }
 
     //post-processing of the call site of the inlined method, whose argument is an anonymous class replaced with a lambda,
@@ -346,6 +444,14 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) &&
                         srcStatementNode.getChildren().size() > 1 && dstStatementNode.getChildren().size() > 1) {
                     //handle ignoreIoException {} in Kotlin to Kotlin
+                    processCallExpressionsModeledAsCompositeStatements(mappingStore, srcStatementNode, dstStatementNode);
+                }
+                if(compositeStatementObjectMapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
+                        compositeStatementObjectMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
+                        srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) &&
+                        srcStatementNode.getChildren().size() > 1 && dstStatementNode.getChildren().size() > 1 &&
+                        JavaToKotlinMigration.isRequireOrCheckCall(srcStatementNode, LANG1) && JavaToKotlinMigration.isRequireOrCheckCall(dstStatementNode, LANG2)) {
+                    //handle require/check(condition) {} in Kotlin to Kotlin
                     processCallExpressionsModeledAsCompositeStatements(mappingStore, srcStatementNode, dstStatementNode);
                 }
                 if(compositeStatementObjectMapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.SYNCHRONIZED_STATEMENT) &&
@@ -1371,6 +1477,9 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                             }
                         }
                     }
+                    else {
+                        processArgumentsWithArrowFunction(matched.first, matched.second, mappingStore);
+                    }
                     Pair<Tree,Tree> field_expressions = Helpers.findPairOfType(matched.first, matched.second,LANG1.FIELD_EXPRESSION,LANG2.FIELD_EXPRESSION);
                     if(field_expressions != null) {
                         mappingStore.addMappingRecursively(field_expressions.first, field_expressions.second);
@@ -1489,9 +1598,18 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             //an assignment moved to the initializer of the assigned field, i.e., the statement client = builder.client; in the constructor
             boolean assignmentToInitializer = leafMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_INITIALIZER) &&
                     JavaToKotlinMigration.handleAssignmentToInitializerMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
-            if(!assignmentToInitializer) {
+            //the constant of the if condition replaced with the condition of the when entry
+            boolean equalityOperandToWhenCondition = !assignmentToInitializer && leafMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY_CONDITION) &&
+                    JavaToKotlinMigration.handleEqualityOperandToWhenCondition(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+            //the name negated in the inverted condition, i.e., if (started) throw ... -> check(!started) {...}
+            boolean nameReplacedWithNegatedName = !assignmentToInitializer && !equalityOperandToWhenCondition &&
+                    JavaToKotlinMigration.handleNameReplacedWithNegatedName(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2);
+            //the throw statement replaced with its message, i.e., if (x) throw new IllegalStateException("message"); -> check(!x) { "message" }
+            boolean throwReplacedWithMessage = !assignmentToInitializer && !equalityOperandToWhenCondition && !nameReplacedWithNegatedName &&
+                    JavaToKotlinMigration.handleThrowReplacedWithMessage(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+            if(!assignmentToInitializer && !equalityOperandToWhenCondition && !nameReplacedWithNegatedName && !throwReplacedWithMessage) {
                 mappingStore.addMapping(srcStatementNode, dstStatementNode);
-                JavaToKotlinMigration.handleLeafMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
+                JavaToKotlinMigration.handleLeafMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, abstractCodeMapping.getRefactorings(), optimizationData.getDeferredFlattenings());
             }
         }
         matchParentStatements(srcStatementNode, dstStatementNode, mappingStore);
@@ -1562,6 +1680,33 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         Pair<Tree,Tree> arrows = Helpers.findPairOfType(lambdaLiterals.first, lambdaLiterals.second, LANG1.ARROW, LANG2.ARROW);
         if(arrows != null) {
             mappingStore.addMapping(arrows.first, arrows.second);
+        }
+    }
+
+    //JS/TS calls with arrow function arguments, i.e., useEffect(() => {...}, [dependencies])
+    //the arrow function bodies are matched by the lambda mappers, the remaining arguments are matched if isomorphic
+    private void processArgumentsWithArrowFunction(Tree call1, Tree call2, ExtendedMultiMappingStore mappingStore) {
+        Pair<Tree,Tree> arguments = Helpers.findPairOfType(call1, call2, LANG1.METHOD_INVOCATION_ARGUMENTS, LANG2.METHOD_INVOCATION_ARGUMENTS);
+        if(arguments == null || arguments.first.getChildren().size() != arguments.second.getChildren().size() ||
+                arguments.first.getChildren().stream().noneMatch(child -> child.getType().name.equals(LANG1.ARROW_FUNCTION))) {
+            return;
+        }
+        Tree callee1 = call1.getChild(0);
+        Tree callee2 = call2.getChild(0);
+        if(callee1.isIsomorphicTo(callee2)) {
+            mappingStore.addMappingRecursively(callee1, callee2);
+        }
+        mappingStore.addMapping(arguments.first, arguments.second);
+        for(int i=0; i<arguments.first.getChildren().size(); i++) {
+            Tree argument1 = arguments.first.getChild(i);
+            Tree argument2 = arguments.second.getChild(i);
+            if(argument1.getType().name.equals(LANG1.ARROW_FUNCTION) && argument2.getType().name.equals(LANG2.ARROW_FUNCTION)) {
+                mappingStore.addMapping(argument1, argument2);
+                processArrowFunction(argument1, argument2, mappingStore, LANG1, LANG2);
+            }
+            else if(argument1.isIsomorphicTo(argument2)) {
+                mappingStore.addMappingRecursively(argument1, argument2);
+            }
         }
     }
 
