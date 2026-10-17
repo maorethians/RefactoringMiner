@@ -1,0 +1,31 @@
+#SWRTJ: There are several issues with this implementation:
+1. **Exception handling is incorrect.** If `fileChannel.write` throws, the `catch` block logs the error, but execution falls through to `WROTE_POSITION_UPDATER.addAndGet(this, data.length)` and `return true`. The caller will believe the write succeeded when it actually failed. The position should only be advanced and `true` returned when the write is confirmed successful.
+2. **Partial write is not handled.** `FileChannel.write(ByteBuffer)` is permitted to write fewer bytes than requested. The code does not check `buffer.hasRemaining()` or loop until the buffer is fully consumed. A partial write followed by an unconditional position advance will corrupt the consume queue.
+3. **Thread-safety / race condition.** The sequence `get(currentPos)` → `write` → `addAndGet` is not atomic. Two concurrent callers can read the same `currentPos`, both write to the same offset (one overwriting the other), and both advance the position, leaving a gap. Consider using `fileChannel.write(ByteBuffer.wrap(data), currentPos)` (the two-arg form that does not mutate the shared channel position) combined with a `compareAndSet` loop on `WROTE_POSITION_UPDATER`, or document/enforce single-threaded access.
+4. **Shared channel position mutation.** `this.fileChannel.position(currentPos)` mutates the channel's shared position field. If any other code path on the same `DefaultMappedFile` relies on the channel position, this will cause interference. Prefer the position-parameter overload of `write`.
+A sketch of a corrected version:
+```java
+@Override
+public boolean appendMessageUsingFileChannel(byte[] data) {
+    int currentPos = WROTE_POSITION_UPDATER.get(this);
+    if ((currentPos + data.length) > this.fileSize) {
+        return false;
+    }
+    try {
+        ByteBuffer buf = ByteBuffer.wrap(data);
+        while (buf.hasRemaining()) {
+            fileChannel.write(buf, currentPos + (data.length - buf.remaining()));
+        }
+    } catch (Throwable e) {
+        log.error("Error occurred when append message to mappedFile.", e);
+        return false;
+    }
+    WROTE_POSITION_UPDATER.addAndGet(this, data.length);
+    return true;
+}
+```
+(And add a `compareAndSet` loop or external synchronization if concurrent writers are possible.)
+
+#GY35D, #HQGGM, #RW30H, #S678A: The conditional branching pattern is repeated identically in four call sites. While functionally correct, this will be a maintenance burden: any future change to the dispatch logic (e.g., adding a third strategy) must be replicated in all four places. Consider encapsulating the choice in a small helper on `MappedFile` (e.g., `appendMessage(byte[] data)` that internally checks the config) or in a factory that returns the appropriate strategy, so callers remain unchanged.
+
+#8MNNX: The default value is `true`, which means the new `FileChannel` path becomes the default behavior for all existing deployments on upgrade. Given that the `FileChannel` implementation has the correctness concerns noted above (partial writes, exception handling), shipping it as the default is risky. Consider defaulting to `false` (preserving the existing `MappedByteBuffer` path) until the `FileChannel` path has been validated in production, or at minimum ensure the implementation issues above are resolved before making it the default.

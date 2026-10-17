@@ -1,0 +1,25 @@
+#MY7RN, #CM9BW: The `onFatalError` callback unconditionally sets `connectionAsyncSubject = null` without verifying that the subject still corresponds to the connection that actually experienced the fatal error. Consider this sequence:
+1. Connection A is active; `connectionAsyncSubject` → A.
+2. Connection A dies; two in-flight RPCs (R1, R2) will each fire `onClose` with a fatal error.
+3. R1's `onClose` fires → `onFatalError` → `connectionAsyncSubject = null`.
+4. A concurrent `acquireConnection()` sees null, creates Connection B, sets `connectionAsyncSubject` → B.
+5. R2's `onClose` fires (still on the old, dead Connection A) → `onFatalError` → `connectionAsyncSubject = null`.
+Step 5 invalidates the perfectly healthy Connection B, forcing yet another connection to be created on the next acquire. The fix would be to capture the specific `AsyncSubject` (or the `Connection`) at creation time and only null it out if it is still the current one:
+```java
+/* onFatalError= */ () -> {
+  synchronized (this) {
+    if (connectionAsyncSubject == mySubject) {
+      connectionAsyncSubject = null;
+    }
+  }
+}
+```
+This is a low-probability race (requires two in-flight RPCs on a dying connection with a concurrent acquire in between), but it is a correctness gap in a concurrency-sensitive path.
+
+#7CWK5, #96PQN: `onClose` is typed as Guava's `Action` while the new `onFatalError` is typed as `Runnable`. Both are single-method, no-arg, no-return functional interfaces and are functionally interchangeable. Using two different types for the same conceptual role (a callback with no arguments) adds unnecessary cognitive overhead for readers. Consider using `Action` for both (or `Runnable` for both) for consistency.
+
+#8WX46: The line
+```java
+listener.onClose(Status.fromThrowable(mock(Errors.NativeIoException.class)), new Metadata());
+```
+is redundant. The mock `ClientCall.start` `doAnswer` already invokes `onClose` on the wrapped listener (which delegates to this same `listener`). Since `listener` is an empty `ClientCall.Listener<>() {}`, this second call is a no-op, but it misleads a reader into thinking it is the mechanism that triggers the fatal-error path. Removing it (or adding a brief comment explaining it is intentional) would make the test's intent clearer.

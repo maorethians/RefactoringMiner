@@ -1,0 +1,32 @@
+#6J2E5: The old `computeOutput` handled `LEFT`, `RIGHT`, `FULL`, and a default case. The new implementation only supports `LEFT` and throws `UnsupportedOperationException` for everything else. If RIGHT or FULL joins were reachable through any code path (even if rarely used), this is a hard breaking change. Consider whether a deprecation path or a more descriptive error message (naming the unsupported join type) would be safer, e.g.:
+```java
+default -> throw new UnsupportedOperationException(
+    "JOIN type " + config.type() + " is not supported in computeOutput; only LEFT is supported"
+);
+```
+
+#HXZG9: The previous code handled `localRelation == null` by falling back to `Expressions.asAttributes(matchFields)` as the right side. The new code throws `IllegalStateException`. If any code path (e.g., plan serialization/deserialization, plan inspection, or a partial-resolution state) calls `output()` before the local relation is bound, this will now fail where it previously succeeded. Please confirm that all callers guarantee `localRelation != null` before invoking `output()`, or that this is an intentional fail-fast for a previously-undefined state.
+
+#0YX4V, #VJ465, #6QJHN: All three deserialization constructors use the pattern:
+```java
+(List<Attribute>) (List) in.readNamedWriteableCollectionAsList(NamedExpression.class)
+```
+Because of type erasure, this cast always succeeds at the list level. A `ClassCastException` would only surface later when an element is actually used as an `Attribute`. If a plan serialized by an older version (or a different code path) contained a non-`Attribute` `NamedExpression` (e.g., a `Function` or `Literal`), the failure would be delayed and harder to diagnose. Consider adding a runtime validation loop after the cast:
+```java
+List<Attribute> matchFields = (List<Attribute>) (List) in.readNamedWriteableCollectionAsList(NamedExpression.class);
+for (Object e : matchFields) {
+    if (e instanceof Attribute == false) {
+        throw new IllegalStateException("Expected Attribute but got " + e.getClass().getSimpleName());
+    }
+}
+```
+This converts a potentially confusing downstream `ClassCastException` into an immediate, descriptive error.
+
+#6J2E5, #KE21C: The old `mergeOutput` logic was:
+- LHS attributes kept if not in RHS **or** if they are match fields (match fields sourced from LHS)
+- RHS attributes kept only if they are **not** match fields (match fields excluded from RHS)
+The new logic (`removeCollisionsWithMatchFields` + `mergeOutputAttributes`) keeps match-field attributes from the **RHS** and merges them with the LHS. This inverts which side "owns" the match-field columns in the output. For a LOOKUP this may be the intended fix (the lookup table's column is what the user expects), but it is a behavioral change for any consumer of `Join.computeOutput`. Please verify that downstream plan-to-physical translation and result-set column ordering are consistent with this new ownership model.
+
+#HG8H4: The added `a instanceof ReferenceAttribute == false` check is a good defensive improvement. However, note that `ReferenceAttribute` may carry a different `id()` or `synthetic()` flag than the original. If a `ReferenceAttribute` is passed in, it is now kept as-is rather than being re-wrapped. Confirm that all callers pass attributes with the expected `id()` and `synthetic()` values, since the old code would have normalized them through the constructor.
+
+#E2Y93: The message `"visitQualifiedNamePatterns can only return UnresolvedNamePattern, UnresolvedStar or UnresolvedAttribute"` lists `UnresolvedNamePattern` and `UnresolvedStar`, but those are already rejected by the preceding `if` block with a `ParsingException`. By the time the second check fires, the only "expected" type is `UnresolvedAttribute`. A message like `"Expected UnresolvedAttribute but got " + ne.getClass().getSimpleName()` would be more actionable for debugging.

@@ -1,0 +1,23 @@
+#ACH5Z, #F5SCW, #7APB5, #BJVK4, #0RFCJ, #0KQ15, #HRT7V, #Y3J5V, #30YWX, #S5XVG, #Q5XZF, #3ENZF, #HFTD7, #HGPD3, #Q1CBN: The `ActionListener.runBefore` callback that sets `lastSeenClusterState` will execute on **both** the success and failure paths. The dependency for `ActionListener.runBefore` explicitly states:
+> "executes the provided `runBefore` callback before the listener is notified via either `#onResponse` or `#onFailure`"
+In the old code, `lastSeenClusterState.set(incomingState)` (or `compareAndSet`) was only reached after `acceptState(...)` returned successfully — if `handlePublishRequest` threw (e.g., `CoordinationStateRejectedException` for a stale term or UUID mismatch), the exception propagated and `lastSeenClusterState` was never updated.
+In the new code, when `handlePublishRequest` throws, `ActionRunnable.supply` routes the exception to `listener.onFailure(...)`, but the `runBefore` callback (`lastSeenClusterState.set(incomingState)`) still executes first. This means a **rejected** state overwrites `lastSeenClusterState`. Since `lastSeenClusterState` is the base for applying subsequent diffs (`deserializeAndApplyDiff(request, in, lastSeen)`), a future diff computed relative to the node's *actual* state will be applied to the wrong base, potentially producing a corrupt state or a spurious `IncompatibleClusterStateVersionException`.
+A concrete scenario:
+1. Node B is at state S₀ (term 5). `lastSeenClusterState` = S₀.
+2. Stale node A (term 3) sends S₁ (term 3). `handlePublishRequest` rejects it (term 3 < 5), but `lastSeenClusterState` is set to S₁.
+3. Node A sends S₂ (term 3, diff from S₁). The diff is applied to S₁ → produces S₂. `handlePublishRequest` rejects again, but `lastSeenClusterState` is now S₂.
+4. The legitimate master sends S₃ (term 6, diff from S₀). The diff is applied to S₂ (wrong base) → likely throws or produces garbage.
+The fix is to update `lastSeenClusterState` only on the success path, e.g.:
+```java
+acceptState(
+    incomingState,
+    ActionListener.wrap(
+        response -> {
+            lastSeenClusterState.set(incomingState);
+            publishResponseListener.onResponse(response);
+        },
+        e -> publishResponseListener.onFailure(e)
+    )
+);
+```
+This applies to both the full-state and diff-state call sites in `#0RFCJ`.

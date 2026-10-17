@@ -1,0 +1,27 @@
+#BANQQ: Two concerns with replacing the return value with `throw new IllegalStateException(...)`:
+1. **Wrong exception type for a user error.** An ambiguous column reference is a user-facing validation error, not an internal invariant violation. `IllegalStateException` signals a bug in the program's state and will typically surface as a 500 / internal error to the user. The previous approach of returning an `UnresolvedAttribute` carrying the message (or a dedicated `EsqlException` / `AnalysisException`) is more appropriate because it lets the caller produce a clean, actionable error response.
+2. **Lost user guidance.** The old message included the hint `"(to disambiguate use quotes or qualifiers)"`. The new message drops it, making the error harder to act on. If the throw is intentional, please restore that hint.
+
+#HY2HB: The duplicate-detection loop has a short-circuit bug:
+```java
+if (outputAttributeNames.add(outputAttr.name()) == false || outputAttributeIds.add(outputAttr.id()) == false) {
+```
+Because of `||`, when a **name** duplicate is detected the right-hand side is never evaluated, so the corresponding `NameId` is never inserted into `outputAttributeIds`. A later attribute that shares that `NameId` (but has a unique name) will then pass the id check and go unreported.
+Example: `A(name="x", id=1)`, `B(name="x", id=2)`, `C(name="y", id=2)` → B triggers the name-dup branch, id 2 is never added, C's id 2 is not flagged.
+Fix by evaluating both adds unconditionally:
+```java
+boolean nameDup = outputAttributeNames.add(outputAttr.name()) == false;
+boolean idDup   = outputAttributeIds.add(outputAttr.id()) == false;
+if (nameDup || idDup) {
+    failures.add(fail(p, "Plan [{}] optimized incorrectly due to duplicate output attribute {}", p.nodeString(), outputAttr.toString()));
+}
+```
+
+#K3TR6: The unchecked cast `(List<Alias>) (List) mergeOutputExpressions(...)` is safe *today* because `childOutput` is `List.of()` so the returned list contains only the `Alias` elements from `visitFields`. However, the safety depends entirely on the implementation detail of `mergeOutputExpressions` (that it never introduces non-`Alias` elements when `childOutput` is empty). If that contract is ever relaxed, this cast will silently produce a `ClassCastException` at the call site.
+Consider either:
+- Adding a `@Contract` / Javadoc note on `mergeOutputExpressions` that the result element type is a supertype of the `fields` element type, or
+- Avoiding the cast by having `Row` accept `List<? extends NamedExpression>` if its API allows it.
+The `@SuppressWarnings("unchecked")` is fine as a stopgap, but the fragility is worth a code comment at the call site.
+
+#K2BS9: Throwing `IllegalStateException` is a reasonable defensive guard, but note the interaction with the new duplicate-output check in `#HY2HB`: if a `Rename` node ever reaches the optimizer (e.g., due to a regression in the analysis phase), `p.output()` will throw an unhandled `IllegalStateException` that propagates out of `checkPlan` and out of the optimizer, rather than being recorded as a `Failure` in the `Failures` collector. This turns a recoverable diagnostic into a crash.
+If the invariant "Rename is always rewritten before optimization" is truly guaranteed, this is acceptable. Otherwise, consider returning an empty list (or a sentinel) so the optimizer's failure-collection path can report it gracefully.

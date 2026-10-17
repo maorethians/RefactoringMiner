@@ -1,0 +1,37 @@
+#PF9T2, #T6VHJ, #6BQK2: The `rewriteFieldDocs` method (and by extension `rewriteTopFieldDocs` and `rewriteTopFieldGroups`) mutates the original `FieldDoc` objects in place:
+```java
+newDocs[pos] = docIdToFieldDoc.get(doc.doc);
+newDocs[pos].score = doc.score;
+newDocs[pos].fields[0] = doc.score;
+```
+This means the `FieldDoc` instances that were part of the original `topDocs.scoreDocs` array are modified. If any other component holds a reference to those objects (e.g., a collector that cached them, or a concurrent request sharing the searcher), they will observe the mutated scores. Consider creating new `FieldDoc` instances instead of mutating the originals, or at minimum add a comment explaining why in-place mutation is safe in this context.
+
+#2E3P0: `validateSortFields` does not guard against sort arrays with more than 2 fields. If a user specifies `[score, _shard_doc, some_other_field]`, the method returns `true` because it only checks `fields[0]` and `fields[1]`, silently ignoring any additional sort fields. This could lead to incorrect rescore behavior since the rescore phase assumes the result ordering is determined solely by score (and optionally `_shard_doc` as a tiebreaker). Consider adding:
+```java
+if (fields.length > 2) {
+    return false;
+}
+```
+
+#PF9T2: In the public constructor, `extractMinWindowSize(rescorers)` is called (via the `super(...)` call) before the `rescorers.isEmpty()` check. If `rescorers` is an empty list, `extractMinWindowSize` returns `Integer.MAX_VALUE`, which is passed as `rankWindowSize` to the parent constructor before the `IllegalArgumentException` is thrown. While this doesn't cause a crash (the exception is thrown immediately after), it's cleaner to validate before calling `super`. Since Java requires `super()` to be the first statement, a practical fix would be to move the empty check into a static factory or to accept that the parent briefly holds an invalid value. At minimum, a brief comment explaining the ordering constraint would help future readers.
+
+#G65N5: The block that populates `FieldDoc#score` from `fields[0]`:
+```java
+Arrays.stream(topDocs.scoreDocs).forEach(t -> {
+    if (t instanceof FieldDoc fieldDoc) {
+        fieldDoc.score = (float) fieldDoc.fields[0];
+    }
+});
+```
+This mutates every `FieldDoc` in the query result's top docs. Combined with the later mutation in `rewriteFieldDocs` (which also writes to `fieldDoc.score` and `fieldDoc.fields[0]`), the same objects are mutated twice. While the net effect is correct, the double mutation makes the data flow harder to reason about. A brief comment or a single unified pass would improve clarity.
+
+#VTZ9E: The removal of the `_shard_doc`-requires-point-in-time validation is a broad behavioral change: it now permits `_shard_doc` as a sort field in any search context, not just PIT-based ones. The new `RescorePhase.validateSortFields` restricts it to a tiebreaker-after-score position *during rescore*, but a plain search with `sort: [_shard_doc]` (no rescore, no PIT) would now pass validation. If this is intentional (i.e., `_shard_doc` is being promoted to a general-purpose tiebreaker), that's fine, but it's worth confirming that downstream code (e.g., `SearchService`, shard-level collectors) handles `_shard_doc` sort correctly outside of a PIT context.
+
+#PMRYK: Good defensive copy. Without `new ArrayList<>(v)`, the parser's internal list could be shared and mutated, leading to subtle bugs if the parser is reused or the list is modified after assignment.
+
+#7SDB3, #SXJWA, #K95KW, #N53D2, #6WNC7, #WVPE6, #1FGE9, #PJ9GA, #9EJPJ, #WC6CJ, #DTJ44, #8N48S, #66R43, #9RYH7: These changes are consistent and correct:
+- Registration, feature flag, and test infrastructure are straightforward.
+- The test additions (`#1FGE9`, `#PJ9GA`, `#9EJPJ`) properly exercise the new `_shard_doc` tiebreaker with rescore.
+- `#DTJ44` and `#8N48S` correctly replace the old `sort == null` check with the new `validateSort` method.
+- `#66R43`/`#9RYH7` correctly refactor the group-rewrite logic to use the shared `rewriteFieldDocs` helper.
+- `#WC6CJ` provides adequate round-trip parsing coverage.

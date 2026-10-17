@@ -1,0 +1,46 @@
+#FPJ1A, #F8W9R, #G5NHS, #JWJ5X, #YPXXG, #7W7XS, #DFJGY, #WKJ8N, #YN9K4, #FDFP6, #KMQD5, #6TF3Q, #9FZHB, #VAM4E, #NFZM0, #WVNRZ: License header diffs — no issues.
+
+#F8W9R: The `toString()` method returns a string starting with `"PopDeliveryRecord{"` but the class name is `PopConsumerRecord`. This is a copy-paste error that will cause confusion in logs and debugging.
+
+#RHGVZ: In the `revive()` method, records added to `failureList` are the **same object references** as those in `consumerRecords`. After `record.setInvisibleTime(record.getInvisibleTime() + backoffInterval)` mutates the record in place, both lists see the modified object. The subsequent `this.popConsumerStore.deleteRecords(consumerRecords)` will compute keys using the **new** (modified) `invisibleTime`, which are the same keys just written by `writeRecords(failureList)`. This means the backoff-retry records are immediately deleted after being written, defeating the retry mechanism.
+Fix: either create new `PopConsumerRecord` instances for the failure list, or track the original keys before mutation and delete only the successful records (or delete by original key).
+
+#RHGVZ: In `revive()`, the array index expression:
+```java
+REWRITE_INTERVALS_IN_SECONDS[Math.min(REWRITE_INTERVALS_IN_SECONDS.length, record.getAttemptTimes())]
+```
+`REWRITE_INTERVALS_IN_SECONDS.length` is 16, so the index can be 16, but valid indices are 0–15. With the default `popReviveMaxAttemptTimes = 16`, the guard `record.getAttemptTimes() < 16` prevents this, but if an operator sets `popReviveMaxAttemptTimes > 16`, this will throw `ArrayIndexOutOfBoundsException`. Use `Math.min(REWRITE_INTERVALS_IN_SECONDS.length - 1, record.getAttemptTimes())` instead.
+
+#RHGVZ: In `transferToFsStore()`:
+```java
+ck.setRePutTimes(ck.getRePutTimes());
+```
+This is a no-op (setting a field to its own current value). It appears to be a placeholder or a bug — the intent was likely to carry over a retry count from the `PopConsumerRecord` or initialize it to a meaningful value.
+
+#RHGVZ, #0PTH9, #Z3EYJ: Both `ackOrderlyNew` and `processChangeInvisibleTimeForOrderNew` use the same unbounded busy-wait pattern:
+```java
+while (!consumerLockService.tryLock(consumeGroup, topic)) {
+}
+```
+This is a hot spin that will saturate a CPU core under lock contention. A brief `Thread.yield()` or `LockSupport.parkNanos(...)` inside the loop would be more appropriate for a broker-side service.
+
+#K149S: Inside the loop over `queueOffsetMap.entrySet()`, the call `clearCache(group, topic, queueId)` uses the outer method parameter `queueId` rather than `entry.getKey()`. If `queueOffsetMap` ever contains more than one queue entry, all iterations will clear the cache for the same (wrong) queue. This should be `entry.getKey()`.
+
+#28GMW: `preShutdown()` closes `defaultCFHandle` but not `columnFamilyHandle`. If the parent class `AbstractRocksDBStorage` also iterates `cfHandles` and closes them during its own shutdown, then `defaultCFHandle` (which is `cfHandles.get(0)`) will be closed twice, potentially causing a native crash in RocksDB JNI. If the parent does **not** close them, then `columnFamilyHandle` is leaked. Clarify the ownership contract and ensure each handle is closed exactly once.
+
+#S5GZ5: ```java
+assert response != null;
+if (response.getCode() == SUCCESS) {
+```
+Assertions are disabled by default in production JVMs (`-ea` not set). If `invokeSync` ever returns null (e.g., on a connection failure that is swallowed), this will throw a `NullPointerException` instead of a meaningful exception. Replace with an explicit null check that throws `RemotingConnectException` or similar.
+
+#RXXAV: The `dryRun` flag logic is inverted:
+```java
+boolean dryRun = commandLine.hasOption('d') &&
+    Boolean.FALSE.toString().equalsIgnoreCase(commandLine.getOptionValue('d'));
+```
+This evaluates to `true` when the user passes `--dryRun false`, and `false` when they pass `--dryRun true`. The comparison should be against `Boolean.TRUE.toString()`.
+
+#7VE8W: `ConsumerRecords.getMinOffsetInBuffer()` reads `recordTreeMap.firstEntry()` without acquiring the `ReentrantLock`. Since `TreeMap` is not thread-safe, concurrent `write()` or `delete()` calls from other threads can cause `ConcurrentModificationException` or return inconsistent results. The same applies to `getInFlightRecordCount()` which calls `recordTreeMap.size()`. These should be called under the lock, or the method should document that it is only safe to call from the cleanup thread.
+
+#HS6F5: In the new KV-service path, when `POLLING_SUC` is returned, the lambda returns `null`, and then `thenAccept(result -> NettyRemotingAbstract.writeResponse(channel, request, result))` is invoked with `result == null`. While `writeResponse` is annotated `@Nullable`, the response is never sent to the client (the long-polling service will respond later). This is correct behavior, but it would be clearer to explicitly skip the `thenAccept` when the result is null (e.g., via a `thenAccept` that checks for null and returns early, or by restructuring the chain) to avoid relying on the `@Nullable` contract of a utility method.

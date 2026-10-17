@@ -1,0 +1,42 @@
+#B6QJ9: **1. `getLocks()` will throw `ClassCastException` at runtime**
+In `AdaptiveBackOffSpinLockImpl.getLocks()`, the return statement is:
+```java
+return (List<AdaptiveBackOffSpinLock>) this.locks.values();
+```
+`Map.values()` returns a `Collection<V>`, not a `List<V>`. This unchecked cast will throw a `ClassCastException` the moment the method is called. It should either return `Collection<AdaptiveBackOffSpinLock>` or wrap in `new ArrayList<>(this.locks.values())`.
+
+#VYWEP: **2. `adaptiveLock` field is not `volatile` — data race on lock swap**
+In `AdaptiveBackOffSpinLockImpl`, the `adaptiveLock` field is read in `lock()` and `unlock()` on every call, but written in `swap()` (which runs from `unlock()` on another thread). Without `volatile` (or equivalent synchronization), a thread may continue to use the stale lock reference indefinitely after a swap. Declare it as `private volatile AdaptiveBackOffSpinLock adaptiveLock;`.
+
+#Z5ASQ: **3. `optimalDegree` in `BackOffSpinLock` has a data race**
+`optimalDegree` is read in `lock()` (unsynchronized) and written in `adapt()` (synchronized) and `update()` (unsynchronized). The `update()` method writes the field without any synchronization, while `lock()` reads it concurrently. The field should be declared `volatile`, and `update()` should either be `synchronized` or use an atomic write.
+
+#6XJXF: **4. Busy-wait on `state` in `lock()` will peg a CPU core**
+```java
+boolean state;
+do {
+    state = this.state.get();
+} while (!state);
+```
+This is a tight spin with no `Thread.yield()` or sleep. If `state` is `false` (during a swap), every calling thread will burn 100% of a core until the swap completes. Add `Thread.yield()` inside the loop, or use a short `LockSupport.parkNanos(...)`.
+
+#M85CD: **5. `threadTable` entries are never removed — unbounded memory growth**
+In `lock()`, each calling thread is inserted into `threadTable.get(slot)` via `putIfAbsent`. The only removal path is `threadTable.get(slot).clear()` inside `swap()`. If `isOpen` is `false` (disabling swap), or if the slot is never the "other" slot when `swap()` runs, entries accumulate forever. Threads should be removed in `unlock()` (e.g., `threadTable.get(slot).remove(Thread.currentThread())`).
+
+#RCJZF: **6. `update()` is never called on the new lock instance**
+In the `CommitLog` constructor (#M85CD), `AdaptiveBackOffSpinLockImpl` is instantiated but its `update(MessageStoreConfig)` method is never invoked. The user-configured `spinLockCollisionRetreatOptimalDegree` is therefore never propagated to the internal `BackOffSpinLock`. The constructor (or a subsequent initialization hook) should call `adaptiveBackOffSpinLock.update(messageStore.getMessageStoreConfig())`.
+**7. `Thread.sleep(0)` is a no-op; use `Thread.yield()` for spin backoff**
+In `BackOffSpinLock.lock()`, the backoff after a failed spin round is:
+```java
+Thread.sleep(0);
+```
+On most JVMs `sleep(0)` returns immediately without yielding the time slice. The intent here is to give other threads a chance to run, which is exactly what `Thread.yield()` does. Replace with `Thread.yield()`.
+**8. `e.printStackTrace()` in production lock code**
+In `BackOffSpinLock.lock()`, the `InterruptedException` handler calls `e.printStackTrace()`. In a high-throughput message store this will flood stderr and is not configurable. Use the project's logger (e.g., `log.warn("Interrupted during spin lock backoff", e)`) and consider restoring the interrupt flag with `Thread.currentThread().interrupt()`.
+**9. Test is timing-dependent and will be flaky in CI**
+`AdaptiveLockTest` relies on `Thread.sleep(1000)` to let a background thread complete its lock/unlock cycle, then asserts exact values (`assertEquals(2000, ...)`, `assertEquals(4, ...)`). The number of retreats recorded depends on scheduling, so the assertions are non-deterministic. Consider:
+- Using a `CountDownLatch` to synchronize instead of fixed sleeps.
+- Asserting ranges or invariants (e.g., `optimalDegree > INITIAL_DEGREE`) rather than exact values.
+- Running the concurrent scenario multiple times to reduce flakiness.
+**10. `currentThreadNum` can leak on exception paths**
+In `AdaptiveBackOffSpinLockImpl.lock()`, `currentThreadNum.incrementAndGet()` is called before `adaptiveLock.lock()`. If `adaptiveLock.lock()` throws (e.g., `InterruptedException` from a `ReentrantLock`), the counter is never decremented, permanently blocking future swaps (the `do { ... } while (currentThreadNum != 0)` loop in `swap()` will spin forever). Wrap in try/finally or decrement in a catch block.

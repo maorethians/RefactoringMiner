@@ -1,0 +1,46 @@
+#KNKFS: The `userEventTriggered` override handles `SslCloseCompletionEvent` but does not propagate any other user events further down the pipeline. Since this is an `@Override` of the base handler's method (which typically calls `ctx.fireUserEventTriggered(evt)`), all non-`SslCloseCompletionEvent` user events will be silently dropped. Consider adding a fallback propagation:
+```java
+@Override
+public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+    if (evt instanceof SslCloseCompletionEvent closeEvent) {
+        if (closeEvent.isSuccess() && ctx.channel().isActive()) {
+            logger.trace("received TLS close_notify, closing connection {}", ctx.channel());
+            ctx.close();
+        }
+    } else {
+        ctx.fireUserEventTriggered(evt);
+    }
+}
+```
+This ensures that any future or existing user events (e.g., `ChannelInputShutdownEvent`, custom pipeline events) are not lost.
+
+#V516F, #J8EW2: In both `nodeSettings` (IT test) and `setupHttpServer` (unit test), a `SelfSignedCertificate` is created but never closed. `SelfSignedCertificate` implements `Closeable` and holds temporary files on disk. While this is test code, it will accumulate temp files across repeated test runs. Consider wrapping in a try-with-resources or calling `ssc.close()` after extracting the paths:
+```java
+var ssc = new SelfSignedCertificate();
+try {
+    // ... build settings using ssc.privateKey().getPath() etc.
+} finally {
+    ssc.delete();
+}
+```
+
+#J8EW2: In `connectClientAndServer`, if `setupHttpClient` or the handshake assertion throws after `setupHttpServer` has succeeded, the server's `Netty4HttpServerTransport` and `TestThreadPool` are never stopped/shut down because the `ConnectionCtx` (which owns cleanup) is never constructed. This leaks the thread pool and bound port on the failure path. Consider a try/catch that performs cleanup before rethrowing:
+```java
+private ConnectionCtx connectClientAndServer(String tlsVersion) {
+    HttpServer server = null;
+    try {
+        server = setupHttpServer(tlsVersion);
+        var client = setupHttpClient(server);
+        var ssl = client.channel.pipeline().get(SslHandler.class);
+        safeAwait(ssl.handshakeFuture());
+        assertEquals(tlsVersion, ssl.engine().getSession().getProtocol());
+        return new ConnectionCtx(tlsVersion, server, client);
+    } catch (Exception e) {
+        if (server != null) {
+            server.netty.stop();
+            server.threadPool.shutdownNow();
+        }
+        throw new RuntimeException(e);
+    }
+}
+```

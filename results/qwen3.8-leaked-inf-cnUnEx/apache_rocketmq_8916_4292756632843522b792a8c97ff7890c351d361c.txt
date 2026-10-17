@@ -1,0 +1,16 @@
+#T7BYC, #E3SBJ, #M9S22: **Critical: The "lock stealing" path breaks mutual exclusion and leaks the semaphore.**
+In `#M9S22`, when `tryAcquire` fails and the lock is deemed expired, the code simply updates `lastLockTimeMs` and returns a non-null value — but it never acquires the semaphore. This means:
+1. **Mutual exclusion is violated.** The original holder (who did acquire the semaphore) and the "stealer" (who did not) can both believe they hold the lock. A third thread can then successfully `tryAcquire` while the stealer is still operating, resulting in two concurrent "lock holders."
+2. **Semaphore leak / permanent deadlock.** In `#E3SBJ`, if the lock is expired (> 2× timeout), `unlock` skips `semaphore.release()`. Combined with the steal path (which never calls `semaphore.acquire()`), the semaphore count is permanently decremented to 0 and never restored. After this happens, no future `tryAcquire` will ever succeed, and the only "recovery" is another steal — which again doesn't fix the count.
+The `synchronized(this)` double-check in the steal path only prevents two *stealers* from racing; it provides no coordination with the actual semaphore holder. The rest of the class relies on `Semaphore` for mutual exclusion, and introducing `synchronized(this)` only around the steal path creates a hybrid locking scheme where the two mechanisms are not coordinated. If the intent is to make the steal atomic with respect to the holder, the holder's `unlock` path would also need to participate in the same synchronization domain.
+A correct approach would be to either:
+- Actually acquire the semaphore in the steal path (e.g., `semaphore.drainPermits()` + `semaphore.acquire()`), or
+- Abandon the semaphore entirely and use a proper `ReentrantLock` with `tryLock` + a timestamp-based expiry that all paths respect, or
+- Use a `StampedLock` / `ReadWriteLock` with explicit ownership tracking.
+
+#XYXPC: **The lock is held across an asynchronous boundary, making the expiry-based unlock unreliable.**
+Here `handleData.unlock(lockTimeMs)` is called inside `future.whenComplete(...)`, meaning the lock is held for an unbounded duration (network I/O, downstream processing, etc.). If the future completes after the lock has expired, `unlock` will skip `semaphore.release()` (per `#E3SBJ`), leaking the semaphore as described above. Even if the future completes before expiry, the lock is held far longer than the `timeoutMs` used in `tryAcquire`, which defeats the purpose of a bounded lock wait.
+Consider whether the async callback should re-acquire the lock (with a fresh `tryAcquire`) rather than relying on a lock that was acquired before the async operation started.
+
+#F31TQ, #ERA66, #P2K7F, #XYXPC: **Returning `Long` (boxed) to signal failure is fragile and obscures intent.**
+Using `null` to mean "lock acquisition failed" forces every caller to perform a null check and makes it easy to accidentally unbox (NPE). A small result object (e.g., `LockResult` with `boolean acquired` + `long timestamp`) or a dedicated exception would make the contract explicit and eliminate the null-check boilerplate repeated in all four call sites.

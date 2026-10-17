@@ -1,0 +1,21 @@
+#TCNQE, #AQN8A, #B9YWS: **Off-by-one: the stream permits `maxBytesRead + 1` bytes instead of `maxBytesRead`.**
+The old `checkMaxBytesRead(int n)` checked `numRead + n > maxBytesRead` *before* the read, so exactly `maxBytesRead` bytes could be consumed. The new `checkMaxBytesRead()` checks `numRead > maxBytesRead` *after* the read, which means the byte that pushes `numRead` past the limit is still read from the underlying stream before the exception is thrown.
+Concrete trace with `maxBytesRead = 1`:
+1. `read()` → pre-check `0 > 1` passes → `super.read()` consumes a byte → `numRead = 1` → post-check `1 > 1` passes → **byte returned** ✓
+2. `read()` → pre-check `1 > 1` passes → `super.read()` consumes **another** byte → `numRead = 2` → post-check `2 > 1` throws ✗
+The second call has already advanced the underlying stream by one byte before the `IOException` is raised. For a `ByteArrayInputStream` this is invisible, but for a network or shared stream it silently discards data.
+Suggested fix: change the guard to `>=` so the limit is enforced *before* the read:
+```java
+private void checkMaxBytesRead() throws IOException {
+    if (numRead >= maxBytesRead) {
+        throw new IOException("Maximum number of bytes read: " + maxBytesRead);
+    }
+}
+```
+With `>=`, the pre-read check in both `read()` overloads blocks the call once the budget is exhausted, and the post-read check becomes a pure safety net (it will only fire if the underlying stream somehow returns more bytes than requested, which `InputStream` contracts forbid).
+Note that the `+ 1` in `int num = Math.min(len, maxBytesRead - numRead + 1)` in `#AQN8A` is a leftover from the old pre-increment logic. With the `>=` guard in place it is harmless (the code path where `numRead == maxBytesRead` is unreachable), but removing it makes the intent clearer:
+```java
+int num = Math.min(len, maxBytesRead - numRead);
+```
+
+#5ZR5H: The new test verifies that a large `read` call succeeds when the underlying stream is smaller than the limit, which is a useful scenario. However, it does not exercise the boundary condition that the refactored logic is most likely to get wrong: reading exactly `maxBytesRead` bytes and then confirming the next read throws. Consider adding a companion test, e.g. a 4-byte stream with `maxBytesRead = 4`, asserting the first read returns 4 bytes and the second throws `IOException`. This would have caught the off-by-one described above.
