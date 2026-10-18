@@ -7,6 +7,7 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import narrator.langchain.prompt.ReviewPrompt;
 import org.refactoringminer.astDiff.graph.cluster.traverse.Splitter;
 
+import java.io.InterruptedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -42,8 +43,9 @@ public class LangChainClient {
             model = OllamaChatModel.builder()
                     .baseUrl(baseUrl != null ? baseUrl : "http://localhost:11434")
                     .modelName(modelName)
-                    .timeout(Duration.ofSeconds(999)) // Increase timeout for local large models
+                    .timeout(Duration.ofSeconds(400)) // Increase timeout for local large models
                     .temperature(temperature)
+                    .maxRetries(1) // A timed-out request is not resent
                     .build();
         } else {
             throw new IllegalArgumentException("Unsupported provider: " + provider);
@@ -52,12 +54,23 @@ public class LangChainClient {
     }
 
     public String generate(String prompt) {
-        return model.generate(prompt);
+        return call(prompt);
+    }
+
+    private String call(String prompt) {
+        try {
+            return model.generate(prompt);
+        } catch (RuntimeException e) {
+            if (e.getCause() instanceof InterruptedIOException) {
+                throw new RequestTimeoutException(e.getCause().getMessage());
+            }
+            throw e;
+        }
     }
 
     public String reviewChapter(String content, boolean rawDiff) {
         System.out.println("result");
-        String result = this.model.generate(this.prompt.chapterResult(content, rawDiff));
+        String result = call(this.prompt.chapterResult(content, rawDiff));
         return result.replace(ReviewPrompt.END_OF_AUDIT, "").trim();
     }
 
@@ -69,7 +82,7 @@ public class LangChainClient {
             List<Integer> split = splits.get(i);
 
             System.out.println("Synthesizing final result part " + (i + 1) + " of " + splits.size());
-            String splitResult = model.generate(this.prompt.result(split.stream().map(results::get).toList()));
+            String splitResult = call(this.prompt.result(split.stream().map(results::get).toList()));
             List<ReviewPrompt.ReviewComment> parsedSplitResult = ReviewPrompt.parseResult(splitResult);
             if (parsedSplitResult == null) {
                 throw new SynthesisFailedException("Failed to parse final result part " + (i + 1) + " of " + splits.size());
@@ -83,6 +96,12 @@ public class LangChainClient {
 
     public static class SynthesisFailedException extends Exception {
         public SynthesisFailedException(String message) {
+            super(message);
+        }
+    }
+
+    public static class RequestTimeoutException extends RuntimeException {
+        public RequestTimeoutException(String message) {
             super(message);
         }
     }

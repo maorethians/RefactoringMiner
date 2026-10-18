@@ -21,6 +21,7 @@ public class Benchmark {
 
     private static final String DATASET_PATH = "dataset/contextCRBench";
     private static final String DETAILED_PRS_PATH = "dataset/detailedPRs";
+    // https://github.com/HaoooWang/llm-knowledge-cutoff-dates#deepseek
     private static final String MIN_CREATED_AT = "2024-03-01T00:00:00Z";
     private static final String RESULTS_DIR = "results/ContextCRBench";
     private static final String LOG_FILE = "scripts/ollama-proxy/ollama_proxy.log";
@@ -131,6 +132,10 @@ public class Benchmark {
                         } catch (LangChainClient.SynthesisFailedException e) {
                             // Leave untracked and without result so a rerun retries it
                             System.out.println("Synthesis failed, skipping " + resultKey + ": " + e.getMessage());
+                            continue;
+                        } catch (LangChainClient.RequestTimeoutException e) {
+                            // Leave untracked and without result so a rerun retries it
+                            System.out.println("Request timed out, skipping " + resultKey + ": " + e.getMessage());
                             continue;
                         }
                         if (best == null) {
