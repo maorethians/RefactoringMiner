@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import logging
 import httpx
@@ -120,7 +121,15 @@ async def proxy_request(request: Request, path: str):
         )
     else:
         try:
-            resp = await client.request(method=request.method, url=path, content=body, headers=headers)
+            # Cancel the upstream request when the client disconnects (e.g. on its timeout),
+            # which closes the connection so Ollama aborts the generation
+            upstream = asyncio.create_task(client.request(method=request.method, url=path, content=body, headers=headers))
+            while not upstream.done():
+                if await request.is_disconnected():
+                    upstream.cancel()
+                    return Response(status_code=499)
+                await asyncio.wait({upstream}, timeout=1.0)
+            resp = upstream.result()
 
             # LOG TOKENS
             try:
