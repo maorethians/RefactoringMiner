@@ -20,6 +20,7 @@ import org.refactoringminer.util.PrefixSuffixUtils;
 
 import gr.uom.java.xmi.Constants;
 import gr.uom.java.xmi.LeafType;
+import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.UMLAnonymousClass;
 import gr.uom.java.xmi.UMLAttribute;
 import gr.uom.java.xmi.UMLOperation;
@@ -47,6 +48,8 @@ import gr.uom.java.xmi.diff.ReplaceConditionalWithTernaryRefactoring;
 import gr.uom.java.xmi.diff.SplitConditionalRefactoring;
 import gr.uom.java.xmi.diff.StringDistance;
 import gr.uom.java.xmi.diff.UMLAbstractClassDiff;
+import gr.uom.java.xmi.diff.UMLClassBaseDiff;
+import gr.uom.java.xmi.diff.UMLModelDiff;
 import gr.uom.java.xmi.diff.UMLOperationDiff;
 import gr.uom.java.xmi.diff.UMLParameterDiff;
 
@@ -738,6 +741,17 @@ public class StringBasedHeuristics {
 		for(String line : lines) {
 			line = VariableReplacementAnalysis.prepareLine(line);
 			if(Visitor.METHOD_SIGNATURE_PATTERN.matcher(line).matches()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//the conditionals within the operations of anonymous classes, i.e., object literals with functions, are matched by the anonymous class diffs
+	private static boolean containsAnonymousClassWithOperations(AbstractCodeFragment statement, UMLOperationBodyMapper mapper, boolean first) {
+		for(AnonymousClassDeclarationObject anonymousClassDeclaration : statement.getAnonymousClassDeclarations()) {
+			UMLAnonymousClass anonymousClass = first ? mapper.findAnonymousClass1(anonymousClassDeclaration) : mapper.findAnonymousClass2(anonymousClassDeclaration);
+			if(anonymousClass != null && !anonymousClass.getOperations().isEmpty()) {
 				return true;
 			}
 		}
@@ -3205,6 +3219,34 @@ public class StringBasedHeuristics {
 		return false;
 	}
 
+	//the assigned fields of the same object are different fields, unless a class renames the first field to the second,
+	//i.e., mapping.id and mapping.startPosition, but not state.group_idx_list and state.group_index for the renamed group_idx_list
+	private static boolean differentFieldsOfTheSameObject(String variableName1, String variableName2, Replacement replacement, UMLOperationBodyMapper mapper) {
+		String suffix1 = "." + replacement.getBefore();
+		String suffix2 = "." + replacement.getAfter();
+		if(!variableName1.endsWith(suffix1) || !variableName2.endsWith(suffix2))
+			return false;
+		String qualifier1 = variableName1.substring(0, variableName1.length() - suffix1.length());
+		String qualifier2 = variableName2.substring(0, variableName2.length() - suffix2.length());
+		return !qualifier1.isEmpty() && qualifier1.equals(qualifier2) && !renamedField(replacement, mapper.getModelDiff());
+	}
+
+	//a class diff removes the field before and adds the field after
+	private static boolean renamedField(Replacement replacement, UMLModelDiff modelDiff) {
+		if(modelDiff == null)
+			return false;
+		List<UMLClassBaseDiff> classDiffs = new ArrayList<>(modelDiff.getCommonClassDiffList());
+		classDiffs.addAll(modelDiff.getClassMoveDiffList());
+		classDiffs.addAll(modelDiff.getInnerClassMoveDiffList());
+		classDiffs.addAll(modelDiff.getClassRenameDiffList());
+		for(UMLClassBaseDiff classDiff : classDiffs) {
+			if(classDiff.getRemovedAttributes().stream().anyMatch(a -> a.getName().equals(replacement.getBefore())) &&
+					classDiff.getAddedAttributes().stream().anyMatch(a -> a.getName().equals(replacement.getAfter())))
+				return true;
+		}
+		return false;
+	}
+
 	protected static boolean variableAssignmentWithEverythingReplaced(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			ReplacementInfo replacementInfo, UMLOperationBodyMapper mapper) {
 		Constants LANG1 = mapper.LANG1;
@@ -3307,6 +3349,8 @@ public class StringBasedHeuristics {
 						(variableName2.equals(replacement.getAfter()) || variableName2.endsWith(" " + replacement.getAfter()) || variableName2.equals(LANG2.THIS_DOT + replacement.getAfter())) &&
 						!variableName1.equals(LANG1.THIS_DOT + variableName2) && !variableName2.equals(LANG2.THIS_DOT + variableName1))
 					variableRename = true;
+				else if(replacement.getType().equals(ReplacementType.VARIABLE_NAME) && differentFieldsOfTheSameObject(variableName1, variableName2, replacement, mapper))
+					variableRename = true;
 				else if(replacement.getType().equals(ReplacementType.VARIABLE_NAME) &&
 						assignment1.equals(replacement.getBefore()) && assignment2.equals(replacement.getAfter()) &&
 						!mapper.getContainer1().isConstructor() && !mapper.getContainer2().isConstructor() && !mapper.getContainer1().getName().equals(mapper.getContainer2().getName()) &&
@@ -3361,6 +3405,10 @@ public class StringBasedHeuristics {
 						String name1 = withoutTemplateArguments(invocationBefore.getName());
 						String name2 = withoutTemplateArguments(invocationAfter.getName());
 						if(!name1.contains(name2) && !name2.contains(name1)) {
+							rightHandSideReplacement = true;
+						}
+						//the name, the expression and all the arguments are replaced, i.e., self._to_internal(questions[qid]) -> int(att[row:row + nrows].sum())
+						else if(replacement.getType().equals(ReplacementType.METHOD_INVOCATION_NAME_AND_EXPRESSION) && invocationBefore.argumentIntersection(invocationAfter).isEmpty()) {
 							rightHandSideReplacement = true;
 						}
 					}
@@ -3896,6 +3944,80 @@ public class StringBasedHeuristics {
 		return false;
 	}
 
+	//the declarations of the same position whose type annotations are added, removed or changed, i.e., const survivors = [] -> const survivors: { member: GuildMember, error: Error }[] = []
+	protected static List<VariableDeclaration[]> changedTypeAnnotations(AbstractCodeFragment fragment1, AbstractCodeFragment fragment2) {
+		List<VariableDeclaration[]> changed = new ArrayList<>();
+		List<VariableDeclaration> declarations1 = fragment1.getVariableDeclarations();
+		List<VariableDeclaration> declarations2 = fragment2.getVariableDeclarations();
+		if(declarations1.size() == declarations2.size() &&
+				PathFileUtils.getLang(fragment1.getLocationInfo().getFilePath()).equals(PathFileUtils.getLang(fragment2.getLocationInfo().getFilePath()))) {
+			for(int i=0; i<declarations1.size(); i++) {
+				VariableDeclaration declaration1 = declarations1.get(i);
+				VariableDeclaration declaration2 = declarations2.get(i);
+				if(declaration1.getType() != null && declaration2.getType() != null && !declaration1.getType().equals(declaration2.getType()) &&
+						(typeAnnotation(fragment1, declaration1) != null || typeAnnotation(fragment2, declaration2) != null)) {
+					changed.add(new VariableDeclaration[] {declaration1, declaration2});
+				}
+			}
+		}
+		return changed;
+	}
+
+	//the type annotation following the declared name, i.e., ": Promise<any>[]" in const promises: Promise<any>[] = []
+	private static String typeAnnotation(AbstractCodeFragment fragment, VariableDeclaration declaration) {
+		LocationInfo typeLocation = declaration.getType().getLocationInfo();
+		if(typeLocation == null || declaration.getVariableName() == null || !typeLocation.getFilePath().equals(fragment.getLocationInfo().getFilePath())) {
+			return null;
+		}
+		String s = fragment.getString();
+		int start = typeLocation.getStartOffset() - fragment.getLocationInfo().getStartOffset();
+		int end = typeLocation.getEndOffset() - fragment.getLocationInfo().getStartOffset();
+		if(start <= 0 || end > s.length() || start >= end) {
+			return null;
+		}
+		//the name, an optional ?, and the colon with optional whitespace precede the type
+		int index = start;
+		while(index > 0 && Character.isWhitespace(s.charAt(index - 1))) {
+			index--;
+		}
+		if(index == 0 || s.charAt(index - 1) != ':') {
+			return null;
+		}
+		index--;
+		while(index > 0 && Character.isWhitespace(s.charAt(index - 1))) {
+			index--;
+		}
+		int annotationStart = index;
+		if(index > 0 && s.charAt(index - 1) == '?') {
+			index--;
+		}
+		if(!s.startsWith(declaration.getVariableName(), index - declaration.getVariableName().length())) {
+			return null;
+		}
+		return s.substring(annotationStart, end);
+	}
+
+	protected static String withoutChangedTypeAnnotations(String s, AbstractCodeFragment fragment, AbstractCodeFragment otherFragment) {
+		List<VariableDeclaration[]> changed = changedTypeAnnotations(fragment, otherFragment);
+		for(VariableDeclaration[] pair : changed) {
+			String annotation = typeAnnotation(fragment, pair[0]);
+			if(annotation != null) {
+				String name = pair[0].getVariableName();
+				int index = s.indexOf(name + annotation);
+				if(index == -1) {
+					index = s.indexOf(name + "?" + annotation);
+					if(index != -1) {
+						name = name + "?";
+					}
+				}
+				if(index != -1) {
+					s = s.substring(0, index + name.length()) + s.substring(index + name.length() + annotation.length());
+				}
+			}
+		}
+		return s;
+	}
+
 	protected static VariableDeclaration declarationWithArrayInitializer(List<VariableDeclaration> declarations) {
 		for(VariableDeclaration declaration : declarations) {
 			Constants LANG = PathFileUtils.getLang(declaration.getLocationInfo().getFilePath());
@@ -4197,7 +4319,8 @@ public class StringBasedHeuristics {
 		ObjectCreation creationCoveringTheEntireStatement2 = call2 instanceof ObjectCreation ? (ObjectCreation)call2 : null;
 		boolean arrayCreation1 = creationCoveringTheEntireStatement1 != null && creationCoveringTheEntireStatement1.isArray();
 		boolean arrayCreation2 = creationCoveringTheEntireStatement2 != null && creationCoveringTheEntireStatement2.isArray();
-		if(!arrayCreation1 && !arrayCreation2 && !containsMethodSignatureOfAnonymousClass(s1, LANG1) && !containsMethodSignatureOfAnonymousClass(s2, LANG2)) {
+		if(!arrayCreation1 && !arrayCreation2 && !containsMethodSignatureOfAnonymousClass(s1, LANG1) && !containsMethodSignatureOfAnonymousClass(s2, LANG2) &&
+				!containsAnonymousClassWithOperations(statement1, mapper, true) && !containsAnonymousClassWithOperations(statement2, mapper, false)) {
 			List<String> ternaryConditionals1 = new ArrayList<>();
 			for(TernaryOperatorExpression ternary : statement1.getTernaryOperatorExpressions()) {
 				String condition = ternary.getCondition().getString();

@@ -19,6 +19,26 @@ import org.jetbrains.kotlin.com.intellij.psi.PsiElement;
 import org.jetbrains.kotlin.psi.KtElement;
 import org.jetbrains.kotlin.psi.KtFile;
 
+import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAst;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstClassMethod;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstPrivateMethod;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstConstructor;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstClassProp;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstPrivateProp;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstAutoAccessor;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsPropertySignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsIndexSignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsMethodSignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsGetterSignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsSetterSignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsCallSignatureDecl;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsConstructSignatureDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstVarDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstFnDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstClassDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsInterfaceDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsTypeAliasDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsEnumDecl;
 import com.caoccao.javet.swc4j.span.Swc4jSpan;
 
 import extension.ast.node.LangASTNode;
@@ -163,24 +183,7 @@ public class LocationInfo {
 	}
 
 	public LocationInfo(String sourceFolder, String filePath, com.github.gumtreediff.tree.Tree tree, CodeElementType codeElementType, String fileContent) {
-		this.sourceFolder = sourceFolder;
-		this.filePath = filePath;
-		this.codeElementType = codeElementType;
-		this.startOffset = tree.getPos();
-		this.length = tree.getLength();
-		this.endOffset = tree.getEndPos();
-		//compute start-line
-		String text = fileContent.substring(0, this.startOffset);
-		long lines = text.lines().count();
-		this.startLine = (int) lines;
-		String text2 = fileContent.substring(this.startOffset, this.endOffset);
-		long lines2 = text2.lines().count();
-		if(lines2 == 0) {
-			this.endLine = this.startLine;
-		}
-		else {
-			this.endLine = (int) (this.startLine + lines2 - 1);
-		}
+		this(sourceFolder, filePath, tree.getPos(), tree.getLength(), tree.getEndPos(), codeElementType, fileContent);
 	}
 
 	public LocationInfo(String sourceFolder, String filePath, int startOffset, int length, int endOffset, CodeElementType codeElementType, String fileContent) {
@@ -190,21 +193,94 @@ public class LocationInfo {
 		this.startOffset = startOffset;
 		this.length = length;
 		this.endOffset = endOffset;
-		//compute start-line
-		String text = fileContent.substring(0, this.startOffset);
-		long lines = text.lines().count();
-		this.startLine = (int) lines;
-		String text2 = fileContent.substring(this.startOffset, this.endOffset);
-		long lines2 = text2.lines().count();
-		if(lines2 == 0) {
-			this.endLine = this.startLine;
+		//1-based lines, also for a location starting at the beginning of a line
+		this.startLine = computeLine(fileContent, startOffset);
+		this.endLine = computeLine(fileContent, Math.max(startOffset, endOffset - 1));
+	}
+
+	public LocationInfo(String sourceFolder, String filePath, ISwc4jAst node, CodeElementType codeElementType, String fileContent) {
+		this(sourceFolder, filePath, node.getSpan(), codeElementType, fileContent);
+		if(isAmbient(node)) {
+			int start = afterDeclareKeyword(fileContent, this.startOffset);
+			if(start != this.startOffset) {
+				String skipped = fileContent.substring(this.startOffset, start);
+				if(skipped.indexOf('\n') >= 0) {
+					this.startLine = computeLine(fileContent, start);
+					this.startColumn = start - (fileContent.lastIndexOf('\n', start - 1) + 1);
+				}
+				else {
+					this.startColumn += start - this.startOffset;
+				}
+				this.startOffset = start;
+				this.length = this.endOffset - start;
+			}
 		}
-		else {
-			this.endLine = (int) (this.startLine + lines2 - 1);
+		if(endsBeforeSeparator(node)) {
+			int end = endBeforeSeparator(fileContent, this.startOffset, this.endOffset);
+			if(end != this.endOffset) {
+				this.endOffset = end;
+				this.length = end - this.startOffset;
+				this.endLine = computeLine(fileContent, Math.max(this.startOffset, end - 1));
+			}
 		}
 	}
 
-	public LocationInfo(String sourceFolder, String filePath, Swc4jSpan span, CodeElementType codeElementType, String fileContent) {
+	//the ambient declarations start after declare, as in the AST, where declare is a sibling, i.e., declare interface A {}
+	private static boolean isAmbient(ISwc4jAst node) {
+		return node instanceof Swc4jAstVarDecl declaration && declaration.isDeclare() ||
+				node instanceof Swc4jAstFnDecl function && function.isDeclare() ||
+				node instanceof Swc4jAstClassDecl clazz && clazz.isDeclare() ||
+				node instanceof Swc4jAstTsInterfaceDecl declaration && declaration.isDeclare() ||
+				node instanceof Swc4jAstTsTypeAliasDecl declaration && declaration.isDeclare() ||
+				node instanceof Swc4jAstTsEnumDecl declaration && declaration.isDeclare();
+	}
+
+	private static int afterDeclareKeyword(String content, int start) {
+		if(!content.startsWith("declare", start) || start + 7 >= content.length() || !Character.isWhitespace(content.charAt(start + 7))) {
+			return start;
+		}
+		int position = start + 7;
+		while(position < content.length() && Character.isWhitespace(content.charAt(position))) {
+			position++;
+		}
+		return position;
+	}
+
+	//the class and interface members without a body end before their trailing ; or , as in the AST, i.e., x: number; and f(): void;
+	private static boolean endsBeforeSeparator(ISwc4jAst node) {
+		if(node instanceof Swc4jAstClassMethod method) {
+			return method.getFunction().getBody().isEmpty();
+		}
+		if(node instanceof Swc4jAstPrivateMethod method) {
+			return method.getFunction().getBody().isEmpty();
+		}
+		if(node instanceof Swc4jAstConstructor constructor) {
+			return constructor.getBody().isEmpty();
+		}
+		return node instanceof Swc4jAstClassProp || node instanceof Swc4jAstPrivateProp || node instanceof Swc4jAstAutoAccessor ||
+				node instanceof Swc4jAstTsPropertySignature || node instanceof Swc4jAstTsIndexSignature || node instanceof Swc4jAstTsMethodSignature ||
+				node instanceof Swc4jAstTsGetterSignature || node instanceof Swc4jAstTsSetterSignature ||
+				node instanceof Swc4jAstTsCallSignatureDecl || node instanceof Swc4jAstTsConstructSignatureDecl;
+	}
+
+	//the end before a trailing ; or , and the whitespace before it
+	public static int endBeforeSeparator(String content, int start, int end) {
+		int separator = end - 1;
+		while(separator > start && Character.isWhitespace(content.charAt(separator))) {
+			separator--;
+		}
+		if(content.charAt(separator) == ';' || content.charAt(separator) == ',') {
+			int trimmed = separator;
+			while(trimmed > start && Character.isWhitespace(content.charAt(trimmed - 1))) {
+				trimmed--;
+			}
+			return trimmed;
+		}
+		return end;
+	}
+
+	//only for the TypeScript comments, which are not AST nodes; the AST nodes use the constructor with the node, which aligns the members with the AST
+	LocationInfo(String sourceFolder, String filePath, Swc4jSpan span, CodeElementType codeElementType, String fileContent) {
 		this.sourceFolder = sourceFolder;
 		this.filePath = filePath;
 		this.codeElementType = codeElementType;
@@ -301,12 +377,13 @@ public class LocationInfo {
 		}
 	}
 
-	// Like the line ends table of JDT CompilationUnit: the offsets of the line terminators (\n, \r, or the \n of \r\n) are computed once per file
+	// Like the line ends table of JDT CompilationUnit: the offsets of the line terminators (\n, \r, or the \n of \r\n) are computed once per file,
+	// and kept per thread, as concurrent analyses (i.e., parallel tests) parse different files
 	private record LineEnds(String fileContent, int[] offsets) {}
-	private static volatile LineEnds lastLineEnds;
+	private static final ThreadLocal<LineEnds> lastLineEnds = new ThreadLocal<>();
 
 	private static int[] lineEnds(String fileContent) {
-		LineEnds cached = lastLineEnds;
+		LineEnds cached = lastLineEnds.get();
 		if(cached != null && cached.fileContent() == fileContent) {
 			return cached.offsets();
 		}
@@ -326,7 +403,7 @@ public class LocationInfo {
 			offsets[count++] = i;
 		}
 		offsets = Arrays.copyOf(offsets, count);
-		lastLineEnds = new LineEnds(fileContent, offsets);
+		lastLineEnds.set(new LineEnds(fileContent, offsets));
 		return offsets;
 	}
 

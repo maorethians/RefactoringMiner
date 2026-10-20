@@ -32,6 +32,13 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
     private Tree srcFieldDeclaration;
     private Tree dstFieldDeclaration;
 
+    //the initializers are mapped to each other by the initializer mapper of the attribute diff
+    private boolean initializerMapped;
+
+    public void setInitializerMapped(boolean initializerMapped) {
+        this.initializerMapped = initializerMapped;
+    }
+
     public FieldDeclarationMatcher(UMLAttribute originalAttribute, UMLAttribute movedAttribute, Optional<UMLJavadocDiff> umlJavadocDiff, UMLCommentListDiff umlCommentListDiff, Constants LANG1, Constants LANG2) {
         this.originalAttribute = originalAttribute;
         this.movedAttribute = movedAttribute;
@@ -281,19 +288,17 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
                 new LeafMatcher(LANG1, LANG2).match(srcType,dstType,mappingStore);
             }
             Tree srcVarDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,srcUMLAttribute.getVariableDeclaration().getLocationInfo(),LANG1);
-            if(srcAttr.equals(srcVarDeclaration)) {
-                if(srcVarDeclaration.getParent().getType().name.equals(LANG1.ASSIGNMENT) && srcVarDeclaration.getParent().getParent().getType().name.equals(LANG1.EXPRESSION_STATEMENT)) {
-                    srcVarDeclaration = srcVarDeclaration.getParent().getParent();
-                }
-            }
             Tree dstVarDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,dstUMLAttribute.getVariableDeclaration().getLocationInfo(),LANG2);
-            if(dstAttr.equals(dstVarDeclaration)) {
-                if(dstVarDeclaration.getParent().getType().name.equals(LANG2.ASSIGNMENT) && dstVarDeclaration.getParent().getParent().getType().name.equals(LANG2.EXPRESSION_STATEMENT)) {
-                    dstVarDeclaration = dstVarDeclaration.getParent().getParent();
-                }
-            }
             mappingStore.addMapping(srcVarDeclaration,dstVarDeclaration);
-            new LeafMatcher(LANG1, LANG2).match(srcVarDeclaration,dstVarDeclaration,mappingStore);
+            if (initializerMapped && srcVarDeclaration != null && dstVarDeclaration != null && !srcVarDeclaration.getChildren().isEmpty() && !dstVarDeclaration.getChildren().isEmpty()) {
+                //the leaves of the initializers are matched through the initializer mapper, i.e., the object literals of StyleSheet.create({...}) through their attributes
+                new LeafMatcher(LANG1, LANG2).match(srcVarDeclaration.getChild(0),dstVarDeclaration.getChild(0),mappingStore);
+                com.github.gumtreediff.utils.Pair<Tree, Tree> equalOperators = Helpers.findPairOfType(srcVarDeclaration,dstVarDeclaration, LANG1.EQUAL_OPERATOR, LANG2.EQUAL_OPERATOR);
+                if (equalOperators != null)
+                    mappingStore.addMapping(equalOperators.first,equalOperators.second);
+            }
+            else
+                new LeafMatcher(LANG1, LANG2).match(srcVarDeclaration,dstVarDeclaration,mappingStore);
             new JavaDocMatcher(optimizationData, srcUMLAttribute.getJavadoc(), dstUMLAttribute.getJavadoc(), umlJavadocDiff, LANG1, LANG2)
                     .match(srcTree, dstTree, mappingStore);
             if (srcVarDeclaration != null && dstVarDeclaration != null)

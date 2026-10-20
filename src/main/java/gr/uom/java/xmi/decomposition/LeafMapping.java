@@ -24,6 +24,7 @@ import gr.uom.java.xmi.decomposition.replacement.Replacement.ReplacementType;
 import gr.uom.java.xmi.Constants;
 import gr.uom.java.xmi.LeafType;
 import gr.uom.java.xmi.InferredType;
+import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.LocationInfo.CodeElementType;
 import gr.uom.java.xmi.UMLComment;
 import gr.uom.java.xmi.UMLOperation;
@@ -42,6 +43,9 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 	private boolean isKeyword;
 	private Map<UMLOperation, Set<AbstractCodeFragment>> extractedStatements;
 	private boolean previousCodeExtracted;
+	private Set<AbstractCodeMapping> mappings = Collections.emptySet();
+	private Boolean mutuallyMostSimilarParents;
+	private boolean distinguishingSurroundingStatements;
 
 	public LeafMapping(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			VariableDeclarationContainer operation1, VariableDeclarationContainer operation2) {
@@ -91,6 +95,215 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 
 	public void setIsomorphic(boolean isomorphic) {
 		this.isomorphic = isomorphic;
+	}
+
+	//the mappings of the mapper, which provide the mapped neighbouring statements
+	public void setMappings(Set<AbstractCodeMapping> mappings) {
+		this.mappings = mappings;
+	}
+
+	//the surrounding statements distinguish identical statements, i.e., the statements of reordered test cases:
+	//first the previous or next statements mapped to each other (or the then branches of else branches), then the blocks that are each other's most similar block, then the identical previous and next statements
+	public int compareSurroundingStatements(LeafMapping o) {
+		int result = 0;
+		boolean mappedNeighbour1 = this.mappedPreviousOrNextStatement() || this.mappedThenBranch();
+		boolean mappedNeighbour2 = o.mappedPreviousOrNextStatement() || o.mappedThenBranch();
+		int mutuallyMostSimilarParents;
+		if(mappedNeighbour1 != mappedNeighbour2) {
+			result = mappedNeighbour1 ? -1 : 1;
+		}
+		else if((mutuallyMostSimilarParents = compareMutuallyMostSimilarParents(o)) != 0) {
+			result = mutuallyMostSimilarParents;
+		}
+		else {
+			boolean identicalNeighbours1 = this.identicalNeighbours();
+			boolean identicalNeighbours2 = o.identicalNeighbours();
+			if(identicalNeighbours1 != identicalNeighbours2) {
+				result = identicalNeighbours1 ? -1 : 1;
+			}
+		}
+		//the mapper keeps the mapping selected by the surrounding statements, as with identical previous and next statements
+		if(result < 0) {
+			this.distinguishingSurroundingStatements = true;
+		}
+		else if(result > 0) {
+			o.distinguishingSurroundingStatements = true;
+		}
+		return result;
+	}
+
+	public boolean hasDistinguishingSurroundingStatements() {
+		return distinguishingSurroundingStatements || hasIdenticalPreviousAndNextStatement();
+	}
+
+	//the statement before (offset -1) or after (offset 1) the fragment in its block
+	private static AbstractCodeFragment neighbour(AbstractCodeFragment fragment, int offset) {
+		CompositeStatementObject parent = fragment.getParent();
+		if(parent == null) {
+			return null;
+		}
+		List<AbstractStatement> statements = parent.getStatements();
+		//the index of the statement in its block, unless the block changed after the statement was added
+		int position = fragment.getIndex();
+		if(position < 0 || position >= statements.size() || statements.get(position) != fragment) {
+			position = statements.indexOf(fragment);
+		}
+		int index = position + offset;
+		return index >= 0 && index < statements.size() ? statements.get(index) : null;
+	}
+
+	//the fragments, or the statements enclosing them, if both fragments are the only statements of their blocks,
+	//i.e., the if statements of if(response != null) return response; or the catch clauses of a single throw statement
+	private AbstractCodeFragment[] surroundedStatements() {
+		AbstractCodeFragment statement1 = getFragment1(), statement2 = getFragment2();
+		while(onlyStatement(statement1) && onlyStatement(statement2) && statement1.getParent().getParent() != null && statement2.getParent().getParent() != null) {
+			statement1 = statement1.getParent();
+			statement2 = statement2.getParent();
+		}
+		return new AbstractCodeFragment[] {statement1, statement2};
+	}
+
+	private static boolean onlyStatement(AbstractCodeFragment fragment) {
+		return fragment.getParent() != null && neighbour(fragment, -1) == null && neighbour(fragment, 1) == null;
+	}
+
+	//the previous and the next statements are looked up in a single pass over the mappings
+	private boolean mappedPreviousOrNextStatement() {
+		AbstractCodeFragment previous1 = neighbour(getFragment1(), -1), previous2 = neighbour(getFragment2(), -1);
+		AbstractCodeFragment next1 = neighbour(getFragment1(), 1), next2 = neighbour(getFragment2(), 1);
+		boolean previous = previous1 != null && previous2 != null;
+		boolean next = next1 != null && next2 != null;
+		if(!previous && !next) {
+			return false;
+		}
+		for(AbstractCodeMapping mapping : mappings) {
+			if((previous && mapping.getFragment1() == previous1 && mapping.getFragment2() == previous2) ||
+					(next && mapping.getFragment1() == next1 && mapping.getFragment2() == next2)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//when the mappings share the block of one fragment and their other blocks are in the same container, at most one of them, the one whose other block has more
+	//identical statements with the shared block, can have mutually most similar blocks, so the blocks are searched only for this mapping, and not at all when the
+	//identical statements are as many
+	private int compareMutuallyMostSimilarParents(LeafMapping o) {
+		CompositeStatementObject parent1 = getFragment1().getParent(), otherParent1 = o.getFragment1().getParent();
+		CompositeStatementObject parent2 = getFragment2().getParent(), otherParent2 = o.getFragment2().getParent();
+		if(parent1 == otherParent1 && parent2 == otherParent2) {
+			return 0;
+		}
+		LeafMapping candidate = null;
+		if(parent1 != null && parent1 == otherParent1 && parent2 != null && otherParent2 != null && root(parent2) == root(otherParent2)) {
+			int common = commonStatements(parent1, parent2), otherCommon = commonStatements(parent1, otherParent2);
+			if(common == otherCommon) {
+				return 0;
+			}
+			candidate = common > otherCommon ? this : o;
+		}
+		else if(parent2 != null && parent2 == otherParent2 && parent1 != null && otherParent1 != null && root(parent1) == root(otherParent1)) {
+			int common = commonStatements(parent1, parent2), otherCommon = commonStatements(otherParent1, parent2);
+			if(common == otherCommon) {
+				return 0;
+			}
+			candidate = common > otherCommon ? this : o;
+		}
+		if(candidate != null) {
+			return candidate.mutuallyMostSimilarParents() ? (candidate == this ? -1 : 1) : 0;
+		}
+		boolean mutuallyMostSimilarParents1 = this.mutuallyMostSimilarParents();
+		boolean mutuallyMostSimilarParents2 = o.mutuallyMostSimilarParents();
+		if(mutuallyMostSimilarParents1 != mutuallyMostSimilarParents2) {
+			return mutuallyMostSimilarParents1 ? -1 : 1;
+		}
+		return 0;
+	}
+
+	//the blocks of the fragments are each other's most similar block in the other container, i.e., the moved block of a reordered test case
+	private boolean mutuallyMostSimilarParents() {
+		if(mutuallyMostSimilarParents == null) {
+			CompositeStatementObject parent1 = getFragment1().getParent();
+			CompositeStatementObject parent2 = getFragment2().getParent();
+			mutuallyMostSimilarParents = parent1 != null && parent2 != null &&
+					mostSimilarBlock(parent1, root(parent2)) == parent2 && mostSimilarBlock(parent2, root(parent1)) == parent1;
+		}
+		return mutuallyMostSimilarParents;
+	}
+
+	private static CompositeStatementObject root(CompositeStatementObject composite) {
+		while(composite.getParent() != null) {
+			composite = composite.getParent();
+		}
+		return composite;
+	}
+
+	//the block under the root with the most identical statements to the block, or null if there is no such unique block
+	private static CompositeStatementObject mostSimilarBlock(CompositeStatementObject block, CompositeStatementObject root) {
+		CompositeStatementObject mostSimilar = null;
+		int maxCommonStatements = 0;
+		boolean unique = false;
+		for(CompositeStatementObject candidate : root.getInnerNodes()) {
+			//a block with fewer statements than the most identical statements so far cannot reach them
+			if(candidate.getStatements().size() < maxCommonStatements) {
+				continue;
+			}
+			int common = commonStatements(block, candidate);
+			if(common > maxCommonStatements) {
+				mostSimilar = candidate;
+				maxCommonStatements = common;
+				unique = true;
+			}
+			else if(common == maxCommonStatements && common > 0) {
+				unique = false;
+			}
+		}
+		return unique ? mostSimilar : null;
+	}
+
+	//the number of identical statements in the blocks, counting each statement at most once
+	private static int commonStatements(CompositeStatementObject block1, CompositeStatementObject block2) {
+		List<String> statements2 = new ArrayList<>();
+		for(AbstractStatement statement2 : block2.getStatements()) {
+			statements2.add(statement2.getString());
+		}
+		int common = 0;
+		for(AbstractStatement statement1 : block1.getStatements()) {
+			if(statements2.remove(statement1.getString())) {
+				common++;
+			}
+		}
+		return common;
+	}
+
+	//identical previous and next statements, where the start or end of both blocks counts as identical,
+	//of the enclosing statements for fragments without neighbours, unlike their mapped neighbours, which might be mapped wrongly
+	private boolean identicalNeighbours() {
+		AbstractCodeFragment[] statements = surroundedStatements();
+		AbstractCodeFragment previous1 = neighbour(statements[0], -1), previous2 = neighbour(statements[1], -1);
+		AbstractCodeFragment next1 = neighbour(statements[0], 1), next2 = neighbour(statements[1], 1);
+		if((previous1 == null && next1 == null) || (previous2 == null && next2 == null)) {
+			return false;
+		}
+		return identicalStatements(previous1, previous2) && identicalStatements(next1, next2);
+	}
+
+	private static boolean identicalStatements(AbstractCodeFragment fragment1, AbstractCodeFragment fragment2) {
+		if(fragment1 == null || fragment2 == null) {
+			return fragment1 == null && fragment2 == null;
+		}
+		return fragment1.getString().equals(fragment2.getString()) && identicalCaughtExceptionTypes(fragment1, fragment2);
+	}
+
+	//the string of a catch clause does not contain the type of its exception, i.e., catch(e) for catch(NoClassDefFoundError e) and catch(ClassFormatError e)
+	private static boolean identicalCaughtExceptionTypes(AbstractCodeFragment fragment1, AbstractCodeFragment fragment2) {
+		if(!fragment1.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE) ||
+				!fragment2.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE)) {
+			return true;
+		}
+		List<String> types1 = fragment1.getVariableDeclarations().stream().map(d -> String.valueOf(d.getType())).collect(Collectors.toList());
+		List<String> types2 = fragment2.getVariableDeclarations().stream().map(d -> String.valueOf(d.getType())).collect(Collectors.toList());
+		return types1.equals(types2);
 	}
 
 	public void setExtractedStatements(Map<UMLOperation, Set<AbstractCodeFragment>> extractedStatements) {
@@ -439,6 +652,12 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 				else if(!this.isIdenticalWithInlinedVariable() && o.isIdenticalWithInlinedVariable()) {
 					return 1;
 				}
+				//the statements of reordered when entries follow their entries
+				boolean identicalWhenEntry1 = this.identicalWhenEntry();
+				boolean identicalWhenEntry2 = o.identicalWhenEntry();
+				if(identicalWhenEntry1 != identicalWhenEntry2) {
+					return identicalWhenEntry1 ? -1 : 1;
+				}
 				List<Double> levelParentEditDistance1 = this.levelParentEditDistance();
 				List<Double> levelParentEditDistance2 = o.levelParentEditDistance();
 				double nLevelParentEditDistance1 = 0, nLevelParentEditDistance2 = 0;
@@ -562,6 +781,13 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 					return Integer.valueOf(depthDiff1).compareTo(Integer.valueOf(depthDiff2));
 				}
 				else {
+					//identical statements cannot be distinguished by their replacements, but by their surrounding statements
+					if(this.getReplacements().isEmpty() && o.getReplacements().isEmpty()) {
+						int surroundingStatements = this.compareSurroundingStatements(o);
+						if(surroundingStatements != 0) {
+							return surroundingStatements;
+						}
+					}
 					int indexDiff1 = Math.abs(this.getFragment1().getIndex() - this.getFragment2().getIndex());
 					int indexDiff2 = Math.abs(o.getFragment1().getIndex() - o.getFragment2().getIndex());
 					if(indexDiff1 != indexDiff2) {
@@ -789,17 +1015,59 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 		return isUnderElseBranch(getFragment1()) && isUnderElseBranch(getFragment2());
 	}
 	
+	//the fragments are nested in when entries with identical conditions, i.e., STRING_IN_UTF8 -> { ... }
+	private boolean identicalWhenEntry() {
+		CompositeStatementObject whenEntry1 = enclosingWhenEntry(getFragment1());
+		CompositeStatementObject whenEntry2 = enclosingWhenEntry(getFragment2());
+		return whenEntry1 != null && whenEntry2 != null && whenEntry1.getString().equals(whenEntry2.getString());
+	}
+
+	private static CompositeStatementObject enclosingWhenEntry(AbstractCodeFragment fragment) {
+		for(CompositeStatementObject parent = fragment.getParent(); parent != null; parent = parent.getParent()) {
+			if(parent.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY)) {
+				return parent;
+			}
+		}
+		return null;
+	}
+
 	private boolean isUnderElseBranch(AbstractCodeFragment fragment) {
+		return ifWithElseBranch(fragment) != null;
+	}
+
+	//the if statement whose else branch, not an else-if branch, contains the fragment
+	private static CompositeStatementObject ifWithElseBranch(AbstractCodeFragment fragment) {
 		if(fragment.getParent() != null) {
 			CompositeStatementObject child = fragment.getParent();
 			if(child.getLocationInfo().getCodeElementType().equals(CodeElementType.BLOCK) && child.getParent() != null) {
 				CompositeStatementObject parent = child.getParent();
-				return parent != null && parent.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
-						child.getLocationInfo().getCodeElementType().equals(CodeElementType.BLOCK) &&
-						parent.getStatements().size() == 2 && parent.getStatements().indexOf(child) == 1;
+				if(parent.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
+						parent.getStatements().size() == 2 && parent.getStatements().indexOf(child) == 1) {
+					return parent;
+				}
 			}
 			else if(child.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT)) {
-				return child.getStatements().size() == 2 && child.getStatements().indexOf(fragment) == 1;
+				if(child.getStatements().size() == 2 && child.getStatements().indexOf(fragment) == 1) {
+					return child;
+				}
+			}
+		}
+		return null;
+	}
+
+	//the then branches of the if statements, whose else branches contain the fragments, have statements mapped to each other,
+	//i.e., the else branches of the if statements of identical cases contain only identical statements
+	private boolean mappedThenBranch() {
+		CompositeStatementObject if1 = ifWithElseBranch(getFragment1());
+		CompositeStatementObject if2 = ifWithElseBranch(getFragment2());
+		if(if1 == null || if2 == null) {
+			return false;
+		}
+		LocationInfo then1 = if1.getStatements().get(0).getLocationInfo();
+		LocationInfo then2 = if2.getStatements().get(0).getLocationInfo();
+		for(AbstractCodeMapping mapping : mappings) {
+			if(then1.subsumes(mapping.getFragment1().getLocationInfo()) && then2.subsumes(mapping.getFragment2().getLocationInfo())) {
+				return true;
 			}
 		}
 		return false;
@@ -1037,8 +1305,9 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 			distance1 = 0;
 		}
 		else {
-			String s1 = removeGenericTypeAfterDot(this.getFragment1().getString().toLowerCase());
-			String s2 = removeGenericTypeAfterDot(this.getFragment2().getString().toLowerCase());
+			//the changed type annotations of the declarations are TYPE replacements, not text differences
+			String s1 = removeGenericTypeAfterDot(StringBasedHeuristics.withoutChangedTypeAnnotations(this.getFragment1().getString(), this.getFragment1(), this.getFragment2()).toLowerCase());
+			String s2 = removeGenericTypeAfterDot(StringBasedHeuristics.withoutChangedTypeAnnotations(this.getFragment2().getString(), this.getFragment2(), this.getFragment1()).toLowerCase());
 			int distance = StringDistance.editDistance(s1, s2);
 			distance1 = (double)distance/(double)Math.max(s1.length(), s2.length());
 		}

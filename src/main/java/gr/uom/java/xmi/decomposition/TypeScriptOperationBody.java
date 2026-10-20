@@ -232,7 +232,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		}
 		else if(statement instanceof Swc4jAstExprStmt expressionStatement) {
 			if(expressionStatement.getExpr() instanceof Swc4jAstAssignExpr assignment && assignment.getRight() instanceof Swc4jAstFnExpr functionExpr) {
-				LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+				LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr, CodeElementType.METHOD_DECLARATION, fileContent);
 				ISwc4jAstAssignTarget assignTarget = assignment.getLeft();
 				String assignTargetString = fileContent.substring(assignTarget.getSpan().getStart(), assignTarget.getSpan().getEnd());
 				String name = functionExpr.getIdent().isPresent() ? functionExpr.getIdent().get().getSym() : assignTargetString;
@@ -254,7 +254,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				}
 			}
 			else if(expressionStatement.getExpr() instanceof Swc4jAstCallExpr callExpr && callExpr.getCallee() instanceof Swc4jAstParenExpr parenExpr && parenExpr.getExpr() instanceof Swc4jAstFnExpr functionExpr) {
-				LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+				LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr, CodeElementType.METHOD_DECLARATION, fileContent);
 				String name = functionExpr.getIdent().isPresent() ? functionExpr.getIdent().get().getSym() : container.getName();
 				String className = container.getClassName();
 				UMLOperation nested = new UMLOperation(name, location, className);
@@ -451,9 +451,10 @@ public class TypeScriptOperationBody extends OperationBody {
 					List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(pat);
 					Swc4jAstTsTypeAnn typeAnnotation = VariableDeclaration.extractTypeAnnotation(pat);
 					for(Swc4jAstBindingIdent identifier : identifiers) {
-						VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, container, activeVariableDeclarations, fileContent);
+						//the exception name without its type annotation, as in the AST, i.e., queryError in catch (queryError: any)
+						VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, identifier.getId(), CodeElementType.VARIABLE_DECLARATION_EXPRESSION, container, activeVariableDeclarations, fileContent);
 						catchClauseStatementObject.addVariableDeclaration(vd);
-						AbstractExpression variableDeclarationName = new AbstractExpression(sourceFolder, filePath, identifier, CodeElementType.CATCH_CLAUSE_EXCEPTION_NAME, container, activeVariableDeclarations, fileContent, typeDeclarations);
+						AbstractExpression variableDeclarationName = new AbstractExpression(sourceFolder, filePath, identifier.getId(), CodeElementType.CATCH_CLAUSE_EXCEPTION_NAME, container, activeVariableDeclarations, fileContent, typeDeclarations);
 						catchClauseStatementObject.addExpression(variableDeclarationName);
 					}
 				}
@@ -494,7 +495,7 @@ public class TypeScriptOperationBody extends OperationBody {
 						List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(declarator.getName());
 						Swc4jAstTsTypeAnn typeAnnotation = VariableDeclaration.extractTypeAnnotation(declarator.getName());
 						//Arrow function declaration style
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl, CodeElementType.METHOD_DECLARATION, fileContent);
 						String append = "";
 						if(container instanceof UMLOperation) {
 							append = "." + ((UMLOperation)container).getName();
@@ -533,7 +534,7 @@ public class TypeScriptOperationBody extends OperationBody {
 					else if(declarator.getInit().get() instanceof Swc4jAstFnExpr functionExpr) {
 						List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(declarator.getName());
 						//function expression declaration style
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl, CodeElementType.METHOD_DECLARATION, fileContent);
 						String append = "";
 						if(container instanceof UMLOperation) {
 							append = "." + ((UMLOperation)container).getName();
@@ -567,7 +568,8 @@ public class TypeScriptOperationBody extends OperationBody {
 					}
 					else if(declarator.getInit().get() instanceof Swc4jAstObjectLit objectLiteral && objectLiteral.getProps().size() > 0) {
 						//List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(declarator.getName());
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+						//the class is the object literal, as in the AST; the declaration is a statement of the container
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, objectLiteral, CodeElementType.TYPE_DECLARATION, fileContent);
 						List<UMLImport> imports = new ArrayList<>();
 						String codePath = getAnonymousCodePath(objectLiteral, fileContent);
 						UMLClass umlClass = new UMLClass(container.getClassName(), codePath, location, true, imports);
@@ -587,7 +589,7 @@ public class TypeScriptOperationBody extends OperationBody {
 						return;
 					}
 					else if(declarator.getInit().get() instanceof Swc4jAstAssignExpr assignExpr && assignExpr.getRight() instanceof Swc4jAstObjectLit objectLiteral && objectLiteral.getProps().size() > 0) {
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, objectLiteral, CodeElementType.TYPE_DECLARATION, fileContent);
 						List<UMLImport> imports = new ArrayList<>();
 						String codePath = getAnonymousCodePath(objectLiteral, fileContent);
 						UMLClass umlClass = new UMLClass(container.getClassName(), codePath, location, true, imports);
@@ -616,7 +618,7 @@ public class TypeScriptOperationBody extends OperationBody {
 						List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(declarator.getName());
 						Swc4jAstTsTypeAnn typeAnnotation = VariableDeclaration.extractTypeAnnotation(declarator.getName());
 						//Arrow function declaration style
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, variableDecl, CodeElementType.METHOD_DECLARATION, fileContent);
 						String append = "";
 						if(container instanceof UMLOperation) {
 							append = "." + ((UMLOperation)container).getName();
@@ -693,7 +695,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		}
 		else if(statement instanceof Swc4jAstTsInterfaceDecl interfaceDecl) {
 			String typeName = interfaceDecl.getId().getSym();
-			LocationInfo location = new LocationInfo(sourceFolder, filePath, interfaceDecl.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+			LocationInfo location = new LocationInfo(sourceFolder, filePath, interfaceDecl, CodeElementType.TYPE_DECLARATION, fileContent);
 			List<UMLImport> imports = new ArrayList<>();
 			UMLClass umlClass = new UMLClass(container.getClassName(), typeName, location, true, imports);
 			processComments(comments, umlClass);
@@ -727,7 +729,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			if(typeParams.isPresent()) {
 				List<Swc4jAstTsTypeParam> list = typeParams.get().getParams();
 				for(Swc4jAstTsTypeParam param : list) {
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param.getSpan(), CodeElementType.TYPE_PARAMETER, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param, CodeElementType.TYPE_PARAMETER, fileContent);
 					UMLTypeParameter umlTypeParameter = new UMLTypeParameter(param.getName().getSym(), locationInfo);
 					umlClass.addTypeParameter(umlTypeParameter);
 				}
@@ -743,7 +745,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			else if(moduleId instanceof Swc4jAstStr str) {
 				typeName = str.getValue();
 			}
-			LocationInfo location = new LocationInfo(sourceFolder, filePath, moduleDecl.getSpan(), CodeElementType.MODULE_DECLARATION, fileContent);
+			LocationInfo location = new LocationInfo(sourceFolder, filePath, moduleDecl, CodeElementType.MODULE_DECLARATION, fileContent);
 			List<UMLImport> imports = new ArrayList<>();
 			UMLClass umlClass = new UMLClass(container.getClassName(), typeName, location, true, imports);
 			if(moduleDecl.getParent() instanceof Swc4jAstExportDecl) {
@@ -769,7 +771,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		}
 		else if(statement instanceof Swc4jAstClassDecl classDecl) {
 			String typeName = classDecl.getIdent().getSym();
-			LocationInfo location = new LocationInfo(sourceFolder, filePath, classDecl.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+			LocationInfo location = new LocationInfo(sourceFolder, filePath, classDecl, CodeElementType.TYPE_DECLARATION, fileContent);
 			List<UMLImport> imports = new ArrayList<>();
 			UMLClass umlClass = new UMLClass(container.getClassName(), typeName, location, true, imports);
 			if(classDecl.getParent() instanceof Swc4jAstExportDecl) {
@@ -783,7 +785,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			if(typeParams.isPresent()) {
 				List<Swc4jAstTsTypeParam> list = typeParams.get().getParams();
 				for(Swc4jAstTsTypeParam param : list) {
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param.getSpan(), CodeElementType.TYPE_PARAMETER, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param, CodeElementType.TYPE_PARAMETER, fileContent);
 					UMLTypeParameter umlTypeParameter = new UMLTypeParameter(param.getName().getSym(), locationInfo);
 					umlClass.addTypeParameter(umlTypeParameter);
 				}
@@ -796,7 +798,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		}
 		else if(statement instanceof Swc4jAstTsEnumDecl enumDecl) {
 			String typeName = enumDecl.getId().getSym();
-			LocationInfo location = new LocationInfo(sourceFolder, filePath, enumDecl.getSpan(), CodeElementType.ENUM_DECLARATION, fileContent);
+			LocationInfo location = new LocationInfo(sourceFolder, filePath, enumDecl, CodeElementType.ENUM_DECLARATION, fileContent);
 			List<UMLImport> imports = new ArrayList<>();
 			UMLClass umlClass = new UMLClass(container.getClassName(), typeName, location, true, imports);
 			if(enumDecl.getParent() instanceof Swc4jAstExportDecl) {
@@ -818,7 +820,7 @@ public class TypeScriptOperationBody extends OperationBody {
 						AbstractExpression expr = new AbstractExpression(sourceFolder, filePath, initializer.get(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, container, activeVariableDeclarations, fileContent, typeDeclarations);
 						vd.setInitializer(expr);
 					}
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.ENUM_CONSTANT_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.ENUM_CONSTANT_DECLARATION, fileContent);
 					UMLEnumConstant attribute = new UMLEnumConstant(vd.getVariableName(), enumConstantType, locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -831,7 +833,7 @@ public class TypeScriptOperationBody extends OperationBody {
 						AbstractExpression expr = new AbstractExpression(sourceFolder, filePath, initializer.get(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, container, activeVariableDeclarations, fileContent, typeDeclarations);
 						vd.setInitializer(expr);
 					}
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.ENUM_CONSTANT_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.ENUM_CONSTANT_DECLARATION, fileContent);
 					UMLEnumConstant attribute = new UMLEnumConstant(vd.getVariableName(), enumConstantType, locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -875,7 +877,7 @@ public class TypeScriptOperationBody extends OperationBody {
 					specifiers.add(name);
 				}
 			}
-			LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, namedExport.getSpan(), CodeElementType.NAMED_EXPORT, fileContent);
+			LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, namedExport, CodeElementType.NAMED_EXPORT, fileContent);
 			UMLNamedExport export = new UMLNamedExport(locationInfo, specifiers);
 			if(namedExport.getSrc().isPresent()) {
 				Swc4jAstStr str = namedExport.getSrc().get();
@@ -889,7 +891,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		else if(statement instanceof Swc4jAstExportDefaultDecl exportDefaultDecl) {
 			ISwc4jAstDefaultDecl defaultDecl = exportDefaultDecl.getDecl();
 			if(defaultDecl instanceof Swc4jAstFnExpr functionExpr) {
-				LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+				LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr, CodeElementType.METHOD_DECLARATION, fileContent);
 				String name = functionExpr.getIdent().isPresent() ? functionExpr.getIdent().get().getSym() : "";
 				String className = container.getClassName();
 				UMLOperation nested = new UMLOperation(name, location, className);
@@ -910,7 +912,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			}
 			else if(defaultDecl instanceof Swc4jAstClassExpr classExpr) {
 				String typeName = classExpr.getIdent().isPresent() ? classExpr.getIdent().get().getSym() : "";
-				LocationInfo location = new LocationInfo(sourceFolder, filePath, classExpr.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+				LocationInfo location = new LocationInfo(sourceFolder, filePath, classExpr, CodeElementType.TYPE_DECLARATION, fileContent);
 				List<UMLImport> imports = new ArrayList<>();
 				UMLClass umlClass = new UMLClass(container.getClassName(), typeName, location, true, imports);
 				umlClass.setVisibility(Visibility.PUBLIC);
@@ -919,7 +921,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				if(typeParams.isPresent()) {
 					List<Swc4jAstTsTypeParam> list = typeParams.get().getParams();
 					for(Swc4jAstTsTypeParam param : list) {
-						LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param.getSpan(), CodeElementType.TYPE_PARAMETER, fileContent);
+						LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param, CodeElementType.TYPE_PARAMETER, fileContent);
 						UMLTypeParameter umlTypeParameter = new UMLTypeParameter(param.getName().getSym(), locationInfo);
 						umlClass.addTypeParameter(umlTypeParameter);
 					}
@@ -941,7 +943,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		}
 		else if(statement instanceof Swc4jAstTsTypeAliasDecl typeAliasDecl) {
 			String typeName = typeAliasDecl.getId().getSym();
-			LocationInfo location = new LocationInfo(sourceFolder, filePath, typeAliasDecl.getSpan(), CodeElementType.TYPE_DECLARATION, fileContent);
+			LocationInfo location = new LocationInfo(sourceFolder, filePath, typeAliasDecl, CodeElementType.TYPE_DECLARATION, fileContent);
 			List<UMLImport> imports = new ArrayList<>();
 			UMLClass umlClass = new UMLClass(container.getClassName(), typeName, location, true, imports);
 			processComments(comments, umlClass);
@@ -982,7 +984,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			if(typeParams.isPresent()) {
 				List<Swc4jAstTsTypeParam> list = typeParams.get().getParams();
 				for(Swc4jAstTsTypeParam param : list) {
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param.getSpan(), CodeElementType.TYPE_PARAMETER, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param, CodeElementType.TYPE_PARAMETER, fileContent);
 					UMLTypeParameter umlTypeParameter = new UMLTypeParameter(param.getName().getSym(), locationInfo);
 					umlClass.addTypeParameter(umlTypeParameter);
 				}
@@ -995,18 +997,18 @@ public class TypeScriptOperationBody extends OperationBody {
 				UMLImport umlImport = null;
 				if(specifier instanceof Swc4jAstImportDefaultSpecifier defaultSpecifier) {
 					Swc4jAstIdent ident = defaultSpecifier.getLocal();
-					LocationInfo location = new LocationInfo(sourceFolder, filePath, ident.getSpan(), CodeElementType.IMPORT_DECLARATION, fileContent);
+					LocationInfo location = new LocationInfo(sourceFolder, filePath, ident, CodeElementType.IMPORT_DECLARATION, fileContent);
 					umlImport = new UMLImport(source + "." + ident.getSym(), false, false, location);
 				}
 				else if(specifier instanceof Swc4jAstImportNamedSpecifier namedSpecifier) {
 					Swc4jAstIdent ident = namedSpecifier.getLocal();
 					Optional<ISwc4jAstModuleExportName> imported = namedSpecifier.getImported();
-					LocationInfo location = new LocationInfo(sourceFolder, filePath, ident.getSpan(), CodeElementType.IMPORT_DECLARATION, fileContent);
+					LocationInfo location = new LocationInfo(sourceFolder, filePath, ident, CodeElementType.IMPORT_DECLARATION, fileContent);
 					umlImport = new UMLImport(source + "." + ident.getSym(), false, true, location);
 				}
 				else if(specifier instanceof Swc4jAstImportStarAsSpecifier star) {
 					Swc4jAstIdent ident = star.getLocal();
-					LocationInfo location = new LocationInfo(sourceFolder, filePath, ident.getSpan(), CodeElementType.IMPORT_DECLARATION, fileContent);
+					LocationInfo location = new LocationInfo(sourceFolder, filePath, ident, CodeElementType.IMPORT_DECLARATION, fileContent);
 					umlImport = new UMLImport(source + "." + ident.getSym(), true, false, location);
 				}
 				if(container instanceof ModuleContainer) {
@@ -1016,7 +1018,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		}
 		else if(statement instanceof Swc4jAstTsImportEqualsDecl importDecl) {
 			Swc4jAstIdent ident = importDecl.getId();
-			LocationInfo location = new LocationInfo(sourceFolder, filePath, importDecl.getSpan(), CodeElementType.IMPORT_DECLARATION, fileContent);
+			LocationInfo location = new LocationInfo(sourceFolder, filePath, importDecl, CodeElementType.IMPORT_DECLARATION, fileContent);
 			UMLImport umlImport = new UMLImport(ident.getSym(), false, false, location);
 			if(container instanceof ModuleContainer) {
 				((ModuleContainer)container).addNestedImport(umlImport);
@@ -1048,7 +1050,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		if(typeParams.isPresent()) {
 			List<Swc4jAstTsTypeParam> list = typeParams.get().getParams();
 			for(Swc4jAstTsTypeParam param : list) {
-				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param.getSpan(), CodeElementType.TYPE_PARAMETER, fileContent);
+				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param, CodeElementType.TYPE_PARAMETER, fileContent);
 				UMLTypeParameter umlTypeParameter = new UMLTypeParameter(param.getName().getSym(), locationInfo);
 				operation.addTypeParameter(umlTypeParameter);
 			}
@@ -1071,10 +1073,10 @@ public class TypeScriptOperationBody extends OperationBody {
 			for(Swc4jAstBindingIdent identifier : identifiers) {
 				VariableDeclaration parameter = null;
 				if(identifiers.size() == attributes.size()) {
-					parameter = new VariableDeclaration(sourceFolder, filePath, attributes.get(index).getType(), identifier, operation, activeVariableDeclarations, fileContent);
+					parameter = new VariableDeclaration(sourceFolder, filePath, attributes.get(index).getType(), identifier, true, operation, activeVariableDeclarations, fileContent);
 				}
 				else {
-					parameter = new VariableDeclaration(sourceFolder, filePath, typeAnnotation2, identifier, operation, activeVariableDeclarations, fileContent);
+					parameter = new VariableDeclaration(sourceFolder, filePath, typeAnnotation2, identifier, true, operation, activeVariableDeclarations, fileContent);
 				}
 				if(parameter.getType() != null) {
 					UMLParameter umlParameter = new UMLParameter(parameter.getVariableName(), parameter.getType(), "in", false);
@@ -1132,7 +1134,7 @@ public class TypeScriptOperationBody extends OperationBody {
 					Swc4jAstIdent key = assignProp.getKey();
 					VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, null, key, container, activeVariableDeclarations, fileContent);
 					vd.setAttribute(true);
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, assignProp.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, assignProp, CodeElementType.FIELD_DECLARATION, fileContent);
 					UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -1148,7 +1150,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				}
 				else if(astProp instanceof Swc4jAstMethodProp methodProp) {
 					ISwc4jAstPropName key = methodProp.getKey();
-					LocationInfo location = new LocationInfo(sourceFolder, filePath, methodProp.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+					LocationInfo location = new LocationInfo(sourceFolder, filePath, methodProp, CodeElementType.METHOD_DECLARATION, fileContent);
 					String name = extractString(key, fileContent);
 					UMLOperation nested = new UMLOperation(name, location, umlClass.getName());
 					if(umlClass instanceof UMLAnonymousClass anonymous) {
@@ -1164,7 +1166,7 @@ public class TypeScriptOperationBody extends OperationBody {
 					String name = extractString(key, fileContent);
 					ISwc4jAstExpr expr = keyValueProp.getValue();
 					if(expr instanceof Swc4jAstArrowExpr arrowExpr) {
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, keyValueProp.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, keyValueProp, CodeElementType.METHOD_DECLARATION, fileContent);
 						UMLOperation operation = new UMLOperation(name, location, umlClass.getName());
 						if(umlClass instanceof UMLAnonymousClass anonymous) {
 							operation.setAnonymousClassContainer(anonymous);
@@ -1178,7 +1180,7 @@ public class TypeScriptOperationBody extends OperationBody {
 						umlClass.addOperation(operation);
 					}
 					else if(expr instanceof Swc4jAstFnExpr functionExpr) {
-						LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+						LocationInfo location = new LocationInfo(sourceFolder, filePath, functionExpr, CodeElementType.METHOD_DECLARATION, fileContent);
 						UMLOperation operation = new UMLOperation(name, location, container.getClassName());
 						operation.setVisibility(Visibility.PUBLIC);
 						if(umlClass instanceof UMLAnonymousClass anonymous) {
@@ -1191,7 +1193,7 @@ public class TypeScriptOperationBody extends OperationBody {
 					else if (key instanceof Swc4jAstIdentName identName) {
 						VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, null, identName, container, activeVariableDeclarations, fileContent);
 						vd.setAttribute(true);
-						LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, keyValueProp.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+						LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, keyValueProp, CodeElementType.FIELD_DECLARATION, fileContent);
 						UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 						attribute.setVariableDeclaration(vd);
 						attribute.setVisibility(Visibility.PRIVATE);
@@ -1208,7 +1210,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				else if(astProp instanceof Swc4jAstIdent ident) {
 					VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, null, ident, container, activeVariableDeclarations, fileContent);
 					vd.setAttribute(true);
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, ident.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, ident, CodeElementType.FIELD_DECLARATION, fileContent);
 					UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -1219,7 +1221,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				if(spread.getExpr() instanceof Swc4jAstIdent ident) {
 					VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, null, ident, container, activeVariableDeclarations, fileContent);
 					vd.setAttribute(true);
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, spread.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, spread, CodeElementType.FIELD_DECLARATION, fileContent);
 					UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -1279,7 +1281,7 @@ public class TypeScriptOperationBody extends OperationBody {
 	}
 
 	public static UMLAnonymousClass createAnonymousClass(Swc4jAstObjectLit node, String sourceFolder, String filePath, VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent, List<UMLClass> typeDeclarations) {
-		LocationInfo location = new LocationInfo(sourceFolder, filePath, node.getSpan(), CodeElementType.ANONYMOUS_CLASS_DECLARATION, fileContent);
+		LocationInfo location = new LocationInfo(sourceFolder, filePath, node, CodeElementType.ANONYMOUS_CLASS_DECLARATION, fileContent);
 		UMLAnonymousClass anonymousClass = null;
 		boolean alreadyAdded = false;
 		for(UMLAnonymousClass anonymous : container.getAnonymousClassList()) {
@@ -1447,7 +1449,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			}
 			else if(expr instanceof Swc4jAstMemberExpr memberExpr) {
 				String text = fileContent.substring(memberExpr.getSpan().getStart(), memberExpr.getSpan().getEnd());
-				LocationInfo location = new LocationInfo(sourceFolder, filePath, memberExpr.getSpan(), CodeElementType.TYPE, fileContent);
+				LocationInfo location = new LocationInfo(sourceFolder, filePath, memberExpr, CodeElementType.TYPE, fileContent);
 				UMLType type = UMLType.extractTypeObject(text, "<", ">", location, PathFileUtils.getLang(filePath));
 				umlClass.setSuperclass(type);
 			}
@@ -1464,7 +1466,7 @@ public class TypeScriptOperationBody extends OperationBody {
 		if(typeParams.isPresent()) {
 			List<Swc4jAstTsTypeParam> list = typeParams.get().getParams();
 			for(Swc4jAstTsTypeParam param : list) {
-				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param.getSpan(), CodeElementType.TYPE_PARAMETER, fileContent);
+				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, param, CodeElementType.TYPE_PARAMETER, fileContent);
 				UMLTypeParameter umlTypeParameter = new UMLTypeParameter(param.getName().getSym(), locationInfo);
 				umlClass.addTypeParameter(umlTypeParameter);
 			}
@@ -1488,7 +1490,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				if(key instanceof Swc4jAstIdent ident && signature.getTypeAnn().isPresent()) {
 					VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, signature.getTypeAnn().get(), ident, container, activeVariableDeclarations, fileContent);
 					vd.setAttribute(true);
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 					UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -1497,7 +1499,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				else if(key instanceof Swc4jAstStr string) {
 					VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, signature.getTypeAnn().get(), string, container, activeVariableDeclarations, fileContent);
 					vd.setAttribute(true);
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 					UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					attribute.setVisibility(Visibility.PRIVATE);
@@ -1531,9 +1533,10 @@ public class TypeScriptOperationBody extends OperationBody {
 					}
 					else if(param instanceof Swc4jAstBindingIdent identifier) {
 						Swc4jAstTsTypeAnn typeAnnotation = identifier.getTypeAnn().isPresent() ? identifier.getTypeAnn().get() : null;
-						VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, container, activeVariableDeclarations, fileContent);
+						//the key of an index signature has no AST node of its own, the attribute is the index signature
+						VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, member, CodeElementType.FIELD_DECLARATION, container, activeVariableDeclarations, fileContent);
 						vd.setAttribute(true);
-						LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+						LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 						UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 						attribute.setVariableDeclaration(vd);
 						attribute.setVisibility(Visibility.PRIVATE);
@@ -1543,9 +1546,9 @@ public class TypeScriptOperationBody extends OperationBody {
 						Swc4jAstTsTypeAnn typeAnnotation = VariableDeclaration.extractTypeAnnotation(pat);
 						List<Swc4jAstBindingIdent> identifiers = VariableDeclaration.extractVariables(pat);
 						for(Swc4jAstBindingIdent identifier : identifiers) {
-							VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, container, activeVariableDeclarations, fileContent);
+							VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, typeAnnotation, identifier, member, CodeElementType.FIELD_DECLARATION, container, activeVariableDeclarations, fileContent);
 							vd.setAttribute(true);
-							LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+							LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 							UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 							attribute.setVariableDeclaration(vd);
 							attribute.setVisibility(Visibility.PRIVATE);
@@ -1595,7 +1598,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			}
 			else if(member instanceof Swc4jAstClassProp classProperty) {
 				if(classProperty.getValue().isPresent() && classProperty.getValue().get() instanceof Swc4jAstArrowExpr arrowExpr) {
-					LocationInfo location = new LocationInfo(sourceFolder, filePath, classProperty.getSpan(), CodeElementType.METHOD_DECLARATION, fileContent);
+					LocationInfo location = new LocationInfo(sourceFolder, filePath, classProperty, CodeElementType.METHOD_DECLARATION, fileContent);
 					String append = "";
 					if(container instanceof UMLOperation) {
 						append = "." + ((UMLOperation)container).getName();
@@ -1620,7 +1623,7 @@ public class TypeScriptOperationBody extends OperationBody {
 				else {
 					VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, classProperty, container, activeVariableDeclarations, fileContent, typeDeclarations);
 					vd.setAttribute(true);
-					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+					LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 					UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 					attribute.setVariableDeclaration(vd);
 					if(classProperty.getAccessibility().isPresent()) {
@@ -1650,7 +1653,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			else if(member instanceof Swc4jAstPrivateProp privateProp) {
 				VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, privateProp, container, activeVariableDeclarations, fileContent, typeDeclarations);
 				vd.setAttribute(true);
-				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 				UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 				attribute.setVariableDeclaration(vd);
 				attribute.setVisibility(Visibility.PRIVATE);
@@ -1665,7 +1668,7 @@ public class TypeScriptOperationBody extends OperationBody {
 			else if(member instanceof Swc4jAstAutoAccessor autoAccessor) {
 				VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, autoAccessor, container, activeVariableDeclarations, fileContent, typeDeclarations);
 				vd.setAttribute(true);
-				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member.getSpan(), CodeElementType.FIELD_DECLARATION, fileContent);
+				LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, member, CodeElementType.FIELD_DECLARATION, fileContent);
 				UMLAttribute attribute = new UMLAttribute(vd.getVariableName(), vd.getType(), locationInfo, umlClass.getName());
 				attribute.setVariableDeclaration(vd);
 				attribute.setVisibility(Visibility.PRIVATE);

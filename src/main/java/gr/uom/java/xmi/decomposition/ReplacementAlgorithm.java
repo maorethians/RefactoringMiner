@@ -40,6 +40,7 @@ import gr.uom.java.xmi.decomposition.UMLOperationBodyMapper.ReplacementInfo;
 import gr.uom.java.xmi.decomposition.replacement.ClassInstanceCreationWithMethodInvocationReplacement;
 import gr.uom.java.xmi.decomposition.replacement.CompositeReplacement;
 import gr.uom.java.xmi.decomposition.replacement.InitializerReplacement;
+import gr.uom.java.xmi.decomposition.replacement.IntersectionReplacement;
 import gr.uom.java.xmi.decomposition.replacement.MethodInvocationReplacement;
 import gr.uom.java.xmi.decomposition.replacement.MethodInvocationWithClassInstanceCreationReplacement;
 import gr.uom.java.xmi.decomposition.replacement.ObjectCreationReplacement;
@@ -2964,6 +2965,9 @@ public class ReplacementAlgorithm {
 				Replacement replacement = new MethodInvocationReplacement(invocationCoveringTheEntireStatement1.actualString(),
 						invocationCoveringTheEntireStatement2.actualString(), invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, ReplacementType.METHOD_INVOCATION_NAME_AND_EXPRESSION);
 				replacementInfo.addReplacement(replacement);
+				if(variableAssignmentWithEverythingReplaced(statement1, statement2, replacementInfo, operationBodyMapper)) {
+					return null;
+				}
 				return replacementInfo.getReplacements();
 			}
 		}
@@ -5132,7 +5136,41 @@ public class ReplacementAlgorithm {
 		if(anonymousArgumentReplacedWithLambdaInParentMapper(statement1, statement2, replacementInfo, operationBodyMapper)) {
 			return replacementInfo.getReplacements();
 		}
+		if(declarationInlinedToObjectAttribute(statement1, statement2, replacementInfo, operationBodyMapper)) {
+			return replacementInfo.getReplacements();
+		}
 		return null;
+	}
+
+	//the declared variable became an attribute with the same name and initializer in an object literal,
+	//i.e., const routeStartsAndEndsSameFloor = startNode.floor === endNode.floor -> const context = { ..., routeStartsAndEndsSameFloor: startNode.floor === endNode.floor }
+	private static boolean declarationInlinedToObjectAttribute(AbstractCodeFragment statement1, AbstractCodeFragment statement2, ReplacementInfo replacementInfo, UMLOperationBodyMapper operationBodyMapper) {
+		if(statement1.getVariableDeclarations().size() == 1 && statement1.getVariableDeclarations().get(0).getInitializer() != null) {
+			VariableDeclaration declaration1 = statement1.getVariableDeclarations().get(0);
+			AbstractExpression initializer1 = declaration1.getInitializer();
+			for(AnonymousClassDeclarationObject anonymousClassDeclaration2 : statement2.getAnonymousClassDeclarations()) {
+				UMLAnonymousClass anonymousClass2 = operationBodyMapper.findAnonymousClass2(anonymousClassDeclaration2);
+				if(anonymousClass2 != null) {
+					for(UMLAttribute attribute2 : anonymousClass2.getAttributes()) {
+						AbstractExpression initializer2 = attribute2.getVariableDeclaration().getInitializer();
+						if(attribute2.getName().equals(declaration1.getVariableName()) && initializer2 != null && initializer2.getString().equals(initializer1.getString())) {
+							IntersectionReplacement replacement = new IntersectionReplacement(statement1.getString(), statement2.getString(), ReplacementType.CONCATENATION);
+							replacementInfo.addReplacement(replacement);
+							for(LeafExpression expression1 : statement1.findExpression(initializer1.getString())) {
+								for(LeafExpression expression2 : statement2.findExpression(initializer2.getString())) {
+									if(expression1.getLocationInfo().equals(initializer1.getLocationInfo()) && expression2.getLocationInfo().equals(initializer2.getLocationInfo())) {
+										LeafMapping leafMapping = new LeafMapping(expression1, expression2, operationBodyMapper.getContainer1(), operationBodyMapper.getContainer2());
+										replacementInfo.addSubExpressionMapping(leafMapping);
+									}
+								}
+							}
+							return true;
+						}
+					}
+				}
+			}
+		}
+		return false;
 	}
 
 	//inlined method, whose parameter is passed as argument to a call, and the argument at the call site is an anonymous class replaced with lambda in the parent mapper,
@@ -6522,7 +6560,10 @@ public class ReplacementAlgorithm {
 					UMLAnonymousClass anonymousClass2 = operationBodyMapper.findAnonymousClass2(anonymousClassDeclaration2);
 					boolean anonymousClassDiffFound = false;
 					for(UMLAnonymousClassDiff anonymousClassDiff : operationBodyMapper.getAnonymousClassDiffs()) {
-						if(anonymousClassDiff.getOriginalClass().equals(anonymousClass1) || anonymousClassDiff.getNextClass().equals(anonymousClass2)) {
+						//by location, since the anonymous classes of TypeScript object literals with the same code path are equal by name,
+						//i.e., the prompt: { start, retry } objects of the elements of args: [...]
+						if((anonymousClass1 != null && anonymousClassDiff.getOriginalClass().getLocationInfo().equals(anonymousClass1.getLocationInfo())) ||
+								(anonymousClass2 != null && anonymousClassDiff.getNextClass().getLocationInfo().equals(anonymousClass2.getLocationInfo()))) {
 							anonymousClassDiffFound = true;
 							break;
 						}
@@ -6530,7 +6571,7 @@ public class ReplacementAlgorithm {
 					if(!anonymousClassDiffFound) {
 						replacementAdded = processAnonymous(statement1, statement2, parameterToArgumentMap, replacementInfo,
 								invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2,
-								replacementAdded, anonymousClassDeclaration1, anonymousClassDeclaration2, lambdaMappers, operationBodyMapper);
+								replacementAdded, anonymousClassDeclaration1, anonymousClassDeclaration2, lambdaMappers, operationBodyMapper, true);
 					}
 				}
 			}
@@ -6541,7 +6582,7 @@ public class ReplacementAlgorithm {
 						AnonymousClassDeclarationObject anonymousClassDeclaration2 = anonymousClassDeclarations2.get(j);
 						replacementAdded = processAnonymous(statement1, statement2, parameterToArgumentMap, replacementInfo,
 								invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2,
-								replacementAdded, anonymousClassDeclaration1, anonymousClassDeclaration2, lambdaMappers, operationBodyMapper);
+								replacementAdded, anonymousClassDeclaration1, anonymousClassDeclaration2, lambdaMappers, operationBodyMapper, false);
 					}
 				}
 			}
@@ -6963,12 +7004,42 @@ public class ReplacementAlgorithm {
 		return counter;
 	}
 
+	//the code path of the anonymous class within its container, i.e., the variable, key and call names between them:
+	//"" for return {...} and "encoder" for the dictionary of the key "encoder" in default_hparams(), create.eventTitleText in styles = StyleSheet.create({ eventTitleText: {...} })
+	private static String nameInContainer(UMLAnonymousClass anonymousClass, VariableDeclarationContainer container) {
+		while(container instanceof LambdaExpressionObject lambda && lambda.getOwner() != null) {
+			container = lambda.getOwner();
+		}
+		String codePath = anonymousClass.getCodePath();
+		String name = container.getName();
+		if(name == null || name.isEmpty()) {
+			return codePath;
+		}
+		if(codePath.equals(name)) {
+			return "";
+		}
+		int index = codePath.lastIndexOf(name + ".");
+		if(index == 0 || (index > 0 && codePath.charAt(index - 1) == '.')) {
+			return codePath.substring(index + name.length() + 1);
+		}
+		return codePath;
+	}
+
+	private static boolean nestedInAnotherAnonymousClass(AbstractCodeFragment statement, AnonymousClassDeclarationObject anonymousClassDeclaration) {
+		for(AnonymousClassDeclarationObject other : statement.getAnonymousClassDeclarations()) {
+			if(other != anonymousClassDeclaration && other.getLocationInfo().subsumes(anonymousClassDeclaration.getLocationInfo())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static boolean processAnonymous(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			Map<String, String> parameterToArgumentMap, ReplacementInfo replacementInfo,
 			AbstractCall invocationCoveringTheEntireStatement1, AbstractCall invocationCoveringTheEntireStatement2,
 			boolean replacementAdded, AnonymousClassDeclarationObject anonymousClassDeclaration1,
 			AnonymousClassDeclarationObject anonymousClassDeclaration2, List<UMLOperationBodyMapper> lambdaMappers,
-			UMLOperationBodyMapper operationBodyMapper) throws RefactoringMinerTimedOutException {
+			UMLOperationBodyMapper operationBodyMapper, boolean pairedByPosition) throws RefactoringMinerTimedOutException {
 		Constants LANG1 = operationBodyMapper.LANG1;
 		Constants LANG2 = operationBodyMapper.LANG2;
 		VariableDeclarationContainer container1 = operationBodyMapper.getContainer1();
@@ -7014,9 +7085,9 @@ public class ReplacementAlgorithm {
 					}
 				}
 				operationBodyMapper.getRefactoringsAfterPostProcessing().addAll(anonymousClassDiffRefactorings);
-				operationBodyMapper.getAnonymousClassDiffs().add(anonymousClassDiff);
+				operationBodyMapper.addAnonymousClassDiff(anonymousClassDiff);
 				if(parentMapper != null && statement1 instanceof AbstractExpression && statement2 instanceof AbstractExpression) {
-					parentMapper.getAnonymousClassDiffs().add(anonymousClassDiff);
+					parentMapper.addAnonymousClassDiff(anonymousClassDiff);
 				}
 				if(classDiff != null) {
 					classDiff.anonymousClassesMatched(anonymousClass1, anonymousClass2);
@@ -7027,7 +7098,46 @@ public class ReplacementAlgorithm {
 				}
 				replacementAdded = true;
 			}
+			else if(matchedThroughNames(statement1, statement2, anonymousClassDeclaration1, anonymousClassDeclaration2, anonymousClass1, anonymousClass2, container1, container2)) {
+				//anonymous classes without operations, i.e., Python dictionaries, with the same variable, key and call names are diffs only if the statement pair is mapped
+				addPendingAnonymousClassDiff(statement1, statement2, anonymousClassDiff, operationBodyMapper, parentMapper);
+				//identical anonymous classes, apart from their indentation, do not need a replacement to match the statements
+				if(!anonymousClassDeclaration1.toString().replaceAll("\\s+", "").equals(anonymousClassDeclaration2.toString().replaceAll("\\s+", ""))) {
+					Replacement replacement = new Replacement(anonymousClassDeclaration1.toString(), anonymousClassDeclaration2.toString(), ReplacementType.ANONYMOUS_CLASS_DECLARATION);
+					replacementInfo.addReplacement(replacement);
+					replacementAdded = true;
+				}
+			}
+		}
+		else if(pairedByPosition) {
+			//the statement differs in other anonymous classes, i.e., the objects of args: [{...}, {...}], so the anonymous classes without operations
+			//with the same names at the same position are diffs, if the statement pair is mapped without them
+			UMLAnonymousClass anonymousClass1 = operationBodyMapper.findAnonymousClass1(anonymousClassDeclaration1);
+			UMLAnonymousClass anonymousClass2 = operationBodyMapper.findAnonymousClass2(anonymousClassDeclaration2);
+			if(matchedThroughNames(statement1, statement2, anonymousClassDeclaration1, anonymousClassDeclaration2, anonymousClass1, anonymousClass2, container1, container2)) {
+				UMLAnonymousClassDiff anonymousClassDiff = new UMLAnonymousClassDiff(anonymousClass1, anonymousClass2, classDiff, modelDiff);
+				anonymousClassDiff.process();
+				addPendingAnonymousClassDiff(statement1, statement2, anonymousClassDiff, operationBodyMapper, parentMapper);
+			}
 		}
 		return replacementAdded;
+	}
+
+	private static boolean matchedThroughNames(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
+			AnonymousClassDeclarationObject anonymousClassDeclaration1, AnonymousClassDeclarationObject anonymousClassDeclaration2,
+			UMLAnonymousClass anonymousClass1, UMLAnonymousClass anonymousClass2, VariableDeclarationContainer container1, VariableDeclarationContainer container2) {
+		return anonymousClass1 != null && anonymousClass2 != null &&
+				anonymousClass1.getOperations().isEmpty() && anonymousClass2.getOperations().isEmpty() &&
+				//the nested anonymous classes are matched through the attributes of the anonymous classes containing them
+				!nestedInAnotherAnonymousClass(statement1, anonymousClassDeclaration1) && !nestedInAnotherAnonymousClass(statement2, anonymousClassDeclaration2) &&
+				nameInContainer(anonymousClass1, container1).equals(nameInContainer(anonymousClass2, container2));
+	}
+
+	private static void addPendingAnonymousClassDiff(AbstractCodeFragment statement1, AbstractCodeFragment statement2, UMLAnonymousClassDiff anonymousClassDiff,
+			UMLOperationBodyMapper operationBodyMapper, UMLOperationBodyMapper parentMapper) {
+		operationBodyMapper.addPendingAnonymousClassDiff(anonymousClassDiff, statement1, statement2);
+		if(parentMapper != null && statement1 instanceof AbstractExpression && statement2 instanceof AbstractExpression) {
+			parentMapper.addPendingAnonymousClassDiff(anonymousClassDiff, statement1, statement2);
+		}
 	}
 }
