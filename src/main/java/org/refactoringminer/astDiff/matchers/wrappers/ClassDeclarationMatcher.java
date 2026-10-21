@@ -467,11 +467,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         if(classDiff.getPreprocessorStatementListDiff().isPresent()) {
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getCommonStatements()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
-                if(srcStatement != null && !srcStatement.getLabel().isEmpty() && !srcStatement.getType().name.equals(LANG1.ENDIF))
-                    srcStatement = srcStatement.getParent();
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(dstStatement != null && !dstStatement.getLabel().isEmpty() && !dstStatement.getType().name.equals(LANG2.ENDIF))
-                    dstStatement = dstStatement.getParent();
                 //make sure the preprocessor statement is matched, because TreeSitter puts nested statements under the preprocessor statement, while Eclipse CDT parser does not do the same
                 if(srcStatement != null && dstStatement != null && srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1) {
                     mappingStore.addMappingRecursively(srcStatement.getChild(1), dstStatement.getChild(1));
@@ -499,11 +495,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             }
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getChangedStatements()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
-                if(!srcStatement.getLabel().isEmpty())
-                    srcStatement = srcStatement.getParent();
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(!dstStatement.getLabel().isEmpty())
-                    dstStatement = dstStatement.getParent();
                 if(!mappingStore.isSrcMapped(srcStatement) && !mappingStore.isDstMapped(dstStatement))
                     mappingStore.addMappingRecursively(srcStatement, dstStatement);
             }
@@ -512,16 +504,12 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             UMLForwardDeclarationListDiff umlForwardDeclarationListDiff = classDiff.getForwardDeclarationListDiff().get();
             for (org.apache.commons.lang3.tuple.Pair<UMLForwardDeclaration, UMLForwardDeclaration> statementPair : umlForwardDeclarationListDiff.getCommonDeclarations()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
-                if(srcStatement != null && srcStatement.getType().name.equals(LANG1.FRIEND_KEYWORD))
-                    srcStatement = srcStatement.getParent();
-                else if(srcStatement != null && srcStatement.getType().name.equals(LANG1.TYPE_QUALIFIER))
+                if(srcStatement != null && srcStatement.getType().name.equals(LANG1.TYPE_QUALIFIER))
                     srcStatement = srcStatement.getParent();
                 else if(srcStatement != null && srcStatement.getType().name.equals(LANG1.TYPEDEF))
                     srcStatement = srcStatement.getParent();
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(dstStatement != null && dstStatement.getType().name.equals(LANG2.FRIEND_KEYWORD))
-                    dstStatement = dstStatement.getParent();
-                else if(dstStatement != null && dstStatement.getType().name.equals(LANG2.TYPE_QUALIFIER))
+                if(dstStatement != null && dstStatement.getType().name.equals(LANG2.TYPE_QUALIFIER))
                     dstStatement = dstStatement.getParent();
                 else if(dstStatement != null && dstStatement.getType().name.equals(LANG2.TYPEDEF))
                     dstStatement = dstStatement.getParent();
@@ -1490,10 +1478,6 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 if(colons != null) {
                     mappingStore.addMapping(colons.first, colons.second);
                 }
-                if(srcSubTree.getType().name.equals(LANG1.ACCESS_SPECIFIER))
-                    srcSubTree = TreeUtilFunctions.findByLocationInfo(srcTree, left.getLocationInfo(), LANG1, LANG1.TYPE_IDENTIFIER);
-                if(dstSubTree.getType().name.equals(LANG2.ACCESS_SPECIFIER))
-                    dstSubTree = TreeUtilFunctions.findByLocationInfo(dstTree, right.getLocationInfo(), LANG2, LANG2.TYPE_IDENTIFIER);
                 if(srcSubTree != null && dstSubTree != null) {
                     mappingStore.addMappingRecursively(srcSubTree,dstSubTree);
                     int index1 = parent1.getChildPosition(srcSubTree);
@@ -1504,11 +1488,12 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                         Tree t2 = parent2.getChild(index2+1);
                         mappingStore.addMapping(t1,t2);
                     }
-                    if(index1 > 0 && parent1.getChild(index1-1).getType().name.equals(LANG1.VIRTUAL_KEYWORD) &&
-                            index2 > 0 && parent2.getChild(index2-1).getType().name.equals(LANG2.VIRTUAL_KEYWORD)) {
-                        Tree t1 = parent1.getChild(index1-1);
-                        Tree t2 = parent2.getChild(index2-1);
-                        mappingStore.addMapping(t1,t2);
+                    //the identical access specifier and virtual keyword before the base type, i.e., public in public Base and public virtual Base
+                    for(String keyword : new String[] {LANG1.ACCESS_SPECIFIER, LANG1.VIRTUAL_KEYWORD}) {
+                        Tree t1 = precedingInBaseSpecifier(parent1, index1, keyword);
+                        Tree t2 = precedingInBaseSpecifier(parent2, index2, keyword);
+                        if(t1 != null && t2 != null && t1.isIsoStructuralTo(t2))
+                            mappingStore.addMappingRecursively(t1,t2);
                     }
                 }
             }
@@ -1534,6 +1519,18 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             }
         }
     }
+    //the node of the type before the base type in the same base specifier of the base class clause, i.e., public in public virtual Base
+    private static Tree precedingInBaseSpecifier(Tree baseClassClause, int typeIndex, String type) {
+        for(int i = typeIndex-1; i >= 0; i--) {
+            Tree child = baseClassClause.getChild(i);
+            if(child.getType().name.equals(type))
+                return child;
+            if(child.isLeaf() && (child.getLabel().equals(",") || child.getLabel().equals(":")))
+                return null;
+        }
+        return null;
+    }
+
     private void processSuperClasses(Tree srcTree, Tree dstTree, UMLClassBaseDiff classDiff, ExtendedMultiMappingStore mappingStore) {
         UMLType srcParentUML = classDiff.getOldSuperclass();
         UMLType dstParentUML = classDiff.getNewSuperclass();

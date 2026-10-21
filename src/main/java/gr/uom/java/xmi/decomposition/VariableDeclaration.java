@@ -6,11 +6,15 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import org.eclipse.cdt.core.dom.ast.IASTCompositeTypeSpecifier;
 import org.eclipse.cdt.core.dom.ast.IASTDeclSpecifier;
+import org.eclipse.cdt.core.dom.ast.IASTEnumerationSpecifier;
+import org.eclipse.cdt.core.dom.ast.IASTEnumerationSpecifier.IASTEnumerator;
 import org.eclipse.cdt.core.dom.ast.IASTDeclarator;
 import org.eclipse.cdt.core.dom.ast.IASTName;
 import org.eclipse.cdt.core.dom.ast.IASTNode;
 import org.eclipse.cdt.core.dom.ast.IASTParameterDeclaration;
+import org.eclipse.cdt.core.dom.ast.IASTSimpleDeclaration;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTCatchHandler;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTForStatement;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTIfStatement;
@@ -157,6 +161,18 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 	private final Constants LANG;
 	private boolean declaredInIfElseStatement;
 
+	//the initializer of a class member or of a condition declaration is a sibling of the declarator in the AST, i.e., bool m_flag = false; and if(auto x = f())
+	public static boolean initializerOutsideDeclarator(IASTDeclarator declarator) {
+		if(!(declarator.getParent() instanceof IASTSimpleDeclaration declaration)) {
+			return false;
+		}
+		IASTNode parent = declaration.getParent();
+		return parent instanceof IASTCompositeTypeSpecifier ||
+				parent instanceof ICPPASTIfStatement ifStatement && ifStatement.getConditionDeclaration() == declaration ||
+				parent instanceof ICPPASTWhileStatement whileStatement && whileStatement.getConditionDeclaration() == declaration ||
+				parent instanceof ICPPASTSwitchStatement switchStatement && switchStatement.getControllerDeclaration() == declaration;
+	}
+
 	public VariableDeclaration(String sourceFolder, String filePath, IASTParameterDeclaration parameter, IASTDeclSpecifier declSpecifier,
 			VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
 		IASTDeclarator declarator = parameter.getDeclarator();
@@ -182,7 +198,7 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 			VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
 		this.annotations = new ArrayList<UMLAnnotation>();
 		this.modifiers = new ArrayList<UMLModifier>();
-		this.locationInfo = new LocationInfo(sourceFolder, filePath, declarator, CodeElementType.VARIABLE_DECLARATION_STATEMENT, fileContent);
+		this.locationInfo = new LocationInfo(sourceFolder, filePath, declarator, CodeElementType.VARIABLE_DECLARATION_STATEMENT, fileContent, initializerOutsideDeclarator(declarator));
 		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
 		IASTName name = declarator.getName();
 		this.variableName = name.toString();
@@ -213,6 +229,21 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		int endOffset = scopeNode.getFileLocation().getNodeOffset() + scopeNode.getFileLocation().getNodeLength();
 		this.scope = new VariableScope(filePath, startOffset, endOffset);
 		this.actualSignature = name.getRawSignature();
+	}
+
+	public VariableDeclaration(String sourceFolder, String filePath, IASTEnumerator enumerator, IASTEnumerationSpecifier enumSpecifier,
+			VariableDeclarationContainer container, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
+		this.annotations = new ArrayList<UMLAnnotation>();
+		this.modifiers = new ArrayList<UMLModifier>();
+		this.locationInfo = new LocationInfo(sourceFolder, filePath, enumerator, CodeElementType.ENUM_CONSTANT_DECLARATION, fileContent);
+		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
+		this.variableName = enumerator.getName().toString();
+		this.type = UMLType.extractTypeObject(sourceFolder, filePath, fileContent, enumSpecifier, null, 0);
+		int startOffset = enumSpecifier.getFileLocation().getNodeOffset();
+		int endOffset = enumSpecifier.getFileLocation().getNodeOffset() + enumSpecifier.getFileLocation().getNodeLength();
+		this.scope = new VariableScope(filePath, startOffset, endOffset);
+		this.actualSignature = enumerator.getName().getRawSignature();
+		this.isEnumConstant = true;
 	}
 
 	private IASTNode getScopeNode(IASTDeclarator declarator) {
