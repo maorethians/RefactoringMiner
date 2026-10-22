@@ -8,13 +8,13 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.kohsuke.github.GHRepository;
 import org.refactoringminer.astDiff.graph.MemberUsageFinder;
 import org.refactoringminer.astDiff.graph.ReceiverTypeResolver;
 import gr.uom.java.xmi.RepositoryStateFiles;
 import org.refactoringminer.astDiff.utils.RmGap;
 import org.refactoringminer.rm1.GitHistoryRefactoringMinerImpl;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +25,14 @@ import java.util.stream.Stream;
 public class MemberUsageTest {
 
     private static final String DATASET_PATH = "dataset/contextCRBench";
+    // The files read from GitHub, kept so that later runs need no GitHub access
+    private static final String CACHE_PATH = "src/test/resources/oracle/narrator/cache";
+
+    static {
+        // The cases share one JVM, and the HTTP/2 connection of the default connector gets its streams reset while
+        // downloading the recursive trees of large repositories one after the other
+        System.setProperty("test.github.connector", "urlconnection");
+    }
     private static final String ORACLE_DATA_PATH = "src/test/resources/oracle/narrator/usages.json";
     private static final Map<String, State> STATES = new HashMap<>();
 
@@ -169,8 +177,9 @@ public class MemberUsageTest {
         JsonObject json = JsonParser.parseString(content).getAsJsonObject();
         String repo = json.get("full_name").getAsString();
 
-        GHRepository repository = new GitHistoryRefactoringMinerImpl().getGitHubRepository("https://github.com/" + repo);
-        RepositoryStateFiles files = new RepositoryStateFiles(repository, testCase.commit);
+        RepositoryStateFiles files = new RepositoryStateFiles(
+                () -> new GitHistoryRefactoringMinerImpl().getGitHubRepository("https://github.com/" + repo),
+                repo.substring(repo.lastIndexOf('/') + 1), testCase.commit, new File(CACHE_PATH));
         Map<String, String> contents = new LinkedHashMap<>();
         for (String path : testCase.files) {
             contents.put(path, files.content(path));
