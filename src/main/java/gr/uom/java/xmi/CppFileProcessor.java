@@ -38,6 +38,7 @@ import org.eclipse.cdt.core.dom.ast.IASTNode;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTTemplateDeclaration;
 import org.eclipse.cdt.core.dom.ast.IASTMacroExpansionLocation;
 import org.eclipse.cdt.core.dom.ast.IASTNodeLocation;
+import org.eclipse.cdt.core.dom.ast.IASTPreprocessorFunctionStyleMacroDefinition;
 import org.eclipse.cdt.core.dom.ast.IASTPreprocessorMacroExpansion;
 import org.eclipse.cdt.core.dom.ast.IASTProblem;
 import org.eclipse.cdt.core.dom.ast.IASTProblemDeclaration;
@@ -90,6 +91,10 @@ import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTConversionName;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTDeclSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTDeclarator;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTElaboratedTypeSpecifier;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTForStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTIfStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTSwitchStatement;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTWhileStatement;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTEnumerationSpecifier;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionDeclarator;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTFunctionDefinition;
@@ -102,6 +107,7 @@ import org.eclipse.cdt.core.parser.ExtendedScannerInfo;
 import org.eclipse.cdt.core.parser.FileContent;
 import org.eclipse.cdt.core.parser.IncludeFileContentProvider;
 import org.eclipse.cdt.core.parser.ScannerInfo;
+import org.eclipse.cdt.internal.core.dom.parser.ASTQueries;
 import org.eclipse.cdt.internal.core.dom.parser.c.CASTASMDeclaration;
 import org.eclipse.cdt.internal.core.dom.parser.c.CASTAmbiguousSimpleDeclaration;
 import org.eclipse.cdt.internal.core.dom.parser.c.CASTFunctionDefinition;
@@ -165,13 +171,14 @@ public class CppFileProcessor {
 		this.preprocessor = new CppPreprocessor(this);
 		try {
 			if(PathFileUtils.isCppFile(filePath) || PathFileUtils.isCFile(filePath)) {
-				IASTTranslationUnit ast = parse(filePath, fileContent, astDiff);
-				this.emptyMacroExpansions = emptyMacroExpansions(ast);
+				IASTTranslationUnit treeAst = parse(filePath, fileContent, astDiff);
 				if (astDiff) {
-					//a single parse for the model and the AST diff tree
-					TreeContext treeContext = CppTreeGenerator.generate(fileContent, ast);
+					//a single parse for the model and the AST diff tree, unless the model needs the declarations wrapped in macro calls
+					TreeContext treeContext = CppTreeGenerator.generate(fileContent, treeAst);
 					this.umlModel.getTreeContextMap().put(filePath, treeContext);
 				}
+				IASTTranslationUnit ast = withoutDeclarationMacros(treeAst, filePath, fileContent, astDiff);
+				this.emptyMacroExpansions = emptyMacroExpansions(ast);
 				String sourceFolder = extractCppSourceFolder();
 				List<UMLComment> comments = extractInternalComments(ast.getComments(), sourceFolder, filePath, fileContent);
 				this.umlModel.getCommentMap().put(filePath, comments);
@@ -526,7 +533,19 @@ public class CppFileProcessor {
 		//i.e., std::vector<T> x = e; as (std::vector < T) > x = e, so the file is parsed again with the declarations of these types in the included file
 		String types = misparsedTemplateTypes(translationUnit, fileContent, preamble);
 		if(!types.isEmpty()) {
-			IASTTranslationUnit reparsed = parse(filePath, fileContent, astDiff, preamble.isEmpty() ? types : preamble + "\n" + types);
+			String extendedPreamble = preamble.isEmpty() ? types : preamble + "\n" + types;
+			IASTTranslationUnit reparsed = parse(filePath, fileContent, astDiff, extendedPreamble);
+			if(problems(reparsed) <= problems(translationUnit)) {
+				translationUnit = reparsed;
+				preamble = extendedPreamble;
+			}
+		}
+		//CDT parses the conditions starting with a name it does not know as declarations of variables whose type is the name,
+		//i.e., if (m_isX11 && m_xwaylandSurface) as the declaration of the reference m_xwaylandSurface of type m_isX11,
+		//which a condition cannot declare without an initializer, so the file is parsed again with these names declared as variables in the included file
+		String variables = misparsedConditions(translationUnit);
+		if(!variables.isEmpty()) {
+			IASTTranslationUnit reparsed = parse(filePath, fileContent, astDiff, preamble.isEmpty() ? variables : preamble + "\n" + variables);
 			if(problems(reparsed) <= problems(translationUnit)) {
 				translationUnit = reparsed;
 			}
@@ -697,6 +716,31 @@ public class CppFileProcessor {
 			"long", "mutable", "namespace", "new", "noexcept", "nullptr", "operator", "private", "protected", "public", "register", "reinterpret_cast", "requires",
 			"return", "short", "signed", "sizeof", "static", "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local", "throw", "true",
 			"try", "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while");
+
+	//the declarations of the unknown names that CDT parsed as the types of condition declarations without an initializer, i.e., extern int m_isX11;
+	private static String misparsedConditions(IASTTranslationUnit translationUnit) {
+		Set<String> declarations = new LinkedHashSet<>();
+		translationUnit.accept(new ASTVisitor() {
+			{
+				shouldVisitStatements = true;
+			}
+
+			@Override
+			public int visit(IASTStatement statement) {
+				IASTDeclaration condition = statement instanceof ICPPASTIfStatement ifStatement ? ifStatement.getConditionDeclaration() :
+					statement instanceof ICPPASTWhileStatement whileStatement ? whileStatement.getConditionDeclaration() :
+					statement instanceof ICPPASTSwitchStatement switchStatement ? switchStatement.getControllerDeclaration() :
+					statement instanceof ICPPASTForStatement forStatement ? forStatement.getConditionDeclaration() : null;
+				if(condition instanceof IASTSimpleDeclaration simple && isPartOfFile(condition) && simple.getDeclarators().length == 1
+						&& simple.getDeclarators()[0].getInitializer() == null && simple.getDeclSpecifier() instanceof IASTNamedTypeSpecifier named
+						&& named.getName().getLastName() == named.getName() && named.getName().resolveBinding() instanceof IProblemBinding) {
+					declarations.add("extern int " + named.getName() + ";");
+				}
+				return PROCESS_CONTINUE;
+			}
+		});
+		return String.join("\n", declarations);
+	}
 
 	//the definitions of the unknown macros at the start of declarations, which are followed by a declaration specifier that cannot follow a type
 	private static String unknownDeclarationMacros(IASTTranslationUnit translationUnit, String fileContent) {
@@ -1047,6 +1091,101 @@ public class CppFileProcessor {
 		return problems[0];
 	}
 
+	//CDT locates the declarations expanded from a function-like macro at the whole macro call, i.e., DEPRECATED(LLAMA_API void f(int x), "use g instead");,
+	//so the file is parsed again for the model with the macro calls wrapping declarations blanked, which keeps the declarations of the macro arguments
+	//at their offsets, while the AST diff tree keeps the macro calls
+	private static IASTTranslationUnit withoutDeclarationMacros(IASTTranslationUnit translationUnit, String filePath, String fileContent, boolean astDiff) throws CoreException {
+		Map<Integer, Integer> expansionEnds = new HashMap<>();
+		for(IASTPreprocessorMacroExpansion expansion : translationUnit.getMacroExpansions()) {
+			IASTFileLocation location = expansion.getFileLocation();
+			if(location != null && expansion.isPartOfTranslationUnitFile() && expansion.getMacroDefinition() instanceof IASTPreprocessorFunctionStyleMacroDefinition) {
+				expansionEnds.put(location.getNodeOffset(), location.getNodeOffset() + location.getNodeLength());
+			}
+		}
+		if(expansionEnds.isEmpty()) {
+			return translationUnit;
+		}
+		char[] content = fileContent.toCharArray();
+		boolean[] blanked = {false};
+		translationUnit.accept(new ASTVisitor() {
+			{
+				shouldVisitDeclarations = true;
+			}
+
+			@Override
+			public int visit(IASTDeclaration declaration) {
+				IASTFileLocation location = declaration.getFileLocation();
+				if(declaration instanceof IASTSimpleDeclaration simpleDeclaration && simpleDeclaration.getDeclarators().length == 1 && location != null
+						&& isPartOfFile(declaration) && expansionEnds.containsKey(location.getNodeOffset())) {
+					int start = location.getNodeOffset();
+					int close = expansionEnds.get(start) - 1;
+					int open = fileContent.indexOf('(', start);
+					//the declared name is located at the whole macro call too, so it is found in the text of the arguments
+					String name = ASTQueries.findInnermostDeclarator(simpleDeclaration.getDeclarators()[0]).getName().toString();
+					if(open < 0 || open >= close || fileContent.charAt(close) != ')' || name.isEmpty()) {
+						return PROCESS_SKIP;
+					}
+					Pattern declaredName = Pattern.compile("(?<![\\w:])" + Pattern.quote(name) + "\\s*\\(");
+					//the argument of the macro call with the declared name, i.e., LLAMA_API void f(int x)
+					for(int[] argument : macroArguments(fileContent, open, close)) {
+						if(declaredName.matcher(fileContent).region(argument[0], argument[1]).find()) {
+							blank(content, start, argument[0]);
+							blank(content, argument[1], close + 1);
+							blanked[0] = true;
+							break;
+						}
+					}
+					return PROCESS_SKIP;
+				}
+				return PROCESS_CONTINUE;
+			}
+		});
+		if(!blanked[0]) {
+			return translationUnit;
+		}
+		IASTTranslationUnit reparsed = parse(filePath, new String(content), astDiff);
+		return problems(reparsed) <= problems(translationUnit) ? reparsed : translationUnit;
+	}
+
+	//the start and end offsets of the arguments of the macro call between the parentheses, separated by the commas outside nested parentheses, brackets, braces and literals
+	private static List<int[]> macroArguments(String fileContent, int open, int close) {
+		List<int[]> arguments = new ArrayList<>();
+		int depth = 0;
+		int argumentStart = open + 1;
+		for(int i = open + 1; i < close; i++) {
+			char c = fileContent.charAt(i);
+			if(c == '"' || c == '\'') {
+				//the literal up to its closing quote
+				for(i++; i < close && fileContent.charAt(i) != c; i++) {
+					if(fileContent.charAt(i) == '\\') {
+						i++;
+					}
+				}
+			}
+			else if(c == '(' || c == '[' || c == '{') {
+				depth++;
+			}
+			else if(c == ')' || c == ']' || c == '}') {
+				depth--;
+			}
+			else if(c == ',' && depth == 0) {
+				arguments.add(new int[] {argumentStart, i});
+				argumentStart = i + 1;
+			}
+		}
+		arguments.add(new int[] {argumentStart, close});
+		return arguments;
+	}
+
+	//the characters between the offsets replaced with spaces, keeping the line breaks and thus the offsets and the lines
+	private static void blank(char[] content, int start, int end) {
+		for(int i = start; i < end; i++) {
+			if(content[i] != '\n' && content[i] != '\r') {
+				content[i] = ' ';
+			}
+		}
+	}
+
 	public Visibility processDeclaration(String packageName, String sourceFolder, UMLAbstractClass parentContainer,
 			List<UMLComment> comments, Visibility currentVisibility, IASTDeclaration declaration, ICPPASTTemplateParameter[] templateParameters,
 			List<IASTDeclaration> inactiveContainerAlternatives) {
@@ -1289,7 +1428,8 @@ public class CppFileProcessor {
 					className = declarators[0].getName().toString();
 				}
 			}
-			LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, compositeTypeSpecifier, CodeElementType.TYPE_DECLARATION, fileContent);
+			//the class is located without the specifiers of the declaration, like its AST node, i.e., struct S {...} in static constexpr struct S {...} s;
+			LocationInfo locationInfo = UMLType.cppTypeLocation(sourceFolder, filePath, compositeTypeSpecifier, CodeElementType.TYPE_DECLARATION, fileContent);
 			UMLClass umlClass = new UMLClass(packageName, className, locationInfo, true, new ArrayList<>());
 			umlClass.setVisibility(currentVisibility != null ? currentVisibility : Visibility.PUBLIC);
 			if(compositeTypeSpecifier instanceof ICPPASTCompositeTypeSpecifier cppCompositeTypeSpecifier) {

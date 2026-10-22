@@ -57,6 +57,7 @@ import static gr.uom.java.xmi.diff.UMLClassBaseDiff.BUILDER_STATEMENT_RATIO_THRE
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -3485,15 +3486,15 @@ public class UMLModelDiff {
 			if(removedAttribute == null) {
 				removedAttribute = classDiff.containsRemovedAttributeWithTheSameNameIgnoringChangedType(addedAttribute);
 			}
+			UMLAttributeDiff renameDiff = null;
 			if(removedAttribute == null) {
-				boolean renameFound = false;
 				for(UMLAttributeDiff diff : classDiff.getAttributeDiffList()) {
 					if((diff.isRenamed() || diff.isTypeChanged()) && diff.getRemovedAttribute().equalsIgnoringChangedVisibility(addedAttribute)) {
-						renameFound = true;
+						renameDiff = diff;
 						break;
 					}
 				}
-				if(renameFound) {
+				if(renameDiff != null) {
 					removedAttribute = classDiff.getOriginalClass().containsAttributeWithTheSameSignature(addedAttribute);
 				}
 			}
@@ -3502,6 +3503,12 @@ public class UMLModelDiff {
 			}
 			if(removedAttribute != null) {
 				classDiff.getRemovedAttributes().remove(removedAttribute);
+				//the attribute moved to the added class is no longer renamed in the original class, i.e., file_index moved to the extracted MultiFileScanJob instead of renamed to scan_chunk_file_index,
+				//while an attribute with a changed type keeps its declaration in the original class, i.e., val context = GraphContext() -> val context: GraphContext in the interface HeapGraph
+				if(renameDiff != null && renameDiff.isRenamed() && renameDiff.getRemovedAttribute().equals(removedAttribute)) {
+					classDiff.getAttributeDiffList().remove(renameDiff);
+					classDiff.getAddedAttributes().add(renameDiff.getAddedAttribute());
+				}
 				Refactoring ref = null;
 				ArrayList<UMLOperationBodyMapper> operationBodyMapperList = new ArrayList<>();
 				UMLAttributeDiff attributeDiff = new UMLAttributeDiff(removedAttribute, addedAttribute, operationBodyMapperList);
@@ -3939,13 +3946,25 @@ public class UMLModelDiff {
 		return refactorings;
 	}
 
+	//a merged class differs from the merged class in its own class declaration, which is not a change of the merged class, as there are several original classes
+	private static final Set<RefactoringType> CLASS_LEVEL_REFACTORING_TYPES = EnumSet.of(RefactoringType.ADD_CLASS_ANNOTATION, RefactoringType.REMOVE_CLASS_ANNOTATION,
+			RefactoringType.MODIFY_CLASS_ANNOTATION, RefactoringType.CHANGE_CLASS_ACCESS_MODIFIER, RefactoringType.ADD_CLASS_MODIFIER, RefactoringType.REMOVE_CLASS_MODIFIER,
+			RefactoringType.CHANGE_TYPE_DECLARATION_KIND);
+
 	private List<Refactoring> getMergeClassRefactorings(List<RenamePackageRefactoring> previousRenamePackageRefactorings) throws RefactoringMinerTimedOutException {
 		List<Refactoring> refactorings = new ArrayList<Refactoring>();
 		List<RenamePackageRefactoring> newRenamePackageRefactorings = new ArrayList<RenamePackageRefactoring>();
 		for(UMLClassMergeDiff classMergeDiff : classMergeDiffList) {
 			MergeClassRefactoring refactoring = new MergeClassRefactoring(classMergeDiff);
 			for(UMLClassRenameDiff renameDiff : classMergeDiff.getClassRenameDiffs()) {
+				renameDiff.process();
 				detectSubRefactorings(renameDiff, renameDiff.getRenamedClass(), refactoring.getRefactoringType());
+				//the changes of the members of each merged class, i.e., the attributes renamed and the methods inlined in the merged class
+				for(Refactoring r : renameDiff.getRefactorings()) {
+					if(!CLASS_LEVEL_REFACTORING_TYPES.contains(r.getRefactoringType()) && !refactorings.contains(r) && !this.refactorings.contains(r)) {
+						refactorings.add(r);
+					}
+				}
 			}
 			if(!classMergeDiff.samePackage()) {
 				RenamePattern renamePattern = refactoring.getRenamePattern();
