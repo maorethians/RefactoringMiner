@@ -72,9 +72,6 @@ public class RefactoringMatcher extends OptimizationAwareMatcher {
                         if (variableDeclaration != null) {
                             Tree srcNode = TreeUtilFunctions.findByLocationInfo(srcTree,variableDeclaration.getLocationInfo(),LANG1);
                             Tree dstNode = TreeUtilFunctions.findByLocationInfo(dstTree,parameter.getLocationInfo(),LANG2);
-                            if(dstNode.getType().name.equals(LANG2.LAMBDA_PARAMETERS) && dstNode.getChildren().size() > 0) {
-                                dstNode = dstNode.getChild(0);
-                            }
                             if(Constants.isCrossLanguage(LANG1, LANG2)) {
                                 JavaToKotlinMigration.handleParameterMapping(mappingStore, srcNode, dstNode, LANG1, LANG2, optimizationData.getDeferredFlattenings());
                             }
@@ -141,6 +138,8 @@ public class RefactoringMatcher extends OptimizationAwareMatcher {
             } else if (refactoring instanceof ExtractOperationRefactoring) {
                 ExtractOperationRefactoring extractOperationRefactoring = (ExtractOperationRefactoring) refactoring;
                 UMLOperationBodyMapper bodyMapper = extractOperationRefactoring.getBodyMapper();
+                //the method extracted and moved to another file is matched with the trees of that file
+                if (inOtherFiles(bodyMapper.getContainer1(), bodyMapper.getContainer2())) continue;
                 Constants LANG1 = new Constants(bodyMapper.getContainer1().getLocationInfo().getFilePath());
                 Constants LANG2 = new Constants(bodyMapper.getContainer2().getLocationInfo().getFilePath());
                 new BodyMapperMatcher(optimizationData, bodyMapper, true, LANG1, LANG2).match(srcTree,dstTree,mappingStore);

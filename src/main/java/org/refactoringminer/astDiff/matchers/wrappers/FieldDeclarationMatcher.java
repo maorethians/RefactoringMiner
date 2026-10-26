@@ -1,5 +1,6 @@
 package org.refactoringminer.astDiff.matchers.wrappers;
 
+import com.github.gumtreediff.matchers.Mapping;
 import com.github.gumtreediff.tree.Tree;
 
 import gr.uom.java.xmi.UMLAttribute;
@@ -76,8 +77,21 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
         Tree srcAttr = TreeUtilFunctions.findByLocationInfo(srcTree, srcUMLAttribute.getLocationInfo(), LANG1);
         Tree dstAttr = TreeUtilFunctions.findByLocationInfo(dstTree, dstUMLAttribute.getLocationInfo(), LANG2);
         if (srcAttr == null || dstAttr == null) return;
-        Tree srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.FIELD_DECLARATION);
-        Tree dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.FIELD_DECLARATION);
+        //a C++ enumerator, a Kotlin enum entry or class parameter is its own declaration, and not the field declaring its enum in a class, i.e., A = 1 in enum E { A = 1 };
+        Tree srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.ENUMERATOR);
+        Tree dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.ENUMERATOR);
+        if (srcFieldDeclaration == null && (srcAttr.getType().name.equals(LANG1.ENUM_ENTRY) || srcAttr.getType().name.equals(LANG1.CLASS_PARAMETER))) {
+            srcFieldDeclaration = srcAttr;
+        }
+        if (dstFieldDeclaration == null && (dstAttr.getType().name.equals(LANG2.ENUM_ENTRY) || dstAttr.getType().name.equals(LANG2.CLASS_PARAMETER))) {
+            dstFieldDeclaration = dstAttr;
+        }
+        if (srcFieldDeclaration == null) {
+            srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.FIELD_DECLARATION);
+        }
+        if (dstFieldDeclaration == null) {
+            dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.FIELD_DECLARATION);
+        }
         if (srcFieldDeclaration == null) {
             srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.DECLARATION);
         }
@@ -90,11 +104,11 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
         if (dstFieldDeclaration == null) {
             dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.ENUM_CONSTANT_DECLARATION);
         }
-        //handle fields expanded with macro
-        if (srcFieldDeclaration == null && srcAttr.getType().name.equals(LANG1.METHOD_INVOCATION)) {
+        //handle fields expanded with macro, located at the call or at its statement, i.e., DEFINE_PROP(bool, decorate, true, EFFECT) without a semicolon
+        if (srcFieldDeclaration == null && (srcAttr.getType().name.equals(LANG1.METHOD_INVOCATION) || srcAttr.getType().name.equals(LANG1.EXPRESSION_STATEMENT))) {
             srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.EXPRESSION_STATEMENT);
         }
-        if (dstFieldDeclaration == null && dstAttr.getType().name.equals(LANG2.METHOD_INVOCATION)) {
+        if (dstFieldDeclaration == null && (dstAttr.getType().name.equals(LANG2.METHOD_INVOCATION) || dstAttr.getType().name.equals(LANG2.EXPRESSION_STATEMENT))) {
             dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.EXPRESSION_STATEMENT);
         }
         //handle Record Components (SingleVariableDeclaration)
@@ -111,17 +125,12 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
         if (dstFieldDeclaration == null && dstAttr.getType().name.equals(LANG2.VARIABLE_DECLARATOR)) {
             dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.LEXICAL_DECLARATION);
         }
-        if (srcFieldDeclaration == null || srcFieldDeclaration.getType().name.endsWith("_comment")) {
-            srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree, srcUMLAttribute.getLocationInfo(), LANG1, LANG1.FIELD_DECLARATION);
+        //the C++ type definitions are their own declarations, i.e., typedef int T;
+        if (srcFieldDeclaration == null) {
+            srcFieldDeclaration = TreeUtilFunctions.getParentUntilType(srcAttr, LANG1.TYPE_DEFINITION);
         }
-        if (dstFieldDeclaration == null || dstFieldDeclaration.getType().name.endsWith("_comment")) {
-            dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree, dstUMLAttribute.getLocationInfo(), LANG2, LANG2.FIELD_DECLARATION);
-        }
-        if (srcFieldDeclaration == null || srcFieldDeclaration.getType().name.endsWith("_comment")) {
-            srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree, srcUMLAttribute.getLocationInfo(), LANG1, LANG1.CLASS_PARAMETER);
-        }
-        if (dstFieldDeclaration == null || dstFieldDeclaration.getType().name.endsWith("_comment")) {
-            dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree, dstUMLAttribute.getLocationInfo(), LANG2, LANG2.CLASS_PARAMETER);
+        if (dstFieldDeclaration == null) {
+            dstFieldDeclaration = TreeUtilFunctions.getParentUntilType(dstAttr, LANG2.TYPE_DEFINITION);
         }
         this.srcFieldDeclaration = srcFieldDeclaration;
         this.dstFieldDeclaration = dstFieldDeclaration;
@@ -154,7 +163,18 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
         }
 
         if(srcFieldDeclaration != null && dstFieldDeclaration != null && PathFileUtils.isKotlinFile(srcUMLAttribute.getLocationInfo().getFilePath())) {
-            mappingStore.addMappingRecursively(srcFieldDeclaration,dstFieldDeclaration);
+            //the leading comments are matched by the CommentMatcher and JavaDocMatcher, i.e., /** doc */ val x = 1 and val x = 1,
+            //while the enum entries are not paired by position, as their bodies may differ in structure
+            if(srcFieldDeclaration.getType().equals(dstFieldDeclaration.getType()) && !srcFieldDeclaration.getType().name.equals(LANG1.ENUM_ENTRY)) {
+                mappingStore.addMapping(srcFieldDeclaration,dstFieldDeclaration);
+                List<Tree> srcChildren = childrenAfterComments(srcFieldDeclaration, LANG1);
+                List<Tree> dstChildren = childrenAfterComments(dstFieldDeclaration, LANG2);
+                if(srcChildren.size() == dstChildren.size()) {
+                    for(int i = 0; i < srcChildren.size(); i++) {
+                        mappingStore.addMappingRecursively(srcChildren.get(i), dstChildren.get(i));
+                    }
+                }
+            }
         }
         else if(Constants.isCrossLanguage(LANG1, LANG2)) {
             JavaToKotlinMigration.handleFieldDeclarationMapping(mappingStore, srcAttr, dstAttr, srcFieldDeclaration, dstFieldDeclaration, LANG1, LANG2, optimizationData.getDeferredFlattenings());
@@ -288,7 +308,7 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
             mappingStore.addMapping(srcVarDeclaration,dstVarDeclaration);
             if (initializerMapped && srcVarDeclaration != null && dstVarDeclaration != null && !srcVarDeclaration.getChildren().isEmpty() && !dstVarDeclaration.getChildren().isEmpty()) {
                 //the leaves of the initializers are matched through the initializer mapper, i.e., the object literals of StyleSheet.create({...}) through their attributes
-                new LeafMatcher(LANG1, LANG2).match(srcVarDeclaration.getChild(0),dstVarDeclaration.getChild(0),mappingStore);
+                new LeafMatcher(LANG1, LANG2).match(firstChildAfterComments(srcVarDeclaration, LANG1),firstChildAfterComments(dstVarDeclaration, LANG2),mappingStore);
                 com.github.gumtreediff.utils.Pair<Tree, Tree> equalOperators = Helpers.findPairOfType(srcVarDeclaration,dstVarDeclaration, LANG1.EQUAL_OPERATOR, LANG2.EQUAL_OPERATOR);
                 if (equalOperators != null)
                     mappingStore.addMapping(equalOperators.first,equalOperators.second);
@@ -297,9 +317,12 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
                 new LeafMatcher(LANG1, LANG2).match(srcVarDeclaration,dstVarDeclaration,mappingStore);
             new JavaDocMatcher(optimizationData, srcUMLAttribute.getJavadoc(), dstUMLAttribute.getJavadoc(), umlJavadocDiff, LANG1, LANG2)
                     .match(srcTree, dstTree, mappingStore);
-            if (srcVarDeclaration != null && dstVarDeclaration != null)
-                if (!srcVarDeclaration.getChildren().isEmpty() && !dstVarDeclaration.getChildren().isEmpty())
-                    mappingStore.addMapping(srcVarDeclaration.getChild(0),dstVarDeclaration.getChild(0));
+            if (srcVarDeclaration != null && dstVarDeclaration != null) {
+                Tree srcFirstChild = firstChildAfterComments(srcVarDeclaration, LANG1);
+                Tree dstFirstChild = firstChildAfterComments(dstVarDeclaration, LANG2);
+                if (srcFirstChild != null && dstFirstChild != null && srcFirstChild.getType().name.equals(dstFirstChild.getType().name))
+                    mappingStore.addMapping(srcFirstChild,dstFirstChild);
+            }
         }
         else {
             new JavaDocMatcher(optimizationData, srcUMLAttribute.getJavadoc(), dstUMLAttribute.getJavadoc(), umlJavadocDiff, LANG1, LANG2)
@@ -383,5 +406,29 @@ public class FieldDeclarationMatcher extends OptimizationAwareMatcher implements
             }
         }
         return null;
+    }
+
+    //the leading comments of the Kotlin property declarations, i.e., /** doc */ of /** doc */ private val x = 1
+    private static List<Tree> leadingComments(Tree tree, Constants LANG) {
+        List<Tree> children = tree.getChildren();
+        int first = 0;
+        while (first < children.size() && (children.get(first).getType().name.equals(LANG.LINE_COMMENT) || children.get(first).getType().name.equals(LANG.BLOCK_COMMENT)))
+            first++;
+        return children.subList(0, first);
+    }
+
+    //the children after the leading comments and before the accessors, i.e., the modifiers, val, x, =, 1 of /** doc */ private val x = 1 get() = field
+    //the accessors are matched as operations
+    private static List<Tree> childrenAfterComments(Tree tree, Constants LANG) {
+        List<Tree> children = tree.getChildren();
+        int end = 0;
+        while (end < children.size() && !children.get(end).getType().name.equals(LANG.GETTER) && !children.get(end).getType().name.equals(LANG.SETTER))
+            end++;
+        return children.subList(Math.min(leadingComments(tree, LANG).size(), end), end);
+    }
+
+    private static Tree firstChildAfterComments(Tree tree, Constants LANG) {
+        List<Tree> children = childrenAfterComments(tree, LANG);
+        return children.isEmpty() ? null : children.get(0);
     }
 }

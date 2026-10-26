@@ -460,7 +460,7 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 	public AbstractCall creationCoveringEntireFragment() {
 		String statement = getString();
 		for(AbstractCall creation : getCreations()) {
-			String objectCreation = creation.getString();
+			String objectCreation = withScopeFunctionsOnReceiver(creation);
 			if((objectCreation + LANG.STATEMENT_TERMINATION).equals(statement) || objectCreation.equals(statement)) {
 				creation.coverage = StatementCoverageType.ONLY_CALL;
 				return creation;
@@ -481,6 +481,51 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 			}
 		}
 		return null;
+	}
+
+	//the Kotlin scope functions returning their receiver cover the same statement as the receiver, i.e., GregorianCalendar(UTC).apply {...} and GregorianCalendar(UTC)
+	String withScopeFunctionsOnReceiver(AbstractCall creation) {
+		String string = creation.getString();
+		if(LANG.equals(Constants.KOTLIN)) {
+			for(AbstractCall invocation : getMethodInvocations()) {
+				if((invocation.getName().equals("apply") || invocation.getName().equals("also")) && string.equals(invocation.getExpression()) &&
+						invocation.getLocationInfo().getStartOffset() == creation.getLocationInfo().getStartOffset()) {
+					string = invocation.getString();
+				}
+			}
+		}
+		return string;
+	}
+
+	//the first call of a Kotlin chain followed only by calls with a lambda argument, i.e., getSubjectAltNames(certificate, ALT_DNS_NAME) in return getSubjectAltNames(certificate, ALT_DNS_NAME).any {...}
+	public AbstractCall firstCallOfChainCoveringEntireFragment(AbstractCall invocationCoveringEntireFragment) {
+		if(LANG.equals(Constants.KOTLIN)) {
+			for(AbstractCall invocation : getMethodInvocations()) {
+				if(invocation != invocationCoveringEntireFragment && invocation.getExpression() == null &&
+						invocation.getLocationInfo().getStartOffset() == invocationCoveringEntireFragment.getLocationInfo().getStartOffset()) {
+					String string = invocation.getString();
+					for(AbstractCall call : getMethodInvocations()) {
+						if(call.arguments().size() == 1 && isLambda(call.arguments().get(0)) && string.equals(call.getExpression()) &&
+								call.getLocationInfo().getStartOffset() == invocation.getLocationInfo().getStartOffset()) {
+							string = call.getString();
+						}
+					}
+					if(string.equals(invocationCoveringEntireFragment.getString())) {
+						invocation.coverage = invocationCoveringEntireFragment.coverage;
+						return invocation;
+					}
+				}
+			}
+		}
+		return null;
+	}
+
+	private boolean isLambda(String argument) {
+		for(LambdaExpressionObject lambda : getLambdas()) {
+			if(lambda.getString().equals(argument))
+				return true;
+		}
+		return false;
 	}
 
 	public AbstractCall invocationCoveringEntireFragment() {
@@ -653,18 +698,15 @@ public abstract class AbstractCodeFragment implements LocationInfoProvider {
 			if(prefix.contains("(") && prefix.contains(")")) {
 				int indexOfOpeningParenthesis = prefix.indexOf("(");
 				int indexOfClosingParenthesis = prefix.indexOf(")");
-				boolean openingParenthesisInsideSingleQuotes = ReplacementUtil.isInsideSingleQuotes(prefix, indexOfOpeningParenthesis);
-				boolean closingParenthesisInsideSingleQuotes = ReplacementUtil.isInsideSingleQuotes(prefix, indexOfClosingParenthesis);
-				boolean openingParenthesisInsideDoubleQuotes = ReplacementUtil.isInsideDoubleQuotes(prefix, indexOfOpeningParenthesis);
-				boolean closingParenthesisIndideDoubleQuotes = ReplacementUtil.isInsideDoubleQuotes(prefix, indexOfClosingParenthesis);
-				if(indexOfOpeningParenthesis < indexOfClosingParenthesis &&
-						!openingParenthesisInsideSingleQuotes && !closingParenthesisInsideSingleQuotes &&
-						!openingParenthesisInsideDoubleQuotes && !closingParenthesisIndideDoubleQuotes) {
+				if(indexOfOpeningParenthesis < indexOfClosingParenthesis) {
 					String casting = prefix.substring(indexOfOpeningParenthesis, indexOfClosingParenthesis+1);
-					if(statement.endsWith(LANG.STATEMENT_TERMINATION) && (LANG.RETURN_SPACE + casting + expression + LANG.STATEMENT_TERMINATION).equals(statement)) {
-						return true;
-					}
-					if(!statement.endsWith(LANG.STATEMENT_TERMINATION) && (casting + expression).equals(statement)) {
+					boolean castCoversStatement = statement.endsWith(LANG.STATEMENT_TERMINATION) ?
+							(LANG.RETURN_SPACE + casting + expression + LANG.STATEMENT_TERMINATION).equals(statement) :
+							(casting + expression).equals(statement);
+					//the parentheses in quotes are checked only for a cast covering the statement, as they scan the prefix
+					if(castCoversStatement &&
+							!ReplacementUtil.isInsideSingleQuotes(prefix, indexOfOpeningParenthesis) && !ReplacementUtil.isInsideSingleQuotes(prefix, indexOfClosingParenthesis) &&
+							!ReplacementUtil.isInsideDoubleQuotes(prefix, indexOfOpeningParenthesis) && !ReplacementUtil.isInsideDoubleQuotes(prefix, indexOfClosingParenthesis)) {
 						return true;
 					}
 				}

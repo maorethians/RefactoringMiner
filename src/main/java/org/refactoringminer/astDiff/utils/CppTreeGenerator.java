@@ -1,8 +1,10 @@
 package org.refactoringminer.astDiff.utils;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -13,6 +15,7 @@ import java.util.Set;
 import java.util.TreeMap;
 
 import gr.uom.java.xmi.CppFileProcessor;
+import gr.uom.java.xmi.decomposition.CppVisitor;
 import gr.uom.java.xmi.CppLanguage;
 
 import org.eclipse.cdt.core.dom.ast.IASTArrayDeclarator;
@@ -69,6 +72,7 @@ import org.eclipse.cdt.core.dom.ast.IASTPreprocessorFunctionStyleMacroDefinition
 import org.eclipse.cdt.core.dom.ast.IASTPreprocessorMacroExpansion;
 import org.eclipse.cdt.core.dom.ast.IASTPreprocessorStatement;
 import org.eclipse.cdt.core.dom.ast.IASTProblem;
+import org.eclipse.cdt.core.dom.ast.IASTProblemDeclaration;
 import org.eclipse.cdt.core.dom.ast.IASTProblemHolder;
 import org.eclipse.cdt.core.dom.ast.IASTReturnStatement;
 import org.eclipse.cdt.core.dom.ast.IASTSimpleDeclSpecifier;
@@ -195,6 +199,7 @@ public class CppTreeGenerator {
 		Node root = generator.translationUnit(translationUnit);
 		generator.addDirectives(root);
 		generator.groupConditionals(root);
+		generator.ungroupedDirectives(root);
 		generator.addComments(root);
 		context.setRoot(generator.toTree(root, context));
 		return context;
@@ -336,6 +341,8 @@ public class CppTreeGenerator {
 	private final TreeMap<Integer, Integer> comments = new TreeMap<>();
 	//the start and end offsets of the preprocessor directives, without the line break
 	private final TreeMap<Integer, Integer> directives = new TreeMap<>();
+	//the start of the #if, #ifdef or #ifndef of each #endif
+	private final Map<Integer, Integer> conditionalStarts = new HashMap<>();
 	//the comments and the directives
 	private final TreeMap<Integer, Integer> extras = new TreeMap<>();
 	private Source source;
@@ -975,7 +982,8 @@ public class CppTreeGenerator {
 			source = previous;
 		}
 		//the code outside the parsed nodes, i.e., the closing brace of the prefix that closed early
-		nodes.removeIf(n -> n == null || n.start < start || n.end > end);
+		//the empty problem that CDT gives at the end of the code without a closing brace
+		nodes.removeIf(n -> n == null || n.start < start || n.end > end || n.type.equals("ERROR") && n.start == n.end);
 		absorbMacros(nodes, start);
 		return nodes;
 	}
@@ -1202,6 +1210,11 @@ public class CppTreeGenerator {
 
 	//a macro call whose arguments are not expressions, i.e., ASSIGN_OR_RETURN(auto x, f()); with each argument parsed again as an expression or as a parameter
 	private Node macroCallStatement(int start, int end) {
+		return macroCallStatement(start, end, false);
+	}
+
+	//the call may have no semicolon when it is a member of a class, i.e., DEFINE_PROP(bool, decorate, true, EFFECT) expanded to a field and methods
+	private Node macroCallStatement(int start, int end, boolean optionalSemicolon) {
 		int nameStart = skip(start, end);
 		if(nameStart >= end || !isIdentifierStart(content.charAt(nameStart))) {
 			return null;
@@ -1213,7 +1226,8 @@ public class CppTreeGenerator {
 		}
 		int close = matching(open, end);
 		int semicolon = skip(close + 1, end);
-		if(close >= end || !tokenAt(semicolon).equals(";") || skip(semicolon + 1, end) < end) {
+		boolean withoutSemicolon = optionalSemicolon && close < end && semicolon >= end;
+		if(close >= end || !withoutSemicolon && (!tokenAt(semicolon).equals(";") || skip(semicolon + 1, end) < end)) {
 			return null;
 		}
 		List<Node> arguments = new ArrayList<>();
@@ -1245,10 +1259,57 @@ public class CppTreeGenerator {
 			}
 		}
 		Node call = node("call_expression", nameStart, close + 1, leaf("identifier", nameStart, nameEnd), node("argument_list", open, close + 1, arguments));
-		return node("expression_statement", nameStart, semicolon + 1, call);
+		return node("expression_statement", nameStart, withoutSemicolon ? close + 1 : semicolon + 1, call);
 	}
 
 	//the argument of a macro call as an expression or as a parameter declaration
+	//the declaration whose type is the call of a macro, like the macro_type_specifier of tree-sitter, i.e., typedef GTEST_REMOVE_REFERENCE_AND_CONST_(Container) RawContainer;
+	private Node macroTypeDeclaration(int start, int end, Context context) {
+		List<Node> children = new ArrayList<>();
+		int offset = skip(start, end);
+		boolean typedef = tokenAt(offset).equals("typedef");
+		if(typedef) {
+			children.add(leaf("typedef", offset, offset + "typedef".length()));
+			offset = skip(offset + "typedef".length(), end);
+		}
+		if(offset >= end || !isIdentifierStart(content.charAt(offset))) {
+			return null;
+		}
+		int nameEnd = offset + tokenAt(offset).length();
+		int open = skip(nameEnd, end);
+		if(open >= end || !tokenAt(open).equals("(")) {
+			return null;
+		}
+		int close = matching(open, end);
+		int declarator = skip(close + 1, end);
+		if(close >= end || declarator >= end || !isIdentifierStart(content.charAt(declarator))) {
+			return null;
+		}
+		//the specifiers after the parameters of a constructor are not names, i.e., S(S&&) noexcept;
+		if(KEYWORDS.contains(tokenAt(declarator)) || KEYWORDS.contains(tokenAt(offset))) {
+			return null;
+		}
+		int declaratorEnd = declarator + tokenAt(declarator).length();
+		int semicolon = skip(declaratorEnd, end);
+		if(semicolon >= end || !tokenAt(semicolon).equals(";") || skip(semicolon + 1, end) < end) {
+			return null;
+		}
+		List<Node> type = new ArrayList<>();
+		for(Node token : tokens(open + 1, close)) {
+			type.add(token.type.equals("identifier") ? leaf("type_identifier", token.start, token.end) : token);
+		}
+		if(type.isEmpty()) {
+			return null;
+		}
+		Node descriptor = node("type_descriptor", type.get(0).start, type.get(type.size() - 1).end, type);
+		children.add(node("macro_type_specifier", offset, close + 1, leaf("identifier", offset, nameEnd), leaf("(", open, open + 1), descriptor, leaf(")", close, close + 1)));
+		String name = typedef ? "type_identifier" : context == Context.CLASS ? "field_identifier" : "identifier";
+		children.add(leaf(name, declarator, declaratorEnd));
+		children.add(leaf(";", semicolon, semicolon + 1));
+		String kind = typedef ? "type_definition" : context == Context.CLASS ? "field_declaration" : "declaration";
+		return node(kind, children.get(0).start, semicolon + 1, children);
+	}
+
 	private Node macroArgument(int start, int end) {
 		Map<Integer, String> callInsertions = new HashMap<>();
 		callInsertions.put(start, CALL + "(");
@@ -1666,6 +1727,13 @@ public class CppTreeGenerator {
 
 	//the statement parsed again, or the nodes parsed again in an error node
 	private Node single(List<Node> nodes, IASTStatement statement) {
+		//a declaration that CDT split after the call of the macro of its type
+		if(nodes.size() > 1 || failed(nodes)) {
+			Node macroTypeDeclaration = macroTypeDeclaration(start(statement), end(statement), Context.BLOCK);
+			if(macroTypeDeclaration != null) {
+				return macroTypeDeclaration;
+			}
+		}
 		if(nodes.size() == 1) {
 			return nodes.get(0);
 		}
@@ -1988,7 +2056,11 @@ public class CppTreeGenerator {
 				nodes.add(declarationOrReparsed(sorted[i], context));
 			}
 			else if(source.reparsed) {
-				nodes.add(error(start, end));
+				Node call = context == Context.CLASS ? macroCallStatement(start, end, true) : null;
+				if(call == null) {
+					call = macroTypeDeclaration(start, end, context);
+				}
+				nodes.add(call != null ? call : error(start, end));
 			}
 			else {
 				nodes.addAll(reparseDeclaration(start, end, context));
@@ -2060,6 +2132,11 @@ public class CppTreeGenerator {
 	}
 
 	private Node declarationOrReparsed(IASTDeclaration declaration, Context context) {
+		//NAME(...) name; is not valid C++ unless NAME is a macro, which CDT reads as a type with a parenthesized declarator
+		Node macroTypeDeclaration = declaration instanceof IASTSimpleDeclaration || declaration instanceof IASTProblemDeclaration ? macroTypeDeclaration(start(declaration), end(declaration), context) : null;
+		if(macroTypeDeclaration != null) {
+			return macroTypeDeclaration;
+		}
 		if(!source.reparsed && !(declaration instanceof ICPPASTNamespaceDefinition) && !(declaration instanceof ICPPASTLinkageSpecification)
 				&& !isClassDefinition(declaration) && misparsedTemplate(declaration, true)) {
 			return orDeclaration(reparseDeclaration(start(declaration), end(declaration), context), declaration, context);
@@ -2067,7 +2144,11 @@ public class CppTreeGenerator {
 		if(reparse(declaration) && !(declaration instanceof ICPPASTNamespaceDefinition) && !(declaration instanceof ICPPASTLinkageSpecification)
 				&& !isClassDefinition(declaration) && !isFunctionWithMacroFreeHeader(declaration)) {
 			if(source.reparsed) {
-				return error(start(declaration), end(declaration));
+				Node call = context == Context.CLASS ? macroCallStatement(start(declaration), end(declaration), true) : null;
+				if(call == null) {
+					call = macroTypeDeclaration(start(declaration), end(declaration), context);
+				}
+				return call != null ? call : error(start(declaration), end(declaration));
 			}
 			return orDeclaration(macroFunctionDefinition(reparseDeclaration(start(declaration), end(declaration), context), declaration), declaration, context);
 		}
@@ -2361,6 +2442,10 @@ public class CppTreeGenerator {
 			children.add(statement(function.getBody()));
 		}
 		Node node = node("function_definition", function, children);
+		//the body without its closing brace, which ends after the function definition of CDT
+		if(!children.isEmpty()) {
+			node.end = Math.max(node.end, children.get(children.size() - 1).end);
+		}
 		wrapModifiers(node);
 		if(friend) {
 			Node friendToken = null;
@@ -3379,6 +3464,11 @@ public class CppTreeGenerator {
 			direct = false;
 			return statementKind(statement);
 		}
+		//NAME(...) name; is not valid C++ unless NAME is a macro, which CDT reads as a type with a parenthesized declarator
+		Node macroTypeDeclaration = statement instanceof IASTDeclarationStatement ? macroTypeDeclaration(start(statement), end(statement), Context.BLOCK) : null;
+		if(macroTypeDeclaration != null) {
+			return macroTypeDeclaration;
+		}
 		Set<String> functions = statement instanceof IASTCompoundStatement ? new LinkedHashSet<>() : misparsedCalls(statement, true, new LinkedHashSet<>());
 		functions.removeAll(source.functions);
 		if(!functions.isEmpty()) {
@@ -3388,7 +3478,9 @@ public class CppTreeGenerator {
 		}
 		if((reparse(statement) || !source.reparsed && misparsedTemplate(statement, true)) && !(statement instanceof IASTCompoundStatement)) {
 			if(source.reparsed) {
-				return error(start(statement), end(statement));
+				//the call of a macro in a function parsed again, i.e., TF_ASSERT_OK_AND_ASSIGN(auto x, f()); in TEST(A, B) {...}
+				Node call = macroCallStatement(start(statement), end(statement));
+				return call != null ? call : error(start(statement), end(statement));
 			}
 			if(statement instanceof IASTDeclarationStatement declarationStatement && isFunctionWithMacroFreeHeader(declarationStatement.getDeclaration())) {
 				return declaration(declarationStatement.getDeclaration(), Context.BLOCK);
@@ -3411,7 +3503,7 @@ public class CppTreeGenerator {
 
 	private Node statementKind(IASTStatement statement) {
 		if(statement instanceof IASTCompoundStatement compound) {
-			return compoundStatement(compound, false);
+			return compoundStatement(compound);
 		}
 		if(statement instanceof IASTExpressionStatement expressionStatement) {
 			IASTExpression expression = expressionStatement.getExpression();
@@ -3455,7 +3547,7 @@ public class CppTreeGenerator {
 		if(statement instanceof IASTSwitchStatement switchStatement) {
 			IASTNode controller = switchStatement instanceof ICPPASTSwitchStatement cpp && cpp.getControllerDeclaration() != null ? cpp.getControllerDeclaration() : switchStatement.getControllerExpression();
 			IASTStatement initializer = switchStatement instanceof ICPPASTSwitchStatement cpp ? cpp.getInitializerStatement() : null;
-			Node body = switchStatement.getBody() instanceof IASTCompoundStatement compound ? compoundStatement(compound, true) : statement(switchStatement.getBody());
+			Node body = switchStatement.getBody() instanceof IASTCompoundStatement compound ? compoundStatement(compound) : statement(switchStatement.getBody());
 			return node("switch_statement", statement, conditionClause(start(statement), controller, initializer, body == null ? end(statement) : body.start), body);
 		}
 		if(statement instanceof IASTCaseStatement caseStatement) {
@@ -3508,7 +3600,7 @@ public class CppTreeGenerator {
 		return node("catch_clause", handler, node("parameter_list", open, close + 1, parameters), body);
 	}
 
-	private Node compoundStatement(IASTCompoundStatement compound, boolean switchBody) {
+	private Node compoundStatement(IASTCompoundStatement compound) {
 		List<Node> children = new ArrayList<>();
 		IASTStatement[] statements = compound.getStatements();
 		List<IASTStatement> active = new ArrayList<>();
@@ -3519,12 +3611,26 @@ public class CppTreeGenerator {
 		}
 		for(int i = 0; i < active.size(); i++) {
 			IASTStatement statement = active.get(i);
-			//a macro expansion or a problem followed by the semicolon or the rest of the statement, i.e., CHECK(x); where the macro ends with a semicolon
+			//a declaration whose type is the call of a macro, which CDT split after the call, i.e., typedef GTEST_REMOVE_REFERENCE_AND_CONST_(Container) RawContainer;
+			if(statement instanceof IASTDeclarationStatement && !content.substring(start(statement), end(statement)).stripTrailing().endsWith(";")) {
+				int k = i + 1;
+				while(k < active.size() && !content.substring(start(statement), end(active.get(k))).stripTrailing().endsWith(";")) {
+					k++;
+				}
+				Node macroTypeDeclaration = k < active.size() ? macroTypeDeclaration(start(statement), end(active.get(k)), Context.BLOCK) : null;
+				if(macroTypeDeclaration != null) {
+					children.add(macroTypeDeclaration);
+					i = k;
+					continue;
+				}
+			}
+			//a macro expansion or a problem followed by the semicolon or the rest of the statement, i.e., CHECK(x); where the macro ends with a semicolon,
+			//or ASSIGN_OR_RETURN(auto x, f({{a, b}}, c)); that CDT split at the argument it cannot parse, like the problem statement of the model
 			int end = end(statement);
 			int j = i + 1;
-			if(!source.reparsed && (reparse(statement) && !(statement instanceof IASTCompoundStatement))) {
-				while(j < active.size() && !content.substring(start(statement), end).stripTrailing().endsWith(";")
-						&& !content.substring(start(statement), end).stripTrailing().endsWith("}")
+			if(reparse(statement) && !(statement instanceof IASTCompoundStatement)) {
+				while(j < active.size() && (CppVisitor.unbalancedParentheses(content.substring(start(statement), end))
+						|| !content.substring(start(statement), end).stripTrailing().endsWith(";") && !content.substring(start(statement), end).stripTrailing().endsWith("}"))
 						&& (active.get(j) instanceof IASTNullStatement || active.get(j) instanceof IASTProblemHolder)) {
 					end = end(active.get(j));
 					j++;
@@ -3541,34 +3647,11 @@ public class CppTreeGenerator {
 			}
 		}
 		children.addAll(inactive(source.translationUnit, start(compound) + 1, end(compound) - 1, Context.BLOCK, active.toArray(new IASTNode[0])));
-		Node node = node("compound_statement", compound, children);
-		if(switchBody) {
-			groupCases(node);
+		//the body without its closing brace, which CDT gives as empty at the opening brace, i.e., TEST(A, B) { in an inactive branch
+		if(end(compound) == start(compound) && content.startsWith("{", start(compound))) {
+			return node("compound_statement", start(compound), start(compound) + 1, children);
 		}
-		return node;
-	}
-
-	//the statements after a case label are children of the case statement
-	private static void groupCases(Node node) {
-		List<Node> children = new ArrayList<>();
-		Node current = null;
-		for(Node child : node.children) {
-			if(child.type.equals("case_statement")) {
-				current = child;
-				children.add(child);
-			}
-			else if(current != null && !child.type.equals("}")) {
-				current.add(child);
-				current.end = child.end;
-			}
-			else {
-				children.add(child);
-			}
-		}
-		node.children.clear();
-		for(Node child : children) {
-			node.add(child);
-		}
+		return node("compound_statement", compound, children);
 	}
 
 	private Node ifStatement(IASTIfStatement ifStatement) {
@@ -3607,15 +3690,20 @@ public class CppTreeGenerator {
 		return node("condition_clause", open, close + 1, children);
 	}
 
-	//a declaration in a condition, whose initializer is not in an init_declarator
+	//a declaration in a condition, whose declarator and initializer are in an init_declarator like in the other declarations,
+	//where the variable of the model is located, i.e., int should_continue = index < 2 in for(int index = 0; int should_continue = index < 2; ++index)
 	private Node conditionDeclaration(IASTSimpleDeclaration declaration) {
 		List<Node> children = new ArrayList<>();
 		children.add(declSpecifier(declaration.getDeclSpecifier()));
 		for(IASTDeclarator declarator : declaration.getDeclarators()) {
-			children.add(declaratorCore(declarator, NameKind.IDENTIFIER, false));
+			Node core = declaratorCore(declarator, NameKind.IDENTIFIER, false);
 			IASTInitializer initializer = declarator.getInitializer();
 			if(initializer != null && hasLocation(initializer)) {
-				children.add(initializer(initializer));
+				Node value = initializer(initializer);
+				children.add(node("init_declarator", core.start, value.end, core, value));
+			}
+			else {
+				children.add(core);
 			}
 		}
 		Node node = node("declaration", declaration, children);
@@ -4131,8 +4219,15 @@ public class CppTreeGenerator {
 	private void addDirectives(Node root) {
 		List<Node> leaves = new ArrayList<>();
 		collectLeaves(root, leaves);
+		Deque<Integer> open = new ArrayDeque<>();
 		for(var entry : directives.entrySet()) {
 			Node directive = directive(entry.getKey(), entry.getValue());
+			if(directive.type.equals("#if") || directive.type.equals("#ifdef") || directive.type.equals("#ifndef")) {
+				open.push(directive.start);
+			}
+			else if(directive.type.equals("#endif") && !open.isEmpty()) {
+				conditionalStarts.put(directive.start, open.pop());
+			}
 			insertExtra(root, leaves, directive);
 		}
 	}
@@ -4466,21 +4561,29 @@ public class CppTreeGenerator {
 		boolean grouped = true;
 		while(grouped) {
 			grouped = false;
-			//the innermost conditional, without conditional directives between its directives
-			int open = -1;
-			for(int i = 0; i < children.size(); i++) {
-				String type = children.get(i).type;
-				if(type.equals("#if") || type.equals("#ifdef") || type.equals("#ifndef")) {
-					open = i;
-				}
-				else if(type.equals("#endif") && open >= 0) {
-					group(node, open, i);
-					grouped = true;
-					break;
+			//the innermost conditional, without conditional directives between its directives,
+			//whose #if is a sibling of its #endif, i.e., not the #ifdef of #ifdef X\nextern "C" {\n#endif
+			for(int i = 0; i < children.size() && !grouped; i++) {
+				if(children.get(i).type.equals("#endif") && conditionalStarts.containsKey(children.get(i).start)) {
+					int start = conditionalStarts.get(children.get(i).start);
+					for(int open = i - 1; open >= 0; open--) {
+						if(children.get(open).start == start && children.get(open).type.startsWith("#if")) {
+							group(node, open, i);
+							grouped = true;
+							break;
+						}
+					}
 				}
 			}
 		}
-		//the directives without their conditional
+	}
+
+	//the directives without their conditional, after the grouping, which can move them into the conditionals of the parent nodes
+	private void ungroupedDirectives(Node node) {
+		List<Node> children = node.children;
+		for(Node child : children) {
+			ungroupedDirectives(child);
+		}
 		for(int i = 0; i < children.size(); i++) {
 			Node child = children.get(i);
 			if(child.type.startsWith("#") && !child.leaf) {

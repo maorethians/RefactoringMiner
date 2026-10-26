@@ -20,6 +20,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import org.apache.commons.lang3.tuple.Pair;
 import org.refactoringminer.api.Refactoring;
 import org.refactoringminer.api.RefactoringMinerTimedOutException;
 import org.refactoringminer.util.PathFileUtils;
@@ -75,6 +76,19 @@ public class ReplacementAlgorithm {
 		return null;
 	}
 
+	private static Pair<AbstractExpression, AbstractExpression> sameConditionInIfAndWhenEntry(AbstractCodeFragment statement1, AbstractCodeFragment statement2) {
+		if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
+				statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY)) {
+			List<AbstractExpression> conditions1 = ((CompositeStatementObject)statement1).getExpressions();
+			List<AbstractExpression> conditions2 = ((CompositeStatementObject)statement2).getExpressions().stream()
+					.filter(e -> e.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY_CONDITION)).toList();
+			if(conditions1.size() == 1 && conditions2.size() == 1 && conditions1.get(0).getString().equals(conditions2.get(0).getString())) {
+				return Pair.of(conditions1.get(0), conditions2.get(0));
+			}
+		}
+		return null;
+	}
+
 	//the statements of the Java switch case are nested under the block of the Kotlin when entry, i.e., switch(x) { case A: return null; } -> when(x) { A -> { return null } }
 	private static boolean switchCaseStatementInWhenEntry(AbstractCodeFragment statement1, AbstractCodeFragment statement2) {
 		CompositeStatementObject parent2 = statement2.getParent();
@@ -106,6 +120,19 @@ public class ReplacementAlgorithm {
 		}
 		return matchCollapsedAssertJCastAssertion(statement1, statement2, invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2,
 				assertThatArgument1, baseArgument2, asInstanceOfText, container1, container2, replacementInfo);
+	}
+
+	//the variable initialized with the other call is inlined as the first call of a chain, i.e., List<String> altNames = getSubjectAltNames(certificate, ALT_DNS_NAME) and return getSubjectAltNames(certificate, ALT_DNS_NAME).any {...}
+	private static AbstractCall inlinedVariableInitializer(AbstractCodeFragment statement, AbstractCall invocationCoveringTheEntireStatement, AbstractCall otherInvocationCoveringTheEntireStatement) {
+		if(invocationCoveringTheEntireStatement != null && otherInvocationCoveringTheEntireStatement != null &&
+				otherInvocationCoveringTheEntireStatement.getCoverage().equals(StatementCoverageType.VARIABLE_DECLARATION_INITIALIZER_CALL) &&
+				!invocationCoveringTheEntireStatement.getName().equals(otherInvocationCoveringTheEntireStatement.getName())) {
+			AbstractCall firstCall = statement.firstCallOfChainCoveringEntireFragment(invocationCoveringTheEntireStatement);
+			if(firstCall != null && firstCall.getName().equals(otherInvocationCoveringTheEntireStatement.getName())) {
+				return firstCall;
+			}
+		}
+		return invocationCoveringTheEntireStatement;
 	}
 
 	private static boolean matchCollapsedAssertJTypeCheck(AbstractCodeFragment statement1, AbstractCodeFragment statement2, AbstractCall invocationCoveringTheEntireStatement1,
@@ -359,10 +386,22 @@ public class ReplacementAlgorithm {
 				}
 			}
 		}
-		AbstractCall invocationCoveringTheEntireStatement1 = statement1.invocationCoveringEntireFragment();
-		AbstractCall invocationCoveringTheEntireStatement2 = statement2.invocationCoveringEntireFragment();
+		AbstractCall invocationCoveringEntireFragment1 = statement1.invocationCoveringEntireFragment();
+		AbstractCall invocationCoveringEntireFragment2 = statement2.invocationCoveringEntireFragment();
+		AbstractCall invocationCoveringTheEntireStatement1 = inlinedVariableInitializer(statement1, invocationCoveringEntireFragment1, invocationCoveringEntireFragment2);
+		AbstractCall invocationCoveringTheEntireStatement2 = inlinedVariableInitializer(statement2, invocationCoveringEntireFragment2, invocationCoveringEntireFragment1);
 		AbstractCall assignmentInvocationCoveringTheEntireStatement1 = invocationCoveringTheEntireStatement1 == null ? statement1.assignmentInvocationCoveringEntireStatement() : invocationCoveringTheEntireStatement1;
 		AbstractCall assignmentInvocationCoveringTheEntireStatement2 = invocationCoveringTheEntireStatement2 == null ? statement2.assignmentInvocationCoveringEntireStatement() : invocationCoveringTheEntireStatement2;
+		//the variable assigned with a call on an inlined variable is assigned with the Kotlin run returning the call, i.e., payload = buffer.readByteString() and payload = Buffer().run {...; readByteString()}
+		if(invocationCoveringTheEntireStatement1 == null && invocationCoveringTheEntireStatement2 == null &&
+				assignmentInvocationCoveringTheEntireStatement1 != null && assignmentInvocationCoveringTheEntireStatement2 != null &&
+				statement1.getString().contains(LANG1.ASSIGNMENT) && statement2.getString().contains(LANG2.ASSIGNMENT) &&
+				statement1.getString().substring(0, statement1.getString().indexOf(LANG1.ASSIGNMENT)).equals(statement2.getString().substring(0, statement2.getString().indexOf(LANG2.ASSIGNMENT))) &&
+				matchCallOnInlinedVariableWithRun(assignmentInvocationCoveringTheEntireStatement1, assignmentInvocationCoveringTheEntireStatement2, statement2, replacementInfo, container1, container2)) {
+			Replacement replacement = new MethodInvocationReplacement(assignmentInvocationCoveringTheEntireStatement1.actualString(), assignmentInvocationCoveringTheEntireStatement2.actualString(), assignmentInvocationCoveringTheEntireStatement1, assignmentInvocationCoveringTheEntireStatement2, ReplacementType.METHOD_INVOCATION);
+			replacementInfo.addReplacement(replacement);
+			return replacementInfo.getReplacements();
+		}
 		AbstractCall temp1 = statement1.creationCoveringEntireFragment();
 		ObjectCreation creationCoveringTheEntireStatement1 = temp1 instanceof ObjectCreation ? (ObjectCreation)temp1 : null;
 		AbstractCall temp2 = statement2.creationCoveringEntireFragment();
@@ -1108,8 +1147,8 @@ public class ReplacementAlgorithm {
 			}
 		}
 		findReplacements(creations1, convertLambdasToStringSet(lambdas2), replacementInfo, ReplacementType.CLASS_INSTANCE_CREATION_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
-		findReplacements(variablesToBeConsidered1, creations2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
-		findReplacements(creations1, variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
+		findReplacements(variablesToBeConsidered1, withScopeFunctionsOnReceiver(statement2, creations2, creationMap2), replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
+		findReplacements(withScopeFunctionsOnReceiver(statement1, creations1, creationMap1), variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
 		findReplacements(variables1, convertLambdasToStringSet(lambdas2), replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
 		findReplacements(convertLambdasToStringSet(lambdas1), variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
 		if(statement1.getString().startsWith(LANG1.THROW_SPACE) && statement2.getString().startsWith(LANG2.THROW_SPACE) && creationCoveringTheEntireStatement2 != null && creations2.isEmpty()) {
@@ -2211,6 +2250,12 @@ public class ReplacementAlgorithm {
 				return replacementInfo.getReplacements();
 			}
 		}
+		//match if with when entry having the same condition, i.e., if(x > 0) -> x > 0 -> {...}
+		Pair<AbstractExpression, AbstractExpression> sameConditions = sameConditionInIfAndWhenEntry(statement1, statement2);
+		if(sameConditions != null) {
+			replacementInfo.addSubExpressionMapping(new LeafMapping(sameConditions.getLeft(), sameConditions.getRight(), container1, container2));
+			return replacementInfo.getReplacements();
+		}
 		//match traditional for with enhanced for
 		if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.FOR_STATEMENT) &&
 				statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.ENHANCED_FOR_STATEMENT)) {
@@ -2798,11 +2843,16 @@ public class ReplacementAlgorithm {
 						staticVSNonStatic = true;
 					}
 				}
-				for(UMLClass addedClass : modelDiff.getAddedClasses()) {
-					if((expression1 == null && expression2 != null && container1 != null && addedClass.getName().endsWith("." + expression2)) ||
-							(expression1 != null && expression2 == null && container2 != null && addedClass.getName().endsWith("." + expression1))) {
-						staticVSNonStatic = true;
-						break;
+				//the expression of the single call with an expression, which is a static call of an added class
+				String staticCallExpression = expression1 == null && expression2 != null && container1 != null ? expression2 :
+					expression1 != null && expression2 == null && container2 != null ? expression1 : null;
+				if(staticCallExpression != null) {
+					String suffix = "." + staticCallExpression;
+					for(UMLClass addedClass : modelDiff.getAddedClasses()) {
+						if(addedClass.getName().endsWith(suffix)) {
+							staticVSNonStatic = true;
+							break;
+						}
 					}
 				}
 			}
@@ -2816,6 +2866,7 @@ public class ReplacementAlgorithm {
 					AbstractExpression initializer = variableDeclaration.getInitializer();
 					if(initializer != null && statement1.getString().startsWith(initializer.getString()) && statement2.getString().startsWith(variableDeclaration.getVariableName())) {
 						overlappingExtractVariable = true;
+						break;
 					}
 				}
 			}
@@ -2874,6 +2925,14 @@ public class ReplacementAlgorithm {
 					}
 				}
 			}
+		}
+		//the boolean assertion is inverted and its subject changed with the other replacements, i.e., assertThat(w.isEmpty).isFalse() -> assertThat(w.hasRetainedReferences).isTrue()
+		if(invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null &&
+				invertedBooleanAssertionWithReplacedSubject(invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, replacementInfo, LANG1, LANG2)) {
+			Replacement replacement = new MethodInvocationReplacement(invocationCoveringTheEntireStatement1.getName(),
+					invocationCoveringTheEntireStatement2.getName(), invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, ReplacementType.METHOD_INVOCATION_NAME);
+			replacementInfo.addReplacement(replacement);
+			return replacementInfo.getReplacements();
 		}
 		//method invocation has been renamed but the expression and arguments are identical
 		if(invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null && statement1.getClass().equals(statement2.getClass()) &&
@@ -3014,7 +3073,9 @@ public class ReplacementAlgorithm {
 		}
 		//method invocation has been renamed and arguments changed, but the expressions are identical
 		if(invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null &&
-				invocationCoveringTheEntireStatement1.renamedWithIdenticalExpressionAndDifferentArguments(invocationCoveringTheEntireStatement2, replacementInfo, parameterToArgumentMap, UMLClassBaseDiff.MAX_OPERATION_NAME_DISTANCE, replacementInfo.getLambdaMappers())) {
+				invocationCoveringTheEntireStatement1.renamedWithIdenticalExpressionAndDifferentArguments(invocationCoveringTheEntireStatement2, replacementInfo, parameterToArgumentMap, UMLClassBaseDiff.MAX_OPERATION_NAME_DISTANCE, replacementInfo.getLambdaMappers(),
+						() -> matchPairOfRemovedAddedOperationsWithIdenticalBody(invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, operationBodyMapper) ||
+						(modelDiff != null && modelDiff.matchesPairOfRemovedAddedOperationsWithIdenticalBody(invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, container1, container2, classDiff)))) {
 			ReplacementType type = invocationCoveringTheEntireStatement1.getName().equals(invocationCoveringTheEntireStatement2.getName()) ? ReplacementType.METHOD_INVOCATION_ARGUMENT : ReplacementType.METHOD_INVOCATION_NAME_AND_ARGUMENT;
 			Replacement replacement = new MethodInvocationReplacement(invocationCoveringTheEntireStatement1.actualString(),
 					invocationCoveringTheEntireStatement2.actualString(), invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, type);
@@ -4796,22 +4857,12 @@ public class ReplacementAlgorithm {
 		boolean singleReturnStatement = container1.singleReturnStatement() != null && container2.singleReturnStatement() != null;
 		boolean lastStatement = (statement1.isLastStatement() && statement2.isLastStatement()) || 
 				lastStatementInParentBlockWithSameParentType(statement1, statement2);
+		//the possible extract and inline of the returned variable scan the statements, so they are checked after the other conditions
 		boolean possibleExtract = false;
-		for(AbstractCodeFragment fragment2 : replacementInfo.getStatements2()) {
-			if(statement2.getVariables().size() == 1 && fragment2.getVariableDeclaration(statement2.getVariables().get(0).getString()) != null) {
-				possibleExtract = true;
-				break;
-			}
-		}
-		boolean possibleInline = false;
-		for(AbstractCodeFragment fragment1 : replacementInfo.getStatements1()) {
-			if(statement1.getVariables().size() == 1 && fragment1.getVariableDeclaration(statement1.getVariables().get(0).getString()) != null) {
-				possibleInline = true;
-				break;
-			}
-		}
-		if(parentMapper == null && (!variableReturnAsLastStatement1 || possibleInline) && (!variableReturnAsLastStatement2 || possibleExtract) && ((!numberLiteralReturn1 && !numberLiteralReturn2) || singleReturnStatement) && statement1.getString().startsWith(LANG1.RETURN_SPACE) && statement2.getString().startsWith(LANG2.RETURN_SPACE) && lastStatement &&
+		if(parentMapper == null && ((!numberLiteralReturn1 && !numberLiteralReturn2) || singleReturnStatement) && statement1.getString().startsWith(LANG1.RETURN_SPACE) && statement2.getString().startsWith(LANG2.RETURN_SPACE) && lastStatement &&
 				variableReturnQualified1 == variableReturnQualified2 && container1 instanceof UMLOperation && container2 instanceof UMLOperation &&
+				(!variableReturnAsLastStatement1 || declaresSingleVariable(replacementInfo.getStatements1(), statement1)) &&
+				((possibleExtract = declaresSingleVariable(replacementInfo.getStatements2(), statement2)) || !variableReturnAsLastStatement2) &&
 				compatibleSignatureForFinalReturnStatement(operationBodyMapper) &&
 				(statement1.getLambdas().size() == statement2.getLambdas().size() || possibleExtract)) {
 			boolean callToAddedOperation = false;
@@ -5330,6 +5381,35 @@ public class ReplacementAlgorithm {
 		return false;
 	}
 
+	private static boolean invertedBooleanAssertionWithReplacedSubject(AbstractCall invocation1, AbstractCall invocation2, ReplacementInfo replacementInfo, Constants LANG1, Constants LANG2) {
+		boolean inverted = (invocation1.getName().equals("isTrue") && invocation2.getName().equals("isFalse")) ||
+				(invocation1.getName().equals("isFalse") && invocation2.getName().equals("isTrue"));
+		String expression1 = invocation1.getExpression();
+		String expression2 = invocation2.getExpression();
+		if(!inverted || !invocation1.arguments().isEmpty() || !invocation2.arguments().isEmpty() || expression1 == null || expression2 == null ||
+				expression1.equals(expression2) || !expression1.startsWith("assertThat(") || !expression2.startsWith("assertThat(")) {
+			return false;
+		}
+		for(Replacement replacement : replacementInfo.getReplacements()) {
+			expression1 = ReplacementUtil.performReplacement(expression1, expression2, replacement.getBefore(), replacement.getAfter(), LANG1, LANG2);
+		}
+		return expression1.equals(expression2);
+	}
+
+	//whether one of the statements declares the single variable of the statement, i.e., a possible extract or inline of the returned variable
+	private static boolean declaresSingleVariable(List<? extends AbstractCodeFragment> statements, AbstractCodeFragment statement) {
+		if(statement.getVariables().size() != 1) {
+			return false;
+		}
+		String variable = statement.getVariables().get(0).getString();
+		for(AbstractCodeFragment fragment : statements) {
+			if(fragment.getVariableDeclaration(variable) != null) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static boolean compatibleSignatureForFinalReturnStatement(UMLOperationBodyMapper operationBodyMapper) {
 		if(operationBodyMapper.getOperation1().equalSignature(operationBodyMapper.getOperation2())) {
 			return true;
@@ -5578,6 +5658,67 @@ public class ReplacementAlgorithm {
 		else {
 			removeCommonElements(strings1, strings2);
 		}
+	}
+
+	//the creation followed by a Kotlin scope function returning its receiver replaces a variable as a whole, i.e., buf and Buffer().apply {...}
+	private static Set<String> withScopeFunctionsOnReceiver(AbstractCodeFragment statement, Set<String> creations, Map<String, List<AbstractCall>> creationMap) {
+		Set<String> result = new LinkedHashSet<String>();
+		for(String creation : creations) {
+			result.add(creation);
+			if(creationMap.containsKey(creation)) {
+				for(AbstractCall call : creationMap.get(creation)) {
+					String string = call.getString();
+					if(string != null) {
+						String withScopeFunctions = statement.withScopeFunctionsOnReceiver(call);
+						if(!withScopeFunctions.equals(string)) {
+							result.add(creation + withScopeFunctions.substring(string.length()));
+						}
+					}
+				}
+			}
+		}
+		return result;
+	}
+
+	//the Kotlin run on the creation initializing the variable of the call returns the call as its last statement, i.e., buffer.readByteString() with Buffer buffer = new Buffer() and Buffer().run {...; readByteString()},
+	//and the creations and the calls are mapped as sub-expressions
+	private static boolean matchCallOnInlinedVariableWithRun(AbstractCall invocation1, AbstractCall invocation2, AbstractCodeFragment statement2, ReplacementInfo replacementInfo,
+			VariableDeclarationContainer container1, VariableDeclarationContainer container2) {
+		if(!invocation2.getName().equals("run") || invocation2.arguments().size() != 1 || invocation2.getExpression() == null || invocation1.getExpression() == null) {
+			return false;
+		}
+		AbstractCall lastCall = null;
+		for(LambdaExpressionObject lambda : statement2.getLambdas()) {
+			if(lambda.getString().equals(invocation2.arguments().get(0)) && lambda.getBody() != null) {
+				List<AbstractStatement> statements = lambda.getBody().getCompositeStatement().getStatements();
+				if(statements.size() > 0) {
+					lastCall = statements.get(statements.size()-1).invocationCoveringEntireFragment();
+				}
+			}
+		}
+		if(lastCall == null || lastCall.getExpression() != null || !lastCall.getName().equals(invocation1.getName()) || !lastCall.equalArguments(invocation1)) {
+			return false;
+		}
+		AbstractCall creation2 = null;
+		for(AbstractCall creation : statement2.getCreations()) {
+			if(creation.getString().equals(invocation2.getExpression()) && creation.getLocationInfo().getStartOffset() == invocation2.getLocationInfo().getStartOffset()) {
+				creation2 = creation;
+			}
+		}
+		if(creation2 instanceof ObjectCreation) {
+			for(AbstractCodeFragment fragment1 : replacementInfo.getStatements1()) {
+				VariableDeclaration declaration = fragment1.getVariableDeclaration(invocation1.getExpression());
+				if(declaration != null && declaration.getInitializer() != null) {
+					AbstractCall creation1 = fragment1.creationCoveringEntireFragment();
+					if(creation1 instanceof ObjectCreation && ((ObjectCreation)creation1).getType().equals(((ObjectCreation)creation2).getType())) {
+						replacementInfo.addSubExpressionMapping(new LeafMapping(creation1, creation2, container1, container2));
+						replacementInfo.addSubExpressionMapping(new LeafMapping(invocation1, lastCall, container1, container2));
+						return true;
+					}
+				}
+			}
+		}
+		return false;
 	}
 
 	private static Map<String, List<AbstractCall>> convertToMap(List<AbstractCall> calls) {

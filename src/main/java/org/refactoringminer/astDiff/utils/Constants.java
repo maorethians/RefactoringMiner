@@ -23,6 +23,12 @@ public class Constants {
 				treeType.equals(OBJECT_DECLARATION) || treeType.equals(STRUCT_SPECIFIER) || treeType.equals(TYPE_ALIAS_DECLARATION) || treeType.equals(NAMESPACE);
 	}
 
+    //the declarations, whose leading comments are matched by the JavaDocMatcher and CommentMatcher, i.e., /** doc */ val x = 1
+    public boolean isDeclaration(String treeType) {
+        return isType(treeType) || isMethod(treeType) || treeType.equals(FIELD_DECLARATION) || treeType.equals(INITIALIZER) || treeType.equals(ENUM_ENTRY) ||
+                treeType.equals(CLASS_PARAMETER) || treeType.equals(PARAMETER) || treeType.equals(COMPANION_OBJECT) || treeType.equals(TYPE_ALIAS);
+    }
+
     public boolean isMethod(String treeType) {
         return isNamedMethod(treeType) || treeType.equals(SECONDARY_CONSTRUCTOR) || treeType.equals(LEXICAL_DECLARATION) ||
                 treeType.equals(METHOD_SIGNATURE) || treeType.equals(FUNCTION_SIGNATURE) || treeType.equals(PAIR) ||
@@ -176,7 +182,7 @@ public class Constants {
 			RECORD_DECLARATION = "class_declaration";
 			PREFIX_EXPRESSION = "prefix_expression";
 			METHOD_INVOCATION_ARGUMENTS = "arguments";
-			STRING_LITERAL = "string_literal";
+			STRING_LITERAL = "string";
 			CHARACTER_LITERAL = "character_literal";
 			BOOLEAN_LITERAL = "boolean_literal"; // True, False labels //TODO introduce List of values
 			NULL_LITERAL = "null_literal";
@@ -486,6 +492,7 @@ public class Constants {
     public final String AFFECTATION_OPERATOR = "affectation_operator";
     public final String COMPANION_OBJECT = "companion_object";
     public final String OBJECT_DECLARATION = "object_declaration";
+    public final String ABSTRACT_CLASS_DECLARATION = "abstract_class_declaration";
     public final String OBJECT_LITERAL = "object_literal";
     public final String WHEN_ENTRY = "when_entry";
     public final String WHEN_CONDITION = "when_condition";
@@ -589,6 +596,7 @@ public class Constants {
     public final String DEFAULT_KEYWORD = "default";
     public final String SWITCH_BODY = "switch_body";
     public final String TYPE_ALIAS_DECLARATION = "type_alias_declaration";
+    public final String TYPE_ALIAS = "type_alias";
     public final String OBJECT_TYPE = "object_type";
     public final String PROPERTY_SIGNATURE = "property_signature";
     public final String PROPERTY_IDENTIFIER = "property_identifier";
@@ -633,6 +641,7 @@ public class Constants {
     public final String EXPORT_CLAUSE = "export_clause";
     public final String LABELED = "labeled_statement";
     public final String STATEMENT_IDENTIFIER = "statement_identifier";
+    public final String LABEL = "label";
     public final String PROGRAM = "program"; // This is the root of all trees in TypeScript
     public final String ENUM_KEYWORD = "enum";
     public final String ENUM_BODY = "enum_body";

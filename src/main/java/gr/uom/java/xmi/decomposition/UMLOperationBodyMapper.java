@@ -16,14 +16,12 @@ import gr.uom.java.xmi.ModuleContainer;
 import gr.uom.java.xmi.UMLAbstractClass;
 import gr.uom.java.xmi.UMLAnnotation;
 
-import static gr.uom.java.xmi.JavaFileProcessor.processJavaBlock;
 import static gr.uom.java.xmi.ModuleContainer.*;
 import static gr.uom.java.xmi.decomposition.ReplacementAlgorithm.findReplacementsWithExactMatching;
 import static gr.uom.java.xmi.decomposition.ReplacementAlgorithm.isForEach;
 import static gr.uom.java.xmi.decomposition.ReplacementAlgorithm.processLambdas;
 import static gr.uom.java.xmi.decomposition.ReplacementUtil.isDefaultValue;
 import static gr.uom.java.xmi.decomposition.StringBasedHeuristics.*;
-import static gr.uom.java.xmi.decomposition.Visitor.stringify;
 import static gr.uom.java.xmi.diff.UMLClassBaseDiff.matchParamsWithReplacements;
 import static gr.uom.java.xmi.diff.UMLClassBaseDiff.sanitizeStringLiteral;
 
@@ -94,7 +92,6 @@ import java.util.stream.Collectors;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.commons.lang3.tuple.Triple;
-import org.eclipse.jdt.core.dom.ASTNode;
 import org.refactoringminer.api.Refactoring;
 import org.refactoringminer.api.RefactoringMinerTimedOutException;
 import org.refactoringminer.api.RefactoringType;
@@ -143,6 +140,8 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 	private boolean identicalLambdaBodyMapper;
 	private boolean moveCode;
 	private boolean anonymousCollapse;
+	//the statements containing the lambdas expanded in the body, keyed by the root composite of the lambda body
+	private Map<CompositeStatementObject, AbstractCodeFragment> expandedLambdaOwners = new LinkedHashMap<CompositeStatementObject, AbstractCodeFragment>();
 	private transient AdvancedAssertionMigrationMatcher advancedAssertionMigrationMatcher;
 	private AbstractCall operationInvocation;
 	private Map<String, String> parameterToArgumentMap1;
@@ -2070,6 +2069,47 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		}
 	}
 
+	//the unmatched entries of two mapped when statements are matched through their conditions, i.e., is ClassObj -> {...} and is ClassDumpRecord -> {...}
+	private void matchWhenEntriesThroughConditions(List<CompositeStatementObject> innerNodes1, List<CompositeStatementObject> innerNodes2, Map<String, String> parameterToArgumentMap) throws RefactoringMinerTimedOutException {
+		for(AbstractCodeMapping whenMapping : new ArrayList<>(this.mappings)) {
+			if(!(whenMapping instanceof CompositeStatementObjectMapping) ||
+					!whenMapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_STATEMENT) ||
+					!whenMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_STATEMENT))
+				continue;
+			Map<AbstractCodeFragment, CompositeStatementObject> entries1 = unmatchedWhenEntriesByCondition((CompositeStatementObject)whenMapping.getFragment1(), innerNodes1);
+			Map<AbstractCodeFragment, CompositeStatementObject> entries2 = unmatchedWhenEntriesByCondition((CompositeStatementObject)whenMapping.getFragment2(), innerNodes2);
+			if(entries1.isEmpty() || entries2.isEmpty())
+				continue;
+			List<AbstractCodeMapping> before = new ArrayList<>(this.mappings);
+			processLeaves(new ArrayList<>(entries1.keySet()), new ArrayList<>(entries2.keySet()), parameterToArgumentMap, false);
+			for(AbstractCodeMapping conditionMapping : new ArrayList<>(this.mappings)) {
+				if(before.contains(conditionMapping))
+					continue;
+				CompositeStatementObject entry1 = entries1.get(conditionMapping.getFragment1());
+				CompositeStatementObject entry2 = entries2.get(conditionMapping.getFragment2());
+				if(entry1 != null && entry2 != null && innerNodes1.contains(entry1) && innerNodes2.contains(entry2)) {
+					addMapping(createCompositeMapping(entry1, entry2, parameterToArgumentMap, 0));
+					innerNodes1.remove(entry1);
+					innerNodes2.remove(entry2);
+				}
+			}
+		}
+	}
+
+	private static Map<AbstractCodeFragment, CompositeStatementObject> unmatchedWhenEntriesByCondition(CompositeStatementObject when, List<CompositeStatementObject> innerNodes) {
+		Map<AbstractCodeFragment, CompositeStatementObject> entries = new LinkedHashMap<>();
+		for(AbstractStatement statement : when.getStatements()) {
+			if(statement instanceof CompositeStatementObject entry && entry.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY) && innerNodes.contains(entry)) {
+				List<AbstractExpression> conditions = entry.getExpressions().stream()
+						.filter(e -> e.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY_CONDITION)).toList();
+				if(conditions.size() == 1) {
+					entries.put(conditions.get(0), entry);
+				}
+			}
+		}
+		return entries;
+	}
+
 	//the Java if-else-if chain comparing the same expression with constants is replaced with the Kotlin when with subject, i.e.,
 	//if(x == A) {...} else if(x == B) {...} -> when(x) { A -> {...} B -> {...} }, where the first if is mapped to the when,
 	//the else-if statements are mapped to the when entries, and the constants are mapped to the conditions of the when entries
@@ -2161,14 +2201,9 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		// check if unmatched statements from left side have been commented
 		if(uniqueComments2.size() > 0 && nonMappedLeavesT1.size() > 0) {
 			for(UMLComment comment : uniqueComments2) {
-				String text = comment.getText();
-				if(text.startsWith("//")) {
-					text = text.substring(2);
-				}
-				text = text.trim();
-				ASTNode node = processJavaBlock(text);
-				if(node != null) {
-					String nodeAsString = stringify(node);
+				Optional<String> code = comment.getCodeStatement();
+				if(code.isPresent()) {
+					String nodeAsString = code.get();
 					Set<AbstractCodeFragment> matchingNodes1 = new LinkedHashSet<AbstractCodeFragment>();
 					for(AbstractCodeFragment leaf1 : nonMappedLeavesT1) {
 						if(leaf1.getString().equals(nodeAsString)) {
@@ -2185,14 +2220,9 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		if(uniqueComments1.size() > 0 && nonMappedLeavesT2.size() > 0) {
 			//List<ASTNode>
 			for(UMLComment comment : uniqueComments1) {
-				String text = comment.getText();
-				if(text.startsWith("//")) {
-					text = text.substring(2);
-				}
-				text = text.trim();
-				ASTNode node = processJavaBlock(text);
-				if(node != null) {
-					String nodeAsString = stringify(node);
+				Optional<String> code = comment.getCodeStatement();
+				if(code.isPresent()) {
+					String nodeAsString = code.get();
 					Set<AbstractCodeFragment> matchingNodes2 = new LinkedHashSet<AbstractCodeFragment>();
 					for(AbstractCodeFragment leaf2 : nonMappedLeavesT2) {
 						if(leaf2.getString().equals(nodeAsString)) {
@@ -3746,10 +3776,19 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					collectNestedLambdaExpressions(lambda, nestedLambdas);
 					if(!withinAnonymousClass(lambda, statement, anonymousClassList)) {
 						expandLambda(lambda, leaves, innerNodes, addedLeaves, addedInnerNodes, map, parentOperation, excludeRootBlock);
+						registerExpandedLambdaOwner(lambda, statement);
 					}
 					for(LambdaExpressionObject nestedLambda : nestedLambdas) {
 						if(!withinAnonymousClass(nestedLambda, statement, anonymousClassList)) {
 							expandLambda(nestedLambda, leaves, innerNodes, addedLeaves, addedInnerNodes, map, parentOperation, excludeRootBlock);
+							AbstractCodeFragment owner = statement;
+							for(AbstractCodeFragment leaf : leaves) {
+								if(leaf != statement && leaf.getLambdas().contains(nestedLambda)) {
+									owner = leaf;
+									break;
+								}
+							}
+							registerExpandedLambdaOwner(nestedLambda, owner);
 						}
 					}
 				}
@@ -3773,6 +3812,25 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			}
 		}
 		return false;
+	}
+
+	private void registerExpandedLambdaOwner(LambdaExpressionObject lambda, AbstractCodeFragment owner) {
+		if(lambda.getBody() != null) {
+			expandedLambdaOwners.put(lambda.getBody().getCompositeStatement(), owner);
+		}
+	}
+
+	//the depth of a statement of an expanded lambda in the body of the operation, i.e., the depth of the statement with the lambda plus the depth in the lambda
+	private int depthInBody(AbstractCodeFragment fragment) {
+		CompositeStatementObject root = fragment.getParent();
+		if(root == null && fragment instanceof CompositeStatementObject composite) {
+			root = composite;
+		}
+		while(root != null && root.getParent() != null) {
+			root = root.getParent();
+		}
+		AbstractCodeFragment owner = root != null ? expandedLambdaOwners.get(root) : null;
+		return owner != null ? depthInBody(owner) + fragment.getDepth() : fragment.getDepth();
 	}
 
 	private void expandLambda(LambdaExpressionObject lambda, List<AbstractCodeFragment> leaves,
@@ -6539,6 +6597,9 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			matchElseIfChainWithWhenEntries(innerNodes1, innerNodes2, leaves2, parameterToArgumentMap);
 			matchSwitchCasesWithWhenEntries(leaves1, leaves2);
 		}
+		else if(LANG1.equals(Constants.KOTLIN) && LANG2.equals(Constants.KOTLIN)) {
+			matchWhenEntriesThroughConditions(innerNodes1, innerNodes2, parameterToArgumentMap);
+		}
 		//check for possibly missed split conditional
 		Set<AbstractCodeMapping> mappingsToBeRemoved = new LinkedHashSet<AbstractCodeMapping>();
 		for(AbstractCodeMapping mapping : new LinkedHashSet<>(this.mappings)) {
@@ -6887,6 +6948,10 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		return s1.equals(s2) || s1.endsWith("." + s2) || s2.endsWith("." + s1);
 	}
 
+	private static String whenEntryExpressions(CompositeStatementObject entry, CodeElementType type) {
+		return entry.getExpressions().stream().filter(e -> e.getLocationInfo().getCodeElementType().equals(type)).map(AbstractExpression::getString).collect(Collectors.joining(", "));
+	}
+
 	private boolean identicalBody(CompositeStatementObject statement1, CompositeStatementObject statement2) {
 		if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.SWITCH_STATEMENT) && statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT)) {
 			return false;
@@ -6906,10 +6971,12 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		else if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) && statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE)) {
 			return false;
 		}
-		else if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY) && statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY) &&
-				statement1.getExpressions().size() > 1 && statement2.getExpressions().size() > 1) {
-			if(!equalOrQualified(statement1.getExpressions().get(0).getString(), statement2.getExpressions().get(0).getString()) &&
-					!equalOrQualified(statement1.getExpressions().get(1).getString(), statement2.getExpressions().get(1).getString())) {
+		else if(statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY) && statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY)) {
+			//the body of an entry without a block is its expression, i.e., else -> INSTANCE
+			String expression1 = whenEntryExpressions(statement1, CodeElementType.WHEN_ENTRY_EXPRESSION);
+			String expression2 = whenEntryExpressions(statement2, CodeElementType.WHEN_ENTRY_EXPRESSION);
+			if(!expression1.isEmpty() && !expression2.isEmpty() && !equalOrQualified(expression1, expression2) &&
+					!equalOrQualified(whenEntryExpressions(statement1, CodeElementType.WHEN_ENTRY_CONDITION), whenEntryExpressions(statement2, CodeElementType.WHEN_ENTRY_CONDITION))) {
 				return false;
 			}
 		}
@@ -10185,7 +10252,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 							}
 						}
 					}
-					int depthDifference = fragment.getDepth() - mapping.getFragment1().getDepth();
+					int depthDifference = depthInBody(fragment) - depthInBody(mapping.getFragment1());
 					if(isWithinIfBranch && !isWithinElseIfBranch && depthDifference >= 2 - (directlyNested ? 2 : 0)) {
 						if(!parentMap.containsKey(fragment.getParent())) {
 							parentMap.put(fragment.getParent(), mapping);
@@ -10435,7 +10502,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 							directlyNested = true;
 						}
 					}
-					int depthDifference = fragment.getDepth() - mapping.getFragment2().getDepth();
+					int depthDifference = depthInBody(fragment) - depthInBody(mapping.getFragment2());
 					if(isWithinIfBranch && !isWithinElseIfBranch && depthDifference >= 2 - (directlyNested ? 2 : 0)) {
 						if(!parentMap.containsKey(fragment.getParent())) {
 							parentMap.put(fragment.getParent(), mapping);
@@ -12185,6 +12252,11 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 							return 1;
 						}
 					}
+					int thisConsistentCallRenames = this.consistentCallRenames();
+					int otherConsistentCallRenames = operationBodyMapper.consistentCallRenames();
+					if(thisConsistentCallRenames != otherConsistentCallRenames) {
+						return -Integer.compare(thisConsistentCallRenames, otherConsistentCallRenames);
+					}
 					int thisEditDistance = this.editDistance();
 					int otherEditDistance = operationBodyMapper.editDistance();
 					if(thisEditDistance != otherEditDistance) {
@@ -12233,6 +12305,33 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 				}
 			}
 		}
+	}
+
+	//the renamed calls that agree with the call renames of the mappers already in the class diff, minus those that contradict them,
+	//i.e., reachableInstance(x) -> notLeaking(x) agrees with reachableInstance -> notLeaking in other test methods, reachableInstance(x) -> leaking(x) contradicts it
+	private int consistentCallRenames() {
+		if(!(classDiff instanceof UMLClassBaseDiff baseDiff) || baseDiff.getConsistentMethodInvocationRenames() == null)
+			return 0;
+		return consistentCallRenames(baseDiff.getConsistentMethodInvocationRenames());
+	}
+
+	public int consistentCallRenames(Map<MethodInvocationReplacement, UMLOperationBodyMapper> establishedRenames) {
+		int count = 0;
+		for(MethodInvocationReplacement replacement : getMethodInvocationRenameReplacements()) {
+			String nameBefore = replacement.getInvokedOperationBefore().getName();
+			String nameAfter = replacement.getInvokedOperationAfter().getName();
+			if(nameBefore.equals(nameAfter))
+				continue;
+			for(MethodInvocationReplacement established : establishedRenames.keySet()) {
+				String establishedBefore = established.getInvokedOperationBefore().getName();
+				String establishedAfter = established.getInvokedOperationAfter().getName();
+				if(establishedBefore.equals(nameBefore) && !establishedBefore.equals(establishedAfter)) {
+					count += establishedAfter.equals(nameAfter) ? 1 : -1;
+					break;
+				}
+			}
+		}
+		return count;
 	}
 
 	private List<String> stringLiteralIntersection() {
@@ -12330,8 +12429,10 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 	private double compositeChildMatchingScore(CompositeStatementObject comp1, CompositeStatementObject comp2, 
 			Optional<ReplacementInfo> replacementInfo, Set<AbstractCodeMapping> mappings,
 			List<UMLOperation> removedOperations, List<UMLOperation> addedOperations) {
-		List<AbstractStatement> compStatements1 = comp1.getStatements();
-		List<AbstractStatement> compStatements2 = comp2.getStatements();
+		AbstractStatement ifBranch1 = ifBranchComparedWithWhenEntry(comp1, comp2);
+		AbstractStatement ifBranch2 = ifBranchComparedWithWhenEntry(comp2, comp1);
+		List<AbstractStatement> compStatements1 = ifBranch1 != null ? List.of(ifBranch1) : comp1.getStatements();
+		List<AbstractStatement> compStatements2 = ifBranch2 != null ? List.of(ifBranch2) : comp2.getStatements();
 		int childrenSize1 = compStatements1.size();
 		int childrenSize2 = compStatements2.size();
 		List<CompositeStatementObject> nestedTryCatch1 = getNestedTryCatch(compStatements1);
@@ -12396,8 +12497,8 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			}
 		}
 		if(mappedChildrenSize == 0) {
-			List<AbstractCodeFragment> leaves1 = comp1.getLeaves();
-			List<AbstractCodeFragment> leaves2 = comp2.getLeaves();
+			List<AbstractCodeFragment> leaves1 = ifBranch1 != null ? ifBranch1.getLeaves() : comp1.getLeaves();
+			List<AbstractCodeFragment> leaves2 = ifBranch2 != null ? ifBranch2.getLeaves() : comp2.getLeaves();
 			if(replacementInfo.isPresent()) {
 				ReplacementInfo info = replacementInfo.get();
 				List<Replacement> compositeReplacements = info.getReplacements(ReplacementType.COMPOSITE);
@@ -12607,6 +12708,15 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			return 0;
 		else
 			return (double)mappedChildrenSize/(double)max;
+	}
+
+	//a when entry corresponds to a single branch of an if-else-if chain, so the else branch nested under the if is excluded
+	private static AbstractStatement ifBranchComparedWithWhenEntry(CompositeStatementObject comp, CompositeStatementObject other) {
+		if(comp.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) && comp.getStatements().size() == 2 &&
+				other.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY)) {
+			return comp.getStatements().get(0);
+		}
+		return null;
 	}
 
 	private Set<CompositeStatementObject> constructIfElseIfChain(AbstractCodeFragment fragment) {

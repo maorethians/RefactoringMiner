@@ -8,6 +8,7 @@ import gr.uom.java.xmi.LocationInfoProvider;
 import gr.uom.java.xmi.UMLAnnotation;
 import gr.uom.java.xmi.UMLClass;
 import gr.uom.java.xmi.UMLForwardDeclaration;
+import gr.uom.java.xmi.UMLJavadoc;
 import gr.uom.java.xmi.UMLNamedExport;
 import gr.uom.java.xmi.UMLPreprocessorStatement;
 import gr.uom.java.xmi.UMLProblemDeclaration;
@@ -25,6 +26,7 @@ import gr.uom.java.xmi.diff.UMLClassMoveDiff;
 import gr.uom.java.xmi.diff.UMLClassRenameDiff;
 import gr.uom.java.xmi.diff.UMLCommentListDiff;
 import gr.uom.java.xmi.diff.UMLForwardDeclarationListDiff;
+import gr.uom.java.xmi.diff.UMLJavadocDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportDiff;
 import gr.uom.java.xmi.diff.UMLNamedExportListDiff;
 import gr.uom.java.xmi.diff.UMLParameterDiff;
@@ -46,6 +48,7 @@ import org.refactoringminer.util.PrefixSuffixUtils;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.refactoringminer.astDiff.utils.Helpers.findPairOfType;
@@ -73,37 +76,11 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
     }
 
     private void processClassDeclarationMapping(Tree srcTree, Tree dstTree, UMLClassBaseDiff classDiff, ExtendedMultiMappingStore mappingStore) {
-        String AST_type1 = astType(classDiff.getOriginalClass(), LANG1);
-        String AST_type2 = astType(classDiff.getNextClass(), LANG2);
+        String[] AST_types1 = astTypes(classDiff.getOriginalClass(), LANG1);
+        String[] AST_types2 = astTypes(classDiff.getNextClass(), LANG2);
         //a module is the whole file
-        Tree srcTypeDeclaration = classDiff.getOriginalClass().isModule() ? root(srcTree) : TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,AST_type1);
-        Tree dstTypeDeclaration = classDiff.getNextClass().isModule() ? root(dstTree) : TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,AST_type2);
-        if (srcTypeDeclaration == null && dstTypeDeclaration == null && classDiff.getOriginalClass().isTypeAlias() && classDiff.getNextClass().isTypeAlias()) {
-            srcTypeDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.TYPE_ALIAS_DECLARATION);
-            dstTypeDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,LANG2.TYPE_ALIAS_DECLARATION);
-        }
-        if (srcTypeDeclaration == null && dstTypeDeclaration == null && classDiff.getOriginalClass().isInterface() && classDiff.getNextClass().isInterface()) {
-            srcTypeDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.INTERFACE_DECLARATION);
-            dstTypeDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,LANG2.INTERFACE_DECLARATION);
-        }
-        if (srcTypeDeclaration == null && dstTypeDeclaration == null && classDiff.getOriginalClass().isObject() && classDiff.getNextClass().isObject()) {
-            //a Kotlin object or a TypeScript object literal
-            srcTypeDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.OBJECT_DECLARATION,LANG1.OBJECT);
-            dstTypeDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,LANG2.OBJECT_DECLARATION,LANG2.OBJECT);
-        }
-        if(classDiff.getOriginalClass().isObject() && !classDiff.getNextClass().isObject()) {
-            srcTypeDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.OBJECT_DECLARATION);
-            //an object that becomes the functions of a file is matched with the file
-            dstTypeDeclaration = classDiff.getNextClass().isModule() ? root(dstTree) : TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,LANG2.TYPE_DECLARATION);
-        }
-        else if(!classDiff.getOriginalClass().isObject() && classDiff.getNextClass().isObject()) {
-            srcTypeDeclaration = classDiff.getOriginalClass().isModule() ? root(srcTree) : TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.TYPE_DECLARATION);
-            dstTypeDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,LANG2.OBJECT_DECLARATION);
-        }
-        if (srcTypeDeclaration == null && dstTypeDeclaration == null) {
-            srcTypeDeclaration = TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,LANG1.ERROR);
-            dstTypeDeclaration = TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,LANG2.ERROR);
-        }
+        Tree srcTypeDeclaration = classDiff.getOriginalClass().isModule() ? root(srcTree) : TreeUtilFunctions.findByLocationInfo(srcTree,classDiff.getOriginalClass().getLocationInfo(),LANG1,AST_types1);
+        Tree dstTypeDeclaration = classDiff.getNextClass().isModule() ? root(dstTree) : TreeUtilFunctions.findByLocationInfo(dstTree,classDiff.getNextClass().getLocationInfo(),LANG2,AST_types2);
         if(classDiff.getTypeAliasListDiff().isPresent()) {
             processTypeAliasList(srcTree, dstTree, classDiff.getTypeAliasListDiff().get(), mappingStore);
         }
@@ -791,21 +768,27 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         return tree;
     }
 
-    private String astType(UMLClass umlClass, Constants LANG) {
-        String type = LANG.TYPE_DECLARATION;
+    //the types of the node of the class, i.e., a Kotlin companion object, a Kotlin object declaration or a TypeScript object literal for an object,
+    //and a Java or Kotlin type declaration or a TypeScript interface declaration for an interface
+    private String[] astTypes(UMLClass umlClass, Constants LANG) {
         if (umlClass.isEnum())
-            type = LANG.ENUM_DECLARATION;
-        else if (umlClass.isAnnotation())
-            type = LANG.ANNOTATION_TYPE_DECLARATION;
-        else if (umlClass.isRecord())
-            type = LANG.RECORD_DECLARATION;
-        else if (umlClass.isObject())
-            type = LANG.COMPANION_OBJECT;
-        else if (umlClass.isStruct())
-            type = LANG.STRUCT_SPECIFIER;
-        else if (umlClass.isUnion())
-            type = LANG.UNION_SPECIFIER;
-        return type;
+            return new String[] {LANG.ENUM_DECLARATION};
+        if (umlClass.isAnnotation())
+            return new String[] {LANG.ANNOTATION_TYPE_DECLARATION};
+        if (umlClass.isRecord())
+            return new String[] {LANG.RECORD_DECLARATION};
+        if (umlClass.isObject())
+            return new String[] {LANG.COMPANION_OBJECT, LANG.OBJECT_DECLARATION, LANG.OBJECT};
+        if (umlClass.isStruct())
+            return new String[] {LANG.STRUCT_SPECIFIER};
+        if (umlClass.isUnion())
+            return new String[] {LANG.UNION_SPECIFIER};
+        if (umlClass.isTypeAlias())
+            return new String[] {LANG.TYPE_DECLARATION, LANG.TYPE_ALIAS_DECLARATION};
+        if (umlClass.isInterface())
+            return new String[] {LANG.TYPE_DECLARATION, LANG.INTERFACE_DECLARATION};
+        //the TypeScript abstract classes have their own node type
+        return new String[] {LANG.TYPE_DECLARATION, LANG.ABSTRACT_CLASS_DECLARATION};
     }
 
     private void processClassBlock(Tree srcTypeDeclaration, Tree dstTypeDeclaration, ExtendedMultiMappingStore mappingStore) {
@@ -1313,12 +1296,6 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
     private void processPrimaryConstructorParameterPair(Tree srcTypeDeclaration, Tree dstTypeDeclaration, VariableDeclaration left, VariableDeclaration right, ExtendedMultiMappingStore mappingStore) {
         Tree srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, left.getLocationInfo(), LANG1);
         Tree dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, right.getLocationInfo(), LANG2);
-        if (srcFieldDeclaration == null || srcFieldDeclaration.getType().name.endsWith("_comment")) {
-            srcFieldDeclaration = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, left.getLocationInfo(), LANG1, LANG1.CLASS_PARAMETER);
-        }
-        if (dstFieldDeclaration == null || dstFieldDeclaration.getType().name.endsWith("_comment")) {
-            dstFieldDeclaration = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, right.getLocationInfo(), LANG2, LANG2.CLASS_PARAMETER);
-        }
         if (srcFieldDeclaration == null || dstFieldDeclaration == null)
             return;
         if (srcFieldDeclaration.isIsoStructuralTo(dstFieldDeclaration))
@@ -1327,6 +1304,13 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         else if (!Constants.isCrossLanguage(LANG1, LANG2) && srcFieldDeclaration.getType().name.equals(dstFieldDeclaration.getType().name)) {
             new LeafMatcher(LANG1, LANG2).match(srcFieldDeclaration,dstFieldDeclaration,mappingStore);
             mappingStore.addMapping(srcFieldDeclaration,dstFieldDeclaration);
+        }
+        //the KDoc of the parameters, i.e., class A(/** doc */ val x: Int)
+        if (left.getJavadoc().isPresent() && right.getJavadoc().isPresent()) {
+            UMLJavadoc leftJavadoc = left.getJavadoc().get();
+            UMLJavadoc rightJavadoc = right.getJavadoc().get();
+            new JavaDocMatcher(optimizationData, leftJavadoc, rightJavadoc, Optional.of(new UMLJavadocDiff(leftJavadoc, rightJavadoc)), LANG1, LANG2)
+                    .match(srcTypeDeclaration, dstTypeDeclaration, mappingStore);
         }
     }
 

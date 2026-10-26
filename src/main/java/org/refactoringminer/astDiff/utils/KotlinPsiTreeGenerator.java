@@ -1,6 +1,7 @@
 package org.refactoringminer.astDiff.utils;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -165,14 +166,6 @@ public class KotlinPsiTreeGenerator {
 		return t.getType().name.equals("line_comment") || t.getType().name.equals("multiline_comment");
 	}
 
-	private static boolean hasNewlineBefore(ASTNode n) {
-		for(ASTNode p = n.getTreePrev(); p != null && (p.getElementType() == TokenType.WHITE_SPACE || isComment(p) || p.getTextLength() == 0); p = p.getTreePrev()) {
-			if(p.getText().contains("\n"))
-				return true;
-		}
-		return false;
-	}
-
 	private static boolean isComment(ASTNode n) {
 		return COMMENTS.contains(type(n));
 	}
@@ -295,8 +288,30 @@ public class KotlinPsiTreeGenerator {
 
 	// ---------------------------------------------------------------- declarations
 
-	//the declaration with its leading comments, which are its first children in PSI, while they precede it in the tree-sitter tree
+	//the declaration with its leading comments, which are its first children, like in PSI and in the model, i.e., /** doc */ fun f() {...}
 	private List<Tree> declaration(ASTNode n) {
+		List<Tree> trees = declarationWithoutLeadingComments(n);
+		List<ASTNode> kids = kids(n);
+		List<Tree> leadingComments = new ArrayList<>();
+		if(DECLARATIONS.contains(type(n))) {
+			for(int i = 0; i < kids.size() && isComment(kids.get(i)); i++) {
+				leadingComments.add(comment(kids.get(i)));
+			}
+		}
+		if(!leadingComments.isEmpty() && !trees.isEmpty()) {
+			Tree declaration = trees.get(0);
+			int end = declaration.getEndPos();
+			for(int i = leadingComments.size() - 1; i >= 0; i--) {
+				declaration.insertChild(leadingComments.get(i), 0);
+				leadingComments.get(i).setParent(declaration);
+			}
+			declaration.setPos(leadingComments.get(0).getPos());
+			declaration.setLength(end - declaration.getPos());
+		}
+		return trees;
+	}
+
+	private List<Tree> declarationWithoutLeadingComments(ASTNode n) {
 		List<Tree> trees = new ArrayList<>();
 		if(isComment(n)) {
 			trees.add(comment(n));
@@ -306,7 +321,6 @@ public class KotlinPsiTreeGenerator {
 		int first = 0;
 		if(DECLARATIONS.contains(type(n))) {
 			while(first < kids.size() && isComment(kids.get(first))) {
-				trees.add(comment(kids.get(first)));
 				first++;
 			}
 		}
@@ -315,59 +329,39 @@ public class KotlinPsiTreeGenerator {
 			case "CLASS" -> trees.add(classDeclaration(n, rest));
 			case "OBJECT_DECLARATION" -> trees.add(objectDeclaration(n, rest));
 			case "FUN" -> trees.add(function(n, rest));
-			case "PROPERTY" -> {
-				//the accessors follow the property, which ends before them, as in the tree-sitter tree
-				List<ASTNode> accessors = new ArrayList<>();
-				for(ASTNode c : rest) {
-					if(type(c).equals("PROPERTY_ACCESSOR")) accessors.add(c);
-				}
-				List<ASTNode> declaration = new ArrayList<>(rest);
-				declaration.removeAll(accessors);
-				while(!declaration.isEmpty() && isComment(declaration.get(declaration.size() - 1))) declaration.remove(declaration.size() - 1);
-				Tree property = property(n, declaration);
-				if(!accessors.isEmpty() && !declaration.isEmpty()) property.setLength(end(declaration.get(declaration.size() - 1)) - property.getPos());
-				trees.add(property);
-				//an accessor on the same line as the property is its last child, i.e., val x get() = y
-				ASTNode sameLine = !accessors.isEmpty() && !declaration.isEmpty() && !hasNewlineBefore(accessors.get(0)) ? accessors.get(0) : null;
-				if(sameLine != null) {
-					add(property, accessor(sameLine));
-					property.setLength(end(sameLine) - property.getPos());
-				}
-				//the comments after the declaration, i.e., val x = 1 // comment, follow it
-				if(accessors.isEmpty() && !declaration.isEmpty() && isComment(rest.get(rest.size() - 1)))
-					property.setLength(end(declaration.get(declaration.size() - 1)) - property.getPos());
-				for(ASTNode c : rest) {
-					if(c == sameLine) continue;
-					if(accessors.contains(c)) trees.add(accessor(c));
-					else if(isComment(c) && !accessors.isEmpty() && start(c) > start(accessors.get(0))) trees.add(comment(c));
-					else if(isComment(c) && accessors.isEmpty() && !declaration.isEmpty() && start(c) >= end(declaration.get(declaration.size() - 1))) trees.add(comment(c));
-				}
-			}
+			//the property holds its accessors and comments, like the property in the model, i.e., val x: Int get() = y
+			case "PROPERTY" -> trees.add(property(n, rest));
 			case "TYPEALIAS" -> trees.add(typeAlias(n, rest));
 			case "CLASS_INITIALIZER" -> trees.add(initializer(n, rest));
 			case "SECONDARY_CONSTRUCTOR" -> trees.add(secondaryConstructor(n, rest));
 			case "ENUM_ENTRY" -> trees.add(enumEntry(n, rest));
 			case "ANNOTATED_EXPRESSION" -> {
-				//the annotations of an assignment are statements preceding it, as in the tree-sitter tree, while they are prefix operators of an expression
+				//the annotations and comments of an assignment are its first children, like the statement in the model, while they are prefix operators of an expression
 				ASTNode inner = null;
 				for(ASTNode c : kids(n)) {
 					if(!type(c).equals("ANNOTATION_ENTRY") && !isComment(c)) inner = c;
 				}
 				Tree e = inner != null ? expression(inner) : null;
 				if(e != null && e.getType().name.equals("assignment")) {
+					int index = 0;
 					for(ASTNode c : kids(n)) {
-						if(type(c).equals("ANNOTATION_ENTRY")) trees.add(annotation(c, "class_modifier"));
+						if(type(c).equals("ANNOTATION_ENTRY")) e.insertChild(annotation(c, "class_modifier"), index++);
+						else if(isComment(c) && start(c) < start(inner)) e.insertChild(comment(c), index++);
 					}
+					e.setLength(e.getEndPos() - start(n));
+					e.setPos(start(n));
 					trees.add(e);
 				}
 				else trees.add(expression(n));
 			}
 			case "LABELED_EXPRESSION" -> {
-				//a labeled statement is a label followed by the statement, as in the tree-sitter tree, i.e., outer@ for (...)
+				//a labeled statement is the label and the statement, like the labeled statement in the model, i.e., outer@ for (...)
+				Tree t = node("labeled_statement", n);
 				for(ASTNode c : kids(n)) {
-					if(type(c).equals("LABEL_QUALIFIER")) trees.add(leaf("label", c));
-					else trees.addAll(declaration(c));
+					if(type(c).equals("LABEL_QUALIFIER")) add(t, leaf("label", c));
+					else for(Tree d : declaration(c)) add(t, d);
 				}
+				trees.add(t);
 			}
 			default -> trees.add(expression(n));
 		}
@@ -447,11 +441,9 @@ public class KotlinPsiTreeGenerator {
 		return t;
 	}
 
+	//the enum entry with its trailing comma or semicolon, like in PSI and in the model, i.e., A(1),
 	private Tree enumEntry(ASTNode n, List<ASTNode> rest) {
 		Tree t = declarationNode("enum_entry", n, rest);
-		int last = rest.size() - 1;
-		while(last > 0 && (Set.of("COMMA", "SEMICOLON").contains(type(rest.get(last))) || isComment(rest.get(last)))) last--;
-		t.setLength(end(rest.get(last)) - t.getPos());
 		for(ASTNode c : rest) {
 			switch(type(c)) {
 				case "MODIFIER_LIST" -> add(t, modifiers(c));
@@ -482,7 +474,6 @@ public class KotlinPsiTreeGenerator {
 				case "VALUE_PARAMETER_LIST" -> {
 					for(ASTNode p : kids(c)) {
 						if(type(p).equals("VALUE_PARAMETER")) {
-							addAll(t, leadingComments(p));
 							add(t, parameter(p, "class_parameter"));
 						}
 						else if(isComment(p))
@@ -572,53 +563,19 @@ public class KotlinPsiTreeGenerator {
 	private Tree functionValueParameters(ASTNode n) {
 		Tree t = node("function_value_parameters", n);
 		for(ASTNode c : kids(n)) {
-			if(type(c).equals("VALUE_PARAMETER")) {
-				addAll(t, leadingComments(c));
-				//the default value is a sibling of the parameter, as in the tree-sitter tree, i.e., function_value_parameters -> [parameter, =, value]
-				ASTNode eq = kid(c, "EQ");
-				Tree p = parameter(c, "parameter");
-				//the modifiers are a sibling of the parameter, as in the tree-sitter tree, i.e., function_value_parameters -> [parameter_modifiers, parameter]
-				if(!p.getChildren().isEmpty() && p.getChild(0).getType().name.equals("parameter_modifiers")) {
-					Tree m = p.getChild(0);
-					p.getChildren().remove(0);
-					p.setPos(p.getChild(0).getPos());
-					p.setLength(end(c) - p.getPos());
-					add(t, m);
-				}
-				if(eq != null) {
-					int index = 0;
-					while(index < p.getChildren().size() && p.getChild(index).getPos() < start(eq)) index++;
-					List<Tree> defaults = new ArrayList<>(p.getChildren().subList(index, p.getChildren().size()));
-					p.getChildren().removeAll(defaults);
-					p.setLength(p.getChildren().get(p.getChildren().size() - 1).getEndPos() - p.getPos());
-					add(t, p);
-					addAll(t, defaults);
-				}
-				else add(t, p);
-			}
+			if(type(c).equals("VALUE_PARAMETER"))
+				add(t, parameter(c, "parameter"));
 			else if(isComment(c))
 				add(t, comment(c));
 		}
 		return t;
 	}
 
-	//the comments preceding a parameter, which are its first children in PSI
-	private List<Tree> leadingComments(ASTNode n) {
-		List<Tree> trees = new ArrayList<>();
-		for(ASTNode c : kids(n)) {
-			if(!isComment(c)) break;
-			trees.add(comment(c));
-		}
-		return trees;
-	}
-
-	//parameter -> [parameter_modifiers?, simple_identifier, type] or class_parameter -> [modifiers?, binding_pattern_kind?, simple_identifier, type, =, default]
+	//parameter -> [comments?, parameter_modifiers?, simple_identifier, type, =, default] or class_parameter -> [comments?, modifiers?, binding_pattern_kind?, simple_identifier, type, =, default],
+	//where the parameters keep their leading comments, modifiers and default values, like the declarations and the model, i.e., fun f(/** doc */ @A x: Int = 1)
 	private Tree parameter(ASTNode n, String type) {
-		List<ASTNode> kids = kids(n);
-		int first = 0;
-		while(first < kids.size() - 1 && isComment(kids.get(first))) first++;
-		Tree t = node(type, start(kids.get(first)), end(n));
-		for(ASTNode c : kids.subList(first, kids.size())) {
+		Tree t = node(type, n);
+		for(ASTNode c : kids(n)) {
 			switch(type(c)) {
 				case "MODIFIER_LIST" -> add(t, type.equals("parameter") ? parameterModifiers(c) : modifiers(c));
 				case "val", "var" -> add(t, bindingPatternKind(c));
@@ -676,6 +633,7 @@ public class KotlinPsiTreeGenerator {
 					}
 					add(t, d);
 				}
+				case "PROPERTY_ACCESSOR" -> add(t, accessor(c));
 				case "COLON", "DOT", "SEMICOLON" -> {}
 				default -> {
 					if(isComment(c)) add(t, comment(c));
@@ -732,7 +690,7 @@ public class KotlinPsiTreeGenerator {
 		for(ASTNode c : rest) {
 			switch(type(c)) {
 				case "init" -> add(t, leaf("initializer_keyword", c));
-				case "BLOCK" -> addAll(t, blockStatements(c));
+				case "BLOCK" -> add(t, bracedStatements(c));
 				default -> {
 					if(isComment(c)) add(t, comment(c));
 				}
@@ -759,7 +717,7 @@ public class KotlinPsiTreeGenerator {
 					}
 					add(t, d);
 				}
-				case "BLOCK" -> addAll(t, blockStatements(c));
+				case "BLOCK" -> add(t, bracedStatements(c));
 				default -> {
 					if(isComment(c)) add(t, comment(c));
 				}
@@ -994,21 +952,8 @@ public class KotlinPsiTreeGenerator {
 		return t;
 	}
 
-	//the statements of a block, from the first to the last statement, without the braces
-	//an empty try, catch or finally block is a statements node spanning its braces, with the comments inside them, so that it is matched with an empty Java block
-	private List<Tree> tryBlockStatements(ASTNode block) {
-		List<ASTNode> inside = kids(block).stream().filter(c -> !type(c).equals("LBRACE") && !type(c).equals("RBRACE")).toList();
-		ASTNode lbrace = kid(block, "LBRACE"), rbrace = kid(block, "RBRACE");
-		if(lbrace == null || rbrace == null || !inside.stream().allMatch(c -> isComment(c)))
-			return blockStatements(block);
-		Tree t = node("statements", start(lbrace), end(rbrace));
-		for(ASTNode c : inside)
-			add(t, comment(c));
-		return List.of(t);
-	}
-
+	//the statements of a block without the braces, with the comments before and after them, like the block in the model, i.e., a lambda body starting with a comment
 	private List<Tree> blockStatements(ASTNode block) {
-		List<Tree> trees = new ArrayList<>();
 		List<Tree> statements = new ArrayList<>();
 		for(ASTNode c : kids(block)) {
 			switch(type(c)) {
@@ -1016,20 +961,26 @@ public class KotlinPsiTreeGenerator {
 				default -> statements.addAll(declaration(c));
 			}
 		}
-		//the comments before the first statement are siblings of the statements, while the comments after the last statement are part of them
-		int first = 0, last = statements.size() - 1;
-		while(first <= last && isComment(statements.get(first))) first++;
-		trees.addAll(statements.subList(0, first));
-		if(first <= last) {
-			Tree span = span("statements", new ArrayList<>(statements.subList(first, last + 1)));
-			//the semicolon terminating the last statement is part of the statements
-			for(ASTNode c : kids(block)) {
-				if(type(c).equals("SEMICOLON") && start(c) == span.getEndPos()) span.setLength(end(c) - span.getPos());
-			}
-			trees.add(span);
+		if(statements.isEmpty())
+			return statements;
+		Tree span = span("statements", statements);
+		//the semicolon terminating the last statement is part of the statements
+		for(ASTNode c : kids(block)) {
+			if(type(c).equals("SEMICOLON") && start(c) == span.getEndPos()) span.setLength(end(c) - span.getPos());
 		}
-		trees.addAll(statements.subList(last + 1, statements.size()));
-		return trees;
+		return List.of(span);
+	}
+
+	//the statements of a block that has no other node in the tree, spanning its braces like the block in the model, i.e., init { ... } and try { ... }
+	private Tree bracedStatements(ASTNode block) {
+		Tree t = node("statements", block);
+		for(ASTNode c : kids(block)) {
+			switch(type(c)) {
+				case "LBRACE", "RBRACE", "SEMICOLON" -> {}
+				default -> addAll(t, declaration(c));
+			}
+		}
+		return t;
 	}
 
 	// ---------------------------------------------------------------- expressions
@@ -1173,16 +1124,20 @@ public class KotlinPsiTreeGenerator {
 				return t;
 			}
 			case "ANNOTATED_EXPRESSION" -> {
-				//the annotations are prefix operators, as in the tree-sitter tree, i.e., @A @B x is prefix_expression -> [@A, prefix_expression -> [@B, x]]
+				//the annotations are prefix operators, as in the tree-sitter tree, i.e., @A @B x is prefix_expression -> [@A, prefix_expression -> [@B, x]],
+				//and the comments after an annotation follow it, i.e., @A // comment x
 				List<ASTNode> annotations = new ArrayList<>();
+				Map<ASTNode, List<ASTNode>> comments = new HashMap<>();
 				Tree t = null;
 				for(ASTNode c : kids(n)) {
 					if(type(c).equals("ANNOTATION_ENTRY")) annotations.add(c);
+					else if(isComment(c) && !annotations.isEmpty() && t == null) comments.computeIfAbsent(annotations.get(annotations.size() - 1), k -> new ArrayList<>()).add(c);
 					else if(!isComment(c)) t = expression(c);
 				}
 				for(int i = annotations.size() - 1; i >= 0; i--) {
 					Tree p = node("prefix_expression", start(annotations.get(i)), t != null ? t.getEndPos() : end(n));
 					add(p, annotation(annotations.get(i), "class_modifier"));
+					for(ASTNode c : comments.getOrDefault(annotations.get(i), List.of())) add(p, comment(c));
 					add(p, t);
 					t = p;
 				}
@@ -1582,7 +1537,7 @@ public class KotlinPsiTreeGenerator {
 		return t;
 	}
 
-	//lambda_literal -> [lambda_parameters?, arrow?, statements?]
+	//lambda_literal -> [lambda_parameters?, arrow?, statements]
 	private Tree lambda(ASTNode n) {
 		ASTNode literal = kid(n, "FUNCTION_LITERAL");
 		Tree t = node("lambda_literal", n);
@@ -1601,6 +1556,12 @@ public class KotlinPsiTreeGenerator {
 				case "ARROW" -> add(t, leaf("arrow", c));
 				case "BLOCK" -> addAll(t, blockStatements(c));
 				default -> {}
+			}
+		}
+		//an empty body is an empty statements node, like the empty block in the model, i.e., f(x) {}
+		if(t.getChildren().stream().noneMatch(c -> c.getType().name.equals("statements"))) {
+			for(ASTNode c = literal.getFirstChildNode(); c != null; c = c.getTreeNext()) {
+				if(type(c).equals("BLOCK") && blockStatements(c).isEmpty()) add(t, node("statements", start(c), start(c)));
 			}
 		}
 		return t;
@@ -1695,12 +1656,8 @@ public class KotlinPsiTreeGenerator {
 						//the subject of when, when_subject -> expression, including the parentheses
 						Tree s = node("when_subject", lpar != null ? start(lpar) : start(c), rpar != null ? end(rpar) : end(c));
 						if(type(c).equals("PROPERTY")) {
-							//when (val x = y), as when_subject -> [property_declaration_keyword, variable_declaration, affectation_operator, y] in the tree-sitter tree
-							for(Tree d : declaration(c)) {
-								if(!d.getType().name.equals("property_declaration")) { add(s, d); continue; }
-								for(Tree p : new ArrayList<>(d.getChildren()))
-									add(s, p.getType().name.equals("binding_pattern_kind") ? p.getChild(0) : p);
-							}
+							//when (val x = y), as when_subject -> property_declaration, like the subject in the model
+							for(Tree d : declaration(c)) add(s, d);
 						}
 						else
 							add(s, expression(c));
@@ -1755,26 +1712,18 @@ public class KotlinPsiTreeGenerator {
 		Tree t = node("try_expression", n);
 		for(ASTNode c : kids(n)) {
 			switch(type(c)) {
-				case "BLOCK" -> addAll(t, tryBlockStatements(c));
+				case "BLOCK" -> add(t, bracedStatements(c));
 				case "CATCH" -> {
 					Tree catchBlock = node("catch_block", c);
 					for(ASTNode e : kids(c)) {
 						switch(type(e)) {
 							case "VALUE_PARAMETER_LIST" -> {
+								//the exception is a parameter, like the variable declaration of the catch clause in the model
 								for(ASTNode p : kids(e)) {
-									if(type(p).equals("VALUE_PARAMETER")) {
-										for(ASTNode x : kids(p)) {
-											switch(type(x)) {
-												case "IDENTIFIER" -> add(catchBlock, simpleIdentifier(x));
-												case "TYPE_REFERENCE" -> add(catchBlock, typeTree(x));
-												case "MODIFIER_LIST" -> add(catchBlock, modifiers(x));
-												default -> {}
-											}
-										}
-									}
+									if(type(p).equals("VALUE_PARAMETER")) add(catchBlock, parameter(p, "parameter"));
 								}
 							}
-							case "BLOCK" -> addAll(catchBlock, tryBlockStatements(e));
+							case "BLOCK" -> add(catchBlock, bracedStatements(e));
 							default -> {}
 						}
 					}
@@ -1783,7 +1732,7 @@ public class KotlinPsiTreeGenerator {
 				case "FINALLY" -> {
 					Tree finallyBlock = node("finally_block", c);
 					for(ASTNode e : kids(c)) {
-						if(type(e).equals("BLOCK")) addAll(finallyBlock, tryBlockStatements(e));
+						if(type(e).equals("BLOCK")) add(finallyBlock, bracedStatements(e));
 					}
 					add(t, finallyBlock);
 				}

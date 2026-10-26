@@ -35,6 +35,7 @@ import org.eclipse.cdt.core.dom.ast.IASTFileLocation;
 import org.eclipse.cdt.core.dom.ast.IASTExpressionStatement;
 import org.eclipse.cdt.core.dom.ast.IASTIdExpression;
 import org.eclipse.cdt.core.dom.ast.IASTNode;
+import org.eclipse.cdt.core.dom.ast.IASTNodeSelector;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTTemplateDeclaration;
 import org.eclipse.cdt.core.dom.ast.IASTMacroExpansionLocation;
 import org.eclipse.cdt.core.dom.ast.IASTNodeLocation;
@@ -53,6 +54,7 @@ import org.eclipse.cdt.core.dom.ast.cpp.ICPPNamespace;
 import org.eclipse.cdt.core.dom.ast.IASTComment;
 import org.eclipse.cdt.core.dom.ast.IASTCompositeTypeSpecifier;
 import org.eclipse.cdt.core.dom.ast.IASTDeclaration;
+import org.eclipse.cdt.core.dom.ast.IASTDeclarationStatement;
 import org.eclipse.cdt.core.dom.ast.IASTDeclarator;
 import org.eclipse.cdt.core.dom.ast.IASTFieldDeclarator;
 import org.eclipse.cdt.core.dom.ast.IASTArrayDeclarator;
@@ -297,6 +299,19 @@ public class CppFileProcessor {
 			}
 			else if(statement instanceof IASTPreprocessorEndifStatement && !open.isEmpty()) {
 				List<IASTPreprocessorStatement> conditional = open.pop();
+				if(!sameEnclosingNode(conditional, statement)) {
+					//the directives in different nodes, like the AST nodes, i.e., !\n#if X\nf\n#else\ng\n#endif\n(a), are not grouped
+					for(IASTPreprocessorStatement directive : conditional) {
+						int directiveStart = directive.getFileLocation().getNodeOffset();
+						if(directive instanceof IASTPreprocessorIfStatement || directive instanceof IASTPreprocessorElifStatement) {
+							ends.put(directive, afterLineBreak(directiveStart));
+						}
+						else if(directive instanceof IASTPreprocessorElseStatement) {
+							ends.put(directive, directiveNameEnd(directiveStart));
+						}
+					}
+					continue;
+				}
 				int endifStart = statement.getFileLocation().getNodeOffset();
 				int contentEnd = endifStart;
 				while(contentEnd > 0 && Character.isWhitespace(fileContent.charAt(contentEnd - 1))) {
@@ -320,6 +335,27 @@ public class CppFileProcessor {
 			}
 		}
 		return ends;
+	}
+
+	//whether the directives of the conditional are in the same innermost node of the file
+	private static boolean sameEnclosingNode(List<IASTPreprocessorStatement> conditional, IASTPreprocessorStatement endif) {
+		IASTNodeSelector selector = endif.getTranslationUnit().getNodeSelector(null);
+		IASTNode enclosing = enclosingNode(selector, endif);
+		for(IASTPreprocessorStatement directive : conditional) {
+			if(enclosingNode(selector, directive) != enclosing) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	//the innermost node containing the directive with the characters around it, which is not the directive itself
+	private static IASTNode enclosingNode(IASTNodeSelector selector, IASTPreprocessorStatement directive) {
+		IASTFileLocation location = directive.getFileLocation();
+		int start = Math.max(0, location.getNodeOffset() - 1);
+		IASTNode enclosing = selector.findEnclosingNode(start, location.getNodeOffset() + location.getNodeLength() + 1 - start);
+		//a directive at the start or at the end of the file
+		return enclosing != null ? enclosing : directive.getTranslationUnit();
 	}
 
 	//the end of the name of the directive starting at the offset, i.e., the end of #endif in #endif // X
@@ -543,9 +579,20 @@ public class CppFileProcessor {
 		//CDT parses the conditions starting with a name it does not know as declarations of variables whose type is the name,
 		//i.e., if (m_isX11 && m_xwaylandSurface) as the declaration of the reference m_xwaylandSurface of type m_isX11,
 		//which a condition cannot declare without an initializer, so the file is parsed again with these names declared as variables in the included file
-		String variables = misparsedConditions(translationUnit);
+		String variables = misparsedConditions(translationUnit, fileContent);
 		if(!variables.isEmpty()) {
-			IASTTranslationUnit reparsed = parse(filePath, fileContent, astDiff, preamble.isEmpty() ? variables : preamble + "\n" + variables);
+			String extendedPreamble = preamble.isEmpty() ? variables : preamble + "\n" + variables;
+			IASTTranslationUnit reparsed = parse(filePath, fileContent, astDiff, extendedPreamble);
+			if(problems(reparsed) <= problems(translationUnit)) {
+				translationUnit = reparsed;
+				preamble = extendedPreamble;
+			}
+		}
+		//CDT parses the statements calling the result of the call of a function it does not know as declarations of variables whose type is the function,
+		//i.e., f(a)(b); as the declaration of a with type f, so the file is parsed again with these names declared as functions in the included file
+		String functions = misparsedCalls(translationUnit, fileContent);
+		if(!functions.isEmpty()) {
+			IASTTranslationUnit reparsed = parse(filePath, fileContent, astDiff, preamble.isEmpty() ? functions : preamble + "\n" + functions);
 			if(problems(reparsed) <= problems(translationUnit)) {
 				translationUnit = reparsed;
 			}
@@ -717,9 +764,12 @@ public class CppFileProcessor {
 			"return", "short", "signed", "sizeof", "static", "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local", "throw", "true",
 			"try", "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while");
 
-	//the declarations of the unknown names that CDT parsed as the types of condition declarations without an initializer, i.e., extern int m_isX11;
-	private static String misparsedConditions(IASTTranslationUnit translationUnit) {
+	//the declarations of the unknown names that CDT parsed as the types of condition declarations without an initializer, i.e., extern int m_isX11;,
+	//and of the unknown classes of the member functions containing them, whose scope CDT cannot look the names up in, i.e., struct A {}; for void A::f() {...}
+	private static String misparsedConditions(IASTTranslationUnit translationUnit, String fileContent) {
 		Set<String> declarations = new LinkedHashSet<>();
+		//the names used as types in the file, which are computed once per name
+		Map<String, Boolean> types = new HashMap<>();
 		translationUnit.accept(new ASTVisitor() {
 			{
 				shouldVisitStatements = true;
@@ -735,11 +785,58 @@ public class CppFileProcessor {
 						&& simple.getDeclarators()[0].getInitializer() == null && simple.getDeclSpecifier() instanceof IASTNamedTypeSpecifier named
 						&& named.getName().getLastName() == named.getName() && named.getName().resolveBinding() instanceof IProblemBinding) {
 					declarations.add("extern int " + named.getName() + ";");
+					String owner = ownerClassDeclaration(statement, fileContent, types);
+					if(owner != null) {
+						declarations.add(owner);
+					}
 				}
 				return PROCESS_CONTINUE;
 			}
 		});
 		return String.join("\n", declarations);
+	}
+
+	//the declarations of the unknown names that CDT parsed as the types of declaration statements with a parenthesized declarator followed by parameters,
+	//i.e., int f(...); for f(a)(b);, when the names are not used as types in other declarations of the file
+	private static String misparsedCalls(IASTTranslationUnit translationUnit, String fileContent) {
+		Set<String> names = new LinkedHashSet<>();
+		Set<String> types = new HashSet<>();
+		translationUnit.accept(new ASTVisitor() {
+			{
+				shouldVisitDeclSpecifiers = true;
+			}
+
+			@Override
+			public int visit(IASTDeclSpecifier declSpecifier) {
+				if(declSpecifier instanceof IASTNamedTypeSpecifier named && isPartOfFile(named)) {
+					if(misparsedCall(named, fileContent)) {
+						names.add(named.getName().toString());
+					}
+					else {
+						types.add(named.getName().getLastName().toString());
+					}
+				}
+				return PROCESS_CONTINUE;
+			}
+		});
+		names.removeAll(types);
+		return names.stream().map(name -> "int " + name + "(...);").collect(Collectors.joining("\n"));
+	}
+
+	private static boolean misparsedCall(IASTNamedTypeSpecifier named, String fileContent) {
+		if(!(named.getParent() instanceof IASTSimpleDeclaration declaration) || !(declaration.getParent() instanceof IASTDeclarationStatement)
+				|| declaration.getDeclarators().length != 1 || named.getStorageClass() != IASTDeclSpecifier.sc_unspecified || named.isConst()) {
+			return false;
+		}
+		IASTDeclarator declarator = declaration.getDeclarators()[0];
+		IASTName name = named.getName();
+		IASTFileLocation location = name.getFileLocation();
+		if(declarator.getNestedDeclarator() == null || declarator.getPointerOperators().length > 0 || name instanceof ICPPASTQualifiedName
+				|| name instanceof ICPPASTTemplateId || location == null || !(name.resolveBinding() instanceof IProblemBinding)) {
+			return false;
+		}
+		int end = location.getNodeOffset() + location.getNodeLength();
+		return end <= fileContent.length() && fileContent.substring(location.getNodeOffset(), end).equals(name.toString()) && nextNonWhitespace(fileContent, end) == '(';
 	}
 
 	//the definitions of the unknown macros at the start of declarations, which are followed by a declaration specifier that cannot follow a type
@@ -928,9 +1025,9 @@ public class CppFileProcessor {
 		return inNamespaces(namespaces, "template<class... __rm_t__> int " + lastName + "(...);");
 	}
 
-	//the definition of the unknown class of the member function that contains the expression, i.e., A in void A::f() {...}, in the namespaces of the member function
-	private static String ownerClassDeclaration(IASTExpression expression, String fileContent, Map<String, Boolean> types) {
-		IASTNode parent = expression.getParent();
+	//the definition of the unknown class of the member function that contains the node, i.e., A in void A::f() {...}, in the namespaces of the member function
+	private static String ownerClassDeclaration(IASTNode node, String fileContent, Map<String, Boolean> types) {
+		IASTNode parent = node.getParent();
 		while(parent != null && !(parent instanceof IASTFunctionDefinition)) {
 			parent = parent.getParent();
 		}
@@ -1253,6 +1350,11 @@ public class CppFileProcessor {
 			//When the CDT parser encounters unrecognized code, it captures the issue inside this declaration so parsing can continue.
 			LocationInfo location = new LocationInfo(sourceFolder, filePath, cppProblemDeclaration, CodeElementType.PROBLEM_DECLARATION, fileContent);
 			String raw = cppProblemDeclaration.getRawSignature();
+			//the problem ends with its code, without the line break that CDT includes, i.e., TEST(A, B) {\n in an inactive branch
+			if(raw.length() > raw.stripTrailing().length() && location.getEndOffset() - location.getStartOffset() == raw.length()) {
+				int end = location.getStartOffset() + raw.stripTrailing().length();
+				location = new LocationInfo(sourceFolder, filePath, location.getStartOffset(), end - location.getStartOffset(), end, CodeElementType.PROBLEM_DECLARATION, fileContent);
+			}
 			boolean isFunctionDeclarator = false;
 			boolean isClassDeclaration = false;
 			boolean isFunctionDefinition = raw.contains("{") && !raw.contains("{.") && !raw.contains("{}");
@@ -1264,6 +1366,13 @@ public class CppFileProcessor {
 			}
 			else if(signature.contains("class ")) {
 				isClassDeclaration = true;
+				//the class definition ends with its body, like the class specifier of the tree, while the semicolon belongs to the declaration,
+				//i.e., class Builder FLATBUFFERS_FINAL_CLASS {...};
+				int close = location.getStartOffset() + raw.stripTrailing().length() - 1;
+				if(raw.stripTrailing().endsWith("};")) {
+					close = fileContent.lastIndexOf('}', close);
+					location = new LocationInfo(sourceFolder, filePath, location.getStartOffset(), close + 1 - location.getStartOffset(), close + 1, CodeElementType.PROBLEM_DECLARATION, fileContent);
+				}
 			}
 			UMLProblemDeclaration problemDeclaration = new UMLProblemDeclaration(packageName, sourceFolder, location, signature, raw, isFunctionDefinition, isFunctionDeclarator, isClassDeclaration);
 			distributeComments(comments, location, problemDeclaration.getComments());

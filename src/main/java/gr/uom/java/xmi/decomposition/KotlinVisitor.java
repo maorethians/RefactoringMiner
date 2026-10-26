@@ -12,6 +12,7 @@ import org.jetbrains.kotlin.com.intellij.psi.stubs.IStubElementType;
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType;
 import org.jetbrains.kotlin.lexer.KtSingleValueToken;
 import org.jetbrains.kotlin.psi.KtArrayAccessExpression;
+import org.jetbrains.kotlin.psi.KtWhenConditionIsPattern;
 import org.jetbrains.kotlin.psi.KtWhenConditionInRange;
 import org.jetbrains.kotlin.psi.KtWhenConditionWithExpression;
 import org.jetbrains.kotlin.psi.KtBinaryExpression;
@@ -29,6 +30,7 @@ import org.jetbrains.kotlin.psi.KtFile;
 import org.jetbrains.kotlin.psi.KtLabeledExpression;
 import org.jetbrains.kotlin.psi.KtLambdaExpression;
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression;
+import org.jetbrains.kotlin.psi.KtQualifiedExpression;
 import org.jetbrains.kotlin.psi.KtObjectDeclaration;
 import org.jetbrains.kotlin.psi.KtObjectLiteralExpression;
 import org.jetbrains.kotlin.psi.KtParenthesizedExpression;
@@ -242,6 +244,12 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 		return super.visitWhenConditionInRange(condition, data);
 	}
 
+	public Object visitWhenConditionIsPattern(KtWhenConditionIsPattern condition, Object data) {
+		if(condition.getTypeReference() != null)
+			visitTypeReference(condition.getTypeReference(), data);
+		return super.visitWhenConditionIsPattern(condition, data);
+	}
+
 	public Object visitSuperTypeEntry(KtSuperTypeEntry entry, Object data) {
 		visitTypeReference(entry.getTypeReference(), data);
 		return super.visitSuperTypeEntry(entry, data);
@@ -449,6 +457,20 @@ public class KotlinVisitor extends KtVisitor<Object, Object> {
 		}
 		if (expression.getSelectorExpression() != null)
 			this.visitExpression(expression.getSelectorExpression(), data);
+		//the receiver of a property access through a chain of properties is a qualified name, like the qualifier of a Java QualifiedName, i.e., hprof.reader in hprof.reader.identifierByteSize
+		if(expression.getSelectorExpression() instanceof KtNameReferenceExpression && expression.getReceiverExpression() instanceof KtDotQualifiedExpression receiver &&
+				isPropertyChain(receiver) && !(expression.getParent() instanceof KtQualifiedExpression parent && parent.getReceiverExpression() == expression)) {
+			LeafExpression qualifiedName = new LeafExpression(cu, sourceFolder, filePath, receiver, CodeElementType.QUALIFIED_NAME, container);
+			variables.add(qualifiedName);
+		}
+	}
+
+	//a chain of property accesses starting with a variable, i.e., hprof.reader
+	private static boolean isPropertyChain(KtExpression expression) {
+		if(expression instanceof KtNameReferenceExpression name)
+			return !Character.isUpperCase(name.getReferencedName().charAt(0));
+		return expression instanceof KtDotQualifiedExpression qualified && qualified.getSelectorExpression() instanceof KtNameReferenceExpression &&
+				isPropertyChain(qualified.getReceiverExpression());
 	}
 
 	private void processSafeQualifiedExpression(KtSafeQualifiedExpression safeQualifiedExpression, Object data) {

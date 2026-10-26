@@ -127,7 +127,7 @@ public class KotlinFileProcessor {
 		compilationUnitComments.removeAll(codeElementComments);
 	}
 
-	private static UMLJavadoc generateDocComment(KtFile cu, String sourceFolder, String filePath, String fileContent, KDoc javaDoc) {
+	public static UMLJavadoc generateDocComment(KtFile cu, String sourceFolder, String filePath, String fileContent, KDoc javaDoc) {
 		UMLJavadoc doc = null;
 		if (javaDoc != null) {
 			LocationInfo locationInfo = new LocationInfo(cu, sourceFolder, filePath, javaDoc, CodeElementType.JAVADOC);
@@ -438,6 +438,8 @@ public class KotlinFileProcessor {
 						}
 					}
 					umlAttribute.setVariableDeclaration(variableDeclaration);
+					//the KDoc of the class parameters declaring properties, i.e., class A(/** doc */ val x: Int)
+					umlAttribute.setJavadoc(variableDeclaration.getJavadoc().orElse(null));
 					umlClass.addAttribute(umlAttribute);
 				}
 				else {
@@ -576,7 +578,8 @@ public class KotlinFileProcessor {
 					OperationBody operationBody = new KotlinOperationBody(ktFile, sourceFolder, filePath, constructor.getBodyBlockExpression(), umlConstructor, umlClass.getAttributes(), fileContent);
 					umlConstructor.setBody(operationBody);
 				}
-				if (constructor.getDelegationCall() != null) {
+				//a constructor without : this(...) or : super(...) has an implicit delegation call without text
+				if (constructor.getDelegationCall() != null && !constructor.getDelegationCall().isImplicit()) {
 					KtConstructorDelegationCall call = constructor.getDelegationCall();
 					AbstractExpression defaultExpression = new AbstractExpression(ktFile, sourceFolder, filePath, call, CodeElementType.FUNCTION_INITIALIZER_EXPRESSION, umlConstructor, activeVariableDeclarations, fileContent);
 					umlConstructor.setDefaultExpression(defaultExpression);

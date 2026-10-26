@@ -39,14 +39,22 @@ public class JavaToKotlinMigration {
     public static void handleCompositeMapping(ExtendedMultiMappingStore mappingStore, Tree srcStatementNode, Tree dstStatementNode, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
         if(srcStatementNode.getType().name.equals(LANG1.CATCH_CLAUSE) && dstStatementNode.getType().name.equals(LANG2.CATCH_CLAUSE)) {
             Tree singleVariableDeclaration1 = TreeUtilFunctions.findChildByType(srcStatementNode, LANG1.SINGLE_VARIABLE_DECLARATION);
-            if(singleVariableDeclaration1 != null) {
-                handleParameterMapping(mappingStore, singleVariableDeclaration1, dstStatementNode, LANG1, LANG2, deferredFlattenings);
-                deferredFlattenings.flattenKeepingMappings(srcStatementNode, singleVariableDeclaration1);
+            Tree parameter2 = TreeUtilFunctions.findChildByType(dstStatementNode, LANG2.PARAMETER);
+            if(singleVariableDeclaration1 != null && parameter2 != null) {
+                handleParameterMapping(mappingStore, singleVariableDeclaration1, parameter2, LANG1, LANG2, deferredFlattenings);
             }
             Tree block1 = TreeUtilFunctions.findChildByType(srcStatementNode, LANG1.BLOCK);
             Tree block2 = TreeUtilFunctions.findChildByType(dstStatementNode, LANG2.STATEMENTS);
             if(block1 != null && block2 != null) {
                 mappingStore.addMapping(block1, block2);
+            }
+        }
+        else if(srcStatementNode.getType().name.equals(LANG1.LABELED_STATEMENT) && dstStatementNode.getType().name.equals(LANG2.LABELED)) {
+            //the labels of the labeled statements, i.e., outer: for (...) -> outer@ for (...)
+            Tree label1 = TreeUtilFunctions.findChildByType(srcStatementNode, LANG1.SIMPLE_NAME);
+            Tree label2 = TreeUtilFunctions.findChildByType(dstStatementNode, LANG2.LABEL);
+            if(label1 != null && label2 != null) {
+                mappingStore.addMapping(label1, label2);
             }
         }
         else if(srcStatementNode.getType().name.equals(LANG1.TRY_STATEMENT) && dstStatementNode.getType().name.equals(LANG2.TRY_STATEMENT)) {
@@ -3111,34 +3119,6 @@ public class JavaToKotlinMigration {
             for(Pair<Tree, Tree> pair : pairs)
                 mapSameStructure(mappingStore, pair.first, pair.second);
         }
-        //align Kotlin declaration's parent -> multiline_comment, declaration with Java declaration -> Javadoc
-        Tree parent1 = srcJavadoc.getParent();
-        Tree parent2 = dstComment.getParent();
-        if(parent1 != null && parent2 != null) {
-            Tree declaration2 = null;
-            Set<Tree> dsts = mappingStore.getDsts(parent1);
-            if(dsts != null) {
-                for(Tree dst : dsts) {
-                    if(dst.getPos() >= dstComment.getEndPos() && dst != parent2) {
-                        declaration2 = dst;
-                        break;
-                    }
-                }
-            }
-            else {
-                int index = parent2.getChildPosition(dstComment);
-                if(index + 1 < parent2.getChildren().size()) {
-                    Tree nextSibling = parent2.getChild(index + 1);
-                    if(!nextSibling.getType().name.equals(LANG2.BLOCK_COMMENT) && !nextSibling.getType().name.equals(LANG2.LINE_COMMENT))
-                        declaration2 = nextSibling;
-                }
-            }
-            if(declaration2 != null) {
-                parent2.getChildren().remove(dstComment);
-                declaration2.insertChild(dstComment, 0);
-                dstComment.setParent(declaration2);
-            }
-        }
         return true;
     }
 
@@ -3426,6 +3406,10 @@ public class JavaToKotlinMigration {
     //matches the words of a Javadoc text separated by any whitespace, including line breaks followed by a leading *,
     //allowing HTML markup to be converted to Markdown, i.e., <pre> to ```kotlin and &lt; to <, Markdown emphasis to be added, i.e., **text**,
     //words to be converted to links, i.e., IOException to [IOException], and the stray punctuation of the Java text to be removed, i.e., } in {@link A} }
+    //the start of the text of an HTML link, i.e., href="url">text of <a href="url">text</a>
+    private static final Pattern HTML_LINK_TEXT_START = Pattern.compile("(?i)href=\"[^\"]*\">(.*)");
+    private static final Pattern HTML_LINK_TEXT_END = Pattern.compile("(?i)(.*)</a>([.,;:)!?]*)");
+
     private static Pattern javadocTextPattern(String label) {
         String separator = "(?:\\s*\\n\\s*\\*(?!/))?\\s+";
         StringBuilder regex = new StringBuilder();
@@ -3454,6 +3438,30 @@ public class JavaToKotlinMigration {
             return "(?:```[\\w+-]*|" + Pattern.quote(word) + ")";
         if(word.equalsIgnoreCase("</pre>"))
             return "(?:```|" + Pattern.quote(word) + ")";
+        //the HTML links become Markdown links, i.e., <a href="url">text</a> and [text](url) or [text][ref], whose words might be on different lines
+        if(word.equalsIgnoreCase("<a"))
+            return null;
+        String linkStart = "";
+        String linkEnd = "";
+        Matcher href = HTML_LINK_TEXT_START.matcher(word);
+        if(href.matches()) {
+            word = href.group(1);
+            linkStart = "\\[?";
+        }
+        //the end of the text of an HTML link, followed by punctuation, i.e., text</a>.
+        Matcher end = HTML_LINK_TEXT_END.matcher(word);
+        if(end.matches()) {
+            word = end.group(1);
+            //an inline link [text](url) or a reference link [text][ref]
+            linkEnd = "(?:\\]\\([^)\\s]*\\)|\\]\\[[^\\]\\s]*\\])?" + Pattern.quote(end.group(2));
+        }
+        if(word.isEmpty())
+            return null;
+        String pattern = javadocWordPatternWithoutLinks(word);
+        return pattern == null ? null : linkStart + pattern + linkEnd;
+    }
+
+    private static String javadocWordPatternWithoutLinks(String word) {
         String markdown = word.replaceAll("</?p>", "").replaceAll("</?(strong|b)>", "**").replaceAll("</?(em|i)>", "*").replaceAll("</?code>", "`");
         if(markdown.isEmpty())
             return null;
