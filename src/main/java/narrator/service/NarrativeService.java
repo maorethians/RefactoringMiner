@@ -1,12 +1,8 @@
 package narrator.service;
 
-import narrator.Driver;
 import narrator.mcp.html.NarrativeHtmlGenerator;
 import org.jgrapht.Graph;
-import org.refactoringminer.astDiff.graph.Edge;
-import org.refactoringminer.astDiff.graph.Node;
-import org.refactoringminer.astDiff.graph.RawNode;
-import org.refactoringminer.astDiff.graph.ReviewNode;
+import org.refactoringminer.astDiff.graph.*;
 import org.refactoringminer.astDiff.graph.cluster.Cluster;
 import org.refactoringminer.astDiff.graph.cluster.Clusterer;
 import org.refactoringminer.astDiff.graph.cluster.traverse.*;
