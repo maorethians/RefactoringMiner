@@ -273,6 +273,93 @@ public abstract class UMLAbstractClassDiff {
 		return operationBodyMapperList;
 	}
 
+	//the mappers by the offsets of the expressions of the original class they replaced in their statement mappings, computed when first needed
+	private Map<Long, UMLOperationBodyMapper> mappersByReplacedExpressionOffsets;
+	//the mappers by the offsets of the statements of the original class they left unmatched, computed when first needed
+	private Map<Long, UMLOperationBodyMapper> mappersByUnmatchedStatementOffsets;
+	//the offsets of the operations of the next class calling each mapper's operation or called by it, computed when first needed
+	private Map<UMLOperationBodyMapper, Set<Long>> callRelatedOperationOffsets;
+	//the offsets of the operations of the next class, computed when first needed
+	private Set<Long> nextOperationOffsets;
+
+	private static long offsets(int startOffset, int endOffset) {
+		return ((long) startOffset << 32) | endOffset;
+	}
+
+	//the mapper that replaced the expression of the original class at the given offsets in one of its statement mappings, or null
+	public UMLOperationBodyMapper getMapperReplacingExpression(int startOffset, int endOffset) {
+		if(mappersByReplacedExpressionOffsets == null) {
+			mappersByReplacedExpressionOffsets = new HashMap<>();
+			for(UMLOperationBodyMapper mapper : operationBodyMapperList) {
+				for(AbstractCodeMapping mapping : mapper.getMappings()) {
+					for(Replacement replacement : mapping.getReplacements()) {
+						for(LeafExpression expression : mapping.getFragment1().findExpression(replacement.getBefore())) {
+							LocationInfo location = expression.getLocationInfo();
+							mappersByReplacedExpressionOffsets.put(offsets(location.getStartOffset(), location.getEndOffset()), mapper);
+						}
+					}
+				}
+			}
+		}
+		return mappersByReplacedExpressionOffsets.get(offsets(startOffset, endOffset));
+	}
+
+	//the mapper that left the statement of the original class at the given offsets unmatched, i.e., a deleted statement, or null
+	public UMLOperationBodyMapper getMapperLeavingStatementUnmatched(int startOffset, int endOffset) {
+		if(mappersByUnmatchedStatementOffsets == null) {
+			mappersByUnmatchedStatementOffsets = new HashMap<>();
+			for(UMLOperationBodyMapper mapper : operationBodyMapperList) {
+				for(AbstractCodeFragment statement : mapper.getNonMappedLeavesT1()) {
+					LocationInfo location = statement.getLocationInfo();
+					mappersByUnmatchedStatementOffsets.put(offsets(location.getStartOffset(), location.getEndOffset()), mapper);
+				}
+			}
+		}
+		return mappersByUnmatchedStatementOffsets.get(offsets(startOffset, endOffset));
+	}
+
+	//whether the code at the given offsets of the next class is an operation
+	public boolean isNextOperation(int startOffset, int endOffset) {
+		if(nextOperationOffsets == null) {
+			nextOperationOffsets = new HashSet<>();
+			for(UMLOperation operation : nextClass.getOperations()) {
+				nextOperationOffsets.add(offsets(operation.getLocationInfo().getStartOffset(), operation.getLocationInfo().getEndOffset()));
+			}
+		}
+		return nextOperationOffsets.contains(offsets(startOffset, endOffset));
+	}
+
+	//whether the code at the given offsets of the next class is the mapper's operation, or an operation calling it or called by it,
+	//to which an expression replaced in the mapper may have moved, i.e., to the callers as the argument of a new parameter
+	public boolean isCallRelatedOperation(UMLOperationBodyMapper mapper, int startOffset, int endOffset) {
+		if(callRelatedOperationOffsets == null) {
+			callRelatedOperationOffsets = new HashMap<>();
+		}
+		Set<Long> related = callRelatedOperationOffsets.get(mapper);
+		if(related == null) {
+			related = new HashSet<>();
+			VariableDeclarationContainer container = mapper.getContainer2();
+			Set<String> calledNames = new HashSet<>();
+			for(AbstractCall invocation : container.getAllOperationInvocations()) {
+				calledNames.add(invocation.getName());
+			}
+			related.add(offsets(container.getLocationInfo().getStartOffset(), container.getLocationInfo().getEndOffset()));
+			for(UMLOperation operation : nextClass.getOperations()) {
+				boolean calls = calledNames.contains(operation.getName());
+				for(AbstractCall invocation : operation.getAllOperationInvocations()) {
+					if(invocation.getName().equals(container.getName())) {
+						calls = true;
+					}
+				}
+				if(calls) {
+					related.add(offsets(operation.getLocationInfo().getStartOffset(), operation.getLocationInfo().getEndOffset()));
+				}
+			}
+			callRelatedOperationOffsets.put(mapper, related);
+		}
+		return related.contains(offsets(startOffset, endOffset));
+	}
+
 	public List<UMLOperationBodyMapper> getOperationBodyMapperListIncludingNestedMappersInAnonymousClassDiffs() {
 		ArrayList<UMLOperationBodyMapper> mappers = new ArrayList<>(operationBodyMapperList);
 		for(UMLOperationBodyMapper mapper : operationBodyMapperList) {
@@ -3574,7 +3661,8 @@ public abstract class UMLAbstractClassDiff {
 			boolean commonTokenCheck = false;
 			for(String token1 : tokens1) {
 				for(String token2 : tokens2) {
-					if(token1.equals(token2) || token1.startsWith(token2)) {
+					//case-insensitive startsWith, since testOneArgument splits into One, while oneArgument splits into one
+					if(token1.regionMatches(true, 0, token2, 0, token2.length())) {
 						commonTokens.add(token2);
 					}
 				}

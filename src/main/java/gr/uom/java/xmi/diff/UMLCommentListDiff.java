@@ -17,6 +17,7 @@ import gr.uom.java.xmi.PythonFileProcessor;
 import gr.uom.java.xmi.UMLClass;
 import gr.uom.java.xmi.UMLComment;
 import gr.uom.java.xmi.UMLCommentGroup;
+import gr.uom.java.xmi.decomposition.AbstractCodeFragment;
 import gr.uom.java.xmi.decomposition.AbstractCodeMapping;
 import gr.uom.java.xmi.decomposition.CompositeStatementObject;
 import gr.uom.java.xmi.decomposition.StatementObject;
@@ -182,23 +183,11 @@ public class UMLCommentListDiff {
 		int groupsAfterSize = groupsAfter.size();
 		List<UMLCommentGroup> groupsBeforeToBeRemoved = new ArrayList<UMLCommentGroup>();
 		List<UMLCommentGroup> groupsAfterToBeRemoved = new ArrayList<UMLCommentGroup>();
-		for(UMLCommentGroup groupBefore : groupsBefore) {
-			for(UMLCommentGroup groupAfter : groupsAfter) {
-				if(groupBefore.sameText(groupAfter) && !groupsAfterToBeRemoved.contains(groupAfter)) {
-					for(int i=0; i<groupBefore.getGroup().size(); i++) {
-						UMLComment commentBefore = groupBefore.getGroup().get(i);
-						UMLComment commentAfter = groupAfter.getGroup().get(i);
-						Pair<UMLComment, UMLComment> pair = Pair.of(commentBefore, commentAfter);
-						commonComments.add(pair);
-						deletedComments.remove(commentBefore);
-						addedComments.remove(commentAfter);
-					}
-					groupsBeforeToBeRemoved.add(groupBefore);
-					groupsAfterToBeRemoved.add(groupAfter);
-					break;
-				}
-			}
+		//the groups within the statements of a mapping are matched first, then the remaining groups in order
+		if(!mappings.isEmpty()) {
+			matchGroupsWithSameText(groupsBefore, groupsAfter, groupsBeforeToBeRemoved, groupsAfterToBeRemoved, deletedComments, addedComments, true);
 		}
+		matchGroupsWithSameText(groupsBefore, groupsAfter, groupsBeforeToBeRemoved, groupsAfterToBeRemoved, deletedComments, addedComments, false);
 		groupsBefore.removeAll(groupsBeforeToBeRemoved);
 		groupsAfter.removeAll(groupsAfterToBeRemoved);
 		for(UMLCommentGroup groupBefore : groupsBefore) {
@@ -257,6 +246,67 @@ public class UMLCommentListDiff {
 			this.deletedComments.addAll(deletedComments);
 			this.addedComments.addAll(addedComments);
 		}
+	}
+
+	private void matchGroupsWithSameText(List<UMLCommentGroup> groupsBefore, List<UMLCommentGroup> groupsAfter,
+			List<UMLCommentGroup> groupsBeforeToBeRemoved, List<UMLCommentGroup> groupsAfterToBeRemoved,
+			List<UMLComment> deletedComments, List<UMLComment> addedComments, boolean withinMappedStatements) {
+		for(UMLCommentGroup groupBefore : groupsBefore) {
+			if(groupsBeforeToBeRemoved.contains(groupBefore)) {
+				continue;
+			}
+			for(UMLCommentGroup groupAfter : groupsAfter) {
+				if(groupBefore.sameText(groupAfter) && !groupsAfterToBeRemoved.contains(groupAfter) &&
+						(!withinMappedStatements || withinMappedStatements(groupBefore.getGroup(), groupAfter.getGroup()))) {
+					for(int i=0; i<groupBefore.getGroup().size(); i++) {
+						UMLComment commentBefore = groupBefore.getGroup().get(i);
+						UMLComment commentAfter = groupAfter.getGroup().get(i);
+						Pair<UMLComment, UMLComment> pair = Pair.of(commentBefore, commentAfter);
+						commonComments.add(pair);
+						deletedComments.remove(commentBefore);
+						addedComments.remove(commentAfter);
+					}
+					groupsBeforeToBeRemoved.add(groupBefore);
+					groupsAfterToBeRemoved.add(groupAfter);
+					break;
+				}
+			}
+		}
+	}
+
+	private boolean withinMappedStatements(List<UMLComment> commentsBefore, List<UMLComment> commentsAfter) {
+		for(AbstractCodeMapping mapping : mappings) {
+			if(mapping.getFragment1() instanceof StatementObject && mapping.getFragment2() instanceof StatementObject &&
+					withinLines(commentsBefore, mapping.getFragment1().getLocationInfo()) && withinLines(commentsAfter, mapping.getFragment2().getLocationInfo())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//an end-of-line comment follows the end of the statement on its last line
+	private static boolean withinLines(List<UMLComment> comments, LocationInfo location) {
+		for(UMLComment comment : comments) {
+			if(comment.getLocationInfo().getStartLine() < location.getStartLine() || comment.getLocationInfo().getEndLine() > location.getEndLine()) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	//an end-of-line comment belongs to the whole statement, whereas a comment within a statement may belong to a sub-expression moved elsewhere
+	private boolean endOfLineCommentsOfMappedStatements(UMLComment left, UMLComment right) {
+		for(AbstractCodeMapping mapping : mappings) {
+			if(mapping.getFragment1() instanceof StatementObject && mapping.getFragment2() instanceof StatementObject &&
+					endOfLineComment(left, mapping.getFragment1().getLocationInfo()) && endOfLineComment(right, mapping.getFragment2().getLocationInfo())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static boolean endOfLineComment(UMLComment comment, LocationInfo location) {
+		return comment.getLocationInfo().getStartLine() == location.getEndLine() && comment.getLocationInfo().getStartOffset() >= location.getEndOffset();
 	}
 
 	private boolean allRemainingCommentsBelongToGroups(List<UMLComment> comments, List<UMLCommentGroup> groups) {
@@ -383,6 +433,29 @@ public class UMLCommentListDiff {
 		return false;
 	}
 
+	//comments embedded in a statement, such as argument labels, or ending its line have no previous statement, but belong to their enclosing statement
+	//the non-mapped statements of a mapper moving code between operations (extract, inline, merge, move), or of the body it shares with its parent mapper,
+	//may be mapped by another such mapper
+	private boolean isCommentNestedInNonMappedStatement(UMLComment comment, boolean before) {
+		if(operationBodyMapper != null && !operationBodyMapper.isMoveCode() && !sharesBodyWithParentMapper(before)) {
+			List<AbstractCodeFragment> nonMappedLeaves = before ? operationBodyMapper.getNonMappedLeavesT1() : operationBodyMapper.getNonMappedLeavesT2();
+			for(AbstractCodeFragment leaf : nonMappedLeaves) {
+				if(withinLines(List.of(comment), leaf.getLocationInfo())) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private boolean sharesBodyWithParentMapper(boolean before) {
+		UMLOperationBodyMapper parentMapper = operationBodyMapper.getParentMapper();
+		if(parentMapper != null) {
+			return before ? parentMapper.getContainer1().equals(operationBodyMapper.getContainer1()) : parentMapper.getContainer2().equals(operationBodyMapper.getContainer2());
+		}
+		return false;
+	}
+
 	private boolean mappedParent(UMLComment left, UMLComment right) {
 		if(left.getParent() != null && right.getParent() != null) {
 			if(left.getParent().getParent() == null && right.getParent().getParent() == null) {
@@ -406,11 +479,13 @@ public class UMLCommentListDiff {
 				List<Integer> matchingIndices = findAllMatchingIndices(commentsAfter, comment);
 				List<Boolean> mappedParent = new ArrayList<Boolean>();
 				List<Boolean> mappedPreviousStatement = new ArrayList<Boolean>();
+				List<Boolean> endOfLineCommentsOfMappedStatements = new ArrayList<Boolean>();
 				List<Boolean> identicalNextComment = new ArrayList<Boolean>();
 				if(matchingIndices.size() > 1) {
 					for(Integer index : matchingIndices) {
 						mappedParent.add(mappedParent(comment, commentsAfter.get(index)));
 						mappedPreviousStatement.add(mappedPreviousStatement(comment, commentsAfter.get(index)));
+						endOfLineCommentsOfMappedStatements.add(endOfLineCommentsOfMappedStatements(comment, commentsAfter.get(index)));
 						if(commentsBefore.indexOf(comment) < commentsBefore.size() - 1 && index < commentsAfter.size() - 1) {
 							UMLComment commentAfterLeft = commentsBefore.get(commentsBefore.indexOf(comment)+1);
 							UMLComment commentAfterRight = commentsAfter.get(index + 1);
@@ -431,6 +506,9 @@ public class UMLCommentListDiff {
 						if(mappedPreviousStatement.contains(true) && mappedPreviousStatement.get(i) == false) {
 							continue;
 						}
+						if(endOfLineCommentsOfMappedStatements.contains(true) && endOfLineCommentsOfMappedStatements.get(i) == false) {
+							continue;
+						}
 						if(identicalNextComment.contains(true) && identicalNextComment.indexOf(true) == identicalNextComment.lastIndexOf(true)  && identicalNextComment.get(i) == false) {
 							continue;
 						}
@@ -448,11 +526,13 @@ public class UMLCommentListDiff {
 				List<Integer> matchingIndices = findAllMatchingIndices(commentsBefore, comment);
 				List<Boolean> mappedParent = new ArrayList<Boolean>();
 				List<Boolean> mappedPreviousStatement = new ArrayList<Boolean>();
+				List<Boolean> endOfLineCommentsOfMappedStatements = new ArrayList<Boolean>();
 				List<Boolean> identicalNextComment = new ArrayList<Boolean>();
 				if(matchingIndices.size() > 1) {
 					for(Integer index : matchingIndices) {
 						mappedParent.add(mappedParent(commentsBefore.get(index), comment));
 						mappedPreviousStatement.add(mappedPreviousStatement(commentsBefore.get(index), comment));
+						endOfLineCommentsOfMappedStatements.add(endOfLineCommentsOfMappedStatements(commentsBefore.get(index), comment));
 						if(commentsAfter.indexOf(comment) < commentsAfter.size() - 1 && index < commentsBefore.size() - 1) {
 							UMLComment commentAfterLeft = commentsBefore.get(index + 1);
 							UMLComment commentAfterRight = commentsAfter.get(commentsAfter.indexOf(comment)+1);
@@ -471,6 +551,9 @@ public class UMLCommentListDiff {
 							continue;
 						}
 						if(mappedPreviousStatement.contains(true) && mappedPreviousStatement.get(i) == false) {
+							continue;
+						}
+						if(endOfLineCommentsOfMappedStatements.contains(true) && endOfLineCommentsOfMappedStatements.get(i) == false) {
 							continue;
 						}
 						if(identicalNextComment.contains(true) && identicalNextComment.indexOf(true) == identicalNextComment.lastIndexOf(true) && identicalNextComment.get(i) == false) {
@@ -492,7 +575,7 @@ public class UMLCommentListDiff {
 					if(pair.getLeft().getText().equals(deletedComment.getText()) &&
 							pair.getRight().getText().equals(deletedComment.getText()) &&
 							!deletedComment.isCommentedCode() && !deletedComment.nestedInCatchBlock() &&
-							!isDeletedCommentWithPreviousDeletedStatement(deletedComment)) {
+							!isDeletedCommentWithPreviousDeletedStatement(deletedComment) && !isCommentNestedInNonMappedStatement(deletedComment, true)) {
 						Pair<UMLComment, UMLComment> newPair = Pair.of(deletedComment, pair.getRight());
 						commonComments.add(newPair);
 						deletedComments.remove(deletedComment);
@@ -508,7 +591,7 @@ public class UMLCommentListDiff {
 					if(pair.getLeft().getText().equals(addedComment.getText()) &&
 							pair.getRight().getText().equals(addedComment.getText()) &&
 							!addedComment.isCommentedCode() && !addedComment.nestedInCatchBlock() &&
-							!isAddedCommentWithPreviousAddedStatement(addedComment)) {
+							!isAddedCommentWithPreviousAddedStatement(addedComment) && !isCommentNestedInNonMappedStatement(addedComment, false)) {
 						Pair<UMLComment, UMLComment> newPair = Pair.of(pair.getLeft(), addedComment);
 						commonComments.add(newPair);
 						addedComments.remove(addedComment);

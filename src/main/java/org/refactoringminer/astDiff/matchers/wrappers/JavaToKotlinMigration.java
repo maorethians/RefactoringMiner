@@ -601,6 +601,17 @@ public class JavaToKotlinMigration {
         if(!letWithLambda) {
             removeFromParent(inv2, lambdas2, LANG2.METHOD_INVOCATION);
         }
+        //the Java instance creation replaced with a Kotlin lambda argument has no Kotlin call counterpart, and neither have the calls inside the lambda,
+        //i.e., writerExecutor.scheduleAtFixedRate(new PingRunnable(false, 0, 0), ...) -> writerExecutor.scheduleAtFixedRate({ threadName(...) {...} }, ...)
+        List<Tree> argumentLambdas2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.LAMBDA_LITERAL).stream()
+                .filter(t2 -> t2.getParent() != null && t2.getParent().getType().name.equals(LANG2.VALUE_ARGUMENT)).collect(Collectors.toList());
+        if(argumentLambdas2.size() > 0) {
+            removeFromParent(inv2, argumentLambdas2, LANG2.METHOD_INVOCATION);
+            Set<String> names2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.SIMPLE_NAME, LANG2.TYPE_IDENTIFIER).stream().map(Tree::getLabel).collect(Collectors.toSet());
+            inv1.removeIf(t1 -> t1.getType().name.equals(LANG1.CLASS_INSTANCE_CREATION) && t1.getParent() != null && t1.getParent().getType().name.equals(LANG1.METHOD_INVOCATION_ARGUMENTS) &&
+                    TreeUtilFunctions.findChildByType(t1, LANG1.ANONYMOUS_CLASS_DECLARATION) == null && t1.getChildren().size() > 0 &&
+                    t1.getChild(0).getType().name.equals(LANG1.SIMPLE_TYPE) && t1.getChild(0).getChildren().size() == 1 && !names2.contains(t1.getChild(0).getChild(0).getLabel()));
+        }
         //check if class instance creation has an anonymous class and remove it
         if(anonymous1.size() > anonymous2.size()) {
             List<Tree> invocationToBeRemoved = new ArrayList<Tree>();
@@ -1026,6 +1037,13 @@ public class JavaToKotlinMigration {
             children1.remove(lengthComparison1.getChild(lengthComparison1.getChildren().size() - 1));
         }
         children2 = TreeUtilFunctions.findChildrenByTypeRecursively(dstStatementNode, LANG2.INTEGER_LITERAL, LANG2.FLOAT_LITERAL);
+        //the statement itself is a number literal, i.e., a field initializer 0 -> 0L
+        if(srcStatementNode.getType().name.equals(LANG1.NUMBER_LITERAL)) {
+            children1.add(0, srcStatementNode);
+        }
+        if(dstStatementNode.getType().name.equals(LANG2.INTEGER_LITERAL) || dstStatementNode.getType().name.equals(LANG2.FLOAT_LITERAL)) {
+            children2.add(0, dstStatementNode);
+        }
         if(children1.size() == children2.size()) {
             for(int i=0; i<children1.size(); i++) {
                 //handle -literal
@@ -3010,6 +3028,27 @@ public class JavaToKotlinMigration {
         return null;
     }
 
+    //align Kotlin object_literal -> [delegation_specifier -> [constructor_invocation ->] user_type, type_body] with Java ClassInstanceCreation -> [type, AnonymousClassDeclaration],
+    //i.e., new Listener() {...} -> object : Listener() {...}
+    public static void handleAnonymousClassToObjectMapping(ExtendedMultiMappingStore mappingStore, Tree anonymousClass1, Tree object2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        if(anonymousClass1 == null || object2 == null || anonymousClass1.getParent() == null)
+            return;
+        Tree creation1 = anonymousClass1.getParent();
+        if(!creation1.getType().name.equals(LANG1.CLASS_INSTANCE_CREATION) || !object2.getType().name.equals(LANG2.OBJECT_LITERAL))
+            return;
+        Tree body2 = TreeUtilFunctions.findChildByType(object2, LANG2.CLASS_BLOCK);
+        if(body2 != null)
+            mappingStore.addMapping(anonymousClass1, body2);
+        Tree delegation2 = TreeUtilFunctions.findChildByType(object2, LANG2.DELEGATION_SPECIFIER);
+        if(delegation2 == null)
+            return;
+        //a superclass has a constructor invocation, while an interface has only the type, i.e., object : Runnable {...}
+        Tree invocation2 = TreeUtilFunctions.findChildByType(delegation2, LANG2.CONSTRUCTOR_INVOCATION);
+        Tree type2 = TreeUtilFunctions.findChildByType(invocation2 != null ? invocation2 : delegation2, LANG2.USER_TYPE);
+        if(creation1.getChildren().size() > 0)
+            alignTypes(mappingStore, creation1.getChild(0), type2, LANG1, LANG2, deferredFlattenings);
+    }
+
     //align Java Javadoc -> TagElement -> TextElement with Kotlin multiline_comment by mirroring the Java structure inside the textually identical Kotlin comment
     public static boolean handleJavadocMapping(ExtendedMultiMappingStore mappingStore, Tree srcJavadoc, Tree dstComment, Constants LANG1, Constants LANG2) {
         if(!srcJavadoc.getType().name.equals(LANG1.JAVA_DOC) || !dstComment.getType().name.equals(LANG2.BLOCK_COMMENT))
@@ -3536,6 +3575,8 @@ public class JavaToKotlinMigration {
             type1 = TreeUtilFunctions.findChildByType(declaration1, LANG1.PRIMITIVE_TYPE);
         if(type1 == null)
             type1 = TreeUtilFunctions.findChildByType(declaration1, LANG1.PARAMETERIZED_TYPE);
+        if(type1 == null)
+            type1 = TreeUtilFunctions.findChildByType(declaration1, LANG1.ARRAY_TYPE);
         return type1;
     }
 
@@ -3550,7 +3591,8 @@ public class JavaToKotlinMigration {
         return type2;
     }
 
-    //align Kotlin user_type with Java SimpleType, PrimitiveType, and ParameterizedType, i.e., int -> Int, Integer -> Int, List<Header> -> List<Header>
+    //align Kotlin user_type with Java SimpleType, PrimitiveType, ParameterizedType, and ArrayType, i.e., int -> Int, Integer -> Int, List<Header> -> List<Header>,
+    //Http2Stream[] -> Array<Http2Stream>, byte[] -> ByteArray
     private static void alignTypes(ExtendedMultiMappingStore mappingStore, Tree type1, Tree type2, Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
         if(type1 == null || type2 == null)
             return;
@@ -3614,6 +3656,28 @@ public class JavaToKotlinMigration {
                 for(int i=1; i<type1.getChildren().size(); i++) {
                     alignTypes(mappingStore, type1.getChild(i), type2.getChild(i), LANG1, LANG2, deferredFlattenings);
                 }
+            }
+        }
+        else if(type1.getType().name.equals(LANG1.ARRAY_TYPE) && type1.getChildren().size() == 2 && type2.getChildren().size() > 0 && type2.getChild(0).isLeaf()) {
+            Tree elementType1 = type1.getChild(0);
+            Tree name2 = type2.getChild(0);
+            Tree typeArguments2 = TreeUtilFunctions.findChildByType(type2, LANG2.TYPE_ARGUMENTS);
+            if(name2.getLabel().equals("Array") && typeArguments2 != null && typeArguments2.getChildren().size() == 1) {
+                //align Kotlin user_type -> [type_identifier 'Array', type_arguments -> type_projection -> type] with Java ArrayType -> [type, Dimension]
+                Tree typeProjection2 = typeArguments2.getChild(0);
+                if(!typeProjection2.getType().name.equals(LANG2.TYPE_PROJECTION) || typeProjection2.getChildren().size() != 1)
+                    return;
+                mappingStore.addMapping(type1, type2);
+                mappingStore.addMapping(type1.getChild(1), name2);
+                alignTypes(mappingStore, elementType1, typeProjection2.getChild(0), LANG1, LANG2, deferredFlattenings);
+                //flatten type_projection and type_arguments, innermost first, so that each is still a child of its parent
+                flattenDstChildKeepingMappings(deferredFlattenings, typeArguments2, typeProjection2);
+                flattenDstChildKeepingMappings(deferredFlattenings, type2, typeArguments2);
+            }
+            else if(type2.getChildren().size() == 1 && elementType1.getType().name.equals(LANG1.PRIMITIVE_TYPE) && name2.getLabel().equals(kotlinTypeName(type1, LANG1))) {
+                //align Kotlin user_type -> type_identifier 'ByteArray' with Java ArrayType -> [PrimitiveType 'byte', Dimension]
+                mappingStore.addMapping(type1, type2);
+                mappingStore.addMapping(elementType1, name2);
             }
         }
     }
@@ -3729,6 +3793,133 @@ public class JavaToKotlinMigration {
         liftFromModifiers(mappingStore, modifiers2, override2);
         mappingStore.addMapping(annotation1, override2);
         mappingStore.addMapping(annotation1.getChild(0), keyword2);
+    }
+
+    //align Java MethodDeclaration -> THROWS_KEYWORD 'throws' and the thrown types with Kotlin function_declaration -> modifiers -> annotation @Throws(X::class, ...),
+    //the Kotlin annotation declaring the exceptions of a function for its Java callers, i.e., throws IOException -> @Throws(IOException::class)
+    public static void handleThrowsMapping(ExtendedMultiMappingStore mappingStore, Tree srcOperationNode, Tree dstOperationNode, Constants LANG1, Constants LANG2) {
+        Tree keyword1 = TreeUtilFunctions.findChildByType(srcOperationNode, LANG1.THROWS_KEYWORD);
+        Tree modifiers2 = TreeUtilFunctions.findChildByType(dstOperationNode, LANG2.MODIFIERS);
+        if(keyword1 == null || modifiers2 == null)
+            return;
+        Tree name2 = null;
+        List<Tree> classLiterals2 = Collections.emptyList();
+        for(Tree annotation2 : modifiers2.getChildren()) {
+            Tree invocation2 = TreeUtilFunctions.findChildByType(annotation2, LANG2.CONSTRUCTOR_INVOCATION);
+            Tree userType2 = invocation2 != null ? TreeUtilFunctions.findChildByType(invocation2, LANG2.USER_TYPE) : null;
+            Tree lastName2 = userType2 != null && !userType2.getChildren().isEmpty() ? userType2.getChild(userType2.getChildren().size() - 1) : null;
+            if(lastName2 != null && lastName2.getType().name.equals(LANG2.TYPE_IDENTIFIER) && lastName2.getLabel().equals("Throws")) {
+                name2 = lastName2;
+                Tree arguments2 = TreeUtilFunctions.findChildByType(invocation2, LANG2.METHOD_INVOCATION_ARGUMENTS);
+                if(arguments2 != null)
+                    classLiterals2 = TreeUtilFunctions.findChildrenByTypeRecursively(arguments2, LANG2.CALLABLE_REFERENCE);
+                break;
+            }
+        }
+        if(name2 == null)
+            return;
+        //the name of the annotation is the Kotlin equivalent of the throws keyword, so it is labeled as the Java keyword, like the override modifier
+        removeDstMappings(mappingStore, name2);
+        name2.setLabel(keyword1.getLabel());
+        mappingStore.addMapping(keyword1, name2);
+        //the thrown types follow the throws keyword, and each one is mapped to the class literal of the type with the same name
+        List<Tree> children1 = srcOperationNode.getChildren();
+        for(int i = children1.indexOf(keyword1) + 1; i < children1.size() && !children1.get(i).getType().name.equals(LANG1.BLOCK); i++) {
+            Tree type1 = children1.get(i);
+            List<Tree> names1 = leaves(type1);
+            for(Tree classLiteral2 : classLiterals2) {
+                if(classLiteral2.getChildren().isEmpty())
+                    continue;
+                List<Tree> names2 = leaves(classLiteral2.getChild(0));
+                if(names1.isEmpty() || names2.isEmpty() || !names1.get(names1.size() - 1).getLabel().equals(names2.get(names2.size() - 1).getLabel()) || mappingStore.isDstMapped(classLiteral2))
+                    continue;
+                mappingStore.addMapping(type1, classLiteral2);
+                for(int k = 1; k <= Math.min(names1.size(), names2.size()) && names1.get(names1.size() - k).getLabel().equals(names2.get(names2.size() - k).getLabel()); k++) {
+                    removeDstMappings(mappingStore, names2.get(names2.size() - k));
+                    mappingStore.addMapping(names1.get(names1.size() - k), names2.get(names2.size() - k));
+                }
+                break;
+            }
+        }
+    }
+
+    //align the Java super-types, which follow extends or implements, with the Kotlin super-types, which all follow the colon,
+    //i.e., class A extends B implements C -> class A : B(), C, pairing the types by name, and then the remaining ones in source code order,
+    //i.e., the changed superclass NamedRunnable -> Runnable; the extends and implements keywords have no Kotlin counterpart
+    public static void handleSuperTypesMapping(ExtendedMultiMappingStore mappingStore, Tree srcTypeDeclaration, Tree dstTypeDeclaration,
+            Constants LANG1, Constants LANG2, DeferredFlattenings deferredFlattenings) {
+        List<Tree> types1 = new ArrayList<>();
+        boolean inheritance = false;
+        for(Tree child1 : srcTypeDeclaration.getChildren()) {
+            if(child1.getType().name.equals(LANG1.TYPE_INHERITANCE_KEYWORD))
+                inheritance = true;
+            else if(inheritance && child1.getType().name.endsWith("Type"))
+                types1.add(child1);
+            else if(inheritance)
+                break;
+        }
+        List<Tree> types2 = new ArrayList<>();
+        for(Tree child2 : dstTypeDeclaration.getChildren()) {
+            if(child2.getType().name.equals(LANG2.DELEGATION_SPECIFIER)) {
+                Tree type2 = superType(child2, LANG2);
+                if(type2 != null)
+                    types2.add(type2);
+            }
+        }
+        if(types1.isEmpty() || types2.isEmpty())
+            return;
+        List<Pair<Tree, Tree>> pairs = new ArrayList<>();
+        for(Tree type1 : new ArrayList<>(types1)) {
+            String name1 = superTypeName(type1, LANG1);
+            for(Tree type2 : types2) {
+                if(name1 != null && name1.equals(superTypeName(type2, LANG2))) {
+                    pairs.add(new Pair<>(type1, type2));
+                    types1.remove(type1);
+                    types2.remove(type2);
+                    break;
+                }
+            }
+        }
+        for(int i = 0; i < Math.min(types1.size(), types2.size()); i++)
+            pairs.add(new Pair<>(types1.get(i), types2.get(i)));
+        for(Pair<Tree, Tree> pair : pairs) {
+            if(!mappingStore.isSrcMapped(pair.first) && !mappingStore.isDstMapped(pair.second))
+                handleTypeMapping(mappingStore, pair.first, pair.second, LANG1, LANG2, deferredFlattenings);
+        }
+    }
+
+    //the type of the Kotlin super-type entry, which is a constructor call for a superclass with a constructor, i.e., B in B() and C in C
+    private static Tree superType(Tree delegationSpecifier2, Constants LANG2) {
+        Tree type2 = TreeUtilFunctions.findChildByType(delegationSpecifier2, LANG2.USER_TYPE);
+        if(type2 == null) {
+            Tree invocation2 = TreeUtilFunctions.findChildByType(delegationSpecifier2, LANG2.CONSTRUCTOR_INVOCATION);
+            if(invocation2 != null)
+                type2 = TreeUtilFunctions.findChildByType(invocation2, LANG2.USER_TYPE);
+        }
+        return type2;
+    }
+
+    //the simple name of the super-type without its type arguments, i.e., Handler in Http2Reader.Handler and List in List<String>
+    private static String superTypeName(Tree type, Constants LANG) {
+        Tree base = type.getType().name.equals(LANG.PARAMETERIZED_TYPE) && !type.getChildren().isEmpty() ? type.getChild(0) : type;
+        if(base.getType().name.equals(LANG.USER_TYPE)) {
+            String name = null;
+            for(Tree child : base.getChildren())
+                if(child.getType().name.equals(LANG.TYPE_IDENTIFIER))
+                    name = child.getLabel();
+            return name;
+        }
+        List<Tree> names = leaves(base);
+        return names.isEmpty() ? null : names.get(names.size() - 1).getLabel();
+    }
+
+    //the leaves of the tree in source code order
+    private static List<Tree> leaves(Tree tree) {
+        List<Tree> leaves = new ArrayList<>();
+        for(Tree t : tree.preOrder())
+            if(t.isLeaf())
+                leaves.add(t);
+        return leaves;
     }
 
     //moves the modifier from the Kotlin modifiers to the declaration, keeping the source code order of the annotations and modifiers
