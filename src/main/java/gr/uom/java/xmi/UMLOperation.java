@@ -431,8 +431,17 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 					annotation.getTypeName().equals("BeforeEach") || annotation.getTypeName().equals("BeforeAll")) {
 				return true;
 			}
+			if(LANG.equals(Constants.PYTHON) && isPytestFixture(annotation)) {
+				return true;
+			}
 		}
 		return false;
+	}
+
+	//the pytest fixture decorators, i.e., @pytest.fixture, @pytest_asyncio.fixture, or @fixture imported from pytest, which set up (and after their yield tear down) the state of the tests using them
+	private static boolean isPytestFixture(UMLAnnotation annotation) {
+		String typeName = annotation.getTypeName();
+		return typeName.equals("pytest.fixture") || typeName.equals("pytest_asyncio.fixture") || typeName.equals("fixture");
 	}
 
 	public boolean hasTearDownAnnotation() {
@@ -441,6 +450,9 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			if(annotation.getTypeName().equals("After") || annotation.getTypeName().equals("AfterClass") ||
 					//JUnit 5
 					annotation.getTypeName().equals("AfterEach") || annotation.getTypeName().equals("AfterAll")) {
+				return true;
+			}
+			if(LANG.equals(Constants.PYTHON) && isPytestFixture(annotation)) {
 				return true;
 			}
 		}
@@ -1663,35 +1675,41 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 
 	public boolean isMain() {
 		List<UMLType> parameterTypeList = getParameterTypeList();
-		return getName().equals("main") && getReturnParameter().getType().getClassType().equals("void") &&
+		return getName().equals("main") && returnsType("void") &&
 				parameterTypeList.size() == 1 && parameterTypeList.get(0).getClassType().equals("String") &&
 				parameterTypeList.get(0).getArrayDimension() == 1;
 	}
 
+	//the declared return type, or any type when it is inferred, i.e., override fun toString() = "..." in Kotlin
+	private boolean returnsType(String classType) {
+		UMLParameter returnParameter = getReturnParameter();
+		return returnParameter == null || returnParameter.getType().getClassType().equals(classType);
+	}
+
 	private boolean isEquals() {
 		List<UMLType> parameterTypeList = getParameterTypeList();
-		return getName().equals("equals") && getReturnParameter().getType().getClassType().equals("boolean") &&
+		return getName().equals("equals") && returnsType("boolean") &&
 				parameterTypeList.size() == 1 && parameterTypeList.get(0).getClassType().equals("Object");
 	}
 
 	private boolean isHashCode() {
 		List<UMLType> parameterTypeList = getParameterTypeList();
-		return getName().equals("hashCode") && getReturnParameter().getType().getClassType().equals("int") && parameterTypeList.size() == 0;
+		return getName().equals("hashCode") && returnsType("int") && parameterTypeList.size() == 0;
 	}
 
 	private boolean isToString() {
 		List<UMLType> parameterTypeList = getParameterTypeList();
-		return getName().equals("toString") && getReturnParameter().getType().getClassType().equals("String") && parameterTypeList.size() == 0;
+		return getName().equals("toString") && returnsType("String") && parameterTypeList.size() == 0;
 	}
 
 	private boolean isClone() {
 		List<UMLType> parameterTypeList = getParameterTypeList();
-		return getName().equals("clone") && getReturnParameter().getType().getClassType().equals("Object") && parameterTypeList.size() == 0;
+		return getName().equals("clone") && returnsType("Object") && parameterTypeList.size() == 0;
 	}
 
 	private boolean isCompareTo() {
 		List<UMLType> parameterTypeList = getParameterTypeList();
-		return getName().equals("compareTo") && getReturnParameter().getType().getClassType().equals("int") && parameterTypeList.size() == 1;
+		return getName().equals("compareTo") && returnsType("int") && parameterTypeList.size() == 1;
 	}
 
 	public boolean compatibleSignature(UMLOperation removedOperation) {

@@ -27,6 +27,7 @@ import org.refactoringminer.util.PathFileUtils;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /* Created by pourya on 2024-05-22*/
@@ -100,7 +101,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         for (AbstractCodeMapping abstractCodeMapping : mappings) {
             if (abstractCodeMapping instanceof LeafMapping) {
                 if (optimizationData.getProcessedLeafMappings().add(abstractCodeMapping)) {
-                    processLeafMapping(srcTree,dstTree,abstractCodeMapping,mappingStore, isPartOfExtractedMethod);
+                    processLeafMapping(srcTree,dstTree,abstractCodeMapping,bodyMapper,mappingStore, isPartOfExtractedMethod);
                     if (containsReplacementOfType(abstractCodeMapping, ReplacementType.ARGUMENT_REPLACED_WITH_RIGHT_HAND_SIDE_OF_ASSIGNMENT_EXPRESSION)) {
                         Tree srcStatementNode = TreeUtilFunctions.findByLocationInfo(srcTree, abstractCodeMapping.getFragment1().getLocationInfo(), LANG1);
                         Tree dstStatementNode = TreeUtilFunctions.findByLocationInfo(dstTree, abstractCodeMapping.getFragment2().getLocationInfo(), LANG2);
@@ -110,11 +111,12 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 }
             }
             else if (abstractCodeMapping instanceof CompositeStatementObjectMapping)
-                processCompositeMapping(srcTree,dstTree,abstractCodeMapping,mappingStore);
+                processCompositeMapping(srcTree,dstTree,abstractCodeMapping,bodyMapper,mappingStore);
         }
         if (Constants.isCrossLanguage(LANG1, LANG2) && bodyMapper.getOperationInvocation() != null)
             processAnonymousArgumentReplacedWithLambda(srcTree, dstTree, bodyMapper, mappingStore);
-        if (isPartOfExtractedMethod)
+        //the model relates the docs only when doc elements moved along with the code, i.e., not two unrelated Python docstrings
+        if (isPartOfExtractedMethod && bodyMapper.getJavadocDiff().isPresent())
             new JavaDocMatcher(optimizationData, bodyMapper.getContainer1().getJavadoc(), bodyMapper.getContainer2().getJavadoc(), bodyMapper.getJavadocDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
         new CommentMatcher(optimizationData, bodyMapper.getCommentListDiff(), LANG1, LANG2).match(srcTree,dstTree,mappingStore);
 
@@ -258,7 +260,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         }
     }
 
-    private void processCompositeMapping(Tree srcTree, Tree dstTree, AbstractCodeMapping abstractCodeMapping, ExtendedMultiMappingStore mappingStore) {
+    private void processCompositeMapping(Tree srcTree, Tree dstTree, AbstractCodeMapping abstractCodeMapping, UMLOperationBodyMapper bodyMapper, ExtendedMultiMappingStore mappingStore) {
         CompositeStatementObjectMapping compositeStatementObjectMapping = (CompositeStatementObjectMapping) abstractCodeMapping;
         LocationInfo srcLocationInfo = compositeStatementObjectMapping.getFragment1().getLocationInfo();
         Tree srcStatementNode = TreeUtilFunctions.findByLocationInfo(srcTree,srcLocationInfo,LANG1);
@@ -350,6 +352,17 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         }
                     }
                 }
+                //the async keyword of an asynchronous for or with statement, and the clause holding the with items, i.e., async with timeout(5), connect(url) as connection: ...
+                Pair<Tree, Tree> asyncKeywords = Helpers.findPairOfType(srcStatementNode, dstStatementNode, LANG1.ASYNC_KEYWORD, LANG2.ASYNC_KEYWORD);
+                if (asyncKeywords != null) {
+                    mappingStore.addMapping(asyncKeywords.first, asyncKeywords.second);
+                }
+                if (srcStatementNode.getType().name.equals(LANG1.WITH_STATEMENT)) {
+                    Pair<Tree, Tree> withClauses = Helpers.findPairOfType(srcStatementNode, dstStatementNode, LANG1.WITH_CLAUSE, LANG2.WITH_CLAUSE);
+                    if (withClauses != null) {
+                        mappingStore.addMapping(withClauses.first, withClauses.second);
+                    }
+                }
                 if(compositeStatementObjectMapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.TRY_STATEMENT) &&
                         compositeStatementObjectMapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.TRY_STATEMENT) &&
                         srcStatementNode.getType().name.equals(LANG1.METHOD_INVOCATION) && dstStatementNode.getType().name.equals(LANG2.METHOD_INVOCATION) &&
@@ -372,7 +385,8 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                     //handle synchronized(lock) {} in Kotlin to Kotlin
                     processCallExpressionsModeledAsCompositeStatements(mappingStore, srcStatementNode, dstStatementNode);
                 }
-                if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
+                if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS) &&
+                        correspondingParents(compositeStatementObjectMapping, bodyMapper)) {
                     Tree parent1 = srcStatementNode.getParent();
                     Tree parent2 = dstStatementNode.getParent();
                     mappingStore.addMapping(parent1, parent2);
@@ -406,7 +420,8 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                     mappingStore.addMapping(srcStatementNode.getParent(), dstStatementNode.getParent());
                     new KeywordMatcher(LANG1, LANG2, LANG1.JUMP_KEYWORD, LANG2.JUMP_KEYWORD, "return").match(srcStatementNode.getParent(),dstStatementNode.getParent(),mappingStore);
                 }
-                else if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
+                else if(srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS) &&
+                        correspondingParents(abstractCodeMapping, bodyMapper)) {
                     mappingStore.addMapping(srcStatementNode.getParent(), dstStatementNode.getParent());
                 }
                 Pair<Tree, Tree> matched = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.ELSE, LANG2.ELSE);
@@ -1056,10 +1071,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 if (asPatterns != null) {
                     mappingStore.addMappingRecursively(asPatterns.first,asPatterns.second);
                 }
-                Pair<Tree, Tree> identifiers = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.SIMPLE_NAME, LANG2.SIMPLE_NAME);
-                if (identifiers != null) {
-                    mappingStore.addMapping(identifiers.first,identifiers.second);
-                }
+                matchExceptionTypes(srcStatementNode, dstStatementNode, mappingStore, LANG1, LANG2);
                 Pair<Tree, Tree> opening = Helpers.findPairOfType(srcStatementNode,dstStatementNode, LANG1.OPENING_PARENTHESIS, LANG2.OPENING_PARENTHESIS);
                 if (opening != null) {
                     mappingStore.addMapping(opening.first,opening.second);
@@ -1090,7 +1102,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                     Pair<Tree, Tree> parameterDeclarations = Helpers.findPairOfType(parameter_lists.first,parameter_lists.second, LANG1.PARAMETER_DECLARATION, LANG2.PARAMETER_DECLARATION);
                     if (parameterDeclarations != null) {
                         mappingStore.addMapping(parameterDeclarations.first,parameterDeclarations.second);
-                        identifiers = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.SIMPLE_NAME, LANG2.SIMPLE_NAME);
+                        Pair<Tree, Tree> identifiers = Helpers.findPairOfType(parameterDeclarations.first,parameterDeclarations.second, LANG1.SIMPLE_NAME, LANG2.SIMPLE_NAME);
                         if (identifiers != null) {
                             mappingStore.addMapping(identifiers.first,identifiers.second);
                         }
@@ -1116,6 +1128,27 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    //the exception types of a Python except clause are matched by name, and the rest in order, i.e., except DatabaseError, TimeoutError, ValueError:
+    private static void matchExceptionTypes(Tree srcStatementNode, Tree dstStatementNode, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
+        List<Tree> identifiers1 = new ArrayList<>(TreeUtilFunctions.findChildrenByType(srcStatementNode, LANG1.SIMPLE_NAME));
+        List<Tree> identifiers2 = new ArrayList<>(TreeUtilFunctions.findChildrenByType(dstStatementNode, LANG2.SIMPLE_NAME));
+        for (Tree identifier1 : new ArrayList<>(identifiers1)) {
+            for (Tree identifier2 : identifiers2) {
+                if (identifier1.getLabel().equals(identifier2.getLabel())) {
+                    mappingStore.addMapping(identifier1, identifier2);
+                    identifiers1.remove(identifier1);
+                    identifiers2.remove(identifier2);
+                    break;
+                }
+            }
+        }
+        if (identifiers1.size() == identifiers2.size()) {
+            for (int i = 0; i < identifiers1.size(); i++) {
+                mappingStore.addMapping(identifiers1.get(i), identifiers2.get(i));
             }
         }
     }
@@ -1167,7 +1200,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         }
         return false;
     }
-    private void processLeafMapping(Tree srcTree, Tree dstTree, AbstractCodeMapping abstractCodeMapping, ExtendedMultiMappingStore mappingStore, boolean isPartOfExtractedMethod) {
+    private void processLeafMapping(Tree srcTree, Tree dstTree, AbstractCodeMapping abstractCodeMapping, UMLOperationBodyMapper bodyMapper, ExtendedMultiMappingStore mappingStore, boolean isPartOfExtractedMethod) {
         LeafMapping leafMapping = (LeafMapping) abstractCodeMapping;
         Tree srcStatementNode = TreeUtilFunctions.findByLocationInfo(srcTree,leafMapping.getFragment1().getLocationInfo(),LANG1);
         Tree dstStatementNode = TreeUtilFunctions.findByLocationInfo(dstTree,leafMapping.getFragment2().getLocationInfo(),LANG2);
@@ -1238,7 +1271,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 for(UMLOperationBodyMapper lambdaMapper : abstractCodeMapping.getLambdaMappers()) {
                     processBodyMapper(srcTree, dstTree, lambdaMapper, mappingStore, isPartOfExtractedMethod);
                 }
-                matchParentStatements(srcStatementNode, dstStatementNode, mappingStore);
+                matchParentStatements(srcStatementNode, dstStatementNode, abstractCodeMapping, bodyMapper, mappingStore);
                 return;
             }
             else {
@@ -1343,7 +1376,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                 JavaToKotlinMigration.handleLeafMapping(mappingStore, srcStatementNode, dstStatementNode, LANG1, LANG2, abstractCodeMapping.getRefactorings(), optimizationData.getDeferredFlattenings());
             }
         }
-        matchParentStatements(srcStatementNode, dstStatementNode, mappingStore);
+        matchParentStatements(srcStatementNode, dstStatementNode, abstractCodeMapping, bodyMapper, mappingStore);
         matchEqualOperatorsOfInitializers(srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
         boolean _abstractExp = abstractCodeMapping.getFragment1() instanceof AbstractExpression || abstractCodeMapping.getFragment2() instanceof AbstractExpression;
         boolean _leafExp = abstractCodeMapping.getFragment1() instanceof LeafExpression || abstractCodeMapping.getFragment2() instanceof LeafExpression;
@@ -1373,6 +1406,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             else
                 new IgnoringCommentsLeafMatcher(LANG1, LANG2).match(srcStatementNode,dstStatementNode,mappingStore);
             additionallyMatchedStatements(srcTree, dstTree, srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
+            removeArgumentToParameterMappings(srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
         }
         optimizeVariableDeclarations(abstractCodeMapping);
         if (!isPartOfExtractedMethod && srcStatementNode.getType().name.equals(LANG1.RETURN_STATEMENT) && dstStatementNode.getType().name.equals(LANG2.RETURN_STATEMENT)) {
@@ -1381,6 +1415,70 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         if (!abstractCodeMapping.getRefactorings().isEmpty()) {
             leafMappingRefactoringAwareness(dstTree, abstractCodeMapping, mappingStore);
         }
+    }
+
+    //an argument replaced with a parameter of an extracted or inlined method is mapped as a whole to the parameter, i.e., keyPair -> pemKeyPair,
+    //or to the argument of the call, but its parts are not mapped to the parameter,
+    //i.e., the owner identifier of event.repository.owner.login is not mapped to the parameter owner of find_app_comment(github, owner, repo, ...)
+    private void removeArgumentToParameterMappings(Tree srcStatementNode, Tree dstStatementNode, AbstractCodeMapping mapping, ExtendedMultiMappingStore mappingStore) {
+        if (bodyMapper.getOperationInvocation() == null)
+            return;
+        Map<String, String> extractedParameterToArgument = bodyMapper.getParameterToArgumentMap2().orElse(Map.of());
+        Map<String, String> inlinedParameterToArgument = bodyMapper.getParameterToArgumentMap1().orElse(Map.of());
+        for (Replacement replacement : mapping.getReplacements()) {
+            if (!replacement.getBefore().equals(extractedParameterToArgument.get(replacement.getAfter())) &&
+                    !replacement.getAfter().equals(inlinedParameterToArgument.get(replacement.getBefore())))
+                continue;
+            for (LeafExpression expression1 : mapping.getFragment1().findExpression(replacement.getBefore())) {
+                Tree tree1 = TreeUtilFunctions.findByLocationInfo(srcStatementNode, expression1.getLocationInfo(), LANG1);
+                for (LeafExpression expression2 : mapping.getFragment2().findExpression(replacement.getAfter())) {
+                    Tree tree2 = TreeUtilFunctions.findByLocationInfo(dstStatementNode, expression2.getLocationInfo(), LANG2);
+                    if (tree1 == null || tree2 == null)
+                        continue;
+                    for (Tree t1 : tree1.preOrder()) {
+                        if (t1.getPos() == tree1.getPos() && t1.getEndPos() == tree1.getEndPos())
+                            continue;
+                        Set<Tree> dsts = mappingStore.getDsts(t1);
+                        if (dsts == null)
+                            continue;
+                        for (Tree t2 : new ArrayList<>(dsts)) {
+                            if (t2 == tree2 || t2.getParents().contains(tree2))
+                                mappingStore.removeMapping(t1, t2);
+                        }
+                    }
+                    matchParentsOfArgumentAndParameter(tree1, tree2, mappingStore);
+                }
+            }
+        }
+    }
+
+    //the parents of an argument and the parameter replacing it, whose other children are mapped, i.e., repo=event.repository.name -> repo=repo,
+    //where the keyword and = are mapped, while the argument is mapped to the argument of the call
+    private static void matchParentsOfArgumentAndParameter(Tree tree1, Tree tree2, ExtendedMultiMappingStore mappingStore) {
+        Tree child1 = outermostWithSameRange(tree1);
+        Tree child2 = outermostWithSameRange(tree2);
+        Tree parent1 = child1.getParent();
+        Tree parent2 = child2.getParent();
+        if (parent1 == null || parent2 == null || mappingStore.isSrcMapped(parent1) || mappingStore.isDstMapped(parent2) ||
+                !parent1.getType().name.equals(parent2.getType().name) || parent1.getChildren().size() != parent2.getChildren().size() ||
+                parent1.getChildPosition(child1) != parent2.getChildPosition(child2))
+            return;
+        for (int i = 0; i < parent1.getChildren().size(); i++) {
+            Tree otherChild1 = parent1.getChild(i);
+            if (otherChild1 == child1)
+                continue;
+            Set<Tree> dsts = mappingStore.getDsts(otherChild1);
+            if (dsts == null || !dsts.contains(parent2.getChild(i)))
+                return;
+        }
+        mappingStore.addMapping(parent1, parent2);
+    }
+
+    private static Tree outermostWithSameRange(Tree tree) {
+        Tree outermost = tree;
+        while (outermost.getParent() != null && outermost.getParent().getPos() == tree.getPos() && outermost.getParent().getEndPos() == tree.getEndPos())
+            outermost = outermost.getParent();
+        return outermost;
     }
 
     //the = before the mapped initializers, i.e., idx_t file_index = DConstants::INVALID_INDEX; -> idx_t scan_chunk_file_index = DConstants::INVALID_INDEX;
@@ -1399,10 +1497,25 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         }
     }
 
-    private void matchParentStatements(Tree srcStatementNode, Tree dstStatementNode, ExtendedMultiMappingStore mappingStore) {
-        if(srcStatementNode.getParent() != null && srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent() != null && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS)) {
+    private void matchParentStatements(Tree srcStatementNode, Tree dstStatementNode, AbstractCodeMapping mapping, UMLOperationBodyMapper bodyMapper, ExtendedMultiMappingStore mappingStore) {
+        if(srcStatementNode.getParent() != null && srcStatementNode.getParent().getType().name.equals(LANG1.STATEMENTS) && dstStatementNode.getParent() != null && dstStatementNode.getParent().getType().name.equals(LANG2.STATEMENTS) &&
+                correspondingParents(mapping, bodyMapper)) {
             mappingStore.addMapping(srcStatementNode.getParent(), dstStatementNode.getParent());
         }
+    }
+
+    //the parents of two mapped statements correspond in the mapper of two corresponding functions, while in an extracted, inlined or moved code fragment only if the model maps them,
+    //i.e., not the body of skipLong() { skip(LONG_SIZE) } and the body of the scan it is inlined to, which the scan before the commit is mapped to
+    private static boolean correspondingParents(AbstractCodeMapping mapping, UMLOperationBodyMapper bodyMapper) {
+        if(!bodyMapper.isMoveCode() && bodyMapper.getOperationInvocation() == null)
+            return true;
+        CompositeStatementObject parent1 = mapping.getFragment1().getParent();
+        CompositeStatementObject parent2 = mapping.getFragment2().getParent();
+        for(AbstractCodeMapping m : bodyMapper.getMappings()) {
+            if(m.getFragment1() == parent1 && m.getFragment2() == parent2)
+                return true;
+        }
+        return false;
     }
 
     //Kotlin call_expression -> [callee, call_suffix -> [value_arguments?, annotated_lambda -> lambda_literal -> [lambda_parameters?, arrow?, statements]]],

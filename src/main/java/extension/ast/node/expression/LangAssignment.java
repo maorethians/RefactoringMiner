@@ -9,6 +9,8 @@ public class LangAssignment extends LangExpression {
     private String operator;
     private LangASTNode leftSide;
     private LangASTNode rightSide;
+    //the annotation of an annotated assignment, i.e., Final in MAX_COMMENT_CHARS: Final = 60_000
+    private String typeAnnotation;
 
     public LangAssignment() {super(NodeTypeEnum.ASSIGNMENT);}
 
@@ -40,6 +42,11 @@ public class LangAssignment extends LangExpression {
         return operator;
     }
 
+    //an augmented assignment updates the variable it assigns instead of binding it, i.e., missing += [...], unlike missing = [...], x := 1 or type X = int
+    public boolean isAugmented() {
+        return operator != null && operator.length() > 1 && operator.endsWith("=") && !operator.equals(":=");
+    }
+
     public void setOperator(String operator) {
         this.operator = operator;
     }
@@ -58,6 +65,14 @@ public class LangAssignment extends LangExpression {
 
     public void setRightSide(LangASTNode rightSide) {
         this.rightSide = rightSide;
+    }
+
+    public String getTypeAnnotation() {
+        return typeAnnotation;
+    }
+
+    public void setTypeAnnotation(String typeAnnotation) {
+        this.typeAnnotation = typeAnnotation;
     }
 
     public String toString() {

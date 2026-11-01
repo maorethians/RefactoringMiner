@@ -41,6 +41,12 @@ public class MappingOptimizer {
 		this.LANG2 = classDiff.LANG2;
 	}
 
+	public MappingOptimizer(UMLOperationBodyMapper mapper) {
+		this.classDiff = mapper.getClassDiff();
+		this.LANG1 = mapper.LANG1;
+		this.LANG2 = mapper.LANG2;
+	}
+
 	public void optimizeDuplicateMappingsForMoveCode(List<UMLOperationBodyMapper> moveCodeMappers, Collection<Refactoring> refactorings) {
 		if(moveCodeMappers.size() > 1) {
 			Map<AbstractCodeFragment, List<AbstractCodeMapping>> oneToManyMappings = new HashMap<>();
@@ -94,6 +100,37 @@ public class MappingOptimizer {
 			}
 			optimizeDuplicateMappings(oneToManyMappings, oneToManyMappers, refactorings);
 		}
+	}
+
+	private boolean callsExtractedMethod(AbstractCodeFragment fragment, Set<UMLOperationBodyMapper> childMappers) {
+		for(UMLOperationBodyMapper childMapper : childMappers) {
+			if(childMapper.getOperationInvocation() == null || fragment.getString().contains(childMapper.getOperationInvocation().actualString())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean introducesCall(AbstractCodeMapping mapping) {
+		Set<String> names1 = new LinkedHashSet<String>();
+		for(AbstractCall call : mapping.getFragment1().getMethodInvocations()) {
+			names1.add(call.getName());
+		}
+		for(AbstractCall call : mapping.getFragment2().getMethodInvocations()) {
+			if(!names1.contains(call.getName())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private AbstractExpression findExpressionOfComposite(Set<AbstractCodeFragment> fragments, CompositeStatementObject composite) {
+		for(AbstractExpression expression : composite.getExpressions()) {
+			if(fragments.contains(expression)) {
+				return expression;
+			}
+		}
+		return null;
 	}
 
 	private AbstractCodeFragment findFragmentContainingExpression(Set<AbstractCodeFragment> fragments, AbstractExpression expression) {
@@ -197,9 +234,19 @@ public class MappingOptimizer {
 				}
 			}
 			for(AbstractCodeMapping mapping : parentMapper.getMappings()) {
+				AbstractExpression expressionOfComposite = null;
 				if(oneToManyMappings.containsKey(mapping.getFragment1())) {
 					oneToManyMappings.get(mapping.getFragment1()).add(mapping);
 					oneToManyMappers.get(mapping.getFragment1()).add(parentMapper);
+				}
+				//a child mapper mapped the expression of a composite mapped in the parent mapper, although the expression was not replaced with a call,
+				//i.e., if(repository is None) -> if(repository_id is None) duplicated as return None if row is None else ..., but not if(pool == null || pool.isClosed()) -> if(poolInactive())
+				//or if(!acquireEquipment(shoppingItem)) -> if(!acquireEquipment(shoppingItem, person)) calling the extracted method
+				else if(mapping.getFragment1() instanceof CompositeStatementObject &&
+						(expressionOfComposite = findExpressionOfComposite(oneToManyMappings.keySet(), (CompositeStatementObject)mapping.getFragment1())) != null &&
+						!introducesCall(mapping) && !callsExtractedMethod(mapping.getFragment2(), parentMapper.getChildMappers())) {
+					oneToManyMappings.get(expressionOfComposite).add(mapping);
+					oneToManyMappers.get(expressionOfComposite).add(parentMapper);
 				}
 				else {
 					List<AbstractCodeMapping> mappings = new ArrayList<>();
@@ -212,6 +259,23 @@ public class MappingOptimizer {
 			}
 			optimizeDuplicateMappings(oneToManyMappings, oneToManyMappers, refactorings);
 		}
+	}
+
+	//a composite moved to the extracted method returning instead of its body, which stayed in the caller,
+	//i.e., if(cond) { await mark_published(...); return True } -> if(cond) { return comment } in the extracted method,
+	//so the parent mapper mapping the composite to if(comment is not None) { ... } through its body is removed
+	private static int parentMappingOfCompositeMovedToExtractedMethod(List<AbstractCodeMapping> mappings, List<UMLOperationBodyMapper> mappers) {
+		if(mappings.size() != 2)
+			return -1;
+		for(int i=0; i<2; i++) {
+			UMLOperationBodyMapper childMapper = mappers.get(i);
+			if(mappings.get(i) instanceof CompositeStatementObjectMapping && mappings.get(1-i) instanceof CompositeStatementObjectMapping &&
+					childMapper.getParentMapper() != null && childMapper.getParentMapper().equals(mappers.get(1-i)) &&
+					childMapper.compositeMovedToExtractedMethod((CompositeStatementObject)mappings.get(i).getFragment1(), (CompositeStatementObject)mappings.get(i).getFragment2())) {
+				return 1-i;
+			}
+		}
+		return -1;
 	}
 
 	private void optimizeDuplicateMappings(Map<AbstractCodeFragment, List<AbstractCodeMapping>> oneToManyMappings,
@@ -375,7 +439,11 @@ public class MappingOptimizer {
 				editDistances.add(mapping.editDistance());
 			}
 			Set<Integer> indicesToBeRemoved = new LinkedHashSet<>();
-			if(callsExtractedInlinedMethod.contains(true) && callsExtractedInlinedMethod.contains(false)) {
+			int parentMappingOfMovedComposite = parentMappingOfCompositeMovedToExtractedMethod(mappings, mappers);
+			if(parentMappingOfMovedComposite != -1) {
+				indicesToBeRemoved.add(parentMappingOfMovedComposite);
+			}
+			else if(callsExtractedInlinedMethod.contains(true) && callsExtractedInlinedMethod.contains(false)) {
 				int getterCount = 0;
 				int setterCount = 0;
 				boolean callerToExtractedMethodHasCompositeReplacement = false;
@@ -539,118 +607,14 @@ public class MappingOptimizer {
 				UMLOperationBodyMapper mapper = mapperIterator.next();
 				if(indicesToBeRemoved.contains(index)) {
 					if(!atLeastOneMappingCallsExtractedOrInlinedMethodWithVariableDeclarationOrThrow) {
-						mapper.removeMapping(mapping);
-						for(LeafMapping leafMapping : mapping.getSubExpressionMappings()) {
-							mapper.removeMapping(leafMapping);
-						}
-						if(mapping instanceof LeafMapping) {
-							if(!mapper.getNonMappedLeavesT1().contains(mapping.getFragment1())) {
-								mapper.getNonMappedLeavesT1().add(mapping.getFragment1());
-							}
-							if(!mapper.getNonMappedLeavesT2().contains(mapping.getFragment2())) {
-								mapper.getNonMappedLeavesT2().add(mapping.getFragment2());
-							}
-						}
-						else if(mapping instanceof CompositeStatementObjectMapping) {
-							if(!mapper.getNonMappedInnerNodesT1().contains(mapping.getFragment1())) {
-								mapper.getNonMappedInnerNodesT1().add((CompositeStatementObject) mapping.getFragment1());
-							}
-							if(!mapper.getNonMappedInnerNodesT2().contains(mapping.getFragment2())) {
-								mapper.getNonMappedInnerNodesT2().add((CompositeStatementObject) mapping.getFragment2());
-							}
-						}
-						//remove refactorings based on mapping
-						Set<Refactoring> refactoringsAfterPostProcessing = mapper.getRefactoringsAfterPostProcessing();
-						Set<Refactoring> otherMapperRefactoringsAfterPostProcessing = new LinkedHashSet<>();
-						for(UMLOperationBodyMapper otherMapper : mappers) {
-							boolean equalMappers = otherMapper.equals(mapper) && otherMapper.getMappings().equals(mapper.getMappings());
-							if(!equalMappers) {
-								otherMapperRefactoringsAfterPostProcessing.addAll(otherMapper.getRefactoringsAfterPostProcessing());
-							}
-						}
-						for(Refactoring r : refactoringsAfterPostProcessing) {
-							if(r instanceof ReferenceBasedRefactoring) {
-								ReferenceBasedRefactoring referenceBased = (ReferenceBasedRefactoring)r;
-								Set<AbstractCodeMapping> references = referenceBased.getReferences();
-								if(references.contains(mapping) && !otherMapperRefactoringsAfterPostProcessing.contains(r)) {
-									refactoringsToBeRemoved.add(r);
-								}
-							}
-							else if(r instanceof InvertConditionRefactoring) {
-								InvertConditionRefactoring invert = (InvertConditionRefactoring)r;
-								if(mapping.getFragment1().equals(invert.getOriginalConditional()) && mapping.getFragment2().equals(invert.getInvertedConditional())
-										 && !otherMapperRefactoringsAfterPostProcessing.contains(r)) {
-									refactoringsToBeRemoved.add(r);
-								}
-							}
-							else if(r instanceof ReplaceLoopWithPipelineRefactoring) {
-								ReplaceLoopWithPipelineRefactoring replace = (ReplaceLoopWithPipelineRefactoring)r;
-								if(replace.getCodeFragmentsBefore().contains(mapping.getFragment1()) || replace.getCodeFragmentsAfter().contains(mapping.getFragment2())) {
-									refactoringsToBeRemoved.add(r);
-								}
-							}
-							else if(r instanceof ReplaceConditionalWithTernaryRefactoring) {
-								ReplaceConditionalWithTernaryRefactoring replace = (ReplaceConditionalWithTernaryRefactoring)r;
-								if(mapping.getFragment1().equals(replace.getOriginalConditional()) || mapping.getFragment2().equals(replace.getTernaryConditional())) {
-									boolean ternaryCallsExtractedMethod = false;
-									for(UMLOperationBodyMapper childMapper : mapper.getChildMappers()) {
-										List<AbstractCall> calls = mapping.getFragment2().getMethodInvocations();
-										for(AbstractCall call : calls) {
-											if(call.matchesOperation(childMapper.getContainer2(), mapper.getContainer2(), classDiff, mapper.getModelDiff())) {
-												ternaryCallsExtractedMethod = true;
-												break;
-											}
-										}
-									}
-									if(!ternaryCallsExtractedMethod) {
-										refactoringsToBeRemoved.add(r);
-									}
-								}
-							}
-						}
-						refactoringsAfterPostProcessing.removeAll(refactoringsToBeRemoved);
+						removeMapping(mapping, mapper, mappers);
 						updatedMappers.add(mapper);
 					}
 				}
 				index++;
 			}
 		}
-		for(Refactoring ref : refactorings) {
-			if(ref instanceof ExtractOperationRefactoring) {
-				ExtractOperationRefactoring refactoring = (ExtractOperationRefactoring)ref;
-				if(updatedMappers.contains(refactoring.getBodyMapper())) {
-					if(refactoring.getBodyMapper().getMappings().size() == 0 || refactoring.getBodyMapper().containsOnlyBlockMappings()) {
-						refactoringsToBeRemoved.add(refactoring);
-					}
-					else {
-						refactoring.updateMapperInfo();
-					}
-				}
-			}
-			else if(ref instanceof InlineOperationRefactoring) {
-				InlineOperationRefactoring refactoring = (InlineOperationRefactoring)ref;
-				if(updatedMappers.contains(refactoring.getBodyMapper())) {
-					if(refactoring.getBodyMapper().getMappings().size() == 0 || refactoring.getBodyMapper().containsOnlyBlockMappings()) {
-						refactoringsToBeRemoved.add(refactoring);
-					}
-					else {
-						refactoring.updateMapperInfo();
-					}
-				}
-			}
-			else if(ref instanceof MoveCodeRefactoring) {
-				MoveCodeRefactoring refactoring = (MoveCodeRefactoring)ref;
-				if(updatedMappers.contains(refactoring.getBodyMapper())) {
-					if(refactoring.getBodyMapper().getMappings().size() == 0 || refactoring.getBodyMapper().containsOnlyBlockMappings()) {
-						refactoringsToBeRemoved.add(refactoring);
-					}
-					else {
-						refactoring.updateMapperInfo();
-					}
-				}
-			}
-		}
-		refactorings.removeAll(refactoringsToBeRemoved);
+		updateRefactorings(updatedMappers, refactorings);
 	}
 
 	private boolean callToExtractedInlinedMethodIsArgument(AbstractCodeMapping mapping, UMLOperationBodyMapper mapper) {
@@ -893,5 +857,193 @@ public class MappingOptimizer {
 				}
 			}
 		}
+	}
+
+	private void removeMapping(AbstractCodeMapping mapping, UMLOperationBodyMapper mapper, List<UMLOperationBodyMapper> mappers) {
+		mapper.removeMapping(mapping);
+		for(LeafMapping leafMapping : mapping.getSubExpressionMappings()) {
+			mapper.removeMapping(leafMapping);
+		}
+		if(mapping instanceof LeafMapping) {
+			if(!mapper.getNonMappedLeavesT1().contains(mapping.getFragment1())) {
+				mapper.getNonMappedLeavesT1().add(mapping.getFragment1());
+			}
+			if(!mapper.getNonMappedLeavesT2().contains(mapping.getFragment2())) {
+				mapper.getNonMappedLeavesT2().add(mapping.getFragment2());
+			}
+		}
+		else if(mapping instanceof CompositeStatementObjectMapping) {
+			if(!mapper.getNonMappedInnerNodesT1().contains(mapping.getFragment1())) {
+				mapper.getNonMappedInnerNodesT1().add((CompositeStatementObject) mapping.getFragment1());
+			}
+			if(!mapper.getNonMappedInnerNodesT2().contains(mapping.getFragment2())) {
+				mapper.getNonMappedInnerNodesT2().add((CompositeStatementObject) mapping.getFragment2());
+			}
+		}
+		//remove refactorings based on mapping
+		Set<Refactoring> refactoringsAfterPostProcessing = mapper.getRefactoringsAfterPostProcessing();
+		Set<Refactoring> otherMapperRefactoringsAfterPostProcessing = new LinkedHashSet<>();
+		for(UMLOperationBodyMapper otherMapper : mappers) {
+			boolean equalMappers = otherMapper.equals(mapper) && otherMapper.getMappings().equals(mapper.getMappings());
+			if(!equalMappers) {
+				otherMapperRefactoringsAfterPostProcessing.addAll(otherMapper.getRefactoringsAfterPostProcessing());
+			}
+		}
+		for(Refactoring r : refactoringsAfterPostProcessing) {
+			if(r instanceof ReferenceBasedRefactoring) {
+				ReferenceBasedRefactoring referenceBased = (ReferenceBasedRefactoring)r;
+				Set<AbstractCodeMapping> references = referenceBased.getReferences();
+				if(references.contains(mapping) && !otherMapperRefactoringsAfterPostProcessing.contains(r)) {
+					refactoringsToBeRemoved.add(r);
+				}
+			}
+			else if(r instanceof InvertConditionRefactoring) {
+				InvertConditionRefactoring invert = (InvertConditionRefactoring)r;
+				if(mapping.getFragment1().equals(invert.getOriginalConditional()) && mapping.getFragment2().equals(invert.getInvertedConditional())
+						 && !otherMapperRefactoringsAfterPostProcessing.contains(r)) {
+					refactoringsToBeRemoved.add(r);
+				}
+			}
+			else if(r instanceof ReplaceLoopWithPipelineRefactoring) {
+				ReplaceLoopWithPipelineRefactoring replace = (ReplaceLoopWithPipelineRefactoring)r;
+				if(replace.getCodeFragmentsBefore().contains(mapping.getFragment1()) || replace.getCodeFragmentsAfter().contains(mapping.getFragment2())) {
+					refactoringsToBeRemoved.add(r);
+				}
+			}
+			else if(r instanceof ReplaceConditionalWithTernaryRefactoring) {
+				ReplaceConditionalWithTernaryRefactoring replace = (ReplaceConditionalWithTernaryRefactoring)r;
+				if(mapping.getFragment1().equals(replace.getOriginalConditional()) || mapping.getFragment2().equals(replace.getTernaryConditional())) {
+					boolean ternaryCallsExtractedMethod = false;
+					for(UMLOperationBodyMapper childMapper : mapper.getChildMappers()) {
+						List<AbstractCall> calls = mapping.getFragment2().getMethodInvocations();
+						for(AbstractCall call : calls) {
+							if(call.matchesOperation(childMapper.getContainer2(), mapper.getContainer2(), classDiff, mapper.getModelDiff())) {
+								ternaryCallsExtractedMethod = true;
+								break;
+							}
+						}
+					}
+					if(!ternaryCallsExtractedMethod) {
+						refactoringsToBeRemoved.add(r);
+					}
+				}
+			}
+		}
+		refactoringsAfterPostProcessing.removeAll(refactoringsToBeRemoved);
+	}
+
+	private void updateRefactorings(Set<UMLOperationBodyMapper> updatedMappers, Collection<Refactoring> refactorings) {
+		for(Refactoring ref : refactorings) {
+			if(ref instanceof ExtractOperationRefactoring) {
+				ExtractOperationRefactoring refactoring = (ExtractOperationRefactoring)ref;
+				if(updatedMappers.contains(refactoring.getBodyMapper())) {
+					if(refactoring.getBodyMapper().getMappings().size() == 0 || refactoring.getBodyMapper().containsOnlyBlockMappings()) {
+						refactoringsToBeRemoved.add(refactoring);
+					}
+					else {
+						refactoring.updateMapperInfo();
+					}
+				}
+			}
+			else if(ref instanceof InlineOperationRefactoring) {
+				InlineOperationRefactoring refactoring = (InlineOperationRefactoring)ref;
+				if(updatedMappers.contains(refactoring.getBodyMapper())) {
+					if(refactoring.getBodyMapper().getMappings().size() == 0 || refactoring.getBodyMapper().containsOnlyBlockMappings()) {
+						refactoringsToBeRemoved.add(refactoring);
+					}
+					else {
+						refactoring.updateMapperInfo();
+					}
+				}
+			}
+			else if(ref instanceof MoveCodeRefactoring) {
+				MoveCodeRefactoring refactoring = (MoveCodeRefactoring)ref;
+				if(updatedMappers.contains(refactoring.getBodyMapper())) {
+					if(refactoring.getBodyMapper().getMappings().size() == 0 || refactoring.getBodyMapper().containsOnlyBlockMappings()) {
+						refactoringsToBeRemoved.add(refactoring);
+					}
+					else {
+						refactoring.updateMapperInfo();
+					}
+				}
+			}
+		}
+		refactorings.removeAll(refactoringsToBeRemoved);
+	}
+
+	//in extracted or inlined code, a return of no value paired with a return of a value, i.e., return std::nullopt -> return target_key,
+	//unless a return is the whole body of its method, and the blocks mapped only through such a pair
+	public void removeNoValueReturnedAsValue(UMLOperationBodyMapper mapper, Collection<Refactoring> refactorings) {
+		Set<UMLOperationBodyMapper> updatedMappers = new LinkedHashSet<>();
+		if(mapper.getContainer1().singleReturnStatement() == null && mapper.getContainer2().singleReturnStatement() == null) {
+			List<AbstractCodeMapping> toBeRemoved = new ArrayList<>();
+			for(AbstractCodeMapping mapping : mapper.getMappings()) {
+				if(mapping instanceof LeafMapping && noValueReturnedAsValue(mapping)) {
+					toBeRemoved.add(mapping);
+				}
+			}
+			for(AbstractCodeMapping mapping : new ArrayList<>(toBeRemoved)) {
+				CompositeStatementObject parent1 = mapping.getFragment1().getParent();
+				CompositeStatementObject parent2 = mapping.getFragment2().getParent();
+				for(AbstractCodeMapping other : mapper.getMappings()) {
+					if(other.getFragment1().equals(parent1) && other.getFragment2().equals(parent2) &&
+							parent1.getLocationInfo().getCodeElementType().equals(CodeElementType.BLOCK) && !mapsNestedStatement(mapper, parent1, parent2, toBeRemoved)) {
+						toBeRemoved.add(other);
+					}
+				}
+			}
+			List<UMLOperationBodyMapper> mappers = List.of(mapper);
+			for(AbstractCodeMapping mapping : toBeRemoved) {
+				removeMapping(mapping, mapper, mappers);
+				updatedMappers.add(mapper);
+			}
+		}
+		updateRefactorings(updatedMappers, refactorings);
+	}
+
+	//another mapping than the removed ones maps statements directly nested in the blocks
+	private static boolean mapsNestedStatement(UMLOperationBodyMapper mapper, CompositeStatementObject block1, CompositeStatementObject block2, List<AbstractCodeMapping> removed) {
+		for(AbstractCodeMapping mapping : mapper.getMappings()) {
+			if(!removed.contains(mapping) && block1.equals(mapping.getFragment1().getParent()) && block2.equals(mapping.getFragment2().getParent())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean noValueReturnedAsValue(AbstractCodeMapping mapping) {
+		Set<Replacement> replacements = mapping.getReplacements();
+		if(replacements.size() != 1) {
+			return false;
+		}
+		String expression1 = returnedExpression(mapping.getFragment1().getString(), LANG1);
+		String expression2 = returnedExpression(mapping.getFragment2().getString(), LANG2);
+		if(expression1 == null || expression2 == null) {
+			return false;
+		}
+		Replacement replacement = replacements.iterator().next();
+		if(!replacement.getBefore().equals(expression1) || !replacement.getAfter().equals(expression2)) {
+			return false;
+		}
+		return noValue(expression1, LANG1) != noValue(expression2, LANG2);
+	}
+
+	//null, None, nullptr, and the empty std::optional of C++
+	private static boolean noValue(String expression, Constants LANG) {
+		if(expression.equals(LANG.NULL)) {
+			return true;
+		}
+		return LANG.equals(Constants.CPP) && (expression.equals("std::nullopt") || expression.equals("nullopt") || expression.equals("NULL"));
+	}
+
+	private static String returnedExpression(String statement, Constants LANG) {
+		if(statement.startsWith(LANG.RETURN_SPACE)) {
+			String expression = statement.substring(LANG.RETURN_SPACE.length());
+			if(expression.endsWith(LANG.STATEMENT_TERMINATION)) {
+				expression = expression.substring(0, expression.length() - LANG.STATEMENT_TERMINATION.length());
+			}
+			return expression.strip();
+		}
+		return null;
 	}
 }

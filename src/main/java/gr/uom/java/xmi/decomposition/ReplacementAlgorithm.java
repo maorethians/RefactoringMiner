@@ -27,6 +27,7 @@ import org.refactoringminer.util.PathFileUtils;
 
 import gr.uom.java.xmi.Constants;
 import gr.uom.java.xmi.LeafType;
+import gr.uom.java.xmi.UMLAbstractClass;
 import gr.uom.java.xmi.UMLAnonymousClass;
 import gr.uom.java.xmi.UMLAttribute;
 import gr.uom.java.xmi.UMLClass;
@@ -87,6 +88,35 @@ public class ReplacementAlgorithm {
 			}
 		}
 		return null;
+	}
+
+	//the subject of a when is replaced with a subject variable and the entries keep their conditions, i.e., when (graphObject) { is GraphInstanceRecord -> ... } -> when (val objectRecord = graph.findObjectByObjectId(instanceId)) { is GraphInstanceRecord -> ... }
+	private static boolean whenSubjectReplacedWithSubjectVariable(AbstractCodeFragment statement1, AbstractCodeFragment statement2) {
+		if(!statement1.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_STATEMENT) ||
+				!statement2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_STATEMENT)) {
+			return false;
+		}
+		if(statement1.getVariableDeclarations().isEmpty() == statement2.getVariableDeclarations().isEmpty()) {
+			return false;
+		}
+		//the same conditions, since a nested when with the subject variable may test a subset of the conditions, i.e., when (val record = graphObject.readRecord()) { is BooleanArrayDump -> ... }
+		List<String> conditions1 = whenEntryConditions((CompositeStatementObject)statement1);
+		List<String> conditions2 = whenEntryConditions((CompositeStatementObject)statement2);
+		return !conditions1.isEmpty() && conditions1.size() == conditions2.size() && conditions1.containsAll(conditions2);
+	}
+
+	private static List<String> whenEntryConditions(CompositeStatementObject when) {
+		List<String> conditions = new ArrayList<String>();
+		for(AbstractStatement statement : when.getStatements()) {
+			if(statement instanceof CompositeStatementObject entry && entry.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY)) {
+				for(AbstractExpression expression : entry.getExpressions()) {
+					if(expression.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY_CONDITION)) {
+						conditions.add(expression.getString());
+					}
+				}
+			}
+		}
+		return conditions;
 	}
 
 	//the statements of the Java switch case are nested under the block of the Kotlin when entry, i.e., switch(x) { case A: return null; } -> when(x) { A -> { return null } }
@@ -226,6 +256,17 @@ public class ReplacementAlgorithm {
 		return false;
 	}
 
+	//the comparison operator asserted by a fluent assertion, i.e., " < " for assertThat(x).isLessThan(y)
+	private static String comparisonOperatorOfAssertion(String name) {
+		switch(name) {
+			case "isLessThan": return " < ";
+			case "isGreaterThan": return " > ";
+			case "isLessThanOrEqualTo": return " <= ";
+			case "isGreaterThanOrEqualTo": return " >= ";
+			default: return null;
+		}
+	}
+
 	private static AbstractCall singleArgumentInvocation(Map<String, List<AbstractCall>> methodInvocationMap, String name) {
 		for(List<AbstractCall> invocations : methodInvocationMap.values()) {
 			for(AbstractCall invocation : invocations) {
@@ -357,7 +398,36 @@ public class ReplacementAlgorithm {
 		return collection2;
 	}
 
+	//the fragment is only an attribute initialized with the call
+	private static boolean attributeWithInitializer(AbstractCodeFragment statement, List<UMLAttribute> attributes, AbstractCall call) {
+		if(statement.getVariables().size() == 1 && statement.getString().equals(statement.getVariables().get(0).getString())) {
+			for(UMLAttribute attribute : attributes) {
+				AbstractExpression initializer = attribute.getVariableDeclaration().getInitializer();
+				if(attribute.getName().equals(statement.getString()) && initializer != null && initializer.getString().equals(call.actualString())) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private static Replacement callReplacedWithAttribute(AbstractCall call, String before, String after, Direction direction) {
+		if(call instanceof ObjectCreation) {
+			return new Replacement(before, after, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION);
+		}
+		return new VariableReplacementWithMethodInvocation(before, after, call, direction);
+	}
+
 	protected static Set<Replacement> findReplacementsWithExactMatching(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
+			Map<String, String> parameterToArgumentMap, ReplacementInfo replacementInfo, boolean equalNumberOfAssertions, UMLOperationBodyMapper operationBodyMapper, boolean isomorphic) throws RefactoringMinerTimedOutException {
+		Set<Replacement> replacements = exactMatchingReplacements(statement1, statement2, parameterToArgumentMap, replacementInfo, equalNumberOfAssertions, operationBodyMapper, isomorphic);
+		if(replacements != null && fieldOfAnotherObjectReplaced(statement1, replacements, operationBodyMapper)) {
+			return null;
+		}
+		return replacements;
+	}
+
+	private static Set<Replacement> exactMatchingReplacements(AbstractCodeFragment statement1, AbstractCodeFragment statement2,
 			Map<String, String> parameterToArgumentMap, ReplacementInfo replacementInfo, boolean equalNumberOfAssertions, UMLOperationBodyMapper operationBodyMapper, boolean isomorphic) throws RefactoringMinerTimedOutException {
 		VariableDeclarationContainer container1 = operationBodyMapper.getContainer1();
 		VariableDeclarationContainer container2 = operationBodyMapper.getContainer2();
@@ -408,6 +478,19 @@ public class ReplacementAlgorithm {
 		ObjectCreation creationCoveringTheEntireStatement2 = temp2 instanceof ObjectCreation ? (ObjectCreation)temp2 : null;
 		AbstractCall assignmentCreationCoveringTheEntireStatement1 = creationCoveringTheEntireStatement1 == null ? statement1.assignmentCreationCoveringEntireStatement() : creationCoveringTheEntireStatement1;
 		AbstractCall assignmentCreationCoveringTheEntireStatement2 = creationCoveringTheEntireStatement2 == null ? statement2.assignmentCreationCoveringEntireStatement() : creationCoveringTheEntireStatement2;
+		//the call forming one fragment is the initializer of the attribute forming the other fragment, i.e., val adapter = ConcatAdapter(config) into private val mAdapter = ConcatAdapter(config) and val adapter get() = mAdapter
+		if(classDiff != null) {
+			AbstractCall call1 = invocationCoveringEntireFragment1 != null ? invocationCoveringEntireFragment1 : creationCoveringTheEntireStatement1;
+			if(call1 != null && statement1.getString().equals(call1.actualString()) && attributeWithInitializer(statement2, classDiff.getAddedAttributes(), call1)) {
+				replacementInfo.addReplacement(callReplacedWithAttribute(call1, call1.actualString(), statement2.getString(), Direction.INVOCATION_TO_VARIABLE));
+				return replacementInfo.getReplacements();
+			}
+			AbstractCall call2 = invocationCoveringEntireFragment2 != null ? invocationCoveringEntireFragment2 : creationCoveringTheEntireStatement2;
+			if(call2 != null && statement2.getString().equals(call2.actualString()) && attributeWithInitializer(statement1, classDiff.getRemovedAttributes(), call2)) {
+				replacementInfo.addReplacement(callReplacedWithAttribute(call2, statement1.getString(), call2.actualString(), Direction.VARIABLE_TO_INVOCATION));
+				return replacementInfo.getReplacements();
+			}
+		}
 		Map<String, List<AbstractCall>> methodInvocationMap1 = convertToMap(statement1.getMethodInvocations());
 		Map<String, List<AbstractCall>> methodInvocationMap2 = convertToMap(statement2.getMethodInvocations());
 		List<AnonymousClassDeclarationObject> anonymousClassDeclarations1 = statement1.getAnonymousClassDeclarations();
@@ -727,8 +810,23 @@ public class ReplacementAlgorithm {
 		}
 		
 		// replace variables with the corresponding arguments
+		Set<String> variablesBeforeArguments1 = new LinkedHashSet<String>(variables1);
+		Set<String> variablesBeforeArguments2 = new LinkedHashSet<String>(variables2);
 		replaceVariablesWithArguments(variables1, parameterToArgumentMap);
 		replaceVariablesWithArguments(variables2, parameterToArgumentMap);
+		// the arguments replacing the parameters, which are in the same places of both argumentized statements, are not replaced with other variables,
+		// i.e., event.repository.id in (event.repository.id,) -> (github_repository_id,) is not replaced with query in "SELECT ..." -> query
+		Set<String> argumentsMatchedByArgumentization = new LinkedHashSet<String>();
+		for(String variable : variables2) {
+			if(!variablesBeforeArguments2.contains(variable) && variablesBeforeArguments1.contains(variable) && sameOccurrencesInArgumentizedStrings(variable, replacementInfo))
+				argumentsMatchedByArgumentization.add(variable);
+		}
+		for(String variable : variables1) {
+			if(!variablesBeforeArguments1.contains(variable) && variablesBeforeArguments2.contains(variable) && sameOccurrencesInArgumentizedStrings(variable, replacementInfo))
+				argumentsMatchedByArgumentization.add(variable);
+		}
+		variables1.removeAll(argumentsMatchedByArgumentization);
+		variables2.removeAll(argumentsMatchedByArgumentization);
 		
 		Set<String> methodInvocations1 = new LinkedHashSet<String>(methodInvocationMap1.keySet());
 		Set<String> methodInvocations2 = new LinkedHashSet<String>(methodInvocationMap2.keySet());
@@ -2250,6 +2348,10 @@ public class ReplacementAlgorithm {
 				return replacementInfo.getReplacements();
 			}
 		}
+		//match when with when having a subject variable in place of the subject and the same entry conditions
+		if(whenSubjectReplacedWithSubjectVariable(statement1, statement2)) {
+			return replacementInfo.getReplacements();
+		}
 		//match if with when entry having the same condition, i.e., if(x > 0) -> x > 0 -> {...}
 		Pair<AbstractExpression, AbstractExpression> sameConditions = sameConditionInIfAndWhenEntry(statement1, statement2);
 		if(sameConditions != null) {
@@ -3548,6 +3650,7 @@ public class ReplacementAlgorithm {
 			//assertTrue(>0) to fluid assertThat().isPositive()
 			//assertTrue(<0) to fluid assertThat().isNegative()
 			//assertTrue(==0) to fluid assertThat().isZero()
+			//assertTrue(x < y) to fluid assertThat(x).isLessThan(y), and similarly for >, <=, >=
 			//assertEquals(y, x.size()) to assertThat(x).hasSize(y)
 			if((invocationCoveringTheEntireStatement1.getName().equals("assertTrue") && invocationCoveringTheEntireStatement2.getName().equals("isTrue")) ||
 					(invocationCoveringTheEntireStatement1.getName().equals("assertSame") && invocationCoveringTheEntireStatement2.getName().equals("isSameAs")) ||
@@ -3595,7 +3698,9 @@ public class ReplacementAlgorithm {
 					(invocationCoveringTheEntireStatement1.getName().equals("assertTrue") && invocationCoveringTheEntireStatement2.getName().equals("isNegative") &&
 							invocationCoveringTheEntireStatement1.arguments().size() > 0 && invocationCoveringTheEntireStatement1.arguments().get(0).contains(" < 0")) ||
 					(invocationCoveringTheEntireStatement1.getName().equals("assertTrue") && invocationCoveringTheEntireStatement2.getName().equals("isZero") &&
-							invocationCoveringTheEntireStatement1.arguments().size() > 0 && invocationCoveringTheEntireStatement1.arguments().get(0).contains(" == 0"))) {
+							invocationCoveringTheEntireStatement1.arguments().size() > 0 && invocationCoveringTheEntireStatement1.arguments().get(0).contains(" == 0")) ||
+					(invocationCoveringTheEntireStatement1.getName().equals("assertTrue") && comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement2.getName()) != null &&
+							invocationCoveringTheEntireStatement1.arguments().size() > 0 && invocationCoveringTheEntireStatement1.arguments().get(invocationCoveringTheEntireStatement1.arguments().size()-1).contains(comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement2.getName())))) {
 				for(String key2 : methodInvocationMap2.keySet()) {
 					for(AbstractCall invocation2 : methodInvocationMap2.get(key2)) {
 						if(invocation2.getName().equals("assertThat")) {
@@ -3623,6 +3728,18 @@ public class ReplacementAlgorithm {
 										String before = arg.substring(0, arg.indexOf(" instanceof "));
 										String after = arg.substring(arg.indexOf(" instanceof ") + " instanceof ".length(), arg.length());
 										if(operationBodyMapper.getArgumentizedString(statement2).contains(before) && operationBodyMapper.getArgumentizedString(statement2).contains(after)) {
+											Replacement replacement = new MethodInvocationReplacement(
+													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
+													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
+											replacementInfo.addReplacement(replacement);
+											return replacementInfo.getReplacements();
+										}
+									}
+									else if(comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement2.getName()) != null && arg.contains(comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement2.getName()))) {
+										String operator = comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement2.getName());
+										String before = arg.substring(0, arg.indexOf(operator));
+										String after = arg.substring(arg.indexOf(operator) + operator.length(), arg.length());
+										if(arguments.get(0).equals(before) && invocationCoveringTheEntireStatement2.arguments().size() == 1 && invocationCoveringTheEntireStatement2.arguments().get(0).equals(after)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocationCoveringTheEntireStatement1.actualString(), invocation2.actualString(),
 													invocationCoveringTheEntireStatement1, invocation2, ReplacementType.ASSERTION_CONVERSION);
@@ -3740,7 +3857,9 @@ public class ReplacementAlgorithm {
 					(invocationCoveringTheEntireStatement2.getName().equals("assertTrue") && invocationCoveringTheEntireStatement1.getName().equals("isNegative") &&
 							invocationCoveringTheEntireStatement2.arguments().size() > 0 && invocationCoveringTheEntireStatement2.arguments().get(0).contains(" < 0")) ||
 					(invocationCoveringTheEntireStatement2.getName().equals("assertTrue") && invocationCoveringTheEntireStatement1.getName().equals("isZero") &&
-							invocationCoveringTheEntireStatement2.arguments().size() > 0 && invocationCoveringTheEntireStatement2.arguments().get(0).contains(" == 0"))) {
+							invocationCoveringTheEntireStatement2.arguments().size() > 0 && invocationCoveringTheEntireStatement2.arguments().get(0).contains(" == 0")) ||
+					(invocationCoveringTheEntireStatement2.getName().equals("assertTrue") && comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement1.getName()) != null &&
+							invocationCoveringTheEntireStatement2.arguments().size() > 0 && invocationCoveringTheEntireStatement2.arguments().get(invocationCoveringTheEntireStatement2.arguments().size()-1).contains(comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement1.getName())))) {
 				for(String key1 : methodInvocationMap1.keySet()) {
 					for(AbstractCall invocation1 : methodInvocationMap1.get(key1)) {
 						if(invocation1.getName().equals("assertThat")) {
@@ -3768,6 +3887,18 @@ public class ReplacementAlgorithm {
 										String before = arg.substring(0, arg.indexOf(" instanceof "));
 										String after = arg.substring(arg.indexOf(" instanceof ") + " instanceof ".length(), arg.length());
 										if(operationBodyMapper.getArgumentizedString(statement1).contains(before) && operationBodyMapper.getArgumentizedString(statement1).contains(after)) {
+											Replacement replacement = new MethodInvocationReplacement(
+													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
+													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
+											replacementInfo.addReplacement(replacement);
+											return replacementInfo.getReplacements();
+										}
+									}
+									else if(comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement1.getName()) != null && arg.contains(comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement1.getName()))) {
+										String operator = comparisonOperatorOfAssertion(invocationCoveringTheEntireStatement1.getName());
+										String before = arg.substring(0, arg.indexOf(operator));
+										String after = arg.substring(arg.indexOf(operator) + operator.length(), arg.length());
+										if(arguments.get(0).equals(before) && invocationCoveringTheEntireStatement1.arguments().size() == 1 && invocationCoveringTheEntireStatement1.arguments().get(0).equals(after)) {
 											Replacement replacement = new MethodInvocationReplacement(
 													invocation1.actualString(), invocationCoveringTheEntireStatement2.actualString(),
 													invocation1, invocationCoveringTheEntireStatement2, ReplacementType.ASSERTION_CONVERSION);
@@ -5753,6 +5884,13 @@ public class ReplacementAlgorithm {
 		return set;
 	}
 
+	private static boolean sameOccurrencesInArgumentizedStrings(String variable, ReplacementInfo replacementInfo) {
+		int occurrences1 = ReplacementUtil.countInstances(replacementInfo.getArgumentizedString1(), variable);
+		int occurrences2 = ReplacementUtil.countInstances(replacementInfo.getArgumentizedString2(), variable);
+		return occurrences1 > 0 && occurrences1 == occurrences2 &&
+				ReplacementUtil.sameCharsBeforeAfter(replacementInfo.getArgumentizedString1(), replacementInfo.getArgumentizedString2(), variable);
+	}
+
 	private static void replaceVariablesWithArguments(Set<String> variables, Map<String, String> parameterToArgumentMap) {
 		for(String parameter : parameterToArgumentMap.keySet()) {
 			String argument = parameterToArgumentMap.get(parameter);
@@ -5852,6 +5990,46 @@ public class ReplacementAlgorithm {
 			}
 		}
 		return false;
+	}
+
+	//in an extract and move scenario, the fields of the receiver of the call are accessed directly in the extracted method,
+	//so the same field of another local object cannot be replaced with code not accessing that object, i.e., (CsmToken)kept.element -> (CsmToken)element,
+	//or ((CsmToken)kept.element) -> csmToken, when removed.isWhiteSpace() is extracted to the class of removed declaring element,
+	//unless the other object holds an instance of the target class, i.e., assembly.flowControl -> flowControl, when assembly.publication is the receiver before the move
+	private static boolean fieldOfAnotherObjectReplaced(AbstractCodeFragment statement1, Set<Replacement> replacements, UMLOperationBodyMapper operationBodyMapper) {
+		AbstractCall callSiteInvocation = operationBodyMapper.getOperationInvocation();
+		UMLOperationBodyMapper parentMapper = operationBodyMapper.getParentMapper();
+		UMLModelDiff modelDiff = operationBodyMapper.getModelDiff();
+		if(callSiteInvocation == null || callSiteInvocation.getExpression() == null || parentMapper == null || modelDiff == null ||
+				!operationBodyMapper.getContainer1().equals(parentMapper.getContainer1()) ||
+				operationBodyMapper.getContainer2().getClassName().equals(operationBodyMapper.getCallSiteOperation().getClassName()))
+			return false;
+		UMLAbstractClass targetClass = modelDiff.findClassInChildModel(operationBodyMapper.getContainer2().getClassName());
+		if(targetClass == null)
+			return false;
+		String receiver = callSiteInvocation.getExpression();
+		for(LeafExpression variable : statement1.getVariables()) {
+			String variable1 = variable.getString();
+			int dot = variable1.indexOf(".");
+			if(dot > 0 && dot == variable1.lastIndexOf(".")) {
+				String object1 = variable1.substring(0, dot);
+				VariableDeclaration declaration1 = operationBodyMapper.getContainer1().getVariableDeclaration(object1);
+				if(!receiver.equals(object1) && !receiver.startsWith(object1 + ".") && declaration1 != null &&
+						targetClass.containsAttributeWithName(variable1.substring(dot + 1)) && !holdsInstanceOf(declaration1, targetClass, modelDiff)) {
+					for(Replacement replacement : replacements) {
+						if(replacement.getBefore().contains(variable1) && !replacement.getAfter().contains(object1 + ".")) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	private static boolean holdsInstanceOf(VariableDeclaration declaration, UMLAbstractClass targetClass, UMLModelDiff modelDiff) {
+		UMLAbstractClass declarationClass = modelDiff.findClassInParentModel(declaration.getType().getClassType());
+		return declarationClass != null && !declarationClass.attributesOfType(targetClass.getName()).isEmpty();
 	}
 
 	private static void findReplacements(Set<String> strings1, Set<String> strings2, ReplacementInfo replacementInfo, ReplacementType type,

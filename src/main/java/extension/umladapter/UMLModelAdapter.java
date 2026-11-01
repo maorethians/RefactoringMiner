@@ -49,6 +49,14 @@ public class UMLModelAdapter {
         compilationUnitComments.removeAll(codeElementComments);
     }
 
+    //the comments of an attribute, i.e., # GitHub rejects comments longer than 65,536 characters. right before MAX_COMMENT_CHARS: Final = 60_000
+    private static void distributeAttributeComments(List<UMLComment> compilationUnitComments, UMLClass umlClass, String fileContent) {
+        for (UMLAttribute attribute : umlClass.getAttributes()) {
+            LocationInfo attributeLocationInfo = attribute.getVariableDeclaration() != null ? attribute.getVariableDeclaration().getLocationInfo() : attribute.getLocationInfo();
+            distributeComments(compilationUnitComments, attributeLocationInfo, List.of(), attribute.getComments(), fileContent);
+        }
+    }
+
     //the comment is right before the declaration or its first decorator, or between its decorators
     private static boolean precedesDeclaration(LocationInfo commentLocationInfo, LocationInfo codeElementLocationInfo, List<UMLAnnotation> annotations, String fileContent) {
         int declarationStartOffset = codeElementLocationInfo.getStartOffset();
@@ -124,6 +132,7 @@ public class UMLModelAdapter {
                 moduleClass.addOperation(operation);
             }
         }
+        distributeAttributeComments(comments, moduleClass, fileContent);
         distributeComments(comments, moduleClass.getLocationInfo(), List.of(), moduleClass.getComments(), fileContent);
         //if there are still comments left, add them to module
         if(comments.size() > 0)
@@ -207,12 +216,15 @@ public class UMLModelAdapter {
         }
         UMLClass umlClass = new UMLClass(moduleName, className, locationInfo, typeDecl.isTopLevel(), imports);
 
+        //the container of the class-level code also holds the decorator arguments, i.e., a dictionary argument of a class decorator
+        ModuleContainer moduleContainer = new ModuleContainer(locationInfo, typeDecl.getName());
         for (LangAnnotation langAnnotation : typeDecl.getAnnotations()) {
             umlClass.addAnnotation(new UMLAnnotation(
                     typeDecl.getRootCompilationUnit(),
                     sourceFolder,
                     filePath,
                     langAnnotation,
+                    moduleContainer,
                     fileContent));
         }
 
@@ -276,7 +288,6 @@ public class UMLModelAdapter {
             }
         }
         if (typeDecl.getStatements().size() > 0) {
-            ModuleContainer moduleContainer = new ModuleContainer(locationInfo, typeDecl.getName());
             OperationBody opBody = new LangOperationBody(
                     typeDecl.getRootCompilationUnit(),
                     sourceFolder,
@@ -291,6 +302,7 @@ public class UMLModelAdapter {
             umlClass.getOperations().addAll(moduleContainer.getNestedOperations());
             umlClass.getAttributes().addAll(moduleContainer.getNestedAttributes());
         }
+        distributeAttributeComments(comments, umlClass, fileContent);
         distributeComments(comments, locationInfo, umlClass.getAnnotations(), umlClass.getComments(), fileContent);
         return umlClass;
     }
@@ -317,6 +329,7 @@ public class UMLModelAdapter {
                     sourceFolder,
                     filePath,
                     langAnnotation,
+                    umlOperation,
                     fileContent));
         }
 
@@ -448,6 +461,9 @@ public class UMLModelAdapter {
 
     private static void processAssignmentForAttribute(LangMethodDeclaration methodDeclaration, LangAssignment assignment, String className, List<UMLAttribute> attributes,
                                                String sourceFolder, String filePath, UMLOperation umlOperation, String fileContent) {
+        if (assignment.isAugmented()) {
+            return;
+        }
         LangASTNode leftSide = assignment.getLeftSide();
 
         if (leftSide instanceof LangFieldAccess langFieldAccess) {
@@ -501,6 +517,9 @@ public class UMLModelAdapter {
 
     private static void processClassLevelAssignmentForAttribute(UMLClass typeDeclaration, LangAssignment assignment,
                                                String sourceFolder, String filePath, String fileContent) {
+        if (assignment.isAugmented()) {
+            return;
+        }
         LangASTNode leftSide = assignment.getLeftSide();
 
         if (leftSide instanceof LangSimpleName simpleName) {
@@ -516,7 +535,7 @@ public class UMLModelAdapter {
             );
             UMLAttribute attribute = new UMLAttribute(
                     attributeName,
-                    UMLType.extractTypeObject("Object", PathFileUtils.getLang(filePath)),
+                    assignment.getTypeAnnotation() != null ? UMLType.extractTypeObject(assignment.getTypeAnnotation(), "[", "]", null, PathFileUtils.getLang(filePath)) : UMLType.extractTypeObject("Object", PathFileUtils.getLang(filePath)),
                     attributeLocationInfo,
                     typeDeclaration.getName()
             );

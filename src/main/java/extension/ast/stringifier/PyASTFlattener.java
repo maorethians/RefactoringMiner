@@ -209,8 +209,10 @@ public class PyASTFlattener implements LangASTFlattener {
     @Override
     public void visit(LangAssignment langAssignment) {
         langAssignment.getLeftSide().accept(this);
-        builder.append(langAssignment.getOperator());
-        langAssignment.getRightSide().accept(this);
+        if (langAssignment.getRightSide() != null) {
+            builder.append(langAssignment.getOperator());
+            langAssignment.getRightSide().accept(this);
+        }
     }
 
     @Override
@@ -650,9 +652,10 @@ public class PyASTFlattener implements LangASTFlattener {
 
     @Override
     public void visit(LangTernaryExpression langTernaryExpression) {
-        langTernaryExpression.getCondition().accept(this);
-        builder.append(" if ");
+        //a conditional expression is written value if condition else other value, i.e., " FOR UPDATE OF r" if lock else ""
         langTernaryExpression.getThenExpression().accept(this);
+        builder.append(" if ");
+        langTernaryExpression.getCondition().accept(this);
         builder.append(" else ");
         langTernaryExpression.getElseExpression().accept(this);
     }
