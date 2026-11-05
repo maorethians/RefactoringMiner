@@ -324,6 +324,17 @@ public abstract class UMLAbstractClass implements AnnotationProvider, CommentPro
 		return false;
 	}
 
+	//an explicit import of the qualified name, or an on-demand import of its package, i.e., import org.junit.jupiter.api.*
+	public boolean imports(String qualifiedName) {
+		String packageName = qualifiedName.contains(".") ? qualifiedName.substring(0, qualifiedName.lastIndexOf(".")) : "";
+		for(UMLImport imported : getImportedTypes()) {
+			if(!imported.isStatic() && (imported.isOnDemand() ? imported.getName().equals(packageName) : imported.getName().equals(qualifiedName))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public boolean importsType(String targetClass) {
 		if(targetClass.contains(".__module__")) {
 			targetClass = targetClass.replace(".__module__", "");
@@ -1140,7 +1151,7 @@ public abstract class UMLAbstractClass implements AnnotationProvider, CommentPro
 				return new MatchResult(commonOperations.size(), commonAttributes.size(), identicalOperations.size(), identicalInitializerAttributes, totalOperations, totalAttributes, matchedCompanions, totalCompanions, false);
 			}
 		}
-		if(this.isInterface() && umlClass.isInterface()) {
+		if(this.isInterface() && umlClass.isInterface() && totalOperations > 0) {
 			if(commonOperations.size() > Math.floor(totalOperations/2.0)) {
 				return new MatchResult(commonOperations.size(), commonAttributes.size(), identicalOperations.size(), identicalInitializerAttributes, totalOperations, totalAttributes, matchedCompanions, totalCompanions, true);
 			}

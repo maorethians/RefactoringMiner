@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.Set;
 
 import org.antlr.v4.runtime.CommonTokenStream;
@@ -161,6 +162,9 @@ public class PythonTreeGenerator {
 			return depth;
 		}
 	}
+
+	//the annotation of an explicit type alias (PEP 613), i.e., TypeAlias or typing.TypeAlias
+	private static final Pattern TYPE_ALIAS_ANNOTATION = Pattern.compile("(?:[A-Za-z_]\\w*\\.)*TypeAlias");
 
 	private final String content;
 	private final List<Token> tokens;
@@ -432,6 +436,7 @@ public class PythonTreeGenerator {
 		if(ctx.getToken(PythonParser.COLON, 0) != null) {
 			//annotated assignment
 			Node node = new Node("assignment");
+			boolean typeAlias = false;
 			for(ParseTree child : children) {
 				if(child instanceof TerminalNode terminal) {
 					node.add(token(terminal));
@@ -447,9 +452,11 @@ public class PythonTreeGenerator {
 				}
 				else if(child instanceof PythonParser.ExpressionContext expression) {
 					node.add(type(expression));
+					typeAlias = TYPE_ALIAS_ANNOTATION.matcher(expression.getText()).matches();
 				}
 				else if(child instanceof PythonParser.Annotated_rhsContext rightHandSide) {
-					node.add(annotatedRightHandSide(rightHandSide));
+					//the value of an explicit type alias is a type, like the value of a type alias statement, i.e., X: TypeAlias = Literal["a", "b"]
+					node.add(typeAlias && rightHandSide.yield_expr() == null ? node("type", typeExpression(annotatedRightHandSide(rightHandSide))) : annotatedRightHandSide(rightHandSide));
 				}
 			}
 			return node;
@@ -680,7 +687,8 @@ public class PythonTreeGenerator {
 				decorator.add(expression(expression));
 			}
 			else if(isToken(child, PythonParser.NEWLINE)) {
-				newline(((TerminalNode) child).getSymbol().getTokenIndex(), decorator);
+				//the decorator ends at its expression like its annotation, and a comment at the end of its line is in the decorated definition, i.e., @functools.wraps(obj)  # type: ignore
+				newline(((TerminalNode) child).getSymbol().getTokenIndex(), node);
 			}
 		}
 		node.add(definition);
@@ -2044,7 +2052,8 @@ public class PythonTreeGenerator {
 		tree.setPos(Math.max(node.start, 0));
 		tree.setLength(Math.max(node.end - node.start, 0));
 		for(Node child : node.children) {
-			if(!child.ignored) {
+			//a node without code, i.e., an ERROR node of the recovery with only a newline or an indent, and the try statement of such nodes, has no range
+			if(!child.ignored && child.start >= 0) {
 				tree.addChild(toTree(child, context));
 			}
 		}

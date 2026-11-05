@@ -86,6 +86,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.regex.Pattern;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
@@ -778,6 +779,8 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					}
 				}
 			}
+			addWhenEntryExpressionsWithStreamAPICalls(innerNodes1, leaves1, LANG1);
+			addWhenEntryExpressionsWithStreamAPICalls(innerNodes2, leaves2, LANG2);
 			Set<AbstractCodeFragment> streamAPIStatements1 = StreamAPIMatcher.statementsWithStreamAPICalls(leaves1, LANG1);
 			Set<AbstractCodeFragment> streamAPIStatements2 = StreamAPIMatcher.statementsWithStreamAPICalls(leaves2, LANG2);
 			boolean skip = false;
@@ -1319,6 +1322,9 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 				}
 			}
 			
+			if(container1.getBodyHashCode() != container2.getBodyHashCode()) {
+				repairDeclarationsReplacingAssignments(leaves1, leaves2, isomorphic);
+			}
 			updateNonMappedLeavesT1(leaves1);
 			updateNonMappedLeavesT2(leaves2);
 			nonMappedInnerNodesT1.addAll(innerNodes1);
@@ -2974,6 +2980,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 
 	public void addChildMapper(UMLOperationBodyMapper mapper) throws RefactoringMinerTimedOutException {
 		this.childMappers.add(mapper);
+		mapCallSite(mapper);
 		//check for variable extracted in parentMapper, but referenced in childMapper
 		UMLAbstractClassDiff classDiff = this.classDiff != null ? this.classDiff : parentMapper != null ? parentMapper.classDiff : null;
 		for(AbstractCodeFragment statement : getNonMappedLeavesT2()) {
@@ -3593,6 +3600,9 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			//remove the innerNodes that were mapped with replacement, if they are not mapped again for a second time
 			innerNodes1.removeAll(addedInnerNodes1);
 			innerNodes2.removeAll(addedInnerNodes2);
+			if(nested) {
+				mapSplitTryStatements(operationBodyMapper, innerNodes1, innerNodes2);
+			}
 			updateNonMappedLeavesT1(leaves1);
 			updateNonMappedLeavesT2(leaves2);
 			nonMappedInnerNodesT1.addAll(innerNodes1);
@@ -3630,6 +3640,55 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 				}
 			}
 		}
+	}
+
+	//a try statement split between a nested extracted method and the extracted method calling it: the caller mapped the try with the part it kept,
+	//and this method got the other part, so the try is mapped a second time here, with its catch clauses of the same exception types, i.e., the with
+	//statement and except DatabaseError, TimeoutError, ValueError moved to _persist_pull_request, except RepositoryNotRegisteredError kept in
+	//_handle_pull_request_delivery calling it
+	private void mapSplitTryStatements(UMLOperationBodyMapper callerMapper, List<CompositeStatementObject> innerNodes1, List<CompositeStatementObject> innerNodes2) {
+		for(CompositeStatementObject composite2 : new ArrayList<>(innerNodes2)) {
+			if(!(composite2 instanceof TryStatementObject try2) || alreadyMatched2(try2)) {
+				continue;
+			}
+			TryStatementObject try1 = splitTryStatement(callerMapper, try2);
+			if(try1 == null) {
+				continue;
+			}
+			addMapping(createCompositeMapping(try1, try2, parameterToArgumentMap2, mappedChildrenRatio(try1, try2)));
+			innerNodes2.remove(try2);
+			for(CompositeStatementObject catch2 : try2.getCatchClauses()) {
+				for(CompositeStatementObject catch1 : try1.getCatchClauses()) {
+					if(!alreadyMatched2(catch2) && innerNodes1.contains(catch1) && !alreadyMatched1(catch1) && catch1.getString().equals(catch2.getString())) {
+						addMapping(createCompositeMapping(catch1, catch2, parameterToArgumentMap2, mappedChildrenRatio(catch1, catch2)));
+						innerNodes1.remove(catch1);
+						innerNodes2.remove(catch2);
+					}
+				}
+			}
+		}
+	}
+
+	//the try statement of the original method having a statement mapped into the given try statement, when the caller mapper already mapped it to another try statement
+	private TryStatementObject splitTryStatement(UMLOperationBodyMapper callerMapper, TryStatementObject try2) {
+		for(AbstractCodeMapping mapping : mappings) {
+			if(try2.getStatements().contains(mapping.getFragment2()) && mapping.getFragment1().getParent() instanceof TryStatementObject try1 &&
+					!alreadyMatched1(try1) && callerMapper.alreadyMatched1(try1)) {
+				return try1;
+			}
+		}
+		return null;
+	}
+
+	//the share of the statements directly nested in the two composites that are mapped to each other
+	private double mappedChildrenRatio(CompositeStatementObject composite1, CompositeStatementObject composite2) {
+		int mapped = 0;
+		for(AbstractCodeMapping mapping : mappings) {
+			if(composite1.getStatements().contains(mapping.getFragment1()) && composite2.getStatements().contains(mapping.getFragment2())) {
+				mapped++;
+			}
+		}
+		return (double)mapped / Math.max(1, Math.max(composite1.getStatements().size(), composite2.getStatements().size()));
 	}
 
 	private void processCommentsAndJavadoc(UMLOperation addedOperation) {
@@ -3743,9 +3802,11 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 	void expandAnonymousAndLambdas(AbstractCodeFragment fragment, List<AbstractCodeFragment> leaves, List<CompositeStatementObject> innerNodes,
 			Set<AbstractCodeFragment> addedLeaves, Set<CompositeStatementObject> addedInnerNodes,
 			List<UMLAnonymousClass> anonymousClassList, Map<AbstractCodeFragment, VariableDeclarationContainer> map, VariableDeclarationContainer parentOperation, boolean excludeRootBlock) {
-		if(fragment instanceof StatementObject) {
-			StatementObject statement = (StatementObject)fragment;
-			if(!leaves.contains(statement)) {
+		//statements and the expressions of when entries with lambdas, i.e., is ObjectArrayDumpRecord -> record.elementIds.forEachIndexed { index, objectId -> ... };
+		//an expression is not a statement, so the caller decides whether it is a leaf. Other expressions, i.e., the body of an expression lambda, are not expanded
+		if(fragment instanceof StatementObject || fragment.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY_EXPRESSION)) {
+			AbstractCodeFragment statement = fragment;
+			if(fragment instanceof StatementObject && !leaves.contains(statement)) {
 				leaves.add(statement);
 				addedLeaves.add(statement);
 			}
@@ -3839,6 +3900,21 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 				}
 			}
 		}
+	}
+
+	//the expressions of when entries calling stream APIs are statements, i.e., is ObjectArrayDumpRecord -> record.elementIds.forEachIndexed { index, objectId -> ... }
+	private static void addWhenEntryExpressionsWithStreamAPICalls(List<CompositeStatementObject> innerNodes, List<AbstractCodeFragment> leaves, Constants LANG) {
+		List<AbstractCodeFragment> expressions = new ArrayList<>();
+		for(CompositeStatementObject innerNode : innerNodes) {
+			if(innerNode.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY)) {
+				for(AbstractExpression expression : innerNode.getExpressions()) {
+					if(expression.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY_EXPRESSION) && !leaves.contains(expression)) {
+						expressions.add(expression);
+					}
+				}
+			}
+		}
+		leaves.addAll(StreamAPIMatcher.statementsWithStreamAPICalls(expressions, LANG));
 	}
 
 	//JavaScript: the functions of object literals are both lambdas and operations of anonymous classes,
@@ -5963,6 +6039,8 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 						matchingInnerNodes1 = Collections.emptyList();
 					}
 					TreeSet<CompositeStatementObjectMapping> mappingSet = new TreeSet<CompositeStatementObjectMapping>();
+					//the composites matched only by their children, without replacements making the composites identical
+					Set<CompositeStatementObjectMapping> childrenOnlyMappings = new LinkedHashSet<CompositeStatementObjectMapping>();
 					for(ListIterator<CompositeStatementObject> innerNodeIterator2 = innerNodes2.listIterator(); innerNodeIterator2.hasNext();) {
 						CompositeStatementObject statement2 = innerNodeIterator2.next();
 						if(!alreadyMatched2(statement2)) {
@@ -6148,6 +6226,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 								CompositeStatementObjectMapping mapping = createCompositeMapping(statement1, statement2, parameterToArgumentMap, score);
 								mapping.addLambdaMappers(replacementInfo.getLambdaMappers());
 								mapping.addSubExpressionMappings(replacementInfo.getSubExpressionMappings());
+								childrenOnlyMappings.add(mapping);
 								mappingSet.add(mapping);
 							}
 						}
@@ -6156,7 +6235,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 						if(!duplicateMappingInParentMapper(mappingSet)) {
 							CompositeStatementObjectMapping oneTryBlockNestedUnderTheOther = oneTryBlockNestedUnderTheOther(mappingSet);
 							//checkForOtherPossibleMatchesForFragment2(innerNodes1, innerNodes2, statement1, mappingSet, parameterToArgumentMap, removedOperations, addedOperations, tryWithResourceMigration);
-							CompositeStatementObjectMapping minStatementMapping = oneTryBlockNestedUnderTheOther != null ? oneTryBlockNestedUnderTheOther : mappingSet.first();
+							CompositeStatementObjectMapping minStatementMapping = oneTryBlockNestedUnderTheOther != null ? oneTryBlockNestedUnderTheOther : headerMatchOfSplitBody(mappingSet, childrenOnlyMappings);
 							addMapping(minStatementMapping);
 							innerNodes2.remove(minStatementMapping.getFragment2());
 							innerNodeIterator1.remove();
@@ -6366,6 +6445,8 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					if(matchingInnerNodes2 == null) {
 						matchingInnerNodes2 = Collections.emptyList();
 					}
+					//the composites matched only by their children, without replacements making the composites identical
+					Set<CompositeStatementObjectMapping> childrenOnlyMappings = new LinkedHashSet<CompositeStatementObjectMapping>();
 					TreeSet<CompositeStatementObjectMapping> mappingSet = parentMapping != null ? new TreeSet<CompositeStatementObjectMapping>(new ScopedCompositeMappingComparatorForExtract(parentMapping)) : new TreeSet<CompositeStatementObjectMapping>();
 					for(ListIterator<CompositeStatementObject> innerNodeIterator1 = innerNodes1.listIterator(); innerNodeIterator1.hasNext();) {
 						CompositeStatementObject statement1 = innerNodeIterator1.next();
@@ -6534,6 +6615,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 								CompositeStatementObjectMapping mapping = createCompositeMapping(statement1, statement2, parameterToArgumentMap, score);
 								mapping.addLambdaMappers(replacementInfo.getLambdaMappers());
 								mapping.addSubExpressionMappings(replacementInfo.getSubExpressionMappings());
+								childrenOnlyMappings.add(mapping);
 								mappingSet.add(mapping);
 							}
 						}
@@ -6564,7 +6646,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 							}
 							else {
 								CompositeStatementObjectMapping oneTryBlockNestedUnderTheOther = oneTryBlockNestedUnderTheOther(mappingSet);
-								CompositeStatementObjectMapping minStatementMapping = oneTryBlockNestedUnderTheOther != null ? oneTryBlockNestedUnderTheOther : mappingSet.first();
+								CompositeStatementObjectMapping minStatementMapping = oneTryBlockNestedUnderTheOther != null ? oneTryBlockNestedUnderTheOther : headerMatchOfSplitBody(mappingSet, childrenOnlyMappings);
 								addMapping(minStatementMapping);
 								innerNodes1.remove(minStatementMapping.getFragment1());
 								innerNodeIterator2.remove();
@@ -6931,6 +7013,74 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		return outermost;
 	}
 
+	//the mapping of the composite matched by replacements, when the children of the composite are split among more than one composite matched only by their children,
+	//i.e., a loop split into several loops, where for (auto& [id, x] : llvm::enumerate(xs)) {a; b; c;} -> for (auto& [i, x] : llvm::enumerate(xs)) {a;} for (id : ids) {b;} for (r : roots) {c;}
+	private CompositeStatementObjectMapping headerMatchOfSplitBody(TreeSet<CompositeStatementObjectMapping> mappingSet, Set<CompositeStatementObjectMapping> childrenOnlyMappings) {
+		if(childrenOnlyMappings.size() > 1) {
+			for(CompositeStatementObjectMapping mapping : mappingSet) {
+				if(!childrenOnlyMappings.contains(mapping)) {
+					return mapping;
+				}
+			}
+		}
+		return mappingSet.first();
+	}
+
+	//the statements of one of the identical composites are mapped to the statements of another composite of the same type, differing only in literals, which has only statements of that composite mapped,
+	//i.e., the bodies of if (bits & 0x4u) {handle_->Clear();} and if (bits & 0x4u) {uuid_.Clear();} when the first body is mapped to if (bits & 0x8u) {handle_->Clear();},
+	//but not when the other composite has the statements of its own counterpart, i.e., return null; moved from if (!valid) {return null;} into a previous if (end) {skip(); return null;}
+	private boolean childrenMappedInAnotherComposite(CompositeStatementObject comp1, CompositeStatementObject comp2) {
+		CodeElementType type = comp1.getLocationInfo().getCodeElementType();
+		for(AbstractCodeMapping mapping : mappings) {
+			AbstractCodeFragment fragment1 = mapping.getFragment1();
+			AbstractCodeFragment fragment2 = mapping.getFragment2();
+			boolean inside1 = fragment1 != comp1 && comp1.getLocationInfo().subsumes(fragment1.getLocationInfo());
+			boolean inside2 = fragment2 != comp2 && comp2.getLocationInfo().subsumes(fragment2.getLocationInfo());
+			if(inside1 && !inside2) {
+				CompositeStatementObject other2 = anotherComposite(fragment2, type, comp2);
+				if(other2 != null && sameExceptLiterals(comp1, other2) && onlyStatementsOf(comp1, other2, true)) {
+					return true;
+				}
+			}
+			if(inside2 && !inside1) {
+				CompositeStatementObject other1 = anotherComposite(fragment1, type, comp1);
+				if(other1 != null && sameExceptLiterals(comp2, other1) && onlyStatementsOf(comp2, other1, false)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	//the composites differ only in their number, string and character literals, i.e., if (bits & 0x00000004u) and if (bits & 0x00000008u)
+	private static boolean sameExceptLiterals(CompositeStatementObject composite, CompositeStatementObject other) {
+		return LITERAL.matcher(composite.getString()).replaceAll("#").equals(LITERAL.matcher(other.getString()).replaceAll("#"));
+	}
+
+	private static final Pattern LITERAL = Pattern.compile("\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|\\b0[xX][0-9a-fA-F]+[uUlL]*\\b|\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?[uUlLfFdD]*\\b");
+
+	//the closest composite of the type enclosing the fragment, if it is not the composite and does not enclose it
+	private static CompositeStatementObject anotherComposite(AbstractCodeFragment fragment, CodeElementType type, CompositeStatementObject composite) {
+		CompositeStatementObject parent = fragment.getParent();
+		while(parent != null && !parent.getLocationInfo().getCodeElementType().equals(type)) {
+			parent = parent.getParent();
+		}
+		return parent != null && parent != composite && !parent.getLocationInfo().subsumes(composite.getLocationInfo()) ? parent : null;
+	}
+
+	//all mapped statements within the other composite are mapped to statements within the composite, on the other side
+	private boolean onlyStatementsOf(CompositeStatementObject composite, CompositeStatementObject other, boolean compositeInT1) {
+		for(AbstractCodeMapping mapping : mappings) {
+			AbstractCodeFragment inOther = compositeInT1 ? mapping.getFragment2() : mapping.getFragment1();
+			AbstractCodeFragment counterpart = compositeInT1 ? mapping.getFragment1() : mapping.getFragment2();
+			if(inOther != other && other.getLocationInfo().subsumes(inOther.getLocationInfo()) &&
+					(counterpart == composite || !composite.getLocationInfo().subsumes(counterpart.getLocationInfo()))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	private boolean allLeavesWithinBodyMapped(CompositeStatementObject statement1, CompositeStatementObject statement2) {
 		if(statement1.getLocationInfo().getCodeElementType().equals(statement2.getLocationInfo().getCodeElementType())) {
 			int allLeaves1 = 0;
@@ -7003,7 +7153,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		AbstractCodeFragment leaf2 = mapping.getFragment2();
 		LeafMapping strongest = null;
 		for(AbstractCodeFragment other1 : leaves1) {
-			if(other1 != leaf1 && !alreadyMatched1(other1) && other1.getDepth() == leaf1.getDepth() && other1.getString().equals(leaf1.getString()) && equalCatchClauseIndex(other1, leaf2)) {
+			if(other1 != leaf1 && !alreadyMatched1(other1) && other1.getDepth() == leaf1.getDepth() && other1.getString().equals(leaf1.getString()) && compatibleCatchClauses(other1, leaf2)) {
 				LeafMapping other = createLeafMapping(other1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 				if(other.compareSurroundingStatements(strongest != null ? strongest : mapping) < 0) {
 					strongest = other;
@@ -7469,7 +7619,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 								String argumentizedString2 = preprocessInput2(leaf1, leaf2);
 								if(leaf1.getString().equals(leaf2.getString()) || argumentizedString1.equals(argumentizedString2)) {
 									matchCount++;
-									if(leaf1.getDepth() == leaf2.getDepth() && equalCatchClauseIndex(leaf1, leaf2)) {
+									if(leaf1.getDepth() == leaf2.getDepth() && compatibleCatchClauses(leaf1, leaf2)) {
 										LeafMapping mapping = createLeafMapping(leaf1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 										mappingSet.add(mapping);
 									}
@@ -7841,7 +7991,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					TreeSet<LeafMapping> mappingSet = initializeMappingSetForInlineScenario(parentMapping);
 					for(ListIterator<? extends AbstractCodeFragment> leafIterator2 = leaves2.listIterator(); leafIterator2.hasNext();) {
 						AbstractCodeFragment leaf2 = leafIterator2.next();
-						if(!alreadyMatched2(leaf2)) {
+						if(!alreadyMatched2(leaf2) && equalCatchClauseExceptionTypes(leaf1, leaf2)) {
 							int mappingsBefore = mappings.size();
 							int refactoringsBefore = refactorings.size();
 							ReplacementInfo replacementInfo = initializeReplacementInfo(leaf1, leaf2, leaves1, leaves2);
@@ -8036,7 +8186,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 								String argumentizedString2 = preprocessInput2(leaf1, leaf2);
 								if(leaf1.getString().equals(leaf2.getString()) || argumentizedString1.equals(argumentizedString2)) {
 									matchCount++;
-									if(leaf1.getDepth() == leaf2.getDepth() && equalCatchClauseIndex(leaf1, leaf2)) {
+									if(leaf1.getDepth() == leaf2.getDepth() && compatibleCatchClauses(leaf1, leaf2)) {
 										LeafMapping mapping = createLeafMapping(leaf1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 										mappingSet.add(mapping);
 									}
@@ -8379,7 +8529,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					TreeSet<LeafMapping> mappingSet = initializeMappingSetForExtractScenario(parentMapping);
 					for(ListIterator<? extends AbstractCodeFragment> leafIterator1 = leaves1.listIterator(); leafIterator1.hasNext();) {
 						AbstractCodeFragment leaf1 = leafIterator1.next();
-						if(!alreadyMatched1(leaf1)) {
+						if(!alreadyMatched1(leaf1) && equalCatchClauseExceptionTypes(leaf1, leaf2)) {
 							int mappingsBefore = mappings.size();
 							int refactoringsBefore = refactorings.size();
 							ReplacementInfo replacementInfo = initializeReplacementInfo(leaf1, leaf2, leaves1, leaves2);
@@ -8578,7 +8728,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					(leaf2.getLocationInfo().getStartLine() == lambda2.getLocationInfo().getStartLine() || leaf2.getLocationInfo().getStartLine() == lambda2.getLocationInfo().getStartLine()-1)) {
 				if(lambda1.toString().equals(lambda2.toString())) {
 					matchCount++;
-					if(leaf1.getDepth() == leaf2.getDepth() && equalCatchClauseIndex(leaf1, leaf2)) {
+					if(leaf1.getDepth() == leaf2.getDepth() && compatibleCatchClauses(leaf1, leaf2)) {
 						LeafMapping mapping = createLeafMapping(leaf1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 						mappingSet.add(mapping);
 					}
@@ -8598,7 +8748,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					}
 					if(identical >= repr1.size()-1 && identical > 0) {
 						matchCount++;
-						if(leaf1.getDepth() == leaf2.getDepth() && equalCatchClauseIndex(leaf1, leaf2)) {
+						if(leaf1.getDepth() == leaf2.getDepth() && compatibleCatchClauses(leaf1, leaf2)) {
 							LeafMapping mapping = createLeafMapping(leaf1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 							mappingSet.add(mapping);
 						}
@@ -8613,7 +8763,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					(leaf2.getLocationInfo().getStartLine() == anonymous2.getLocationInfo().getStartLine() || leaf2.getLocationInfo().getStartLine() == anonymous2.getLocationInfo().getStartLine()-1)) {
 				if(anonymous1.toString().equals(anonymous2.toString())) {
 					matchCount++;
-					if(leaf1.getDepth() == leaf2.getDepth() && equalCatchClauseIndex(leaf1, leaf2)) {
+					if(leaf1.getDepth() == leaf2.getDepth() && compatibleCatchClauses(leaf1, leaf2)) {
 						LeafMapping mapping = createLeafMapping(leaf1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 						mappingSet.add(mapping);
 					}
@@ -8633,7 +8783,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					}
 					if(identical >= lines1.length-1 && identical > 0) {
 						matchCount++;
-						if(leaf1.getDepth() == leaf2.getDepth() && equalCatchClauseIndex(leaf1, leaf2)) {
+						if(leaf1.getDepth() == leaf2.getDepth() && compatibleCatchClauses(leaf1, leaf2)) {
 							LeafMapping mapping = createLeafMapping(leaf1, leaf2, parameterToArgumentMap, equalNumberOfAssertions, isomorphic);
 							mappingSet.add(mapping);
 						}
@@ -8889,6 +9039,32 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			}
 		}
 		return false;
+	}
+
+	private boolean compatibleCatchClauses(AbstractCodeFragment leaf1, AbstractCodeFragment leaf2) {
+		return equalCatchClauseIndex(leaf1, leaf2) && equalCatchClauseExceptionTypes(leaf1, leaf2);
+	}
+
+	//statements of catch clauses of different exception types are not paired when the try of the first statement has a clause of the exception types of the second one,
+	//i.e., parser.exit in except SchemaNotEmptyError and parser.exit in except DatabaseError as error, when the original try has an except DatabaseError
+	private boolean equalCatchClauseExceptionTypes(AbstractCodeFragment leaf1, AbstractCodeFragment leaf2) {
+		CompositeStatementObject catch1 = leaf1.getParent();
+		CompositeStatementObject catch2 = leaf2.getParent();
+		if(catch1 == null || catch2 == null || !catch1.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE) ||
+				!catch2.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE) || catch1.getTryContainer().isEmpty()) {
+			return true;
+		}
+		Set<String> types1 = new HashSet<>(catch1.getCatchClauseExceptionTypes());
+		Set<String> types2 = new HashSet<>(catch2.getCatchClauseExceptionTypes());
+		if(types2.isEmpty() || types1.equals(types2)) {
+			return true;
+		}
+		for(CompositeStatementObject other1 : catch1.getTryContainer().get().getCatchClauses()) {
+			if(!other1.equals(catch1) && new HashSet<>(other1.getCatchClauseExceptionTypes()).equals(types2)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private boolean equalCatchClauseIndex(AbstractCodeFragment leaf1, AbstractCodeFragment leaf2) {
@@ -11357,6 +11533,28 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		if(mapping.getArgumentization() == null) {
 			mapping.setArgumentization(argumentization);
 		}
+		//the condition of the if replaced by a check macro is matched with the macro, like the returned error
+		if(mapping instanceof LeafMapping leafMapping && mapping.containsReplacement(ReplacementType.CONDITIONAL_RETURN_REPLACED_WITH_CHECK_MACRO)) {
+			AbstractExpression condition = CppStatusMacros.conditionOfReplacedIf(mapping.getFragment1());
+			if(condition != null && !alreadyMatched1(condition)) {
+				LeafMapping conditionMapping = new LeafMapping(condition, mapping.getFragment2(), leafMapping.getOperation1(), leafMapping.getOperation2());
+				conditionMapping.addReplacements(mapping.getReplacements());
+				leafMapping.addSubExpressionMapping(conditionMapping);
+			}
+		}
+		//the check and the value of the StatusOr replaced by an assign-or-return macro are matched with the macro, like its declaration
+		if(mapping instanceof LeafMapping leafMapping && mapping.containsReplacement(ReplacementType.STATUS_OR_DECLARATION_REPLACED_WITH_ASSIGN_OR_RETURN)) {
+			for(AbstractCodeFragment replaced : CppStatusMacros.replacedByAssignOrReturn(mapping.getFragment1())) {
+				if(!alreadyMatched1(replaced)) {
+					LeafMapping replacedMapping = new LeafMapping(replaced, mapping.getFragment2(), leafMapping.getOperation1(), leafMapping.getOperation2());
+					replacedMapping.addReplacements(mapping.getReplacements());
+					leafMapping.addSubExpressionMapping(replacedMapping);
+					if(!(replaced instanceof AbstractExpression)) {
+						mappingHashcodesT1.add(replaced.hashCode());
+					}
+				}
+			}
+		}
 		this.mappings.add(mapping);
 		if(mapping.getSubExpressionMappings().size() > 0) {
 			this.mappings.addAll(mapping.getSubExpressionMappings());
@@ -11553,6 +11751,12 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 					loserRefactorings.put(r, Boolean.TRUE);
 				}
 			}
+			//the anonymous class replaced with the lambda of a loser mapping, i.e., object : ForEachCallback {...} matched against { pathNode -> ... }
+			for(Refactoring r : refactorings) {
+				if(r instanceof ReplaceAnonymousWithLambdaRefactoring replaceAnonymous && replaceAnonymous.getBodyMapper() == lambdaMapper) {
+					loserRefactorings.put(r, Boolean.TRUE);
+				}
+			}
 		}
 		if(!loserRefactorings.isEmpty()) {
 			refactorings.removeIf(loserRefactorings::containsKey);
@@ -11656,6 +11860,126 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 			}
 		}
 		return validReplacements;
+	}
+
+	//a declaration mapped to an identical declaration of deleted code is mapped instead to an unmatched assignment of the same variable and value,
+	//whose previous and next statements are mapped to the previous and next statements of the declaration, i.e., threw = false; -> boolean threw = false;
+	//when the first block declaring threw is deleted, and the identical boolean threw = false; of the deleted block was mapped
+	private void repairDeclarationsReplacingAssignments(List<AbstractCodeFragment> leaves1, List<AbstractCodeFragment> leaves2, boolean isomorphic) throws RefactoringMinerTimedOutException {
+		for(AbstractCodeMapping mapping : new ArrayList<>(mappings)) {
+			if(!(mapping instanceof LeafMapping) || !mappings.contains(mapping)) {
+				continue;
+			}
+			AbstractCodeFragment declaration1 = mapping.getFragment1();
+			AbstractCodeFragment declaration2 = mapping.getFragment2();
+			if(!declaration2.getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_STATEMENT) ||
+					!declaration1.getString().equals(declaration2.getString())) {
+				continue;
+			}
+			List<VariableDeclaration> declarations2 = declaration2.getVariableDeclarations();
+			if(declarations2.size() != 1 || declarations2.get(0).getInitializer() == null) {
+				continue;
+			}
+			//the identical declaration is not surrounded by the counterparts of the statements around the declaration
+			if(containsMapping(sibling(declaration1, -1), sibling(declaration2, -1)) || containsMapping(sibling(declaration1, 1), sibling(declaration2, 1))) {
+				continue;
+			}
+			VariableDeclaration declaration = declarations2.get(0);
+			String assignment = declaration.getVariableName() + LANG1.ASSIGNMENT + declaration.getInitializer().getString() + LANG1.STATEMENT_TERMINATION;
+			for(AbstractCodeFragment leaf1 : new ArrayList<>(leaves1)) {
+				if(leaf1.getString().equals(assignment) &&
+						containsMapping(sibling(leaf1, -1), sibling(declaration2, -1)) && containsMapping(sibling(leaf1, 1), sibling(declaration2, 1))) {
+					ReplacementInfo replacementInfo = initializeReplacementInfo(leaf1, declaration2, leaves1, leaves2);
+					Map<String, String> parameterToArgumentMap = new LinkedHashMap<String, String>();
+					Set<Replacement> replacements = findReplacementsWithExactMatching(leaf1, declaration2, parameterToArgumentMap, replacementInfo, false, this, isomorphic);
+					if(replacements != null) {
+						LeafMapping repairedMapping = createLeafMapping(leaf1, declaration2, parameterToArgumentMap, false, isomorphic);
+						repairedMapping.addReplacements(replacements);
+						repairedMapping.addSubExpressionMappings(replacementInfo.getSubExpressionMappings());
+						removeMapping(mapping);
+						addMapping(repairedMapping);
+						leaves1.remove(leaf1);
+						leaves1.add(declaration1);
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	//the call site of an inlined (extracted) method is mapped to the statement taking its place, when the returned expression of the method is mapped to it,
+	//i.e., val shallowSize = graph.computeShallowSize(x) -> val shallowSize = when (...) {...} for the inlined return when (...) {...},
+	//as the statement matching leaves them unmatched when the whole initializer is replaced, and the accepted refactoring confirms the pair
+	private void mapCallSite(UMLOperationBodyMapper childMapper) {
+		AbstractCall invocation = childMapper.getOperationInvocation();
+		boolean inlined = childMapper.getContainer2() == container2 && childMapper.getContainer1() != container1;
+		boolean extracted = childMapper.getContainer1() == container1 && childMapper.getContainer2() != container2;
+		if(invocation == null || (!inlined && !extracted)) {
+			return;
+		}
+		//the single mapping of the return statement of the inlined (extracted) method
+		AbstractCodeMapping returnMapping = null;
+		for(AbstractCodeMapping mapping : childMapper.getMappings()) {
+			AbstractCodeFragment returnStatement = inlined ? mapping.getFragment1() : mapping.getFragment2();
+			if(returnStatement.getLocationInfo().getCodeElementType().equals(CodeElementType.RETURN_STATEMENT)) {
+				if(returnMapping != null) {
+					return;
+				}
+				returnMapping = mapping;
+			}
+		}
+		if(returnMapping == null) {
+			return;
+		}
+		AbstractCodeFragment replacingStatement = inlined ? returnMapping.getFragment2() : returnMapping.getFragment1();
+		String[] replacingNameAndInitializer = declarationNameAndInitializer(replacingStatement);
+		if(replacingNameAndInitializer == null || (inlined ? alreadyMatched2(replacingStatement) : alreadyMatched1(replacingStatement))) {
+			return;
+		}
+		for(AbstractCodeFragment callSite : inlined ? nonMappedLeavesT1 : nonMappedLeavesT2) {
+			if(callSite.getLocationInfo().subsumes(invocation.getLocationInfo())) {
+				String[] callSiteNameAndInitializer = declarationNameAndInitializer(callSite);
+				if(callSiteNameAndInitializer != null && callSiteNameAndInitializer[0].equals(replacingNameAndInitializer[0]) &&
+						callSiteNameAndInitializer[1].equals(invocation.actualString()) && !(inlined ? alreadyMatched1(callSite) : alreadyMatched2(callSite))) {
+					AbstractCodeFragment fragment1 = inlined ? callSite : replacingStatement;
+					AbstractCodeFragment fragment2 = inlined ? replacingStatement : callSite;
+					String before = inlined ? callSiteNameAndInitializer[1] : replacingNameAndInitializer[1];
+					String after = inlined ? replacingNameAndInitializer[1] : callSiteNameAndInitializer[1];
+					LeafMapping mapping = new LeafMapping(fragment1, fragment2, container1, container2);
+					mapping.addReplacement(new Replacement(before, after, ReplacementType.CALL_REPLACED_WITH_RETURNED_EXPRESSION));
+					addMapping(mapping);
+					nonMappedLeavesT1.remove(fragment1);
+					nonMappedLeavesT2.remove(fragment2);
+				}
+				return;
+			}
+		}
+	}
+
+	//the name and the initializer of a statement declaring a single variable with an initializer, i.e., [x, e] for val x = e, or null
+	//a return statement is not considered, as the returned expression of the inlined (extracted) method has the same role,
+	//i.e., return compute(x) -> return result is explained by the return result of the inlined compute(x)
+	private static String[] declarationNameAndInitializer(AbstractCodeFragment statement) {
+		if(statement.getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_STATEMENT)) {
+			List<VariableDeclaration> declarations = statement.getVariableDeclarations();
+			if(declarations.size() == 1 && declarations.get(0).getInitializer() != null) {
+				return new String[] {declarations.get(0).getVariableName(), declarations.get(0).getInitializer().getString()};
+			}
+		}
+		return null;
+	}
+
+	//the statement before (-1) or after (1) a statement in its parent, or null
+	private static AbstractCodeFragment sibling(AbstractCodeFragment statement, int offset) {
+		CompositeStatementObject parent = statement.getParent();
+		if(parent == null) {
+			return null;
+		}
+		int index = parent.getStatements().indexOf(statement) + offset;
+		if(index < 0 || index >= parent.getStatements().size() || parent.getStatements().indexOf(statement) < 0) {
+			return null;
+		}
+		return parent.getStatements().get(index);
 	}
 
 	private ReplacementInfo initializeReplacementInfo(AbstractCodeFragment leaf1, AbstractCodeFragment leaf2,
@@ -12934,7 +13258,7 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 						!comp1.getLocationInfo().getCodeElementType().equals(CodeElementType.TRY_STATEMENT) &&
 						!comp1.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE) &&
 						!logGuard(comp1) && !nullCheck(comp1, comp2, replacementInfo) &&
-						!parentMapperContainsExactMapping(comp1) && !equalIfElseIfChain) {
+						!parentMapperContainsExactMapping(comp1) && !equalIfElseIfChain && !childrenMappedInAnotherComposite(comp1, comp2)) {
 					return 0.01;
 				}
 			}

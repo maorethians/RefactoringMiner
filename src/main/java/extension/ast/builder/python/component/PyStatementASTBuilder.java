@@ -10,6 +10,7 @@ import extension.ast.node.expression.LangMethodInvocation;
 import extension.ast.node.expression.LangSimpleName;
 import extension.ast.node.literal.LangDictionaryLiteral;
 import extension.ast.node.literal.LangTupleLiteral;
+import extension.ast.node.expression.LangAssignment;
 import extension.ast.node.statement.LangBlock;
 import extension.base.lang.python.PythonParser;
 import org.antlr.v4.runtime.ParserRuleContext;
@@ -28,6 +29,15 @@ public class PyStatementASTBuilder extends PyBaseASTBuilder {
         if (ctx.statements() != null) {
             for (PythonParser.StatementContext stmtCtx : ctx.statements().statement()) {
                 statements.addAll(statements(stmtCtx));
+            }
+        }
+        //a block on the line of its header has simple statements, i.e., class MyClass: ... or def f(x): return x
+        else if (ctx.simple_stmts() != null) {
+            for (PythonParser.Simple_stmtContext simpleCtx : ctx.simple_stmts().simple_stmt()) {
+                LangASTNode statement = mainBuilder.visit(simpleCtx);
+                if (statement != null) {
+                    statements.add(statement);
+                }
             }
         }
         return LangASTNodeFactory.createBlock(ctx, statements);
@@ -84,12 +94,17 @@ public class PyStatementASTBuilder extends PyBaseASTBuilder {
         return null;
     }
 
-    // TODO
+    //the PEP 695 type alias statement, as an assignment with the type operator, i.e., type Pair[T] = tuple[T, T]
     public LangASTNode visitType_alias(PythonParser.Type_aliasContext ctx) {
         String name = ctx.name().getText();
         LangASTNode value = mainBuilder.visit(ctx.expression());
         LangASTNode left = LangASTNodeFactory.createSimpleName(name, ctx.name());
-        return LangASTNodeFactory.createAssignment("type", left, value, ctx);
+        LangASTNode assignment = LangASTNodeFactory.createAssignment("type", left, value, ctx);
+        if (ctx.type_params() != null && assignment instanceof LangAssignment langAssignment &&
+                mainBuilder.visit(ctx.type_params()) instanceof LangBlock typeParameters) {
+            langAssignment.setTypeParameters(typeParameters.getStatements());
+        }
+        return assignment;
     }
 
     public LangASTNode visitIf_stmt(PythonParser.If_stmtContext ctx) {
@@ -199,6 +214,13 @@ public class PyStatementASTBuilder extends PyBaseASTBuilder {
             LangASTNode typeNode = mainBuilder.visit(ctx.expression());
             if (typeNode != null) exceptionTypes.add(typeNode);
         }
+        //an unparenthesized list of exception types (Python 3.14), i.e., except DatabaseError, TimeoutError:
+        else if (ctx.expressions() != null) {
+            for (PythonParser.ExpressionContext expressionCtx : ctx.expressions().expression()) {
+                LangASTNode typeNode = mainBuilder.visit(expressionCtx);
+                if (typeNode != null) exceptionTypes.add(typeNode);
+            }
+        }
         
         if (ctx.name() != null) {
             exceptionVariable = LangASTNodeFactory.createSimpleName(ctx.name().getText(), ctx.name());
@@ -298,6 +320,13 @@ public class PyStatementASTBuilder extends PyBaseASTBuilder {
         if (ctx.expression() != null) {
             LangASTNode typeNode = mainBuilder.visit(ctx.expression());
             if (typeNode != null) exceptionTypes.add(typeNode);
+        }
+        //an unparenthesized list of exception types (Python 3.14), i.e., except DatabaseError, TimeoutError:
+        else if (ctx.expressions() != null) {
+            for (PythonParser.ExpressionContext expressionCtx : ctx.expressions().expression()) {
+                LangASTNode typeNode = mainBuilder.visit(expressionCtx);
+                if (typeNode != null) exceptionTypes.add(typeNode);
+            }
         }
         
         if (ctx.name() != null) {

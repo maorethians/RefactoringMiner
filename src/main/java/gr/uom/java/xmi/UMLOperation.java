@@ -37,6 +37,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	private String name;
 	private Visibility visibility;
 	private boolean isAbstract;
+	//a function declared in the if or else block of a conditional, i.e., if typing.TYPE_CHECKING: def f(): ... else: def f(): ...
+	private UMLClass.ConditionallyCreated conditionallyCreated = UMLClass.ConditionallyCreated.NO;
 	private List<UMLParameter> parameters;
 	private String className;
 	private boolean isConstructor;
@@ -256,6 +258,14 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		return isAbstract;
 	}
 
+	public UMLClass.ConditionallyCreated getConditionallyCreated() {
+		return conditionallyCreated;
+	}
+
+	public void setConditionallyCreated(UMLClass.ConditionallyCreated conditionallyCreated) {
+		this.conditionallyCreated = conditionallyCreated;
+	}
+
 	public void setAbstract(boolean isAbstract) {
 		this.isAbstract = isAbstract;
 	}
@@ -414,6 +424,16 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		return false;
 	}
 
+	//a test of JUnit or TestNG, or a JUnit 4 theory
+	public boolean isTest() {
+		for(UMLAnnotation annotation : annotations) {
+			if(annotation.getTypeName().equals("Test") || annotation.getTypeName().equals("Theory")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public boolean hasParameterizedTestAnnotation() {
 		for(UMLAnnotation annotation : annotations) {
 			if(UMLOperation.isParameterizedTestAnnotation(annotation)) {
@@ -457,6 +477,42 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			}
 		}
 		return false;
+	}
+
+	//base.evaluate() inside a loop of the operation or of an anonymous class it creates, i.e., the Statement returned by TestRule.apply
+	public boolean evaluatesInLoop() {
+		if(getBody() != null) {
+			for(CompositeStatementObject node : getBody().getCompositeStatement().getInnerNodes()) {
+				LocationInfo.CodeElementType type = node.getLocationInfo().getCodeElementType();
+				if(type.equals(LocationInfo.CodeElementType.ENHANCED_FOR_STATEMENT) || type.equals(LocationInfo.CodeElementType.FOR_STATEMENT) ||
+						type.equals(LocationInfo.CodeElementType.WHILE_STATEMENT) || type.equals(LocationInfo.CodeElementType.DO_STATEMENT)) {
+					for(AbstractCall call : node.getAllMethodInvocations()) {
+						if(call.getName().equals("evaluate") && call.arguments().isEmpty()) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+		for(UMLAnonymousClass anonymous : getAnonymousClassList()) {
+			for(UMLOperation anonymousOperation : anonymous.getOperations()) {
+				if(anonymousOperation.evaluatesInLoop()) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	//a set-up or tear-down method is not a test, even when it is also annotated as a parameterized test, i.e., @Before setUp() -> @BeforeEach @ParameterizedTest @EnumSource setUp(CoordinateSystem3D cs)
+	public boolean isLifecycleMethod() {
+		return hasSetUpAnnotation() || hasTearDownAnnotation();
+	}
+
+	//a method that is not a test and already had parameters is not a test parameterized, but a helper that became a parameterized test,
+	//i.e., private Any2(IEnumerable<Integer> source, Predicate1<Integer> predicate, boolean expected) renamed to @ParameterizedTest Any(source, predicate, expected)
+	public boolean isHelperWithParameters() {
+		return !isTest() && !getParameterNameList().isEmpty();
 	}
 
 	public boolean hasDataProviderAnnotation() {
@@ -1334,6 +1390,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				this.equalTrailingReturnType(operation) &&
 				this.isForwardDeclaration() == operation.isForwardDeclaration() &&
 				thisEmptyBody == otherEmptyBody &&
+				this.conditionallyCreated.equals(operation.conditionallyCreated) &&
 				this.getParameterTypeList().equals(operation.getParameterTypeList()) &&
 				equalTypeParameters(operation);
 		}
@@ -1367,6 +1424,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				this.isExplicit == operation.isExplicit &&
 				this.equalTrailingReturnType(operation) &&
 				this.isForwardDeclaration() == operation.isForwardDeclaration() &&
+				this.conditionallyCreated.equals(operation.conditionallyCreated) &&
 				equalTypeParameters(operation)) {
 			UMLParameter thisReturnParameter = this.getReturnParameter();
 			UMLParameter otherReturnParameter = operation.getReturnParameter();
@@ -1403,6 +1461,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		result = prime * result + (trailingReturnType.isPresent() ? trailingReturnType.get().hashCode() : 0);
 		result = prime * result + (isForwardDeclaration() ? 1231 : 1237);
 		result = prime * result + (thisEmptyBody ? 1231 : 1237);
+		result = prime * result + conditionallyCreated.ordinal();
 		result = prime * result + ((name == null) ? 0 : name.hashCode());
 		result = prime * result + ((getParameterTypeList() == null) ? 0 : getParameterTypeList().hashCode());
 		result = prime * result + ((visibility == null) ? 0 : visibility.hashCode());

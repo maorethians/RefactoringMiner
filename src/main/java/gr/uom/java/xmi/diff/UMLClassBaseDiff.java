@@ -24,6 +24,7 @@ import gr.uom.java.xmi.ListCompositeType;
 import gr.uom.java.xmi.ModuleContainer;
 import gr.uom.java.xmi.UMLAnnotation;
 import gr.uom.java.xmi.UMLAnonymousClass;
+import gr.uom.java.xmi.LocationInfoProvider;
 import gr.uom.java.xmi.UMLAttribute;
 import gr.uom.java.xmi.UMLClass;
 import gr.uom.java.xmi.UMLComment;
@@ -32,6 +33,7 @@ import gr.uom.java.xmi.UMLInitializer;
 import gr.uom.java.xmi.UMLJavadoc;
 import gr.uom.java.xmi.UMLOperation;
 import gr.uom.java.xmi.UMLType;
+import gr.uom.java.xmi.UMLTypeAlias;
 import gr.uom.java.xmi.Visibility;
 import gr.uom.java.xmi.decomposition.AbstractCall;
 import gr.uom.java.xmi.decomposition.AbstractCodeFragment;
@@ -43,12 +45,15 @@ import gr.uom.java.xmi.decomposition.VariableDeclaration;
 import gr.uom.java.xmi.decomposition.VariableReplacementAnalysis;
 import gr.uom.java.xmi.decomposition.UMLOperationBodyMapper;
 import gr.uom.java.xmi.decomposition.replacement.MethodInvocationReplacement;
+import gr.uom.java.xmi.decomposition.replacement.Replacement;
 import gr.uom.java.xmi.decomposition.replacement.Replacement.ReplacementType;
 import gr.uom.java.xmi.diff.MoveCodeRefactoring.Type;
 
 import static gr.uom.java.xmi.UMLAbstractClass.reactFunctionComponentNames;
 
 public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements Comparable<UMLClassBaseDiff> {
+	//the replacements of a literal with another literal
+	private static final Set<ReplacementType> LITERAL_REPLACEMENTS = Set.of(ReplacementType.STRING_LITERAL, ReplacementType.CHAR_LITERAL, ReplacementType.NUMBER_LITERAL, ReplacementType.BOOLEAN_LITERAL, ReplacementType.STRING_LITERAL_REPLACED_WITH_CHAR_LITERAL);
 
 	private boolean visibilityChanged;
 	private Visibility oldVisibility;
@@ -72,6 +77,9 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 	private Optional<UMLJavadocDiff> packageDeclarationJavadocDiff;
 	private Optional<UMLParameterListDiff> primaryConstructorParameterListDiff;
 	private Optional<UMLTypeAliasListDiff> typeAliasListDiff;
+	//the type aliases replaced with attributes of the same name, and the attributes replaced with type aliases, in the original and the next class,
+	//i.e., ForwardRef: typing.TypeAlias = typing.ForwardRef -> ForwardRef = typing.ForwardRef
+	private List<Pair<LocationInfoProvider, LocationInfoProvider>> typeAliasesReplacedWithAttributes = new ArrayList<>();
 	private Optional<UMLNamedExportListDiff> namedExportListDiff;
 	private Optional<UMLPreprocessorStatementListDiff> preprocessorStatementListDiff;
 	private Optional<UMLForwardDeclarationListDiff> forwardDeclarationListDiff;
@@ -137,6 +145,46 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 		return typeAliasListDiff;
 	}
 
+	public List<Pair<LocationInfoProvider, LocationInfoProvider>> getTypeAliasesReplacedWithAttributes() {
+		return typeAliasesReplacedWithAttributes;
+	}
+
+	//a type alias of a class, whose name is not a type alias of the other class but an attribute that is not in the class of the type alias, and the reverse,
+	//i.e., the explicit ForwardRef: typing.TypeAlias = typing.ForwardRef replaced with the assignment ForwardRef = typing.ForwardRef
+	private void processTypeAliasesReplacedWithAttributes() {
+		for(UMLTypeAlias typeAlias : getOriginalClass().getTypeAliasList()) {
+			UMLAttribute attribute = attributeReplacingTypeAlias(typeAlias, getNextClass(), getOriginalClass());
+			if(attribute != null) {
+				typeAliasesReplacedWithAttributes.add(Pair.of(typeAlias, attribute));
+			}
+		}
+		for(UMLTypeAlias typeAlias : getNextClass().getTypeAliasList()) {
+			UMLAttribute attribute = attributeReplacingTypeAlias(typeAlias, getOriginalClass(), getNextClass());
+			if(attribute != null) {
+				typeAliasesReplacedWithAttributes.add(Pair.of(attribute, typeAlias));
+			}
+		}
+	}
+
+	private static UMLAttribute attributeReplacingTypeAlias(UMLTypeAlias typeAlias, UMLClass otherClass, UMLClass aliasClass) {
+		for(UMLTypeAlias otherTypeAlias : otherClass.getTypeAliasList()) {
+			if(otherTypeAlias.getName().equals(typeAlias.getName())) {
+				return null;
+			}
+		}
+		for(UMLAttribute attribute : aliasClass.getAttributes()) {
+			if(attribute.getName().equals(typeAlias.getName())) {
+				return null;
+			}
+		}
+		for(UMLAttribute attribute : otherClass.getAttributes()) {
+			if(attribute.getName().equals(typeAlias.getName())) {
+				return attribute;
+			}
+		}
+		return null;
+	}
+
 	public Optional<UMLNamedExportListDiff> getNamedExportListDiff() {
 		return namedExportListDiff;
 	}
@@ -198,6 +246,7 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 			UMLTypeAliasListDiff typeAliasListDiff = new UMLTypeAliasListDiff(getOriginalClass().getTypeAliasList(), getNextClass().getTypeAliasList());
 			this.typeAliasListDiff = Optional.of(typeAliasListDiff);
 		}
+		processTypeAliasesReplacedWithAttributes();
 		processInitializers();
 		processModifiers();
 		processTypeParameters();
@@ -215,6 +264,7 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 				checkForOperationSignatureChanges(this.removedNestedOperations, this.addedOperations);
 			}
 		}
+		checkForTestsParameterizedThroughHelper(this.removedOperations);
 		processAttributes();
 		checkForAttributeChanges();
 		checkForInlinedOperations();
@@ -1984,14 +2034,28 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 				int lastIndex = nextClass.getOperations().lastIndexOf(operation);
 				int finalIndex = index;
 				if(index != lastIndex) {
-					if(containsMapperForOperation2(nextClass.getOperations().get(index))) {
+					//the equal operations without a mapper, i.e., the overloads of a Python method differing only in their return type
+					List<Integer> candidates = new ArrayList<>();
+					for(int i=index; i<=lastIndex; i++) {
+						UMLOperation candidate = nextClass.getOperations().get(i);
+						if(candidate.equals(operation) && !containsMapperForOperation2(candidate)) {
+							candidates.add(i);
+						}
+					}
+					if(candidates.isEmpty()) {
 						finalIndex = lastIndex;
 					}
-					else if(!operation.isConstructor()) {
-						double d1 = operation.getReturnParameter().getType().normalizedNameDistance(nextClass.getOperations().get(index).getReturnParameter().getType());
-						double d2 = operation.getReturnParameter().getType().normalizedNameDistance(nextClass.getOperations().get(lastIndex).getReturnParameter().getType());
-						if(d2 < d1) {
-							finalIndex = lastIndex;
+					else {
+						finalIndex = candidates.get(0);
+						if(!operation.isConstructor()) {
+							double minDistance = operation.getReturnParameter().getType().normalizedNameDistance(nextClass.getOperations().get(finalIndex).getReturnParameter().getType());
+							for(int i=1; i<candidates.size(); i++) {
+								double distance = operation.getReturnParameter().getType().normalizedNameDistance(nextClass.getOperations().get(candidates.get(i)).getReturnParameter().getType());
+								if(distance < minDistance) {
+									minDistance = distance;
+									finalIndex = candidates.get(i);
+								}
+							}
 						}
 					}
 				}
@@ -2055,7 +2119,12 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 			if(!removedOperation.getAnnotations().isEmpty() && this.getOriginalClass().uniqueAnnotation(removedOperation)) {
 				for(UMLOperation addedOperation : addedOperations) {
 					if(!addedOperation.getAnnotations().isEmpty() && this.getNextClass().uniqueAnnotation(addedOperation)) {
-						if(removedOperation.getAnnotations().equals(addedOperation.getAnnotations()) && removedOperation.hasEmptyBody() && addedOperation.hasEmptyBody()) {
+						//the unique identical annotations pair renamed operations with empty bodies, i.e., @Theory allIntsOk(int) -> @Theory theory(int),
+						//and operations with the same name whose bodies are rewritten, when an annotation has arguments identifying the operation,
+						//i.e., @router.get("/api/me") me(user) -> me(user, settings), but not a marker annotation, i.e., @Override or @Inject
+						if(removedOperation.getAnnotations().equals(addedOperation.getAnnotations()) &&
+								((removedOperation.hasEmptyBody() && addedOperation.hasEmptyBody()) ||
+								(removedOperation.getName().equals(addedOperation.getName()) && removedOperation.getAnnotations().stream().anyMatch(a -> !a.isMarkerAnnotation())))) {
 							UMLOperationBodyMapper operationBodyMapper = new UMLOperationBodyMapper(removedOperation, addedOperation, this);
 							this.addOperationBodyMapper(operationBodyMapper);
 							UMLOperationDiff operationSignatureDiff = operationBodyMapper.getOperationSignatureDiff().get();
@@ -2079,9 +2148,18 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 	private boolean removedOrAddedOperationWithIdenticalBody(UMLOperation originalOperation, UMLOperation nextOperation, List<UMLOperation> removedOperationsToBeRemoved, List<UMLOperation> addedOperationsToBeRemoved) throws RefactoringMinerTimedOutException {
 		List<String> nextOperationStringRepresentation = nextOperation.stringRepresentation();
 		List<String> originalOperationStringRepresentation = originalOperation.stringRepresentation();
+		//the operations with the same name are kept when all their statements correspond with different literals at most,
+		//i.e., generated accessors whose bit masks shift after a field is inserted, return (_has_bits_[0] & 0x04u) != 0; -> return (_has_bits_[0] & 0x08u) != 0;
+		Boolean sameNameOperationsCompletelyMapped = null;
 		if(!nextOperationStringRepresentation.equals(originalOperationStringRepresentation) && nextOperationStringRepresentation.size() > 2) {
 			for(UMLOperation removedOperation : removedOperations) {
 				if(removedOperation.stringRepresentation().equals(nextOperationStringRepresentation) && !containCallToOperation(removedOperation, originalOperation)) {
+					if(sameNameOperationsCompletelyMapped == null) {
+						sameNameOperationsCompletelyMapped = differOnlyInLiterals(originalOperation, nextOperation);
+					}
+					if(sameNameOperationsCompletelyMapped) {
+						break;
+					}
 					UMLOperationBodyMapper operationBodyMapper = new UMLOperationBodyMapper(removedOperation, nextOperation, this);
 					List<AbstractCodeMapping> exactMatchListWithoutMatchesInNestedContainers = operationBodyMapper.getExactMatchesWithoutMatchesInNestedContainers();
 					int exactMatchesWithoutMatchesInNestedContainers = exactMatchListWithoutMatchesInNestedContainers.size();
@@ -2105,6 +2183,12 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 		if(!originalOperationStringRepresentation.equals(nextOperationStringRepresentation) && originalOperationStringRepresentation.size() > 2) {
 			for(UMLOperation addedOperation : addedOperations) {
 				if(addedOperation.stringRepresentation().equals(originalOperationStringRepresentation) && !containCallToOperation(addedOperation, nextOperation)) {
+					if(sameNameOperationsCompletelyMapped == null) {
+						sameNameOperationsCompletelyMapped = differOnlyInLiterals(originalOperation, nextOperation);
+					}
+					if(sameNameOperationsCompletelyMapped) {
+						break;
+					}
 					UMLOperationBodyMapper operationBodyMapper = new UMLOperationBodyMapper(originalOperation, addedOperation, this);
 					List<AbstractCodeMapping> exactMatchListWithoutMatchesInNestedContainers = operationBodyMapper.getExactMatchesWithoutMatchesInNestedContainers();
 					int exactMatchesWithoutMatchesInNestedContainers = exactMatchListWithoutMatchesInNestedContainers.size();
@@ -2126,6 +2210,24 @@ public abstract class UMLClassBaseDiff extends UMLAbstractClassDiff implements C
 			}
 		}
 		return false;
+	}
+
+	//all statements of the two operations are mapped, identical or with a different literal
+	private boolean differOnlyInLiterals(UMLOperation operation1, UMLOperation operation2) throws RefactoringMinerTimedOutException {
+		UMLOperationBodyMapper mapper = new UMLOperationBodyMapper(operation1, operation2, this);
+		if(mapper.getMappings().isEmpty() ||
+				!mapper.getNonMappedLeavesT1().isEmpty() || !mapper.getNonMappedLeavesT2().isEmpty() ||
+				!mapper.getNonMappedInnerNodesT1().isEmpty() || !mapper.getNonMappedInnerNodesT2().isEmpty()) {
+			return false;
+		}
+		for(AbstractCodeMapping mapping : mapper.getMappings()) {
+			for(Replacement replacement : mapping.getReplacements()) {
+				if(!LITERAL_REPLACEMENTS.contains(replacement.getType())) {
+					return false;
+				}
+			}
+		}
+		return true;
 	}
 
 	protected boolean containsMapperForOperation1(UMLOperation operation) {

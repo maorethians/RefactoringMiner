@@ -2084,26 +2084,31 @@ public class CppTreeGenerator {
 	private void absorbEmptyMacros(List<Node> nodes) {
 		int previousEnd = 0;
 		for(Node node : nodes) {
-			if(node.type.equals("declaration") || node.type.equals("function_definition") || node.type.equals("field_declaration")) {
-				boolean absorbed = true;
-				while(absorbed) {
-					absorbed = false;
-					for(int[] expansion : source.expansions) {
-						if(expansion[0] >= previousEnd && expansion[1] <= node.start && skip(expansion[1], node.start) == node.start && !inExtra(expansion[0])) {
-							List<Node> tokens = tokens(expansion[0], expansion[1]);
-							Node macro = tokens.size() == 1 && tokens.get(0).type.equals("identifier") ? tokens.get(0) : macroCall(expansion[0], expansion[1]);
-							if(macro != null) {
-								node.children.add(0, macro);
-								macro.parent = node;
-								node.start = expansion[0];
-								absorbed = true;
-							}
-							break;
+			absorbEmptyMacros(node, previousEnd);
+			previousEnd = Math.max(previousEnd, node.end);
+		}
+	}
+
+	//the macros expanded to nothing between the offset and a declaration become its first children
+	private void absorbEmptyMacros(Node node, int previousEnd) {
+		if(node.type.equals("declaration") || node.type.equals("function_definition") || node.type.equals("field_declaration")) {
+			boolean absorbed = true;
+			while(absorbed) {
+				absorbed = false;
+				for(int[] expansion : source.expansions) {
+					if(expansion[0] >= previousEnd && expansion[1] <= node.start && skip(expansion[1], node.start) == node.start && !inExtra(expansion[0])) {
+						List<Node> tokens = tokens(expansion[0], expansion[1]);
+						Node macro = tokens.size() == 1 && tokens.get(0).type.equals("identifier") ? tokens.get(0) : macroCall(expansion[0], expansion[1]);
+						if(macro != null) {
+							node.children.add(0, macro);
+							macro.parent = node;
+							node.start = expansion[0];
+							absorbed = true;
 						}
+						break;
 					}
 				}
 			}
-			previousEnd = Math.max(previousEnd, node.end);
 		}
 	}
 
@@ -2226,6 +2231,7 @@ public class CppTreeGenerator {
 			int close = find(">", open, end(declaration));
 			Node parameters = node("template_parameter_list", open, close + 1, new ArrayList<>());
 			Node inner = declarationOrReparsed(specialization.getDeclaration(), Context.TOP);
+			absorbEmptyMacros(inner, close + 1);
 			return node("template_declaration", declaration, parameters, inner);
 		}
 		if(declaration instanceof IASTFunctionDefinition function) {
@@ -2281,7 +2287,11 @@ public class CppTreeGenerator {
 			parameterNodes.add(templateParameter(parameter));
 		}
 		children.add(node("template_parameter_list", open, close + 1, parameterNodes));
-		children.add(declarationOrReparsed(template.getDeclaration(), Context.TOP));
+		Node declaration = declarationOrReparsed(template.getDeclaration(), Context.TOP);
+		//the macros expanded to nothing after the template parameters belong to the declaration, like the location of the declaration in the model,
+		//i.e., GOOGLE_PROTOBUF_ATTRIBUTE_NOINLINE in template<> GOOGLE_PROTOBUF_ATTRIBUTE_NOINLINE T* Arena::CreateMaybeMessage<T>(Arena* arena) {...}
+		absorbEmptyMacros(declaration, close + 1);
+		children.add(declaration);
 		return node("template_declaration", template, children);
 	}
 
@@ -3486,8 +3496,10 @@ public class CppTreeGenerator {
 				return declaration(declarationStatement.getDeclaration(), Context.BLOCK);
 			}
 			List<Node> nodes = reparse(start(statement), end(statement), Context.BLOCK);
-			//a statement with a body that CDT parsed is converted when the code parsed again has errors, so that its body is converted
-			if(failed(nodes) && !problem(statement) && hasNestedStatement(statement)) {
+			//a statement with a body that CDT parsed is converted when the code parsed again has errors, so that its body is converted,
+			//like a declaration that CDT parsed, i.e., static const char descriptor[] GOOGLE_PROTOBUF_ATTRIBUTE_SECTION_VARIABLE(protodesc_cold) = {...};
+			//that the code parsed again in a block splits at the macro, like the declarations of the file in orDeclaration
+			if(failed(nodes) && !problem(statement) && (hasNestedStatement(statement) || statement instanceof IASTDeclarationStatement)) {
 				return statementWithoutReparse(statement);
 			}
 			if(failed(nodes)) {
@@ -3626,13 +3638,16 @@ public class CppTreeGenerator {
 			}
 			//a macro expansion or a problem followed by the semicolon or the rest of the statement, i.e., CHECK(x); where the macro ends with a semicolon,
 			//or ASSIGN_OR_RETURN(auto x, f({{a, b}}, c)); that CDT split at the argument it cannot parse, like the problem statement of the model
+			//the statements of the same expansion have its range, i.e., GET_ACTION_STRING(zoomLevel, "zoom_level"); expanded to a declaration, calls and an if statement,
+			//so they are parsed again with it as one statement, instead of a copy of the call for each of them
 			int end = end(statement);
 			int j = i + 1;
-			if(reparse(statement) && !(statement instanceof IASTCompoundStatement)) {
-				while(j < active.size() && (CppVisitor.unbalancedParentheses(content.substring(start(statement), end))
+			if(reparse(statement) && !blockInCode(statement)) {
+				while(j < active.size() && (start(active.get(j)) >= start(statement) && end(active.get(j)) <= end
+						|| (CppVisitor.unbalancedParentheses(content.substring(start(statement), end))
 						|| !content.substring(start(statement), end).stripTrailing().endsWith(";") && !content.substring(start(statement), end).stripTrailing().endsWith("}"))
-						&& (active.get(j) instanceof IASTNullStatement || active.get(j) instanceof IASTProblemHolder)) {
-					end = end(active.get(j));
+						&& (active.get(j) instanceof IASTNullStatement || active.get(j) instanceof IASTProblemHolder))) {
+					end = Math.max(end, end(active.get(j)));
 					j++;
 				}
 			}
@@ -3652,6 +3667,11 @@ public class CppTreeGenerator {
 			return node("compound_statement", start(compound), start(compound) + 1, children);
 		}
 		return node("compound_statement", compound, children);
+	}
+
+	//a block written in the code, whose statements are converted, unlike the block of an expansion, i.e., { if (x) return y; } of FLATBUFFERS_GET_FIELD_BIT_WIDTH(u, 8);
+	private boolean blockInCode(IASTStatement statement) {
+		return statement instanceof IASTCompoundStatement && content.startsWith("{", start(statement));
 	}
 
 	private Node ifStatement(IASTIfStatement ifStatement) {

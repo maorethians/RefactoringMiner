@@ -22,6 +22,7 @@ import gr.uom.java.xmi.decomposition.CompositeStatementObject;
 import gr.uom.java.xmi.decomposition.CompositeStatementObjectMapping;
 import gr.uom.java.xmi.decomposition.LeafMapping;
 import gr.uom.java.xmi.decomposition.StringBasedHeuristics;
+import gr.uom.java.xmi.decomposition.TryStatementObject;
 import gr.uom.java.xmi.decomposition.UMLOperationBodyMapper;
 import gr.uom.java.xmi.decomposition.VariableDeclaration;
 import gr.uom.java.xmi.decomposition.AbstractCall.StatementCoverageType;
@@ -278,6 +279,33 @@ public class MappingOptimizer {
 		return -1;
 	}
 
+	//a try statement split between methods, i.e., mapped to several try statements: each mapping of it is backed by statements or catch clauses of the try mapped into the try it is mapped to,
+	//and no statement or catch clause backs two of them, so all its mappings are kept, i.e., the try with the with statement and except DatabaseError
+	//in _persist_pull_request and the try with except RepositoryNotRegisteredError in _handle_pull_request_delivery
+	private static boolean splitTryStatement(List<AbstractCodeMapping> mappings, List<UMLOperationBodyMapper> mappers) {
+		Set<AbstractCodeFragment> backingChildren = new LinkedHashSet<>();
+		for(int i=0; i<mappings.size(); i++) {
+			if(!(mappings.get(i).getFragment1() instanceof TryStatementObject try1) || !(mappings.get(i).getFragment2() instanceof TryStatementObject try2) ||
+					!try1.equals(mappings.get(0).getFragment1())) {
+				return false;
+			}
+			boolean childMapped = false;
+			for(AbstractCodeMapping mapping : mappers.get(i).getMappings()) {
+				if((try1.getStatements().contains(mapping.getFragment1()) && try2.getStatements().contains(mapping.getFragment2())) ||
+						(try1.getCatchClauses().contains(mapping.getFragment1()) && try2.getCatchClauses().contains(mapping.getFragment2()))) {
+					if(!backingChildren.add(mapping.getFragment1())) {
+						return false;
+					}
+					childMapped = true;
+				}
+			}
+			if(!childMapped) {
+				return false;
+			}
+		}
+		return new LinkedHashSet<>(mappers).size() == mappers.size();
+	}
+
 	private void optimizeDuplicateMappings(Map<AbstractCodeFragment, List<AbstractCodeMapping>> oneToManyMappings,
 			Map<AbstractCodeFragment, List<UMLOperationBodyMapper>> oneToManyMappers, Collection<Refactoring> refactorings) {
 		for(Iterator<AbstractCodeFragment> it = oneToManyMappers.keySet().iterator(); it.hasNext();) {
@@ -307,6 +335,9 @@ public class MappingOptimizer {
 				}
 			}
 			if(identicalExtractedMethod && exactMappers == mappers.size()) {
+				continue;
+			}
+			if(splitTryStatement(mappings, mappers)) {
 				continue;
 			}
 			Iterator<AbstractCodeMapping> mappingIterator = mappings.iterator();
@@ -535,7 +566,7 @@ public class MappingOptimizer {
 					}
 				}
 				if(!anonymousClassDeclarationMatch && !splitConditional && !splitDeclaration)
-					determineIndicesToBeRemoved(nestedMapper, identical, exactMappingsNestedUnderCompositeExcludingBlocks, replacementTypeCount, replacementCoversEntireStatement, extractInlineOverlappingRefactoring, indicesToBeRemoved, editDistances, compositeChildMatchingScores);
+					determineIndicesToBeRemovedAmongRemaining(nestedMapper, identical, exactMappingsNestedUnderCompositeExcludingBlocks, replacementTypeCount, replacementCoversEntireStatement, extractInlineOverlappingRefactoring, indicesToBeRemoved, editDistances, compositeChildMatchingScores);
 			}
 			else if(parentIsContainerBody.contains(true)) {
 				boolean splitConditional = false;
@@ -739,6 +770,38 @@ public class MappingOptimizer {
 			}
 		}
 		return matchingParentMappers;
+	}
+
+	//the mappings that are not already removed still compete, i.e., for(match : matches) is mapped by the parent mapper to for(arg : call.arguments()) with replacements,
+	//and exactly by the mappers of addRow, extracted twice, so the mapping of the second extraction, without a parent mapping, is removed and the parent mapping still loses
+	private void determineIndicesToBeRemovedAmongRemaining(List<Boolean> nestedMapper, List<Boolean> identical,
+			List<Integer> exactMappingsNestedUnderCompositeExcludingBlocks,
+			List<Integer> replacementTypeCount, List<Boolean> replacementCoversEntireStatement,
+			List<Boolean> extractInlineOverlappingRefactoring, Set<Integer> indicesToBeRemoved, List<Double> editDistances, List<Double> compositeChildMatchingScores) {
+		List<Integer> remaining = new ArrayList<>();
+		for(int i=0; i<identical.size(); i++) {
+			if(!indicesToBeRemoved.contains(i)) {
+				remaining.add(i);
+			}
+		}
+		if(remaining.size() < 2) {
+			return;
+		}
+		Set<Integer> remainingIndicesToBeRemoved = new LinkedHashSet<>();
+		determineIndicesToBeRemoved(sublist(nestedMapper, remaining), sublist(identical, remaining), sublist(exactMappingsNestedUnderCompositeExcludingBlocks, remaining),
+				sublist(replacementTypeCount, remaining), sublist(replacementCoversEntireStatement, remaining), sublist(extractInlineOverlappingRefactoring, remaining),
+				remainingIndicesToBeRemoved, sublist(editDistances, remaining), sublist(compositeChildMatchingScores, remaining));
+		for(int index : remainingIndicesToBeRemoved) {
+			indicesToBeRemoved.add(remaining.get(index));
+		}
+	}
+
+	private static <T> List<T> sublist(List<T> list, List<Integer> indices) {
+		List<T> sublist = new ArrayList<>();
+		for(int index : indices) {
+			sublist.add(list.get(index));
+		}
+		return sublist;
 	}
 
 	private void determineIndicesToBeRemoved(List<Boolean> nestedMapper, List<Boolean> identical,

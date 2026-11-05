@@ -12,6 +12,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -1374,12 +1375,32 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 		}
 		else {
 			//the changed type annotations of the declarations are TYPE replacements, not text differences
-			String s1 = removeGenericTypeAfterDot(StringBasedHeuristics.withoutChangedTypeAnnotations(this.getFragment1().getString(), this.getFragment1(), this.getFragment2()).toLowerCase());
+			String s1 = removeGenericTypeAfterDot(StringBasedHeuristics.withoutChangedTypeAnnotations(withMigratedConversions(this.getFragment1().getString()), this.getFragment1(), this.getFragment2()).toLowerCase());
 			String s2 = removeGenericTypeAfterDot(StringBasedHeuristics.withoutChangedTypeAnnotations(this.getFragment2().getString(), this.getFragment2(), this.getFragment1()).toLowerCase());
 			int distance = StringDistance.editDistance(s1, s2);
 			distance1 = (double)distance/(double)Math.max(s1.length(), s2.length());
 		}
 		return distance1;
+	}
+
+	private static final Pattern PRIMITIVE_CAST = Pattern.compile("^\\((byte|short|int|long|float|double|char)\\)\\s*(.+)$");
+
+	//the Java primitive casts replaced with their Kotlin conversions are not text differences, i.e., (int)byteCount -> byteCount.toInt()
+	private String withMigratedConversions(String s1) {
+		if(!LANG1.equals(Constants.JAVA) || !LANG2.equals(Constants.KOTLIN)) {
+			return s1;
+		}
+		for(Replacement r : getReplacements()) {
+			Matcher cast = PRIMITIVE_CAST.matcher(r.getBefore());
+			if(cast.matches()) {
+				String type = cast.group(1);
+				String conversion = cast.group(2) + ".to" + Character.toUpperCase(type.charAt(0)) + type.substring(1) + "()";
+				if(r.getAfter().equals(conversion)) {
+					s1 = s1.replace(r.getBefore(), r.getAfter());
+				}
+			}
+		}
+		return s1;
 	}
 
 	private boolean referencesMapping(LeafMapping o) {
@@ -1433,6 +1454,19 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 		return s;
 	}
 
+	//a Java if (or else-if) migrated to a Kotlin when entry
+	private boolean ifBranchMigratedToWhenEntry(CompositeStatementObject parent1, CompositeStatementObject parent2) {
+		return LANG1.equals(Constants.JAVA) && LANG2.equals(Constants.KOTLIN) &&
+				parent1.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
+				parent2.getLocationInfo().getCodeElementType().equals(CodeElementType.WHEN_ENTRY);
+	}
+
+	private static boolean sameCondition(CompositeStatementObject composite1, CodeElementType type1, CompositeStatementObject composite2, CodeElementType type2) {
+		List<String> conditions1 = composite1.getExpressions().stream().filter(e -> e.getLocationInfo().getCodeElementType().equals(type1)).map(e -> e.getString()).toList();
+		List<String> conditions2 = composite2.getExpressions().stream().filter(e -> e.getLocationInfo().getCodeElementType().equals(type2)).map(e -> e.getString()).toList();
+		return !conditions1.isEmpty() && conditions1.equals(conditions2);
+	}
+
 	private boolean identicalDepthIndexAndParentType() {
 		if(getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_STATEMENT) &&
 				getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_STATEMENT)) {
@@ -1462,9 +1496,14 @@ public class LeafMapping extends AbstractCodeMapping implements Comparable<LeafM
 			parent2 = parent2.getParent();
 		}
 		if(parent1 != null && parent2 != null) {
-			if(parent1.getLocationInfo().getCodeElementType().equals(parent2.getLocationInfo().getCodeElementType()) &&
+			boolean ifBranchMigratedToWhenEntry = ifBranchMigratedToWhenEntry(parent1, parent2);
+			if((parent1.getLocationInfo().getCodeElementType().equals(parent2.getLocationInfo().getCodeElementType()) || ifBranchMigratedToWhenEntry) &&
 					!parent1.getLocationInfo().getCodeElementType().equals(CodeElementType.CATCH_CLAUSE)) {
 				if(parent1.getString().equals(parent2.getString()) && !parent1.getString().equals(LANG1.TRY)) {
+					return true;
+				}
+				//the Java if/else-if branches become the entries of a Kotlin when, i.e., if (byteCount <= PAYLOAD_BYTE_MAX) -> byteCount <= PAYLOAD_BYTE_MAX ->
+				if(ifBranchMigratedToWhenEntry && sameCondition(parent1, CodeElementType.IF_STATEMENT_CONDITION, parent2, CodeElementType.WHEN_ENTRY_CONDITION)) {
 					return true;
 				}
 				boolean multipleVarDeclarations = false;

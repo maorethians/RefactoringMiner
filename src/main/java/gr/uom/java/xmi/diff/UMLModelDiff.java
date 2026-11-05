@@ -117,6 +117,7 @@ public class UMLModelDiff {
 	private Map<Replacement, Set<CandidateAttributeRefactoring>> renameMap = new LinkedHashMap<Replacement, Set<CandidateAttributeRefactoring>>();
 	private Map<MergeVariableReplacement, Set<CandidateMergeVariableRefactoring>> mergeMap = new LinkedHashMap<MergeVariableReplacement, Set<CandidateMergeVariableRefactoring>>();
 	private List<UMLCommentListDiff> commentsMovedBetweenClasses = new ArrayList<UMLCommentListDiff>();
+	private List<UMLCommentListDiff> commentsMovedBetweenElements = new ArrayList<UMLCommentListDiff>();
 	private Map<MethodInvocationReplacement, UMLOperationBodyMapper> consistentMethodInvocationRenames = new LinkedHashMap<>();
 	private List<UMLClassMoveDiff> classMoveDiffListToBePostProcessed = new ArrayList<>();
 
@@ -426,6 +427,10 @@ public class UMLModelDiff {
 
 	public List<UMLCommentListDiff> getCommentsMovedBetweenClasses() {
 		return commentsMovedBetweenClasses;
+	}
+
+	public List<UMLCommentListDiff> getCommentsMovedBetweenElements() {
+		return commentsMovedBetweenElements;
 	}
 
 	public boolean commonlyImplementedOperations(UMLOperation operation1, UMLOperation operation2, UMLClassBaseDiff classDiff2) {
@@ -3636,7 +3641,8 @@ public class UMLModelDiff {
 		newInvocations.removeAll(intersection);
 		for(AbstractCall newInvocation : newInvocations) {
 			for(UMLOperation operation : addedOperations) {
-				if(!operation.isAbstract() && !operation.hasEmptyBody() &&
+				//a method is not extracted from its own body, i.e., the call parseHeaderOf(it) in parseHeaderOf(hprofFile) calls the overload parseHeaderOf(source)
+				if(!operation.equals(addedOperation) && !operation.isAbstract() && !operation.hasEmptyBody() &&
 						!refactoringListContainsAnotherMoveRefactoringWithTheSameAddedOperation(operation) &&
 						newInvocation.matchesOperation(operation, addedOperation, classDiff, this)) {
 					//check if removedOperation has nested operation with the same name. possible extraction of nested operation to parent container
@@ -5043,6 +5049,9 @@ public class UMLModelDiff {
 											else
 												ref = new MoveOperationRefactoring(operationBodyMapper);
 											inferredMoveOperationRefactorings.add(ref);
+											//the variables of the inferred move, i.e., the unchanged parameters matched in the AST diff, as for the other moved operations
+											operationBodyMapper.computeRefactoringsWithinBody();
+											inferredMoveOperationRefactorings.addAll(operationBodyMapper.getRefactoringsAfterPostProcessing());
 											UMLOperationDiff operationSignatureDiff = operationBodyMapper.getOperationSignatureDiff().get();
 											Set<Refactoring> signatureRefactorings = operationSignatureDiff.getRefactorings();
 											inferredMoveOperationRefactorings.addAll(signatureRefactorings);
@@ -5072,6 +5081,9 @@ public class UMLModelDiff {
 											else
 												ref = new MoveOperationRefactoring(operationBodyMapper);
 											inferredMoveOperationRefactorings.add(ref);
+											//the variables of the inferred move, i.e., the unchanged parameters matched in the AST diff, as for the other moved operations
+											operationBodyMapper.computeRefactoringsWithinBody();
+											inferredMoveOperationRefactorings.addAll(operationBodyMapper.getRefactoringsAfterPostProcessing());
 											UMLOperationDiff operationSignatureDiff = operationBodyMapper.getOperationSignatureDiff().get();
 											Set<Refactoring> signatureRefactorings = operationSignatureDiff.getRefactorings();
 											inferredMoveOperationRefactorings.addAll(signatureRefactorings);
@@ -5087,6 +5099,7 @@ public class UMLModelDiff {
 		}
 		refactorings.addAll(inferredMoveOperationRefactorings);
 		removeFalseMappingsOfExtractedAndInlinedCode();
+		commentsMovedBetweenElements = CommentsMovedBetweenElements.match(this, refactorings);
 		return filterOutDuplicateRefactorings(refactorings);
 	}
 
