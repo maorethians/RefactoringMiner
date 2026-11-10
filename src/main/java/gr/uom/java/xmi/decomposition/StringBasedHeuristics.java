@@ -3,6 +3,7 @@ package gr.uom.java.xmi.decomposition;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -19,6 +20,7 @@ import org.refactoringminer.util.PathFileUtils;
 import org.refactoringminer.util.PrefixSuffixUtils;
 
 import gr.uom.java.xmi.Constants;
+import gr.uom.java.xmi.InferredType;
 import gr.uom.java.xmi.LeafType;
 import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.UMLAnonymousClass;
@@ -1323,13 +1325,6 @@ public class StringBasedHeuristics {
 	public static boolean differOnlyInThis(String s1, String s2, Constants LANG1, Constants LANG2) {
 		if(differOnlyInPrefix(s1, s2, "", LANG1.THIS_DOT, LANG2.THIS_DOT)) {
 			return true;
-		}
-		if(LANG1.equals(Constants.TYPESCRIPT) && LANG2.equals(Constants.TYPESCRIPT) && s1.contains("\n") && s2.contains("\n")) {
-			s1 = s1.replaceAll("\s", "").replaceAll("\n", "").replaceAll(",", "");
-			s2 = s2.replaceAll("\s", "").replaceAll("\n", "").replaceAll(",", "");
-			if(s1.equals(s2)) {
-				return true;
-			}
 		}
 		if(s1.startsWith("(") && s1.endsWith(")") && !s2.startsWith("(") && !s2.endsWith(")")) {
 			s1 = s1.substring(1, s1.length()-1);
@@ -3410,6 +3405,13 @@ public class StringBasedHeuristics {
 						assignment1.equals(replacement.getBefore()) &&
 						assignment2.equals(replacement.getAfter()))
 					rightHandSideReplacement = true;
+				//an assignment of a boolean literal and the declaration of another variable, i.e., major = true; and var options = me.options;
+				//two assignments or two declarations can migrate a flag to an enum, i.e., params.use_mmap = false; and params.load_mode = LLAMA_LOAD_MODE_NONE;
+				else if(replacement.getType().equals(ReplacementType.BOOLEAN_REPLACED_WITH_VARIABLE) &&
+						statement1.getVariableDeclarations().size() != statement2.getVariableDeclarations().size() &&
+						assignment1.equals(replacement.getBefore()) &&
+						assignment2.equals(replacement.getAfter()))
+					rightHandSideReplacement = true;
 				else if(replacement.getType().equals(ReplacementType.VARIABLE_REPLACED_WITH_STRING_LITERAL) &&
 						assignment1.equals(replacement.getBefore()) &&
 						assignment2.equals(replacement.getAfter()) &&
@@ -3827,7 +3829,10 @@ public class StringBasedHeuristics {
 					initializerReplacement = true;
 				}
 			}
-			if((LANG1.equals(Constants.PYTHON) || LANG2.equals(Constants.PYTHON)) && variableRename && (initializerReplacement || nullInitializer || zeroArgumentClassInstantiation || classInstantiationArgumentReplacement)) {
+			//without declared types (Python, or JavaScript/TypeScript declarations with inferred types), the type cannot support the match
+			boolean python = LANG1.equals(Constants.PYTHON) || LANG2.equals(Constants.PYTHON);
+			boolean untyped = python || (type1 instanceof InferredType && type2 instanceof InferredType);
+			if(untyped && variableRename && (initializerReplacement || nullInitializer || zeroArgumentClassInstantiation || classInstantiationArgumentReplacement)) {
 				boolean thisInitializer = initializer1 != null && initializer1.getExpression().startsWith(LANG1.THIS_DOT) &&
 						initializer2 != null && initializer2.getExpression().startsWith(LANG2.THIS_DOT);
 				boolean functionLevelScope = container1.getBody() != null && container2.getBody() != null &&
@@ -3835,7 +3840,8 @@ public class StringBasedHeuristics {
 						v1.getLocationInfo().getFilePath().equals(v2.getLocationInfo().getFilePath()) &&
 						v1.getScope().getEndOffset() == container1.getBody().getCompositeStatement().getLocationInfo().getEndOffset() &&
 						v2.getScope().getEndOffset() == container2.getBody().getCompositeStatement().getLocationInfo().getEndOffset();
-				if(!thisInitializer && !functionLevelScope) {
+				//only Python declares every variable at function level, i.e., var declarations of JavaScript at function level are not exempted
+				if(!thisInitializer && (!functionLevelScope || !python)) {
 					return true;
 				}
 			}
@@ -4016,6 +4022,16 @@ public class StringBasedHeuristics {
 
 	//the type annotation following the declared name, i.e., ": Promise<any>[]" in const promises: Promise<any>[] = []
 	private static String typeAnnotation(AbstractCodeFragment fragment, VariableDeclaration declaration) {
+		String printedAnnotation = declaration.getTypeAnnotation();
+		if(printedAnnotation != null) {
+			//TypeScript statements are printed, so the source offsets do not index their strings
+			String s = fragment.getString();
+			String name = declaration.getVariableName();
+			if(name != null && (s.contains(name + printedAnnotation) || s.contains(name + "?" + printedAnnotation))) {
+				return printedAnnotation;
+			}
+			return null;
+		}
 		LocationInfo typeLocation = declaration.getType().getLocationInfo();
 		if(typeLocation == null || declaration.getVariableName() == null || !typeLocation.getFilePath().equals(fragment.getLocationInfo().getFilePath())) {
 			return null;
@@ -4399,9 +4415,14 @@ public class StringBasedHeuristics {
 				ternaryConditionals2.add(ternary.getThenExpression().getString());
 				ternaryConditionals2.add(ternary.getElseExpression().getString());
 			}
+			//the condition of an if statement compared with a statement whose expression became a ternary operator with a condition sharing a variable through a replacement,
+			//i.e., the variable assigned in the if statement replaced with the ternary operator, is a candidate conditional replaced with a ternary
+			boolean ifConditionOfStatement1 = statement1 instanceof AbstractExpression expression1 && expression1.getOwner() != null &&
+					expression1.getOwner().getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT);
 			boolean containsTernaryOperatorReplacement = false;
 			for(Replacement replacement : info.getReplacements()) {
-				if(replacement.getAfter().contains(LANG2.TERNARY_CONDITION) && replacement.getAfter().contains(LANG2.TERNARY_ELSE)) {
+				if(replacement.getAfter().contains(LANG2.TERNARY_CONDITION) && replacement.getAfter().contains(LANG2.TERNARY_ELSE) &&
+						!(ifConditionOfStatement1 && !replacement.getBefore().contains(LANG1.TERNARY_CONDITION) && ternaryConditionSharesVariable(statement1, statement2))) {
 					containsTernaryOperatorReplacement = true;
 				}
 			}
@@ -5734,5 +5755,20 @@ public class StringBasedHeuristics {
 		return parent != null && parent.getLocationInfo().getCodeElementType().equals(CodeElementType.IF_STATEMENT) &&
 				child.getLocationInfo().getCodeElementType().equals(CodeElementType.BLOCK) &&
 				parent.getStatements().size() == 2 && parent.getStatements().indexOf(child) == 1;
+	}
+
+	private static boolean ternaryConditionSharesVariable(AbstractCodeFragment ifCondition, AbstractCodeFragment statement2) {
+		Set<String> variables1 = new HashSet<>();
+		for(LeafExpression variable : ifCondition.getVariables()) {
+			variables1.add(variable.getString());
+		}
+		for(TernaryOperatorExpression ternary : statement2.getTernaryOperatorExpressions()) {
+			for(LeafExpression variable : ternary.getCondition().getVariables()) {
+				if(variables1.contains(variable.getString())) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 }

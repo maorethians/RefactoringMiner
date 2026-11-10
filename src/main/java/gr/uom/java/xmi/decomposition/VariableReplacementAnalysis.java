@@ -57,6 +57,7 @@ import gr.uom.java.xmi.diff.ReplaceGenericWithDiamondRefactoring;
 import gr.uom.java.xmi.diff.SplitVariableRefactoring;
 import gr.uom.java.xmi.diff.UMLAbstractClassDiff;
 import gr.uom.java.xmi.diff.UMLAnnotationDiff;
+import gr.uom.java.xmi.diff.UMLAnonymousClassDiff;
 import gr.uom.java.xmi.diff.UMLAnnotationListDiff;
 import gr.uom.java.xmi.diff.UMLClassBaseDiff;
 import gr.uom.java.xmi.diff.UMLModelDiff;
@@ -84,9 +85,12 @@ public class VariableReplacementAnalysis {
 	private Set<VariableDeclaration> removedVariables = new LinkedHashSet<>();
 	private Set<VariableDeclaration> removedVariablesStoringTheReturnOfInlinedMethod = new LinkedHashSet<>();
 	private Set<VariableDeclaration> removedVariablesInAnonymousClassDeclarations = new LinkedHashSet<>();
+	private Map<VariableDeclaration, VariableDeclarationContainer> nestedScopesOfRemovedVariables = new LinkedHashMap<>();
     private Set<VariableDeclaration> addedVariables = new LinkedHashSet<>();
     private Set<VariableDeclaration> addedVariablesStoringTheReturnOfExtractedMethod = new LinkedHashSet<>();
     private Set<VariableDeclaration> addedVariablesInAnonymousClassDeclarations = new LinkedHashSet<>();
+	private Map<VariableDeclaration, VariableDeclarationContainer> nestedScopesOfAddedVariables = new LinkedHashMap<>();
+	private Map<VariableDeclarationContainer, VariableDeclarationContainer> matchedNestedScopes = new LinkedHashMap<>();
     private Set<Pair<VariableDeclaration, VariableDeclaration>> matchedVariables = new LinkedHashSet<>();
     private Set<Pair<VariableDeclaration, VariableDeclaration>> movedVariables = new LinkedHashSet<>();
 	private Set<RenameVariableRefactoring> variableRenames = new LinkedHashSet<RenameVariableRefactoring>();
@@ -114,6 +118,14 @@ public class VariableReplacementAnalysis {
 		this.nonMappedInnerNodesT2 = mapper.getNonMappedInnerNodesT2();
 		this.operation1 = mapper.getContainer1();
 		this.operation2 = mapper.getContainer2();
+		for(UMLAnonymousClassDiff anonymousClassDiff : mapper.getAnonymousClassDiffs()) {
+			for(UMLOperationBodyMapper anonymousMapper : anonymousClassDiff.getOperationBodyMapperList()) {
+				matchedNestedScopes.put(anonymousMapper.getContainer1(), anonymousMapper.getContainer2());
+			}
+		}
+		collectMatchedLambdas(mapper.getLambdaMappers());
+		collectLambdaParameters(operation1.getAllLambdas(), nestedScopesOfRemovedVariables);
+		collectLambdaParameters(operation2.getAllLambdas(), nestedScopesOfAddedVariables);
 		this.parameterNameList1 = mapper.getParameterNameList1();
 		this.parameterNameList2 = mapper.getParameterNameList2();
 		this.aliasedVariablesInOriginalMethod = operation1.aliasedVariables();
@@ -147,6 +159,9 @@ public class VariableReplacementAnalysis {
 					List<VariableDeclaration> allVariableDeclarations = operation.getAllVariableDeclarations();
 					this.removedVariables.addAll(allVariableDeclarations);
 					this.removedVariablesInAnonymousClassDeclarations.addAll(allVariableDeclarations);
+					for(VariableDeclaration declaration : allVariableDeclarations) {
+						nestedScopesOfRemovedVariables.put(declaration, operation);
+					}
 				}
 			}
 			this.addedVariables.addAll(operation2.getAllVariableDeclarations());
@@ -155,6 +170,9 @@ public class VariableReplacementAnalysis {
 					List<VariableDeclaration> allVariableDeclarations = operation.getAllVariableDeclarations();
 					this.addedVariables.addAll(allVariableDeclarations);
 					this.addedVariablesInAnonymousClassDeclarations.addAll(allVariableDeclarations);
+					for(VariableDeclaration declaration : allVariableDeclarations) {
+						nestedScopesOfAddedVariables.put(declaration, operation);
+					}
 				}
 			}
 		}
@@ -163,7 +181,7 @@ public class VariableReplacementAnalysis {
 			this.addedVariables.remove(matchedVariable.getRight());
 			this.matchedVariables.add(matchedVariable);
 			if(!matchedVariable.getLeft().getVariableName().equals(matchedVariable.getRight().getVariableName())) {
-				Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(matchedVariable.getLeft(), matchedVariable.getRight(), mappings, classDiff, modelDiff);
+				Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(matchedVariable.getLeft(), matchedVariable.getRight(), mappings);
 				RenameVariableRefactoring ref = new RenameVariableRefactoring(matchedVariable.getLeft(), matchedVariable.getRight(), operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 				variableRenames.add(ref);
 				getVariableRefactorings(matchedVariable.getLeft(), matchedVariable.getRight(), operation1, operation2, variableReferences, ref);
@@ -505,7 +523,7 @@ public class VariableReplacementAnalysis {
 								}
 							}
 							Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
-							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
+							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable) && !declaredInDifferentNestedScopes(removedVariable, addedVariable)) {
 								removedVariablesToBeRemoved.add(removedVariable);
 								addedVariablesToBeRemoved.add(addedVariable);
 								matchedVariables.add(pair);
@@ -530,7 +548,7 @@ public class VariableReplacementAnalysis {
 								}
 							}
 							Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
-							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
+							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable) && !declaredInDifferentNestedScopes(removedVariable, addedVariable)) {
 								removedVariablesToBeRemoved.add(removedVariable);
 								addedVariablesToBeRemoved.add(addedVariable);
 								matchedVariables.add(pair);
@@ -555,7 +573,7 @@ public class VariableReplacementAnalysis {
 								}
 							}
 							Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
-							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable)) {
+							if(!matchedVariables.contains(pair) && addedVariable.getVariableName().equals(removedVariable.getVariableName()) && equalType(removedVariable, addedVariable) && !declaredInDifferentNestedScopes(removedVariable, addedVariable)) {
 								removedVariablesToBeRemoved.add(removedVariable);
 								addedVariablesToBeRemoved.add(addedVariable);
 								matchedVariables.add(pair);
@@ -770,7 +788,7 @@ public class VariableReplacementAnalysis {
 					Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 					if(!matchedVariables.contains(pair) && removedVariable.getVariableName().equals(addedVariable.getVariableName()) && !bothCatchExceptionVariables(removedVariable, addedVariable) &&
 							!containerElementRelationship(removedVariable, addedVariable) && mappedStatementWithinVariableScopes(removedVariable, addedVariable)) {
-						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings, classDiff, modelDiff);
+						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings);
 						removedVariablesToBeRemoved.add(removedVariable);
 						addedVariablesToBeRemoved.add(addedVariable);
 						matchedVariables.add(pair);
@@ -793,7 +811,7 @@ public class VariableReplacementAnalysis {
 					Pair<VariableDeclaration, VariableDeclaration> pair = Pair.of(removedVariable, addedVariable);
 					if(!matchedVariables.contains(pair) && removedVariable.getVariableName().equals(addedVariable.getVariableName()) && !bothCatchExceptionVariables(removedVariable, addedVariable) &&
 							!containerElementRelationship(removedVariable, addedVariable) && mappedStatementWithinVariableScopes(removedVariable, addedVariable)) {
-						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings, classDiff, modelDiff);
+						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings);
 						removedVariablesToBeRemoved.add(removedVariable);
 						addedVariablesToBeRemoved.add(addedVariable);
 						matchedVariables.add(pair);
@@ -834,6 +852,53 @@ public class VariableReplacementAnalysis {
 			}
 		}
 		return isRemovedVariableCatchException && isAddedVariableCatchException;
+	}
+
+	private void collectMatchedLambdas(Set<UMLOperationBodyMapper> lambdaMappers) {
+		for(UMLOperationBodyMapper lambdaMapper : lambdaMappers) {
+			if(!matchedNestedScopes.containsKey(lambdaMapper.getContainer1())) {
+				matchedNestedScopes.put(lambdaMapper.getContainer1(), lambdaMapper.getContainer2());
+				collectMatchedLambdas(lambdaMapper.getLambdaMappers());
+			}
+		}
+	}
+
+	private static void collectLambdaParameters(List<LambdaExpressionObject> lambdas, Map<VariableDeclaration, VariableDeclarationContainer> nestedScopes) {
+		for(LambdaExpressionObject lambda : lambdas) {
+			for(VariableDeclaration parameter : lambda.getParameters()) {
+				nestedScopes.putIfAbsent(parameter, lambda);
+			}
+			collectLambdaParameters(lambda.getAllLambdas(), nestedScopes);
+		}
+	}
+
+	//the variables of nested scopes (operations of anonymous classes and lambdas) matched with other scopes are not matched by name,
+	//i.e., index of getLabelForIndex(index, datasetIndex) is not matched with index of the next method tickFormatFunction(tick, index, ticks),
+	//and message of the callback of addType('tag', ...) is not matched with message of the callback of addType('existingTag', ...),
+	//but recoveryVersion of getLogFile(long recoveryVersion) is matched with that of the renamed getLogFiles(final long recoveryVersion)
+	private boolean declaredInDifferentNestedScopes(VariableDeclaration removedVariable, VariableDeclaration addedVariable) {
+		VariableDeclarationContainer scope1 = nestedScopesOfRemovedVariables.get(removedVariable);
+		VariableDeclarationContainer scope2 = nestedScopesOfAddedVariables.get(addedVariable);
+		if(scope1 == null || scope2 == null) {
+			return false;
+		}
+		VariableDeclarationContainer matched2 = matchedNestedScopes.get(scope1);
+		if(matched2 != null) {
+			return !matched2.equals(scope2);
+		}
+		if(matchedNestedScopes.containsValue(scope2)) {
+			return true;
+		}
+		//the scopes are within mapped statements, whose counterparts do not contain the other scope,
+		//i.e., the callbacks of this.commandHandler.resolver.addType('tag', ...) and addType('existingTag', ...)
+		for(AbstractCodeMapping mapping : mappings) {
+			boolean contains1 = mapping.getFragment1().getLocationInfo().subsumes(scope1.getLocationInfo());
+			boolean contains2 = mapping.getFragment2().getLocationInfo().subsumes(scope2.getLocationInfo());
+			if(contains1 != contains2) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private boolean mappedStatementWithinVariableScopes(VariableDeclaration removedVariable, VariableDeclaration addedVariable) {
@@ -1098,7 +1163,7 @@ public class VariableReplacementAnalysis {
 					VariableDeclaration declaration2 = declarations2.get(i);
 					if(declaration1.getVariableName().equals(declaration2.getVariableName())) {
 						if(equalType(declaration2, declaration1) && declaration1.equalQualifiedType(declaration2)) {
-							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 							removedVariables.remove(declaration1);
 							addedVariables.remove(declaration2);
 							matchedVariables.add(Pair.of(declaration1, declaration2));
@@ -1106,7 +1171,7 @@ public class VariableReplacementAnalysis {
 						}
 						else if(!containsVariableDeclarationWithSameNameAndType(declaration1, declarations2) &&
 								!containsVariableDeclarationWithSameNameAndType(declaration2, declarations1)) {
-							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 							removedVariables.remove(declaration1);
 							addedVariables.remove(declaration2);
 							matchedVariables.add(Pair.of(declaration1, declaration2));
@@ -1120,7 +1185,7 @@ public class VariableReplacementAnalysis {
 				VariableDeclaration declaration2 = declarations2.get(0);
 				if(declaration1.getVariableName().equals(declaration2.getVariableName())) {
 					if(equalType(declaration2, declaration1) && declaration1.equalQualifiedType(declaration2)) {
-						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 						removedVariables.remove(declaration1);
 						addedVariables.remove(declaration2);
 						matchedVariables.add(Pair.of(declaration1, declaration2));
@@ -1128,7 +1193,7 @@ public class VariableReplacementAnalysis {
 					}
 					else if(!containsVariableDeclarationWithSameNameAndType(declaration1, declarations2) &&
 							!containsVariableDeclarationWithSameNameAndType(declaration2, declarations1)) {
-						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+						Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 						removedVariables.remove(declaration1);
 						addedVariables.remove(declaration2);
 						matchedVariables.add(Pair.of(declaration1, declaration2));
@@ -1180,7 +1245,7 @@ public class VariableReplacementAnalysis {
 					for(UMLAttribute addedAttribute : addedAttributes) {
 						VariableDeclaration declaration2 = addedAttribute.getVariableDeclaration();
 						if(declaration1.getVariableName().equals(declaration2.getVariableName()) && equalType(declaration2, declaration1)) {
-							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 							if(variableReferences.size() > 0) {
 								RenameVariableRefactoring refactoring = new RenameVariableRefactoring(declaration1, declaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 								refactorings.add(refactoring);
@@ -1196,7 +1261,7 @@ public class VariableReplacementAnalysis {
 						for(UMLAttribute addedAttribute : addedAttributes) {
 							VariableDeclaration declaration2 = addedAttribute.getVariableDeclaration();
 							if(declaration1.getVariableName().equals(declaration2.getVariableName()) && equalType(declaration2, declaration1)) {
-								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 								if(variableReferences.size() > 0) {
 									RenameVariableRefactoring refactoring = new RenameVariableRefactoring(declaration1, declaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 									refactorings.add(refactoring);
@@ -1212,7 +1277,7 @@ public class VariableReplacementAnalysis {
 					for(UMLAttribute removedAttribute : removedAttributes) {
 						VariableDeclaration declaration1 = removedAttribute.getVariableDeclaration();
 						if(declaration1.getVariableName().equals(declaration2.getVariableName()) && equalType(declaration2, declaration1)) {
-							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 							if(variableReferences.size() > 0) {
 								RenameVariableRefactoring refactoring = new RenameVariableRefactoring(declaration1, declaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 								refactorings.add(refactoring);
@@ -1228,7 +1293,7 @@ public class VariableReplacementAnalysis {
 						for(UMLAttribute removedAttribute : removedAttributes) {
 							VariableDeclaration declaration1 = removedAttribute.getVariableDeclaration();
 							if(declaration1.getVariableName().equals(declaration2.getVariableName()) && equalType(declaration2, declaration1)) {
-								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 								if(variableReferences.size() > 0) {
 									RenameVariableRefactoring refactoring = new RenameVariableRefactoring(declaration1, declaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 									refactorings.add(refactoring);
@@ -1343,7 +1408,7 @@ public class VariableReplacementAnalysis {
 							else {
 								for(VariableDeclaration declaration1 : mapping.getFragment1().getVariableDeclarations()) {
 									if(declaration1.getVariableName().equals(declaration2.getVariableName()) && equalType(declaration2, declaration1)) {
-										Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+										Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 										if(variableReferences.size() > 0 && mapping.getFragment2().getVariableDeclaration(declaration1.getVariableName()) == null) {
 											RenameVariableRefactoring refactoring = new RenameVariableRefactoring(declaration1, declaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 											refactorings.add(refactoring);
@@ -1391,7 +1456,7 @@ public class VariableReplacementAnalysis {
 							else {
 								for(VariableDeclaration declaration2 : mapping.getFragment2().getVariableDeclarations()) {
 									if(declaration1.getVariableName().equals(declaration2.getVariableName()) && equalType(declaration2, declaration1)) {
-										Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings, classDiff, modelDiff);
+										Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(declaration1, declaration2, mappings);
 										if(variableReferences.size() > 0 && mapping.getFragment1().getVariableDeclaration(declaration2.getVariableName()) == null) {
 											RenameVariableRefactoring refactoring = new RenameVariableRefactoring(declaration1, declaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
 											refactorings.add(refactoring);
@@ -1748,7 +1813,7 @@ public class VariableReplacementAnalysis {
 					for(VariableDeclaration removedVariable : removedVariables) {
 						for(VariableDeclaration addedVariable : splitVariables) {
 							if(removedVariable.getVariableName().equals(addedVariable.getVariableName()) && equalType(addedVariable, removedVariable)) {
-								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings, classDiff, modelDiff);
+								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings);
 								matchedVariables.add(Pair.of(removedVariable, addedVariable));
 								getVariableRefactorings(removedVariable, addedVariable, oldVariable.getValue(), operationAfter, variableReferences, null);
 								break;
@@ -1758,7 +1823,7 @@ public class VariableReplacementAnalysis {
 					for(VariableDeclaration addedVariable : addedVariables) {
 						VariableDeclaration removedVariable = oldVariable.getKey();
 						if(removedVariable.getVariableName().equals(addedVariable.getVariableName()) && equalType(addedVariable, removedVariable)) {
-							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings, classDiff, modelDiff);
+							Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings);
 							matchedVariables.add(Pair.of(removedVariable, addedVariable));
 							getVariableRefactorings(removedVariable, addedVariable, oldVariable.getValue(), operationAfter, variableReferences, null);
 							break;
@@ -2028,7 +2093,7 @@ public class VariableReplacementAnalysis {
 						for(VariableDeclaration removedVariable : removedVariables) {
 							VariableDeclaration addedVariable = newVariable.getKey();
 							if(removedVariable.getVariableName().equals(addedVariable.getVariableName()) && equalType(addedVariable, removedVariable)) {
-								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings, classDiff, modelDiff);
+								Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings);
 								matchedVariables.add(Pair.of(removedVariable, addedVariable));
 								getVariableRefactorings(removedVariable, addedVariable, operationBefore, newVariable.getValue(), variableReferences, null);
 								break;
@@ -2037,7 +2102,7 @@ public class VariableReplacementAnalysis {
 						for(VariableDeclaration addedVariable : addedVariables) {
 							for(VariableDeclaration removedVariable : mergedVariables) {
 								if(removedVariable.getVariableName().equals(addedVariable.getVariableName()) && equalType(addedVariable, removedVariable)) {
-									Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings, classDiff, modelDiff);
+									Set<AbstractCodeMapping> variableReferences = VariableReferenceExtractor.findReferences(removedVariable, addedVariable, mappings);
 									matchedVariables.add(Pair.of(removedVariable, addedVariable));
 									getVariableRefactorings(removedVariable, addedVariable, operationBefore, newVariable.getValue(), variableReferences, null);
 									break;
@@ -2118,7 +2183,7 @@ public class VariableReplacementAnalysis {
 					variableDeclaration2.getLocationInfo().getCodeElementType().equals(CodeElementType.LAMBDA_EXPRESSION_PARAMETER);
 			if((variableReferences.size() > 1 && consistencyCheck(variableDeclaration1, variableDeclaration2, variableReferences)) ||
 					(variableReferences.size() == 1 && (replacementInLocalVariableDeclaration(vdReplacement.getVariableNameReplacement(), variableReferences) || lambdaParameter))) {
-				Set<AbstractCodeMapping> additionalReferences = VariableReferenceExtractor.findReferences(variableDeclaration1, variableDeclaration2, mappings, classDiff, modelDiff);
+				Set<AbstractCodeMapping> additionalReferences = VariableReferenceExtractor.findReferences(variableDeclaration1, variableDeclaration2, mappings);
 				Set<AbstractCodeMapping> allReferences = new LinkedHashSet<AbstractCodeMapping>();
 				allReferences.addAll(variableReferences);
 				allReferences.addAll(additionalReferences);
@@ -2174,7 +2239,7 @@ public class VariableReplacementAnalysis {
 							actualReferences.add(mapping);
 						}
 					}
-					Set<AbstractCodeMapping> additionalReferences = VariableReferenceExtractor.findReferences(variableDeclaration1, variableDeclaration2, mappings, classDiff, modelDiff);
+					Set<AbstractCodeMapping> additionalReferences = VariableReferenceExtractor.findReferences(variableDeclaration1, variableDeclaration2, mappings);
 					actualReferences.addAll(additionalReferences);
 					RenameVariableRefactoring ref = new RenameVariableRefactoring(variableDeclaration1, variableDeclaration2, operation1, operation2, actualReferences, insideExtractedOrInlinedMethod);
 					if(!existsConflictingExtractVariableRefactoring(ref) && !existsConflictingMergeVariableRefactoring(ref) && !existsConflictingSplitVariableRefactoring(ref) && !existsConflictingParameter(ref) &&

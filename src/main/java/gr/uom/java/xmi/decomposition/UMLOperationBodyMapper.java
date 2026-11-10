@@ -4325,17 +4325,21 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		}
 	}
 
+	//a leaf of an expanded lambda body is already non-mapped when the lambda mapper of its statement left it unmapped,
+	//i.e., the body of useEffect(() => {...}) expanded because its nested lambdas changed
 	private void updateNonMappedLeavesT1(List<AbstractCodeFragment> leaves1) {
 		for(AbstractCodeFragment leaf : leaves1) {
-			if(!mappingHashcodesT1.contains(leaf.hashCode())) {
+			if(!mappingHashcodesT1.contains(leaf.hashCode()) && !nonMappedLeavesT1.contains(leaf)) {
 				nonMappedLeavesT1.add(leaf);
 			}
 		}
 	}
 
+	//a leaf of an expanded lambda body is already non-mapped when the lambda mapper of its statement left it unmapped,
+	//i.e., the body of useEffect(() => {...}) expanded because its nested lambdas changed
 	private void updateNonMappedLeavesT2(List<AbstractCodeFragment> leaves2) {
 		for(AbstractCodeFragment leaf : leaves2) {
-			if(!mappingHashcodesT2.contains(leaf.hashCode())) {
+			if(!mappingHashcodesT2.contains(leaf.hashCode()) && !nonMappedLeavesT2.contains(leaf)) {
 				nonMappedLeavesT2.add(leaf);
 			}
 		}
@@ -13396,20 +13400,31 @@ public class UMLOperationBodyMapper implements Comparable<UMLOperationBodyMapper
 		return false;
 	}
 
+	//the siblings of a nested mapper include the child mappers of its ancestors, i.e., the duplicated code of buildLabel(...) extracted from one branch
+	//of the original method, while the other branch is extracted into calculateLabel(...) calling buildLabel(...),
+	//except the mappers of the same call, which reach the same extraction through another call tree
 	private LeafMapping parentOrSiblingMapperContainsMapping(Set<LeafMapping> mappings) {
 		if(parentMapper != null) {
 			for(LeafMapping mapping : mappings) {
 				if(parentMapper.mappings.contains(mapping)) {
 					return mapping;
 				}
-				for(UMLOperationBodyMapper childMapper : parentMapper.getChildMappers()) {
-					if(childMapper.mappings.contains(mapping)) {
-						return mapping;
+				for(UMLOperationBodyMapper ancestor = parentMapper; ancestor != null; ancestor = ancestor.getParentMapper()) {
+					for(UMLOperationBodyMapper childMapper : ancestor.getChildMappers()) {
+						if(!sameCall(childMapper) && childMapper.mappings.contains(mapping)) {
+							return mapping;
+						}
 					}
 				}
 			}
 		}
 		return null;
+	}
+
+	//calls with the same text are equal, so the calls are compared by their locations
+	private boolean sameCall(UMLOperationBodyMapper mapper) {
+		return operationInvocation != null && mapper.operationInvocation != null &&
+				operationInvocation.getLocationInfo().equals(mapper.operationInvocation.getLocationInfo());
 	}
 
 	public boolean parentMapperContainsMapping(AbstractCodeFragment statement) {
