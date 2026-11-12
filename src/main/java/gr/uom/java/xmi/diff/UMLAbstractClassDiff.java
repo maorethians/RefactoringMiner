@@ -39,6 +39,7 @@ import gr.uom.java.xmi.JavaFileProcessor;
 import gr.uom.java.xmi.LeafType;
 import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.LocationInfo.CodeElementType;
+import gr.uom.java.xmi.ModuleContainer;
 import gr.uom.java.xmi.SourceAnnotation;
 import gr.uom.java.xmi.UMLAbstractClass;
 import gr.uom.java.xmi.UMLAnnotation;
@@ -1441,6 +1442,39 @@ public abstract class UMLAbstractClassDiff {
 		return candidateAttributeSplits;
 	}
 
+	//the removed attributes whose values are arguments of the initializer of the new attribute, like those of the merged attributes found from the replacements,
+	//i.e., TOOL_NAME = "RefactoringMiner" and SCHEMA_VERSION = "1" with OUTPUT_KEY and OUTPUT_TYPE merged to REFACTORING_RUNS = AnalysisKind(tool_name="RefactoringMiner", ..., schema_version="1"),
+	//used only by the code moved to another file
+	private Set<UMLAttribute> addRemovedAttributesPassedToInitializer(Set<UMLAttribute> mergedAttributes, UMLAttribute newAttribute) {
+		if(newAttribute.getVariableDeclaration() == null || newAttribute.getVariableDeclaration().getInitializer() == null) {
+			return mergedAttributes;
+		}
+		AbstractExpression initializer = newAttribute.getVariableDeclaration().getInitializer();
+		AbstractCall call = initializer.creationCoveringEntireFragment() != null ? initializer.creationCoveringEntireFragment() : initializer.invocationCoveringEntireFragment();
+		if(call == null) {
+			return mergedAttributes;
+		}
+		List<String> arguments = call.arguments();
+		for(UMLAttribute mergedAttribute : mergedAttributes) {
+			if(!passedToInitializer(mergedAttribute, arguments)) {
+				return mergedAttributes;
+			}
+		}
+		Set<UMLAttribute> extended = new LinkedHashSet<UMLAttribute>();
+		for(UMLAttribute attribute : originalClass.getAttributes()) {
+			if(mergedAttributes.contains(attribute) ||
+					(findAttributeInNextClass(attribute.getName()) == null && passedToInitializer(attribute, arguments))) {
+				extended.add(attribute);
+			}
+		}
+		return extended.containsAll(mergedAttributes) ? extended : mergedAttributes;
+	}
+
+	private static boolean passedToInitializer(UMLAttribute attribute, List<String> arguments) {
+		VariableDeclaration declaration = attribute.getVariableDeclaration();
+		return declaration != null && declaration.getInitializer() != null && arguments.contains(declaration.getInitializer().getString());
+	}
+
 	public List<Refactoring> getRefactorings() throws RefactoringMinerTimedOutException {
 		List<Refactoring> originalRefactorings = new ArrayList<Refactoring>(this.refactorings);
 		List<Refactoring> refactorings = new ArrayList<Refactoring>(this.refactorings);
@@ -1492,6 +1526,7 @@ public abstract class UMLAbstractClassDiff {
 			for(CandidateMergeVariableRefactoring candidate : set) {
 				if(mergedVariables.size() > 1 && mergedVariables.size() == merge.getMergedVariables().size() && a2 != null &&
 						mergedAttributes.size() > 0 && mergedAttributes.iterator().next().getClassName().equals(a2.getClassName())) {
+					mergedAttributes = addRemovedAttributesPassedToInitializer(mergedAttributes, a2);
 					MergeAttributeRefactoring ref = new MergeAttributeRefactoring(mergedAttributes, a2, getOriginalClassName(), getNextClassName(), set);
 					if(!refactorings.contains(ref)) {
 						refactorings.add(ref);
@@ -6256,6 +6291,10 @@ public abstract class UMLAbstractClassDiff {
 	}
 
 	protected List<UMLOperationBodyMapper> checkForExtractedOperations() throws RefactoringMinerTimedOutException {
+		return checkForExtractedOperations(getOperationBodyMapperListIncludingNestedMappersInAnonymousClassDiffs());
+	}
+
+	protected List<UMLOperationBodyMapper> checkForExtractedOperations(List<UMLOperationBodyMapper> allMappers) throws RefactoringMinerTimedOutException {
 		List<UMLOperation> operationsToBeRemoved = new ArrayList<UMLOperation>();
 		List<UMLOperationBodyMapper> extractedOperationMappers = new ArrayList<UMLOperationBodyMapper>();
 		Set<UMLOperationBodyMapper> nestedFunctionMappers = new LinkedHashSet<>();
@@ -6273,7 +6312,6 @@ public abstract class UMLAbstractClassDiff {
 			allAddedOperations.addAll(addedOp.getNestedOperations());
 		}
 		allAddedOperations.addAll(outerClassAddedOperations);
-		List<UMLOperationBodyMapper> allMappers = getOperationBodyMapperListIncludingNestedMappersInAnonymousClassDiffs();
 		for(UMLOperationBodyMapper mapper : allMappers) {
 			ExtractOperationDetection detection = new ExtractOperationDetection(mapper, allAddedOperations, this, modelDiff);
 			List<UMLOperation> sortedAddedOperations = detection.getAddedOperationsSortedByCalls();
@@ -6333,7 +6371,11 @@ public abstract class UMLAbstractClassDiff {
 								operationBodyMapper.getOperation2() != null &&
 								mapper.getOperation2().getNestedOperations().size() < operationBodyMapper.getOperation1().getNestedOperations().size() &&
 								addedOperation.getNestedOperations().size() > 0) {
-							nestedFunctionMappers.addAll(processNestedOperationsForExtractedMethod(operationBodyMapper.getOperation1(), addedOperation));
+							nestedFunctionMappers.addAll(processNestedOperationsForExtractedMethod(operationBodyMapper.getOperation1().getNestedOperations(), addedOperation));
+						}
+						//the functions of a module are its nested functions, i.e., root() nested in create_app() extracted from the module statements
+						else if(operationBodyMapper.getContainer1() instanceof ModuleContainer && addedOperation.getNestedOperations().size() > 0) {
+							nestedFunctionMappers.addAll(processNestedOperationsForExtractedMethod(new ArrayList<>(removedOperations), addedOperation));
 						}
 						extractedOperationMappers.add(operationBodyMapper);
 						mapper.addChildMapper(operationBodyMapper);
@@ -6368,9 +6410,9 @@ public abstract class UMLAbstractClassDiff {
 		return extractedOperationMappers;
 	}
 
-	private Set<UMLOperationBodyMapper> processNestedOperationsForExtractedMethod(UMLOperation operation1, UMLOperation operation2) throws RefactoringMinerTimedOutException {
+	private Set<UMLOperationBodyMapper> processNestedOperationsForExtractedMethod(List<UMLOperation> operations1, UMLOperation operation2) throws RefactoringMinerTimedOutException {
 		Set<UMLOperationBodyMapper> nestedMappers = new LinkedHashSet<>();
-		for(UMLOperation operation : operation1.getNestedOperations()) {
+		for(UMLOperation operation : operations1) {
 			UMLOperation operationWithTheSameSignature = operation2.nestedOperationWithTheSameSignatureIgnoringChangedTypes(operation);
 			if(removedOperations.contains(operation) && operationWithTheSameSignature != null && !mapperListContainsOperation(operation, operationWithTheSameSignature)) {
 				UMLOperationBodyMapper mapper = new UMLOperationBodyMapper(operation, operationWithTheSameSignature, this);

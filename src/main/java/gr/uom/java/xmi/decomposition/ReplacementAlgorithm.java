@@ -1,5 +1,8 @@
 package gr.uom.java.xmi.decomposition;
 
+import java.util.Comparator;
+import gr.uom.java.xmi.decomposition.replacement.JsxElementReplacement;
+import gr.uom.java.xmi.diff.JsxElementDiff;
 import static gr.uom.java.xmi.decomposition.CodeBlockBetweenComments.generateCodeBlock;
 import static gr.uom.java.xmi.decomposition.OperationInvocation.PRIMITIVE_WRAPPER_CLASS_MAP;
 import static gr.uom.java.xmi.decomposition.StringBasedHeuristics.*;
@@ -13,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -1111,7 +1115,31 @@ public class ReplacementAlgorithm {
 			if(declarationInlinedToObjectAttribute(statement1, statement2, replacementInfo, operationBodyMapper)) {
 				return replacementInfo.getReplacements();
 			}
+			if(jsxElementsReplaced(statement1, statement2, replacementInfo)) {
+				return replacementInfo.getReplacements();
+			}
+			if(sameVariableAssignedWithAnotherCallOnTheSameValue()) {
+				return replacementInfo.getReplacements();
+			}
 			return null;
+		}
+
+		//the same variable is assigned with another call transforming the same value, its first argument, which is a call itself,
+		//i.e., masks = tf.tile(tf.expand_dims(tril, 0), [tf.shape(outputs)[0], 1, 1]) -> masks = tf.expand_dims(tf.expand_dims(tril, 0), 1)
+		private boolean sameVariableAssignedWithAnotherCallOnTheSameValue() {
+			if(assignmentInvocationCoveringTheEntireStatement1 instanceof OperationInvocation call1 && assignmentInvocationCoveringTheEntireStatement2 instanceof OperationInvocation call2 &&
+					statement1.getString().contains(LANG1.ASSIGNMENT) && statement2.getString().contains(LANG2.ASSIGNMENT) &&
+					statement1.getString().substring(0, statement1.getString().indexOf(LANG1.ASSIGNMENT)).equals(statement2.getString().substring(0, statement2.getString().indexOf(LANG2.ASSIGNMENT))) &&
+					!call1.getName().equals(call2.getName()) && Objects.equals(call1.getExpression(), call2.getExpression()) &&
+					call1.arguments().size() > 0 && call2.arguments().size() > 0) {
+				String value1 = call1.arguments().get(0);
+				String value2 = call2.arguments().get(0);
+				if(value1.equals(value2) && value1.contains("(")) {
+					replacementInfo.addReplacement(new MethodInvocationReplacement(call1.actualString(), call2.actualString(), call1, call2, ReplacementType.METHOD_INVOCATION_NAME_AND_ARGUMENT));
+					return true;
+				}
+			}
+			return false;
 		}
 
 		private Set<Replacement> matchAssignedCallChains() throws RefactoringMinerTimedOutException {
@@ -1971,7 +1999,18 @@ public class ReplacementAlgorithm {
 
 		private void findExpressionReplacements() throws RefactoringMinerTimedOutException {
 			findReplacements(variablesInitializedWith(variables1, objectLiterals2, container1), objectLiterals2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_OBJECT_LITERAL, container1, container2, classDiff);
-			findReplacements(objectLiterals1, variablesInitializedWith(variables2, objectLiterals1, container2), replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_OBJECT_LITERAL, container1, container2, classDiff);
+			Set<String> initializedVariables2 = variablesInitializedWith(variables2, objectLiterals1, container2);
+			if(initializedVariables2.isEmpty() && operationBodyMapper.getCallSiteOperation() != null && operationBodyMapper.getParameterToArgumentMap2().isPresent() &&
+					operationBodyMapper.getParameterToArgumentMap2().get().size() > 0) {
+				//the arguments replacing the parameters of the extracted method are variables of the call site, i.e., setup(location) in setup(coords) { mock({ coords }); }
+				Set<String> arguments2 = new LinkedHashSet<>(variables2);
+				arguments2.retainAll(operationBodyMapper.getParameterToArgumentMap2().get().values());
+				//the call can be in a lambda of the call site, i.e., in the test it('...', () => {...}) of a test suite
+				AbstractCall call = operationBodyMapper.getOperationInvocation();
+				VariableDeclarationContainer callContainer = call != null && call.getContainer() instanceof LambdaExpressionObject lambda ? lambda : operationBodyMapper.getCallSiteOperation();
+				initializedVariables2 = variablesInitializedWith(arguments2, objectLiterals1, callContainer);
+			}
+			findReplacements(objectLiterals1, initializedVariables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_OBJECT_LITERAL, container1, container2, classDiff);
 			
 			findReplacements(methodInvocations1, arrayAccesses2, replacementInfo, ReplacementType.ARRAY_ACCESS_REPLACED_WITH_METHOD_INVOCATION, container1, container2, classDiff);
 			findReplacements(arrayAccesses1, methodInvocations2, replacementInfo, ReplacementType.ARRAY_ACCESS_REPLACED_WITH_METHOD_INVOCATION, container1, container2, classDiff);
@@ -5526,11 +5565,33 @@ public class ReplacementAlgorithm {
 			return CONTINUE_MATCHING;
 		}
 
+		//the returned attribute is replaced with a getter on the same receiver, i.e., return self.ops.base -> return self.ops.get_base(numerical)
+		private boolean attributeReturnReplacedWithGetter() {
+			if(variableReturnQualified1 && invocationCoveringTheEntireStatement2 != null && invocationCoveringTheEntireStatement2.getExpression() != null) {
+				String attribute = statement1.getVariables().get(0).getString();
+				int index = attribute.lastIndexOf(".");
+				String qualifier = attribute.substring(0, index);
+				String name = attribute.substring(index + 1);
+				return qualifier.equals(invocationCoveringTheEntireStatement2.getExpression()) &&
+						invocationCoveringTheEntireStatement2.getName().toLowerCase().contains(name.toLowerCase());
+			}
+			if(variableReturnQualified2 && invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement1.getExpression() != null) {
+				String attribute = statement2.getVariables().get(0).getString();
+				int index = attribute.lastIndexOf(".");
+				String qualifier = attribute.substring(0, index);
+				String name = attribute.substring(index + 1);
+				return qualifier.equals(invocationCoveringTheEntireStatement1.getExpression()) &&
+						invocationCoveringTheEntireStatement1.getName().toLowerCase().contains(name.toLowerCase());
+			}
+			return false;
+		}
+
 		private Set<Replacement> matchReturnStatements() throws RefactoringMinerTimedOutException {
+			boolean attributeGetter = false;
 			if(parentMapper == null && ((!numberLiteralReturn1 && !numberLiteralReturn2) || singleReturnStatement) && statement1.getString().startsWith(LANG1.RETURN_SPACE) && statement2.getString().startsWith(LANG2.RETURN_SPACE) && lastStatement &&
-					variableReturnQualified1 == variableReturnQualified2 && container1 instanceof UMLOperation && container2 instanceof UMLOperation &&
-					(!variableReturnAsLastStatement1 || declaresSingleVariable(replacementInfo.getStatements1(), statement1)) &&
-					((possibleExtract = declaresSingleVariable(replacementInfo.getStatements2(), statement2)) || !variableReturnAsLastStatement2) &&
+					(variableReturnQualified1 == variableReturnQualified2 || (attributeGetter = attributeReturnReplacedWithGetter())) && container1 instanceof UMLOperation && container2 instanceof UMLOperation &&
+					(!variableReturnAsLastStatement1 || attributeGetter || declaresSingleVariable(replacementInfo.getStatements1(), statement1)) &&
+					(attributeGetter || (possibleExtract = declaresSingleVariable(replacementInfo.getStatements2(), statement2)) || !variableReturnAsLastStatement2) &&
 					compatibleSignatureForFinalReturnStatement(operationBodyMapper) &&
 					(statement1.getLambdas().size() == statement2.getLambdas().size() || possibleExtract)) {
 				boolean callToAddedOperation = false;
@@ -5862,6 +5923,76 @@ public class ReplacementAlgorithm {
 
 	//the declared variable became an attribute with the same name and initializer in an object literal,
 	//i.e., const routeStartsAndEndsSameFloor = startNode.floor === endNode.floor -> const context = { ..., routeStartsAndEndsSameFloor: startNode.floor === endNode.floor }
+	//the statements differ only in corresponding JSX elements, i.e., resizeDrag = (<Draggable onStop={handleStop} zIndex={999}>...</Draggable>)
+	//-> resizeDrag = (<Draggable onStop={(e, data) => handleStop(...)}>...</Draggable>), where each pair of different elements is a JSX element replacement
+	//holding their diff, and the replacements already found within the elements are kept (i.e., handleStop -> the lambda)
+	private static boolean jsxElementsReplaced(AbstractCodeFragment statement1, AbstractCodeFragment statement2, ReplacementInfo replacementInfo) {
+		List<JsxElement> elements1 = outermostJsxElements(statement1.getJsxElements());
+		List<JsxElement> elements2 = outermostJsxElements(statement2.getJsxElements());
+		if(elements1.isEmpty() || elements1.size() != elements2.size()) {
+			return false;
+		}
+		String s1 = statement1.getString();
+		List<JsxElementDiff> diffs = new ArrayList<>();
+		for(int i=0; i<elements1.size(); i++) {
+			JsxElement element1 = elements1.get(i);
+			JsxElement element2 = elements2.get(i);
+			if(element1.getString().equals(element2.getString())) {
+				continue;
+			}
+			JsxElementDiff diff = new JsxElementDiff(element1, element2);
+			if(!diff.isCounterpart()) {
+				return false;
+			}
+			int index = s1.indexOf(element1.getString());
+			if(index < 0) {
+				return false;
+			}
+			s1 = s1.substring(0, index) + element2.getString() + s1.substring(index + element1.getString().length());
+			diffs.add(diff);
+		}
+		if(diffs.isEmpty() || !s1.equals(statement2.getString())) {
+			return false;
+		}
+		Set<Replacement> outsideElements = new LinkedHashSet<>();
+		for(Replacement replacement : replacementInfo.getReplacements()) {
+			boolean withinElements = false;
+			for(JsxElementDiff diff : diffs) {
+				if(diff.getElement1().getString().contains(replacement.getBefore()) && diff.getElement2().getString().contains(replacement.getAfter())) {
+					withinElements = true;
+					break;
+				}
+			}
+			if(!withinElements) {
+				outsideElements.add(replacement);
+			}
+		}
+		replacementInfo.removeReplacements(outsideElements);
+		for(JsxElementDiff diff : diffs) {
+			replacementInfo.addReplacement(new JsxElementReplacement(diff));
+		}
+		return true;
+	}
+
+	//the JSX elements not nested in another element of the same statement, in source order
+	private static List<JsxElement> outermostJsxElements(List<JsxElement> elements) {
+		List<JsxElement> outermost = new ArrayList<>();
+		for(JsxElement element : elements) {
+			boolean nested = false;
+			for(JsxElement other : elements) {
+				if(other != element && other.getLocationInfo().subsumes(element.getLocationInfo())) {
+					nested = true;
+					break;
+				}
+			}
+			if(!nested) {
+				outermost.add(element);
+			}
+		}
+		outermost.sort(Comparator.comparingInt(e -> e.getLocationInfo().getStartOffset()));
+		return outermost;
+	}
+
 	private static boolean declarationInlinedToObjectAttribute(AbstractCodeFragment statement1, AbstractCodeFragment statement2, ReplacementInfo replacementInfo, UMLOperationBodyMapper operationBodyMapper) {
 		if(statement1.getVariableDeclarations().size() == 1 && statement1.getVariableDeclarations().get(0).getInitializer() != null) {
 			VariableDeclaration declaration1 = statement1.getVariableDeclarations().get(0);
@@ -6097,10 +6228,37 @@ public class ReplacementAlgorithm {
 			nameIntersection.retainAll(parameterNameList2);
 			return (parameterTypeCompatible && parameterNameCompatible) || (typeIntersection.size() >= 2 && nameIntersection.size() >= 2);
 		}
+		//the parameters differ only by parameters with default values, so the existing calls remain valid, i.e., def get_base(self) -> def get_base(self, numerical=False)
+		if(operationBodyMapper.getOperation1().getName().equals(operationBodyMapper.getOperation2().getName()) && operationBodyMapper.getOperation1().compatibleReturnParameter(operationBodyMapper.getOperation2()) &&
+				onlyParametersWithDefaultValuesDiffer(operationBodyMapper.getOperation1(), operationBodyMapper.getOperation2())) {
+			return true;
+		}
 		if(operationBodyMapper.getOperation1().getName().contains(operationBodyMapper.getOperation2().getName()) || operationBodyMapper.getOperation2().getName().contains(operationBodyMapper.getOperation1().getName())) {
 			return parameterTypeList1.equals(parameterTypeList2) && operationBodyMapper.getOperation1().compatibleReturnParameter(operationBodyMapper.getOperation2());
 		}
 		return false;
+	}
+
+	private static boolean onlyParametersWithDefaultValuesDiffer(UMLOperation operation1, UMLOperation operation2) {
+		List<UMLParameter> parameters1 = operation1.getParametersWithoutReturnType();
+		List<UMLParameter> parameters2 = operation2.getParametersWithoutReturnType();
+		if(parameters1.size() == parameters2.size()) {
+			return false;
+		}
+		List<UMLParameter> fewer = parameters1.size() < parameters2.size() ? parameters1 : parameters2;
+		List<UMLParameter> more = parameters1.size() < parameters2.size() ? parameters2 : parameters1;
+		for(int i=0; i<more.size(); i++) {
+			UMLParameter parameter = more.get(i);
+			if(i < fewer.size()) {
+				if(!parameter.getName().equals(fewer.get(i).getName())) {
+					return false;
+				}
+			}
+			else if(parameter.getVariableDeclaration() == null || parameter.getVariableDeclaration().getInitializer() == null) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private static boolean wrapInMethodCall(String s1, String s2, Map<String, List<AbstractCall>> methodInvocationMap1, ReplacementInfo info) {
@@ -7535,9 +7693,12 @@ public class ReplacementAlgorithm {
 				if(lambdas1.size() < lambdas2.size()) {
 					for(int i=0; i<lambdas1.size(); i++) {
 						LambdaExpressionObject lambda1 = lambdas1.get(i);
-						List<LambdaExpressionObject> filtered2 = lambdas2.stream().filter(l -> l.getBodyHashCode() == lambda1.getBodyHashCode()).collect(Collectors.toList());
+						List<LambdaExpressionObject> filtered2 = sameLambdas(lambda1, lambdas2);
 						if(filtered2.size() == 1) {
 							processLambdas(lambda1, filtered2.get(0), replacementInfo, operationBodyMapper, false);
+						}
+						else if(filtered2.size() > 1 && lambda1.getBody() == null && filtered2.get(0).getString().equals(lambda1.getString())) {
+							processLambdas(lambda1, filtered2.get(Math.min(sameTextOccurrence(lambda1, lambdas1), filtered2.size()-1)), replacementInfo, operationBodyMapper, false);
 						}
 						else {
 							for(int j=0; j<lambdas2.size(); j++) {
@@ -7557,9 +7718,12 @@ public class ReplacementAlgorithm {
 				else {
 					for(int j=0; j<lambdas2.size(); j++) {
 						LambdaExpressionObject lambda2 = lambdas2.get(j);
-						List<LambdaExpressionObject> filtered1 = lambdas1.stream().filter(l -> l.getBodyHashCode() == lambda2.getBodyHashCode()).collect(Collectors.toList());
+						List<LambdaExpressionObject> filtered1 = sameLambdas(lambda2, lambdas1);
 						if(filtered1.size() == 1) {
 							processLambdas(filtered1.get(0), lambda2, replacementInfo, operationBodyMapper, false);
+						}
+						else if(filtered1.size() > 1 && lambda2.getBody() == null && filtered1.get(0).getString().equals(lambda2.getString())) {
+							processLambdas(filtered1.get(Math.min(sameTextOccurrence(lambda2, lambdas2), filtered1.size()-1)), lambda2, replacementInfo, operationBodyMapper, false);
 						}
 						else {
 							for(int i=0; i<lambdas1.size(); i++) {
@@ -7664,6 +7828,33 @@ public class ReplacementAlgorithm {
 			}
 		}
 		return null;
+	}
+
+	//lambdas without a block body, i.e., method references and expression lambdas, all have the same body hash code,
+	//so those with the same text are preferred, i.e., PlanNamedTypes::writeAggregateExec is paired with the identical reference
+	//and not with every other method reference of the statement
+	private static List<LambdaExpressionObject> sameLambdas(LambdaExpressionObject lambda, List<LambdaExpressionObject> others) {
+		if(lambda.getBody() == null) {
+			List<LambdaExpressionObject> sameText = others.stream().filter(l -> l.getBody() == null && l.getString().equals(lambda.getString())).collect(Collectors.toList());
+			if(sameText.size() > 0) {
+				return sameText;
+			}
+		}
+		return others.stream().filter(l -> l.getBodyHashCode() == lambda.getBodyHashCode()).collect(Collectors.toList());
+	}
+
+	//the position of the lambda among the lambdas of its statement with the same text, so that repeated identical method references are paired in order
+	private static int sameTextOccurrence(LambdaExpressionObject lambda, List<LambdaExpressionObject> lambdas) {
+		int occurrence = 0;
+		for(LambdaExpressionObject other : lambdas) {
+			if(other == lambda) {
+				break;
+			}
+			if(other.getBody() == null && other.getString().equals(lambda.getString())) {
+				occurrence++;
+			}
+		}
+		return occurrence;
 	}
 
 	protected static void processLambdas(LambdaExpressionObject lambda1, LambdaExpressionObject lambda2,

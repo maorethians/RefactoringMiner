@@ -2,6 +2,7 @@ package gr.uom.java.xmi.diff;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.ListIterator;
@@ -12,6 +13,7 @@ import java.util.Set;
 import org.refactoringminer.api.Refactoring;
 import org.refactoringminer.api.RefactoringMinerTimedOutException;
 
+import gr.uom.java.xmi.ModuleContainer;
 import gr.uom.java.xmi.UMLOperation;
 import gr.uom.java.xmi.UMLParameter;
 import gr.uom.java.xmi.VariableDeclarationContainer;
@@ -24,9 +26,11 @@ import gr.uom.java.xmi.decomposition.AbstractCodeMapping;
 import gr.uom.java.xmi.decomposition.AbstractExpression;
 import gr.uom.java.xmi.decomposition.CompositeStatementObject;
 import gr.uom.java.xmi.decomposition.CompositeStatementObjectMapping;
+import gr.uom.java.xmi.decomposition.JsxElement;
 import gr.uom.java.xmi.decomposition.LambdaExpressionObject;
 import gr.uom.java.xmi.decomposition.LeafExpression;
 import gr.uom.java.xmi.decomposition.LeafMapping;
+import gr.uom.java.xmi.decomposition.MethodReference;
 import gr.uom.java.xmi.decomposition.OperationInvocation;
 import gr.uom.java.xmi.decomposition.ReplacementUtil;
 import gr.uom.java.xmi.decomposition.StatementObject;
@@ -120,13 +124,30 @@ public class ExtractOperationDetection {
 		return sorted;
 	}
 
+	//an inline function replaced with the added function passed by its name, i.e., onStop={(e) => {...}} replaced with onStop={handleStop}
+	private static boolean lambdaReplacedWithFunctionReference(UMLOperationBodyMapper mapper, UMLOperation addedOperation) {
+		for(AbstractCodeMapping mapping : mapper.getMappings()) {
+			if(!mapping.isExact() && mapping.getFragment1().getLambdas().size() > mapping.getFragment2().getLambdas().size()) {
+				for(JsxElement element : mapping.getFragment2().getJsxElements()) {
+					for(MethodReference reference : element.getFunctionReferences()) {
+						if(reference.getName().equals(addedOperation.getName())) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+		return false;
+	}
+
 	public List<ExtractOperationRefactoring> check(UMLOperation addedOperation) throws RefactoringMinerTimedOutException {
 		List<ExtractOperationRefactoring> refactorings = new ArrayList<ExtractOperationRefactoring>();
 		if(modelDiff != null && modelDiff.refactoringListContainsAnotherMoveRefactoringWithTheSameAddedOperation(addedOperation)) {
 			return refactorings;
 		}
 		if(!mapper.getNonMappedLeavesT1().isEmpty() || !mapper.getNonMappedInnerNodesT1().isEmpty() ||
-			!mapper.getReplacementsInvolvingMethodInvocation().isEmpty() || mapper.containsCompositeMappingWithoutReplacements() || mapper.containsLambdaMapper()) {
+			!mapper.getReplacementsInvolvingMethodInvocation().isEmpty() || mapper.containsCompositeMappingWithoutReplacements() || mapper.containsLambdaMapper() ||
+			lambdaReplacedWithFunctionReference(mapper, addedOperation)) {
 			List<AbstractCall> addedOperationInvocations = callCountMap != null ? callCountMap.get(addedOperation) : matchingInvocations(addedOperation, operationInvocations, mapper.getContainer2());
 			if(addedOperationInvocations.size() > 0 && !invocationMatchesWithOperationHavingDefaultParameterValues(addedOperationInvocations.get(0), mapper.getContainer1().getAllOperationInvocations())) {
 				int otherAddedMethodsCalled = 0;
@@ -143,7 +164,9 @@ public class ExtractOperationDetection {
 					}
 				}
 				//check if the source method contains more statements than (addedOperationInvocations.size() * addedOperation statements)
-				if(otherAddedMethodsCalledWithSameOrMoreCallSites == 0 && (otherAddedMethodsCalled == 0 || mapper.getContainer1().stringRepresentation().size() > addedOperationInvocations.size() * addedOperation.stringRepresentation().size())) {
+				//the calls in the tests of a test suite describe('...', () => {...}) are in separate tests, like calls in separate methods
+				boolean moduleWithTestSuites = mapper.getContainer1() instanceof ModuleContainer module && !module.getDescribeMap().isEmpty();
+				if((otherAddedMethodsCalledWithSameOrMoreCallSites == 0 || moduleWithTestSuites) && (otherAddedMethodsCalled == 0 || mapper.getContainer1().stringRepresentation().size() > addedOperationInvocations.size() * addedOperation.stringRepresentation().size())) {
 					List<AbstractCall> sortedInvocations = sortInvocationsBasedOnArgumentOccurrences(addedOperationInvocations);
 					for(AbstractCall addedOperationInvocation : sortedInvocations) {
 						processAddedOperation(addedOperation, refactorings, sortedInvocations, addedOperationInvocation);
@@ -435,7 +458,9 @@ public class ExtractOperationDetection {
 		if(mapper.getClassDiff() != null) {
 			List<String> variableReferences = mapper.getContainer2().getAllVariables();
 			for(UMLAttribute attribute : mapper.getClassDiff().getNextClass().getAttributes()) {
-				if(variableReferences.contains(attribute.getName()) && attribute.getVariableDeclaration().getInitializer() != null) {
+				//the module-level attributes are code of the module, i.e., app = create_app() in a Python module
+				if((variableReferences.contains(attribute.getName()) || mapper.getContainer2() instanceof ModuleContainer) &&
+						attribute.getVariableDeclaration() != null && attribute.getVariableDeclaration().getInitializer() != null) {
 					List<AbstractCall> invocations = attribute.getVariableDeclaration().getInitializer().getAllOperationInvocations();
 					for(AbstractCall invocation : invocations) {
 						if(!operationInvocations.contains(invocation))
@@ -460,7 +485,38 @@ public class ExtractOperationDetection {
 		for(AbstractCodeFragment statement : mapper.getNonMappedLeavesT2()) {
 			addStatementInvocations(operationInvocations, statement);
 		}
+		addFunctionReferencesInJsxElements(operationInvocations, mapper);
 		return operationInvocations;
+	}
+
+	//the functions passed by their name to JSX elements outside the exactly mapped statements, i.e., handleStop in <Draggable onStop={handleStop} />,
+	//which call the function extracted from the replaced inline function <Draggable onStop={(e) => {...}} />
+	private static void addFunctionReferencesInJsxElements(List<AbstractCall> operationInvocations, UMLOperationBodyMapper mapper) {
+		if(mapper.getContainer2().getBody() == null) {
+			return;
+		}
+		Set<AbstractCodeFragment> exactlyMappedStatements = new HashSet<AbstractCodeFragment>();
+		for(AbstractCodeMapping mapping : mapper.getMappings()) {
+			if(mapping.isExact()) {
+				exactlyMappedStatements.add(mapping.getFragment2());
+			}
+		}
+		CompositeStatementObject body = mapper.getContainer2().getBody().getCompositeStatement();
+		List<AbstractCodeFragment> statements = new ArrayList<AbstractCodeFragment>(body.getLeaves());
+		for(CompositeStatementObject innerNode : body.getInnerNodes()) {
+			statements.addAll(innerNode.getExpressions());
+		}
+		for(AbstractCodeFragment statement : statements) {
+			if(!exactlyMappedStatements.contains(statement)) {
+				for(JsxElement element : statement.getJsxElements()) {
+					for(MethodReference reference : element.getFunctionReferences()) {
+						if(!containsInvocation(operationInvocations, reference)) {
+							operationInvocations.add(reference);
+						}
+					}
+				}
+			}
+		}
 	}
 
 	public static List<AbstractCall> getInvocationsInSourceOperationAfterExtraction(UMLOperationBodyMapper mapper) {
@@ -550,13 +606,14 @@ public class ExtractOperationDetection {
 		}
 		List<UMLParameter> originalMethodParameters = originalOperation.getParametersWithoutReturnType();
 		Map<UMLParameter, UMLParameter> originalMethodParametersPassedAsArgumentsMappedToCalledMethodParameters = new LinkedHashMap<UMLParameter, UMLParameter>();
-		List<String> arguments = addedOperationInvocation.arguments();
 		List<UMLParameter> parameters = addedOperation.getParametersWithoutReturnType();
+		List<String> arguments = addedOperationInvocation.argumentsOfParameters(parameters);
 		Map<String, String> parameterToArgumentMap = new LinkedHashMap<String, String>();
-		//special handling for methods with varargs parameter for which no argument is passed in the matching invocation
-		int size = Math.min(arguments.size(), parameters.size());
-		for(int i=0; i<size; i++) {
+		for(int i=0; i<parameters.size(); i++) {
 			String argumentName = arguments.get(i);
+			if(argumentName == null) {
+				continue;
+			}
 			String parameterName = parameters.get(i).getName();
 			parameterToArgumentMap.put(parameterName, argumentName);
 			for(UMLParameter originalMethodParameter : originalMethodParameters) {
@@ -572,6 +629,26 @@ public class ExtractOperationDetection {
 					new LinkedHashMap<String, String>(), parameterToArgumentMap, classDiff, addedOperationInvocation, nested, Optional.empty(), Optional.empty());
 		}
 		return null;
+	}
+
+	//a returned expression extracted into a variable that is returned after more statements use it, i.e., return sign_in_problem_page(message, status) ->
+	//page = sign_in_problem_page(message, status_code, sign_in_path); _clear_cookie(page, ...); return page in the extracted method,
+	//so the statements between the declaration and the return using the variable complete the returned value
+	private static int statementsUsingReturnedVariable(UMLOperationBodyMapper operationBodyMapper, AbstractCodeFragment declaration, AbstractCodeFragment returnStatement, String variableName) {
+		int count = 0;
+		for(AbstractCodeFragment leaf2 : operationBodyMapper.getNonMappedLeavesT2()) {
+			if(leaf2 != returnStatement && leaf2.countableStatement() && leaf2.getVariableDeclarations().isEmpty() &&
+					leaf2.getLocationInfo().getStartOffset() > declaration.getLocationInfo().getEndOffset() &&
+					leaf2.getLocationInfo().getEndOffset() < returnStatement.getLocationInfo().getStartOffset()) {
+				for(LeafExpression variable : leaf2.getVariables()) {
+					if(variable.getString().equals(variableName)) {
+						count++;
+						break;
+					}
+				}
+			}
+		}
+		return count;
 	}
 
 	private boolean extractMatchCondition(UMLOperationBodyMapper operationBodyMapper, List<AbstractCodeMapping> additionalExactMatches, boolean forNestedMapper) {
@@ -642,6 +719,9 @@ public class ExtractOperationDetection {
 					for(AbstractCodeFragment leaf2 : operationBodyMapper.getNonMappedLeavesT2()) {
 						if(leaf2.countableStatement() && leaf2.getString().equals(LANG2.RETURN_SPACE + variableDeclaration.getVariableName() + LANG2.STATEMENT_TERMINATION)) {
 							nonMappedElementsT2--;
+							if(mapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.RETURN_STATEMENT)) {
+								nonMappedElementsT2 -= statementsUsingReturnedVariable(operationBodyMapper, mapping.getFragment2(), leaf2, variableDeclaration.getVariableName());
+							}
 							break;
 						}
 					}

@@ -144,11 +144,11 @@ Moreover, the benchmark has been extended with valid instances for the following
 * `Merge Parameter`
 * `Invert Condition`
 
-As of **October 30, 2026** the precision and recall of RefactoringMiner on this benchmark is:
+As of **November 12, 2026** the precision and recall of RefactoringMiner on this benchmark is:
 
 | Refactoring Type | TP | FP | FN | Precision | Recall |
 |:-----------------------|-----------:|--------:|--------:|--------:|--------:|
-|**Total**|3591  | 26  | 52  | 0.993  | 0.986|
+|**Total**|3590  | 26  | 52  | 0.993  | 0.986|
 |Extract Method|375  |  1  |  4  | 0.997  | 0.989|
 |Rename Class|233  |  0  |  1  | 1.000  | 0.996|
 |Move Attribute|79  |  0  |  3  | 1.000  | 0.963|
@@ -170,7 +170,7 @@ As of **October 30, 2026** the precision and recall of RefactoringMiner on this 
 |Extract And Move Method|141  |  0  |  4  | 1.000  | 0.972|
 |Move And Inline Method|28  |  1  |  6  | 0.966  | 0.824|
 |Replace Anonymous With Class| 5  |  0  |  0  | 1.000  | 1.000|
-|Extract Variable|295  |  0  |  3  | 1.000  | 0.990|
+|Extract Variable|294  |  0  |  3  | 1.000  | 0.990|
 |Extract Attribute| 7  |  0  |  0  | 1.000  | 1.000|
 |Inline Variable|126  |  0  |  8  | 1.000  | 0.940|
 |Rename Variable|310  |  4  |  5  | 0.987  | 0.984|
@@ -195,7 +195,7 @@ As of **October 30, 2026** the precision and recall of RefactoringMiner on this 
 ## Python Benchmark
 **Source**: Hassan Atwi, Bin Lin, Nikolaos Tsantalis, Yutaro Kashiwa, Yasutaka Kamei, Naoyasu Ubayashi, Gabriele Bavota, and Michele Lanza, "PyRef: Refactoring Detection in Python Projects," 21st IEEE International Working Conference on Source Code Analysis and Manipulation (SCAM'2021), Engineering Track, Luxembourg City, Luxembourg, September 27-28, 2021.
 
-**Properties**: 202 commits from 3 open-source projects
+**Properties**: 203 commits from 3 open-source projects
 
 **Commit dates**: January 2013 - October 2020
 
@@ -234,17 +234,17 @@ Moreover, the benchmark has been extended with valid instances for the following
 * `Invert Condition`
 * `Split Parameter`
 
-As of **October 31, 2026** the precision and recall of RefactoringMiner on this benchmark is:
+As of **November 12, 2026** the precision and recall of RefactoringMiner on this benchmark is:
 
 | Refactoring Type | TP | FP | FN | Precision | Recall |
 |:-----------------------|-----------:|--------:|--------:|--------:|--------:|
-|**Total**|1148  |  4  |  5  | 0.997  | 0.996|
+|**Total**|1159  |  3  |  2  | 0.997  | 0.998|
 |Extract Method|39  |  0  |  0  | 1.000  | 1.000|
 |Rename Class|13  |  0  |  0  | 1.000  | 1.000|
 |Move Attribute| 5  |  0  |  0  | 1.000  | 1.000|
-|Rename Method|140  |  0  |  1  | 1.000  | 0.993|
+|Rename Method|141  |  0  |  1  | 1.000  | 0.993|
 |Inline Method| 6  |  0  |  0  | 1.000  | 1.000|
-|Move Method|22  |  0  |  0  | 1.000  | 1.000|
+|Move Method|23  |  0  |  0  | 1.000  | 1.000|
 |Move And Rename Method| 9  |  0  |  0  | 1.000  | 1.000|
 |Pull Up Method| 9  |  0  |  0  | 1.000  | 1.000|
 |Move Class|15  |  0  |  0  | 1.000  | 1.000|
@@ -256,9 +256,9 @@ As of **October 31, 2026** the precision and recall of RefactoringMiner on this 
 |Extract Subclass| 2  |  0  |  0  | 1.000  | 1.000|
 |Extract Class| 3  |  0  |  0  | 1.000  | 1.000|
 |Extract And Move Method|15  |  0  |  0  | 1.000  | 1.000|
-|Extract Variable|68  |  1  |  0  | 0.986  | 1.000|
+|Extract Variable|69  |  0  |  0  | 1.000  | 1.000|
 |Inline Variable|21  |  0  |  0  | 1.000  | 1.000|
-|Rename Variable|119  |  0  |  3  | 1.000  | 0.975|
+|Rename Variable|121  |  0  |  1  | 1.000  | 0.992|
 |Rename Parameter|136  |  1  |  0  | 0.993  | 1.000|
 |Rename Attribute|28  |  0  |  0  | 1.000  | 1.000|
 |Split Parameter| 3  |  0  |  0  | 1.000  | 1.000|
@@ -267,11 +267,11 @@ As of **October 31, 2026** the precision and recall of RefactoringMiner on this 
 |Parameterize Variable|17  |  0  |  0  | 1.000  | 1.000|
 |Localize Parameter|10  |  0  |  0  | 1.000  | 1.000|
 |Parameterize Attribute| 1  |  0  |  0  | 1.000  | 1.000|
-|Change Variable Type|29  |  2  |  0  | 0.935  | 1.000|
+|Change Variable Type|33  |  2  |  0  | 0.943  | 1.000|
 |Add Method Annotation|26  |  0  |  0  | 1.000  | 1.000|
 |Remove Method Annotation|19  |  0  |  0  | 1.000  | 1.000|
 |Add Class Annotation| 1  |  0  |  0  | 1.000  | 1.000|
-|Add Parameter|251  |  0  |  1  | 1.000  | 0.996|
+|Add Parameter|253  |  0  |  0  | 1.000  | 1.000|
 |Remove Parameter|81  |  0  |  0  | 1.000  | 1.000|
 |Reorder Parameter|18  |  0  |  0  | 1.000  | 1.000|
 |Encapsulate Attribute| 3  |  0  |  0  | 1.000  | 1.000|
@@ -280,11 +280,21 @@ As of **October 31, 2026** the precision and recall of RefactoringMiner on this 
 |Move Code| 9  |  0  |  0  | 1.000  | 1.000|
 
 **Important notes**:
-Commit [asyml/texar@36f4b18](https://github.com/asyml/texar/commit/36f4b18340e2974cfee80e5c347bf7ae7459ab88) has been skipped due to a parsing error,
+Commit [asyml/texar@36f4b18](https://github.com/asyml/texar/commit/36f4b18340e2974cfee80e5c347bf7ae7459ab88) has a parsing error,
 i.e., a missing comma after parameter `w_ppl=1.` of function `append` in file `examples/tsf/stats.py`
 ```python
 def append(self, loss, g, ppl, d, d0, d1,
              w_loss=1., w_g=1., w_ppl=1. w_d=1, w_d0=1., w_d1=1.):
+```
+RefactoringMiner repairs such missing commas between two items in brackets, as long as the repair reduces the parsing errors, and prints a message in the `System.error` logs for each repair.
+The same commit has also parsing errors that cannot be repaired in file `txtgen/models/tsf/tsf.py` (a missing colon after the signature of `eval_step`, and a missing closing bracket), which affect only refactoring types that are not part of the benchmark.
+
+Commit [asyml/texar@151bd0b](https://github.com/asyml/texar/commit/151bd0b30ac2a967607d9f9aa7d16a6ec7114929) has a parsing error in file `examples/tsf/tsf_trainer.py`,
+i.e., a dictionary entry passed as an argument without its braces and the `feed_dict` keyword, which causes the false negative `Rename Variable fetches_ to batch in method public train() from class tsf.tsf_trainer.TSFTrainer`.
+The other refactorings of the commit are in files without parsing errors, and are detected.
+```python
+batch = sess.run([input_tensors],
+                 tx.global_mode(): tf.estimator.ModeKeys.EVAL)
 ```
 Python commits may not always be syntactically valid, leading to parsing errors. Make sure to consult the `System.error` logs printed by the tool for parsing errors, as commits with parsing errors may include incorrect refactoring information.
 
@@ -380,11 +390,11 @@ As of **November 1, 2026** the precision and recall of RefactoringMiner on this 
 **File**: [data.json](https://github.com/tsantalis/RefactoringMiner/blob/master/src/test/resources/oracle/javascript-dataset/data.json)
 
 The original benchmark has been extended by adding newly supported refactoring types by RefactoringMiner.
-As of **October 27, 2026** the precision and recall of RefactoringMiner on this benchmark is:
+As of **November 12, 2026** the precision and recall of RefactoringMiner on this benchmark is:
 
 | Refactoring Type | TP | FP | FN | Precision | Recall |
 |:-----------------------|-----------:|--------:|--------:|--------:|--------:|
-|**Total**|168  |  3  |  0  | 0.982  | 1.000|
+|**Total**|171  |  3  |  0  | 0.983  | 1.000|
 |Extract Method|24  |  0  |  0  | 1.000  | 1.000|
 |Rename Class| 1  |  0  |  0  | 1.000  | 1.000|
 |Rename Method|10  |  0  |  0  | 1.000  | 1.000|
@@ -393,9 +403,9 @@ As of **October 27, 2026** the precision and recall of RefactoringMiner on this 
 |Move Class| 2  |  0  |  0  | 1.000  | 1.000|
 |Move And Rename Class| 1  |  0  |  0  | 1.000  | 1.000|
 |Extract And Move Method| 1  |  0  |  0  | 1.000  | 1.000|
-|Extract Variable|22  |  2  |  0  | 0.917  | 1.000|
+|Extract Variable|22  |  1  |  0  | 0.957  | 1.000|
 |Inline Variable|10  |  0  |  0  | 1.000  | 1.000|
-|Rename Variable|31  |  1  |  0  | 0.969  | 1.000|
+|Rename Variable|33  |  2  |  0  | 0.943  | 1.000|
 |Rename Parameter| 7  |  0  |  0  | 1.000  | 1.000|
 |Rename Attribute| 4  |  0  |  0  | 1.000  | 1.000|
 |Parameterize Variable| 3  |  0  |  0  | 1.000  | 1.000|
@@ -405,4 +415,4 @@ As of **October 27, 2026** the precision and recall of RefactoringMiner on this 
 |Change Method Access Modifier| 8  |  0  |  0  | 1.000  | 1.000|
 |Merge Conditional| 2  |  0  |  0  | 1.000  | 1.000|
 |Move Code| 1  |  0  |  0  | 1.000  | 1.000|
-|Replace Conditional With Ternary| 2  |  0  |  0  | 1.000  | 1.000|
+|Replace Conditional With Ternary| 3  |  0  |  0  | 1.000  | 1.000|

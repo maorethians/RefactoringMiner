@@ -165,6 +165,10 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 	private boolean declaredInIfElseStatement;
 	//the printed type annotation following the declared name in TypeScript, i.e., ": Promise<any>[]"
 	private String typeAnnotation;
+	//the offset of the object pattern of a parameter destructured from it, i.e., {a, b: c} in f({a, b: c}: Props), otherwise -1
+	private int objectPatternOffset = -1;
+	//the property of the object pattern destructured into the parameter, i.e., b for c in f({a, b: c}: Props), null for ...rest
+	private String objectPatternProperty;
 
 	//the initializer of a class member or of a condition declaration is a sibling of the declarator in the AST, i.e., bool m_flag = false; and if(auto x = f())
 	public static boolean initializerOutsideDeclarator(IASTDeclarator declarator) {
@@ -447,6 +451,37 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		this.scope = new VariableScope(filePath, key.getStartChar(), scopeEndOffset);
 	}
 
+	//the variable is assigned in every branch of the if-elif-else chain, which ends with an else
+	private static boolean definedInAllBranches(LangIfStatement ifStatement, String variableName) {
+		LangIfStatement current = ifStatement;
+		while(true) {
+			if(!assignedInBlock(current.getBody(), variableName)) {
+				return false;
+			}
+			LangASTNode elseBody = current.getElseBody();
+			if(elseBody instanceof LangIfStatement elif) {
+				current = elif;
+			}
+			else {
+				return elseBody != null && assignedInBlock(elseBody, variableName);
+			}
+		}
+	}
+
+	private static boolean assignedInBlock(LangASTNode block, String variableName) {
+		if(block != null) {
+			for(LangASTNode child : block.getChildren()) {
+				if(child instanceof LangExpressionStatement expressionStatement &&
+						expressionStatement.getExpression() instanceof LangAssignment assignment &&
+						assignment.getLeftSide() instanceof LangSimpleName simpleName &&
+						simpleName.getIdentifier().equals(variableName)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	public VariableDeclaration(LangCompilationUnit cu, String sourceFolder, String filePath,
 							   LangAssignment assignment, VariableDeclarationContainer container,
 							   String variableName, Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent) {
@@ -488,22 +523,15 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 				LangASTNode scopeNode = parent;
 				int endOffset = scopeNode.getStartChar() + scopeNode.getLength();
 				if(scopeNode instanceof LangBlock && scopeNode.getParent() instanceof LangIfStatement ifStatement) {
-					scopeNode = scopeNode.getParent().getParent();
-					startOffset = scopeNode.getStartChar();
-					endOffset = scopeNode.getStartChar() + scopeNode.getLength();
-					boolean variableWithSameNameDefinedInElseBranch = false;
-					if(ifStatement.getElseBody() != null) {
-						List<LangASTNode> elseChildren = ifStatement.getElseBody().getChildren();
-						for(LangASTNode child : elseChildren) {
-							if(child instanceof LangExpressionStatement expressionStatement &&
-									expressionStatement.getExpression() instanceof LangAssignment elseAssignment &&
-									elseAssignment.getLeftSide() instanceof LangSimpleName simpleName &&
-									simpleName.getIdentifier().equals(variableName)) {
-								variableWithSameNameDefinedInElseBranch = true;
-							}
-						}
+					//a variable defined in a branch of an if-elif-else chain is visible after the chain, from its definition until the end of the block enclosing the chain,
+					//where an elif is an if statement nested as the else of the previous one
+					LangIfStatement outermostIfStatement = ifStatement;
+					while(outermostIfStatement.getParent() instanceof LangIfStatement previous && previous.getElseBody() == outermostIfStatement) {
+						outermostIfStatement = previous;
 					}
-					if(!activeVariableDeclarations.containsKey(variableName) && variableWithSameNameDefinedInElseBranch) {
+					scopeNode = outermostIfStatement.getParent();
+					endOffset = scopeNode.getStartChar() + scopeNode.getLength();
+					if(!activeVariableDeclarations.containsKey(variableName) && definedInAllBranches(outermostIfStatement, variableName)) {
 						declaredInIfElseStatement = true;
 					}
 				}
@@ -538,8 +566,8 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 				this.type = ((ObjectCreation)creationCoveringEntireFragment).getType();
 			}
 		}
-		if(assignment.getTypeAnnotation() != null) {
-			this.type = UMLType.extractTypeObject(assignment.getTypeAnnotation(), "[", "]", null, LANG);
+		if(assignment.getDeclaredType() != null) {
+			this.type = UMLType.extractTypeObject(assignment.getDeclaredType(), "[", "]", null, LANG);
 		}
 
 		this.isAttribute = false;
@@ -1319,6 +1347,9 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		if(parameterEntry) {
 			this.initializer = parameterInitializer(sourceFolder, filePath, fragment, container, activeVariableDeclarations, fileContent);
 		}
+		if(parameterEntry) {
+			setObjectPatternProperty(fragment);
+		}
 	}
 
 	//the declaration located at another AST node than its binding identifier, i.e., the index signature of its key,
@@ -1360,6 +1391,9 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
 		this.variableName = fragment.getId().getSym();
 		this.type = typeAnnotation;
+		if(parameterEntry) {
+			setObjectPatternProperty(fragment);
+		}
 		//this.initializer = fragment.getInit().isPresent() ? new AbstractExpression(sourceFolder, filePath, fragment.getInit().get(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, container, activeVariableDeclarations, fileContent) : null;
 		ISwc4jAst scopeNode = getScopeNode(fragment);
 		int startOffset = fragment.getSpan().getStart();
@@ -1513,6 +1547,51 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 			entry = paramProp;
 		}
 		return entry;
+	}
+
+	//the parameter destructured from the object pattern, which is the entire parameter, i.e., a and c in f({a, b: c}: Props) or f({a, b: c} = {})
+	private void setObjectPatternProperty(Swc4jAstBindingIdent identifier) {
+		ISwc4jAst entry = parameterEntry(identifier);
+		if(entry instanceof Swc4jAstTsParamProp) {
+			return;
+		}
+		ISwc4jAst objectPattern = entry.getParent();
+		if(!(objectPattern instanceof Swc4jAstObjectPat)) {
+			return;
+		}
+		ISwc4jAst parent = objectPattern.getParent();
+		if(parent instanceof Swc4jAstAssignPat assignPat && assignPat.getLeft() == objectPattern) {
+			parent = assignPat.getParent();
+		}
+		if(parent instanceof ISwc4jAstPat || parent instanceof ISwc4jAstObjectPatProp) {
+			return;
+		}
+		this.objectPatternOffset = objectPattern.getSpan().getStart();
+		if(entry instanceof Swc4jAstAssignPatProp) {
+			this.objectPatternProperty = identifier.getId().getSym();
+		}
+		else if(entry instanceof Swc4jAstKeyValuePatProp keyValuePatProp) {
+			ISwc4jAstPropName key = keyValuePatProp.getKey();
+			if(key instanceof Swc4jAstIdentName identName) {
+				this.objectPatternProperty = identName.getSym();
+			}
+			else if(key instanceof Swc4jAstStr str) {
+				this.objectPatternProperty = str.getValue();
+			}
+		}
+	}
+
+	public boolean isDestructuredFromObjectPattern() {
+		return objectPatternOffset != -1;
+	}
+
+	public boolean sameObjectPattern(VariableDeclaration other) {
+		return objectPatternOffset != -1 && objectPatternOffset == other.objectPatternOffset &&
+				locationInfo.getFilePath().equals(other.locationInfo.getFilePath());
+	}
+
+	public String getObjectPatternProperty() {
+		return objectPatternProperty;
 	}
 
 	private static ISwc4jAstExpr parameterDefaultValue(Swc4jAstBindingIdent identifier) {
