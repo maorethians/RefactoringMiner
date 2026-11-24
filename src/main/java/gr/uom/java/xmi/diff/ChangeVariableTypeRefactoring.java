@@ -30,7 +30,7 @@ public class ChangeVariableTypeRefactoring extends ChangeTypeRefactoring impleme
 		this.changedTypeVariable = changedTypeVariable;
 		this.operationBefore = operationBefore;
 		this.operationAfter = operationAfter;
-		this.variableReferences = variableReferences;
+		this.variableReferences = new LinkedHashSet<AbstractCodeMapping>(variableReferences);
 		this.relatedRefactorings = new LinkedHashSet<Refactoring>();
 		this.insideExtractedOrInlinedMethod = insideExtractedOrInlinedMethod;
 	}
@@ -81,6 +81,10 @@ public class ChangeVariableTypeRefactoring extends ChangeTypeRefactoring impleme
 
 	public Set<AbstractCodeMapping> getReferences() {
 		return variableReferences;
+	}
+
+	public void addReferences(Set<AbstractCodeMapping> references) {
+		variableReferences.addAll(references);
 	}
 
 	public boolean isInsideExtractedOrInlinedMethod() {

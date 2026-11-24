@@ -904,8 +904,12 @@ public class StringBasedHeuristics {
 					(differOnlyInTypeAssertion(s1, s2, fragment2) || differOnlyInTypeAssertion(s2, s1, fragment1))) {
 				return true;
 			}
+			if(LANG1.equals(Constants.CPP) && LANG2.equals(Constants.CPP) &&
+					(differOnlyInNamedCast(s1, s2, fragment2) || differOnlyInNamedCast(s2, s1, fragment1))) {
+				return true;
+			}
 			if(!diff1.isEmpty() && StringDistance.isNumeric(diff1) && !diff2.isEmpty() && StringDistance.isNumeric(diff2) &&
-					!commonSuffix.startsWith("=")) {
+					!commonSuffix.startsWith("=") && !commonSuffix.startsWith(LANG1.ASSIGNMENT)) {
 				boolean skip = false;
 				List<LeafExpression> variables1 = fragment1.getVariables();
 				List<LeafExpression> variables2 = fragment2.getVariables();
@@ -1244,6 +1248,25 @@ public class StringBasedHeuristics {
 		}
 		return false;
 	}
+
+	//the C++ named cast added to an expression, i.e., struct limit_info *lip = p; -> struct limit_info *lip = static_cast<limit_info *>(p);
+	private static boolean differOnlyInNamedCast(String s1, String s2, AbstractCodeFragment fragment2) {
+		for(LeafExpression cast : fragment2.getCastExpressions()) {
+			String castString = cast.getString();
+			if(NAMED_CAST.matcher(castString).lookingAt() && castString.endsWith(")") && s2.contains(castString)) {
+				int open = castString.indexOf("(", castString.indexOf(">"));
+				if(open > 0) {
+					String operand = castString.substring(open + 1, castString.length() - 1);
+					if(s2.replace(castString, operand).equals(s1)) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	private static final Pattern NAMED_CAST = Pattern.compile("(static|dynamic|const|reinterpret)_cast\\s*<");
 
 	private static boolean cast(String diff1, String diff2) {
 		return (diff1.isEmpty() && diff2.startsWith("(") && diff2.endsWith(")")) || diff2.equals("(" + diff1 + ")");
@@ -3420,9 +3443,22 @@ public class StringBasedHeuristics {
 						!mapper.getContainer1().isConstructor() && !mapper.getContainer2().isConstructor() && !mapper.getContainer1().getName().equals(mapper.getContainer2().getName()) &&
 						zeroCallsToExtractedMethodsOrParentMapperWithNonIdenticalSignature(mapper))
 					rightHandSideReplacement = true;
+				//an assignment and the declaration of another variable with another right-hand side, i.e., roundedStart = me.firstTick; and var dataMin = me.dataMin;
+				else if(replacement.getType().equals(ReplacementType.VARIABLE_NAME) &&
+						statement1.getVariableDeclarations().size() != statement2.getVariableDeclarations().size() &&
+						assignment1.equals(replacement.getBefore()) &&
+						assignment2.equals(replacement.getAfter()))
+					rightHandSideReplacement = true;
 				else if(replacement.getType().equals(ReplacementType.VARIABLE_REPLACED_WITH_NULL_LITERAL) &&
 						assignment1.equals(replacement.getBefore()) &&
 						assignment2.equals(replacement.getAfter()))
+					rightHandSideReplacement = true;
+				//a field and a local variable assigned the opposite boolean literal, i.e., this.waitForOwnResult = false; and synchronouslyEmitted = true;
+				//two local variables can be renamed with the opposite meaning, i.e., boolean useDt = false; and boolean anchorPresent = true;
+				else if(replacement.getType().equals(ReplacementType.BOOLEAN_LITERAL) &&
+						assignment1.equals(replacement.getBefore()) &&
+						assignment2.equals(replacement.getAfter()) &&
+						variableName1.strip().startsWith(LANG1.THIS_DOT) != variableName2.strip().startsWith(LANG2.THIS_DOT))
 					rightHandSideReplacement = true;
 				//an assignment of a boolean literal and the declaration of another variable, i.e., major = true; and var options = me.options;
 				//two assignments or two declarations can migrate a flag to an enum, i.e., params.use_mmap = false; and params.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -3546,7 +3582,7 @@ public class StringBasedHeuristics {
 					return true;
 				}
 				for(AbstractCodeFragment fragment : replacementInfo.getStatements2()) {
-					if(fragment.getString().startsWith(variableName1 + "=")) {
+					if(fragment.getString().startsWith(variableName1 + LANG2.ASSIGNMENT)) {
 						return true;
 					}
 				}
@@ -4465,6 +4501,22 @@ public class StringBasedHeuristics {
 		return conditional;
 	}
 
+	//the ! in a string literal or a JSX text is not a negation, i.e., <Text>See you tomorrow!</Text>
+	private static boolean containsNotOperator(String s, AbstractCodeFragment statement, Constants LANG) {
+		String code = s;
+		for(LeafExpression literal : statement.getStringLiterals()) {
+			code = code.replace(literal.getString(), "");
+		}
+		for(JsxElement element : statement.getJsxElements()) {
+			for(JsxElement.JsxChild child : element.getChildren()) {
+				if(!child.isElement() && !child.string().startsWith("{")) {
+					code = code.replace(child.string(), "");
+				}
+			}
+		}
+		return code.contains(LANG.NOT) || code.contains("!");
+	}
+
 	protected static boolean commonConditional(String s1, String s2, Map<String, String> parameterToArgumentMap, ReplacementInfo info, AbstractCodeFragment statement1, AbstractCodeFragment statement2, UMLOperationBodyMapper mapper, boolean isomorphic) {
 		Constants LANG1 = mapper.LANG1;
 		Constants LANG2 = mapper.LANG2;
@@ -4486,22 +4538,13 @@ public class StringBasedHeuristics {
 			List<String> ternaryConditionals1 = new ArrayList<>();
 			for(TernaryOperatorExpression ternary : statement1.getTernaryOperatorExpressions()) {
 				String condition = ternary.getCondition().getString();
-				String temp0 = new String(condition);
-				for(Replacement replacement : info.getReplacements()) {
-					temp0 = ReplacementUtil.performReplacement(temp0, replacement.getBefore(), replacement.getAfter());
-				}
+				String temp0 = ReplacementUtil.performReplacements(condition, info.getReplacements());
 				ternaryConditionals1.add(temp0);
 				String thenExpression = ternary.getThenExpression().getString();
-				String temp1 = new String(thenExpression);
-				for(Replacement replacement : info.getReplacements()) {
-					temp1 = ReplacementUtil.performReplacement(temp1, replacement.getBefore(), replacement.getAfter());
-				}
+				String temp1 = ReplacementUtil.performReplacements(thenExpression, info.getReplacements());
 				ternaryConditionals1.add(temp1);
 				String elseExpression = ternary.getElseExpression().getString();
-				String temp2 = new String(elseExpression);
-				for(Replacement replacement : info.getReplacements()) {
-					temp2 = ReplacementUtil.performReplacement(temp2, replacement.getBefore(), replacement.getAfter());
-				}
+				String temp2 = ReplacementUtil.performReplacements(elseExpression, info.getReplacements());
 				ternaryConditionals1.add(temp2);
 			}
 			List<String> ternaryConditionals2 = new ArrayList<>();
@@ -4549,7 +4592,7 @@ public class StringBasedHeuristics {
 			String AND2 = LANG2.AND.strip();
 			String OR2 = LANG2.OR.strip();
 			boolean containLogicalOperator = s1.contains(OR1) || s1.contains(AND1) || s2.contains(OR2) || s2.contains(AND2);
-			boolean containsNotOperator = (s1.contains(LANG1.NOT) || s1.contains("!")) != (s2.contains(LANG2.NOT) || s2.contains("!"));
+			boolean containsNotOperator = containsNotOperator(s1, statement1, LANG1) != containsNotOperator(s2, statement2, LANG2);
 			if(call1 == null)
 				call1 = statement1.invocationCoveringEntireFragment();
 			if(call2 == null)

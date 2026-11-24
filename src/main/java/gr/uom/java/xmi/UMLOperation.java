@@ -39,6 +39,8 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	private boolean isAbstract;
 	//a function declared in the if or else block of a conditional, i.e., if typing.TYPE_CHECKING: def f(): ... else: def f(): ...
 	private UMLClass.ConditionallyCreated conditionallyCreated = UMLClass.ConditionallyCreated.NO;
+	//the preprocessor branches enclosing a C/C++ function defined in more than one branch of the same conditional group, i.e., #ifdef CONFIG_X[0] > #if A[1]
+	private String preprocessorBranch;
 	private List<UMLParameter> parameters;
 	private String className;
 	private boolean isConstructor;
@@ -266,6 +268,32 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		this.conditionallyCreated = conditionallyCreated;
 	}
 
+	public String getPreprocessorBranch() {
+		return preprocessorBranch;
+	}
+
+	//whether the operations are in different branches of the same conditional group, so that one cannot call the other,
+	//i.e., free_thread_stack() of #ifdef CONFIG_VMAP_STACK[0] and thread_stack_delayed_free() of #ifdef CONFIG_VMAP_STACK[1]
+	public boolean inSiblingPreprocessorBranch(VariableDeclarationContainer other) {
+		if(preprocessorBranch == null || !(other instanceof UMLOperation operation) || operation.preprocessorBranch == null) {
+			return false;
+		}
+		String[] branches1 = preprocessorBranch.split(" > ");
+		String[] branches2 = operation.preprocessorBranch.split(" > ");
+		for(int i=0; i<Math.min(branches1.length, branches2.length); i++) {
+			if(!branches1[i].equals(branches2[i])) {
+				String group1 = branches1[i].substring(0, branches1[i].lastIndexOf('['));
+				String group2 = branches2[i].substring(0, branches2[i].lastIndexOf('['));
+				return group1.equals(group2);
+			}
+		}
+		return false;
+	}
+
+	public void setPreprocessorBranch(String preprocessorBranch) {
+		this.preprocessorBranch = preprocessorBranch;
+	}
+
 	public void setAbstract(boolean isAbstract) {
 		this.isAbstract = isAbstract;
 	}
@@ -453,6 +481,18 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 			}
 			if(LANG.equals(Constants.PYTHON) && isPytestFixture(annotation)) {
 				return true;
+			}
+		}
+		return false;
+	}
+
+	//a function decorated as a pytest fixture, which pytest calls for the tests and fixtures having a parameter with its name
+	public boolean isPytestFixture() {
+		if(LANG.equals(Constants.PYTHON)) {
+			for(UMLAnnotation annotation : annotations) {
+				if(isPytestFixture(annotation)) {
+					return true;
+				}
 			}
 		}
 		return false;
@@ -1391,6 +1431,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				this.isForwardDeclaration() == operation.isForwardDeclaration() &&
 				thisEmptyBody == otherEmptyBody &&
 				this.conditionallyCreated.equals(operation.conditionallyCreated) &&
+				Objects.equals(this.preprocessorBranch, operation.preprocessorBranch) &&
 				this.getParameterTypeList().equals(operation.getParameterTypeList()) &&
 				equalTypeParameters(operation);
 		}
@@ -1425,6 +1466,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 				this.equalTrailingReturnType(operation) &&
 				this.isForwardDeclaration() == operation.isForwardDeclaration() &&
 				this.conditionallyCreated.equals(operation.conditionallyCreated) &&
+				Objects.equals(this.preprocessorBranch, operation.preprocessorBranch) &&
 				equalTypeParameters(operation)) {
 			UMLParameter thisReturnParameter = this.getReturnParameter();
 			UMLParameter otherReturnParameter = operation.getReturnParameter();
@@ -1462,6 +1504,7 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 		result = prime * result + (isForwardDeclaration() ? 1231 : 1237);
 		result = prime * result + (thisEmptyBody ? 1231 : 1237);
 		result = prime * result + conditionallyCreated.ordinal();
+		result = prime * result + ((preprocessorBranch == null) ? 0 : preprocessorBranch.hashCode());
 		result = prime * result + ((name == null) ? 0 : name.hashCode());
 		result = prime * result + ((getParameterTypeList() == null) ? 0 : getParameterTypeList().hashCode());
 		result = prime * result + ((visibility == null) ? 0 : visibility.hashCode());
@@ -1740,9 +1783,9 @@ public class UMLOperation implements Comparable<UMLOperation>, Serializable, Var
 	}
 
 	//the declared return type, or any type when it is inferred, i.e., override fun toString() = "..." in Kotlin
-	private boolean returnsType(String classType) {
+	public boolean returnsType(String classType) {
 		UMLParameter returnParameter = getReturnParameter();
-		return returnParameter == null || returnParameter.getType().getClassType().equals(classType);
+		return returnParameter == null || (returnParameter.getType() != null && returnParameter.getType().getClassType().equals(classType));
 	}
 
 	private boolean isEquals() {

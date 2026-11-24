@@ -297,7 +297,8 @@ public class KotlinOperationBody extends OperationBody {
 			processWhenStatement(ktFile, sourceFolder, filePath, parent, fileContent, whenStatement);
 		}
 		else if(statement instanceof KtLabeledExpression labeledStatement) {
-			CompositeStatementObject child = new CompositeStatementObject(ktFile, sourceFolder, filePath, labeledStatement, parent.getDepth()+1, CodeElementType.LABELED_STATEMENT.setName(labeledStatement.getLabelName()), fileContent);
+			CompositeStatementObject child = new CompositeStatementObject(ktFile, sourceFolder, filePath, labeledStatement, parent.getDepth()+1, CodeElementType.LABELED_STATEMENT, fileContent);
+			child.setLabel(labeledStatement.getLabelName());
 			parent.addStatement(child);
 			addStatementInVariableScopes(child);
 			if(labeledStatement.getBaseExpression() != null) {
@@ -350,7 +351,7 @@ public class KotlinOperationBody extends OperationBody {
 			VariableDeclaration vd = variableDeclaration instanceof KtProperty ?
 					new VariableDeclaration(ktFile, sourceFolder, filePath, (KtProperty)variableDeclaration, container, activeVariableDeclarations, fileContent, parent.getLocationInfo()) :
 					new VariableDeclaration(ktFile, sourceFolder, filePath, (KtDestructuringDeclarationEntry)variableDeclaration, container, activeVariableDeclarations, fileContent, parent.getLocationInfo());
-			child.getVariableDeclarations().add(vd);
+			child.addVariableDeclaration(vd);
 			addStatementInVariableScopes(child);
 			addAllInActiveVariableDeclarations(child.getVariableDeclarations());
 		}
@@ -366,7 +367,7 @@ public class KotlinOperationBody extends OperationBody {
 			parent.addStatement(child);
 			for(KtDestructuringDeclarationEntry entry : destructuringDeclaration.getEntries()) {
 				VariableDeclaration vd = new VariableDeclaration(ktFile, sourceFolder, filePath, entry, container, activeVariableDeclarations, fileContent, parent.getLocationInfo());
-				child.getVariableDeclarations().add(vd);
+				child.addVariableDeclaration(vd);
 			}
 			addStatementInVariableScopes(child);
 			addAllInActiveVariableDeclarations(child.getVariableDeclarations());

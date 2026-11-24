@@ -33,7 +33,7 @@ public class RenameVariableRefactoring extends ChangeTypeRefactoring implements 
 		this.renamedVariable = renamedVariable;
 		this.operationBefore = operationBefore;
 		this.operationAfter = operationAfter;
-		this.variableReferences = variableReferences;
+		this.variableReferences = new LinkedHashSet<AbstractCodeMapping>(variableReferences);
 		this.insideExtractedOrInlinedMethod = insideExtractedOrInlinedMethod;
 	}
 
@@ -88,6 +88,10 @@ public class RenameVariableRefactoring extends ChangeTypeRefactoring implements 
 
 	public Set<AbstractCodeMapping> getReferences() {
 		return variableReferences;
+	}
+
+	public void addReferences(Set<AbstractCodeMapping> references) {
+		variableReferences.addAll(references);
 	}
 
 	public boolean isInsideExtractedOrInlinedMethod() {

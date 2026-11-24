@@ -8,6 +8,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -35,6 +36,7 @@ import org.refactoringminer.util.PathFileUtils;
 import org.refactoringminer.util.PrefixSuffixUtils;
 
 import gr.uom.java.xmi.Constants;
+import gr.uom.java.xmi.InferredType;
 import gr.uom.java.xmi.JavaFileProcessor;
 import gr.uom.java.xmi.LeafType;
 import gr.uom.java.xmi.LocationInfo;
@@ -580,6 +582,73 @@ public abstract class UMLAbstractClassDiff {
 				}
 			}
 		}
+	}
+
+	//matching two nested operations adds their unmatched nested operations to removedNestedOperations and addedNestedOperations (processNestedOperations),
+	//so the signature changes are checked on copies of the lists, and the nested operations found meanwhile are checked in the next round,
+	//i.e., function restore() nested in function mockGlobal() nested in the arrow function createSchemaFetch
+	protected void checkForNestedOperationSignatureChanges() throws RefactoringMinerTimedOutException {
+		if(removedNestedOperations.isEmpty() && addedNestedOperations.isEmpty()) {
+			return;
+		}
+		checkForNestedOperationsMovedUpLevel();
+		List<List<UMLOperation>> foundNestedOperations = checkForNestedOperationSignatureChanges(new ArrayList<>(removedNestedOperations), new ArrayList<>(addedNestedOperations));
+		if(removedNestedOperations.size() == addedOperations.size() && addedNestedOperations.size() == 0) {
+			checkForNestedOperationSignatureChanges(new ArrayList<>(removedNestedOperations), addedOperations);
+		}
+		while(foundNestedOperations.get(0).size() > 0 && foundNestedOperations.get(1).size() > 0) {
+			foundNestedOperations = checkForNestedOperationSignatureChanges(foundNestedOperations.get(0), foundNestedOperations.get(1));
+		}
+	}
+
+	//an added nested operation with the same signature as a nested operation of a removed nested operation of the same parent operation moved up a level,
+	//i.e., function restore() nested in function mockGlobal() nested in the arrow function createSchemaFetch is nested in createSchemaFetch after mockGlobal() is removed,
+	//so it is matched before the removed nested operation is matched with the added one as renamed
+	private void checkForNestedOperationsMovedUpLevel() throws RefactoringMinerTimedOutException {
+		for(UMLOperation removedNestedOperation : new ArrayList<>(removedNestedOperations)) {
+			if(removedNestedOperation.getNestedOperations().isEmpty()) {
+				continue;
+			}
+			for(UMLOperationBodyMapper mapper : new ArrayList<>(operationBodyMapperList)) {
+				if(mapper.getOperation1() == null || mapper.getOperation2() == null || !mapper.getOperation1().getNestedOperations().contains(removedNestedOperation)) {
+					continue;
+				}
+				for(UMLOperation addedNestedOperation : new ArrayList<>(addedNestedOperations)) {
+					if(mapper.getOperation2().getNestedOperations().contains(addedNestedOperation)) {
+						UMLOperation operationWithTheSameSignature = removedNestedOperation.nestedOperationWithTheSameSignatureIgnoringChangedTypes(addedNestedOperation);
+						if(operationWithTheSameSignature != null && !mapperListContainsOperation(operationWithTheSameSignature, addedNestedOperation)) {
+							UMLOperationBodyMapper nestedMapper = new UMLOperationBodyMapper(operationWithTheSameSignature, addedNestedOperation, this);
+							this.addOperationBodyMapper(nestedMapper);
+							addedNestedOperations.remove(addedNestedOperation);
+						}
+					}
+				}
+				break;
+			}
+		}
+	}
+
+	//removedOperations is a copy of (some of) removedNestedOperations, addedOperations a copy of (some of) addedNestedOperations or the addedOperations of the class,
+	//returns the removed and added nested operations found while matching
+	private List<List<UMLOperation>> checkForNestedOperationSignatureChanges(List<UMLOperation> removedOperations, List<UMLOperation> addedOperations) throws RefactoringMinerTimedOutException {
+		Set<UMLOperation> removedBefore = identitySet(removedOperations);
+		Set<UMLOperation> addedBefore = identitySet(addedOperations);
+		int removedNestedSize = removedNestedOperations.size();
+		int addedNestedSize = addedNestedOperations.size();
+		checkForOperationSignatureChanges(removedOperations, addedOperations);
+		List<UMLOperation> foundRemoved = new ArrayList<>(removedNestedOperations.subList(removedNestedSize, removedNestedOperations.size()));
+		List<UMLOperation> foundAdded = new ArrayList<>(addedNestedOperations.subList(addedNestedSize, addedNestedOperations.size()));
+		Set<UMLOperation> removedAfter = identitySet(removedOperations);
+		Set<UMLOperation> addedAfter = identitySet(addedOperations);
+		removedNestedOperations.removeIf(operation -> removedBefore.contains(operation) && !removedAfter.contains(operation));
+		addedNestedOperations.removeIf(operation -> addedBefore.contains(operation) && !addedAfter.contains(operation));
+		return List.of(foundRemoved, foundAdded);
+	}
+
+	private static Set<UMLOperation> identitySet(List<UMLOperation> operations) {
+		Set<UMLOperation> set = Collections.newSetFromMap(new IdentityHashMap<>());
+		set.addAll(operations);
+		return set;
 	}
 
 	private void processNestedOperations(UMLOperation operation1, UMLOperation operation2) throws RefactoringMinerTimedOutException {
@@ -1366,6 +1435,25 @@ public abstract class UMLAbstractClassDiff {
 				}
 			}
 		}
+		//the extraction to a function added in the module of the class, i.e., handleIncrementalResult(result, lastDiff) called in QueryInfo.markResult
+		if(modelDiff != null && LANG1.equals(Constants.TYPESCRIPT) && LANG2.equals(Constants.TYPESCRIPT)) {
+			String moduleName = nextClass.getPackageName() + ".__module__";
+			UMLAbstractClass module2 = modelDiff.findClassInChildModel(moduleName);
+			UMLAbstractClass module1 = modelDiff.findClassInParentModel(originalClass.getPackageName() + ".__module__");
+			if(module2 != null && !module2.equals(nextClass)) {
+				for(AbstractCall addedOperationInvocation : addedOperationInvocations) {
+					if(addedOperationInvocation.getExpression() == null && !intersection.contains(addedOperationInvocation) && !matchedOperationInvocations.contains(addedOperationInvocation)) {
+						for(UMLOperation operation : module2.getOperations()) {
+							boolean existsInParentModule = module1 != null && module1.getOperations().stream().anyMatch(o -> o.getName().equals(operation.getName()));
+							if(!existsInParentModule && operation.getBody() != null && addedOperationInvocation.matchesOperation(operation, addedOperation, this, modelDiff)) {
+								matchingAddedOperations.add(operation);
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
 		if(LANG1.equals(Constants.TYPESCRIPT) && LANG2.equals(Constants.TYPESCRIPT) && matchingAddedOperations.size() > 0) {
 			return true;
 		}
@@ -1428,6 +1516,22 @@ public abstract class UMLAbstractClassDiff {
 
 	public UMLAbstractClass getNextClass() {
 		return nextClass;
+	}
+
+	//a Python attribute without a declaration in the model, first assigned in the method replacing the variable, i.e., self._dataset in _make_data()
+	private static VariableDeclaration attributeAssignedInMethod(String attributeAccess, String attributeName, CandidateAttributeRefactoring candidate) {
+		VariableDeclarationContainer container2 = candidate.getOperationAfter();
+		if(container2.getBody() == null) {
+			return null;
+		}
+		for(AbstractCodeFragment leaf2 : container2.getBody().getCompositeStatement().getLeaves()) {
+			for(LeafExpression variable : leaf2.getVariables()) {
+				if(variable.getString().equals(attributeAccess)) {
+					return new VariableDeclaration(variable, attributeName, candidate.getOriginalVariableDeclaration().getType(), container2);
+				}
+			}
+		}
+		return null;
 	}
 
 	public Set<CandidateAttributeRefactoring> getCandidateAttributeRenames() {
@@ -1707,8 +1811,21 @@ public abstract class UMLAbstractClassDiff {
 						}
 					}
 					else {
-						//field is declared in a superclass or outer class
-						candidateAttributeRenames.add(candidate);
+						String renamedVariableName = candidate.getRenamedVariableName();
+						VariableDeclaration assignedAttribute = candidate.isVariableAssignedToAttribute() && renamedVariableName.startsWith(LANG2.THIS_DOT) ?
+								attributeAssignedInMethod(renamedVariableName, after, candidate) : null;
+						if(assignedAttribute != null) {
+							RenameVariableRefactoring ref = new RenameVariableRefactoring(
+									candidate.getOriginalVariableDeclaration(), assignedAttribute,
+									candidate.getOperationBefore(), candidate.getOperationAfter(), candidate.getReferences(), false);
+							if(!refactorings.contains(ref)) {
+								refactorings.add(ref);
+							}
+						}
+						else {
+							//field is declared in a superclass or outer class
+							candidateAttributeRenames.add(candidate);
+						}
 					}
 				}
 				else if(candidate.getRenamedVariableDeclaration() != null) {
@@ -4975,8 +5092,22 @@ public abstract class UMLAbstractClassDiff {
 					removedOperation.testMethodCheck(addedOperation)) {
 				mapperSet.add(operationBodyMapper);
 			}
-			else if(absoluteDifferenceInPosition == 0 && !removedOperation.isConstructor() && !addedOperation.isConstructor() &&
-					removedOperation.getName().equals(addedOperation.getName()) && operationBodyMapper.exactMatches() > 0) {
+			else if(!removedOperation.isConstructor() && !addedOperation.isConstructor() &&
+					removedOperation.getName().equals(addedOperation.getName()) && operationBodyMapper.exactMatches() > 0 &&
+					(absoluteDifferenceInPosition == 0 ||
+					//the only operation with this name before and after, whose parameters changed and whose body grew around most of its identical statements
+					(uniqueOperationName(removedOperation, addedOperation) && mappedElementsMoreThanNonMappedT1(mappings, operationBodyMapper) &&
+							relativePositionCheck(differenceInPosition, absoluteDifferenceInPosition) &&
+							compatibleSignatures(removedOperation, addedOperation, absoluteDifferenceInPosition)))) {
+				mapperSet.add(operationBodyMapper);
+			}
+			//the only operation with this name before and after, with the same declared return type, whose parameters changed and which delegated to another removed operation,
+			//whose logic replaced the delegation, i.e., getCurrentResult(saveAsLastResult) { return this.maskResult(this.getCurrentFullResult(saveAsLastResult)); } -> getCurrentResult() {...}
+			else if(mappings == 0 && !removedOperation.isConstructor() && !addedOperation.isConstructor() &&
+					removedOperation.getName().equals(addedOperation.getName()) && uniqueOperationName(removedOperation, addedOperation) &&
+					delegatesToAnotherRemovedOperation(removedOperation) &&
+					sameDeclaredReturnType(removedOperation, addedOperation) &&
+					!removedOperation.hasTestAnnotation() && !addedOperation.hasTestAnnotation()) {
 				mapperSet.add(operationBodyMapper);
 			}
 			else if(mappings > 0 && removedOperation.hasTestAnnotation() && addedOperation.hasParameterizedTestAnnotation() &&
@@ -5236,6 +5367,19 @@ public abstract class UMLAbstractClassDiff {
 				mapperSet.add(operationBodyMapper);
 			}
 		}
+	}
+
+	private boolean uniqueOperationName(UMLOperation removedOperation, UMLOperation addedOperation) {
+		return originalClass.getOperations().stream().filter(o -> o.getName().equals(removedOperation.getName())).count() == 1 &&
+				nextClass.getOperations().stream().filter(o -> o.getName().equals(addedOperation.getName())).count() == 1;
+	}
+
+	private static boolean sameDeclaredReturnType(UMLOperation removedOperation, UMLOperation addedOperation) {
+		UMLParameter returnParameter1 = removedOperation.getReturnParameter();
+		UMLParameter returnParameter2 = addedOperation.getReturnParameter();
+		return returnParameter1 != null && returnParameter2 != null &&
+				returnParameter1.getType() != null && !(returnParameter1.getType() instanceof InferredType) &&
+				removedOperation.equalReturnParameter(addedOperation);
 	}
 
 	private boolean relativePositionCheck(int differenceInPosition, int absoluteDifferenceInPosition) {
@@ -5678,9 +5822,61 @@ public abstract class UMLAbstractClassDiff {
 				nonMappedElementsT1CallingRemovedOperation >= nonMappedElementsT1WithoutThoseCallingRemovedOperation);
 	}
 
+	//the test renamed in place, right after the counterpart of the test before it, when the best mapper pairs it with another test
+	//and the test in place has as many identical statements and leaves less of the added test unmatched,
+	//i.e., TotalMissStat -> TotalMissIncrementsMissStat after PropagationOnLookupMiss -> PromotesToHotterTierOnColdHit,
+	//not HashesOnceAndSharesTargetKeyAcrossTiers added further down, which reuses more of the old setup but leaves more of its own code unmatched
+	private UMLOperationBodyMapper renamedTestInPlace(UMLOperationBodyMapper bestMapper, List<UMLOperationBodyMapper> mapperList) {
+		if(!(bestMapper.getContainer1() instanceof UMLOperation removedTest) || !(bestMapper.getContainer2() instanceof UMLOperation bestAddedTest) ||
+				!removedTest.hasTestAnnotation() || !bestAddedTest.hasTestAnnotation()) {
+			return null;
+		}
+		UMLOperation testBefore1 = adjacentTest(removedTest, originalClass.getOperations(), -1);
+		if(testBefore1 == null) {
+			return null;
+		}
+		UMLOperation testBefore2 = null;
+		for(UMLOperationBodyMapper mapper : operationBodyMapperList) {
+			if(mapper.getContainer1() == testBefore1 && mapper.getContainer2() instanceof UMLOperation operation2) {
+				testBefore2 = operation2;
+				break;
+			}
+		}
+		UMLOperation inPlace = testBefore2 != null ? adjacentTest(testBefore2, nextClass.getOperations(), 1) : null;
+		if(inPlace == null || inPlace == bestAddedTest) {
+			return null;
+		}
+		for(int i=1; i<mapperList.size(); i++) {
+			UMLOperationBodyMapper mapper = mapperList.get(i);
+			if(mapper.getContainer1() == removedTest && mapper.getContainer2() == inPlace && mapper.mappingsWithoutBlocks() > 0 &&
+					mapper.exactMatches() >= bestMapper.exactMatches() && mapper.nonMappedElementsT2() < bestMapper.nonMappedElementsT2()) {
+				return mapper;
+			}
+		}
+		return null;
+	}
+
+	//the test before (-1) or after (1) the test among the tests of the operations, or null
+	private static UMLOperation adjacentTest(UMLOperation test, List<UMLOperation> operations, int direction) {
+		int index = operations.indexOf(test);
+		if(index < 0) {
+			return null;
+		}
+		for(int i = index + direction; i >= 0 && i < operations.size(); i += direction) {
+			if(operations.get(i).hasTestAnnotation()) {
+				return operations.get(i);
+			}
+		}
+		return null;
+	}
+
 	private UMLOperationBodyMapper findBestMapper(TreeSet<UMLOperationBodyMapper> mapperSet) {
 		List<UMLOperationBodyMapper> mapperList = new ArrayList<UMLOperationBodyMapper>(mapperSet);
 		UMLOperationBodyMapper bestMapper = mapperSet.first();
+		UMLOperationBodyMapper renamedInPlace = renamedTestInPlace(bestMapper, mapperList);
+		if(renamedInPlace != null) {
+			return renamedInPlace;
+		}
 		VariableDeclarationContainer bestMapperOperation1 = bestMapper.getContainer1();
 		VariableDeclarationContainer bestMapperOperation2 = bestMapper.getContainer2();
 		int bestCommonParameterTypes = bestMapperOperation1.commonParameterTypes(bestMapperOperation2).size();
@@ -5695,7 +5891,10 @@ public abstract class UMLAbstractClassDiff {
 		boolean secondBestMapperHasIdenticalParameterTypes = secondBestMapperOperation1 != null && secondBestMapperOperation2 != null &&
 				secondBestMapperOperation1.getParameterTypeList().equals(secondBestMapperOperation2.getParameterTypeList()) &&
 				secondBestMapperOperation1.getParameterTypeList().size() > 0 && secondBestMapperOperation1.getName().equals(secondBestMapperOperation2.getName());
-		if(secondBestMapperHasIdenticalParameterTypes) {
+		//unless the best mapper has identical parameter types too, i.e., the variants of a C function in sibling preprocessor branches
+		boolean bestMapperHasIdenticalParameterTypes = bestMapperOperation1.getParameterTypeList().equals(bestMapperOperation2.getParameterTypeList()) &&
+				bestMapperOperation1.getParameterTypeList().size() > 0 && bestMapperOperation1.getName().equals(bestMapperOperation2.getName());
+		if(secondBestMapperHasIdenticalParameterTypes && !bestMapperHasIdenticalParameterTypes) {
 			return mapperList.get(1);
 		}
 		if(equalSignatureWithCommonParameterTypes(bestMapperOperation1, bestMapperOperation2) &&
@@ -6058,6 +6257,11 @@ public abstract class UMLAbstractClassDiff {
 		if(addedOperation.compatibleSignature(removedOperation)) {
 			return true;
 		}
+		//the only operations with their name in both classes, i.e., memcg_charge_kernel_stack(struct task_struct *tsk) -> memcg_charge_kernel_stack(struct vm_struct *vm)
+		if(removedOperation.getName().equals(addedOperation.getName()) && !removedOperation.isConstructor() &&
+				uniqueName(removedOperation, originalClass.getOperations()) && uniqueName(addedOperation, nextClass.getOperations())) {
+			return true;
+		}
 		if(absoluteDifferenceInPosition == 0 || operationsBeforeOrAfterMatch(removedOperation, addedOperation)) {
 			if(!gettersWithDifferentReturnType(removedOperation, addedOperation)) {
 				if(addedOperation.getParameterTypeList().equals(removedOperation.getParameterTypeList()) || addedOperation.normalizedNameDistance(removedOperation) <= MAX_OPERATION_NAME_DISTANCE) {
@@ -6072,6 +6276,15 @@ public abstract class UMLAbstractClassDiff {
 			}
 		}
 		return false;
+	}
+
+	private static boolean uniqueName(UMLOperation operation, List<UMLOperation> operations) {
+		for(UMLOperation other : operations) {
+			if(other != operation && other.getName().equals(operation.getName())) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private boolean gettersWithDifferentReturnType(UMLOperation removedOperation, UMLOperation addedOperation) {

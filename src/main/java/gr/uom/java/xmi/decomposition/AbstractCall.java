@@ -56,7 +56,8 @@ public abstract class AbstractCall extends LeafExpression {
 	protected int numberOfArguments;
 	protected String expression;
 	protected List<String> arguments;
-	protected List<UMLType> typeArguments = new ArrayList<UMLType>();
+	//most calls have no type arguments, the list is created on the first one (Issue #1220)
+	protected List<UMLType> typeArguments = Collections.emptyList();
 	protected StatementCoverageType coverage = StatementCoverageType.NONE;
 	private static final List<String> logNames = List.of("trace", "debug", "info", "warn", "error", "fatal", "log");
 	private static final List<String> logGuardNames = List.of("isDebugEnabled", "isEnabled", "isErrorEnabled", "isFatalEnabled", "isInfoEnabled", "isTraceEnabled", "isWarnEnabled");
@@ -127,6 +128,13 @@ public abstract class AbstractCall extends LeafExpression {
 
 	public String getExpression() {
 		return expression;
+	}
+
+	protected void addTypeArgument(UMLType typeArgument) {
+		if(typeArguments.isEmpty()) {
+			typeArguments = new ArrayList<>();
+		}
+		typeArguments.add(typeArgument);
 	}
 
 	public List<String> arguments() {
@@ -282,7 +290,8 @@ public abstract class AbstractCall extends LeafExpression {
 		}
 		else if(this instanceof MethodReference) {
 			MethodReference methodReference = (MethodReference)this;
-			return methodReference.getName().equals(operation.getName());
+			return methodReference.getName().equals(operation.getName()) &&
+					!(operation instanceof UMLOperation umlOperation && umlOperation.inSiblingPreprocessorBranch(callerOperation));
 		}
 		return false;
 	}
@@ -444,6 +453,12 @@ public abstract class AbstractCall extends LeafExpression {
 						if(expression1.equals(replacement.getBefore()) && expression2.equals(replacement.getAfter())) {
 							return true;
 						}
+					}
+					//a call with changed arguments nested within the expressions of calls with the same name, i.e., expect(await tabThrough(user, 9)).toEqual(...) ->
+					//expect(await tabThrough(user, 10)).toEqual(...), but not $(picker).pickadate("picker").stop() -> $(pickatizedDateInput).pickadate("picker").start()
+					if(identicalName(call) && before.identicalName(after) && before.identicalExpression(after) && !before.equalArguments(after) &&
+							!expression1.equals(replacement.getBefore()) && expression1.contains(replacement.getBefore()) && expression2.contains(replacement.getAfter())) {
+						expression1AfterReplacements = ReplacementUtil.performReplacement(expression1AfterReplacements, expression2, replacement.getBefore(), replacement.getAfter(), LANG1, LANG2);
 					}
 				}
 				else if(replacement instanceof VariableReplacementWithMethodInvocation) {
@@ -1422,6 +1437,24 @@ public abstract class AbstractCall extends LeafExpression {
 			}
 		}
 		return false;
+	}
+
+	//JavaScript str.match(regex) and regex.exec(str) return the same result for a regex without the g flag, so the receiver and the argument swap,
+	//and the regex may be extracted, i.e., location.match(/\b([A-Z]{1,5})\d{1,4}[A-Z]?\b/) -> ROOM_CODE_COMPACT_PATTERN.exec(location)
+	public boolean regexMatchSwappedWithExec(AbstractCall call) {
+		if(!LANG.equals(Constants.TYPESCRIPT) || getExpression() == null || call.getExpression() == null || arguments().size() != 1 || call.arguments().size() != 1) {
+			return false;
+		}
+		boolean matchToExec = getName().equals("match") && call.getName().equals("exec");
+		boolean execToMatch = getName().equals("exec") && call.getName().equals("match");
+		if(!matchToExec && !execToMatch) {
+			return false;
+		}
+		String string1 = matchToExec ? getExpression() : arguments().get(0);
+		String regex1 = matchToExec ? arguments().get(0) : getExpression();
+		String string2 = matchToExec ? call.arguments().get(0) : call.getExpression();
+		String regex2 = matchToExec ? call.getExpression() : call.arguments().get(0);
+		return string1.equals(string2) && (regex1.equals(regex2) || regex1.startsWith("/") || regex2.startsWith("/"));
 	}
 
 	public boolean identicalWithExpressionArgumentSwap(AbstractCall call) {

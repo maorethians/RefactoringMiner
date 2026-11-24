@@ -12,12 +12,14 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.IntUnaryOperator;
 import java.util.TreeMap;
 
 import gr.uom.java.xmi.CppFileProcessor;
 import gr.uom.java.xmi.decomposition.CppVisitor;
 import gr.uom.java.xmi.CppLanguage;
 
+import org.eclipse.core.runtime.CoreException;
 import org.eclipse.cdt.core.dom.ast.IASTArrayDeclarator;
 import org.eclipse.cdt.core.dom.ast.IASTArrayModifier;
 import org.eclipse.cdt.core.dom.ast.IASTArraySubscriptExpression;
@@ -187,6 +189,12 @@ public class CppTreeGenerator {
 			"_Atomic", "__extension__", "noexcept");
 
 	public static TreeContext generate(String content, IASTTranslationUnit translationUnit) {
+		return generate(content, translationUnit, Map.of());
+	}
+
+	//with the declarations of the parameters of the K&R function definitions, by the offsets of the declarators of the definitions,
+	//which the translation unit does not have, as they are blanked for the C++ parser
+	public static TreeContext generate(String content, IASTTranslationUnit translationUnit, Map<Integer, List<IASTSimpleDeclaration>> knrDeclarations) {
 		TreeContext context = new TreeContext();
 		if(content.isEmpty()) {
 			Tree root = context.createTree(TypeSet.type("empty_root"));
@@ -196,6 +204,11 @@ public class CppTreeGenerator {
 			return context;
 		}
 		CppTreeGenerator generator = new CppTreeGenerator(content);
+		generator.knrDeclarations = knrDeclarations;
+		generator.filePath = translationUnit.getFilePath();
+		if(CppFileProcessor.keywordNames(translationUnit.getFilePath())) {
+			generator.keywords = CppFileProcessor.keywords(translationUnit, content);
+		}
 		Node root = generator.translationUnit(translationUnit);
 		generator.addDirectives(root);
 		generator.groupConditionals(root);
@@ -295,7 +308,8 @@ public class CppTreeGenerator {
 			List<int[]> list = new ArrayList<>();
 			for(IASTPreprocessorMacroExpansion expansion : translationUnit.getMacroExpansions()) {
 				IASTFileLocation location = expansion.getFileLocation();
-				if(location != null && expansion.isPartOfTranslationUnitFile()) {
+				//a keyword of C++ used as a name in C code, i.e., new in attribute *new, is a name of the file, not a macro
+				if(location != null && expansion.isPartOfTranslationUnitFile() && !CppFileProcessor.isKeywordName(expansion)) {
 					list.add(new int[] {offset(location.getNodeOffset()), offset(location.getNodeOffset() + location.getNodeLength())});
 				}
 			}
@@ -327,6 +341,8 @@ public class CppTreeGenerator {
 	}
 
 	private static final String INSERTED_TYPE = "int ";
+	private static final String INSERTED_IF = "if(0);";
+	private static final String INSERTED_IF_CONDITION = "if(0)";
 	//the function whose arguments are parsed again, which is declared so that CDT does not parse its call as a declaration
 	private static final String CALL = "__rm_call__";
 	private static final String INSERTED_CLASS = "__rm_type__";
@@ -336,6 +352,10 @@ public class CppTreeGenerator {
 	private enum NameKind {IDENTIFIER, TYPE, FIELD, NAMESPACE, LABEL}
 
 	private final String content;
+	private Map<Integer, List<IASTSimpleDeclaration>> knrDeclarations = Map.of();
+	//the source of the declarations of the parameters of the K&R function definitions, which are parsed on their own
+	private Source knrSource;
+	private String filePath = "";
 	private final int length;
 	//the start and end offsets of the comments
 	private final TreeMap<Integer, Integer> comments = new TreeMap<>();
@@ -849,6 +869,13 @@ public class CppTreeGenerator {
 
 	//error
 
+	//a problem at code already in the node of the previous statement, which CDT reports again, i.e., the ) of for_each_possible_cpu(cpu) followed by the statement it repeats,
+	//like the model that has no statement for it; a problem after the code of the node is kept, i.e., the macro and initializer of
+	//static const char descriptor[] GOOGLE_PROTOBUF_ATTRIBUTE_SECTION_VARIABLE(protodesc_cold) = {...}; whose declaration node ends at descriptor[]
+	private boolean problemInPrevious(IASTStatement statement, Node previous) {
+		return statement instanceof IASTProblemHolder && previous != null && start(statement) >= previous.start && end(statement) <= previous.end;
+	}
+
 	private Node error(int start, int end) {
 		return node("ERROR", start, end, new ArrayList<>());
 	}
@@ -881,6 +908,9 @@ public class CppTreeGenerator {
 		return false;
 	}
 
+	//the keywords of C++ that the parsed code of a file of C code or of a header uses as keywords, while the others can be names in the code parsed again,
+	//and null for a file of C++ code
+	private Set<String> keywords;
 	//the name of the class whose members are parsed again, so that its constructors are parsed
 	private String className = "__rm_class__";
 	//whether the next statement is converted without parsing it again
@@ -916,6 +946,12 @@ public class CppTreeGenerator {
 			inserted.put(brace, INSERTED_CLASS);
 		}
 		inserted.putAll(extraInsertions);
+		//the branch continuing an if statement of the code before it, i.e., else if (x) return 1; in #ifdef NAS ... #endif after if (y) return 0;,
+		//is parsed after an if statement that is not in the code, and is the else clause of that if statement
+		int elseStart = context == Context.BLOCK ? elseContinuation(start, end) : -1;
+		if(elseStart >= 0) {
+			inserted.put(elseStart, INSERTED_IF);
+		}
 		Map<Integer, Integer> masked = new HashMap<>();
 		StringBuilder builder = new StringBuilder(rewrite(start, end, inserted, masked));
 		for(int offset : inserted.descendingKeySet()) {
@@ -930,8 +966,19 @@ public class CppTreeGenerator {
 		String code = prefix + builder + suffix;
 		IASTTranslationUnit translationUnit;
 		try {
-			translationUnit = CppLanguage.getDefault().getASTTranslationUnit(FileContent.create("__rm_reparsed__.cpp", code.toCharArray()), new ScannerInfo(),
-					IncludeFileContentProvider.getEmptyFilesProvider(), EmptyCIndex.INSTANCE, GPPLanguage.OPTION_IS_SOURCE_UNIT, new DefaultLogService());
+			translationUnit = parseFragment(code);
+			//C code using keywords of C++ as names, i.e., typedef enum { false, true } bool; in #ifndef __cplusplus, is parsed again with these keywords defined as names
+			String keywords = this.keywords != null ? CppFileProcessor.keywordNames(translationUnit, code, this.keywords) : "";
+			if(!keywords.isEmpty()) {
+				IASTTranslationUnit reparsed = parseFragment(keywords + "\n" + code);
+				if(CppFileProcessor.problems(reparsed) < CppFileProcessor.problems(translationUnit)) {
+					translationUnit = reparsed;
+					prefix = keywords + "\n" + prefix;
+					for(int[] insertion : insertions) {
+						insertion[0] += keywords.length() + 1;
+					}
+				}
+			}
 		}
 		catch(Exception e) {
 			nodes.add(error(start, end));
@@ -965,7 +1012,13 @@ public class CppTreeGenerator {
 			else if(declarations.length == 1 && declarations[0] instanceof IASTFunctionDefinition function && function.getBody() instanceof IASTCompoundStatement body) {
 				IASTStatement[] statements = body.getStatements();
 				for(IASTStatement statement : statements) {
-					nodes.add(statement(statement));
+					Node node = statement(statement);
+					if(elseStart >= 0 && nodes.isEmpty() && node != null && node.type.equals("if_statement") && node.start == elseStart
+							&& node.last() != null && node.last().type.equals("else_clause")) {
+						//the else and the if statement of the else clause are in the branch, since the if statement they continue is not
+						node = inline(new ArrayList<>(node.last().children));
+					}
+					nodes.add(node);
 				}
 				nodes.addAll(inactive(translationUnit, start, end, Context.BLOCK, statements));
 			}
@@ -986,6 +1039,20 @@ public class CppTreeGenerator {
 		nodes.removeIf(n -> n == null || n.start < start || n.end > end || n.type.equals("ERROR") && n.start == n.end);
 		absorbMacros(nodes, start);
 		return nodes;
+	}
+
+	//the offset of the else starting the code between the offsets, or -1
+	private int elseContinuation(int start, int end) {
+		int offset = skip(start, end);
+		if(content.startsWith("else", offset) && (offset + 4 >= end || !isIdentifierPart(content.charAt(offset + 4)))) {
+			return offset;
+		}
+		return -1;
+	}
+
+	private static IASTTranslationUnit parseFragment(String code) throws CoreException {
+		return CppLanguage.getDefault().getASTTranslationUnit(FileContent.create("__rm_reparsed__.cpp", code.toCharArray()), new ScannerInfo(),
+				IncludeFileContentProvider.getEmptyFilesProvider(), EmptyCIndex.INSTANCE, GPPLanguage.OPTION_IS_SOURCE_UNIT, new DefaultLogService());
 	}
 
 	//the starts of the declarations between the offsets that are a name with parameters followed by a body, i.e., TEST(A, B) {...}
@@ -1727,6 +1794,16 @@ public class CppTreeGenerator {
 
 	//the statement parsed again, or the nodes parsed again in an error node
 	private Node single(List<Node> nodes, IASTStatement statement) {
+		//the error of a problem at code already in the node before it, i.e., the ) of for_each_possible_cpu(cpu) that CDT reports again in the code parsed again
+		List<Node> withoutRepeatedErrors = new ArrayList<>();
+		for(Node node : nodes) {
+			Node previous = withoutRepeatedErrors.isEmpty() ? null : withoutRepeatedErrors.get(withoutRepeatedErrors.size() - 1);
+			if(node != null && previous != null && node.type.equals("ERROR") && node.start >= previous.start && node.end <= previous.end) {
+				continue;
+			}
+			withoutRepeatedErrors.add(node);
+		}
+		nodes = withoutRepeatedErrors;
 		//a declaration that CDT split after the call of the macro of its type
 		if(nodes.size() > 1 || failed(nodes)) {
 			Node macroTypeDeclaration = macroTypeDeclaration(start(statement), end(statement), Context.BLOCK);
@@ -1833,6 +1910,18 @@ public class CppTreeGenerator {
 	//the code between the offsets without the macro definitions, and with string literals instead of the macros between string literals
 	private String rewrite(int start, int end, TreeMap<Integer, String> inserted, Map<Integer, Integer> masked) {
 		StringBuilder code = new StringBuilder(withoutMacroDefinitions(start, end));
+		//the declarations of the parameters of the K&R function definitions, i.e., int a; in int f(a) int a; { ... } of a branch that is not taken,
+		//which are blanked like for the parser of the file, so that the definitions are parsed and get these declarations
+		for(List<IASTSimpleDeclaration> declarations : knrDeclarations.values()) {
+			for(IASTSimpleDeclaration declaration : declarations) {
+				IASTFileLocation location = declaration.getFileLocation();
+				for(int k = Math.max(location.getNodeOffset(), start); k < Math.min(location.getNodeOffset() + location.getNodeLength(), end); k++) {
+					if(code.charAt(k - start) != '\n' && code.charAt(k - start) != '\r') {
+						code.setCharAt(k - start, ' ');
+					}
+				}
+			}
+		}
 		List<int[]> tokens = new ArrayList<>();
 		int offset = skip(start, end);
 		while(offset < end) {
@@ -1843,6 +1932,19 @@ public class CppTreeGenerator {
 		for(int i = 0; i < tokens.size(); i++) {
 			int[] token = tokens.get(i);
 			String text = tokenText(token);
+			//a type argument of a call of a macro, i.e., struct task_struct in container_of(rhp, struct task_struct, rcu), which is masked as a name,
+			//so that the call is parsed, and converted to a type
+			int typeEnd = callTypeArgumentEnd(tokens, i);
+			if(typeEnd > 0) {
+				int argumentStart = token[0];
+				int argumentEnd = tokens.get(typeEnd)[1];
+				for(int k = argumentStart; k < argumentEnd; k++) {
+					code.setCharAt(k - start, '_');
+				}
+				masked.put(argumentStart, argumentEnd);
+				i = typeEnd;
+				continue;
+			}
 			if(!isIdentifierStart(text.charAt(0)) || KEYWORDS.contains(text)) {
 				continue;
 			}
@@ -1883,6 +1985,58 @@ public class CppTreeGenerator {
 		return code.toString();
 	}
 
+	//the index of the last token of an elaborated type that is an argument of a call, i.e., struct task_struct * in f(p, struct task_struct *, m), or -1;
+	//the argument is between ( or , and , or ) on one line, and the name before the parentheses is a call, and not the name of a declaration, i.e., int f(struct S *);
+	private int callTypeArgumentEnd(List<int[]> tokens, int i) {
+		String text = tokenText(tokens.get(i));
+		if(!(text.equals("struct") || text.equals("union") || text.equals("enum")) || i < 2 || i + 2 >= tokens.size()) {
+			return -1;
+		}
+		String previous = tokenText(tokens.get(i - 1));
+		String name = tokenText(tokens.get(i + 1));
+		if(!(previous.equals("(") || previous.equals(",")) || !isIdentifierStart(name.charAt(0)) || KEYWORDS.contains(name)) {
+			return -1;
+		}
+		int last = i + 1;
+		while(last + 1 < tokens.size() && tokenText(tokens.get(last + 1)).equals("*")) {
+			last++;
+		}
+		if(last + 1 >= tokens.size() || !(tokenText(tokens.get(last + 1)).equals(",") || tokenText(tokens.get(last + 1)).equals(")"))
+				|| content.substring(tokens.get(i)[0], tokens.get(last)[1]).contains("\n")) {
+			return -1;
+		}
+		//the opening parenthesis of the arguments
+		int depth = 0;
+		int open = i - 1;
+		for(; open >= 0; open--) {
+			String token = tokenText(tokens.get(open));
+			if(token.equals(")")) {
+				depth++;
+			}
+			else if(token.equals("(")) {
+				if(depth == 0) {
+					break;
+				}
+				depth--;
+			}
+		}
+		if(open < 1) {
+			return -1;
+		}
+		String callee = tokenText(tokens.get(open - 1));
+		if(!isIdentifierStart(callee.charAt(0)) || KEYWORDS.contains(callee)) {
+			return -1;
+		}
+		//the type or name before the name of a declaration, i.e., int in int f(struct S *);
+		if(open >= 2) {
+			String beforeCallee = tokenText(tokens.get(open - 2));
+			if(isIdentifierStart(beforeCallee.charAt(0)) && !beforeCallee.equals("return") || beforeCallee.equals("*") || beforeCallee.equals("&") || beforeCallee.equals(">")) {
+				return -1;
+			}
+		}
+		return last;
+	}
+
 	private boolean isString(int[] token) {
 		int prefix = literalPrefix(token[0], token[1]);
 		return prefix >= 0 && content.charAt(token[0] + prefix) == '"';
@@ -1908,6 +2062,15 @@ public class CppTreeGenerator {
 	//the nodes of the inactive preprocessor branches between the offsets, outside the nodes of the active code
 	private List<Node> inactive(IASTTranslationUnit translationUnit, int start, int end, Context context, IASTNode[] activeNodes) {
 		List<Node> nodes = new ArrayList<>();
+		for(int[] region : inactiveRegions(translationUnit, start, end, activeNodes)) {
+			nodes.addAll(reparse(region[0], region[1], context));
+		}
+		return nodes;
+	}
+
+	//the outermost inactive regions between the offsets that do not overlap the active nodes
+	private List<int[]> inactiveRegions(IASTTranslationUnit translationUnit, int start, int end, IASTNode[] activeNodes) {
+		List<int[]> regions = new ArrayList<>();
 		for(int[] region : inactiveRegions(translationUnit)) {
 			if(region[0] >= start && region[1] <= end) {
 				boolean overlaps = false;
@@ -1918,11 +2081,58 @@ public class CppTreeGenerator {
 					}
 				}
 				if(!overlaps) {
-					nodes.addAll(reparse(region[0], region[1], context));
+					regions.add(region);
 				}
 			}
 		}
-		return nodes;
+		return regions;
+	}
+
+	//the else clauses of a branch that is not taken, which continue the if statement right before the branch, i.e., else if (c) z; in
+	//if (a) x; else if (b) y; #ifdef NAS else if (c) z; #endif, are in the last if statement of its else clauses, like in the model,
+	//which parses the code of the branch with the code before it, and the if statements and the else clauses containing it end with the branch
+	private static boolean continueIfStatement(List<Node> statements, int regionStart, List<Node> nodes) {
+		Node previous = null;
+		for(Node statement : statements) {
+			if(statement != null && statement.end <= regionStart && (previous == null || statement.end > previous.end)) {
+				previous = statement;
+			}
+		}
+		if(previous == null || nodes.isEmpty()) {
+			return false;
+		}
+		return appendToIfChain(previous, nodes);
+	}
+
+	//the nodes added to the last if statement of the else clauses of the if statement, whose else clauses and if statements end with the nodes
+	private static boolean appendToIfChain(Node first, List<Node> nodes) {
+		if(!first.type.equals("if_statement")) {
+			return false;
+		}
+		List<Node> chain = new ArrayList<>();
+		Node ifStatement = first;
+		while(true) {
+			chain.add(ifStatement);
+			Node last = ifStatement.last();
+			if(last == null || !last.type.equals("else_clause")) {
+				break;
+			}
+			chain.add(last);
+			if(last.last() == null || !last.last().type.equals("if_statement")) {
+				//an if statement ending with an else clause, which an else cannot continue
+				return false;
+			}
+			ifStatement = last.last();
+		}
+		int end = -1;
+		for(Node node : nodes) {
+			ifStatement.add(node);
+			end = Math.max(end, node.end);
+		}
+		for(Node node : chain) {
+			node.end = Math.max(node.end, end);
+		}
+		return true;
 	}
 
 	//the start and end offsets of the code in the outermost inactive preprocessor branches
@@ -2091,6 +2301,13 @@ public class CppTreeGenerator {
 
 	//the macros expanded to nothing between the offset and a declaration become its first children
 	private void absorbEmptyMacros(Node node, int previousEnd) {
+		//the declaration parsed again is in an inline node, i.e., asmlinkage __visible void __init start_kernel(void) {...}
+		if(node.type.equals(INLINE) && !node.children.isEmpty()) {
+			Node first = node.children.get(0);
+			absorbEmptyMacros(first, previousEnd);
+			node.start = Math.min(node.start, first.start);
+			return;
+		}
 		if(node.type.equals("declaration") || node.type.equals("function_definition") || node.type.equals("field_declaration")) {
 			boolean absorbed = true;
 			while(absorbed) {
@@ -2110,6 +2327,26 @@ public class CppTreeGenerator {
 				}
 			}
 		}
+	}
+
+	//the range of the call to a function-like macro defined in the file and expanded to nothing right before the semicolon of the empty statement,
+	//i.e., mm_free_pgd(mm); with #define mm_free_pgd(mm) in the #else branch of #ifdef CONFIG_MMU, which is a call statement like in the model
+	private int[] emptyMacroCall(IASTNullStatement statement) {
+		int semicolon = start(statement);
+		for(IASTPreprocessorMacroExpansion expansion : source.translationUnit.getMacroExpansions()) {
+			IASTFileLocation location = expansion.getFileLocation();
+			if(location == null || !expansion.isPartOfTranslationUnitFile()) {
+				continue;
+			}
+			int start = source.offset(location.getNodeOffset());
+			int end = source.offset(location.getNodeOffset() + location.getNodeLength());
+			if(end <= semicolon && content.substring(end, semicolon).isBlank() &&
+					expansion.getMacroDefinition() instanceof IASTPreprocessorFunctionStyleMacroDefinition definition &&
+					definition.isPartOfTranslationUnitFile() && definition.getExpansion().isBlank()) {
+				return new int[] {start, end};
+			}
+		}
+		return null;
 	}
 
 	//the call of a macro between the offsets as a call with its arguments parsed again, i.e., ABSL_DEPRECATED("...")
@@ -2396,12 +2633,67 @@ public class CppTreeGenerator {
 		return node;
 	}
 
+	//whether the braces of the linkage specification are each in their own conditional branch, i.e., #ifdef __cplusplus extern "C" { #endif ... #ifdef __cplusplus } #endif
+	//of a header shared by C and C++, so the braces wrap the declarations only for C++: the opening brace is followed by #endif and the closing brace follows an #if,
+	//which the model also uses, so that the conditional groups of the model are the groups of the tree
+	public static boolean conditionalLinkageBraces(String linkage) {
+		int open = linkage.indexOf('{');
+		int close = linkage.lastIndexOf('}');
+		if(open < 0 || close <= open) {
+			return false;
+		}
+		int next = open + 1;
+		while(next < close && Character.isWhitespace(linkage.charAt(next))) {
+			next++;
+		}
+		if(!linkage.startsWith("#", next) || !directiveName(linkage, next).equals("endif")) {
+			return false;
+		}
+		int previous = close;
+		while(previous > open && Character.isWhitespace(linkage.charAt(previous - 1))) {
+			previous--;
+		}
+		int lineStart = linkage.lastIndexOf('\n', previous - 1) + 1;
+		int hash = lineStart;
+		while(hash < previous && (linkage.charAt(hash) == ' ' || linkage.charAt(hash) == '\t')) {
+			hash++;
+		}
+		return linkage.startsWith("#", hash) && directiveName(linkage, hash).startsWith("if");
+	}
+
+	//the name of the directive starting at the offset, i.e., endif in # endif
+	private static String directiveName(String text, int hash) {
+		int start = hash + 1;
+		while(start < text.length() && (text.charAt(start) == ' ' || text.charAt(start) == '\t')) {
+			start++;
+		}
+		int end = start;
+		while(end < text.length() && Character.isLetter(text.charAt(end))) {
+			end++;
+		}
+		return text.substring(start, end);
+	}
+
 	private Node linkageSpecification(ICPPASTLinkageSpecification linkage) {
 		int literal = find("\"", start(linkage), end(linkage));
 		int literalStart = skip(start(linkage) + "extern".length(), end(linkage));
 		Node string = stringLiteral(literalStart, tokenEnd(literalStart, end(linkage)));
 		int open = find("{", string.end, end(linkage));
 		IASTDeclaration[] declarations = linkage.getDeclarations(false);
+		int close = end(linkage) - 1;
+		//braces opened and closed in their own conditional branches, i.e., #ifdef __cplusplus extern "C" { #endif ... #ifdef __cplusplus } #endif of a header shared by C and C++,
+		//which wrap the declarations only for C++, so the declarations stay in the enclosing code and each brace is in its own conditional
+		if(open >= 0 && close > open && (declarations.length == 0 || open < start(declarations[0])) &&
+				conditionalLinkageBraces(content.substring(start(linkage), end(linkage)))) {
+			Node opening = node("linkage_specification", start(linkage), open + 1, List.of(string));
+			List<Node> nodes = new ArrayList<>();
+			nodes.add(opening);
+			IASTDeclaration[] active = activeDeclarations(declarations);
+			nodes.addAll(declarations(active, Context.TOP));
+			nodes.addAll(inactive(source.translationUnit, open + 1, close, Context.TOP, active));
+			nodes.add(leaf("}", close, close + 1));
+			return inline(nodes);
+		}
 		if(open >= 0 && (declarations.length == 0 || open < start(declarations[0]))) {
 			return node("linkage_specification", linkage, string, declarationList(open, end(linkage), declarations, linkage.getTranslationUnit()));
 		}
@@ -2422,6 +2714,25 @@ public class CppTreeGenerator {
 		Node declaratorNode = declarator(declarator, kind, false);
 		children.add(declaratorNode);
 		int bodyStart = declaratorNode.end;
+		//the declarations of the parameters of a K&R function definition, between its declarator and its body, i.e., int a; char *b; in int f(a, b) int a; char *b; { ... }
+		if(hasLocation(declarator)) {
+			for(IASTSimpleDeclaration declaration : knrDeclarations.getOrDefault(start(declarator), List.of())) {
+				//the declarations are parsed on their own at their offsets in the file, also when the definition is in code parsed again
+				Source previous = source;
+				if(knrSource == null) {
+					knrSource = new Source(declaration.getTranslationUnit(), 0, false);
+				}
+				source = knrSource;
+				try {
+					Node declarationNode = simpleDeclaration(declaration, Context.BLOCK);
+					children.add(declarationNode);
+					bodyStart = declarationNode.end;
+				}
+				finally {
+					source = previous;
+				}
+			}
+		}
 		if(function instanceof ICPPASTFunctionDefinition cpp) {
 			ICPPASTConstructorChainInitializer[] initializers = cpp.getMemberInitializers();
 			if(initializers.length > 0) {
@@ -2586,7 +2897,8 @@ public class CppTreeGenerator {
 		nodes.add(node);
 		if(declarator instanceof IASTFieldDeclarator field && field.getBitFieldSize() != null) {
 			Node size = expression(field.getBitFieldSize());
-			int colon = findLast(":", node.end, size.start);
+			//an unnamed bit field (unsigned :0;) has no declarator node
+			int colon = findLast(":", node == null ? start(declarator) : node.end, size.start);
 			nodes.add(node("bitfield_clause", colon, size.end, size));
 		}
 		IASTInitializer initializer = declarator.getInitializer();
@@ -2750,6 +3062,12 @@ public class CppTreeGenerator {
 			nodes.add(index, node);
 		}
 		return nodes;
+	}
+
+	//the offset of the brace closing the one at the offset, skipping comments, strings and preprocessor lines like the tree does, for the model to end a declaration where the tree does
+	public static IntUnaryOperator braceMatcher(String content) {
+		CppTreeGenerator generator = new CppTreeGenerator(content);
+		return open -> generator.matching(open, generator.length);
 	}
 
 	private int matching(int open, int limit) {
@@ -2928,6 +3246,10 @@ public class CppTreeGenerator {
 		int end = end(enumeration);
 		int keywordStart = find("enum", start, end);
 		List<Node> children = new ArrayList<>();
+		//a specifier recovered by CDT without its keyword, i.e., typedef in typedef enum { false, true } bool; of C code, whose enumerators are keywords in C++
+		if(keywordStart < 0) {
+			return node("enum_specifier", start, end, children);
+		}
 		IASTName name = enumeration.getName();
 		int after = keywordStart + 4;
 		if(name != null && hasLocation(name) && end(name) > start(name)) {
@@ -3052,9 +3374,11 @@ public class CppTreeGenerator {
 		}
 		int close = matching(open, end(function));
 		List<Node> parameterNodes = new ArrayList<>();
+		//the parameters of a K&R function definition are names, i.e., (a, b) in int f(a, b) int a; char *b; { ... }
+		boolean knr = CppFileProcessor.knrDefinition(filePath, function);
 		for(IASTParameterDeclaration parameter : parameters) {
 			if(hasLocation(parameter)) {
-				parameterNodes.add(parameterDeclaration(parameter));
+				parameterNodes.add(knr ? name(CppFileProcessor.knrParameterName(parameter), NameKind.IDENTIFIER) : parameterDeclaration(parameter));
 			}
 		}
 		Node parameterList = node("parameter_list", open, close + 1, parameterNodes);
@@ -3534,7 +3858,12 @@ public class CppTreeGenerator {
 			IASTInitializerClause argument = returnStatement.getReturnArgument();
 			return node("return_statement", statement, argument == null ? null : initializerClause(argument));
 		}
-		if(statement instanceof IASTNullStatement) {
+		if(statement instanceof IASTNullStatement nullStatement) {
+			int[] expansion = emptyMacroCall(nullStatement);
+			Node call = expansion != null ? macroCall(expansion[0], expansion[1]) : null;
+			if(call != null) {
+				return node("expression_statement", expansion[0], end(statement), call);
+			}
 			return node("expression_statement", statement);
 		}
 		if(statement instanceof ICPPASTRangeBasedForStatement rangeFor) {
@@ -3623,6 +3952,9 @@ public class CppTreeGenerator {
 		}
 		for(int i = 0; i < active.size(); i++) {
 			IASTStatement statement = active.get(i);
+			if(!children.isEmpty() && problemInPrevious(statement, children.get(children.size() - 1))) {
+				continue;
+			}
 			//a declaration whose type is the call of a macro, which CDT split after the call, i.e., typedef GTEST_REMOVE_REFERENCE_AND_CONST_(Container) RawContainer;
 			if(statement instanceof IASTDeclarationStatement && !content.substring(start(statement), end(statement)).stripTrailing().endsWith(";")) {
 				int k = i + 1;
@@ -3661,7 +3993,12 @@ public class CppTreeGenerator {
 				children.add(statement(statement));
 			}
 		}
-		children.addAll(inactive(source.translationUnit, start(compound) + 1, end(compound) - 1, Context.BLOCK, active.toArray(new IASTNode[0])));
+		for(int[] region : inactiveRegions(source.translationUnit, start(compound) + 1, end(compound) - 1, active.toArray(new IASTNode[0]))) {
+			List<Node> nodes = reparse(region[0], region[1], Context.BLOCK);
+			if(elseContinuation(region[0], region[1]) < 0 || !continueIfStatement(children, region[0], nodes)) {
+				children.addAll(nodes);
+			}
+		}
 		//the body without its closing brace, which CDT gives as empty at the opening brace, i.e., TEST(A, B) { in an inactive branch
 		if(end(compound) == start(compound) && content.startsWith("{", start(compound))) {
 			return node("compound_statement", start(compound), start(compound) + 1, children);
@@ -3679,20 +4016,76 @@ public class CppTreeGenerator {
 		Node then = statement(ifStatement.getThenClause());
 		IASTNode condition = ifStatement instanceof ICPPASTIfStatement cpp && cpp.getConditionDeclaration() != null ? cpp.getConditionDeclaration() : ifStatement.getConditionExpression();
 		IASTStatement initializer = ifStatement instanceof ICPPASTIfStatement cpp ? cpp.getInitializerStatement() : null;
-		children.add(conditionClause(start(ifStatement), condition, initializer, then == null ? end(ifStatement) : then.start));
+		Node conditionClause = conditionClause(start(ifStatement), condition, initializer, then == null ? end(ifStatement) : then.start);
+		children.add(conditionClause);
+		if(then != null) {
+			//the branches that are not taken before the statement, i.e., return a; in if (x) #ifdef NAS return a; #else return b; #endif
+			for(int[] region : inactiveRegions(source.translationUnit)) {
+				if(region[0] >= conditionClause.end && region[1] <= then.start) {
+					children.addAll(inactiveThen(region[0], region[1]));
+				}
+			}
+		}
 		children.add(then);
 		IASTStatement elseClause = ifStatement.getElseClause();
 		if(elseClause != null && hasLocation(elseClause)) {
 			Node elseNode = statement(elseClause);
 			int elseStart = findLast("else", then.end, elseNode.start);
-			children.add(node("else_clause", elseStart, elseNode.end, elseNode));
+			Node elseClauseNode = node("else_clause", elseStart, elseNode.end, elseNode);
+			//the branches that are not taken between the statement and the else clause, i.e., if (b) y; in if (a) x; #ifdef NAS if (b) y; #endif else z;,
+			//which the model parses with the code around them in a block, so that the else clause continues the last if statement of the branches
+			List<Node> branches = ifStatement.getParent() instanceof IASTCompoundStatement ? inactiveBeforeElse(then.end, elseStart) : List.of();
+			if(!branches.isEmpty() && appendToIfChain(branches.get(branches.size() - 1), List.of(elseClauseNode))) {
+				List<Node> nodes = new ArrayList<>();
+				nodes.add(node("if_statement", start(ifStatement), then.end, children));
+				nodes.addAll(branches);
+				return inline(nodes);
+			}
+			children.add(elseClauseNode);
 		}
 		return node("if_statement", ifStatement, children);
 	}
 
+	private List<Node> inactiveBeforeElse(int start, int end) {
+		List<Node> nodes = new ArrayList<>();
+		for(int[] region : inactiveRegions(source.translationUnit)) {
+			if(region[0] >= start && region[1] <= end) {
+				nodes.addAll(reparse(region[0], region[1], Context.BLOCK));
+			}
+		}
+		return nodes;
+	}
+
+	//the code of a branch that is not taken between the condition of an if statement and its statement, which is a statement followed by else clauses,
+	//i.e., f(a); else if (y) g(a); in if (x) #ifdef NAS f(a); else if (y) g(a); #else f(b); else if (y) g(b); #endif, parsed after an if statement that is not in the code
+	private List<Node> inactiveThen(int start, int end) {
+		int statementStart = skip(start, end);
+		if(statementStart >= end) {
+			return List.of();
+		}
+		List<Node> nodes = reparse(start, end, Context.BLOCK, Set.of(), Map.of(statementStart, INSERTED_IF_CONDITION));
+		if(nodes.size() == 1 && nodes.get(0).type.equals("if_statement") && nodes.get(0).start == statementStart) {
+			List<Node> branch = new ArrayList<>();
+			for(Node child : nodes.get(0).children) {
+				if(child.type.equals("else_clause")) {
+					branch.addAll(child.children);
+				}
+				else if(child.end > statementStart) {
+					branch.add(child);
+				}
+			}
+			return List.of(inline(branch));
+		}
+		return nodes;
+	}
+
 	private Node conditionClause(int searchStart, IASTNode condition, IASTStatement initializer, int limit) {
 		int open = find("(", searchStart, limit);
-		int close = findLast(")", open, limit);
+		//the parenthesis after the condition, and not the last one before the statement, which can be in a branch that is not taken before the statement
+		int close = condition != null && hasLocation(condition) ? find(")", end(condition), limit) : -1;
+		if(close < 0) {
+			close = findLast(")", open, limit);
+		}
 		List<Node> children = new ArrayList<>();
 		if(initializer != null && hasLocation(initializer)) {
 			Node init = statement(initializer);
@@ -3785,6 +4178,14 @@ public class CppTreeGenerator {
 		}
 		if(expression instanceof IASTIdExpression id) {
 			IASTName name = id.getName();
+			//a type argument of a call, which was masked as a name, i.e., struct task_struct in container_of(rhp, struct task_struct, rcu)
+			Integer maskedEnd = source.maskedArguments.get(start(id));
+			if(maskedEnd != null && maskedEnd == end(id)) {
+				List<Node> types = templateArguments(start(id), maskedEnd);
+				if(types.size() == 1) {
+					return types.get(0);
+				}
+			}
 			if(text(name).equals("NULL")) {
 				return wrap("null", leaf("NULL", start(name), end(name)));
 			}

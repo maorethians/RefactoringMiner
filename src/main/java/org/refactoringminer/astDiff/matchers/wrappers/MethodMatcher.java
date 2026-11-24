@@ -448,6 +448,8 @@ public class MethodMatcher extends BodyMapperMatcher{
                 }
                 if(srcOperationNode.getParent().getType().name.equals(LANG1.FIELD_DECLARATION) && dstOperationNode.getParent().getType().name.equals(LANG2.FIELD_DECLARATION)) {
                     mappingStore.addMapping(srcOperationNode.getParent(), dstOperationNode.getParent());
+                    //the storage class specifiers of a function returning a pointer, i.e., extern in extern void *log_get_tls_data(void);
+                    matchStorageClassSpecifiers(srcOperationNode.getParent(), dstOperationNode.getParent(), mappingStore);
                     com.github.gumtreediff.utils.Pair<Tree,Tree> type_qualifiers = Helpers.findPairOfType(srcOperationNode.getParent(),dstOperationNode.getParent(),LANG1.TYPE_QUALIFIER,LANG2.TYPE_QUALIFIER);
                     if (type_qualifiers != null) {
                         mappingStore.addMappingRecursively(type_qualifiers.first,type_qualifiers.second);
@@ -474,6 +476,8 @@ public class MethodMatcher extends BodyMapperMatcher{
                 }
                 else if(srcOperationNode.getParent().getType().name.equals(LANG1.DECLARATION) && dstOperationNode.getParent().getType().name.equals(LANG2.DECLARATION)) {
                     mappingStore.addMapping(srcOperationNode.getParent(), dstOperationNode.getParent());
+                    //the storage class specifiers of a function returning a pointer, i.e., extern in extern void *log_get_tls_data(void);
+                    matchStorageClassSpecifiers(srcOperationNode.getParent(), dstOperationNode.getParent(), mappingStore);
                     com.github.gumtreediff.utils.Pair<Tree,Tree> type_qualifiers = Helpers.findPairOfType(srcOperationNode.getParent(),dstOperationNode.getParent(),LANG1.TYPE_QUALIFIER,LANG2.TYPE_QUALIFIER);
                     if (type_qualifiers != null) {
                         mappingStore.addMappingRecursively(type_qualifiers.first,type_qualifiers.second);
@@ -949,9 +953,11 @@ public class MethodMatcher extends BodyMapperMatcher{
             }
         }
         matched = Helpers.findPairOfType(srcOperationNode,dstOperationNode,LANG1.POINTER_DECLARATOR,LANG2.POINTER_DECLARATOR);
-        if (matched != null) {
+        //the nested pointer declarators of a return type with several pointers, i.e., struct queue_info ***find(int priority)
+        while (matched != null) {
             mappingStore.addMapping(matched.first,matched.second);
             processTreesContainingFunctionDeclarators(matched.first,matched.second, mappingStore);
+            matched = Helpers.findPairOfType(matched.first,matched.second,LANG1.POINTER_DECLARATOR,LANG2.POINTER_DECLARATOR);
         }
         if(srcOperationNode.getType().name.equals(LANG1.REFERENCE_DECLARATOR) && dstOperationNode.getType().name.equals(LANG2.FUNCTION_DECLARATOR)) {
             mappingStore.addMapping(srcOperationNode, dstOperationNode);
@@ -1260,6 +1266,17 @@ public class MethodMatcher extends BodyMapperMatcher{
         return match;
     }
 
+    //the storage class specifiers of the declaration of a function, i.e., extern in extern void init_IRQ(void);, whose operation is located at its declarator
+    private void matchStorageClassSpecifiers(Tree declaration1, Tree declaration2, ExtendedMultiMappingStore mappingStore) {
+        List<Tree> specifiers1 = TreeUtilFunctions.findChildrenByType(declaration1, LANG1.STORAGE_CLASS_SPECIFIER);
+        List<Tree> specifiers2 = TreeUtilFunctions.findChildrenByType(declaration2, LANG2.STORAGE_CLASS_SPECIFIER);
+        if(specifiers1.size() == specifiers2.size()) {
+            for(int i=0; i<specifiers1.size(); i++) {
+                mappingStore.addMappingRecursively(specifiers1.get(i), specifiers2.get(i));
+            }
+        }
+    }
+
     private void processFunctionDeclarators(Tree functionDeclarator1, Tree functionDeclarator2, ExtendedMultiMappingStore mappingStore) {
         mappingStore.addMapping(functionDeclarator1,functionDeclarator2);
         com.github.gumtreediff.utils.Pair<Tree,Tree> identifiers = Helpers.findPairOfType(functionDeclarator1,functionDeclarator2,LANG1.FIELD_IDENTIFIER,LANG2.FIELD_IDENTIFIER);
@@ -1407,6 +1424,7 @@ public class MethodMatcher extends BodyMapperMatcher{
         }
         if(parent1.getType().name.equals(LANG1.DECLARATION) && parent2.getType().name.equals(LANG2.DECLARATION)) {
             mappingStore.addMapping(parent1,parent2);
+            matchStorageClassSpecifiers(parent1, parent2, mappingStore);
             Tree lastChild1 = parent1.getChild(parent1.getChildren().size()-1);
             Tree lastChild2 = parent2.getChild(parent2.getChildren().size()-1);
             if(lastChild1.getType().name.equals(LANG1.SEMICOLON) && lastChild2.getType().name.equals(LANG2.SEMICOLON)) {
@@ -1440,6 +1458,7 @@ public class MethodMatcher extends BodyMapperMatcher{
         }
         else if(parent1.getType().name.equals(LANG1.FIELD_DECLARATION) && parent2.getType().name.equals(LANG2.FIELD_DECLARATION)) {
             mappingStore.addMapping(parent1,parent2);
+            matchStorageClassSpecifiers(parent1, parent2, mappingStore);
             Tree lastChild1 = parent1.getChild(parent1.getChildren().size()-1);
             Tree lastChild2 = parent2.getChild(parent2.getChildren().size()-1);
             if(lastChild1.getType().name.equals(LANG1.SEMICOLON) && lastChild2.getType().name.equals(LANG2.SEMICOLON)) {
@@ -1664,6 +1683,145 @@ public class MethodMatcher extends BodyMapperMatcher{
         return null;
     }
 
+    //the changed type of a pattern parameter, whose object type members are matched by their names, with the separators following them,
+    //i.e., { a: A; b: B } -> { a: A; c: C; b: B }, where the separator after c is the added one, and not the one after a
+    private void matchChangedTypeAnnotation(Tree typeAnnotation1, Tree typeAnnotation2, ExtendedMultiMappingStore mappingStore) {
+        mappingStore.addMapping(typeAnnotation1, typeAnnotation2);
+        List<Tree> children1 = typeAnnotation1.getChildren();
+        List<Tree> children2 = typeAnnotation2.getChildren();
+        if(children1.size() != children2.size()) {
+            new LeafMatcher(LANG1, LANG2).match(typeAnnotation1, typeAnnotation2, mappingStore);
+            return;
+        }
+        for(int i=0; i<children1.size(); i++) {
+            Tree child1 = children1.get(i);
+            Tree child2 = children2.get(i);
+            if(child1.getType().name.equals(LANG1.OBJECT_TYPE) && child2.getType().name.equals(LANG2.OBJECT_TYPE)) {
+                matchObjectTypes(child1, child2, mappingStore);
+            }
+            else if(TreeUtilFunctions.isIsomorphicTo(child1, child2)) {
+                mappingStore.addMappingRecursively(child1, child2);
+            }
+            else {
+                new LeafMatcher(LANG1, LANG2).match(child1, child2, mappingStore);
+                mappingStore.addMapping(child1, child2);
+            }
+        }
+    }
+
+    private void matchObjectTypes(Tree objectType1, Tree objectType2, ExtendedMultiMappingStore mappingStore) {
+        if(TreeUtilFunctions.isIsomorphicTo(objectType1, objectType2)) {
+            mappingStore.addMappingRecursively(objectType1, objectType2);
+            return;
+        }
+        mappingStore.addMapping(objectType1, objectType2);
+        List<Tree> children1 = objectType1.getChildren();
+        List<Tree> children2 = objectType2.getChildren();
+        //the braces
+        if(children1.size() > 0 && children2.size() > 0) {
+            Tree first1 = children1.get(0), first2 = children2.get(0);
+            if(first1.isLeaf() && TreeUtilFunctions.isIsomorphicTo(first1, first2)) {
+                mappingStore.addMapping(first1, first2);
+            }
+            Tree last1 = children1.get(children1.size()-1), last2 = children2.get(children2.size()-1);
+            if(last1.isLeaf() && TreeUtilFunctions.isIsomorphicTo(last1, last2)) {
+                mappingStore.addMapping(last1, last2);
+            }
+        }
+        //the members with the same name, then the remaining members in their order when as many remain on both sides
+        Set<Tree> used = new HashSet<>();
+        List<Tree> remaining1 = new ArrayList<>();
+        for(Tree member1 : children1) {
+            if(member1.isLeaf()) {
+                continue;
+            }
+            String name1 = memberName(member1, LANG1);
+            Tree member2 = null;
+            for(Tree candidate : children2) {
+                if(!candidate.isLeaf() && !used.contains(candidate) && candidate.getType().name.equals(member1.getType().name) &&
+                        name1 != null && name1.equals(memberName(candidate, LANG2))) {
+                    member2 = candidate;
+                    break;
+                }
+            }
+            if(member2 != null) {
+                used.add(member2);
+                matchMembers(member1, member2, mappingStore);
+            }
+            else {
+                remaining1.add(member1);
+            }
+        }
+        List<Tree> remaining2 = new ArrayList<>();
+        for(Tree member2 : children2) {
+            if(!member2.isLeaf() && !used.contains(member2)) {
+                remaining2.add(member2);
+            }
+        }
+        if(remaining1.size() == remaining2.size()) {
+            for(int i=0; i<remaining1.size(); i++) {
+                if(remaining1.get(i).getType().name.equals(remaining2.get(i).getType().name)) {
+                    matchMembers(remaining1.get(i), remaining2.get(i), mappingStore);
+                }
+            }
+        }
+    }
+
+    private void matchMembers(Tree member1, Tree member2, ExtendedMultiMappingStore mappingStore) {
+        matchMemberParts(member1, member2, mappingStore);
+        //the separator following the member, i.e., ; or ,
+        Tree next1 = nextSibling(member1);
+        Tree next2 = nextSibling(member2);
+        if(next1 != null && next2 != null && next1.isLeaf() && next2.isLeaf() && next1.getType().name.equals(next2.getType().name) &&
+                !next1.getType().name.equals(LANG1.CLOSING_CURLY_BRACE)) {
+            mappingStore.addMapping(next1, next2);
+        }
+    }
+
+    //the parts of the paired members, identical ones as a whole, the ones with the same shape by their positions, and a changed one with its identical copy
+    //in the other, i.e., ReactNode in actions?: ReactNode -> actions?: ReactNode | null, or else as a replacement, i.e., PullInsights["refactorings"] -> PullRefactorings
+    private void matchMemberParts(Tree tree1, Tree tree2, ExtendedMultiMappingStore mappingStore) {
+        if(TreeUtilFunctions.isIsomorphicTo(tree1, tree2)) {
+            mappingStore.addMappingRecursively(tree1, tree2);
+            return;
+        }
+        if(tree1.getType().name.equals(tree2.getType().name) && tree1.getChildren().size() == tree2.getChildren().size() && !tree1.isLeaf()) {
+            mappingStore.addMapping(tree1, tree2);
+            for(int i=0; i<tree1.getChildren().size(); i++) {
+                matchMemberParts(tree1.getChild(i), tree2.getChild(i), mappingStore);
+            }
+            return;
+        }
+        for(Tree descendant : tree2.getDescendants()) {
+            if(TreeUtilFunctions.isIsomorphicTo(tree1, descendant)) {
+                mappingStore.addMappingRecursively(tree1, descendant);
+                return;
+            }
+        }
+        for(Tree descendant : tree1.getDescendants()) {
+            if(TreeUtilFunctions.isIsomorphicTo(descendant, tree2)) {
+                mappingStore.addMappingRecursively(descendant, tree2);
+                return;
+            }
+        }
+        new LeafMatcher(LANG1, LANG2).match(tree1, tree2, mappingStore);
+        mappingStore.addMapping(tree1, tree2);
+    }
+
+    private static Tree nextSibling(Tree tree) {
+        Tree parent = tree.getParent();
+        if(parent == null) {
+            return null;
+        }
+        int index = parent.getChildPosition(tree);
+        return index + 1 < parent.getChildren().size() ? parent.getChild(index + 1) : null;
+    }
+
+    private static String memberName(Tree member, Constants LANG) {
+        Tree name = childOfType(member, LANG.PROPERTY_IDENTIFIER);
+        return name != null ? name.getLabel() : null;
+    }
+
     private static boolean isParameterWrapper(Tree tree, Constants LANG) {
         String type = tree.getType().name;
         return type.equals(LANG.REQUIRED_PARAMETER) || type.equals(LANG.OPTIONAL_PARAMETER) || type.equals(LANG.ASSIGNMENT_PATTERN);
@@ -1743,6 +1901,12 @@ public class MethodMatcher extends BodyMapperMatcher{
             else if(Constants.isCrossLanguage(LANG1, LANG2)) {
                 JavaToKotlinMigration.handleParameterMapping(mappingStore, leftTree, rightTree, LANG1, LANG2, optimizationData.getDeferredFlattenings());
             }
+            else if(leftTree.getType().name.equals(LANG1.SIMPLE_NAME) && rightTree.getType().name.equals(LANG2.PARAMETER_DECLARATION) ||
+                    leftTree.getType().name.equals(LANG1.PARAMETER_DECLARATION) && rightTree.getType().name.equals(LANG2.SIMPLE_NAME)) {
+                //a parameter of a K&R function definition declared by its name alone, which makes it an int, i.e., n in f(n) { ... } -> f(int n),
+                //whose name is matched with the name in the declaration of the other parameter
+                new LeafMatcher(LANG1, LANG2).match(leftTree,rightTree,mappingStore);
+            }
             else {
                 new LeafMatcher(LANG1, LANG2).match(leftTree,rightTree,mappingStore);
                 Tree name1 = parameterName(leftTree, LANG1);
@@ -1788,7 +1952,14 @@ public class MethodMatcher extends BodyMapperMatcher{
                         mappingStore.addMapping(requiredParameter1,requiredParameter2);
                         if(requiredParameter1.getChildren().size() > 1 && requiredParameter2.getChildren().size() > 1 &&
                                 requiredParameter1.getChild(1).getType().name.equals(LANG1.TYPE_ANNOTATION) && requiredParameter2.getChild(1).getType().name.equals(LANG2.TYPE_ANNOTATION)) {
-                            mappingStore.addMappingRecursively(requiredParameter1.getChild(1), requiredParameter2.getChild(1));
+                            Tree typeAnnotation1 = requiredParameter1.getChild(1);
+                            Tree typeAnnotation2 = requiredParameter2.getChild(1);
+                            if(TreeUtilFunctions.isIsomorphicTo(typeAnnotation1, typeAnnotation2)) {
+                                mappingStore.addMappingRecursively(typeAnnotation1, typeAnnotation2);
+                            }
+                            else {
+                                matchChangedTypeAnnotation(typeAnnotation1, typeAnnotation2, mappingStore);
+                            }
                         }
                         processPatternDefault(requiredParameter1, requiredParameter2, mappingStore);
                         mapFollowingComma(requiredParameter1, requiredParameter2, mappingStore);

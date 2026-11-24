@@ -1760,6 +1760,38 @@ public class ReplacementAlgorithm {
 			findReplacements(creations1, creations2, replacementInfo, ReplacementType.CLASS_INSTANCE_CREATION, container1, container2, classDiff);
 		}
 
+		//the creations within a call extracted to a variable of the second statement are replaced with the call as a whole, not with the variable,
+		//i.e., sql.Identifier(name) in admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name))) -> admin.execute(query),
+		//where query = sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name))
+		private Set<String> creationsNotNestedInExtractedCall(Set<String> creations) {
+			Set<String> extractedCalls = new LinkedHashSet<>();
+			for(AbstractCodeFragment fragment2 : replacementInfo.getStatements2()) {
+				for(VariableDeclaration declaration : fragment2.getVariableDeclarations()) {
+					if(declaration.getInitializer() != null && variables2.contains(declaration.getVariableName()) &&
+							methodInvocations1.contains(declaration.getInitializer().getString())) {
+						extractedCalls.add(declaration.getInitializer().getString());
+					}
+				}
+			}
+			if(extractedCalls.isEmpty()) {
+				return creations;
+			}
+			Set<String> filtered = new LinkedHashSet<>();
+			for(String creation : creations) {
+				boolean nested = false;
+				for(String call : extractedCalls) {
+					if(!call.equals(creation) && call.contains(creation)) {
+						nested = true;
+						break;
+					}
+				}
+				if(!nested) {
+					filtered.add(creation);
+				}
+			}
+			return filtered;
+		}
+
 		private Set<Replacement> findVariableAndCallReplacements() throws RefactoringMinerTimedOutException {
 			for(String s : variables1) {
 				if(statement1.getString().startsWith(s + LANG1.ASSIGNMENT)) {
@@ -1768,7 +1800,7 @@ public class ReplacementAlgorithm {
 			}
 			findReplacements(creations1, convertLambdasToStringSet(lambdas2), replacementInfo, ReplacementType.CLASS_INSTANCE_CREATION_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
 			findReplacements(variablesToBeConsidered1, withScopeFunctionsOnReceiver(statement2, creations2, creationMap2), replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
-			findReplacements(withScopeFunctionsOnReceiver(statement1, creations1, creationMap1), variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
+			findReplacements(creationsNotNestedInExtractedCall(withScopeFunctionsOnReceiver(statement1, creations1, creationMap1)), variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_CLASS_INSTANCE_CREATION, container1, container2, classDiff);
 			findReplacements(variables1, convertLambdasToStringSet(lambdas2), replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
 			findReplacements(convertLambdasToStringSet(lambdas1), variables2, replacementInfo, ReplacementType.VARIABLE_REPLACED_WITH_LAMBDA, container1, container2, classDiff);
 			if(statement1.getString().startsWith(LANG1.THROW_SPACE) && statement2.getString().startsWith(LANG2.THROW_SPACE) && creationCoveringTheEntireStatement2 != null && creations2.isEmpty()) {
@@ -3537,6 +3569,30 @@ public class ReplacementAlgorithm {
 						invocationCoveringTheEntireStatement2.actualString(), invocationCoveringTheEntireStatement1, invocationCoveringTheEntireStatement2, ReplacementType.METHOD_INVOCATION_EXPRESSION_ARGUMENT_SWAPPED);
 				replacementInfo.addReplacement(replacement);
 				return replacementInfo.getReplacements();
+			}
+			//JavaScript str.match(regex) replaced with regex.exec(str), with the crossing replacements of the receiver and the argument replaced by the swap,
+			//and the regex literal replaced with its extracted constant, if any
+			if(assignmentInvocationCoveringTheEntireStatement1 != null && assignmentInvocationCoveringTheEntireStatement2 != null &&
+					assignmentInvocationCoveringTheEntireStatement1.regexMatchSwappedWithExec(assignmentInvocationCoveringTheEntireStatement2)) {
+				AbstractCall call1 = assignmentInvocationCoveringTheEntireStatement1;
+				AbstractCall call2 = assignmentInvocationCoveringTheEntireStatement2;
+				String temp = statement1.getString().replace(call1.actualString(), call2.actualString());
+				if(temp.equals(statement2.getString())) {
+					Set<Replacement> crossing = new LinkedHashSet<>();
+					for(Replacement r : replacementInfo.getReplacements()) {
+						if(call1.actualString().contains(r.getBefore()) && call2.actualString().contains(r.getAfter())) {
+							crossing.add(r);
+						}
+					}
+					replacementInfo.removeReplacements(crossing);
+					String regex1 = call1.getName().equals("match") ? call1.arguments().get(0) : call1.getExpression();
+					String regex2 = call2.getName().equals("exec") ? call2.getExpression() : call2.arguments().get(0);
+					if(!regex1.equals(regex2)) {
+						replacementInfo.addReplacement(new Replacement(regex1, regex2, ReplacementType.VARIABLE_REPLACED_WITH_STRING_LITERAL));
+					}
+					replacementInfo.addReplacement(new MethodInvocationReplacement(call1.actualString(), call2.actualString(), call1, call2, ReplacementType.METHOD_INVOCATION_EXPRESSION_ARGUMENT_SWAPPED));
+					return replacementInfo.getReplacements();
+				}
 			}
 			//Kotlin extension call is identical with the static call having the receiver as first argument, i.e., source.buffer() -> Okio.buffer(source)
 			if(invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null &&
@@ -5451,7 +5507,7 @@ public class ReplacementAlgorithm {
 				}
 			}
 			if(variableDeclarations1.size() > 0  && variableDeclarations2.size() > 0 && variableDeclarations1.toString().equals(variableDeclarations2.toString()) &&
-					invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null && parentMapper == null) {
+					invocationCoveringTheEntireStatement1 != null && invocationCoveringTheEntireStatement2 != null && (parentMapper == null || operationBodyMapper.isTestCallbackMapper())) {
 				int variableDeclarationsInOtherStatements1 = 0;
 				for(AbstractCodeFragment fragment1 : replacementInfo.getStatements1()) {
 					for(VariableDeclaration variableDeclaration : fragment1.getVariableDeclarations()) {
@@ -8137,7 +8193,7 @@ public class ReplacementAlgorithm {
 		return codePath;
 	}
 
-	private static boolean nestedInAnotherAnonymousClass(AbstractCodeFragment statement, AnonymousClassDeclarationObject anonymousClassDeclaration) {
+	static boolean nestedInAnotherAnonymousClass(AbstractCodeFragment statement, AnonymousClassDeclarationObject anonymousClassDeclaration) {
 		for(AnonymousClassDeclarationObject other : statement.getAnonymousClassDeclarations()) {
 			if(other != anonymousClassDeclaration && other.getLocationInfo().subsumes(anonymousClassDeclaration.getLocationInfo())) {
 				return true;
@@ -8164,6 +8220,21 @@ public class ReplacementAlgorithm {
 		String statementWithoutAnonymous2 = statementWithoutAnonymous(statement2, anonymousClassDeclaration2, container2);
 		if(operationBodyMapper.anonymousClassMatchedByParentMapper(anonymousClassDeclaration1, anonymousClassDeclaration2)) {
 			return replacementAdded;
+		}
+		if(operationBodyMapper.skipsDataObjectDiffs()) {
+			UMLAnonymousClass anonymousClass1 = operationBodyMapper.findAnonymousClass1(anonymousClassDeclaration1);
+			UMLAnonymousClass anonymousClass2 = operationBodyMapper.findAnonymousClass2(anonymousClassDeclaration2);
+			if(dataObjects(anonymousClass1, anonymousClass2)) {
+				//the data objects of tests are not diffed but matched within their statements, so the objects matched through their names
+				//are replaced without comparing the statements around them, i.e., each of the expected calls { name: 'lineTo', args: [...] }
+				if(matchedThroughNames(statement1, statement2, anonymousClassDeclaration1, anonymousClassDeclaration2, anonymousClass1, anonymousClass2, container1, container2) &&
+						!anonymousClassDeclaration1.toString().replaceAll("\\s+", "").equals(anonymousClassDeclaration2.toString().replaceAll("\\s+", ""))) {
+					Replacement replacement = new Replacement(anonymousClassDeclaration1.toString(), anonymousClassDeclaration2.toString(), ReplacementType.ANONYMOUS_CLASS_DECLARATION);
+					replacementInfo.addReplacement(replacement);
+					replacementAdded = true;
+				}
+				return replacementAdded;
+			}
 		}
 		if(replacementInfo.getRawDistance() == 0 || statementWithoutAnonymous1.equals(statementWithoutAnonymous2) || anonymousClassDeclaration1.toString().equals(anonymousClassDeclaration2.toString()) ||
 				identicalAfterVariableAndTypeReplacements(statementWithoutAnonymous1, statementWithoutAnonymous2, replacementInfo.getReplacements(), LANG1, LANG2) ||
@@ -8226,13 +8297,19 @@ public class ReplacementAlgorithm {
 			//with the same names at the same position are diffs, if the statement pair is mapped without them
 			UMLAnonymousClass anonymousClass1 = operationBodyMapper.findAnonymousClass1(anonymousClassDeclaration1);
 			UMLAnonymousClass anonymousClass2 = operationBodyMapper.findAnonymousClass2(anonymousClassDeclaration2);
-			if(matchedThroughNames(statement1, statement2, anonymousClassDeclaration1, anonymousClassDeclaration2, anonymousClass1, anonymousClass2, container1, container2)) {
+			if(!operationBodyMapper.skipsDataObjectDiffs() &&
+					matchedThroughNames(statement1, statement2, anonymousClassDeclaration1, anonymousClassDeclaration2, anonymousClass1, anonymousClass2, container1, container2)) {
 				UMLAnonymousClassDiff anonymousClassDiff = new UMLAnonymousClassDiff(anonymousClass1, anonymousClass2, classDiff, modelDiff);
 				anonymousClassDiff.process();
 				addPendingAnonymousClassDiff(statement1, statement2, anonymousClassDiff, operationBodyMapper, parentMapper);
 			}
 		}
 		return replacementAdded;
+	}
+
+	//objects without operations, i.e., TypeScript object literals and Python dictionaries holding data
+	private static boolean dataObjects(UMLAnonymousClass anonymousClass1, UMLAnonymousClass anonymousClass2) {
+		return anonymousClass1 != null && anonymousClass2 != null && anonymousClass1.getOperations().isEmpty() && anonymousClass2.getOperations().isEmpty();
 	}
 
 	private static boolean matchedThroughNames(AbstractCodeFragment statement1, AbstractCodeFragment statement2,

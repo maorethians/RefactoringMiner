@@ -3,6 +3,7 @@ package gr.uom.java.xmi.diff;
 import gr.uom.java.xmi.Constants;
 import gr.uom.java.xmi.InferredType;
 import gr.uom.java.xmi.LeafType;
+import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.UMLAbstractClass;
 import gr.uom.java.xmi.UMLAnnotation;
 import gr.uom.java.xmi.UMLAnonymousClass;
@@ -20,6 +21,7 @@ import gr.uom.java.xmi.UMLModelASTReader;
 import gr.uom.java.xmi.UMLModule;
 import gr.uom.java.xmi.UMLOperation;
 import gr.uom.java.xmi.UMLParameter;
+import gr.uom.java.xmi.UMLPreprocessorStatement;
 import gr.uom.java.xmi.UMLRealization;
 import gr.uom.java.xmi.UMLType;
 import gr.uom.java.xmi.UMLTypeParameter;
@@ -87,7 +89,7 @@ import org.refactoringminer.util.PathFileUtils;
 import org.refactoringminer.util.PrefixSuffixUtils;
 
 public class UMLModelDiff {
-	private static final Pattern RETURN_NUMBER_LITERAL = Pattern.compile("return \\d+;\n");
+	private static final Pattern RETURN_NUMBER_LITERAL = Pattern.compile("return \\d+;?\n");
 	private final int MAXIMUM_NUMBER_OF_COMPARED_METHODS;
 	private UMLModel parentModel;
 	private UMLModel childModel;
@@ -2810,6 +2812,24 @@ public class UMLModelDiff {
 		return addedAttributes;
 	}
 
+	//the object literal initializing the attribute is an object class, which is reported as Replace Anonymous With Class,
+	//i.e., classExtractor: createClassExtractor({...}) -> const javaClassConfig: ClassExtractionConfig = {...}
+	private boolean initializerModeledAsObject(UMLAttribute attribute) {
+		VariableDeclaration variableDeclaration = attribute.getVariableDeclaration();
+		if(childModel == null || variableDeclaration == null || variableDeclaration.getInitializer() == null) {
+			return false;
+		}
+		LocationInfo initializer = variableDeclaration.getInitializer().getLocationInfo();
+		for(UMLClass umlClass : childModel.getClassList()) {
+			LocationInfo location = umlClass.getLocationInfo();
+			if(umlClass.isObject() && location.getFilePath().equals(initializer.getFilePath()) &&
+					location.getStartOffset() == initializer.getStartOffset() && location.getEndOffset() == initializer.getEndOffset()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public List<UMLAttribute> getAddedAttributesInCommonClasses() {
 		List<UMLAttribute> addedAttributes = new ArrayList<UMLAttribute>();
 		for(UMLClassDiff classDiff : commonClassDiffList) {
@@ -4702,7 +4722,7 @@ public class UMLModelDiff {
 					List<AbstractCall> calls = attributeDiff.getInitializerMapper().get().getContainer2().getAllOperationInvocations();
 					for(AbstractCall call : calls) {
 						for(UMLAttribute addedAttribute : classDiff.getAddedAttributes()) {
-							if(call.getName().equals(addedAttribute.getName())) {
+							if(call.getName().equals(addedAttribute.getName()) && !initializerModeledAsObject(addedAttribute)) {
 								UMLOperationBodyMapper mapper = new UMLOperationBodyMapper(attributeDiff.getRemovedAttribute(), addedAttribute, classDiff, this);
 								if(mapper.getMappings().size() > 0) {
 									ExtractOperationRefactoring extractOperationRefactoring =
@@ -4712,7 +4732,7 @@ public class UMLModelDiff {
 							}
 						}
 						for(UMLAttribute addedAttribute : attributesInAddedClasses) {
-							if(call.getName().equals(addedAttribute.getName())) {
+							if(call.getName().equals(addedAttribute.getName()) && !initializerModeledAsObject(addedAttribute)) {
 								UMLOperationBodyMapper mapper = new UMLOperationBodyMapper(attributeDiff.getRemovedAttribute(), addedAttribute, classDiff, this);
 								if(mapper.getMappings().size() > 0) {
 									ExtractOperationRefactoring extractOperationRefactoring =
@@ -4762,24 +4782,28 @@ public class UMLModelDiff {
 		Map<Pair<UMLOperation, UMLOperation>, Set<MethodInvocationReplacement>> map = new LinkedHashMap<Pair<UMLOperation, UMLOperation>, Set<MethodInvocationReplacement>>();
 		for(UMLClassDiff classDiff : commonClassDiffList) {
 			inferMethodSignatureRelatedRefactorings(classDiff, refactorings, map);
+			inferPreprocessorDefinitionChanges(classDiff);
 			detectImportDeclarationChanges(classDiff, packageRefactorings);
 			detectImportChangesOfMovedAttributes(classDiff, refactorings);
 			detectInterfaceChanges(classDiff, packageRefactorings);
 		}
 		for(UMLClassMoveDiff classDiff : classMoveDiffList) {
 			inferMethodSignatureRelatedRefactorings(classDiff, refactorings, map);
+			inferPreprocessorDefinitionChanges(classDiff);
 			detectImportDeclarationChanges(classDiff, packageRefactorings);
 			detectImportChangesOfMovedAttributes(classDiff, refactorings);
 			detectInterfaceChanges(classDiff, packageRefactorings);
 		}
 		for(UMLClassMoveDiff classDiff : innerClassMoveDiffList) {
 			inferMethodSignatureRelatedRefactorings(classDiff, refactorings, map);
+			inferPreprocessorDefinitionChanges(classDiff);
 			detectImportDeclarationChanges(classDiff, packageRefactorings);
 			detectImportChangesOfMovedAttributes(classDiff, refactorings);
 			detectInterfaceChanges(classDiff, packageRefactorings);
 		}
 		for(UMLClassRenameDiff classDiff : classRenameDiffList) {
 			inferMethodSignatureRelatedRefactorings(classDiff, refactorings, map);
+			inferPreprocessorDefinitionChanges(classDiff);
 			detectImportDeclarationChanges(classDiff, packageRefactorings);
 			detectImportChangesOfMovedAttributes(classDiff, refactorings);
 			detectInterfaceChanges(classDiff, packageRefactorings);
@@ -5638,6 +5662,46 @@ public class UMLModelDiff {
 			replacements.addAll(classDiff.findMethodInvocationReplacementWithMatchingSignatures(operation1, operation2, differingCallsPerMapping));
 		}
 		return replacements;
+	}
+
+	//the removed and added macro definitions with the names of an operation and its counterpart matched elsewhere in the model are changed definitions,
+	//like the removed and added interface operations with the signatures of matched implementations,
+	//i.e., #define alloc_thread_info_node(tsk, node) -> #define alloc_thread_stack_node(tsk, node) with alloc_thread_info_node renamed to alloc_thread_stack_node in fork.c
+	private void inferPreprocessorDefinitionChanges(UMLClassBaseDiff classDiff) {
+		if(classDiff.getPreprocessorStatementListDiff().isEmpty() || !classDiff.hasBothAddedAndRemovedPreprocessorStatements()) {
+			return;
+		}
+		UMLPreprocessorStatementListDiff preprocessorDiff = classDiff.getPreprocessorStatementListDiff().get();
+		Set<Pair<String, String>> renamedDefinitions = new LinkedHashSet<>();
+		for(UMLPreprocessorStatement removedStatement : preprocessorDiff.getRemovedStatements()) {
+			if(!removedStatement.isDefinition() || removedStatement.getName().isEmpty()) {
+				continue;
+			}
+			for(UMLPreprocessorStatement addedStatement : preprocessorDiff.getAddedStatements()) {
+				if(addedStatement.isDefinition() && addedStatement.getName().isPresent() && !addedStatement.getName().equals(removedStatement.getName()) &&
+						mapperWithMatchingNamesExists(removedStatement.getName().get(), addedStatement.getName().get())) {
+					renamedDefinitions.add(Pair.of(removedStatement.getName().get(), addedStatement.getName().get()));
+				}
+			}
+		}
+		for(Pair<String, String> renamedDefinition : renamedDefinitions) {
+			preprocessorDiff.pairRenamedDefinitions(renamedDefinition.getLeft(), renamedDefinition.getRight());
+		}
+	}
+
+	private boolean mapperWithMatchingNamesExists(String name1, String name2) {
+		List<UMLClassBaseDiff> classDiffs = new ArrayList<>(commonClassDiffList);
+		classDiffs.addAll(classMoveDiffList);
+		classDiffs.addAll(innerClassMoveDiffList);
+		classDiffs.addAll(classRenameDiffList);
+		for(UMLClassBaseDiff classDiff : classDiffs) {
+			for(UMLOperationBodyMapper mapper : classDiff.getOperationBodyMapperList()) {
+				if(mapper.getOperation1() != null && mapper.getOperation2() != null && mapper.getOperation1().getName().equals(name1) && mapper.getOperation2().getName().equals(name2)) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	private List<UMLOperationBodyMapper> findMappersWithMatchingSignatures(UMLOperation operation1, UMLOperation operation2) {

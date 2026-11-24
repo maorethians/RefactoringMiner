@@ -144,7 +144,7 @@ public class TypeScriptVisitor extends Swc4jAstVisitor {
 				variables.add(name);
 			}
 		}
-		else if(node.getParent() instanceof Swc4jAstAssignExpr assignExpr && node.getObj() instanceof Swc4jAstThisExpr && assignExpr.getParent() instanceof Swc4jAstExprStmt exprStatement &&
+		else if(node.getParent() instanceof Swc4jAstAssignExpr assignExpr && assignExpr.getLeft() == node && node.getObj() instanceof Swc4jAstThisExpr && assignExpr.getParent() instanceof Swc4jAstExprStmt exprStatement &&
 				exprStatement.getParent() instanceof Swc4jAstBlockStmt block && block.getParent() instanceof Swc4jAstConstructor) {
 			VariableDeclaration vd = new VariableDeclaration(sourceFolder, filePath, assignExpr, container, activeVariableDeclarations, fileContent, typeDeclarations);
 			variableDeclarations.add(vd);
@@ -153,7 +153,10 @@ public class TypeScriptVisitor extends Swc4jAstVisitor {
 	}
 
 	public Swc4jAstVisitorResponse visitThisExpr(Swc4jAstThisExpr node) {
-		if(node.getParent() instanceof Swc4jAstMemberExpr) {
+		//the callee of a call is not a variable, i.e., this.getLastError in this.getLastError(), like in Java
+		boolean callee = node.getParent() instanceof Swc4jAstMemberExpr memberExpr &&
+				memberExpr.getParent() instanceof Swc4jAstCallExpr call && call.getCallee() == memberExpr;
+		if(node.getParent() instanceof Swc4jAstMemberExpr && !callee) {
 			LeafExpression varDeclarator = new LeafExpression(sourceFolder, filePath, node.getParent(), CodeElementType.SIMPLE_NAME, container, fileContent);
 			variables.add(varDeclarator);
 		}
@@ -209,7 +212,8 @@ public class TypeScriptVisitor extends Swc4jAstVisitor {
 				}
 			}
 		}
-		else if(node.getParent() instanceof Swc4jAstKeyValueProp prop && prop.getValue().equals(node)) {
+		//the value of a key-value property or a shorthand property, i.e., { mockGlobal: mockGlobal } or { mockGlobal }
+		else if((node.getParent() instanceof Swc4jAstKeyValueProp prop && prop.getValue().equals(node)) || node.getParent() instanceof Swc4jAstObjectLit) {
 			String name = node.getSym();
 			if(container instanceof ModuleContainer module) {
 				for(UMLOperation op : module.getNestedOperations()) {

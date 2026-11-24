@@ -1,5 +1,6 @@
 package gr.uom.java.xmi.decomposition;
 
+import org.eclipse.cdt.core.dom.ast.IASTName;
 import static gr.uom.java.xmi.decomposition.Visitor.stringify;
 
 import java.util.ArrayList;
@@ -32,7 +33,7 @@ public class MethodReference extends AbstractCall {
 		this.arguments = new ArrayList<String>();
 		List<Type> typeArgs = reference.typeArguments();
 		for(Type typeArg : typeArgs) {
-			this.typeArguments.add(UMLType.extractTypeObject(cu, sourceFolder, filePath, typeArg, 0, javaFileContent));
+			addTypeArgument(UMLType.extractTypeObject(cu, sourceFolder, filePath, typeArg, 0, javaFileContent));
 		}
 	}
 	
@@ -42,7 +43,7 @@ public class MethodReference extends AbstractCall {
 		this.arguments = new ArrayList<String>();
 		List<Type> typeArgs = reference.typeArguments();
 		for(Type typeArg : typeArgs) {
-			this.typeArguments.add(UMLType.extractTypeObject(cu, sourceFolder, filePath, typeArg, 0, javaFileContent));
+			addTypeArgument(UMLType.extractTypeObject(cu, sourceFolder, filePath, typeArg, 0, javaFileContent));
 		}
 		if(reference.getQualifier() != null) {
 			this.expression = reference.getQualifier().getFullyQualifiedName() + ".super";
@@ -59,7 +60,7 @@ public class MethodReference extends AbstractCall {
 		this.arguments = new ArrayList<String>();
 		List<Type> typeArgs = reference.typeArguments();
 		for(Type typeArg : typeArgs) {
-			this.typeArguments.add(UMLType.extractTypeObject(cu, sourceFolder, filePath, typeArg, 0, javaFileContent));
+			addTypeArgument(UMLType.extractTypeObject(cu, sourceFolder, filePath, typeArg, 0, javaFileContent));
 		}
 	}
 
@@ -74,6 +75,20 @@ public class MethodReference extends AbstractCall {
 		super(sourceFolder, filePath, reference, CodeElementType.METHOD_REFERENCE, container, fileContent);
 		this.methodName = methodName;
 		this.expression = expression;
+		this.arguments = new ArrayList<String>();
+	}
+
+	//a C/C++ function passed by its name, i.e., thread_stack_free_rcu in call_rcu(rh, thread_stack_free_rcu)
+	public MethodReference(String sourceFolder, String filePath, IASTName functionName, String fileContent) {
+		super(functionName.toString(), new LocationInfo(sourceFolder, filePath, functionName, CodeElementType.METHOD_REFERENCE, fileContent));
+		this.methodName = functionName.toString();
+		this.arguments = new ArrayList<String>();
+	}
+
+	//a pytest fixture requested by a parameter with its name, i.e., _migrated_template in def database_url(_migrated_template: str)
+	public MethodReference(VariableDeclaration fixtureParameter) {
+		super(fixtureParameter.getLocationInfo());
+		this.methodName = fixtureParameter.getVariableName();
 		this.arguments = new ArrayList<String>();
 	}
 

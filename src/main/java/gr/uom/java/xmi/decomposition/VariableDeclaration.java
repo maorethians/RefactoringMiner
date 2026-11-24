@@ -114,6 +114,7 @@ import com.caoccao.javet.swc4j.ast.pat.Swc4jAstRestPat;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsEnumDecl;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsInterfaceDecl;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsTypeAliasDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstUsingDecl;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstVarDecl;
 import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstVarDeclarator;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsParamProp;
@@ -137,6 +138,7 @@ import gr.uom.java.xmi.KotlinFileProcessor;
 import gr.uom.java.xmi.LocationInfo;
 import gr.uom.java.xmi.LocationInfo.CodeElementType;
 import gr.uom.java.xmi.LocationInfoProvider;
+import gr.uom.java.xmi.TypeScriptFileProcessor;
 import gr.uom.java.xmi.UMLAnnotation;
 import gr.uom.java.xmi.UMLClass;
 import gr.uom.java.xmi.UMLJavadoc;
@@ -201,6 +203,23 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		int endOffset = container != null ? container.getLocationInfo().getEndOffset() : locationInfo.getEndOffset();
 		this.scope = new VariableScope(filePath, startOffset, endOffset);
 		this.actualSignature = parameter.getRawSignature();
+	}
+
+	//a parameter of a K&R function definition, i.e., b in int f(a, b) int a; char *b; { ... }, located at its declaration after the names of the parameters,
+	//or at its name when no declaration declares it, i.e., c in f(c) { ... }, which makes it an int
+	public VariableDeclaration(String sourceFolder, String filePath, IASTNode location, String name, IASTDeclSpecifier declSpecifier, IASTDeclarator declarator,
+			VariableDeclarationContainer container, String fileContent) {
+		this.annotations = new ArrayList<UMLAnnotation>();
+		this.modifiers = new ArrayList<UMLModifier>();
+		this.locationInfo = new LocationInfo(sourceFolder, filePath, location, CodeElementType.SINGLE_VARIABLE_DECLARATION, fileContent);
+		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
+		this.variableName = name;
+		this.type = declSpecifier != null ? UMLType.extractTypeObject(sourceFolder, filePath, fileContent, declSpecifier, declarator, 0) : UMLType.extractTypeObject("int", LANG);
+		this.varargsParameter = false;
+		int startOffset = locationInfo.getStartOffset();
+		int endOffset = container != null ? container.getLocationInfo().getEndOffset() : locationInfo.getEndOffset();
+		this.scope = new VariableScope(filePath, startOffset, endOffset);
+		this.actualSignature = fileContent.substring(locationInfo.getStartOffset(), locationInfo.getEndOffset());
 	}
 
 	public VariableDeclaration(String sourceFolder, String filePath, IASTDeclarator declarator, IASTDeclSpecifier declSpecifier,
@@ -328,6 +347,19 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		}
 		//TODO Handle more scenarios of variable declarations
 		return null;
+	}
+
+	//an attribute assigned in a method without a declaration in the model, i.e., self._dataset = ... in a Python method other than __init__
+	public VariableDeclaration(LeafExpression attributeAccess, String attributeName, UMLType type, VariableDeclarationContainer container) {
+		this.variableName = attributeName;
+		this.locationInfo = attributeAccess.getLocationInfo();
+		this.LANG = PathFileUtils.getLang(locationInfo.getFilePath());
+		this.type = type;
+		this.isAttribute = true;
+		this.annotations = new ArrayList<>();
+		this.modifiers = new ArrayList<>();
+		LocationInfo containerLocation = container.getLocationInfo();
+		this.scope = new VariableScope((LangCompilationUnit)null, containerLocation.getFilePath(), containerLocation.getStartOffset(), containerLocation.getEndOffset());
 	}
 
 	public VariableDeclaration(LangCompilationUnit cu, String sourceFolder, String filePath,
@@ -975,7 +1007,8 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 
 	private static CodeElementType extractVariableDeclarationType(Swc4jAstVarDeclarator variableDeclaration) {
 		//TODO handle field declaration and parameter declaration cases
-		if(variableDeclaration.getParent() instanceof Swc4jAstVarDecl parent) {
+		ISwc4jAst parent = variableDeclaration.getParent();
+		if(parent instanceof Swc4jAstVarDecl || parent instanceof Swc4jAstUsingDecl) {
 			if(parent instanceof ISwc4jAstForHead) {
 				return CodeElementType.VARIABLE_DECLARATION_EXPRESSION;
 			}
@@ -1282,7 +1315,7 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 		else {
 			this.type = new InferredType();
 		}
-		this.variableName = key.toString();
+		this.variableName = TypeScriptFileProcessor.memberName(key, fileContent);
 		this.initializer = classProperty.getValue().isPresent() ? new AbstractExpression(sourceFolder, filePath, classProperty.getValue().get(), CodeElementType.VARIABLE_DECLARATION_INITIALIZER, container, activeVariableDeclarations, fileContent, typeDeclarations) : null;
 		ISwc4jAst scopeNode = getScopeNode(classProperty);
 		int startOffset = scopeNode.getSpan().getStart();
@@ -1464,7 +1497,7 @@ public class VariableDeclaration implements LocationInfoProvider, VariableDeclar
 	private ISwc4jAst getScopeNode(ISwc4jAst node) {
 		ISwc4jAst parent = node.getParent();
 		while(parent != null) {
-			if(parent instanceof Swc4jAstVarDecl) {
+			if(parent instanceof Swc4jAstVarDecl || parent instanceof Swc4jAstUsingDecl) {
 				return parent.getParent();
 			}
 			else if(parent instanceof Swc4jAstFunction) {

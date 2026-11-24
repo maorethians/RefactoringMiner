@@ -6,14 +6,27 @@ import static gr.uom.java.xmi.decomposition.Visitor.stringify;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.eclipse.cdt.core.dom.ast.IASTDeclSpecifier;
 import org.eclipse.cdt.core.dom.ast.IASTNode;
+import org.eclipse.cdt.core.dom.ast.IASTNodeLocation;
+import org.eclipse.cdt.core.dom.ast.IASTMacroExpansionLocation;
+import org.eclipse.cdt.core.dom.ast.IASTPreprocessorMacroDefinition;
+import org.eclipse.cdt.core.dom.ast.IASTPreprocessorFunctionStyleMacroDefinition;
 import org.eclipse.cdt.core.dom.ast.IASTDeclarator;
 import org.eclipse.cdt.core.dom.ast.IASTPointerOperator;
+import org.eclipse.cdt.core.dom.ast.IASTPointer;
+import org.eclipse.cdt.core.dom.ast.ASTSignatureUtil;
+import org.eclipse.cdt.core.dom.ast.IASTSimpleDeclSpecifier;
+import org.eclipse.cdt.core.dom.ast.IASTNamedTypeSpecifier;
+import org.eclipse.cdt.core.dom.ast.IASTElaboratedTypeSpecifier;
+import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTReferenceOperator;
 import org.eclipse.cdt.core.dom.ast.cpp.ICPPASTCompositeTypeSpecifier.ICPPASTBaseSpecifier;
 import org.eclipse.cdt.internal.core.dom.parser.c.CASTDeclarator;
 import org.eclipse.jdt.core.dom.AnnotatableType;
@@ -59,6 +72,7 @@ import com.caoccao.javet.swc4j.ast.pat.Swc4jAstObjectPat;
 import com.caoccao.javet.swc4j.ast.pat.Swc4jAstRestPat;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsArrayType;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsConditionalType;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsExprWithTypeArgs;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsFnType;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsImportType;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsIndexedAccessType;
@@ -70,6 +84,7 @@ import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsMethodSignature;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsOptionalType;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsParenthesizedType;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsPropertySignature;
+import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsThisType;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsQualifiedName;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsTupleElement;
 import com.caoccao.javet.swc4j.ast.ts.Swc4jAstTsTupleType;
@@ -94,8 +109,9 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 	private int arrayDimension;
 	private boolean parameterized;
 	private boolean nullable;
-	private List<UMLType> typeArguments = new ArrayList<UMLType>();
-	protected List<UMLAnnotation> annotations = new ArrayList<UMLAnnotation>();
+	//most types have no type arguments or annotations, the lists are created on the first element (Issue #1220)
+	private List<UMLType> typeArguments = Collections.emptyList();
+	protected List<UMLAnnotation> annotations = Collections.emptyList();
 
 	public LocationInfo getLocationInfo() {
 		return locationInfo;
@@ -103,6 +119,20 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 
 	public int getArrayDimension() {
 		return this.arrayDimension;
+	}
+
+	public void addTypeArgument(UMLType typeArgument) {
+		if(typeArguments.isEmpty()) {
+			typeArguments = new ArrayList<>();
+		}
+		typeArguments.add(typeArgument);
+	}
+
+	protected void addAnnotation(UMLAnnotation annotation) {
+		if(annotations.isEmpty()) {
+			annotations = new ArrayList<>();
+		}
+		annotations.add(annotation);
 	}
 
 	public List<UMLType> getTypeArguments() {
@@ -318,7 +348,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 		}
 		UMLType typeObject = new LeafType(qualifiedName, LANG);
 		typeObject.arrayDimension = arrayDimension;
-		typeObject.typeArguments = typeArgumentDecomposition;
+		typeObject.typeArguments = typeArgumentDecomposition.isEmpty() ? Collections.emptyList() : typeArgumentDecomposition;
 		typeObject.parameterized = parameterized;
 		typeObject.locationInfo = location;
 		return (LeafType)typeObject;
@@ -410,7 +440,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			AnnotatableType annotatableType = (AnnotatableType)type;
 			List<Annotation> annotations = annotatableType.annotations();
 			for(Annotation annotation : annotations) {
-				leafType.annotations.add(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
+				leafType.addAnnotation(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
 			}
 			return leafType;
 		}
@@ -421,7 +451,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			AnnotatableType annotatableType = (AnnotatableType)qualified;
 			List<Annotation> annotations = annotatableType.annotations();
 			for(Annotation annotation : annotations) {
-				rightType.annotations.add(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
+				rightType.addAnnotation(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
 			}
 			return new CompositeType(leftType, rightType);
 		}
@@ -432,7 +462,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			AnnotatableType annotatableType = (AnnotatableType)nameQualified;
 			List<Annotation> annotations = annotatableType.annotations();
 			for(Annotation annotation : annotations) {
-				rightType.annotations.add(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
+				rightType.addAnnotation(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
 			}
 			return new CompositeType(leftType, rightType);
 		}
@@ -449,7 +479,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			AnnotatableType annotatableType = (AnnotatableType)wildcard;
 			List<Annotation> annotations = annotatableType.annotations();
 			for(Annotation annotation : annotations) {
-				myWildcardType.annotations.add(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
+				myWildcardType.addAnnotation(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
 			}
 			return myWildcardType;
 		}
@@ -460,7 +490,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 				Dimension dimension = (Dimension)dim;
 				List<Annotation> annotations = dimension.annotations();
 				for(Annotation annotation : annotations) {
-					arrayType.annotations.add(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
+					arrayType.addAnnotation(new UMLAnnotation(cu, sourceFolder, filePath, annotation, javaFileContent));
 				}
 			}
 			arrayType.arrayDimension = array.getDimensions();
@@ -472,7 +502,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			container.parameterized = true;
 			List<Type> typeArguments = parameterized.typeArguments();
 			for(Type argument : typeArguments) {
-				container.typeArguments.add(extractTypeObject(cu, sourceFolder, filePath, argument, javaFileContent));
+				container.addTypeArgument(extractTypeObject(cu, sourceFolder, filePath, argument, javaFileContent));
 			}
 			return container;
 		}
@@ -550,7 +580,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 				UMLType rightType = extractTypeObject(userType.getReferencedName(), PathFileUtils.getLang(filePath));
 				for (KtTypeProjection typeProjection : userType.getTypeArguments()) {
 					UMLType projection = extractTypeObject(ktFile, sourceFolder, filePath, fileContent, typeProjection);
-					rightType.typeArguments.add(projection);
+					rightType.addTypeArgument(projection);
 					rightType.parameterized = true;
 				}
 				return new CompositeType(left, (LeafType) rightType);
@@ -558,7 +588,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 				UMLType leafType = extractTypeObject(userType.getReferencedName(), PathFileUtils.getLang(filePath));
 				for (KtTypeProjection typeProjection : userType.getTypeArguments()) {
 					UMLType projection = extractTypeObject(ktFile, sourceFolder, filePath, fileContent, typeProjection);
-					leafType.typeArguments.add(projection);
+					leafType.addTypeArgument(projection);
 					leafType.parameterized = true;
 				}
 				return leafType;
@@ -624,7 +654,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 		if(modifierList != null) {
 			for (PsiElement modifier : modifierList.getChildren()) {
 				if (modifier instanceof KtAnnotationEntry annotationEntry) {
-					umlType.annotations.add(new UMLAnnotation(ktFile, sourceFolder, filePath, annotationEntry, fileContent));
+					umlType.addAnnotation(new UMLAnnotation(ktFile, sourceFolder, filePath, annotationEntry, fileContent));
 				}
 			}
 		}
@@ -634,6 +664,21 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 		UMLType umlType = UMLType.extractTypeObject(type.getSym(), PathFileUtils.getLang(filePath));
 		umlType.locationInfo = new LocationInfo(sourceFolder, filePath, type, CodeElementType.TYPE, fileContent);
 		umlType.arrayDimension += extraDimensions;
+		return umlType;
+	}
+
+	//the type in an implements or interface extends clause, i.e., Subscribable<T> in class X implements Subscribable<T>, located on the whole type with its type arguments
+	public static UMLType extractTypeObject(String sourceFolder, String filePath, String fileContent, Swc4jAstTsExprWithTypeArgs type) {
+		if(!(type.getExpr() instanceof Swc4jAstIdent ident)) {
+			return null;
+		}
+		UMLType umlType = UMLType.extractTypeObject(ident.getSym(), PathFileUtils.getLang(filePath));
+		if(type.getTypeArgs().isPresent()) {
+			for(ISwc4jAstTsType typeArg : type.getTypeArgs().get().getParams()) {
+				umlType.addTypeArgument(extractTypeObject(sourceFolder, filePath, fileContent, typeArg, 0));
+			}
+		}
+		umlType.locationInfo = new LocationInfo(sourceFolder, filePath, type, CodeElementType.TYPE, fileContent);
 		return umlType;
 	}
 
@@ -711,7 +756,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 				if(typeArguments.size() > 0)
 					leafType.parameterized = true;
 				for(UMLType typeArg : typeArguments) {
-					leafType.typeArguments.add(typeArg);
+					leafType.addTypeArgument(typeArg);
 				}
 				return leafType;
 			}
@@ -729,7 +774,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 				if(typeArguments.size() > 0)
 					compositeType.parameterized = true;
 				for(UMLType typeArg : typeArguments) {
-					compositeType.typeArguments.add(typeArg);
+					compositeType.addTypeArgument(typeArg);
 				}
 				return compositeType;
 			}
@@ -763,6 +808,11 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			ListCompositeType listCompositeType = new ListCompositeType(memberTypeList, Kind.LITERAL);
 			listCompositeType.setKeys(keys);
 			return listCompositeType;
+		}
+		else if(type instanceof Swc4jAstTsThisType) {
+			//the polymorphic this type, i.e., restore(data): this
+			UMLType leafType = extractTypeObject("this", PathFileUtils.getLang(filePath));
+			return leafType;
 		}
 		else if(type instanceof Swc4jAstTsLitType literalType) {
 			UMLType leafType = extractTypeObject("'" + literalType.getLit().toString() + "'", PathFileUtils.getLang(filePath));
@@ -888,13 +938,16 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 	}
 
 	public static UMLType extractTypeObject(String sourceFolder, String filePath, String fileContent, IASTDeclSpecifier declSpecifier, IASTDeclarator declarator, int extraDimensions) {
-		StringBuilder type = new StringBuilder(cleanTypeText(CppVisitor.singleLine(declSpecifier.getRawSignature())));
+		//a type written as an argument of a function-like macro, whose text is the call of the macro, i.e., unsigned long in SYSCALL_DEFINE1(unshare, unsigned long, unshare_flags)
+		boolean expanded = inMacroCall(declSpecifier);
+		StringBuilder type = new StringBuilder(expanded ? cleanTypeText(expandedText(declSpecifier)) :
+			cleanTypeText(withoutSpecifierMacros(CppVisitor.singleLine(declSpecifier.getRawSignature()), declSpecifier)));
 		if(type.isEmpty() && declarator instanceof CASTDeclarator cDeclarator) {
 			type = new StringBuilder(cleanTypeText(cDeclarator.getName().toString()));
 		}
 		if(declarator != null) {
 			for(IASTPointerOperator pointerOperator : declarator.getPointerOperators()) {
-				type.append(pointerOperator.getRawSignature());
+				type.append(expanded ? pointerOperatorText(pointerOperator) : pointerOperator.getRawSignature());
 			}
 		}
 		String typeText = type.toString().trim();
@@ -905,6 +958,80 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 		UMLType umlType = UMLType.extractTypeObject(typeText, "<", ">", locationInfo, PathFileUtils.getLang(filePath));
 		umlType.arrayDimension += extraDimensions;
 		return umlType;
+	}
+
+	//whether the node comes only from the expansion of a function-like macro called in the file, i.e., long in SYSCALL_DEFINE1(...) expanded to long sys_unshare(...)
+	private static boolean inMacroCall(IASTNode node) {
+		IASTNodeLocation[] locations = node.getNodeLocations();
+		if(locations.length == 0) {
+			return false;
+		}
+		for(IASTNodeLocation location : locations) {
+			if(!(location instanceof IASTMacroExpansionLocation expansion) || !(expansion.getExpansion().getMacroDefinition() instanceof IASTPreprocessorFunctionStyleMacroDefinition)) {
+				return false;
+			}
+		}
+		return node.getRawSignature().contains("(");
+	}
+
+	//the text of a type specifier built from its AST, for a type written as a macro argument, whose tokens CDT does not give, i.e., unsigned long or struct clone_args
+	private static String expandedText(IASTDeclSpecifier declSpecifier) {
+		StringBuilder text = new StringBuilder();
+		if(declSpecifier.isConst()) {
+			text.append("const ");
+		}
+		if(declSpecifier.isVolatile()) {
+			text.append("volatile ");
+		}
+		if(declSpecifier instanceof IASTSimpleDeclSpecifier simple) {
+			if(simple.isSigned()) {
+				text.append("signed ");
+			}
+			if(simple.isUnsigned()) {
+				text.append("unsigned ");
+			}
+			if(simple.isShort()) {
+				text.append("short ");
+			}
+			if(simple.isLong()) {
+				text.append("long ");
+			}
+			if(simple.isLongLong()) {
+				text.append("long long ");
+			}
+			String keyword = switch(simple.getType()) {
+				case IASTSimpleDeclSpecifier.t_void -> "void";
+				case IASTSimpleDeclSpecifier.t_char -> "char";
+				case IASTSimpleDeclSpecifier.t_int -> "int";
+				case IASTSimpleDeclSpecifier.t_float -> "float";
+				case IASTSimpleDeclSpecifier.t_double -> "double";
+				case IASTSimpleDeclSpecifier.t_bool -> "bool";
+				case IASTSimpleDeclSpecifier.t_auto -> "auto";
+				default -> text.isEmpty() || text.toString().matches("(const |volatile )*") ? ASTSignatureUtil.getSignature(declSpecifier) : "";
+			};
+			text.append(keyword);
+		}
+		else if(declSpecifier instanceof IASTNamedTypeSpecifier named) {
+			text.append(named.getName().toString());
+		}
+		else if(declSpecifier instanceof IASTElaboratedTypeSpecifier elaborated) {
+			text.append(elaborated.getKind() == IASTElaboratedTypeSpecifier.k_struct ? "struct " : elaborated.getKind() == IASTElaboratedTypeSpecifier.k_union ? "union " :
+				elaborated.getKind() == IASTElaboratedTypeSpecifier.k_enum ? "enum " : "class ").append(elaborated.getName().toString());
+		}
+		else {
+			return ASTSignatureUtil.getSignature(declSpecifier);
+		}
+		return text.toString().strip();
+	}
+
+	private static String pointerOperatorText(IASTPointerOperator pointerOperator) {
+		if(pointerOperator instanceof ICPPASTReferenceOperator reference) {
+			return reference.isRValueReference() ? "&&" : "&";
+		}
+		if(pointerOperator instanceof IASTPointer pointer) {
+			return "*" + (pointer.isConst() ? " const" : "") + (pointer.isVolatile() ? " volatile" : "");
+		}
+		return pointerOperator.getRawSignature();
 	}
 
 	public static UMLType extractTypeObject(String sourceFolder, String filePath, String fileContent, ICPPASTBaseSpecifier declSpecifier, IASTDeclarator declarator, int extraDimensions) {
@@ -931,6 +1058,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 	//the C++ type is located without the specifiers and qualifiers around it, like its AST node, i.e., int in static const int
 	static LocationInfo cppTypeLocation(String sourceFolder, String filePath, IASTNode declSpecifier, CodeElementType codeElementType, String fileContent) {
 		LocationInfo locationInfo = new LocationInfo(sourceFolder, filePath, declSpecifier, codeElementType, fileContent);
+		Set<String> specifierMacros = specifierMacros(declSpecifier);
 		int start = locationInfo.getStartOffset();
 		int end = locationInfo.getEndOffset();
 		while(true) {
@@ -942,7 +1070,7 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			while(next < end && Character.isWhitespace(fileContent.charAt(next))) {
 				next++;
 			}
-			if(wordEnd == start || next == wordEnd || next >= end || !CPP_TYPE_SURROUNDING_KEYWORDS.contains(fileContent.substring(start, wordEnd)))
+			if(wordEnd == start || next == wordEnd || next >= end || !isSurroundingKeyword(fileContent.substring(start, wordEnd), specifierMacros))
 				break;
 			start = next;
 		}
@@ -955,13 +1083,48 @@ public abstract class UMLType implements Serializable, LocationInfoProvider, Ann
 			while(previous > start && Character.isWhitespace(fileContent.charAt(previous - 1))) {
 				previous--;
 			}
-			if(wordStart == end || previous == wordStart || previous <= start || !CPP_TYPE_SURROUNDING_KEYWORDS.contains(fileContent.substring(wordStart, end)))
+			if(wordStart == end || previous == wordStart || previous <= start || !isSurroundingKeyword(fileContent.substring(wordStart, end), specifierMacros))
 				break;
 			end = previous;
 		}
 		if(start == locationInfo.getStartOffset() && end == locationInfo.getEndOffset())
 			return locationInfo;
 		return new LocationInfo(sourceFolder, filePath, start, end - start, end, codeElementType, fileContent);
+	}
+
+	private static boolean isSurroundingKeyword(String word, Set<String> specifierMacros) {
+		return CPP_TYPE_SURROUNDING_KEYWORDS.contains(word) || specifierMacros.contains(word);
+	}
+
+	//the macros in the specifiers of a declaration that expand to specifiers or to nothing, which are not part of the type,
+	//i.e., __always_inline defined as inline in static __always_inline long f(...)
+	private static Set<String> specifierMacros(IASTNode declSpecifier) {
+		Set<String> macros = new HashSet<>();
+		for(IASTNodeLocation location : declSpecifier.getNodeLocations()) {
+			if(location instanceof IASTMacroExpansionLocation expansionLocation) {
+				IASTPreprocessorMacroDefinition definition = expansionLocation.getExpansion().getMacroDefinition();
+				if(definition != null && !(definition instanceof IASTPreprocessorFunctionStyleMacroDefinition) && definition.getExpansion() != null) {
+					boolean specifiers = true;
+					for(String word : definition.getExpansion().trim().split("\\s+")) {
+						if(!word.isEmpty() && !CPP_TYPE_SURROUNDING_KEYWORDS.contains(word)) {
+							specifiers = false;
+							break;
+						}
+					}
+					if(specifiers) {
+						macros.add(definition.getName().toString());
+					}
+				}
+			}
+		}
+		return macros;
+	}
+
+	private static String withoutSpecifierMacros(String rawType, IASTNode declSpecifier) {
+		for(String macro : specifierMacros(declSpecifier)) {
+			rawType = rawType.replaceAll("\\b" + Pattern.quote(macro) + "\\b", "");
+		}
+		return rawType;
 	}
 
 	public static String cleanTypeText(String rawType) {

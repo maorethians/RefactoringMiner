@@ -214,6 +214,9 @@ public class VariableReplacementAnalysis {
 	//the definitions of a Python variable are the same variable, so the renames of its definitions to the definitions of another variable are a single rename,
 	//with the references of all of them, i.e., es1 = None; if ...: es1 = tuple(...) -> ss1 = None; if ...: ss1 = tuple(...)
 	private void mergeRenamesOfPythonRedefinitions() {
+		if(!LANG2.equals(Constants.PYTHON)) {
+			return;
+		}
 		List<RenameVariableRefactoring> renames = new ArrayList<RenameVariableRefactoring>(variableRenames);
 		Set<RenameVariableRefactoring> merged = new LinkedHashSet<RenameVariableRefactoring>();
 		for(int i=0; i<renames.size(); i++) {
@@ -224,7 +227,7 @@ public class VariableReplacementAnalysis {
 			for(int j=i+1; j<renames.size(); j++) {
 				RenameVariableRefactoring other = renames.get(j);
 				if(!merged.contains(other) && sameRenameOfPythonVariable(kept, other)) {
-					kept.getReferences().addAll(other.getReferences());
+					kept.addReferences(other.getReferences());
 					merged.add(other);
 				}
 			}
@@ -239,9 +242,45 @@ public class VariableReplacementAnalysis {
 		VariableDeclaration renamed1 = rename1.getRenamedVariable();
 		VariableDeclaration renamed2 = rename2.getRenamedVariable();
 		return rename1.getOperationBefore().equals(rename2.getOperationBefore()) && rename1.getOperationAfter().equals(rename2.getOperationAfter()) &&
-				original1.getVariableName().equals(original2.getVariableName()) && renamed1.getVariableName().equals(renamed2.getVariableName()) &&
-				(original1.equals(original2) || pythonRedefinition(original1, original2, rename1.getOperationBefore())) &&
-				(renamed1.equals(renamed2) || pythonRedefinition(renamed1, renamed2, rename1.getOperationAfter()));
+				samePythonVariable(original1, original2, rename1.getOperationBefore()) && samePythonVariable(renamed1, renamed2, rename1.getOperationAfter());
+	}
+
+	//the same rename, already detected for another definition of the same Python variable, i.e., filename = kwargs.pop(...); if filename is None: filename = ... -> parameter filename
+	private RenameVariableRefactoring renameOfAnotherPythonDefinition(RenameVariableRefactoring newRename) {
+		if(!LANG2.equals(Constants.PYTHON)) {
+			return null;
+		}
+		for(Refactoring refactoring : refactorings) {
+			if(refactoring instanceof RenameVariableRefactoring rename && rename.getRefactoringType().equals(newRename.getRefactoringType()) &&
+					sameRenameOfPythonVariable(rename, newRename)) {
+				return rename;
+			}
+		}
+		return null;
+	}
+
+	//the same type change, already detected for another definition of the same Python variable, i.e., encoder = ForwardRNNEncoder(...) assigned twice in a function
+	private ChangeVariableTypeRefactoring typeChangeOfAnotherPythonDefinition(ChangeVariableTypeRefactoring newTypeChange) {
+		if(!LANG2.equals(Constants.PYTHON)) {
+			return null;
+		}
+		for(Refactoring refactoring : refactorings) {
+			if(refactoring instanceof ChangeVariableTypeRefactoring typeChange &&
+					typeChange.getOperationBefore().equals(newTypeChange.getOperationBefore()) && typeChange.getOperationAfter().equals(newTypeChange.getOperationAfter()) &&
+					samePythonVariable(typeChange.getOriginalVariable(), newTypeChange.getOriginalVariable(), newTypeChange.getOperationBefore()) &&
+					samePythonVariable(typeChange.getChangedTypeVariable(), newTypeChange.getChangedTypeVariable(), newTypeChange.getOperationAfter()) &&
+					typeChange.getOriginalVariable().getType().equals(newTypeChange.getOriginalVariable().getType()) &&
+					typeChange.getChangedTypeVariable().getType().equals(newTypeChange.getChangedTypeVariable().getType())) {
+				return typeChange;
+			}
+		}
+		return null;
+	}
+
+	//the same declaration, or another definition of the same Python variable
+	static boolean samePythonVariable(VariableDeclaration variable1, VariableDeclaration variable2, VariableDeclarationContainer container) {
+		return variable1.getVariableName().equals(variable2.getVariableName()) &&
+				(variable1.equals(variable2) || pythonRedefinition(variable1, variable2, container));
 	}
 
 	private void findAttributeRenamesWithIdenticalPreviousAndNextFieldDeclarations(UMLAbstractClassDiff classDiff) throws RefactoringMinerTimedOutException {
@@ -1348,7 +1387,9 @@ public class VariableReplacementAnalysis {
 						MethodInvocationReplacement r = (MethodInvocationReplacement)replacement;
 						AbstractCall beforeCall = r.getInvokedOperationBefore();
 						AbstractCall afterCall = r.getInvokedOperationAfter();
-						if(beforeCall.identicalName(afterCall) && beforeCall.arguments().size() == afterCall.arguments().size()) {
+						//the arguments are paired by position also in a renamed call, i.e., .replace(/\s+/g, ' ') -> .replaceAll(WHITESPACE_PATTERN, ' ') in a call chain,
+						//and the added attribute must be initialized with the replaced argument
+						if(beforeCall.arguments().size() == afterCall.arguments().size()) {
 							for(int i=0; i<beforeCall.arguments().size(); i++) {
 								String arg1 = beforeCall.arguments().get(i);
 								String arg2 = afterCall.arguments().get(i);
@@ -2262,6 +2303,7 @@ public class VariableReplacementAnalysis {
 			Set<SimpleEntry<VariableDeclaration, VariableDeclarationContainer>> v1s = getVariableDeclaration1(replacement);
 			SimpleEntry<VariableDeclaration, VariableDeclarationContainer> v2 = getVariableDeclaration2(replacement);
 			Set<AbstractCodeMapping> variableReferences = finalConsistentRenames.get(replacement);
+			boolean replacedWithAttributeInScope = v2 == null && variableReplacedWithAttributeInScope(replacement, v1s);
 			if(!v1s.isEmpty() && v2 != null) {
 				for(SimpleEntry<VariableDeclaration, VariableDeclarationContainer> v1 : v1s) {
 					VariableDeclaration variableDeclaration1 = v1.getKey();
@@ -2287,8 +2329,8 @@ public class VariableReplacementAnalysis {
 					}
 				}
 			}
-			else if((!operation1.getAllVariables().contains(replacement.getAfter()) || cyclicRename(finalConsistentRenames.keySet(), replacement)) &&
-					(!operation2.getAllVariables().contains(replacement.getBefore()) || cyclicRename(finalConsistentRenames.keySet(), replacement)) &&
+			else if((!operation1.getAllVariables().contains(replacement.getAfter()) || cyclicRename(finalConsistentRenames.keySet(), replacement) || replacedWithAttributeInScope) &&
+					(!operation2.getAllVariables().contains(replacement.getBefore()) || cyclicRename(finalConsistentRenames.keySet(), replacement) || replacedWithAttributeInScope) &&
 					!fieldAssignmentWithPreviouslyExistingParameter(replacementOccurrenceMap.get(replacement)) &&
 					!fieldAssignmentToPreviouslyExistingAttribute(replacementOccurrenceMap.get(replacement)) &&
 					!(operation1.getName().equals("toString") && operation2.getName().equals("toString")) &&
@@ -2301,6 +2343,7 @@ public class VariableReplacementAnalysis {
 					candidate.setOriginalVariableDeclaration(v1.getKey());
 				if(v2 != null)
 					candidate.setRenamedVariableDeclaration(v2.getKey());
+				candidate.setVariableAssignedToAttribute(replacedWithAttributeInScope);
 				ExtractVariableRefactoring conflictingExtractVariableRefactoring = existsConflictingExtractVariableRefactoring(candidate);
 				if(conflictingExtractVariableRefactoring == null) {
 					boolean skip = false;
@@ -2324,6 +2367,41 @@ public class VariableReplacementAnalysis {
 				}
 			}
 		}
+	}
+
+	//the variable is replaced with an attribute in the scope of its replaced declarations, but still used before them, i.e., dataset = dataset.prefetch(...) -> self._dataset = self._dataset.prefetch(...)
+	private boolean variableReplacedWithAttributeInScope(Replacement replacement, Set<SimpleEntry<VariableDeclaration, VariableDeclarationContainer>> v1s) {
+		if(v1s.isEmpty() || !mapper.LANG1.equals(Constants.PYTHON) || !mapper.LANG2.equals(Constants.PYTHON) || !replacement.getAfter().startsWith(mapper.LANG2.THIS_DOT) ||
+				replacement.getAfter().substring(mapper.LANG2.THIS_DOT.length()).contains(".")) {
+			return false;
+		}
+		//the variable is assigned to the attribute before, i.e., self._dataset = dataset
+		boolean variableAssignedToAttribute = false;
+		if(operation1.getBody() != null) {
+			String assignment = replacement.getAfter() + mapper.LANG1.ASSIGNMENT + replacement.getBefore() + mapper.LANG1.STATEMENT_TERMINATION;
+			for(AbstractCodeFragment fragment1 : operation1.getBody().getCompositeStatement().getLeaves()) {
+				if(fragment1.getString().equals(assignment)) {
+					variableAssignedToAttribute = true;
+					break;
+				}
+			}
+		}
+		if(!variableAssignedToAttribute) {
+			return false;
+		}
+		for(AbstractCodeMapping mapping : mappings) {
+			for(SimpleEntry<VariableDeclaration, VariableDeclarationContainer> v1 : v1s) {
+				//a reference replacing the variable may still read its previous value, i.e., (self._dataset, self._decoder) = self._process_dataset(dataset)
+				if(v1.getKey().getScope().subsumes(mapping.getFragment1().getLocationInfo()) && !mapping.getReplacements().contains(replacement)) {
+					for(LeafExpression variable : mapping.getFragment2().getVariables()) {
+						if(variable.getString().equals(replacement.getBefore())) {
+							return false;
+						}
+					}
+				}
+			}
+		}
+		return true;
 	}
 
 	private boolean conflictWithChildMapperRefactoring(CandidateAttributeRefactoring candidate) {
@@ -2389,7 +2467,13 @@ public class VariableReplacementAnalysis {
 		}
 		if(ref == null && variableDeclaration1.isParameter() != variableDeclaration2.isParameter()) {
 			RenameVariableRefactoring refactoring = new RenameVariableRefactoring(variableDeclaration1, variableDeclaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
-			refactorings.add(refactoring);
+			RenameVariableRefactoring sameVariableRefactoring = renameOfAnotherPythonDefinition(refactoring);
+			if(sameVariableRefactoring != null) {
+				sameVariableRefactoring.addReferences(variableReferences);
+			}
+			else {
+				refactorings.add(refactoring);
+			}
 		}
 		if(variableDeclaration1.getType() != null && variableDeclaration2.getType() != null) {
 			String typeArguments1 = variableDeclaration1.getType().typeArgumentsToString();
@@ -2410,10 +2494,17 @@ public class VariableReplacementAnalysis {
 					skip = variableDeclaration1.isParameter() && variableDeclaration2.isParameter() && !operation1.getParameterDeclarationList().contains(variableDeclaration1) && !operation2.getParameterDeclarationList().contains(variableDeclaration2);
 					if(!skip) {
 						ChangeVariableTypeRefactoring refactoring = new ChangeVariableTypeRefactoring(variableDeclaration1, variableDeclaration2, operation1, operation2, variableReferences, insideExtractedOrInlinedMethod);
+						ChangeVariableTypeRefactoring sameVariableRefactoring = typeChangeOfAnotherPythonDefinition(refactoring);
+						if(sameVariableRefactoring != null) {
+							sameVariableRefactoring.addReferences(variableReferences);
+							refactoring = sameVariableRefactoring;
+						}
+						else {
+							refactorings.add(refactoring);
+						}
 						if(ref != null) {
 							refactoring.addRelatedRefactoring(ref);
 						}
-						refactorings.add(refactoring);
 					}
 				}
 			}

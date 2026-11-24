@@ -62,6 +62,14 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         processBodyMapper(srcTree,dstTree,bodyMapper,mappingStore,isPartOfExtractedMethod);
     }
     private void processBodyMapper(Tree srcTree, Tree dstTree, UMLOperationBodyMapper bodyMapper, ExtendedMultiMappingStore mappingStore, boolean isPartOfExtractedMethod) {
+        //the functions declared in the callbacks of test suites and tests, matched by the model
+        for (UMLOperationBodyMapper nestedOperationMapper : bodyMapper.getNestedOperationMappers()) {
+            new MethodMatcher(optimizationData, nestedOperationMapper, LANG1, LANG2).match(srcTree, dstTree, mappingStore);
+        }
+        //the types declared in the callbacks of test suites and tests, matched by the model
+        for (UMLClassDiff nestedClassDiff : bodyMapper.getNestedClassDiffs()) {
+            new ClassDiffMatcher(optimizationData, nestedClassDiff, true, Collections.emptyList(), LANG1, LANG2).match(srcTree, dstTree, mappingStore);
+        }
         if (bodyMapper.getAnonymousClassDiffs() != null) {
             for (UMLAnonymousClassDiff anonymousClassDiff : bodyMapper.getAnonymousClassDiffs()) {
                 new ClassAttrMatcher(optimizationData, anonymousClassDiff, LANG1, LANG2).match(srcTree,dstTree,mappingStore);
@@ -1204,7 +1212,8 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
     }
 
     //the anonymous classes without operations matched through their attributes within the fragments of the mapping
-    private List<UMLAnonymousClassDiff> matchedAnonymousClassDiffs(AbstractCodeMapping mapping, boolean initializer) {
+    //bodyMapper: the mapper holding the mapping, i.e., the mapper of a lambda or of a test suite, whose anonymous class diffs are matched within the mapping
+    private List<UMLAnonymousClassDiff> matchedAnonymousClassDiffs(AbstractCodeMapping mapping, UMLOperationBodyMapper bodyMapper, boolean initializer) {
         List<UMLAnonymousClassDiff> diffs = new ArrayList<>();
         if (initializer && (!mapping.getFragment1().getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_INITIALIZER) ||
                 !mapping.getFragment2().getLocationInfo().getCodeElementType().equals(CodeElementType.VARIABLE_DECLARATION_INITIALIZER)))
@@ -1227,7 +1236,8 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         new IgnoringCommentsLeafMatcher(LANG1, LANG2).match(srcStatementNode,dstStatementNode,statementMappings);
         for (Mapping mapping : statementMappings) {
             if (!withinAnonymousClass(mapping, matchedAnonymousClassDiffs) ||
-                    (unmapped(mappingStore.getDsts(mapping.first)) && unmapped(mappingStore.getSrcs(mapping.second))))
+                    (unmapped(mappingStore.getDsts(mapping.first)) && unmapped(mappingStore.getSrcs(mapping.second)) &&
+                    withinSameAnonymousClassDiff(mapping, matchedAnonymousClassDiffs)))
                 mappingStore.addMapping(mapping.first, mapping.second);
         }
     }
@@ -1330,6 +1340,19 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         }
     }
 
+    //the unmapped leaves within an anonymous class matched by the model are completed only with the leaves within the anonymous class it is matched with,
+    //i.e., the properties of the rows of it.each([...]) tables are not paired with the properties of other rows
+    private static boolean withinSameAnonymousClassDiff(Mapping mapping, List<UMLAnonymousClassDiff> anonymousClassDiffs) {
+        for (UMLAnonymousClassDiff anonymousClassDiff : anonymousClassDiffs) {
+            LocationInfo location1 = anonymousClassDiff.getOriginalClass().getLocationInfo();
+            LocationInfo location2 = anonymousClassDiff.getNextClass().getLocationInfo();
+            if (mapping.first.getPos() >= location1.getStartOffset() && mapping.first.getEndPos() <= location1.getEndOffset() &&
+                    mapping.second.getPos() >= location2.getStartOffset() && mapping.second.getEndPos() <= location2.getEndOffset())
+                return true;
+        }
+        return false;
+    }
+
     private static boolean withinAnonymousClass(Mapping mapping, List<UMLAnonymousClassDiff> anonymousClassDiffs) {
         for (UMLAnonymousClassDiff anonymousClassDiff : anonymousClassDiffs) {
             LocationInfo location1 = anonymousClassDiff.getOriginalClass().getLocationInfo();
@@ -1359,6 +1382,16 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             if(srcStatementNode.getType().name.equals(LANG1.ARROW_FUNCTION) && dstStatementNode.getType().name.equals(LANG2.ARROW_FUNCTION)) {
                 mappingStore.addMapping(srcStatementNode, dstStatementNode);
                 processArrowFunction(srcStatementNode, dstStatementNode, mappingStore, LANG1, LANG2);
+                return;
+            }
+            else if(matchedThroughLambdaMappers(abstractCodeMapping, srcStatementNode, dstStatementNode)) {
+                //the callbacks of test suites and tests are matched by their mappers, and the rest of the statement (call, arguments, lambda, parameters) by its leaves
+                mappingStore.addMapping(srcStatementNode, dstStatementNode);
+                for(UMLOperationBodyMapper lambdaMapper : abstractCodeMapping.getLambdaMappers()) {
+                    processBodyMapper(srcTree, dstTree, lambdaMapper, mappingStore, isPartOfExtractedMethod);
+                }
+                matchLeavesOutsideLambdas(srcTree, dstTree, srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
+                matchParentStatements(srcStatementNode, dstStatementNode, abstractCodeMapping, bodyMapper, mappingStore);
                 return;
             }
             else if(containsLambdaMapperWithNonMappedLeaves(abstractCodeMapping, srcStatementNode, dstStatementNode)) {
@@ -1535,7 +1568,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
         if (_abstractExpWithNonCompositeOwner || _leafExp) {
             //the initializers with anonymous classes without operations matched through their attributes are not matched again as leaves in the last step,
             //which overrides the mappings of their attributes, i.e., the object literal of StyleSheet.create({...})
-            List<UMLAnonymousClassDiff> matchedAnonymousClassDiffs = matchedAnonymousClassDiffs(abstractCodeMapping, true);
+            List<UMLAnonymousClassDiff> matchedAnonymousClassDiffs = matchedAnonymousClassDiffs(abstractCodeMapping, bodyMapper, true);
             //the initializers of the attributes of an anonymous class are within the statement mapped in the parent mapper, so they only complete its unmapped leaves,
             //i.e., body: JSON.stringify({ origin: ... }) -> body: JSON.stringify(this.buildRequestBody(origin, destination)) keeps origin mapped in the extracted method
             if (declaredInAnonymousClass(bodyMapper))
@@ -1545,7 +1578,7 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             else
                 matchLeavesAroundAnonymousClasses(srcTree, dstTree, srcStatementNode, dstStatementNode, matchedAnonymousClassDiffs, mappingStore);
         } else {
-            List<UMLAnonymousClassDiff> matchedAnonymousClassDiffs = matchedAnonymousClassDiffs(abstractCodeMapping, false);
+            List<UMLAnonymousClassDiff> matchedAnonymousClassDiffs = matchedAnonymousClassDiffs(abstractCodeMapping, bodyMapper, false);
             if (!matchedAnonymousClassDiffs.isEmpty())
                 matchLeavesAroundAnonymousClasses(srcTree, dstTree, srcStatementNode, dstStatementNode, matchedAnonymousClassDiffs, mappingStore);
             else if (!matchCallReplacedWithReturnedExpression(srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore))
@@ -1553,12 +1586,56 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
             additionallyMatchedStatements(srcTree, dstTree, srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
             removeArgumentToParameterMappings(srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
         }
+        matchReplacedStringLiterals(srcStatementNode, dstStatementNode, abstractCodeMapping, mappingStore);
         optimizeVariableDeclarations(abstractCodeMapping);
         if (!isPartOfExtractedMethod && srcStatementNode.getType().name.equals(LANG1.RETURN_STATEMENT) && dstStatementNode.getType().name.equals(LANG2.RETURN_STATEMENT)) {
             optimizationData.getSubtreeMappings().addMapping(srcStatementNode,dstStatementNode);
         }
         if (!abstractCodeMapping.getRefactorings().isEmpty()) {
             leafMappingRefactoringAwareness(dstTree, abstractCodeMapping, mappingStore);
+        }
+    }
+
+    //the string literals the model replaced within mapped arrays are mapped with each other, instead of the literals the tree matcher pairs by position,
+    //i.e., examples: ['prefix', 'prefix *', 'prefix Yukikaze'] -> examples: ['*', 'Yukikaze'] maps 'prefix *' to '*', and 'prefix' is deleted
+    private void matchReplacedStringLiterals(Tree srcStatementNode, Tree dstStatementNode, AbstractCodeMapping mapping, ExtendedMultiMappingStore mappingStore) {
+        for (Replacement replacement : mapping.getReplacements()) {
+            if (!replacement.getType().equals(ReplacementType.STRING_LITERAL))
+                continue;
+            List<LeafExpression> expressions1 = mapping.getFragment1().findExpression(replacement.getBefore());
+            List<LeafExpression> expressions2 = mapping.getFragment2().findExpression(replacement.getAfter());
+            if (expressions1.size() != 1 || expressions2.size() != 1)
+                continue;
+            Tree tree1 = TreeUtilFunctions.findByLocationInfo(srcStatementNode, expressions1.get(0).getLocationInfo(), LANG1);
+            Tree tree2 = TreeUtilFunctions.findByLocationInfo(dstStatementNode, expressions2.get(0).getLocationInfo(), LANG2);
+            if (tree1 == null || tree2 == null || !tree1.getType().name.equals(LANG1.STRING_LITERAL) || !tree2.getType().name.equals(LANG2.STRING_LITERAL) ||
+                    !tree1.isIsoStructuralTo(tree2))
+                continue;
+            //only the elements of the mapped arrays, not the value of match: 'rest' and of id: 'reason',
+            //nor the operands of a concatenation, i.e., "---- " + "---- [%s UTC]%n" -> Strings.repeat("-", n) + " [%s UTC]%n" (helios da39bfeb)
+            Tree parent1 = tree1.getParent();
+            Tree parent2 = tree2.getParent();
+            if (parent1 == null || parent2 == null || !parent1.getType().name.equals(LANG1.ARRAY) || !parent2.getType().name.equals(LANG2.ARRAY))
+                continue;
+            Set<Tree> parentDsts = mappingStore.getDsts(parent1);
+            if (parentDsts == null || !parentDsts.contains(parent2))
+                continue;
+            Set<Tree> dsts = mappingStore.getDsts(tree1);
+            if (dsts != null && dsts.contains(tree2))
+                continue;
+            for (Tree t1 : tree1.preOrder()) {
+                Set<Tree> mapped = mappingStore.getDsts(t1);
+                if (mapped != null)
+                    for (Tree t2 : new ArrayList<>(mapped))
+                        mappingStore.removeMapping(t1, t2);
+            }
+            for (Tree t2 : tree2.preOrder()) {
+                Set<Tree> mapped = mappingStore.getSrcs(t2);
+                if (mapped != null)
+                    for (Tree t1 : new ArrayList<>(mapped))
+                        mappingStore.removeMapping(t1, t2);
+            }
+            mappingStore.addMappingRecursively(tree1, tree2);
         }
     }
 
@@ -1772,6 +1849,97 @@ public class BodyMapperMatcher extends OptimizationAwareMatcher {
                     return true;
                 }
             }
+        }
+        return false;
+    }
+
+    //the matched test suites describe('...', () => {...}) and tests it('...', () => {...}) whose callbacks are matched by their mappers in the model
+    private static boolean matchedThroughLambdaMappers(AbstractCodeMapping abstractCodeMapping, Tree srcStatementNode, Tree dstStatementNode) {
+        if(!srcStatementNode.isIsoStructuralTo(dstStatementNode)) {
+            for(UMLOperationBodyMapper lambdaMapper : abstractCodeMapping.getLambdaMappers()) {
+                if(lambdaMapper.isTestCallbackMapper())
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    //the leaves of a statement matched through its lambda mappers that are outside the lambda bodies, i.e., the lambdas, their parameters
+    //and the arguments of the call other than the callbacks, while the leaves within the lambda bodies are left to the lambda mappers
+    private void matchLeavesOutsideLambdas(Tree srcTree, Tree dstTree, Tree srcStatementNode, Tree dstStatementNode, AbstractCodeMapping abstractCodeMapping, ExtendedMultiMappingStore mappingStore) {
+        List<LocationInfo> lambdas1 = new ArrayList<>();
+        List<LocationInfo> lambdas2 = new ArrayList<>();
+        for(UMLOperationBodyMapper lambdaMapper : abstractCodeMapping.getLambdaMappers()) {
+            if(lambdaMapper.getOperationSignatureDiff().isPresent()) {
+                LocationInfo body1 = bodyLocation(lambdaMapper.getOperationSignatureDiff().get().getRemovedOperation());
+                LocationInfo body2 = bodyLocation(lambdaMapper.getOperationSignatureDiff().get().getAddedOperation());
+                if(body1 != null)
+                    lambdas1.add(body1);
+                if(body2 != null)
+                    lambdas2.add(body2);
+            }
+        }
+        //the code outside the lambda bodies is usually unchanged (i.e., the call of a test suite describe('...', () => {...})),
+        //so its nodes are paired in order, without matching the whole statement including the lambda bodies
+        List<Tree> outside1 = new ArrayList<>();
+        List<Tree> outside2 = new ArrayList<>();
+        nodesOutside(srcStatementNode, lambdas1, outside1);
+        nodesOutside(dstStatementNode, lambdas2, outside2);
+        if (identicalNodes(outside1, outside2)) {
+            for (int i = 0; i < outside1.size(); i++) {
+                if (unmapped(mappingStore.getDsts(outside1.get(i))) && unmapped(mappingStore.getSrcs(outside2.get(i))))
+                    mappingStore.addMapping(outside1.get(i), outside2.get(i));
+            }
+            return;
+        }
+        ExtendedMultiMappingStore leafMappings = new ExtendedMultiMappingStore(srcTree, dstTree, LANG1, LANG2);
+        new IgnoringCommentsLeafMatcher(LANG1, LANG2).match(srcStatementNode, dstStatementNode, leafMappings);
+        for (Mapping mapping : leafMappings) {
+            if (unmapped(mappingStore.getDsts(mapping.first)) && unmapped(mappingStore.getSrcs(mapping.second)) &&
+                    !within(mapping.first, lambdas1) && !within(mapping.second, lambdas2))
+                mappingStore.addMapping(mapping.first, mapping.second);
+        }
+    }
+
+    //the nodes of a statement in pre-order, without the nodes strictly within the lambda bodies
+    private static void nodesOutside(Tree node, List<LocationInfo> lambdaBodies, List<Tree> nodes) {
+        if (within(node, lambdaBodies))
+            return;
+        nodes.add(node);
+        for (Tree child : node.getChildren())
+            nodesOutside(child, lambdaBodies, nodes);
+    }
+
+    private static boolean identicalNodes(List<Tree> nodes1, List<Tree> nodes2) {
+        if (nodes1.size() != nodes2.size())
+            return false;
+        for (int i = 0; i < nodes1.size(); i++) {
+            if (!nodes1.get(i).getType().name.equals(nodes2.get(i).getType().name) || !nodes1.get(i).getLabel().equals(nodes2.get(i).getLabel()))
+                return false;
+        }
+        return true;
+    }
+
+    //the body (block or expression) of a lambda, or of the operation of an anonymous class matched with a lambda
+    private static LocationInfo bodyLocation(gr.uom.java.xmi.VariableDeclarationContainer container) {
+        if(container instanceof LambdaExpressionObject lambda) {
+            if(lambda.getBody() != null)
+                return lambda.getBody().getCompositeStatement().getLocationInfo();
+            if(lambda.getExpression() != null)
+                return lambda.getExpression().getLocationInfo();
+        }
+        else if(container instanceof gr.uom.java.xmi.UMLOperation operation && operation.getBody() != null) {
+            return operation.getBody().getCompositeStatement().getLocationInfo();
+        }
+        return null;
+    }
+
+    //strictly within a lambda body, as the nodes spanning the whole body are the lambda itself, i.e., lambda_literal and annotated_lambda in Kotlin
+    private static boolean within(Tree node, List<LocationInfo> locations) {
+        for (LocationInfo location : locations) {
+            if (node.getPos() >= location.getStartOffset() && node.getEndPos() <= location.getEndOffset() &&
+                    (node.getPos() != location.getStartOffset() || node.getEndPos() != location.getEndOffset()))
+                return true;
         }
         return false;
     }

@@ -148,6 +148,29 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 if(matched != null) {
                     mappingStore.addMapping(matched.first, matched.second);
                 }
+                //the initialized variables of the type, which the model does not have apart from the type, i.e., str2vns[] = {...} in struct {...} str2vns[] = {...};
+                matched = Helpers.findPairOfType(srcTypeDeclaration.getParent(),dstTypeDeclaration.getParent(),LANG1.INIT_DECLARATOR,LANG2.INIT_DECLARATOR);
+                if(matched != null && !mappingStore.isSrcMapped(matched.first) && !mappingStore.isDstMapped(matched.second)) {
+                    if(TreeUtilFunctions.isIsomorphicTo(matched.first, matched.second)) {
+                        mappingStore.addMappingRecursively(matched.first, matched.second);
+                    }
+                    else {
+                        new LeafMatcher(LANG1, LANG2).match(matched.first, matched.second, mappingStore);
+                        mappingStore.addMapping(matched.first, matched.second);
+                    }
+                }
+                //a local type with variables, which has no statement in the model, i.e., union {...} uu; in a function body
+                Tree srcParent = srcTypeDeclaration.getParent();
+                Tree dstParent = dstTypeDeclaration.getParent();
+                if (srcParent.getParent() != null && srcParent.getParent().getType().name.equals(LANG1.COMPOUND_STATEMENT) &&
+                        dstParent.getParent() != null && dstParent.getParent().getType().name.equals(LANG2.COMPOUND_STATEMENT)) {
+                    mappingStore.addMapping(srcParent, dstParent);
+                    Tree semicolon1 = srcParent.getChildren().get(srcParent.getChildren().size()-1);
+                    Tree semicolon2 = dstParent.getChildren().get(dstParent.getChildren().size()-1);
+                    if (semicolon1.getType().name.equals(LANG1.SEMICOLON) && semicolon2.getType().name.equals(LANG2.SEMICOLON)) {
+                        mappingStore.addMapping(semicolon1, semicolon2);
+                    }
+                }
             }
             if (srcTypeDeclaration.getParent().getType().name.equals(LANG1.TYPE_DEFINITION)
                     && dstTypeDeclaration.getParent().getType().name.equals(LANG2.TYPE_DEFINITION)) {
@@ -463,18 +486,28 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                 boolean ifDef = srcStatement != null && dstStatement != null && srcStatement.getType().name.equals(LANG1.PREPROC_IFDEF) && dstStatement.getType().name.equals(LANG2.PREPROC_IFDEF) &&
                         (classDiff.getPreprocessorStatementListDiff().get().getAddedStatements().size() > 0 || classDiff.getPreprocessorStatementListDiff().get().getRemovedStatements().size() > 0);
                 if(srcStatement != null && dstStatement != null && !ifDef) {
-                    mappingStore.addMappingRecursively(srcStatement, dstStatement);
+                    mapConditionalGroup(srcStatement, dstStatement, mappingStore);
                     parent1 = srcStatement.getParent();
                     parent2 = dstStatement.getParent();
                     processParentLinkageSpecification(parent1, parent2, mappingStore);
                 }
-                else
+                else {
                     mappingStore.addMapping(srcStatement, dstStatement);
+                    matchConditionalLinkageBraces(srcStatement, dstStatement, mappingStore);
+                }
             }
             for (org.apache.commons.lang3.tuple.Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> statementPair : classDiff.getPreprocessorStatementListDiff().get().getChangedStatements()) {
                 Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
                 Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-                if(!mappingStore.isSrcMapped(srcStatement) && !mappingStore.isDstMapped(dstStatement))
+                //a conditional with a changed condition, whose node contains its block, i.e., #ifndef CONFIG_ARCH_THREAD_INFO_ALLOCATOR ... #endif,
+                //maps its directive and condition, and its block is matched by its own declarations
+                if(srcStatement != null && dstStatement != null && statementPair.getLeft().isConditional() && statementPair.getRight().isConditional() &&
+                        srcStatement.getChildren().size() > 1 && dstStatement.getChildren().size() > 1) {
+                    mappingStore.addMapping(srcStatement, dstStatement);
+                    mappingStore.addMapping(srcStatement.getChild(0), dstStatement.getChild(0));
+                    mappingStore.addMappingRecursively(srcStatement.getChild(1), dstStatement.getChild(1));
+                }
+                else if(!mappingStore.isSrcMapped(srcStatement) && !mappingStore.isDstMapped(dstStatement))
                     mappingStore.addMappingRecursively(srcStatement, dstStatement);
             }
         }
@@ -630,18 +663,28 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             Tree ambient1 = module1.getParent();
             Tree ambient2 = module2.getParent();
             if(ambient1 != null && ambient2 != null && ambient1.getType().name.equals(LANG1.AMBIENT_DECLARATION) && ambient2.getType().name.equals(LANG2.AMBIENT_DECLARATION)) {
-                mappingStore.addMapping(ambient1, ambient2);
-                Pair<Tree, Tree> declares = Helpers.findPairOfType(ambient1, ambient2, LANG1.DECLARE_KEYWORD, LANG2.DECLARE_KEYWORD);
-                if(declares != null) {
-                    mappingStore.addMapping(declares.first, declares.second);
-                }
+                processAmbientDeclaration(ambient1, ambient2, mappingStore, LANG1, LANG2);
             }
         }
         else if(block1.getType().name.equals(LANG1.AMBIENT_DECLARATION) && block2.getType().name.equals(LANG2.AMBIENT_DECLARATION)) {
-            mappingStore.addMapping(block1, block2);
-            Pair<Tree, Tree> declares = Helpers.findPairOfType(block1, block2, LANG1.DECLARE_KEYWORD, LANG2.DECLARE_KEYWORD);
-            if(declares != null) {
-                mappingStore.addMapping(declares.first, declares.second);
+            processAmbientDeclaration(block1, block2, mappingStore, LANG1, LANG2);
+        }
+    }
+
+    //declare namespace X {...}, or export declare namespace X {...}
+    private static void processAmbientDeclaration(Tree ambient1, Tree ambient2, ExtendedMultiMappingStore mappingStore, Constants LANG1, Constants LANG2) {
+        mappingStore.addMapping(ambient1, ambient2);
+        Pair<Tree, Tree> declares = Helpers.findPairOfType(ambient1, ambient2, LANG1.DECLARE_KEYWORD, LANG2.DECLARE_KEYWORD);
+        if(declares != null) {
+            mappingStore.addMapping(declares.first, declares.second);
+        }
+        Tree export1 = ambient1.getParent();
+        Tree export2 = ambient2.getParent();
+        if(export1 != null && export2 != null && export1.getType().name.equals(LANG1.EXPORT_STATEMENT) && export2.getType().name.equals(LANG2.EXPORT_STATEMENT)) {
+            mappingStore.addMapping(export1, export2);
+            Pair<Tree, Tree> exports = Helpers.findPairOfType(export1, export2, LANG1.EXPORT_KEYWORD, LANG2.EXPORT_KEYWORD);
+            if(exports != null) {
+                mappingStore.addMapping(exports.first, exports.second);
             }
         }
     }
@@ -653,7 +696,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         Pair<Tree, Tree> matched;
         Tree srcStatement = TreeUtilFunctions.findByLocationInfo(srcTypeDeclaration, statementPair.getLeft().getLocationInfo(), LANG1);
         Tree dstStatement = TreeUtilFunctions.findByLocationInfo(dstTypeDeclaration, statementPair.getRight().getLocationInfo(), LANG2);
-        if(statementPair.getLeft().isFunctionDefinition() && statementPair.getRight().isFunctionDefinition() && !srcStatement.getType().name.equals(LANG1.METHOD_DECLARATION) && !dstStatement.getType().name.equals(LANG2.METHOD_DECLARATION)) {
+        if(statementPair.getLeft().isFunctionDefinition() && statementPair.getRight().isFunctionDefinition() && srcStatement != null && dstStatement != null && !srcStatement.getType().name.equals(LANG1.METHOD_DECLARATION) && !dstStatement.getType().name.equals(LANG2.METHOD_DECLARATION)) {
             Tree tmpSrcStatement = TreeUtilFunctions.getParentUntilType(srcStatement, LANG1.METHOD_DECLARATION);
             Tree tmpDstStatement = TreeUtilFunctions.getParentUntilType(dstStatement, LANG2.METHOD_DECLARATION);
             if(tmpSrcStatement != null) srcStatement = tmpSrcStatement;
@@ -701,6 +744,52 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
         }
         UMLCommentListDiff diff = new UMLCommentListDiff(statementPair.getLeft().getComments(), statementPair.getRight().getComments());
         new CommentMatcher(optimizationData, diff, LANG1, LANG2).match(srcTree, dstTree, mappingStore);
+    }
+
+    //the conditional group with its code, whose children are mapped by their positions, except the directives that changed, which are mapped by their own pairs,
+    //i.e., #include "limits.h" moved before #include "data_types.h" in an include guard
+    private void mapConditionalGroup(Tree srcStatement, Tree dstStatement, ExtendedMultiMappingStore mappingStore) {
+        if(!srcStatement.getType().name.equals(LANG1.PREPROC_IFDEF) || !dstStatement.getType().name.equals(LANG2.PREPROC_IFDEF) || srcStatement.isIsomorphicTo(dstStatement)
+                || srcStatement.getChildren().size() != dstStatement.getChildren().size()) {
+            mappingStore.addMappingRecursively(srcStatement, dstStatement);
+            return;
+        }
+        mappingStore.addMapping(srcStatement, dstStatement);
+        for(int i = 0; i < srcStatement.getChildren().size(); i++) {
+            Tree child1 = srcStatement.getChild(i);
+            Tree child2 = dstStatement.getChild(i);
+            if(child1.getType().name.startsWith("preproc_") && !child1.isIsomorphicTo(child2)) {
+                continue;
+            }
+            //the functions with changes, whose code is mapped by the mappers of their operations, and not by its positions
+            if(child1.getType().name.equals(LANG1.METHOD_DECLARATION) && child2.getType().name.equals(LANG2.METHOD_DECLARATION) && !child1.isIsomorphicTo(child2)) {
+                continue;
+            }
+            mappingStore.addMappingRecursively(child1, child2);
+        }
+    }
+
+    //the opening of extern "C" in its own conditional branch, i.e., extern "C" { in #ifdef __cplusplus extern "C" { #endif, which is not a declaration of the model,
+    //when the branch is mapped without its block
+    private void matchConditionalLinkageBraces(Tree srcStatement, Tree dstStatement, ExtendedMultiMappingStore mappingStore) {
+        if(srcStatement == null || dstStatement == null) {
+            return;
+        }
+        Tree linkage1 = null;
+        for(Tree child : srcStatement.getChildren()) {
+            if(child.getType().name.equals(LANG1.LINKAGE_SPECIFICATION)) {
+                linkage1 = child;
+            }
+        }
+        Tree linkage2 = null;
+        for(Tree child : dstStatement.getChildren()) {
+            if(child.getType().name.equals(LANG2.LINKAGE_SPECIFICATION)) {
+                linkage2 = child;
+            }
+        }
+        if(linkage1 != null && linkage2 != null && linkage1.isIsomorphicTo(linkage2) && !mappingStore.isSrcMapped(linkage1) && !mappingStore.isDstMapped(linkage2)) {
+            mappingStore.addMappingRecursively(linkage1, linkage2);
+        }
     }
 
     private void processParentLinkageSpecification(Tree parent1, Tree parent2, ExtendedMultiMappingStore mappingStore) {
@@ -1469,12 +1558,7 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
                     mappingStore.addMappingRecursively(srcSubTree,dstSubTree);
                     int index1 = parent1.getChildPosition(srcSubTree);
                     int index2 = parent2.getChildPosition(dstSubTree);
-                    if(parent1.getChildren().size() > index1+1 && parent1.getChild(index1+1).getType().name.equals(LANG1.COMMA) &&
-                            parent2.getChildren().size() > index2+1 && parent2.getChild(index2+1).getType().name.equals(LANG2.COMMA)) {
-                        Tree t1 = parent1.getChild(index1+1);
-                        Tree t2 = parent2.getChild(index2+1);
-                        mappingStore.addMapping(t1,t2);
-                    }
+                    matchFollowingCommas(parent1, parent2, srcSubTree, dstSubTree, mappingStore);
                     //the identical access specifier and virtual keyword before the base type, i.e., public in public Base and public virtual Base
                     for(String keyword : new String[] {LANG1.ACCESS_SPECIFIER, LANG1.VIRTUAL_KEYWORD}) {
                         Tree t1 = precedingInBaseSpecifier(parent1, index1, keyword);
@@ -1501,9 +1585,19 @@ public class ClassDeclarationMatcher extends OptimizationAwareMatcher implements
             if (implement != null) {
                 mappingStore.addMapping(implement.first,implement.second);
             }
+            matchFollowingCommas(parent1, parent2, srcSubTree, dstSubTree, mappingStore);
             if(parent1.getParent().getType().name.equals(LANG1.CLASS_HERITAGE) && parent2.getParent().getType().name.equals(LANG2.CLASS_HERITAGE)) {
                 mappingStore.addMapping(parent1.getParent(), parent2.getParent());
             }
+        }
+    }
+    //the comma after a common type in a list of types, i.e., the comma after A in implements A, B
+    private void matchFollowingCommas(Tree parent1, Tree parent2, Tree child1, Tree child2, ExtendedMultiMappingStore mappingStore) {
+        int index1 = parent1.getChildPosition(child1);
+        int index2 = parent2.getChildPosition(child2);
+        if(index1 >= 0 && index2 >= 0 && parent1.getChildren().size() > index1+1 && parent1.getChild(index1+1).getType().name.equals(LANG1.COMMA) &&
+                parent2.getChildren().size() > index2+1 && parent2.getChild(index2+1).getType().name.equals(LANG2.COMMA)) {
+            mappingStore.addMapping(parent1.getChild(index1+1), parent2.getChild(index2+1));
         }
     }
     //the node of the type before the base type in the same base specifier of the base class clause, i.e., public in public virtual Base

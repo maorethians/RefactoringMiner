@@ -31,6 +31,9 @@ public class ModuleContainer implements VariableDeclarationContainer {
 	//all comments of the module, including the ones distributed to the code elements of the module
 	private List<UMLComment> allComments = new ArrayList<>();
 	private List<UMLClass> nestedClasses = new ArrayList<>();
+	//a list, as the classes are equal by name, i.e., interface Variables declared in several tests
+	private List<NestedClassDeclaredInCallback> nestedClassesDeclaredInCallbacks = new ArrayList<>();
+	private record NestedClassDeclaredInCallback(UMLClass nestedClass, LambdaExpressionObject callback) {}
 	private List<UMLOperation> nestedOperations = new ArrayList<>();
 	private List<UMLAttribute> nestedAttributes = new ArrayList<>();
 	private List<UMLImport> nestedImports = new ArrayList<>();
@@ -157,6 +160,30 @@ public class ModuleContainer implements VariableDeclarationContainer {
 		this.nestedClasses.add(nestedClass);
 	}
 
+	//the types declared in the callbacks of the module statements, i.e., in describe('...', () => {...}): the ones with unique names in the file are classes of the module,
+	//as the types with the same name declared in different callbacks (or functions) cannot be told apart by the diff of the classes, so the others are kept
+	//in the callbacks declaring them, and are matched by their names when the callbacks are matched (i.e., interface Variables declared in several tests)
+	public void addNestedClassDeclaredInCallback(UMLClass nestedClass, LambdaExpressionObject callback) {
+		this.nestedClassesDeclaredInCallbacks.add(new NestedClassDeclaredInCallback(nestedClass, callback));
+	}
+
+	public boolean hasNestedClassesDeclaredInCallbacks() {
+		return !nestedClassesDeclaredInCallbacks.isEmpty();
+	}
+
+	//typeDeclarations: the number of the type declarations of the file with each name, at any depth
+	public void addNestedClassesDeclaredInCallbacks(Map<String, Integer> typeDeclarations) {
+		for(NestedClassDeclaredInCallback declared : nestedClassesDeclaredInCallbacks) {
+			if(typeDeclarations.getOrDefault(declared.nestedClass().getNonQualifiedName(), 0) == 1) {
+				nestedClasses.add(declared.nestedClass());
+			}
+			else {
+				declared.callback().addNestedClass(declared.nestedClass());
+			}
+		}
+		nestedClassesDeclaredInCallbacks.clear();
+	}
+
 	public List<UMLClass> getNestedClasses() {
 		return nestedClasses;
 	}
@@ -250,6 +277,23 @@ public class ModuleContainer implements VariableDeclarationContainer {
 	@Override
 	public List<UMLAnonymousClass> getAnonymousClassList() {
 		return anonymousClassList;
+	}
+
+	//the anonymous classes of a module (i.e., the object literals of a test file) are many, so they are looked up by their location
+	private Map<LocationInfo, UMLAnonymousClass> anonymousClassIndex;
+	private int indexedAnonymousClasses = -1;
+
+	@Override
+	public UMLAnonymousClass findAnonymousClass(AnonymousClassDeclarationObject anonymousClassDeclaration) {
+		List<UMLAnonymousClass> anonymousClasses = getAnonymousClassList();
+		if(anonymousClassIndex == null || indexedAnonymousClasses != anonymousClasses.size()) {
+			anonymousClassIndex = new LinkedHashMap<>();
+			for(UMLAnonymousClass anonymousClass : anonymousClasses) {
+				anonymousClassIndex.putIfAbsent(anonymousClass.getLocationInfo(), anonymousClass);
+			}
+			indexedAnonymousClasses = anonymousClasses.size();
+		}
+		return anonymousClassIndex.get(anonymousClassDeclaration.getLocationInfo());
 	}
 
 	public List<UMLAnonymousClass> getAnonymousClassListIncludingNested() {

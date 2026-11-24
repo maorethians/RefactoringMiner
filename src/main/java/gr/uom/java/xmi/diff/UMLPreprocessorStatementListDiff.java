@@ -108,6 +108,7 @@ public class UMLPreprocessorStatementListDiff {
 		removeByIdentity(newStatementsCopy, newToBeRemoved);
 		oldToBeRemoved.clear();
 		newToBeRemoved.clear();
+		pairConditionalsWithChangedCondition(oldStatementsCopy, newStatementsCopy);
 		//check if some of the remaining statements have equal values
 		for(UMLPreprocessorStatement oldStatement : oldStatementsCopy) {
 			if(oldStatement.getValue().isPresent()) {
@@ -154,6 +155,68 @@ public class UMLPreprocessorStatementListDiff {
 		this.addedStatements = newStatementsCopy;
 	}
 
+	private static final double CONDITIONAL_BLOCK_SIMILARITY = 0.5;
+
+	//the remaining opening conditional directives of the same type and scope, whose blocks are similar, have a changed condition,
+	//and their #elif, #else and #endif correspond, i.e., #ifndef CONFIG_ARCH_THREAD_INFO_ALLOCATOR ... #endif -> #ifndef CONFIG_ARCH_THREAD_STACK_ALLOCATOR ... #endif
+	private void pairConditionalsWithChangedCondition(List<UMLPreprocessorStatement> oldStatements, List<UMLPreprocessorStatement> newStatements) {
+		Map<UMLPreprocessorStatement, UMLPreprocessorStatement> pairedOpenings = new IdentityHashMap<>();
+		for(UMLPreprocessorStatement oldStatement : oldStatements) {
+			if(!oldStatement.isOpeningConditional() || oldStatement.getBlockText().isEmpty()) {
+				continue;
+			}
+			UMLPreprocessorStatement best = null;
+			double bestSimilarity = CONDITIONAL_BLOCK_SIMILARITY;
+			for(UMLPreprocessorStatement newStatement : newStatements) {
+				if(newStatement.getType() == oldStatement.getType() && newStatement.getBlockText().isPresent() && !pairedOpenings.containsValue(newStatement) &&
+						newStatement.getEnclosingFunction().equals(oldStatement.getEnclosingFunction())) {
+					double similarity = tokenSimilarity(oldStatement.getBlockText().get(), newStatement.getBlockText().get());
+					if(similarity >= bestSimilarity) {
+						bestSimilarity = similarity;
+						best = newStatement;
+					}
+				}
+			}
+			if(best != null) {
+				pairedOpenings.put(oldStatement, best);
+			}
+		}
+		if(pairedOpenings.isEmpty()) {
+			return;
+		}
+		List<UMLPreprocessorStatement> oldToBeRemoved = new ArrayList<>();
+		List<UMLPreprocessorStatement> newToBeRemoved = new ArrayList<>();
+		for(Map.Entry<UMLPreprocessorStatement, UMLPreprocessorStatement> entry : pairedOpenings.entrySet()) {
+			changedStatements.add(Pair.of(entry.getKey(), entry.getValue()));
+			oldToBeRemoved.add(entry.getKey());
+			newToBeRemoved.add(entry.getValue());
+		}
+		//the #elif, #else and #endif following the paired opening directives, in order of type
+		for(UMLPreprocessorStatement oldStatement : oldStatements) {
+			if(oldStatement.getPrevious().isEmpty() || !pairedOpenings.containsKey(oldStatement.getPrevious().get())) {
+				continue;
+			}
+			UMLPreprocessorStatement counterpart = pairedOpenings.get(oldStatement.getPrevious().get());
+			for(UMLPreprocessorStatement newStatement : newStatements) {
+				if(newStatement.getType() == oldStatement.getType() && newStatement.getPrevious().isPresent() && newStatement.getPrevious().get() == counterpart &&
+						newToBeRemoved.stream().noneMatch(statement -> statement == newStatement)) {
+					Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> pair = Pair.of(oldStatement, newStatement);
+					if(oldStatement.getValue().equals(newStatement.getValue())) {
+						commonStatements.add(pair);
+					}
+					else {
+						changedStatements.add(pair);
+					}
+					oldToBeRemoved.add(oldStatement);
+					newToBeRemoved.add(newStatement);
+					break;
+				}
+			}
+		}
+		removeByIdentity(oldStatements, oldToBeRemoved);
+		removeByIdentity(newStatements, newToBeRemoved);
+	}
+
 	//the statements themselves, as the directives with the same condition are equal
 	private static void removeByIdentity(List<UMLPreprocessorStatement> statements, List<UMLPreprocessorStatement> toBeRemoved) {
 		statements.removeIf(statement -> toBeRemoved.stream().anyMatch(removed -> removed == statement));
@@ -179,18 +242,31 @@ public class UMLPreprocessorStatementListDiff {
 				equalIndices.add(i);
 			}
 		}
+		//an #else, #elif or #endif corresponds only to the one of the counterpart of its #if
+		if(statement.getPrevious().isPresent()) {
+			UMLPreprocessorStatement counterpart = paired.get(statement.getPrevious().get());
+			for(int index : equalIndices) {
+				if(counterpart != null && candidates.get(index).getPrevious().isPresent() && candidates.get(index).getPrevious().get() == counterpart) {
+					return index;
+				}
+			}
+			return -1;
+		}
 		if(equalIndices.size() <= 1) {
 			return equalIndices.isEmpty() ? -1 : equalIndices.get(0);
 		}
-		if(statement.getPrevious().isPresent()) {
-			UMLPreprocessorStatement counterpart = paired.get(statement.getPrevious().get());
-			if(counterpart != null) {
-				for(int index : equalIndices) {
-					if(candidates.get(index).getPrevious().isPresent() && candidates.get(index).getPrevious().get() == counterpart) {
-						return index;
-					}
-				}
+		//the equal directives in the same function body, or at file scope, i.e., #ifdef X around declarations is not paired with #ifdef X in a function body
+		List<Integer> sameScopeIndices = new ArrayList<>();
+		for(int index : equalIndices) {
+			if(candidates.get(index).getEnclosingFunction().equals(statement.getEnclosingFunction())) {
+				sameScopeIndices.add(index);
 			}
+		}
+		if(sameScopeIndices.size() == 1) {
+			return sameScopeIndices.get(0);
+		}
+		else if(sameScopeIndices.size() > 1) {
+			equalIndices = sameScopeIndices;
 		}
 		if(statement.getBlockText().isPresent()) {
 			String blockText = statement.getBlockText().get();
@@ -263,6 +339,29 @@ public class UMLPreprocessorStatementListDiff {
 		if(removedStatement != null && addedStatement != null) {
 			Pair<UMLPreprocessorStatement, UMLPreprocessorStatement> pair = Pair.of(removedStatement, addedStatement);
 			changedStatements.add(pair);
+			removedStatements.removeIf(statement -> statement == removedStatement);
+			addedStatements.removeIf(statement -> statement == addedStatement);
+		}
+	}
+
+	//the removed definitions with the name before paired in order with the added definitions with the name after, i.e., the variants of a macro in sibling branches
+	public void pairRenamedDefinitions(String nameBefore, String nameAfter) {
+		List<UMLPreprocessorStatement> removed = new ArrayList<>();
+		List<UMLPreprocessorStatement> added = new ArrayList<>();
+		for(UMLPreprocessorStatement statement : removedStatements) {
+			if(statement.isDefinition() && statement.getName().equals(Optional.of(nameBefore))) {
+				removed.add(statement);
+			}
+		}
+		for(UMLPreprocessorStatement statement : addedStatements) {
+			if(statement.isDefinition() && statement.getName().equals(Optional.of(nameAfter))) {
+				added.add(statement);
+			}
+		}
+		for(int i=0; i<Math.min(removed.size(), added.size()); i++) {
+			UMLPreprocessorStatement removedStatement = removed.get(i);
+			UMLPreprocessorStatement addedStatement = added.get(i);
+			changedStatements.add(Pair.of(removedStatement, addedStatement));
 			removedStatements.removeIf(statement -> statement == removedStatement);
 			addedStatements.removeIf(statement -> statement == addedStatement);
 		}

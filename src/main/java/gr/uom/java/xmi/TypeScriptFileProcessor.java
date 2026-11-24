@@ -4,23 +4,31 @@ import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.refactoringminer.astDiff.utils.TypeScriptTreeGenerator;
 
 import com.caoccao.javet.swc4j.Swc4j;
 import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstClassMethod;
+import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstComputedPropName;
 import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstConstructor;
 import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstFunction;
 import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstParam;
 import com.caoccao.javet.swc4j.ast.clazz.Swc4jAstPrivateMethod;
+import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAst;
+import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstExpr;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstModuleItem;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstParamOrTsParamProp;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstPat;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsInterfaceDecl;
+import com.caoccao.javet.swc4j.ast.stmt.Swc4jAstTsTypeAliasDecl;
+import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstPropName;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstStmt;
 import com.caoccao.javet.swc4j.ast.interfaces.ISwc4jAstTsFnParam;
 import com.caoccao.javet.swc4j.ast.pat.Swc4jAstArrayPat;
@@ -59,6 +67,23 @@ public class TypeScriptFileProcessor {
 		this.umlModel = umlModel;
 	}
 
+	//the name of a class member, i.e., [Symbol.iterator] for a computed key, which has no toString of its own
+	public static String memberName(ISwc4jAstPropName key, String fileContent) {
+		if(key instanceof Swc4jAstComputedPropName computed) {
+			return computedMemberName(computed.getExpr(), fileContent);
+		}
+		return key.toString();
+	}
+
+	//the name of an interface method, whose computed key is an expression, i.e., [Symbol.iterator] in [Symbol.iterator](): Iterator<T>
+	public static String memberName(ISwc4jAstExpr key, boolean computed, String fileContent) {
+		return computed ? computedMemberName(key, fileContent) : key.toString();
+	}
+
+	private static String computedMemberName(ISwc4jAstExpr expr, String fileContent) {
+		return "[" + fileContent.substring(expr.getSpan().getStart(), expr.getSpan().getEnd()) + "]";
+	}
+
 	/**
 	 * swc4j gives the offsets in code points, so the source is parsed with each UTF-16 unit of a surrogate pair, i.e., an emoji, replaced by a private use character,
 	 * to get UTF-16 offsets, i.e., the offsets of Java strings. The mapping is one-to-one, so different emoji remain different, and the source code text is taken from the original content.
@@ -87,9 +112,35 @@ public class TypeScriptFileProcessor {
 		return Swc4jMediaType.Jsx;
 	}
 
+	// Mirrors GitHub Linguist (lib/linguist/vendor.yml)
+	private static final Pattern MINIFIED_FILE_PATTERN = Pattern.compile("[-.]min\\.js$");
+	// Mirrors GitHub Linguist (lib/linguist/generated.rb minified_files?)
+	public static final int MINIFIED_AVERAGE_LINE_LENGTH = 110;
+
+	public static boolean isMinified(String filePath, String fileContent) {
+		if (filePath == null || fileContent == null || fileContent.isEmpty()) {
+			return false;
+		}
+		// Linguist vendor.yml: (\.|-)min\.(js|css)$
+		if (MINIFIED_FILE_PATTERN.matcher(filePath).find()) {
+			return true;
+		}
+		// Linguist generated.rb (minified_files?): average line length > 110 characters for JavaScript files
+		if (filePath.endsWith(".js")) {
+			int lines = 1;
+			for (int i = 0; i < fileContent.length(); i++) {
+				if (fileContent.charAt(i) == '\n') {
+					lines++;
+				}
+			}
+			return (fileContent.length() / lines) > MINIFIED_AVERAGE_LINE_LENGTH;
+		}
+		return false;
+	}
+
 	public void processTypeScriptFile(String filePath, String fileContent, boolean astDiff, Swc4j swc4j) {
 		//skip minified JavaScript files
-		if(filePath.endsWith(".min.js")) {
+		if(isMinified(filePath, fileContent)) {
 			return;
 		}
 		try {
@@ -130,6 +181,11 @@ public class TypeScriptFileProcessor {
 						fileContent
 						);
 				moduleContainer.addStatements(opBody.getCompositeStatement().getStatements());
+				if(moduleContainer.hasNestedClassesDeclaredInCallbacks()) {
+					Map<String, Integer> typeDeclarations = new HashMap<>();
+					countTypeDeclarations(module, typeDeclarations);
+					moduleContainer.addNestedClassesDeclaredInCallbacks(typeDeclarations);
+				}
 				moduleClass.setContainer(moduleContainer);
 				moduleClass.setVisibility(Visibility.PUBLIC);
 				moduleClass.operations.addAll(moduleContainer.getNestedOperations());
@@ -194,7 +250,7 @@ public class TypeScriptFileProcessor {
 
 	public static UMLOperation processFunctionDeclaration(String sourceFolder, String filePath, Swc4jAstClassMethod functionDecl, Map<String,Set<VariableDeclaration>> activeVariableDeclarations, String fileContent, String className, List<UMLComment> comments) {
 		LocationInfo location = new LocationInfo(sourceFolder, filePath, functionDecl, CodeElementType.METHOD_DECLARATION, fileContent);
-		UMLOperation operation = new UMLOperation(functionDecl.getKey().toString(), location, className);
+		UMLOperation operation = new UMLOperation(memberName(functionDecl.getKey(), fileContent), location, className);
 		operation.setVisibility(Visibility.PRIVATE);
 		Swc4jAstFunction function = functionDecl.getFunction();
 		return processFunction(sourceFolder, filePath, function, activeVariableDeclarations, fileContent, operation, comments);
@@ -308,7 +364,7 @@ public class TypeScriptFileProcessor {
 	public static UMLOperation processFunctionSignature(String sourceFolder, String filePath, Swc4jAstTsMethodSignature methodSignature,
 			Map<String, Set<VariableDeclaration>> activeVariableDeclarations, String fileContent, String className) {
 		LocationInfo location = new LocationInfo(sourceFolder, filePath, methodSignature, CodeElementType.METHOD_DECLARATION, fileContent);
-		UMLOperation operation = new UMLOperation(methodSignature.getKey().toString(), location, className);
+		UMLOperation operation = new UMLOperation(memberName(methodSignature.getKey(), methodSignature.isComputed(), fileContent), location, className);
 		operation.setVisibility(Visibility.PUBLIC);
 		Optional<Swc4jAstTsTypeAnn> returnType = methodSignature.getTypeAnn();
 		if(returnType.isPresent()) {
@@ -365,5 +421,18 @@ public class TypeScriptFileProcessor {
 		String text = fileContent.substring(startSignatureOffset, endSignatureOffset);
 		operation.setActualSignature(text);
 		return operation;
+	}
+
+	//the number of the interfaces and type aliases declared in the file with each name, at any depth
+	private static void countTypeDeclarations(ISwc4jAst node, Map<String, Integer> typeDeclarations) {
+		if(node instanceof Swc4jAstTsInterfaceDecl interfaceDecl) {
+			typeDeclarations.merge(interfaceDecl.getId().getSym(), 1, Integer::sum);
+		}
+		else if(node instanceof Swc4jAstTsTypeAliasDecl typeAliasDecl) {
+			typeDeclarations.merge(typeAliasDecl.getId().getSym(), 1, Integer::sum);
+		}
+		for(ISwc4jAst child : node.getChildNodes()) {
+			countTypeDeclarations(child, typeDeclarations);
+		}
 	}
 }
